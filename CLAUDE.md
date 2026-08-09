@@ -2,7 +2,7 @@
 
 Australian road-transport marketplace. Customers publish delivery jobs, verified transport providers bid privately, the customer awards one, and the delivery is tracked to completion. Marketplace only — Shipper never holds payment in the MVP.
 
-**There is no application code yet.** This repository is currently nine planning documents. Work proceeds ticket by ticket through `Docs/09-delivery-backlog.md`.
+**M0 is under way.** `SHIP-1`…`SHIP-9` have landed: the monorepo structure, the local stack, and the Go service skeleton with health, configuration, logging, and migrations. Everything above `SHIP-10` is still planning documents. Work proceeds ticket by ticket through `Docs/09-delivery-backlog.md`.
 
 ## Documents are the source of truth
 
@@ -92,6 +92,15 @@ Batch tightly-related tickets on one branch only when they form a single reviewa
 
 ### Commits
 
+<<<<<<< Updated upstream
+=======
+**Claude never runs `git commit`.** Stage nothing, commit nothing. When work is complete, write the proposed commit message to a scratch file and hand it over — the repository owner makes every commit.
+
+This keeps authorship and co-authorship trailers entirely under the owner's control. Do not add `Co-Authored-By` trailers to proposed messages.
+
+Format:
+
+>>>>>>> Stashed changes
 ```
 SHIP-39: rotate refresh tokens on every use
 
@@ -120,9 +129,23 @@ A ticket is done when **all** of these hold:
 
 Meeting all six makes the branch **ready to merge**, not merged. Hand it to the repository owner.
 
+<<<<<<< Updated upstream
 ### Merging
 
 **Claude never merges anything.** Not ticket branches, not pull requests. Prepare the branch, push it, open the pull request if asked — then stop. Every merge is performed by the repository owner.
+=======
+### What Claude does and does not do
+
+| Action | Who |
+|---|---|
+| Write code, create branches, edit files | Claude |
+| Propose commit messages (as scratch files) | Claude |
+| **`git commit`** | **Owner only** |
+| **`git merge`** — ticket branches and pull requests alike | **Owner only** |
+| **`git push`** | Owner, unless explicitly asked |
+
+Claude prepares work and stops at the commit. It does not commit, merge, or self-approve.
+>>>>>>> Stashed changes
 
 The flow:
 
@@ -159,18 +182,65 @@ Read the diff at the first gate, not the second — by the time work reaches a `
 
 ## Commands
 
-None yet — M0 has not been built. Once `SHIP-1`…`SHIP-7` land, this section should list the local stack, migration, build, and test commands. Update it as part of those tickets.
+All run from the repository root. `make` with no target lists them.
+
+```
+make up             Start Postgres, Redis and Kafka, waiting until each is healthy
+make down           Stop the stack, keeping data
+make reset          Stop the stack and destroy all data
+make ps / logs      Stack status; follow stack logs
+
+make migrate-up     Apply all pending migrations
+make migrate-down   Reverse the last migration (make migrate-down n=all for everything)
+make migrate-version
+make migrate-create name=<snake_case_name>
+
+make run            Run the API on the host
+make build          Build bin/shipper-api and bin/shipper-migrate
+make test           go test ./... -race
+make vet
+make check          vet + test — what CI runs for the Go service
+
+make verify         Demonstrate the SHIP-1..9 acceptance criteria end to end
+make psql / redis   Open a shell against the local database or cache
+make kafka-smoke    Create a topic, produce, consume, delete
+```
+
+A typical start: `make up && make migrate-up && make run`, then
+`curl localhost:8080/health`.
+
+Configuration is entirely environment-driven. `deploy/.env.example` documents every
+variable; copy it to `deploy/.env` to override anything locally. Note that `deploy/.env`
+is read by `make`, not by the binaries — run through the make targets or export the
+variables yourself.
+
+`make verify` needs two host clients the stack does not provide:
+`brew install libpq redis`.
+
+The Flutter, admin, and driver-portal commands arrive with SHIP-16, SHIP-22, and SHIP-23.
 
 ## Repository layout
 
-Planned in `Docs/08` Step 1. One repository, four deployables:
+Per `Docs/08` Step 1. One repository, four deployables:
 
 ```
-apps/mobile/          Flutter
-apps/admin/           Next.js
-apps/driver-portal/   Next.js
-services/core/        Go
+apps/mobile/          Flutter — placeholder until SHIP-16
+apps/admin/           Next.js — placeholder until SHIP-22
+apps/driver-portal/   Next.js — placeholder until SHIP-23
+services/core/        Go — the versioned public API and domain
+  cmd/api/            entrypoint, wiring, graceful shutdown
+  cmd/migrate/        migration tool, migrations embedded in the binary
+  internal/config/    environment configuration
+  internal/httpx/     request ID, request logging, panic recovery, JSON helpers
+  internal/logging/   slog handler construction
+  internal/buildinfo/ version and commit, injected at link time
+  migrations/         SQL schema history
 deploy/               docker-compose for local Postgres, Redis, Kafka
+scripts/              verify-foundation.sh — the SHIP-1..9 acceptance run
 ```
+
+The eight domain packages and the `platform/` adapter tree arrive in `SHIP-10`, with the
+import lint rule enforcing their boundaries in `SHIP-11`. Until then `internal/` holds
+infrastructure only, and no domain logic has been written.
 
 Path-filter CI workflows from the first commit — macOS runners for iOS builds cost roughly ten times Linux minutes, and a Go-only change must not trigger one.
