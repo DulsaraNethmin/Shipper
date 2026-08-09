@@ -28,10 +28,25 @@
 | ABN where applicable | Required for businesses | Validation/manual |
 | Address and service area | Required | Self-declared, review exceptions |
 | Vehicle details | Required before bidding with a vehicle | Self-declared |
-| Licence, registration, insurance declarations | Required | Declaration in MVP; evidence process to be approved |
+| Licence, registration, insurance | Required | Document image collected and reviewed by an administrator |
 | Provider terms and goods policy | Required | Explicit acceptance |
 
-**Decision required:** Obtain legal/insurance advice on which evidence must be collected and how often it must be renewed before launch.
+**Decided — evidence is collected and reviewed manually.** Providers upload images of their licence, vehicle registration, and insurance certificate. An administrator reviews each by eye for obvious validity — correct document type, legible, not visibly expired, name matching the account — and records the decision.
+
+This sits deliberately between the two alternatives. Declarations alone would leave Shipper holding no evidence at all, which is an uncomfortable position if something goes wrong during the pilot and an insurer or regulator asks what was checked. Integrating third-party identity and ABN verification would mean building and paying for automated checks before knowing whether provider supply materialises at all.
+
+Manual review is affordable at pilot volume, produces a real evidence trail, and has a useful side effect: it shows exactly which checks are slow, ambiguous, or repetitive, which is the information needed to decide what is worth automating in Phase 2.
+
+**Decision required:** which documents are *legally* required rather than merely prudent, and how often each must be renewed. Owner: legal and insurance advisers. This determines expiry tracking (`§5`) and retention obligations, and remains genuinely outside engineering's competence to settle. It is needed before pilot users are invited, not before build begins.
+
+### 3.1 Evidence capture on mobile
+
+The verification process itself is unchanged by the move to a mobile app; only the capture experience improves. Where document evidence is required:
+
+- Providers photograph documents in-app rather than finding a scanner, which materially reduces onboarding drop-off at the point the funnel is weakest.
+- Captured images upload directly to private object storage through short-lived pre-signed URLs, and are compressed on the device first.
+- Verification images must **not** be written to the device photo library, and must be cleared from app storage once uploaded. Identity documents sitting in a camera roll are a privacy exposure the platform cannot control or revoke.
+- The camera permission may be declined. A file-upload fallback must exist so that a refused permission never blocks verification outright.
 
 ## 4. Verification outcomes
 

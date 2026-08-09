@@ -1,0 +1,58 @@
+# === Secrets and signing material — never commit ===
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p8
+*.p12
+*.jks
+*.keystore
+*.mobileprovision
+*-service-account.json
+google-services.json
+GoogleService-Info.plist
+android/key.properties
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === IDE ===
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# === Go ===
+bin/
+dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# === Flutter / Dart ===
+apps/mobile/.dart_tool/
+apps/mobile/.flutter-plugins
+apps/mobile/.flutter-plugins-dependencies
+apps/mobile/build/
+apps/mobile/ios/Pods/
+apps/mobile/ios/.symlinks/
+apps/mobile/ios/Flutter/Flutter.framework
+apps/mobile/ios/Flutter/Generated.xcconfig
+apps/mobile/android/.gradle/
+apps/mobile/android/local.properties
+apps/mobile/android/app/debug/
+apps/mobile/android/app/release/
+
+# === Node / Next.js ===
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# === Local infrastructure ===
+deploy/data/
+deploy/**/pgdata/

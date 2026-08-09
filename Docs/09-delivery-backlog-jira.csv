@@ -1,0 +1,580 @@
+Issue Type,Summary,Description,Epic Name,Epic Link,Story Points,Priority,Labels
+Epi c,Track X — External dependencies,Unblock everything that depends on a third party. None of this is code; all of it is slow.,External Dependencies,,,Highest,X
+Story,[X-1] Obtain D-U-N-S number for the legal entity,Done when: D-U-N-S number issued and recorded,,External Dependencies,2,Highest,X
+Story,[X-2] Enrol in Apple Developer Program,"Done when: Enrolment approved and App Store Connect accessible
+
+Depends on: X-1",,External Dependencies,3,Highest,X
+Story,[X-3] Enrol in Google Play Console,Done when: Console access granted and developer profile complete,,External Dependencies,2,Highest,X
+Story,[X-4] Brief legal adviser on retention period and verification documents,Done when: Written answers received for Docs 05 §3.1 and Docs 04 §3,,External Dependencies,3,Highest,X
+Story,[X-5] Choose the pilot metropolitan area,Done when: Metro area named and recorded in Docs 01 §8,,External Dependencies,2,Highest,X
+Story,[X-6] Decide whether proof-exception jobs may auto-complete,Done when: Decision recorded in Docs 02 §7,,External Dependencies,1,Highest,X
+Story,[X-7] Publish privacy policy at a public URL,"Done when: Policy live at a stable URL reachable without authentication
+
+Depends on: X-4",,External Dependencies,5,Highest,X
+Story,[X-8] Draft customer terms of use and provider agreement,"Done when: Both documents approved by the legal adviser
+
+Depends on: X-4",,External Dependencies,5,Highest,X
+Story,[X-9] Finalise the prohibited-goods list,"Done when: Category list approved and ready to load as reference data
+
+Depends on: X-4",,External Dependencies,3,Highest,X
+Epic,M0 — Foundation,"The stack runs locally, CI is green, and a signed build reaches a real device.",Foundation,,,Highest,M0
+Story,[SHIP-1] Create monorepo directory structure,"Done when: apps/mobile, apps/admin, apps/driver-portal, services/core, deploy/ exist and are committed",,Foundation,1,Highest,M0
+Story,[SHIP-2] Add PostgreSQL to docker-compose,"Done when: docker compose up starts Postgres and psql connects from the host
+
+Depends on: SHIP-1",,Foundation,2,Highest,M0
+Story,[SHIP-3] Add Redis to docker-compose,"Done when: redis-cli ping returns PONG from the host
+
+Depends on: SHIP-2",,Foundation,1,Highest,M0
+Story,[SHIP-4] Add Kafka to docker-compose,"Done when: A topic can be created and a test message produced and consumed
+
+Depends on: SHIP-2",,Foundation,3,Highest,M0
+Story,[SHIP-5] Go service skeleton with HTTP server,"Done when: Service builds and listens on a configured port
+
+Depends on: SHIP-1",,Foundation,2,Highest,M0
+Story,[SHIP-6] Health endpoint returning build info,"Done when: GET /health returns 200 with version and commit
+
+Depends on: SHIP-5",,Foundation,1,Highest,M0
+Story,[SHIP-7] Database migration tooling and first migration,"Done when: Migrations run up and down from a make target
+
+Depends on: SHIP-2, SHIP-5",,Foundation,3,Highest,M0
+Story,[SHIP-8] Configuration loading from environment,"Done when: All config comes from env vars with documented defaults; no secrets in code
+
+Depends on: SHIP-5",,Foundation,2,Highest,M0
+Story,[SHIP-9] Structured JSON logging with levels,"Done when: Every request logs method, path, status, duration, request ID
+
+Depends on: SHIP-5",,Foundation,2,Highest,M0
+Story,[SHIP-10] Define internal package boundaries for the eight domains,"Done when: Package skeleton exists for the eight domains plus a platform/ tree for integration adapters, per Docs 06 §4.1
+
+Depends on: SHIP-5",,Foundation,3,Highest,M0
+Story,[SHIP-11] Enforce domain boundaries with an import lint rule,"Done when: CI fails when one domain package imports another directly, or when an adapter imports a domain
+
+Depends on: SHIP-10",,Foundation,3,Highest,M0
+Story,[SHIP-12] Standard API error response contract,"Done when: All errors return the same shape with a machine-readable code
+
+Depends on: SHIP-5",,Foundation,2,Highest,M0
+Story,[SHIP-13] API versioning scheme with a /v1 route group,"Done when: All routes are served under /v1 and the version is documented
+
+Depends on: SHIP-5",,Foundation,2,Highest,M0
+Story,[SHIP-14] Request ID generation and context propagation,"Done when: A request ID flows from middleware into logs and downstream calls
+
+Depends on: SHIP-9",,Foundation,2,Highest,M0
+Story,[SHIP-15] Idempotency-key middleware backed by Redis,"Done when: A repeated key returns the stored original response without re-executing
+
+Depends on: SHIP-3, SHIP-12",,Foundation,5,Highest,M0
+Story,[SHIP-16] Flutter project scaffold for iOS and Android,"Done when: App builds and runs on both simulators
+
+Depends on: SHIP-1",,Foundation,2,Highest,M0
+Story,[SHIP-17] Flutter feature-folder structure and state management choice,"Done when: Structure matches Docs 07 §2 and the state approach is documented
+
+Depends on: SHIP-16",,Foundation,3,Highest,M0
+Story,[SHIP-18] Flutter API client with environment-based base URL,"Done when: Client targets local, staging, and production by build flavour
+
+Depends on: SHIP-17",,Foundation,3,Highest,M0
+Story,[SHIP-19] Flutter health round trip proving connectivity,"Done when: App displays the API version fetched from /health
+
+Depends on: SHIP-18, SHIP-6",,Foundation,1,Highest,M0
+Story,"[SHIP-20] CI: Go build, vet, and test","Done when: Workflow runs on every push and fails on a broken build or test
+
+Depends on: SHIP-5",,Foundation,2,Highest,M0
+Story,[SHIP-21] CI: Flutter analyze and test,"Done when: Workflow runs on every push and fails on analyzer errors
+
+Depends on: SHIP-16",,Foundation,2,Highest,M0
+Story,[SHIP-22] Next.js admin panel scaffold,"Done when: App builds and serves a placeholder authenticated shell
+
+Depends on: SHIP-1",,Foundation,2,Highest,M0
+Story,[SHIP-23] Next.js driver portal scaffold,"Done when: App builds and serves a placeholder job page
+
+Depends on: SHIP-1",,Foundation,2,Highest,M0
+Story,[SHIP-24] iOS build signing in CI,"Done when: CI produces a signed .ipa without developer machine involvement
+
+Depends on: SHIP-21, X-2",,Foundation,5,Highest,M0
+Story,[SHIP-25] TestFlight upload pipeline,"Done when: A push to main lands a build in TestFlight and installs on a real device
+
+Depends on: SHIP-24",,Foundation,3,Highest,M0
+Story,[SHIP-26] Android build signing in CI,"Done when: CI produces a signed .aab with keys held in the CI secret store
+
+Depends on: SHIP-21, X-3",,Foundation,3,Highest,M0
+Story,[SHIP-27] Play internal testing upload pipeline,"Done when: A push to main lands a build in Play internal testing and installs on a real device
+
+Depends on: SHIP-26",,Foundation,3,Highest,M0
+Epic,M1 — Identity and access,"A person can register, verify, choose a role, and stay signed in across app restarts.",Identity and Access,,,High,M1
+Story,[SHIP-28] users table migration,"Done when: Table exists with email, phone, role, status, verification state
+
+Depends on: SHIP-7",,Identity and Access,2,High,M1
+Story,[SHIP-29] Password hashing with a modern KDF,"Done when: Passwords stored with argon2id; no reversible storage anywhere
+
+Depends on: SHIP-28",,Identity and Access,2,High,M1
+Story,[SHIP-30] Registration endpoint,"Done when: POST /v1/auth/register creates an unverified account and rejects duplicates
+
+Depends on: SHIP-29",,Identity and Access,3,High,M1
+Story,[SHIP-31] Email verification token issue and storage,"Done when: A single-use, expiring token is generated and stored on registration
+
+Depends on: SHIP-30",,Identity and Access,2,High,M1
+Story,[SHIP-32] Email sending adapter,"Done when: Emails log to console in dev and send via the provider in staging
+
+Depends on: SHIP-8",,Identity and Access,3,High,M1
+Story,[SHIP-33] Email verification confirm endpoint,"Done when: POST /v1/auth/verify-email marks the address verified and consumes the token
+
+Depends on: SHIP-31, SHIP-32",,Identity and Access,2,High,M1
+Story,[SHIP-34] Phone OTP issue and storage,"Done when: A time-limited numeric OTP is generated, rate-limited, and stored hashed
+
+Depends on: SHIP-30",,Identity and Access,3,High,M1
+Story,[SHIP-35] SMS adapter for OTP delivery,"Done when: OTP sends via the SMS provider in staging; logs to console in dev
+
+Depends on: SHIP-8",,Identity and Access,3,High,M1
+Story,[SHIP-36] Phone verification confirm endpoint,"Done when: POST /v1/auth/verify-phone marks the number verified after a correct OTP
+
+Depends on: SHIP-34, SHIP-35",,Identity and Access,2,High,M1
+Story,[SHIP-37] Access token issue,"Done when: Short-lived signed token carrying user ID, role, and expiry
+
+Depends on: SHIP-30",,Identity and Access,3,High,M1
+Story,[SHIP-38] device_sessions table,"Done when: One row per device holding refresh state, device label, and last seen
+
+Depends on: SHIP-28",,Identity and Access,2,High,M1
+Story,[SHIP-39] Refresh token issue with rotation,"Done when: Each refresh returns a new token and invalidates its predecessor
+
+Depends on: SHIP-38, SHIP-37",,Identity and Access,5,High,M1
+Story,[SHIP-40] Refresh token reuse detection,"Done when: Presenting a consumed token invalidates the entire device session
+
+Depends on: SHIP-39",,Identity and Access,3,High,M1
+Story,[SHIP-41] Login endpoint,"Done when: POST /v1/auth/login returns an access and refresh token pair
+
+Depends on: SHIP-39",,Identity and Access,3,High,M1
+Story,[SHIP-42] Token refresh endpoint,"Done when: POST /v1/auth/refresh rotates the pair and rejects reused tokens
+
+Depends on: SHIP-40",,Identity and Access,2,High,M1
+Story,[SHIP-43] Logout endpoint,"Done when: POST /v1/auth/logout revokes the current device session only
+
+Depends on: SHIP-39",,Identity and Access,2,High,M1
+Story,[SHIP-44] Authentication middleware,"Done when: Protected routes reject missing, expired, or malformed tokens with a typed error
+
+Depends on: SHIP-37, SHIP-12",,Identity and Access,3,High,M1
+Story,[SHIP-45] Role assignment at registration,"Done when: Account is created as customer or provider and the role is immutable thereafter
+
+Depends on: SHIP-30",,Identity and Access,2,High,M1
+Story,[SHIP-46] Session list and revoke endpoints,"Done when: A user can list their devices and revoke any one of them
+
+Depends on: SHIP-38, SHIP-44",,Identity and Access,3,High,M1
+Story,[SHIP-47] Rate limiting on authentication endpoints,"Done when: Repeated failures are throttled per account and per IP
+
+Depends on: SHIP-3, SHIP-41",,Identity and Access,3,High,M1
+Story,[SHIP-48] Flutter secure storage wrapper,"Done when: Refresh token persists in Keychain and Keystore and never in preferences
+
+Depends on: SHIP-17",,Identity and Access,3,High,M1
+Story,[SHIP-49] Flutter authentication state and routing guard,"Done when: App routes to signed-in or signed-out shell correctly on cold start
+
+Depends on: SHIP-48",,Identity and Access,5,High,M1
+Story,[SHIP-50] Flutter token refresh interceptor,"Done when: A 401 triggers one refresh and replays the request; concurrent calls refresh once
+
+Depends on: SHIP-49, SHIP-42",,Identity and Access,5,High,M1
+Story,[SHIP-51] Flutter registration screen,"Done when: A new account can be created from the app with inline validation
+
+Depends on: SHIP-49, SHIP-30",,Identity and Access,3,High,M1
+Story,[SHIP-52] Flutter role selection screen,"Done when: Role is chosen during signup and drives the post-login shell
+
+Depends on: SHIP-51, SHIP-45",,Identity and Access,2,High,M1
+Story,[SHIP-53] Flutter email verification screen,"Done when: User can enter or deep-link a code and see verified state
+
+Depends on: SHIP-51, SHIP-33",,Identity and Access,2,High,M1
+Story,[SHIP-54] Flutter phone verification screen,"Done when: User can request and enter an OTP with resend throttling
+
+Depends on: SHIP-51, SHIP-36",,Identity and Access,3,High,M1
+Story,[SHIP-55] Flutter login screen,"Done when: An existing user can sign in and lands in the correct role shell
+
+Depends on: SHIP-49, SHIP-41",,Identity and Access,2,High,M1
+Epic,M2 — Jobs,"A verified customer can create, publish, amend, and cancel a job from the app.",Jobs,,,High,M2
+Story,[SHIP-56] jobs table and status enum migration,"Done when: Schema covers all twelve statuses from Docs 02 §1
+
+Depends on: SHIP-7",,Jobs,3,High,M2
+Story,[SHIP-57] Job status transition guard,"Done when: Every transition passes one guarded function; status is never directly settable
+
+Depends on: SHIP-56",,Jobs,5,High,M2
+Story,[SHIP-58] Goods category reference data,"Done when: Categories load from configuration and are served to clients, not compiled in
+
+Depends on: SHIP-56, X-9",,Jobs,2,High,M2
+Story,[SHIP-59] Prohibited goods validation on publish,"Done when: A job in a prohibited category cannot be published and explains why
+
+Depends on: SHIP-58",,Jobs,3,High,M2
+Story,[SHIP-60] Address and location value object,"Done when: Pickup and drop-off validate and normalise, with coordinates resolved
+
+Depends on: SHIP-56",,Jobs,3,High,M2
+Story,[SHIP-61] Create job draft endpoint,"Done when: POST /v1/jobs creates a Draft owned by the calling customer
+
+Depends on: SHIP-57, SHIP-44",,Jobs,3,High,M2
+Story,[SHIP-62] Edit job draft endpoint,"Done when: PATCH /v1/jobs/{id} updates a Draft and rejects edits by non-owners
+
+Depends on: SHIP-61",,Jobs,3,High,M2
+Story,[SHIP-63] Publish job endpoint,"Done when: Publishing validates required fields, checks customer verification, and transitions to Open
+
+Depends on: SHIP-59, SHIP-60, SHIP-62",,Jobs,5,High,M2
+Story,[SHIP-64] Cancel job endpoint,"Done when: A customer can cancel a Draft or an unawarded Open job
+
+Depends on: SHIP-57",,Jobs,2,High,M2
+Story,"[SHIP-65] Job detail endpoint, customer view","Done when: Returns full job including budget, for the owning customer only
+
+Depends on: SHIP-61",,Jobs,3,High,M2
+Story,"[SHIP-66] Job list endpoint, customer view","Done when: Returns the customer's own jobs, filterable by status, paginated
+
+Depends on: SHIP-65",,Jobs,3,High,M2
+Story,[SHIP-67] Budget field stored and never serialised to providers,"Done when: A provider-facing serialisation test proves the field cannot leak
+
+Depends on: SHIP-65",,Jobs,3,High,M2
+Story,[SHIP-68] Job expiry scheduled task,"Done when: Open jobs close at the earlier of 14 days or the pickup date passing
+
+Depends on: SHIP-57",,Jobs,5,High,M2
+Story,[SHIP-69] Expiry warning 48 hours ahead,"Done when: A domain event fires 48 hours before a job would expire
+
+Depends on: SHIP-68",,Jobs,2,High,M2
+Story,[SHIP-70] Extend job expiry endpoint,"Done when: A customer can extend an expiring job in one call
+
+Depends on: SHIP-68",,Jobs,2,High,M2
+Story,[SHIP-71] Flutter job creation: locations step,"Done when: Pickup and drop-off captured with validation and address lookup
+
+Depends on: SHIP-49, SHIP-60",,Jobs,3,High,M2
+Story,[SHIP-72] Flutter job creation: goods step,"Done when: Category, description, dimensions, and weight captured
+
+Depends on: SHIP-71, SHIP-58",,Jobs,3,High,M2
+Story,[SHIP-73] Flutter job creation: schedule and vehicle step,"Done when: Date window and vehicle requirement captured
+
+Depends on: SHIP-72",,Jobs,3,High,M2
+Story,[SHIP-74] Flutter job creation: budget and review step,"Done when: Optional budget captured; full job reviewed before publish
+
+Depends on: SHIP-73",,Jobs,3,High,M2
+Story,[SHIP-75] Flutter draft save and resume,"Done when: A partially completed job survives app restart and can be resumed
+
+Depends on: SHIP-74, SHIP-62",,Jobs,3,High,M2
+Story,[SHIP-76] Flutter customer job list,"Done when: Customer sees their jobs grouped by status with pull-to-refresh
+
+Depends on: SHIP-49, SHIP-66",,Jobs,3,High,M2
+Story,[SHIP-77] Flutter customer job detail,"Done when: Full job detail with status timeline and available actions
+
+Depends on: SHIP-76, SHIP-65",,Jobs,3,High,M2
+Epic,M3 — Bidding and award,"Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one.",Bidding and Award,,,High,M3
+Story,[SHIP-78] vehicles table and fleet CRUD endpoints,"Done when: A provider can add, edit, and deactivate vehicles
+
+Depends on: SHIP-44, SHIP-7",,Bidding and Award,5,High,M3
+Story,[SHIP-79] Provider profile and service area,"Done when: Provider declares service area and specialties; stored and queryable
+
+Depends on: SHIP-78",,Bidding and Award,3,High,M3
+Story,[SHIP-80] bids table and status enum,"Done when: Schema covers all eight bid statuses from Docs 02 §4
+
+Depends on: SHIP-56",,Bidding and Award,3,High,M3
+Story,[SHIP-81] Job eligibility filter query,"Done when: Filters by service area, vehicle capability, verification state, and job status
+
+Depends on: SHIP-79, SHIP-80",,Bidding and Award,5,High,M3
+Story,[SHIP-82] Open jobs feed endpoint for providers,"Done when: GET /v1/jobs/open returns only eligible jobs, paginated
+
+Depends on: SHIP-81",,Bidding and Award,3,High,M3
+Story,[SHIP-83] Provider job detail with budget stripped,"Done when: Provider view omits budget entirely; verified by test
+
+Depends on: SHIP-82, SHIP-67",,Bidding and Award,3,High,M3
+Story,[SHIP-84] Place bid endpoint,"Done when: A verified, eligible provider can bid once per job with price and timing
+
+Depends on: SHIP-83",,Bidding and Award,3,High,M3
+Story,[SHIP-85] Update bid endpoint,"Done when: A provider can revise their own active bid
+
+Depends on: SHIP-84",,Bidding and Award,2,High,M3
+Story,[SHIP-86] Withdraw bid endpoint,"Done when: A provider can withdraw before acceptance; status becomes Withdrawn
+
+Depends on: SHIP-84",,Bidding and Award,2,High,M3
+Story,[SHIP-87] Counter-offer endpoint for both parties,"Done when: Customer and provider can counter; each counter supersedes the prior offer
+
+Depends on: SHIP-84",,Bidding and Award,5,High,M3
+Story,[SHIP-88] Offer supersede and history chain,"Done when: Only the latest valid offer is acceptable; full chain remains readable
+
+Depends on: SHIP-87",,Bidding and Award,3,High,M3
+Story,[SHIP-89] Bid expiry scheduled task,"Done when: Bids expire on their own terms and emit an event
+
+Depends on: SHIP-84",,Bidding and Award,3,High,M3
+Story,[SHIP-90] Negotiating presentation status,"Done when: A job with active offers presents as Negotiating without closing to new bids
+
+Depends on: SHIP-87, SHIP-57",,Bidding and Award,2,High,M3
+Story,[SHIP-91] Database constraint: one accepted bid per job,"Done when: A partial unique index makes a second accepted bid impossible at the database level
+
+Depends on: SHIP-80",,Bidding and Award,2,High,M3
+Story,"[SHIP-92] Award endpoint, transactional happy path","Done when: POST /v1/jobs/{id}/award accepts one bid and moves the job to Awarded in one transaction
+
+Depends on: SHIP-91, SHIP-88",,Bidding and Award,5,High,M3
+Story,[SHIP-93] Award closes all competing bids atomically,"Done when: Every other bid on the job becomes Rejected in the same transaction
+
+Depends on: SHIP-92",,Bidding and Award,3,High,M3
+Story,[SHIP-94] Award idempotency,"Done when: A retried award with the same key returns the original outcome, not an error
+
+Depends on: SHIP-92, SHIP-15",,Bidding and Award,3,High,M3
+Story,[SHIP-95] Award concurrency test suite,"Done when: Tests prove correctness under double award, withdraw-during-award, and expiry-during-award races
+
+Depends on: SHIP-93, SHIP-94",,Bidding and Award,5,High,M3
+Story,[SHIP-96] Bid history visibility rules,"Done when: Customer, bidding provider, and admin each see only what Docs 02 §4 permits
+
+Depends on: SHIP-88",,Bidding and Award,3,High,M3
+Story,[SHIP-97] Job-scoped messaging between customer and provider,"Done when: Messages attach to a job and are visible only to its two parties and admins
+
+Depends on: SHIP-84",,Bidding and Award,5,High,M3
+Story,[SHIP-98] Flutter provider fleet management,"Done when: Provider can manage vehicles from the app
+
+Depends on: SHIP-49, SHIP-78",,Bidding and Award,5,High,M3
+Story,[SHIP-99] Flutter provider job feed,"Done when: Provider sees eligible open jobs with filters
+
+Depends on: SHIP-98, SHIP-82",,Bidding and Award,3,High,M3
+Story,[SHIP-100] Flutter provider job detail and bid placement,"Done when: Provider can review a job and submit a bid
+
+Depends on: SHIP-99, SHIP-84",,Bidding and Award,3,High,M3
+Story,[SHIP-101] Flutter provider bid list,"Done when: Provider sees their own bids grouped by status
+
+Depends on: SHIP-100",,Bidding and Award,3,High,M3
+Story,[SHIP-102] Flutter customer bid comparison,"Done when: Customer compares price, timing, provider profile, and vehicle side by side
+
+Depends on: SHIP-77, SHIP-96",,Bidding and Award,5,High,M3
+Story,[SHIP-103] Flutter negotiation and messaging UI,"Done when: Both parties exchange messages and counter-offers against a job
+
+Depends on: SHIP-102, SHIP-97",,Bidding and Award,5,High,M3
+Story,[SHIP-104] Flutter award confirmation flow,"Done when: Customer awards a bid with explicit confirmation and sees the result
+
+Depends on: SHIP-102, SHIP-92",,Bidding and Award,3,High,M3
+Epic,M4 — Delivery execution,"A driver completes a delivery with proof, offline, through a link that needs no account.",Delivery Execution,,,High,M4
+Story,[SHIP-105] driver_assignments table,"Done when: Stores driver name and mobile against an awarded job
+
+Depends on: SHIP-56",,Delivery Execution,2,High,M4
+Story,[SHIP-106] Assign driver endpoint,"Done when: Provider nominates a driver or self-assigns; job moves to Driver assigned
+
+Depends on: SHIP-105, SHIP-57",,Delivery Execution,3,High,M4
+Story,[SHIP-107] Job-scoped token generation,"Done when: Signed, time-limited, single-job token generated on assignment
+
+Depends on: SHIP-106",,Delivery Execution,5,High,M4
+Story,[SHIP-108] Driver token validation middleware,"Done when: Token grants access to exactly one job and nothing else; cannot be exchanged for a user session
+
+Depends on: SHIP-107",,Delivery Execution,3,High,M4
+Story,[SHIP-109] Revoke and regenerate driver token,"Done when: Provider or admin can reissue a link, invalidating the previous one
+
+Depends on: SHIP-108",,Delivery Execution,3,High,M4
+Story,[SHIP-110] milestones table with dual timestamps,"Done when: Each row records actor time and server time separately
+
+Depends on: SHIP-56",,Delivery Execution,3,High,M4
+Story,[SHIP-111] Milestone update endpoint with idempotency,"Done when: Records a milestone once per idempotency key and enforces actor permissions
+
+Depends on: SHIP-110, SHIP-15",,Delivery Execution,5,High,M4
+Story,[SHIP-112] Out-of-order milestone absorption,"Done when: A late milestone is recorded as history without moving the job backwards
+
+Depends on: SHIP-111",,Delivery Execution,5,High,M4
+Story,[SHIP-113] Administrative conflict resolution,"Done when: A queued update contradicting an admin action loses and is retained with its reason
+
+Depends on: SHIP-112",,Delivery Execution,3,High,M4
+Story,[SHIP-114] Object storage bucket and pre-signed upload endpoint,"Done when: Client receives a short-lived pre-signed URL and uploads directly
+
+Depends on: SHIP-8",,Delivery Execution,5,High,M4
+Story,[SHIP-115] Proof metadata record,"Done when: Uploaded proof is linked to a job and milestone with access control
+
+Depends on: SHIP-114, SHIP-110",,Delivery Execution,3,High,M4
+Story,[SHIP-116] Proof exception reason capture,"Done when: A reasoned exception can be recorded in place of a photo
+
+Depends on: SHIP-115",,Delivery Execution,3,High,M4
+Story,[SHIP-117] Exception flags the job for moderation,"Done when: An exception-completed job enters the moderation queue
+
+Depends on: SHIP-116",,Delivery Execution,2,High,M4
+Story,[SHIP-118] Delivered validation requires proof or exception,"Done when: Delivered is rejected without either; verified by test
+
+Depends on: SHIP-116, SHIP-57",,Delivery Execution,3,High,M4
+Story,[SHIP-119] 72-hour auto-complete task,"Done when: A Delivered job with no dispute becomes Completed after 72 hours
+
+Depends on: SHIP-118",,Delivery Execution,3,High,M4
+Story,[SHIP-120] Driver portal token landing and job view,"Done when: Opening the link shows only that job's delivery detail
+
+Depends on: SHIP-23, SHIP-108",,Delivery Execution,5,High,M4
+Story,[SHIP-121] Driver portal milestone controls,"Done when: Large touch targets record each milestone from a mobile browser
+
+Depends on: SHIP-120, SHIP-111",,Delivery Execution,3,High,M4
+Story,[SHIP-122] Driver portal photo capture and upload,"Done when: Browser camera captures proof and uploads via pre-signed URL
+
+Depends on: SHIP-121, SHIP-114",,Delivery Execution,5,High,M4
+Story,[SHIP-123] Driver portal delivery completion form,"Done when: Recipient name, note, and proof captured; portal becomes read-only after
+
+Depends on: SHIP-122, SHIP-118",,Delivery Execution,3,High,M4
+Story,[SHIP-124] Flutter durable local operation queue,"Done when: Queued operations survive app restart and are never silently dropped
+
+Depends on: SHIP-17",,Delivery Execution,5,High,M4
+Story,[SHIP-125] Flutter sync worker with backoff,"Done when: Queue drains on reconnection with exponential backoff and per-item idempotency keys
+
+Depends on: SHIP-124, SHIP-111",,Delivery Execution,5,High,M4
+Story,[SHIP-126] Flutter pending-updates indicator,"Done when: A persistent indicator shows how many updates are unsynced
+
+Depends on: SHIP-125",,Delivery Execution,2,High,M4
+Story,[SHIP-127] Flutter four-hour unsynced nudge,"Done when: The provider is prompted when an update has been pending four hours
+
+Depends on: SHIP-126",,Delivery Execution,2,High,M4
+Story,[SHIP-128] Operations alert at 24 hours unsynced,"Done when: A job with a 24-hour unsynced update enters the delivery exception queue
+
+Depends on: SHIP-127",,Delivery Execution,3,High,M4
+Story,[SHIP-129] Flutter milestone update UI,"Done when: Provider records milestones with optimistic local state clearly marked pending
+
+Depends on: SHIP-125",,Delivery Execution,3,High,M4
+Story,[SHIP-130] Flutter camera capture with on-device compression,"Done when: Photo captured, compressed, queued, and never written to the photo library
+
+Depends on: SHIP-129, SHIP-114",,Delivery Execution,5,High,M4
+Story,[SHIP-131] Flutter camera permission fallback,"Done when: A denied permission offers the exception path instead of a dead end
+
+Depends on: SHIP-130, SHIP-116",,Delivery Execution,3,High,M4
+Story,[SHIP-132] Flutter offline conflict reconciliation UI,"Done when: The user is shown clearly when a queued update lost to server state
+
+Depends on: SHIP-125, SHIP-113",,Delivery Execution,3,High,M4
+Story,[SHIP-133] Flutter customer tracking view,"Done when: Customer sees the latest confirmed milestone and proof of delivery
+
+Depends on: SHIP-77, SHIP-115",,Delivery Execution,3,High,M4
+Epic,M5 — Notifications,"Every essential event reaches the right person, without a notification failure losing the event.",Notifications,,,Medium,M5
+Story,[SHIP-134] Transactional outbox table and publisher,"Done when: Domain events commit with their transaction and publish at least once
+
+Depends on: SHIP-4, SHIP-57",,Notifications,5,Medium,M5
+Story,[SHIP-135] Kafka topics and event schema,"Done when: Topics exist with a versioned schema for each domain event
+
+Depends on: SHIP-134",,Notifications,3,Medium,M5
+Story,"[SHIP-136] Emit domain events from job, bid, and delivery transitions","Done when: Every state change in Docs 01 §4.5 emits its event from the domain, not the API layer
+
+Depends on: SHIP-135",,Notifications,5,Medium,M5
+Story,[SHIP-137] Notification consumer service,"Done when: Consumer reads events, resolves recipients, and dispatches per channel
+
+Depends on: SHIP-136",,Notifications,5,Medium,M5
+Story,[SHIP-138] Email templates and dispatch,"Done when: Each essential event has an email template and sends reliably
+
+Depends on: SHIP-137, SHIP-32",,Notifications,3,Medium,M5
+Story,[SHIP-139] Firebase Cloud Messaging adapter,"Done when: Push dispatches to iOS and Android and handles token rejection
+
+Depends on: SHIP-137",,Notifications,3,Medium,M5
+Story,[SHIP-140] device_tokens table with register and deregister,"Done when: Tokens bind to a device session and clear on sign-out
+
+Depends on: SHIP-38, SHIP-139",,Notifications,3,Medium,M5
+Story,[SHIP-141] Push content redaction rules,"Done when: No address, goods description, or full customer name appears in a notification body
+
+Depends on: SHIP-139",,Notifications,2,Medium,M5
+Story,[SHIP-142] Notification preferences per user,"Done when: A user can mute non-essential categories; essential events cannot be muted
+
+Depends on: SHIP-137",,Notifications,3,Medium,M5
+Story,[SHIP-143] Flutter push registration,"Done when: Token registers after sign-in and de-registers on sign-out
+
+Depends on: SHIP-140, SHIP-50",,Notifications,3,Medium,M5
+Story,[SHIP-144] Flutter permission prompt at the right moment,"Done when: Notification permission is requested contextually, never on first launch
+
+Depends on: SHIP-143",,Notifications,2,Medium,M5
+Story,[SHIP-145] Flutter deep link routing,"Done when: Tapping a notification opens the exact job, bid, or dispute it concerns
+
+Depends on: SHIP-143",,Notifications,5,Medium,M5
+Story,[SHIP-146] Flutter notification inbox,"Done when: In-app list of recent notifications with read state
+
+Depends on: SHIP-145",,Notifications,3,Medium,M5
+Epic,M6 — Administration and moderation,"Support can see everything, act on it, and leave an auditable trail.",Administration and Moderation,,,Medium,M6
+Story,"[SHIP-147] Admin authentication, separate from user auth","Done when: Admin sign-in is independent and cannot be reached with a user token
+
+Depends on: SHIP-44, SHIP-22",,Administration and Moderation,5,Medium,M6
+Story,[SHIP-148] Admin roles and least-privilege permissions,"Done when: Permissions are granular and default to the minimum
+
+Depends on: SHIP-147",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-149] audit_log table and write helper,"Done when: Append-only log capturing actor, action, target, timestamp, and reason
+
+Depends on: SHIP-7",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-150] Audit every privileged action,"Done when: All admin mutations write an audit entry; verified by test
+
+Depends on: SHIP-149, SHIP-148",,Administration and Moderation,5,Medium,M6
+Story,[SHIP-151] Admin user search,"Done when: Search users by email, phone, name, and status
+
+Depends on: SHIP-147",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-152] Admin job and bid search,"Done when: Search and open any job with its full bid and status history
+
+Depends on: SHIP-151",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-153] Admin verification queue,"Done when: Pending provider verifications listed oldest first
+
+Depends on: SHIP-152",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-154] Admin verification review and decision,"Done when: Reviewer sets Verified, Restricted, Rejected, or Suspended with a recorded reason
+
+Depends on: SHIP-153, SHIP-150",,Administration and Moderation,5,Medium,M6
+Story,[SHIP-155] Admin document viewer for private evidence,"Done when: Verification images render through short-lived signed URLs and are access-logged
+
+Depends on: SHIP-154, SHIP-114",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-156] Admin reported jobs and messages queue,"Done when: Reports surface with the job and conversation in context
+
+Depends on: SHIP-152",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-157] Admin delivery exception queue,"Done when: Overdue pickup, delayed delivery, failed proof, and unsynced milestones surface here
+
+Depends on: SHIP-152, SHIP-128",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-158] Admin post-award cancellation queue,"Done when: Cancellations after award are listed with the provider's history
+
+Depends on: SHIP-152",,Administration and Moderation,2,Medium,M6
+Story,[SHIP-159] Admin verification expiry queue,"Done when: Expiring and expired provider documents surface ahead of time
+
+Depends on: SHIP-154",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-160] Admin unpublish job,"Done when: A policy-breaching job is removed with a recorded reason and the customer notified
+
+Depends on: SHIP-150",,Administration and Moderation,2,Medium,M6
+Story,[SHIP-161] Admin restrict or suspend a user,"Done when: Account access is limited or disabled with a recorded reason
+
+Depends on: SHIP-150",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-162] Admin internal notes,"Done when: Support notes attach to a user or job and are never user-visible
+
+Depends on: SHIP-150",,Administration and Moderation,2,Medium,M6
+Story,[SHIP-163] Dispute intake endpoint,"Done when: A customer or provider raises a dispute capturing the Docs 04 §7 intake fields
+
+Depends on: SHIP-57",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-164] Admin dispute workflow and outcome,"Done when: Dispute moves through investigation to a documented outcome that unfreezes the job
+
+Depends on: SHIP-163, SHIP-150",,Administration and Moderation,5,Medium,M6
+Story,[SHIP-165] Admin audit log viewer,"Done when: Immutable history is searchable by actor, target, and date
+
+Depends on: SHIP-150",,Administration and Moderation,3,Medium,M6
+Story,[SHIP-166] Two-person review for permanent suspension,"Done when: A permanent suspension requires a second administrator's approval
+
+Depends on: SHIP-161",,Administration and Moderation,3,Medium,M6
+Epic,M7 — Hardening and pilot readiness,"The store prerequisites are met, the system is observable, and the release gate can be run.",Hardening and Pilot Readiness,,,Medium,M7
+Story,[SHIP-167] Minimum supported version endpoint,"Done when: GET /v1/app/minimum-version returns the floor per platform
+
+Depends on: SHIP-13",,Hardening and Pilot Readiness,2,High,M7
+Story,[SHIP-168] Flutter launch-time version gate,"Done when: A build below the floor blocks with an update prompt linking to the store
+
+Depends on: SHIP-167, SHIP-49",,Hardening and Pilot Readiness,3,High,M7
+Story,[SHIP-169] Account deletion request endpoint,"Done when: A signed-in user can request deletion and receives a completion date
+
+Depends on: SHIP-44",,Hardening and Pilot Readiness,3,High,M7
+Story,[SHIP-170] Deletion deferral during an active job,"Done when: A request during Awarded to Delivered queues until the job closes and explains why
+
+Depends on: SHIP-169, SHIP-57",,Hardening and Pilot Readiness,3,High,M7
+Story,[SHIP-171] User record pseudonymisation,"Done when: Profile and contact data are irreversibly replaced by a stable pseudonym
+
+Depends on: SHIP-170",,Hardening and Pilot Readiness,5,High,M7
+Story,[SHIP-172] Cascade deletion of personal artefacts,"Done when: Verification documents, message bodies, device tokens, and attributable images are removed
+
+Depends on: SHIP-171",,Hardening and Pilot Readiness,5,High,M7
+Story,[SHIP-173] Flutter account deletion UI,"Done when: Deletion is initiated in-app with clear consequences and confirmation
+
+Depends on: SHIP-169, SHIP-49",,Hardening and Pilot Readiness,3,High,M7
+Story,[SHIP-174] Datadog APM and log ingestion,"Done when: Traces and structured logs arrive from the Go service and are searchable
+
+Depends on: SHIP-9",,Hardening and Pilot Readiness,3,Medium,M7
+Story,[SHIP-175] Datadog job and bid outcome dashboards,"Done when: Publication, bid, and award success rates are visible on one board
+
+Depends on: SHIP-174",,Hardening and Pilot Readiness,3,Medium,M7
+Story,[SHIP-176] Notification failure alerting,"Done when: A rise in undelivered notifications pages someone
+
+Depends on: SHIP-174, SHIP-137",,Hardening and Pilot Readiness,2,Medium,M7
+Story,[SHIP-177] Delayed and stuck job alerting,"Done when: Jobs stalled in a status beyond threshold raise an alert
+
+Depends on: SHIP-174",,Hardening and Pilot Readiness,2,Medium,M7
+Story,[SHIP-178] Crash and adoption reporting per app version,"Done when: Crash rate and install base are visible per build, feeding version retirement
+
+Depends on: SHIP-21",,Hardening and Pilot Readiness,3,Medium,M7
+Story,[SHIP-179] Permission purpose strings,"Done when: Camera and notification prompts explain their purpose in plain language
+
+Depends on: SHIP-16",,Hardening and Pilot Readiness,1,High,M7
+Story,[SHIP-180] Apple privacy labels submission,"Done when: Labels submitted and consistent with the published privacy policy
+
+Depends on: SHIP-25, X-7",,Hardening and Pilot Readiness,2,High,M7
+Story,[SHIP-181] Google Play data safety declaration,"Done when: Declaration submitted and consistent with the published privacy policy
+
+Depends on: SHIP-27, X-7",,Hardening and Pilot Readiness,2,High,M7
+Story,[SHIP-182] Backup and restore rehearsal,"Done when: A production-shaped database is restored from backup and verified
+
+Depends on: SHIP-2",,Hardening and Pilot Readiness,5,Medium,M7
+Story,[SHIP-183] API-wide rate limiting review,"Done when: Every public endpoint has a considered limit and returns a typed error when exceeded
+
+Depends on: SHIP-47",,Hardening and Pilot Readiness,3,Medium,M7
+Story,[SHIP-184] Pilot-scale load smoke test,"Done when: The stack handles expected pilot concurrency without error-rate degradation
+
+Depends on: SHIP-174",,Hardening and Pilot Readiness,3,Medium,M7
+Story,[SHIP-185] Release gate run-through,"Done when: Every condition in Docs 01 §8 is evidenced and signed off
+
+Depends on: SHIP-180, SHIP-181",,Hardening and Pilot Readiness,3,Medium,M7
