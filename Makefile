@@ -144,6 +144,10 @@ test: ## Run the Go tests
 vet: ## Run go vet
 	cd $(CORE) && go vet ./...
 
+.PHONY: lint-imports
+lint-imports: ## Check the domain boundaries from Docs/06 §4.1 (SHIP-11)
+	cd $(CORE) && go run ./cmd/lintboundaries
+
 .PHONY: fmt
 fmt: ## Format the Go code
 	cd $(CORE) && go fmt ./...
@@ -153,7 +157,7 @@ tidy: ## Tidy go.mod and go.sum
 	cd $(CORE) && go mod tidy
 
 .PHONY: check
-check: vet test ## Everything CI will run for the Go service (SHIP-20)
+check: vet lint-imports test ## Everything CI will run for the Go service (SHIP-20)
 
 # --- Acceptance -----------------------------------------------------------------------
 
