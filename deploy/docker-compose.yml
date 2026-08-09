@@ -1,0 +1,125 @@
+# Local development stack: PostgreSQL, Redis, Kafka.
+#
+# This is a development convenience, not a deployment artefact. Production runs on managed
+# AWS services (Docs/06 §2). Nothing here should acquire production responsibilities —
+# if a setting matters in production, it belongs in infrastructure-as-code, not this file.
+#
+# Every service publishes its port to the host, because the Go service runs on the host
+# during development (`make run`) while its dependencies run in containers.
+#
+#   make up      start everything and wait until healthy
+#   make down    stop, keeping data
+#   make reset   stop and destroy all data
+
+name: shipper
+
+services:
+  # --- SHIP-2 -------------------------------------------------------------------------
+  # System of record. Authoritative for every business decision (Docs/06 §4).
+  postgres:
+    image: postgres:17-alpine
+    container_name: shipper-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shipper}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shipper}
+      POSTGRES_DB: ${POSTGRES_DB:-shipper}
+      # Deterministic collation. Left to the host locale, index ordering can differ
+      # between machines, which is a genuinely unpleasant class of bug to chase.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # The dbname is given explicitly: pg_isready defaults to the username as the
+      # database name, which passes before the real database finishes initialising.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shipper} -d ${POSTGRES_DB:-shipper}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # --- SHIP-3 -------------------------------------------------------------------------
+  # Refresh-token state, device registry, idempotency keys, rate limits (Docs/06 §2.1).
+  #
+  # Redis must never hold the only copy of a job, bid, or status (Docs/06 §4). Persistence
+  # is enabled here so a restart during development does not silently invalidate every
+  # session, but that is a convenience — nothing may depend on it for correctness.
+  redis:
+    image: redis:7-alpine
+    container_name: shipper-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # --- SHIP-4 -------------------------------------------------------------------------
+  # Event backbone for notifications, reporting, and background processing (Docs/06 §2).
+  # Single-node KRaft — no ZooKeeper. Combined broker and controller roles, which is
+  # appropriate for development and never for production.
+  #
+  # Two listeners, and the distinction matters:
+  #   PLAINTEXT      kafka:9092        for clients inside the compose network
+  #   PLAINTEXT_HOST localhost:29092   for clients on the host, including `make run`
+  #
+  # A Kafka client connects once to bootstrap, then reconnects to whatever address the
+  # broker advertises. Advertising only the internal name is the classic misconfiguration:
+  # bootstrap succeeds from the host, then every subsequent call hangs trying to resolve
+  # `kafka`. Hence the separate host listener.
+  #
+  # Note the empty hosts in KAFKA_LISTENERS (`PLAINTEXT://:9092`) rather than an explicit
+  # `0.0.0.0`. Both bind every interface, but the CONTROLLER listener is not advertised,
+  # so Kafka derives its advertised address from `listeners` — and a literal 0.0.0.0 there
+  # fails validation outright with "advertised.listeners cannot use the nonroutable
+  # meta-address". The empty host resolves to the canonical hostname instead.
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: shipper-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # Must match the mounted volume below. Left unset, Kafka writes to /tmp/kafka-logs
+      # and the volume silently holds nothing — the log directory would then be discarded
+      # on container recreation, taking the cluster's metadata with it.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single broker: every replication factor must be 1 or topic creation blocks forever.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Off deliberately. The outbox publisher (SHIP-134) creates topics explicitly with a
+      # versioned schema (SHIP-135); a typo in a topic name should fail loudly rather than
+      # silently create a second topic that nothing consumes.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
+    ports:
+      - "${KAFKA_PORT:-29092}:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
