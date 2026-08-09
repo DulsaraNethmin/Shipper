@@ -14,10 +14,26 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/buildinfo"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/logging"
 )
+
+// newRedisClient builds the Redis client from the configured URL.
+//
+// Parsing here rather than at configuration time keeps config free of a dependency on the
+// client library: config validates strings, and the composition root turns them into
+// connections.
+func newRedisClient(cfg config.Redis) (*redis.Client, error) {
+	opts, err := redis.ParseURL(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("REDIS_URL: %w", err)
+	}
+	return redis.NewClient(opts), nil
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -47,9 +63,34 @@ func run() error {
 		slog.Any("config", cfg),
 	)
 
+	// Redis backs idempotency keys, and will back refresh-token state, the device
+	// registry, and rate limits (Docs/06 §2.1). It is the composition root's job to
+	// build it: httpx knows only the interface it needs, and the store knows nothing
+	// about HTTP.
+	redisClient, err := newRedisClient(cfg.Redis)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = redisClient.Close() }()
+
+	// Reachability is checked at startup for the log line, not as a condition of
+	// starting. A Redis that is briefly unavailable during a deployment must not stop
+	// every instance from coming up — the endpoints that need it fail closed on their
+	// own, per request, and the ones that do not keep serving.
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := redisClient.Ping(pingCtx).Err(); err != nil {
+		log.Warn("redis is not reachable at startup; "+
+			"state-changing endpoints will be refused until it is",
+			slog.String("error", err.Error()))
+	}
+	cancelPing()
+
+	idempotencyStore := idempotency.NewRedisStore(redisClient,
+		cfg.Idempotency.TTL, cfg.Idempotency.InFlightTTL)
+
 	srv := &http.Server{
 		Addr:    cfg.HTTP.Addr(),
-		Handler: newRouter(log, startedAt),
+		Handler: newRouter(log, startedAt, idempotencyStore),
 
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,

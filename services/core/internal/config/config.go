@@ -47,12 +47,13 @@ func (e Environment) valid() bool {
 
 // Config is the whole of the service's configuration.
 type Config struct {
-	Env      Environment
-	HTTP     HTTP
-	Log      Log
-	Database Database
-	Redis    Redis
-	Kafka    Kafka
+	Env         Environment
+	HTTP        HTTP
+	Log         Log
+	Database    Database
+	Redis       Redis
+	Kafka       Kafka
+	Idempotency Idempotency
 }
 
 // HTTP configures the public API listener.
@@ -102,6 +103,23 @@ type Kafka struct {
 	Brokers []string
 }
 
+// Idempotency configures how long the platform remembers what it answered a
+// state-changing request, so that a retry replays rather than repeats it (SHIP-15).
+type Idempotency struct {
+	// TTL is how long a completed response stays replayable.
+	//
+	// It has to outlast the client's retry behaviour, not the request. A phone can be
+	// out of coverage for hours and drain its queue on the drive home (SHIP-124,
+	// SHIP-125), so this is measured in hours rather than minutes.
+	TTL time.Duration
+
+	// InFlightTTL bounds how long a claim survives with no response recorded against it,
+	// which is what happens when the process handling the original request dies. Until
+	// it lapses, retries of that request are refused — so it wants to be comfortably
+	// longer than the slowest handler and much shorter than TTL.
+	InFlightTTL time.Duration
+}
+
 // credentialBearingDefaults are variables whose built-in defaults embed a local
 // throwaway credential. They make a fresh clone work against docker-compose and are
 // refused outside development — see loader.validate.
@@ -140,6 +158,10 @@ func Load() (*Config, error) {
 		Kafka: Kafka{
 			Brokers: l.csv("KAFKA_BROKERS", []string{"localhost:29092"}),
 		},
+		Idempotency: Idempotency{
+			TTL:         l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
+			InFlightTTL: l.duration("IDEMPOTENCY_IN_FLIGHT_TTL", 60*time.Second),
+		},
 	}
 
 	l.validate(cfg)
@@ -163,6 +185,8 @@ func (c Config) LogValue() slog.Value {
 		slog.String("database_url", redactURL(c.Database.URL)),
 		slog.String("redis_url", redactURL(c.Redis.URL)),
 		slog.String("kafka_brokers", strings.Join(c.Kafka.Brokers, ",")),
+		slog.Duration("idempotency_ttl", c.Idempotency.TTL),
+		slog.Duration("idempotency_in_flight_ttl", c.Idempotency.InFlightTTL),
 	)
 }
 
@@ -313,6 +337,13 @@ func (l *loader) validate(cfg *Config) {
 	if cfg.Database.MaxIdleConns > cfg.Database.MaxOpenConns {
 		l.errf("DATABASE_MAX_IDLE_CONNS (%d) cannot exceed DATABASE_MAX_OPEN_CONNS (%d)",
 			cfg.Database.MaxIdleConns, cfg.Database.MaxOpenConns)
+	}
+
+	// A claim that outlived the replay window would refuse a client's retries for longer
+	// than it could ever answer them, which is the worst of both.
+	if cfg.Idempotency.InFlightTTL > cfg.Idempotency.TTL {
+		l.errf("IDEMPOTENCY_IN_FLIGHT_TTL (%s) cannot exceed IDEMPOTENCY_TTL (%s)",
+			cfg.Idempotency.InFlightTTL, cfg.Idempotency.TTL)
 	}
 
 	// Everything below this point is a deployment-safety rule. Development is exempt by

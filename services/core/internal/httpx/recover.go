@@ -9,10 +9,10 @@ import (
 // Recover turns a panic in a handler into a 500 instead of a dropped connection and a
 // dead server process.
 //
-// The response body is deliberately bare. SHIP-12 defines the standard error contract
-// with a machine-readable code, and this is the one place that will need updating when
-// it lands; until then, leaking a panic message to a client would be worse than saying
-// nothing.
+// The client gets the standard error contract with CodeInternal and its request ID, and
+// nothing else. The panic value and stack go to the log, where they are of use to someone
+// who can act on them: a panic message is written by a developer for a developer and
+// routinely names a column, a token field, or an internal identifier.
 func Recover(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -37,9 +37,7 @@ func Recover(log *slog.Logger) func(http.Handler) http.Handler {
 					slog.String("stack", string(debug.Stack())),
 				)
 
-				WriteJSON(w, http.StatusInternalServerError, map[string]string{
-					"error": "internal_error",
-				})
+				WriteError(w, r, StatusError(http.StatusInternalServerError))
 			}()
 
 			next.ServeHTTP(w, r)

@@ -2,7 +2,7 @@
 
 Australian road-transport marketplace. Customers publish delivery jobs, verified transport providers bid privately, the customer awards one, and the delivery is tracked to completion. Marketplace only — Shipper never holds payment in the MVP.
 
-**M0 is under way.** `SHIP-1`…`SHIP-9` have landed: the monorepo structure, the local stack, and the Go service skeleton with health, configuration, logging, and migrations. Everything above `SHIP-10` is still planning documents. Work proceeds ticket by ticket through `Docs/09-delivery-backlog.md`.
+**M0 is under way.** `SHIP-1`…`SHIP-15` have landed: the monorepo structure, the local stack, the Go service with health, configuration, logging and migrations, and now the domain package skeleton with its boundary lint, the standard error contract, the `/v1` route group, request-ID propagation, and Redis-backed idempotency. No domain logic is written yet — the eight domain packages hold their documentation and nothing else. Everything above `SHIP-16` is still planning documents. Work proceeds ticket by ticket through `Docs/09-delivery-backlog.md`.
 
 ## Documents are the source of truth
 
@@ -54,7 +54,7 @@ There is **no BFF tier**. The Go platform owns the versioned public API directly
 - **Adapters wrap external integrations only** (email, SMS, push, object storage, geocoding), and only where a second implementation exists today. `Docs/06` §4.1.
 - **Do not abstract PostgreSQL.** The partial unique index enforcing one-accepted-bid and the row locking in the award transaction are load-bearing and PostgreSQL-specific. Test against a real database, not mocked repositories.
 - **Interfaces are declared by the consuming domain**, never by the implementing package. `delivery/ports.go` declares what delivery needs; the storage package knows nothing about delivery.
-- **Domain packages do not import each other.** Enforced by lint (SHIP-11).
+- **Domain packages do not import each other**, adapters do not import domains, and domains do not import adapters. Enforced by `make lint-imports` and by a test (SHIP-11). A domain and its adapters meet in `cmd/api` and nowhere else.
 - **Domain events are emitted by the domain, not the API layer.**
 - **Anything expected to change under operational pressure lives server-side** — category lists, validation limits, policy copy, feature switches. Flutter has no over-the-air update path for Dart code.
 
@@ -92,15 +92,12 @@ Batch tightly-related tickets on one branch only when they form a single reviewa
 
 ### Commits
 
-<<<<<<< Updated upstream
-=======
 **Claude never runs `git commit`.** Stage nothing, commit nothing. When work is complete, write the proposed commit message to a scratch file and hand it over — the repository owner makes every commit.
 
 This keeps authorship and co-authorship trailers entirely under the owner's control. Do not add `Co-Authored-By` trailers to proposed messages.
 
 Format:
 
->>>>>>> Stashed changes
 ```
 SHIP-39: rotate refresh tokens on every use
 
@@ -129,11 +126,6 @@ A ticket is done when **all** of these hold:
 
 Meeting all six makes the branch **ready to merge**, not merged. Hand it to the repository owner.
 
-<<<<<<< Updated upstream
-### Merging
-
-**Claude never merges anything.** Not ticket branches, not pull requests. Prepare the branch, push it, open the pull request if asked — then stop. Every merge is performed by the repository owner.
-=======
 ### What Claude does and does not do
 
 | Action | Who |
@@ -145,7 +137,6 @@ Meeting all six makes the branch **ready to merge**, not merged. Hand it to the 
 | **`git push`** | Owner, unless explicitly asked |
 
 Claude prepares work and stops at the commit. It does not commit, merge, or self-approve.
->>>>>>> Stashed changes
 
 The flow:
 
@@ -199,9 +190,10 @@ make run            Run the API on the host
 make build          Build bin/shipper-api and bin/shipper-migrate
 make test           go test ./... -race
 make vet
-make check          vet + test — what CI runs for the Go service
+make lint-imports   Check the domain boundaries (SHIP-11)
+make check          vet + lint-imports + test — what CI runs for the Go service
 
-make verify         Demonstrate the SHIP-1..9 acceptance criteria end to end
+make verify         Demonstrate the SHIP-1..15 acceptance criteria end to end
 make psql / redis   Open a shell against the local database or cache
 make kafka-smoke    Create a topic, produce, consume, delete
 ```
@@ -230,17 +222,41 @@ apps/driver-portal/   Next.js — placeholder until SHIP-23
 services/core/        Go — the versioned public API and domain
   cmd/api/            entrypoint, wiring, graceful shutdown
   cmd/migrate/        migration tool, migrations embedded in the binary
+  cmd/lintboundaries/ the domain boundary lint
+  internal/           the eight domains: identity, profiles, fleet, jobs,
+                      bidding, delivery, notifications, admin
+  internal/platform/  integration adapters: email, sms, push, storage, geocoding
   internal/config/    environment configuration
-  internal/httpx/     request ID, request logging, panic recovery, JSON helpers
+  internal/httpx/     middleware: request ID, logging, recovery, error contract,
+                      idempotency, and the JSON helpers
+  internal/idempotency/ the Redis-backed idempotency store
+  internal/boundaries/  the import lint rules
   internal/logging/   slog handler construction
   internal/buildinfo/ version and commit, injected at link time
   migrations/         SQL schema history
 deploy/               docker-compose for local Postgres, Redis, Kafka
-scripts/              verify-foundation.sh — the SHIP-1..9 acceptance run
+scripts/              verify-foundation.sh — the SHIP-1..15 acceptance run
 ```
 
-The eight domain packages and the `platform/` adapter tree arrive in `SHIP-10`, with the
-import lint rule enforcing their boundaries in `SHIP-11`. Until then `internal/` holds
-infrastructure only, and no domain logic has been written.
+The eight domain packages hold documentation and nothing else: no domain logic has been
+written. Their boundaries are enforced from now rather than from when they fill up, because
+`Docs/08` is right that they are almost impossible to reintroduce later.
+
+Adding a package directly under `internal/` fails the lint until it is classified as a
+domain or as infrastructure in `internal/boundaries/boundaries.go`. That is deliberate —
+it makes a ninth domain a decision someone recorded rather than something that happened.
+
+## API conventions
+
+- **Every failure uses the standard error contract** — one shape, a machine-readable
+  `code`, and the request ID in the body (SHIP-12). Clients branch on `code`, never on
+  `message`. See `services/core/README.md` for the shape and the code list.
+- **Product endpoints live under `/v1`**; operational endpoints do not (SHIP-13).
+- **Every state-changing request carries an `Idempotency-Key`** and is refused without one
+  (SHIP-15). The middleware fails closed if Redis is unreachable. **SHIP-44 must supply
+  the authenticated subject as the middleware's `scope`** — until it does, keys share one
+  namespace.
+- **Log through `httpx.LoggerFrom(ctx)`**, which is already bound to the request ID
+  (SHIP-14). Outbound HTTP clients wrap their transport in `httpx.PropagateRequestID`.
 
 Path-filter CI workflows from the first commit — macOS runners for iOS builds cost roughly ten times Linux minutes, and a Go-only change must not trigger one.
