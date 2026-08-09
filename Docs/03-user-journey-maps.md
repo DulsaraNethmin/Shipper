@@ -30,13 +30,17 @@
 
 ## 3. Assigned-driver journey
 
+The assigned driver stays on the **web**. This is a deliberate exception to the mobile-first direction, not an oversight: assigned drivers are frequently subcontracted, casual, or working a single job, and requiring an app install would abandon the low-friction access this journey was designed around. The portal must therefore work well in a mobile browser on a wide range of devices.
+
 | Stage | Driver action | Required experience |
 |---|---|---|
-| Receive assignment | Opens restricted portal link | No general account required for MVP if link security is sufficient |
+| Receive assignment | Opens restricted portal link in a mobile browser | No general account and no app install required for MVP, if link security is sufficient |
 | Prepare | Views pickup/delivery, goods notes, contact guidance | Only data needed for that job |
-| Collect | Updates en-route and picked-up milestones | Fast, mobile-first status controls |
-| Deliver | Updates delivered and captures proof | Proof requirements, timestamp, recipient/details |
+| Collect | Updates en-route and picked-up milestones | Fast, mobile-first status controls; large touch targets usable with one hand |
+| Deliver | Updates delivered and captures proof | Proof requirements, timestamp, recipient/details; photo capture through the browser camera |
 | Finish | Portal access ends or becomes read-only | No access to unrelated commercial data |
+
+The provider, who does have the app, retains the richer fulfilment experience: offline milestone queueing, native camera capture, and push updates. The driver portal is intentionally the leaner of the two.
 
 ## 4. Administrator journey
 
@@ -51,7 +55,9 @@
 ## 5. Experience principles
 
 - Explain trust and policy requirements before users invest time.
-- Design for mobile use at pickup and delivery.
+- **Design for the phone first.** Customer and provider journeys happen in a native app used in the field — in a yard, at a roller door, in a cab. Admin work stays desk-oriented and should not be compromised to match.
 - Make important state changes visible, timestamped, and understandable.
-- Never expose unnecessary personal, commercial, or location data.
+- **Never let poor connectivity block the job.** A driver or provider must be able to record what happened and move on; syncing is the platform's problem, not theirs.
+- **Ask for a device permission only at the moment its value is obvious** — the camera when proof is being captured, notifications after the first bid arrives. Never on first launch.
+- Never expose unnecessary personal, commercial, or location data, including data cached on the device.
 - Give users a clear route to help when the delivery does not proceed as expected.
