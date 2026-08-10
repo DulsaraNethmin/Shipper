@@ -297,7 +297,9 @@ The existing Redis tests skip themselves when Redis is absent, which the CI note
 
 Riverpod for state, `go_router` for routing, `freezed` and `json_serializable` for models, `dio` for transport, and **Drift over SQLite** for the offline queue and cached reads.
 
-Drift specifically because SHIP-124 requires that a queued operation is never silently dropped, which needs transactional local storage rather than a key-value store. **This closes the first two of the four decisions `Docs/07` §9 leaves open.**
+Drift specifically because SHIP-124 requires that a queued operation is never silently dropped, which needs transactional local storage rather than a key-value store. **Two of the four decisions `Docs/07` §9 raised are settled here and recorded there.**
+
+**Note what this section does not settle.** §9's first decision is compound — it bundles the minimum supported iOS and Android versions with the state approach, and only the state half is above. The OS floors are argued in `Docs/07` §9 itself, because the reason is a mobile-architecture one: `Docs/07` §3 requires the refresh token to sit in the Keystore, and the floor follows from what `flutter_secure_storage` needs to put it there.
 
 Feature folders do not import one another, per `Docs/07` §2; shared behaviour moves to `core/` or `shared/`.
 
@@ -357,7 +359,7 @@ That header is spelled by RFC 9110 and not by us, and the Go service meets it at
 | Document | Change |
 |---|---|
 | `Docs/06` §2.1 | Redis is described as backing refresh-token state; PostgreSQL is the record of truth and Redis is a fast-path denylist — see §5 |
-| `Docs/07` §9 | State management and local persistence were open; both are decided in §8.3 |
+| `Docs/07` §9 | State management and local persistence were open; both are decided in §8.3 and recorded in §9. The OS floors, which §9's first decision also bundled, are decided in §9 itself |
 | `Docs/08` Step 1 | The domain file layout gains `http.go` — see §2.1 |
 | `Docs/09` | Seven pieces of required work had no ticket; they are added |
 | `services/core/README.md` | The layout table gains `http.go` and the infrastructure packages |

@@ -112,14 +112,29 @@ Treated as build work, not launch paperwork. Each item below has blocked real su
 - Crash and adoption reporting is per version, feeding the retirement decision in §6.
 - Pilot distribution is TestFlight and Play internal testing. A public store listing is a later, separate gate.
 
-## 9. Decisions required
+## 9. Engineering decisions — two closed, two open
 
-Engineering decisions, to be closed during Step 1 of `08-build-startup-guide.md`:
+Four engineering decisions were left here for Step 1 of `08-build-startup-guide.md`. Two are now closed and recorded in `10-engineering-conventions.md` §8.3. The other two turned out not to be engineering calls at all, and each is annotated below with where it does get closed — an open decision with no named home is indistinguishable from one everybody forgot.
 
-- State management approach and the minimum supported iOS and Android versions.
-- Local persistence technology for the offline queue and cached reads.
-- Whether biometric unlock is offered in the MVP or deferred.
-- Whether the app version floor is raised on a schedule or only in response to a specific defect.
+The first of the four was compound: it bundled the minimum supported OS versions with the state approach, and `10` §8.3 settles only the state half. Both halves are closed here, which is why four decisions make five rows.
+
+| Decision | State | Recorded in, or closes at |
+|---|---|---|
+| State management | **Riverpod** | `10` §8.3 |
+| Minimum supported iOS and Android versions | **iOS 14.0, Android API 24** | Below |
+| Local persistence for the offline queue and cached reads | **Drift over SQLite** | `10` §8.3 |
+| Biometric unlock in the MVP, or deferred | Open — a scope call | The secure-storage work in M1, SHIP-48 onwards |
+| Version floor raised on a schedule or per defect | Open — an operational policy | Needs the owner §6 asks for; the mechanism is already built |
+
+**State management is Riverpod**, with `go_router` for routing, `freezed` and `json_serializable` for models, and `dio` for transport. `10` §8.3 carries that list and is where it changes; restating it here would only create a second copy to disagree with.
+
+**The minimum supported versions are iOS 14.0 and Android API 24 (Android 7.0).** The Android floor is the one that needed an argument. §3 puts the refresh token in the Keystore, and `flutter_secure_storage` reaches it through `EncryptedSharedPreferences`, which requires API 23 — below that it falls back to something weaker. So API 21 and 22, which Flutter itself still supports, cannot hold the token the way §3 requires. Taking Flutter's own floor would have bought reach at the price of the single storage guarantee this document makes, and a token store that is only sometimes hardware-backed is not a guarantee. API 24 clears that boundary rather than sitting on it. iOS 14.0 costs very little by comparison — that install base moves forward on its own.
+
+**Local persistence is Drift over SQLite.** §4 calls the durable queue the single most important client capability, and SHIP-124 requires that a queued operation is never silently dropped. That is a transactional requirement rather than a storage one: an operation, its client-generated idempotency key, the time the user acted, and the local path to its proof image either all commit or none of them do, and the sync worker has to mark an item in flight and recover cleanly when the process dies mid-upload. A key-value store — `shared_preferences`, or Hive — is simpler and cannot express any of that. The first time it half-writes a queue entry, the client has quietly dropped precisely what §4 promises it will not.
+
+**Biometric unlock stays open, and it is a scope question rather than a security one.** §3 has already fixed its position: an optional local unlock, a convenience over the stored token and never a substitute for it. Nothing in the session design moves depending on the answer, which is why it can wait — it is decided alongside the secure-storage work in M1, at SHIP-48 and after, when the token store it would sit in front of exists.
+
+**The version-floor policy stays open, and it is operational rather than engineering.** SHIP-167 is built and configuration-driven — `MIN_SUPPORTED_IOS_BUILD` and `MIN_SUPPORTED_ANDROID_BUILD` — so raising the floor is already a configuration change rather than a release. What is missing is not a mechanism but the owner §6 asks for: who decides that a floor rises, on what evidence, and whether that happens on a cadence or only when a specific defect forces it. Blocking a build is a support event before it is anything else, so the call belongs with whoever carries the pilot's support load.
 
 Product decisions already settled that constrain this client:
 
