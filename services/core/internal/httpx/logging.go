@@ -1,7 +1,6 @@
 package httpx
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -10,28 +9,14 @@ import (
 // Logger emits one structured record per request, carrying the fields SHIP-9 requires:
 // method, path, status, duration, and request ID.
 //
-// It also puts a request-scoped logger on the context (SHIP-14). Every record written
-// through [LoggerFrom] while handling the request carries the request ID without the
-// caller doing anything, which is the difference between a correlation ID that works and
-// one that works wherever somebody remembered it. Reading one request's story out of a
-// log aggregator depends on every line of it being attributable, including the ones
-// written five calls deep in a domain package.
-//
-// The request record itself is written after the handler returns, so the status and
-// duration are the real ones. That means a request that never completes produces no line
-// at all — which is what the server timeouts in the HTTP config are there to bound.
+// The record is written after the handler returns, so the status and duration are the
+// real ones. That means a request that never completes produces no line at all — which
+// is what the server timeouts in the HTTP config are there to bound.
 func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			started := time.Now()
 			rec := &recorder{ResponseWriter: w, status: http.StatusOK}
-
-			requestLog := log
-			if id := RequestIDFrom(r.Context()); id != "" {
-				requestLog = log.With(slog.String("request_id", id))
-			}
-			ctx := ContextWithLogger(r.Context(), requestLog)
-			r = r.WithContext(ctx)
 
 			next.ServeHTTP(rec, r)
 
@@ -40,7 +25,8 @@ func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 			// The query string is deliberately omitted. It is the part of a URL most
 			// likely to carry a token, an email address, or a filter revealing something
 			// about a customer, and this line goes to a log aggregator (SHIP-174).
-			requestLog.LogAttrs(ctx, levelFor(rec.status), "http request",
+			log.LogAttrs(r.Context(), levelFor(rec.status), "http request",
+				slog.String("request_id", RequestIDFrom(r.Context())),
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.Int("status", rec.status),
@@ -49,23 +35,6 @@ func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 			)
 		})
 	}
-}
-
-// ContextWithLogger carries log on ctx, where [LoggerFrom] can find it.
-func ContextWithLogger(ctx context.Context, log *slog.Logger) context.Context {
-	return context.WithValue(ctx, loggerKey, log)
-}
-
-// LoggerFrom returns the request-scoped logger on ctx, already bound to the request ID.
-//
-// It falls back to slog.Default rather than returning nil, so a caller never has to guard
-// against a context that has not been through the middleware — code that logs should not
-// have to decide whether logging is available.
-func LoggerFrom(ctx context.Context) *slog.Logger {
-	if log, ok := ctx.Value(loggerKey).(*slog.Logger); ok && log != nil {
-		return log
-	}
-	return slog.Default()
 }
 
 // levelFor keeps ordinary traffic at info while making failures findable without a

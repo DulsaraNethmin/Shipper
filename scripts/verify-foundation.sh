@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Demonstrates the "Done when" criterion of every ticket in SHIP-1..SHIP-15.
+# Demonstrates the "Done when" criterion of every ticket in SHIP-1..SHIP-9.
 #
 # Docs/09 makes the acceptance criterion the definition of done: if it cannot be shown,
 # the ticket is not finished. This script is how it gets shown — on a developer machine
@@ -106,13 +106,8 @@ go run ./cmd/migrate down all >/dev/null 2>&1 || true   # start from a known sta
 
 go run ./cmd/migrate up >/dev/null
 version_after_up="$(go run ./cmd/migrate version)"
-# The highest number on disk, rather than a literal. Migrations are allocated in per-domain
-# blocks (migrations/blocks.go), so the newest one is not the count of them and hard-coding
-# either would make this line a chore to update on every schema change.
-highest_migration="$(ls migrations/*.up.sql | sed -E 's#.*/0*([0-9]+)_.*#\1#' | sort -n | tail -1)"
-[[ "$version_after_up" == "version $highest_migration" ]] \
-  || fail "after up, expected 'version $highest_migration', got '$version_after_up'"
-ok "migrate up applied every migration, ending at $highest_migration"
+[[ "$version_after_up" == "version 1" ]] || fail "after up, expected 'version 1', got '$version_after_up'"
+ok "migrate up applied migration 1"
 
 "$PSQL" "$DATABASE_URL" -tAc \
   "select 1 from pg_proc where proname = 'set_updated_at';" | grep -q 1 \
@@ -122,11 +117,11 @@ ok "migrate up applied every migration, ending at $highest_migration"
   || fail "citext extension was not created"
 ok "the migration's objects exist in the database"
 
-go run ./cmd/migrate down all >/dev/null
+go run ./cmd/migrate down >/dev/null
 version_after_down="$(go run ./cmd/migrate version)"
 [[ "$version_after_down" == "no migrations applied" ]] \
   || fail "after down, expected 'no migrations applied', got '$version_after_down'"
-ok "migrate down reversed every one of them"
+ok "migrate down reversed it"
 
 if "$PSQL" "$DATABASE_URL" -tAc \
   "select 1 from pg_proc where proname = 'set_updated_at';" | grep -q 1; then
@@ -154,7 +149,6 @@ HTTP_PORT="$VERIFY_PORT" \
 LOG_FORMAT=json \
 LOG_LEVEL=debug \
 DATABASE_URL="$DATABASE_URL" \
-REDIS_URL="$REDIS_URL" \
   "$WORKDIR/shipper-api" >"$WORKDIR/server.log" 2>&1 &
 SERVER_PID=$!
 
@@ -236,242 +230,6 @@ grep -q '"level":"WARN"' "$WORKDIR/server.log" \
 ok "levels are applied by outcome: 2xx at INFO, 4xx at WARN"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-10  package skeleton for the eight domains and the adapter tree"
-
-for d in identity profiles fleet jobs bidding delivery notifications admin; do
-  [[ -d "services/core/internal/$d" ]] || fail "domain package internal/$d is missing"
-done
-ok "all eight domains from Docs/06 §3 have a package"
-
-for a in email sms push storage geocoding; do
-  [[ -d "services/core/internal/platform/$a" ]] || fail "adapter internal/platform/$a is missing"
-done
-ok "the platform/ tree holds the five adapters from Docs/06 §4.1"
-
-# ---------------------------------------------------------------------------------------
-ticket "SHIP-11  the import lint fails on a crossed boundary"
-
-pushd "$ROOT/services/core" >/dev/null
-go build -o "$WORKDIR/lintboundaries" ./cmd/lintboundaries
-popd >/dev/null
-
-pushd "$ROOT/services/core" >/dev/null
-"$WORKDIR/lintboundaries" >/dev/null || fail "the lint reports a violation in this repository"
-popd >/dev/null
-ok "this repository crosses no boundary"
-
-# A throwaway module that breaks each rule, so the check is shown to fail and not merely
-# to pass. A lint nobody has watched fail is a lint nobody knows works.
-fixture="$WORKDIR/fixture"
-mkdir -p "$fixture/internal/jobs" "$fixture/internal/bidding" \
-         "$fixture/internal/platform/email" "$fixture/internal/identity"
-printf 'module github.com/DulsaraNethmin/Shipper/services/core\n\ngo 1.25\n' >"$fixture/go.mod"
-printf 'package bidding\n'  >"$fixture/internal/bidding/pkg.go"
-printf 'package identity\n' >"$fixture/internal/identity/pkg.go"
-printf 'package jobs\n\nimport _ "github.com/DulsaraNethmin/Shipper/services/core/internal/bidding"\n' \
-  >"$fixture/internal/jobs/pkg.go"
-printf 'package email\n\nimport _ "github.com/DulsaraNethmin/Shipper/services/core/internal/identity"\n' \
-  >"$fixture/internal/platform/email/pkg.go"
-
-pushd "$fixture" >/dev/null
-if "$WORKDIR/lintboundaries" >"$WORKDIR/lint.log" 2>&1; then
-  popd >/dev/null
-  cat "$WORKDIR/lint.log"
-  fail "the lint passed a module that crosses two boundaries"
-fi
-popd >/dev/null
-
-grep -q "domain imports domain" "$WORKDIR/lint.log" \
-  || { cat "$WORKDIR/lint.log"; fail "a domain importing another domain was not reported"; }
-grep -q "adapter imports domain" "$WORKDIR/lint.log" \
-  || { cat "$WORKDIR/lint.log"; fail "an adapter importing a domain was not reported"; }
-ok "a domain importing a domain, and an adapter importing a domain, both fail the build"
-
-# ---------------------------------------------------------------------------------------
-ticket "SHIP-13  the public API is served under /v1"
-
-status="$(curl -s -o "$WORKDIR/v1.json" -w '%{http_code}' "http://localhost:$VERIFY_PORT/v1/")"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/v1.json"; fail "GET /v1/ returned $status"; }
-[[ "$(json "$WORKDIR/v1.json" '["api_version"]')" == "v1" ]] \
-  || fail "GET /v1/ did not report api_version=v1"
-ok "GET /v1/ reports the version the group serves"
-
-[[ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$VERIFY_PORT/v1/health")" == "404" ]] \
-  || fail "/health is reachable under /v1"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$VERIFY_PORT/health")" == "200" ]] \
-  || fail "/health is not reachable outside /v1"
-ok "operational endpoints stay outside the version group"
-
-# ---------------------------------------------------------------------------------------
-ticket "SHIP-12  every error has the same shape and a machine-readable code"
-
-error_id="verify-error-id-$$"
-status="$(curl -s -o "$WORKDIR/notfound.json" -w '%{http_code}' \
-  -H "X-Request-Id: $error_id" "http://localhost:$VERIFY_PORT/v1/no-such-thing")"
-[[ "$status" == "404" ]] || fail "expected 404, got $status"
-[[ "$(json "$WORKDIR/notfound.json" '["error"]["code"]')" == "not_found" ]] \
-  || { cat "$WORKDIR/notfound.json"; fail "the 404 carried no machine-readable code"; }
-ok "ServeMux's own 404 arrives as JSON with code=not_found"
-
-status="$(curl -s -X POST -o "$WORKDIR/method.json" -w '%{http_code}' \
-  "http://localhost:$VERIFY_PORT/health")"
-[[ "$status" == "405" ]] || fail "expected 405, got $status"
-[[ "$(json "$WORKDIR/method.json" '["error"]["code"]')" == "method_not_allowed" ]] \
-  || { cat "$WORKDIR/method.json"; fail "the 405 carried no machine-readable code"; }
-ok "a 405 arrives in the same shape with code=method_not_allowed"
-
-# ---------------------------------------------------------------------------------------
-ticket "SHIP-14  one request ID, in the header, the body and the log"
-
-[[ "$(json "$WORKDIR/notfound.json" '["error"]["request_id"]')" == "$error_id" ]] \
-  || fail "the error body did not carry the request ID"
-ok "the ID reached the response body through the request context"
-
-sleep 0.3
-grep -qF "\"request_id\":\"$error_id\"" "$WORKDIR/server.log" \
-  || fail "no log record carried the request ID"
-ok "the same ID identifies the request in the log"
-
-# ---------------------------------------------------------------------------------------
-ticket "SHIP-15  a repeated idempotency key replays the original response"
-
-status="$(curl -s -X POST -o "$WORKDIR/nokey.json" -w '%{http_code}' \
-  -H 'Content-Type: application/json' -d '{}' "http://localhost:$VERIFY_PORT/v1/jobs")"
-[[ "$status" == "400" ]] || fail "a state-changing request without a key returned $status"
-[[ "$(json "$WORKDIR/nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
-  || { cat "$WORKDIR/nokey.json"; fail "expected code=idempotency_key_required"; }
-ok "a state-changing request without an Idempotency-Key is refused"
-
-idem_key="verify-idem-$$"
-curl -s -X POST -D "$WORKDIR/first.headers" -o "$WORKDIR/first.json" \
-  -H "Idempotency-Key: $idem_key" -H 'Content-Type: application/json' \
-  -d '{"price_aud":450}' "http://localhost:$VERIFY_PORT/v1/jobs" >/dev/null
-
-replayed="$(tr -d '\r' <"$WORKDIR/first.headers" | awk -F': ' 'tolower($1)=="idempotency-replayed"{print $2}')"
-[[ -z "$replayed" ]] || fail "the first request was marked as a replay"
-ok "the first request with a new key executes"
-
-curl -s -X POST -D "$WORKDIR/second.headers" -o "$WORKDIR/second.json" \
-  -H "Idempotency-Key: $idem_key" -H 'Content-Type: application/json' \
-  -d '{"price_aud":450}' "http://localhost:$VERIFY_PORT/v1/jobs" >/dev/null
-
-replayed="$(tr -d '\r' <"$WORKDIR/second.headers" | awk -F': ' 'tolower($1)=="idempotency-replayed"{print $2}')"
-[[ "$replayed" == "true" ]] || { cat "$WORKDIR/second.headers"; fail "the retry was not replayed"; }
-diff -q "$WORKDIR/first.json" "$WORKDIR/second.json" >/dev/null \
-  || fail "the replayed body differs from the original"
-ok "the retry returns the stored response byte for byte, marked Idempotency-Replayed"
-
-status="$(curl -s -X POST -o "$WORKDIR/reuse.json" -w '%{http_code}' \
-  -H "Idempotency-Key: $idem_key" -H 'Content-Type: application/json' \
-  -d '{"price_aud":999}' "http://localhost:$VERIFY_PORT/v1/jobs")"
-[[ "$status" == "409" ]] || fail "reusing a key for a different request returned $status"
-[[ "$(json "$WORKDIR/reuse.json" '["error"]["code"]')" == "idempotency_key_reused" ]] \
-  || { cat "$WORKDIR/reuse.json"; fail "expected code=idempotency_key_reused"; }
-ok "the same key with a different request is refused rather than answered"
-
-stored="$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:*:$idem_key" | head -1)"
-[[ -n "$stored" ]] || fail "no idempotency entry was written to Redis"
-ttl="$(redis-cli -u "$REDIS_URL" ttl "$stored")"
-[[ "$ttl" -gt 0 ]] || fail "the stored entry has no expiry (ttl=$ttl)"
-ok "the entry is in Redis under $stored, expiring in ${ttl}s"
-
-# ---------------------------------------------------------------------------------------
-ticket "SHIP-28  the users table, with its constraints enforced by the database"
-
-"$PSQL" "$DATABASE_URL" -tAc \
-  "select 1 from information_schema.tables where table_name = 'users';" | grep -q 1 \
-  || fail "the users table does not exist"
-ok "users exists"
-
-"$PSQL" "$DATABASE_URL" -q -c \
-  "insert into users (id, email, phone, password_hash, role)
-   values (gen_random_uuid(), 'verify-$$@example.com', '+6140000$$', 'x', 'customer');" >/dev/null \
-  || fail "a valid account could not be created"
-
-if "$PSQL" "$DATABASE_URL" -q -c \
-  "insert into users (id, email, phone, password_hash, role)
-   values (gen_random_uuid(), 'VERIFY-$$@EXAMPLE.COM', '+6140001$$', 'x', 'customer');" >/dev/null 2>&1; then
-  fail "the same address in different case was accepted as a second account"
-fi
-ok "email uniqueness is case-insensitive, so one address is one account"
-
-if "$PSQL" "$DATABASE_URL" -q -c \
-  "insert into users (id, email, phone, password_hash, role)
-   values (gen_random_uuid(), 'role-$$@example.com', '+6140002$$', 'x', 'admin');" >/dev/null 2>&1; then
-  fail "'admin' was accepted as a role; admin sign-in is a separate system (SHIP-147)"
-fi
-ok "role is constrained to customer and provider"
-
-# ---------------------------------------------------------------------------------------
-ticket "SHIP-149  the audit log is append-only in the database, not by convention"
-
-audit_id="$("$PSQL" "$DATABASE_URL" -tAc \
-  "insert into audit_log (id, actor_type, action, target_type, target_id)
-   values (gen_random_uuid(), 'system', 'job.expired', 'job', gen_random_uuid())
-   returning id;")"
-[[ -n "$audit_id" ]] || fail "an audit entry could not be appended"
-ok "an entry can be appended"
-
-if "$PSQL" "$DATABASE_URL" -q -c \
-  "update audit_log set reason = 'rewritten' where id = '$audit_id';" >/dev/null 2>&1; then
-  fail "an audit entry was rewritten"
-fi
-ok "UPDATE is refused"
-
-if "$PSQL" "$DATABASE_URL" -q -c \
-  "delete from audit_log where id = '$audit_id';" >/dev/null 2>&1; then
-  fail "an audit entry was deleted"
-fi
-ok "DELETE is refused, so the trail survives a psql prompt"
-
-# ---------------------------------------------------------------------------------------
-ticket "SHIP-167  the app is told the minimum build it may be"
-
-status="$(curl -s -o "$WORKDIR/min-version.json" -w '%{http_code}' \
-  "http://localhost:$VERIFY_PORT/v1/app/minimum-version")"
-[[ "$status" == "200" ]] || fail "GET /v1/app/minimum-version returned $status"
-
-ios_floor="$(json "$WORKDIR/min-version.json" '["ios"]["minimum_build"]')"
-android_floor="$(json "$WORKDIR/min-version.json" '["android"]["minimum_build"]')"
-[[ "$ios_floor" =~ ^[0-9]+$ ]]     || fail "ios.minimum_build is not a number: $ios_floor"
-[[ "$android_floor" =~ ^[0-9]+$ ]] || fail "android.minimum_build is not a number: $android_floor"
-ok "both platforms report a build floor the launch gate can compare against (iOS $ios_floor, Android $android_floor)"
-
-# The floor follows configuration, so raising it is an operational act rather than a release
-# (Docs/07 §6). Restarting with a different value is the whole mechanism.
-kill -TERM "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
-
-SHIPPER_ENV=development \
-HTTP_PORT="$VERIFY_PORT" \
-LOG_FORMAT=json \
-LOG_LEVEL=debug \
-DATABASE_URL="$DATABASE_URL" \
-REDIS_URL="$REDIS_URL" \
-MIN_SUPPORTED_IOS_BUILD=4242 \
-  "$WORKDIR/shipper-api" >>"$WORKDIR/server.log" 2>&1 &
-SERVER_PID=$!
-
-for _ in $(seq 1 50); do
-  curl -fsS "http://localhost:$VERIFY_PORT/health" >/dev/null 2>&1 && break
-  sleep 0.2
-done
-
-curl -fsS -o "$WORKDIR/min-version-raised.json" \
-  "http://localhost:$VERIFY_PORT/v1/app/minimum-version" \
-  || fail "the service did not come back up after the floor was raised"
-raised="$(json "$WORKDIR/min-version-raised.json" '["ios"]["minimum_build"]')"
-[[ "$raised" == "4242" ]] || fail "the floor did not follow MIN_SUPPORTED_IOS_BUILD, got $raised"
-ok "the floor is raised by configuration, not by a release"
-
-# The gate has to work for a build too old to authenticate — otherwise the builds it exists
-# to retire are exactly the ones that cannot discover they must update (Docs/07 §6).
-status="$(curl -s -o /dev/null -w '%{http_code}' \
-  "http://localhost:$VERIFY_PORT/v1/app/minimum-version")"
-[[ "$status" == "200" ]] || fail "the version gate requires authentication (status $status)"
-ok "it answers without credentials"
-
-# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
@@ -484,4 +242,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-9 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
