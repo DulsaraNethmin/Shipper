@@ -9,13 +9,48 @@ Targets iOS and Android.
 ## Running it
 
 ```
-flutter pub get
-flutter run                          # local, whichever device is attached
+make up && make run                             # the API, from the repository root
+make flutter-run d=<device>                     # local, against this worktree's HTTP_PORT
+make flutter-run d=<device> flavour=staging
 ```
 
-`make flutter-run` from the repository root does the same and is documented in `mk/flutter.mk`.
+`make flutter-run` reads `HTTP_PORT` out of `deploy/.env`, which is set per git worktree, so
+the client points at *this* checkout's API without anybody editing Dart. `flutter run` on its
+own works too and defaults to port 8080.
+
 There are no web, macOS, Linux or Windows targets, deliberately: they are not in scope, and
 each one enlarges both the tree and the CI surface for nothing.
+
+## Environments
+
+Three, selected at build time by `--dart-define` (`lib/core/api/api_environment.dart`):
+
+| Define | Values | Effect |
+|---|---|---|
+| `SHIPPER_ENV` | `local` (default), `staging`, `production` | Which deployment the build talks to |
+| `SHIPPER_API_PORT` | default `8080` | Local only. The port `make run` is serving on |
+| `SHIPPER_API_BASE_URL` | unset | Overrides everything. For a physical device on the LAN |
+
+`--dart-define` rather than Xcode and Gradle flavours because it is the mechanism with the
+fewest moving parts that still decides at **build** time. A run-time switch is one a support
+call can talk somebody into flipping. The half this does not give us is `Docs/07` §8's
+requirement that a tester hold a staging build and a production build on **one device** — that
+needs a distinct application id per environment, which is genuinely Xcode and Gradle flavours,
+and it belongs with the signing work at SHIP-24…SHIP-27.
+
+**The local base URL differs by platform and this is not cosmetic.** An iOS simulator shares
+the host's network stack and reaches it on `localhost`; an Android emulator's `localhost` is
+the emulated device itself and the host is `10.0.2.2`. A client that uses `localhost` for both
+works perfectly on iOS and reaches nothing on Android — a defect that survives review because
+whoever wrote it tested on the platform where it works. `api_environment_test.dart` asserts
+both.
+
+The staging and production hostnames are **provisional**: neither is registered, neither is
+deployed, and no ticket owns the DNS. They are written out so the three environments are
+genuinely three, and `SHIPPER_API_BASE_URL` overrides them until they exist.
+
+`make flutter-test-defines` runs the environment test once per flavour, because a single test
+run compiles with one set of defines and therefore cannot prove that any other flavour works.
 
 ## Structure and state
 
