@@ -22,6 +22,10 @@
 //
 //   - password.go (SHIP-29) — argon2id hashing, with the cost parameters stored in the PHC
 //     string beside each hash so the profile can be raised without a migration.
+//   - token.go (SHIP-37) — access token issue: HS256 over a keyset selected by a kid header,
+//     fifteen minutes, and a claim set that carries no permissions and no verification state.
+//     Issue only; the middleware that verifies these is SHIP-44.
+//   - model.go — the two roles, mirroring ck_users_role.
 //
 // The rest of the layout in Docs/10 §2.1 arrives with the tickets that need it: service.go
 // and postgres.go at SHIP-30, ports.go when this domain first needs something of an adapter,

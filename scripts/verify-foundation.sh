@@ -570,6 +570,76 @@ fk_index="$("$PSQL" "$DATABASE_URL" -tAc \
 ok "the updated_at trigger is attached and the foreign key is indexed"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-37  a short-lived signed token carrying the user, the role and an expiry"
+
+pushd "$ROOT/services/core" >/dev/null
+if ! token_log="$(go test ./internal/identity/ -run 'TestAccessToken|TestKeyset|TestNewAccessToken' -count=1 -v 2>&1)"; then
+  echo "$token_log"
+  popd >/dev/null
+  fail "the access token tests do not pass"
+fi
+popd >/dev/null
+ok "the TTL, kid selection, rotation and the driver-audience refusal all hold"
+
+# A real token, decoded here rather than by the library that produced it. Asking the issuer what
+# it issued would prove very little; this reads the bytes that would go over the wire.
+access_token="$(grep -oE 'access token: [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' <<<"$token_log" \
+  | head -1 | awk '{print $3}')"
+[[ -n "$access_token" ]] || { echo "$token_log"; fail "no access token appeared in the test output"; }
+
+python3 - "$access_token" >"$WORKDIR/token.json" <<'PYTHON'
+import base64, json, sys
+
+def segment(s):
+    return json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+
+header, payload, _signature = sys.argv[1].split(".")
+header, payload = segment(header), segment(payload)
+
+json.dump({
+    "alg":         header.get("alg"),
+    "kid":         header.get("kid"),
+    "claim_names": " ".join(sorted(payload)),
+    "iss":         payload.get("iss"),
+    "aud":         payload.get("aud"),
+    "sub":         payload.get("sub"),
+    "role":        payload.get("role"),
+    "lifetime":    payload.get("exp", 0) - payload.get("iat", 0),
+}, sys.stdout)
+PYTHON
+
+[[ "$(json "$WORKDIR/token.json" '["alg"]')" == "HS256" ]] \
+  || fail "the token is not signed with HS256"
+kid="$(json "$WORKDIR/token.json" '["kid"]')"
+[[ -n "$kid" && "$kid" != "None" ]] \
+  || fail "the token names no signing key, so a key could never be rotated"
+ok "HS256, naming its key in the header as kid=$kid"
+
+# Exactly the claim set Docs/10 §5 fixes, checked as a whole. A missing claim breaks something
+# loudly; an added one sits there being believed, which is the direction that matters.
+claims="$(json "$WORKDIR/token.json" '["claim_names"]')"
+[[ "$claims" == "aud exp iat iss jti role sid sub" ]] \
+  || fail "the claims are '$claims', and Docs/10 §5 says exactly: aud exp iat iss jti role sid sub"
+ok "the claim set is exactly sub, role, sid, iat, exp, jti, iss and aud"
+
+for forbidden in permissions scope scopes verified email_verified phone_verified status; do
+  grep -qw "$forbidden" <<<"$claims" && fail "the token carries '$forbidden'"
+done
+ok "no permission and no verification state — the platform decides both, freshly (Docs/07 §3)"
+
+[[ "$(json "$WORKDIR/token.json" '["iss"]')" == "shipper" ]] || fail "iss is not shipper"
+[[ "$(json "$WORKDIR/token.json" '["aud"]')" == "shipper-mobile" ]] \
+  || fail "aud is not shipper-mobile, which is what separates this from the driver token"
+[[ "$(json "$WORKDIR/token.json" '["role"]')" =~ ^(customer|provider)$ ]] \
+  || fail "role is not one of the two the platform issues"
+[[ "$(json "$WORKDIR/token.json" '["sub"]')" =~ ^[0-9a-f-]{36}$ ]] || fail "sub is not a user id"
+ok "iss=shipper, aud=shipper-mobile, and sub carries the user id"
+
+[[ "$(json "$WORKDIR/token.json" '["lifetime"]')" == "900" ]] \
+  || fail "the token lives $(json "$WORKDIR/token.json" '["lifetime"]') seconds, and Docs/10 §5 says 900"
+ok "it expires fifteen minutes after it was issued, measured against an injected clock"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"

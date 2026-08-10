@@ -48,18 +48,17 @@ const (
 // The floor is low enough for tests to use a reduced profile: 64 MiB per hash, across packages
 // that `go test ./...` runs in parallel, will thrash a laptop (Docs/10 §5).
 var argon2Bounds = struct {
-	minMemoryKiB, maxMemoryKiB     uint32
-	minIterations, maxIterations   uint32
-	minParallelism, maxParallelism uint8
-	minSaltLength, maxSaltLength   int
-	minKeyLength, maxKeyLength     int
+	minMemoryKiB, maxMemoryKiB   uint32
+	minIterations, maxIterations uint32
+	minParallelism               uint8
+	minSaltLength, maxSaltLength int
+	minKeyLength, maxKeyLength   int
 }{
 	minMemoryKiB:   1024,    // 1 MiB
 	maxMemoryKiB:   1 << 20, // 1 GiB
 	minIterations:  1,
 	maxIterations:  64,
 	minParallelism: 1,
-	maxParallelism: 64,
 	minSaltLength:  8,
 	maxSaltLength:  64,
 	minKeyLength:   16,
@@ -99,11 +98,12 @@ func (p Argon2Profile) Validate() error {
 	case p.Iterations < b.minIterations || p.Iterations > b.maxIterations:
 		return fmt.Errorf("%w: t=%d is outside %d..%d",
 			ErrInvalidArgon2Profile, p.Iterations, b.minIterations, b.maxIterations)
-	case p.Parallelism < b.minParallelism || p.Parallelism > b.maxParallelism:
-		return fmt.Errorf("%w: p=%d is outside %d..%d",
-			ErrInvalidArgon2Profile, p.Parallelism, b.minParallelism, b.maxParallelism)
-	// argon2 divides the memory between the lanes and rounds down; below eight kibibytes a
-	// lane the rounding reaches zero and the library's behaviour stops being defined.
+	case p.Parallelism < b.minParallelism:
+		return fmt.Errorf("%w: p=%d, and argon2 needs at least %d lane",
+			ErrInvalidArgon2Profile, p.Parallelism, b.minParallelism)
+	// There is no separate ceiling on the lane count: this is the real rule. argon2 divides
+	// the memory between the lanes and rounds down, so below eight kibibytes a lane the
+	// rounding reaches zero and the library's behaviour stops being defined.
 	case p.MemoryKiB < 8*uint32(p.Parallelism):
 		return fmt.Errorf("%w: m=%d leaves less than 8 KiB for each of p=%d lanes",
 			ErrInvalidArgon2Profile, p.MemoryKiB, p.Parallelism)
@@ -255,7 +255,7 @@ func parsePHC(encoded string) (storedHash, error) {
 	// small one and pass Validate.
 	if memory > uint64(argon2Bounds.maxMemoryKiB) ||
 		iterations > uint64(argon2Bounds.maxIterations) ||
-		parallelism > uint64(argon2Bounds.maxParallelism) {
+		parallelism > 255 {
 		return storedHash{}, fmt.Errorf("%w: m=%d, t=%d, p=%d exceeds what this package will run",
 			ErrInvalidArgon2Profile, memory, iterations, parallelism)
 	}

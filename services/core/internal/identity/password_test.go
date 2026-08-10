@@ -284,7 +284,6 @@ func TestPasswordHasherRejectsAnImpossibleProfile(t *testing.T) {
 		"absurd memory":      {MemoryKiB: 1 << 21, Iterations: 3, Parallelism: 4},
 		"no iterations":      {MemoryKiB: 64 * 1024, Iterations: 0, Parallelism: 4},
 		"no lanes":           {MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 0},
-		"too many lanes":     {MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 200},
 		"memory below lanes": {MemoryKiB: 1024, Iterations: 3, Parallelism: 200},
 	}
 
