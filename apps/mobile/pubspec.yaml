@@ -1,0 +1,39 @@
+name: shipper
+description: "Shipper — Australian road-transport marketplace, customer and provider in one app."
+
+# Never published. This is an application, not a package.
+publish_to: 'none'
+
+# version+build. Docs/07 §8 requires every build to carry a unique, monotonically increasing
+# build number and to report its version with each API call, so a crash can be attributed to
+# one build. CI overrides both with --build-name and --build-number; this is the local default.
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # The client stack, decided in Docs/10 §8.3 and recorded in Docs/07 §9. Not a menu — these
+  # are closed decisions, and a second state library or a second router is a defect.
+  flutter_riverpod: ^3.4.2
+  go_router: ^17.4.0
+  dio: ^5.11.0
+  freezed_annotation: ^3.1.0
+  json_annotation: ^4.12.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+  build_runner: ^2.15.1
+  freezed: ^3.2.0
+  json_serializable: ^6.14.1
+
+flutter:
+  uses-material-design: true

@@ -1,0 +1,42 @@
+# Static analysis for the Flutter client.
+#
+# `flutter analyze` fails on anything reported here, including infos, and SHIP-21 runs it on
+# every push. That is the reason to be careful about what goes in: a rule that produces noise
+# gets a baseline of ignores, and a baseline of ignores is a rule nobody enforces.
+#
+# Everything below either encodes a decision from Docs/07 or catches a class of bug that is
+# genuinely silent at runtime.
+
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  language:
+    # `dynamic` is how a JSON map quietly becomes a runtime cast failure three screens later.
+    # Docs/07 §6 requires the client to tolerate unknown response fields, which means decoding
+    # is where types are actually established — so the decoder should be where the analyzer is
+    # strictest, not where it gives up.
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+
+  errors:
+    # A missing return or an unawaited future in the sync worker is a dropped operation, and
+    # Docs/07 §4 says an operation is never silently dropped. Warnings are not enough for
+    # something with that consequence.
+    unawaited_futures: error
+
+linter:
+  rules:
+    # Tokens must never reach logs (Docs/07 §3), and `print` is the shortest path from a
+    # debugging session to exactly that. flutter_lints already carries avoid_print; it is
+    # named here so the reason survives.
+    avoid_print: true
+
+    # An awaited future whose result is ignored, and a future never awaited at all, are the two
+    # halves of the same defect in queue and upload code.
+    unawaited_futures: true
+
+    # Docs/07 §2 organises by feature. Relative imports that climb out of a folder are how that
+    # organisation is eroded, and package: imports make the architecture test's job — and a
+    # reviewer's — considerably easier.
+    always_use_package_imports: true

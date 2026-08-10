@@ -1,0 +1,71 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Flutter's template declares INTERNET only in the debug and profile manifests, for hot
+         reload. A release build therefore has no network access at all, and every API call
+         fails — on the one build type nobody exercises during development, because debug and
+         profile both work. Declared here so it applies to every build type.
+
+         An install-time permission: no prompt, no runtime request, and so no rationale copy. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- SHIP-179. Android has no purpose-string attribute: the system prompt is a fixed
+         sentence, so the explanation has to be in-app copy shown before the prompt. It lives in
+         lib/core/permissions/permission_copy.dart, and permission_copy_test.dart asserts that
+         every permission declared here has copy written for it.
+
+         Photo proof of delivery (Docs/01 §4.4). -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+
+    <!-- Declaring CAMERA otherwise makes Google Play treat a camera as a hardware requirement
+         and hide the app from devices without one. Docs/01 §4.4 allows a recorded exception
+         reason instead of a photo, so the app genuinely works without a camera and must not
+         exclude anybody on its account. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+
+    <!-- Push, from Android 13. Docs/07 §5 asks at the moment its value is obvious — after a
+         first bid arrives — and the app stays fully usable when it is refused. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <application
+        android:label="Shipper"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>

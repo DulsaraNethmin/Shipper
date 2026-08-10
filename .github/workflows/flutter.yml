@@ -1,0 +1,86 @@
+# SHIP-21 — analyzer and tests for the Flutter client.
+#
+# Path-filtered, as .github/workflows/README.md requires, and the filter includes this file
+# because a workflow that ignores its own definition will not re-run when that definition is
+# fixed. It deliberately does *not* list `mk/**` the way the Go workflow does: that glob covers
+# mk/web.mk, and a change to the admin panel's make targets has no bearing on the client.
+#
+# **This job runs on ubuntu, and that is the point of the filter existing at all.** Docs/08
+# Step 1 puts macOS runners at roughly ten times Linux minutes, and nothing here needs one:
+# `flutter analyze` and `flutter test` are host-side Dart. The iOS and Android *builds* need
+# real runners and signing material, and they are SHIP-24…SHIP-27 — blocked on X-2 and X-3,
+# which are Apple and Google account registrations outside this repository.
+name: Flutter
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "apps/mobile/**"
+      - ".github/workflows/flutter.yml"
+      - "mk/flutter.mk"
+      - "Makefile"
+  pull_request:
+    paths:
+      - "apps/mobile/**"
+      - ".github/workflows/flutter.yml"
+      - "mk/flutter.mk"
+      - "Makefile"
+
+# A second push to the same branch supersedes the first, matching the Go workflow. Cancelling
+# saves minutes and stops a stale red run sitting next to a fresh green one.
+concurrency:
+  group: flutter-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: analyze, test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than "latest stable". Flutter's stable channel moves, and a client that
+      # analyses cleanly on one version and not the next should fail on the day somebody
+      # chooses to move it, not on the day the channel does. 3.44.9 is revision 6b182d2c75,
+      # which is what apps/mobile/.metadata records — move both together.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.44.9
+          channel: stable
+          cache: true
+
+      # --enforce-lockfile fails rather than quietly resolving something newer. Docs/10 §9.2
+      # makes adding a dependency a deliberate act on the Go side for the same reason: two
+      # branches that each add one produce a lockfile conflict, and the resolution must be a
+      # decision rather than whatever `pub get` felt like doing on the runner.
+      - name: dependencies match the lockfile
+        working-directory: apps/mobile
+        run: flutter pub get --enforce-lockfile
+
+      # The generated halves of every freezed / json_serializable model are committed, so this
+      # regenerates them and fails if anything moved — the pattern Docs/10 §8.2 prescribes for
+      # `make codegen`. It catches a model edited without regenerating, and a generated file
+      # edited by hand.
+      - name: generated model code is up to date
+        run: |
+          make flutter-codegen
+          git diff --exit-code -- 'apps/mobile/**/*.g.dart' 'apps/mobile/**/*.freezed.dart' || {
+            echo "::error::Generated model code is stale. Run 'make flutter-codegen' and commit the result."
+            exit 1
+          }
+
+      # `make flutter-check` rather than a list of steps, for the reason
+      # .github/workflows/README.md gives about the Go workflow: a workflow that reimplements
+      # what a make target already does drifts from it, and the check that gets dropped is
+      # always the one only CI was running. It is analyze + test + the per-flavour environment
+      # tests (SHIP-18), and the analyzer fails the job on any error, warning or lint.
+      - name: make flutter-check
+        run: make flutter-check
+
+      - name: Australian English
+        run: ./scripts/check-spelling.sh
