@@ -69,13 +69,28 @@ const AdapterRoot = "internal/platform"
 // infrastructure names the internal packages that are not domains: the plumbing every
 // domain is allowed to sit on top of. Extending this list is the deliberate act described
 // in the package comment.
+//
+// The list is deliberately seeded ahead of the code. Everything the next several milestones
+// need is already here, so that a domain package being built never has a reason to reach
+// into this file — which matters because two domains can be under construction at once, and
+// this file is shared (Docs/10 §9.2). An entry that is still unused is a commitment already
+// made, not an oversight.
 var infrastructure = map[string]string{
+	"authctx":     "the authenticated subject, readable by every domain",
 	"boundaries":  "this lint",
 	"buildinfo":   "version and commit, injected at link time",
+	"clock":       "the injectable clock, so scheduled work is testable",
 	"config":      "environment configuration",
+	"db":          "the Runner seam and transaction helper",
+	"events":      "the domain event sink and the transactional outbox writer",
 	"httpx":       "HTTP middleware and helpers",
 	"idempotency": "the Redis-backed idempotency store",
 	"logging":     "structured logger construction",
+	"money":       "minor-unit arithmetic in AUD",
+	"pagination":  "cursor encoding, shared by every list endpoint",
+	"ratelimit":   "the Redis token bucket behind every limited route",
+	"testsupport": "real-database and real-Redis test harnesses",
+	"validate":    "field-level validation returning the error contract's shape",
 }
 
 // Kind is what a package is, which is what decides the rules that apply to it.
