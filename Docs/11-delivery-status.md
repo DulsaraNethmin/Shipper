@@ -10,7 +10,7 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-10, after wave 0 landed on `main` and `develop`.
+**Last updated:** 2026-08-10, preparing wave 1 — SHIP-15b landed, SHIP-37's dependency was amended, and §2's branch table was corrected after describing a position it had already left.
 
 ---
 
@@ -40,10 +40,12 @@
 
 | Branch | At | Holds |
 |---|---|---|
-| `main` | PR #9 | Same content as `develop` |
-| `develop` | PR #8 | Everything below. **Cut new branches from here** |
+| `main` | PR #9 | Everything below **except this file** |
+| `develop` | PR #10 | Everything below. **Cut new branches from here** |
 
-`main` and `develop` are content-identical. Their histories differ because wave 0 reached `main` through a detour — merged directly (PR #6), reverted (PR #7), reapplied (PR #9). That is resolved; `develop → main` merges normally from now on.
+`develop` is three commits ahead of `main` — the PR that added this tracker had not landed when the paragraph you are reading first described the position, which is the failure mode §11 is about, caught one document earlier than usual. `main` does not have `Docs/11-delivery-status.md` at all. Everything else is content-identical.
+
+Their histories differ because wave 0 reached `main` through a detour — merged directly (PR #6), reverted (PR #7), reapplied (PR #9). That is resolved; `develop → main` merges normally from now on.
 
 **A warning worth keeping.** Reverting a merge does not undo it: the commits stay ancestors forever, so re-merging the same branch brings nothing across and reports success. If a merge to `main` is ever reverted again, the fix is to revert *the revert*, not to merge again.
 
@@ -140,13 +142,14 @@ Strict build order says the next ticket is the lowest-numbered open one, **SHIP-
 | SHIP-22, 23 | 4 | Next.js admin, driver portal |
 | SHIP-29 | 2 | argon2id |
 | SHIP-32, 35 | 6 | Email and SMS adapters |
+| SHIP-37 | 3 | Access token issue — *see below* |
 | SHIP-38 | 2 | `device_sessions` |
 | SHIP-56 | 3 | `jobs` table — unblocked now `users` exists |
 | SHIP-59a | 3 | Geocoding adapter |
 | SHIP-67a | 3 | `cmd/worker` scheduler |
 | SHIP-114 | 5 | Object storage, pre-signed upload |
 
-`Docs/09` lists SHIP-37 as depending on SHIP-30. That is overstated — issuing a signed token is a pure function of user id, role and expiry — but the backlog has not been changed, so treat it as blocked unless you decide otherwise.
+**SHIP-37's dependency has been amended, and the backlog now says so.** It listed SHIP-30, the registration endpoint. Issuing a signed token is a pure function of a user id, a role, a session id and a clock, all of which exist once `users` does — the endpoint is the first *caller*, not a blocker, and `Docs/09` is explicit that *Depends on* lists real blockers rather than merely earlier tickets. Amended to SHIP-28 in the wave-1 prep change, with the reasoning recorded under the M1 table. This paragraph previously said "treat it as blocked unless you decide otherwise"; it was decided.
 
 ## 7. The next wave
 
@@ -160,9 +163,34 @@ Three concurrent tracks, roughly 27 points. One agent per Go package directory, 
 
 A and C need no coordination: `identity/ports.go` declares what it needs of an email sender, Go satisfies interfaces structurally, and neither package imports the other.
 
-Track B must also close the two decisions `Docs/07` §9 leaves open — state management and local persistence — **in `Docs/07`**, not only in code. `Docs/10` §8.3 records the recommendation (Riverpod, go_router, Drift); it needs confirming.
+Track B must also close the two decisions `Docs/07` §9 leaves open — state management and local persistence — **in `Docs/07`**, not only in code. `Docs/10` §8.3 records the recommendation (Riverpod, go_router, Drift); it needs confirming. Note that §9's first decision is compound: it bundles the minimum supported iOS and Android versions with the state approach, and `Docs/10` §8.3 settles only the state half. Both halves close in `Docs/07`.
 
 **Exit criterion:** M0 complete except SHIP-24…27. The app shows the API version from `/health` on both simulators. Email and SMS log to console. A signed access token can be issued and verified.
+
+### Decided before the wave, so three tracks do not decide it three ways
+
+| Question | Decision |
+|---|---|
+| SHIP-37's dependency | Amended to SHIP-28 — §6 |
+| Minimum OS versions | **iOS 14.0, Android API 24.** Deliberately above `flutter_secure_storage`'s `EncryptedSharedPreferences` floor of API 23, because `Docs/07` §3 puts the refresh token in the Keystore and API 21–22 falls back to something weaker |
+| Email, SMS and geocoding vendor | **None yet.** Each `provider.go` speaks a generic HTTP contract over `net/http`, taking base URL, key and sender as its own options. `Docs/06` §4.1's stated pattern is that the seam exists before the vendor does; the vendor is named at SHIP-33, SHIP-36 and SHIP-60, which are the tickets that first send anything real |
+| Australian English under `apps/**` | The spelling check now has two scopes — `Docs/10` §9.3. Without it, `Center(` and `color:` fail CI on Flutter's first commit <!-- spelling:ok — naming the exempted identifiers --> |
+
+### Who owns what, this wave
+
+Nothing in the last row is edited by any track. If a ticket appears to need one, that is a finding to report, not a file to open.
+
+| Surface | Owner |
+|---|---|
+| `internal/identity/**`, the identity migration block, `internal/config/**`, `deploy/.env.example` | **A** |
+| `internal/platform/{email,sms,geocoding}/**`, `apps/admin/**`, `apps/driver-portal/**`, `mk/web.mk` | **C** |
+| `apps/mobile/**`, `.github/workflows/flutter.yml`, `mk/flutter.mk`, `Docs/07` §9 | **B** |
+| `scripts/verify-foundation.sh` | A, then C — which is why **A merges before C** |
+| `cmd/api/**`, `routes_golden.txt`, `go.mod`, `go.sum`, the root `Makefile`, `internal/httpx/**`, `internal/boundaries`, `CLAUDE.md` | **nobody** |
+
+Three things make that hold. `go.mod` needs no change — `golang-jwt/jwt/v5` and `golang.org/x/crypto` are already direct dependencies, so SHIP-29 and SHIP-37 add nothing and Track C uses `net/http`. Track C stays out of `internal/config` because its adapters have no consumer until SHIP-33, SHIP-36 and SHIP-60, so there is nothing to configure yet. And **no route is registered anywhere in this wave** — SHIP-29 is a library, SHIP-38 a table, SHIP-37 a token issuer — so `routes_golden.txt` is untouched and the SHIP-44 gate in §8 is not approached.
+
+Tracks do not touch §1 or §2 of this file either: three agents doing the same arithmetic on one table is a guaranteed conflict, and `make status` computes the real numbers anyway. Each track adds its own tickets to §3 and the §10 fence, and §1, §2 and §7 are refreshed once when the wave lands.
 
 ### Wave rules
 
