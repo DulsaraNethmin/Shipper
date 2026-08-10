@@ -97,6 +97,10 @@ EXCLUDES=(
     ":(exclude)**/node_modules/**"
     ":(exclude)**/*.lock"
     ":(exclude)**/pubspec.lock"
+    # The pnpm lockfile is machine-written and every word in it is a package name somebody
+    # else chose — supports-color, color-convert, normalize-path. It does not match *.lock,
+    # and it did not exist to exclude until SHIP-22 added the workspace.
+    ":(exclude)pnpm-lock.yaml"
     ":(exclude)Docs/09-delivery-backlog-jira.csv"
     # Manifests whose field names are defined by the packaging tool, not by us — `license` is
     # theirs, and the description beside it is not user-facing copy.

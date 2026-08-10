@@ -1,0 +1,14 @@
+{
+  "name": "shipper",
+  "private": true,
+  "description": "Workspace root for the Shipper web surfaces. The applications live in apps/.",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "lint": "pnpm -r run lint",
+    "typecheck": "pnpm -r run typecheck"
+  }
+}
