@@ -17,6 +17,48 @@ flutter run                          # local, whichever device is attached
 There are no web, macOS, Linux or Windows targets, deliberately: they are not in scope, and
 each one enlarges both the tree and the CI surface for nothing.
 
+## Structure and state
+
+`lib/` is organised by **feature**, mirroring the platform domains, exactly as `Docs/07` §2
+draws it:
+
+```
+lib/
+  main.dart        one ProviderScope, one app, nothing else
+  core/            api, auth, storage, errors, queue, routing, the app widget
+  features/        identity, profile, fleet, jobs, bidding, delivery, notifications
+  shared/          design_system, formatting, validation
+```
+
+**Features do not import one another.** Shared behaviour moves to `core/` or `shared/`.
+`test/architecture_test.dart` enforces it — the Dart counterpart of the Go boundary lint
+(SHIP-11), and for the same reason: a boundary that only a document asserts is a boundary that
+is already being crossed. It catches both the `package:shipper/features/…` form and the
+relative `../other_feature/…` form, and it also asserts that `lib/features/` holds exactly the
+seven folders `Docs/07` §2 names, so an eighth feature is a decision somebody recorded rather
+than a folder that appeared.
+
+The stack is closed, in `Docs/10` §8.3 and `Docs/07` §9. **Riverpod** for state, **go_router**
+for routing, **`freezed` + `json_serializable`** for models, **`dio`** for transport, and
+**Drift over SQLite** for the offline queue. A second state library or a second router is a
+defect, not a preference.
+
+How Riverpod is used here:
+
+- **One `ProviderScope`, at the root of `main.dart`.** A second one anywhere gives its subtree
+  a private copy of every provider, including the session. Tests override providers on the root
+  scope rather than creating another.
+- **The router is a provider**, not a constant. `Docs/07` §1 requires customer and provider
+  surfaces to stay genuinely separate inside one app, and what a user sees follows session
+  state, so the navigation graph has to be able to change when the session does.
+- **A redirect is never an authorisation decision** (`Docs/07` §3). It may keep a signed-out
+  user off a screen that would be empty; anything the account is not entitled to do fails
+  server-side whether or not the route was reachable.
+
+Drift is decided but **not yet a dependency**. SHIP-17 is structure; the queue is SHIP-124.
+`lib/core/queue/` holds the reasoning and nothing else, because an unused native dependency in
+both platform builds buys nothing that a folder and a paragraph do not.
+
 ## Deployment floors
 
 **iOS 14.0 and Android API 24**, decided in `Docs/07` §9. They are deployment targets, not

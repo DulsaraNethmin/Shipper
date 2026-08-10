@@ -1,28 +1,42 @@
-# This file configures the analyzer, which statically analyzes Dart code to
-# check for errors, warnings, and lints.
+# Static analysis for the Flutter client.
 #
-# The issues identified by the analyzer are surfaced in the UI of Dart-enabled
-# IDEs (https://dart.dev/tools#ides-and-editors). The analyzer can also be
-# invoked from the command line by running `flutter analyze`.
+# `flutter analyze` fails on anything reported here, including infos, and SHIP-21 runs it on
+# every push. That is the reason to be careful about what goes in: a rule that produces noise
+# gets a baseline of ignores, and a baseline of ignores is a rule nobody enforces.
+#
+# Everything below either encodes a decision from Docs/07 or catches a class of bug that is
+# genuinely silent at runtime.
 
-# The following line activates a set of recommended lints for Flutter apps,
-# packages, and plugins designed to encourage good coding practices.
 include: package:flutter_lints/flutter.yaml
 
-linter:
-  # The lint rules applied to this project can be customized in the
-  # section below to disable rules from the `package:flutter_lints/flutter.yaml`
-  # included above or to enable additional rules. A list of all available lints
-  # and their documentation is published at https://dart.dev/lints.
-  #
-  # Instead of disabling a lint rule for the entire project in the
-  # section below, it can also be suppressed for a single line of code
-  # or a specific dart file by using the `// ignore: name_of_lint` and
-  # `// ignore_for_file: name_of_lint` syntax on the line or in the file
-  # producing the lint.
-  rules:
-    # avoid_print: false  # Uncomment to disable the `avoid_print` rule
-    # prefer_single_quotes: true  # Uncomment to enable the `prefer_single_quotes` rule
+analyzer:
+  language:
+    # `dynamic` is how a JSON map quietly becomes a runtime cast failure three screens later.
+    # Docs/07 §6 requires the client to tolerate unknown response fields, which means decoding
+    # is where types are actually established — so the decoder should be where the analyzer is
+    # strictest, not where it gives up.
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
 
-# Additional information about this file can be found at
-# https://dart.dev/guides/language/analysis-options
+  errors:
+    # A missing return or an unawaited future in the sync worker is a dropped operation, and
+    # Docs/07 §4 says an operation is never silently dropped. Warnings are not enough for
+    # something with that consequence.
+    unawaited_futures: error
+
+linter:
+  rules:
+    # Tokens must never reach logs (Docs/07 §3), and `print` is the shortest path from a
+    # debugging session to exactly that. flutter_lints already carries avoid_print; it is
+    # named here so the reason survives.
+    avoid_print: true
+
+    # An awaited future whose result is ignored, and a future never awaited at all, are the two
+    # halves of the same defect in queue and upload code.
+    unawaited_futures: true
+
+    # Docs/07 §2 organises by feature. Relative imports that climb out of a folder are how that
+    # organisation is eroded, and package: imports make the architecture test's job — and a
+    # reviewer's — considerably easier.
+    always_use_package_imports: true
