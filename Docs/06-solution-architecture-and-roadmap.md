@@ -37,7 +37,9 @@ A Flutter client consumes a plain versioned JSON API, so the BFF's responsibilit
 Two consequences follow:
 
 - **One contract, three consumers.** The mobile app, the admin panel, and the driver portal all consume the same versioned Go API. The admin panel keeps its own Next.js server-side data access for privileged screens, but it is an application detail, not a shared platform tier.
-- **Redis changes role.** It no longer holds web sessions. It now backs refresh-token state, the device registry, idempotency keys for offline retries, and rate limits. The rule from §4 still holds: it must not be the only copy of a job, bid, or status.
+- **Redis changes role.** It no longer holds web sessions. It now backs the device registry, idempotency keys for offline retries, and rate limits. The rule from §4 still holds: it must not be the only copy of a job, bid, or status.
+
+  **Refresh-token state is not Redis's to own.** An earlier draft of this section said it was. PostgreSQL `device_sessions` is the record of truth, and Redis may hold a denylist only as a fast path. The guarantee that presenting a consumed refresh token invalidates the entire device session is a security control, and it has to survive a cache flush. See `Docs/10` §5.
 
 ## 3. Platform domains
 
@@ -63,6 +65,24 @@ At MVP scale, these domains may share one deployable Go application and one Post
 - Files such as proof-of-delivery images and verification documents live in private object storage; the database retains metadata and access controls.
 - Maps/geocoding, push, email/SMS, identity checks, and payments are replaceable integrations behind domain-owned interfaces.
 - State-changing API calls accept a client-supplied idempotency key. A mobile client that retries after a dropped connection must be able to do so safely, and the platform must not create duplicate bids, milestones, or proof records as a result.
+
+### 4.0 How a domain event becomes durable — the transactional outbox
+
+"Every critical state change emits a durable domain event" is a requirement, and until now this document did not say by what mechanism. It matters more than it looks, because it collides with the other hard requirement in the system: the award is **one** transaction.
+
+Publishing to Kafka from inside a database transaction cannot be made atomic. The two failure modes are both real and both bad — publish then fail to commit, and a consumer acts on an award that never happened; commit then fail to publish, and the winning provider is never told.
+
+**The event is written to an `outbox` table in the same transaction as the state change.** A separate publisher process reads unpublished rows in order and writes them to Kafka, marking each published once the broker acknowledges it. The transaction is the only thing that has to be atomic, and it already is.
+
+Three consequences follow, and each is a constraint on the code rather than a note:
+
+- **Delivery is at-least-once, never exactly-once.** The publisher can crash between the broker acknowledging and the row being marked. Every consumer must therefore be idempotent, keyed on the event identifier.
+- **The outbox writer is infrastructure, not the notifications domain.** If it belonged to `notifications`, every domain emitting an event would import that domain, and the import rule in §4.1 forbids it. Each domain takes an event-sink interface it declares itself.
+- **Events are emitted by the domain, inside the transaction** — never by the API layer after the fact, which is `08`'s rule and the reason this mechanism has to sit where the transaction is.
+
+Ordering is per aggregate, not global: events for one job are published in the order they were written, and no ordering is promised across jobs. Nothing in the MVP requires more than that.
+
+This is `SHIP-134`. The seam it plugs into is built with the foundation, because `SHIP-57`, `SHIP-69` and `SHIP-89` all emit events well before the publisher exists — see `Docs/10` §6.1.
 
 ### 4.1 Adapters — where the pattern applies, and where it does not
 
@@ -90,7 +110,7 @@ PostgreSQL is the source of truth by decision, not by circumstance. It is not a 
 
 The cost is concrete rather than theoretical. A generic persistence interface pulls the platform toward lowest-common-denominator SQL, and the two mechanisms holding award correctness together are both PostgreSQL-specific:
 
-- The **partial unique index** enforcing one accepted bid per job (§3, `02` §3).
+- The **partial unique index** enforcing one accepted bid per job (`02` §3).
 - Explicit **row locking** in the award transaction.
 
 Both are load-bearing. Neither survives an abstraction designed to keep the database swappable, and losing either converts a database-enforced guarantee into an application-level hope.
@@ -101,7 +121,7 @@ Where the goal is testable domain logic, a **real PostgreSQL instance in tests**
 
 Interfaces are declared by the domain that **consumes** them, not by the package that implements them. `delivery` declares what it needs from storage; the storage package knows nothing about delivery.
 
-This keeps every dependency arrow pointing inward at the domain, and it is the same property the import lint rule in §3 enforces — the architectural rule and the automated check are the same rule expressed twice.
+This keeps every dependency arrow pointing inward at the domain, and it is the same property the import lint rule enforces — the architectural rule and the automated check are the same rule expressed twice. The lint is `SHIP-11`, described in `08` and implemented in `services/core/cmd/lintboundaries`.
 
 ## 5. Security and operations baseline
 
