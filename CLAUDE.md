@@ -2,11 +2,13 @@
 
 Australian road-transport marketplace. Customers publish delivery jobs, verified transport providers bid privately, the customer awards one, and the delivery is tracked to completion. Marketplace only — Shipper never holds payment in the MVP.
 
-**M0 is under way.** `SHIP-1`…`SHIP-15` have landed: the monorepo structure, the local stack, the Go service with health, configuration, logging and migrations, the domain package skeleton with its boundary lint, the standard error contract, the `/v1` route group, request-ID propagation, and Redis-backed idempotency.
+## Start here
 
-`SHIP-15a` then added what makes more than one person able to work at once: the conventions in `Docs/10`, reserved migration blocks, a self-registering route manifest with a golden file, a real-database test harness that fails rather than skips, and the shared infrastructure packages (`db`, `authctx`, `clock`, `validate`, `events`). Alongside it came `SHIP-20` (CI, at last), `SHIP-28` (`users`), `SHIP-149` (the append-only audit log) and `SHIP-167` (the version gate, which has to precede the first device build).
+**`Docs/11-delivery-status.md` says where the work is** — what is done, what is only half done, what is blocked on something outside this repository, and what is safe to start next. Read it before anything else, and run `make status` to see it counted against the backlog and the commit history.
 
-No domain logic is written yet — the eight domain packages still hold their documentation and nothing else. Work proceeds ticket by ticket through `Docs/09-delivery-backlog.md`, and `Docs/10` says how.
+This file deliberately does **not** repeat that state. An earlier version of this paragraph tried, and described the project as sitting at `SHIP-9` for the entire time `SHIP-10` to `SHIP-15` was being written. One place, kept current, beats two that disagree.
+
+What is stable enough to say here: **M0 is under way, and no domain logic exists yet** — the eight packages under `services/core/internal/` still hold their documentation and nothing else. Work proceeds ticket by ticket through `Docs/09`; `Docs/10` says how to write it.
 
 ## Documents are the source of truth
 
@@ -24,6 +26,7 @@ Read the relevant document before implementing. These are decisions, not suggest
 | `Docs/08` | Build order and repo structure |
 | `Docs/09` | The ticket backlog |
 | `Docs/10` | Engineering conventions — the implementation decisions two people would otherwise answer differently |
+| `Docs/11` | **Delivery status — read this first.** What is done, what is half done, what is blocked, what to start next |
 
 If something contradicts a document, the document wins — or the document needs updating first. Do not resolve a contradiction silently in code.
 
