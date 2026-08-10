@@ -72,6 +72,7 @@ SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `m
 | **SHIP-15a** | Conventions (`Docs/10`) and the shared-surface mechanisms |
 | **SHIP-15b** | The spelling check scoped for client code — *see below* |
 | **SHIP-20** | Go CI — build, boundaries, spelling, tests, migration round trip |
+| **SHIP-16** | Flutter scaffold — iOS and Android only, floors at iOS 14.0 and Android API 24 |
 | **SHIP-22** | Admin panel scaffold — pnpm workspace, Next.js App Router, placeholder shell |
 | **SHIP-23** | Driver portal scaffold — placeholder job page, no token route, no account |
 
@@ -232,7 +233,7 @@ in §4 are deliberately absent.
 
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
-SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b
+SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-16
 SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38
 SHIP-59a SHIP-149 SHIP-167
 ```

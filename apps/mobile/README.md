@@ -6,11 +6,44 @@ at signup and drives the post-login shell; it is not two apps and not two builds
 
 Targets iOS and Android.
 
-## Not yet scaffolded
+## Running it
 
-This directory is a placeholder created by **SHIP-1**. The Flutter project itself arrives in
-**SHIP-16** (scaffold), **SHIP-17** (feature-folder structure and state management), and
-**SHIP-18** (API client with environment-based base URL).
+```
+flutter pub get
+flutter run                          # local, whichever device is attached
+```
+
+`make flutter-run` from the repository root does the same and is documented in `mk/flutter.mk`.
+There are no web, macOS, Linux or Windows targets, deliberately: they are not in scope, and
+each one enlarges both the tree and the CI surface for nothing.
+
+## Deployment floors
+
+**iOS 14.0 and Android API 24**, decided in `Docs/07` §9. They are deployment targets, not
+test targets — development runs against a current simulator and emulator.
+
+| Floor | Set in |
+|---|---|
+| Android API 24 | `minSdk` in `android/app/build.gradle.kts` |
+| iOS 14.0 | `IPHONEOS_DEPLOYMENT_TARGET` in `ios/Runner.xcodeproj/project.pbxproj` |
+
+Two places, not the three this used to need, and the difference is worth recording because
+both of the missing ones look like they should be edited.
+
+- **There is no `Podfile`.** Flutter 3.44 integrates plugins as Swift packages and
+  `flutter create` no longer writes one; adding one by hand re-introduces CocoaPods and makes
+  `flutter build ios` print a warning asking for it to be removed again. If a
+  CocoaPods-only plugin ever arrives, Flutter generates the `Podfile` itself and
+  `flutter_ios_podfile_setup` reads the deployment target from the Xcode project.
+- **`ios/Flutter/AppFrameworkInfo.plist` is not where the floor goes.** Flutter rewrites
+  `MinimumOSVersion` in the built `App.framework` at build time, to its *own* minimum, which
+  is 13.0. Setting 14.0 in the source file changes nothing — verified by reading
+  `MinimumOSVersion` out of `build/ios/iphonesimulator/Runner.app/Frameworks/App.framework/Info.plist`
+  after a build. The app's own `Info.plist` correctly reports 14.0, which is the value the
+  App Store reads.
+
+The application id and bundle identifier are both `au.com.shipper`. **Provisional** until
+X-2 and X-3 register it: neither store lets it change once anything has been published.
 
 ## Things that are already decided
 
