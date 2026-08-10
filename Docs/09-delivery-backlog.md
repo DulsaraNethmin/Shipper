@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**200 tickets, 617 points.**
+**201 tickets, 619 points.**
 
 ## How to read this
 
@@ -31,7 +31,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 29 | 73 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 30 | 75 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 26 | 78 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 27 | 95 |
@@ -39,7 +39,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 13 | 45 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 20 | 65 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 19 | 56 |
-| | | **200** | **617** |
+| | | **201** | **619** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -63,7 +63,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 29 tickets, 73 points
+**Size:** 30 tickets, 75 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -83,6 +83,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-14 | Request ID generation and context propagation | 2 | A request ID flows from middleware into logs and downstream calls | SHIP-9 |
 | SHIP-15 | Idempotency-key middleware backed by Redis | 5 | A repeated key returns the stored original response without re-executing | SHIP-3, SHIP-12 |
 | SHIP-15a | Engineering conventions and the shared-surface mechanisms | 5 | Docs 10 exists; migrations, routes, error codes and test databases each have a mechanism that makes a collision fail a test rather than a merge | SHIP-15 |
+| SHIP-15b | Spelling check scoped for client code | 2 | The Australian English check passes over Flutter and Next.js source while still failing on user-facing copy inside them | SHIP-15a |
 | SHIP-16 | Flutter project scaffold for iOS and Android | 2 | App builds and runs on both simulators | SHIP-1 |
 | SHIP-17 | Flutter feature-folder structure and state management choice | 3 | Structure matches Docs 07 §2 and the state approach is documented | SHIP-16 |
 | SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |
@@ -113,7 +114,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-34 | Phone OTP issue and storage | 3 | A time-limited numeric OTP is generated, rate-limited, and stored hashed | SHIP-30 |
 | SHIP-35 | SMS adapter for OTP delivery | 3 | OTP sends via the SMS provider in staging; logs to console in dev | SHIP-8 |
 | SHIP-36 | Phone verification confirm endpoint | 2 | POST /v1/auth/verify-phone marks the number verified after a correct OTP | SHIP-34, SHIP-35 |
-| SHIP-37 | Access token issue | 3 | Short-lived signed token carrying user ID, role, and expiry | SHIP-30 |
+| SHIP-37 | Access token issue | 3 | Short-lived signed token carrying user ID, role, and expiry | SHIP-28 |
 | SHIP-38 | device_sessions table | 2 | One row per device holding refresh state, device label, and last seen | SHIP-28 |
 | SHIP-39 | Refresh token issue with rotation | 5 | Each refresh returns a new token and invalidates its predecessor | SHIP-38, SHIP-37 |
 | SHIP-40 | Refresh token reuse detection | 3 | Presenting a consumed token invalidates the entire device session | SHIP-39 |
@@ -132,6 +133,8 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-53 | Flutter email verification screen | 2 | User can enter or deep-link a code and see verified state | SHIP-51, SHIP-33 |
 | SHIP-54 | Flutter phone verification screen | 3 | User can request and enter an OTP with resend throttling | SHIP-51, SHIP-36 |
 | SHIP-55 | Flutter login screen | 2 | An existing user can sign in and lands in the correct role shell | SHIP-49, SHIP-41 |
+
+**SHIP-37 depended on SHIP-30 until wave 1, and no longer does.** Issuing a signed token is a pure function of a user id, a role, a session id and a clock, all of which exist once `users` does — the registration endpoint is the first *caller*, not a blocker. Under the rule in *How to read this*, that made it an earlier ticket rather than a real blocker, and the effect was to hold a two-day piece of work behind an endpoint that needs it. Amended to SHIP-28 so the identity foundation can be built alongside the endpoints that consume it. SHIP-39 and SHIP-44 continue to depend on SHIP-37, which is a real blocker in both cases.
 
 ## M2 — Jobs
 
