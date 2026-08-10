@@ -18,14 +18,14 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 20 | ~48 |
+| **Done** | 21 | ~50 |
 | Remaining | 180 | ~569 |
-| **Total** | 200 | 617 |
+| **Total** | 201 | 619 |
 
 | Milestone | Done | Points |
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
-| **M0** Foundation | 17 / 29 | 41 / 73 |
+| **M0** Foundation | 18 / 30 | 43 / 75 |
 | **M1** Identity | 1 / 28 | 2 / 78 |
 | **M2** Jobs | 0 / 26 | 0 / 78 |
 | **M3** Bidding and award | 0 / 27 | 0 / 95 |
@@ -51,7 +51,7 @@
 
 Verified by `make verify` — **47 checks**, and `make check` green.
 
-### M0 — Foundation (17 of 29)
+### M0 — Foundation (18 of 30)
 
 | Ticket | What |
 |---|---|
@@ -63,6 +63,7 @@ Verified by `make verify` — **47 checks**, and `make check` green.
 | SHIP-12, 13, 14 | Error contract, `/v1` group, request-ID propagation |
 | SHIP-15 | Redis idempotency middleware, fail-closed |
 | **SHIP-15a** | Conventions (`Docs/10`) and the shared-surface mechanisms |
+| **SHIP-15b** | The spelling check scoped for client code — *see below* |
 | **SHIP-20** | Go CI — build, boundaries, spelling, tests, migration round trip |
 
 ### Elsewhere
@@ -91,6 +92,14 @@ This is the part a new session most needs to know about, because it changes how 
 | `COMPOSE_PROJECT_NAME` pinned | `Makefile` | Worktrees each starting a stack and fighting over ports |
 
 Shared packages now available to every domain: `db` (Runner, InTx), `authctx`, `clock`, `validate`, `events` (outbox writer). Registered but not yet written: `pagination`, `ratelimit`, `money` — write them when first needed, no shared edit required.
+
+### What SHIP-15b changed, and why it existed at all
+
+The Australian English check word-matched case-insensitively over every tracked file, and had never seen Dart or TypeScript because none existed. Flutter's `Center` and `color:` matched `centre` and `colour`; Tailwind's `items-center` matched too. **Track B and Track C would have failed CI on their first commit**, before writing a line of their own. <!-- spelling:ok — naming the exempted identifiers -->
+
+The check now has two scopes — `Docs/10` §9.3. Words that cannot be a framework symbol still apply everywhere, `apps/**` included, because `cancelled` is a job status and `licence` is what a provider is verified against; the dozen that are framework API names apply everywhere else. A single unrenameable identifier takes a `spelling:ok` line waiver instead of an exclude, which is how the `Authorization` header will be handled in Go at SHIP-44.
+
+It is a ticket rather than an untracked commit because `Docs/09` says a letter suffix marks work the plan assumed and no ticket owned. This was exactly that, found by reading the lint rather than by CI going red.
 
 ## 4. Partly done — do not treat these as finished
 
@@ -183,7 +192,7 @@ in §4 are deliberately absent.
 
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
-SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a
+SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b
 SHIP-20 SHIP-28 SHIP-149 SHIP-167
 ```
 

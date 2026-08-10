@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**200 tickets, 617 points.**
+**201 tickets, 619 points.**
 
 ## How to read this
 
@@ -31,7 +31,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 29 | 73 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 30 | 75 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 26 | 78 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 27 | 95 |
@@ -39,7 +39,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 13 | 45 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 20 | 65 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 19 | 56 |
-| | | **200** | **617** |
+| | | **201** | **619** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -63,7 +63,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 29 tickets, 73 points
+**Size:** 30 tickets, 75 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -83,6 +83,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-14 | Request ID generation and context propagation | 2 | A request ID flows from middleware into logs and downstream calls | SHIP-9 |
 | SHIP-15 | Idempotency-key middleware backed by Redis | 5 | A repeated key returns the stored original response without re-executing | SHIP-3, SHIP-12 |
 | SHIP-15a | Engineering conventions and the shared-surface mechanisms | 5 | Docs 10 exists; migrations, routes, error codes and test databases each have a mechanism that makes a collision fail a test rather than a merge | SHIP-15 |
+| SHIP-15b | Spelling check scoped for client code | 2 | The Australian English check passes over Flutter and Next.js source while still failing on user-facing copy inside them | SHIP-15a |
 | SHIP-16 | Flutter project scaffold for iOS and Android | 2 | App builds and runs on both simulators | SHIP-1 |
 | SHIP-17 | Flutter feature-folder structure and state management choice | 3 | Structure matches Docs 07 §2 and the state approach is documented | SHIP-16 |
 | SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |

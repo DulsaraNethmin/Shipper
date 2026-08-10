@@ -331,6 +331,27 @@ Dependencies are added deliberately, not opportunistically. If a change genuinel
 
 `authorisation`, `minimise`, `organisation`, `serialise`. Enforced by `scripts/check-spelling.sh` in CI, because the default for most tooling and most generated text is American.
 
+**The check has two scopes, because under `apps/**` the American form of a dozen of these words is the API rather than a spelling.** Flutter has `Center`, `color:` and `behavior:`; Tailwind has `items-center`; Firebase has `initializeApp`; `json_serializable` generates `serialize`. None can be renamed, and waiving them individually would be hundreds of lines of exactly the noise the script's header warns about. <!-- spelling:ok — this sentence has to name the identifiers the rule exempts -->
+
+That sentence carries a waiver of its own, which is the shortest available demonstration that the mechanism works: a document explaining the exemption has to spell the words it exempts.
+
+So the pair list is split:
+
+| List | Applies to | Holds |
+|---|---|---|
+| `PAIRS` | everything, `apps/**` included | words that cannot be a framework symbol — `authorise`, `organisation`, `cancelled`, `licence`, `minimise`, `fulfil`, `metre` |
+| `IDENTIFIER_PAIRS` | everything **except** `apps/**` | `serialise`, `normalise`, `initialise`, `catalogue`, `behaviour`, `colour`, `centre` |
+
+The split is drawn where it is because `CLAUDE.md` scopes the rule to documents and user-facing copy, and the copy a customer reads is inside `apps/**`. Excluding the whole tree — the obvious alternative — would have stopped checking precisely the half that matters most, while `cancelled` is a job status (`Docs/02` §1) and `licence` is what a provider is verified against (`Docs/04`).
+
+**A one-off unrenameable identifier takes a line waiver, not an exclude:**
+
+```go
+const authHeader = "Authorization" // spelling:ok — HTTP header name, RFC 9110
+```
+
+That header is spelled by RFC 9110 and not by us, and the Go service meets it at SHIP-44 exactly as the Flutter and Next.js clients meet it now. A waiver names its reason on the line that needs it; an exclude quietly stops checking everything else in the file. Add a path to `EXCLUDES` only when the whole file is somebody else's to spell — `package.json` and `pubspec.yaml` are, and are excluded.
+
 ## 10. What this document changes elsewhere
 
 | Document | Change |
