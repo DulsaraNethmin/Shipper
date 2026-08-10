@@ -23,17 +23,6 @@ Each workflow declares the paths it cares about:
 A workflow that ignores its own file will not re-run when that file is fixed, which is a
 confusing way to debug CI. Include it in the filter.
 
-## The Go workflow runs `make check`
-
-**SHIP-20** should invoke `make check` rather than listing steps of its own. It is already
-`vet` + the domain boundary lint (**SHIP-11**) + `go test ./... -race`, and a workflow that
-reimplements that list drifts from it — the boundary lint would then be enforced locally
-and not in CI, which is the one place it has to hold.
-
-The Redis-backed tests skip themselves when there is no Redis to reach, so the workflow
-needs a Redis service container for them to actually run. Without one they pass by being
-skipped, which reads as green.
-
 ## Secrets
 
 Signing keys, keystores, provisioning profiles, and service-account JSON live in the CI

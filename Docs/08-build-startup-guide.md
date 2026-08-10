@@ -86,7 +86,6 @@ services/core/internal/
     service.go       domain logic and transition rules
     ports.go         interfaces this domain requires
     postgres.go      persistence — concrete, not behind an interface
-    http.go          handlers and route registration
   bidding/
   delivery/
   platform/
@@ -95,8 +94,6 @@ services/core/internal/
     push/            fcm.go, noop.go
     storage/         local.go, s3.go
 ```
-
-`http.go` sits in the domain rather than in `cmd/api`, so that adding a domain adds a file instead of editing a shared one — which is what lets two domains be built at the same time without conflicting. A domain importing `internal/httpx` is sitting on infrastructure, not crossing a boundary. The full file layout, including `doc.go`, `model.go` and `errors.go`, is in `Docs/10` §2.1.
 
 Two rules make this hold, both from `06` §4.1:
 
