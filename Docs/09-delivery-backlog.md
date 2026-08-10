@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**194 tickets, 599 points.**
+**200 tickets, 617 points.**
 
 ## How to read this
 
@@ -24,20 +24,22 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 
 **Depends on** lists real blockers only, not merely earlier tickets. Where a ticket has no dependency it can genuinely be pulled forward if you want a change of pace.
 
+**A letter suffix means a ticket added after the first draft.** `SHIP-57a` sorts immediately after `SHIP-57` and before `SHIP-58`, so build order is preserved without renumbering two hundred rows. Each one exists because work the plan assumed turned out to belong to no ticket — a table nobody created, an adapter nobody owned, a process four scheduled tasks all needed.
+
 ## Milestones
 
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 27 | 65 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 29 | 73 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
-| **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 22 | 68 |
+| **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 26 | 78 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 27 | 95 |
 | **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 29 | 101 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 13 | 45 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 20 | 65 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 19 | 56 |
-| | | **194** | **599** |
+| | | **200** | **617** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -61,7 +63,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 27 tickets, 65 points
+**Size:** 29 tickets, 73 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -80,8 +82,10 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-13 | API versioning scheme with a /v1 route group | 2 | All routes are served under /v1 and the version is documented | SHIP-5 |
 | SHIP-14 | Request ID generation and context propagation | 2 | A request ID flows from middleware into logs and downstream calls | SHIP-9 |
 | SHIP-15 | Idempotency-key middleware backed by Redis | 5 | A repeated key returns the stored original response without re-executing | SHIP-3, SHIP-12 |
+| SHIP-15a | Engineering conventions and the shared-surface mechanisms | 5 | Docs 10 exists; migrations, routes, error codes and test databases each have a mechanism that makes a collision fail a test rather than a merge | SHIP-15 |
 | SHIP-16 | Flutter project scaffold for iOS and Android | 2 | App builds and runs on both simulators | SHIP-1 |
 | SHIP-17 | Flutter feature-folder structure and state management choice | 3 | Structure matches Docs 07 §2 and the state approach is documented | SHIP-16 |
+| SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |
 | SHIP-18 | Flutter API client with environment-based base URL | 3 | Client targets local, staging, and production by build flavour | SHIP-17 |
 | SHIP-19 | Flutter health round trip proving connectivity | 1 | App displays the API version fetched from /health | SHIP-18, SHIP-6 |
 | SHIP-20 | CI: Go build, vet, and test | 2 | Workflow runs on every push and fails on a broken build or test | SHIP-5 |
@@ -132,15 +136,18 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M2 — Jobs
 
 **Goal:** A verified customer can create, publish, amend, and cancel a job from the app.  
-**Size:** 22 tickets, 68 points
+**Size:** 26 tickets, 78 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
-| SHIP-56 | jobs table and status enum migration | 3 | Schema covers all twelve statuses from Docs 02 §1 | SHIP-7 |
+| SHIP-56 | jobs table and status enum migration | 3 | Schema covers all twelve statuses from Docs 02 §1 | SHIP-7, SHIP-28 |
+| SHIP-56a | Status enumeration codegen for Go, Dart and TypeScript | 2 | One source produces all three; CI fails if a generated file is stale | SHIP-56 |
 | SHIP-57 | Job status transition guard | 5 | Every transition passes one guarded function; status is never directly settable | SHIP-56 |
+| SHIP-57a | job_status_history table | 2 | Every transition records actor, reason, actor time and server time | SHIP-57 |
 | SHIP-58 | Goods category reference data | 2 | Categories load from configuration and are served to clients, not compiled in | SHIP-56, X-9 |
 | SHIP-59 | Prohibited goods validation on publish | 3 | A job in a prohibited category cannot be published and explains why | SHIP-58 |
-| SHIP-60 | Address and location value object | 3 | Pickup and drop-off validate and normalise, with coordinates resolved | SHIP-56 |
+| SHIP-59a | Geocoding adapter | 3 | Provider-backed in staging, stub in tests; a failed lookup does not fail the job | SHIP-8 |
+| SHIP-60 | Address and location value object | 3 | Pickup and drop-off validate and normalise, with coordinates resolved | SHIP-56, SHIP-59a |
 | SHIP-61 | Create job draft endpoint | 3 | POST /v1/jobs creates a Draft owned by the calling customer | SHIP-57, SHIP-44 |
 | SHIP-62 | Edit job draft endpoint | 3 | PATCH /v1/jobs/{id} updates a Draft and rejects edits by non-owners | SHIP-61 |
 | SHIP-63 | Publish job endpoint | 5 | Publishing validates required fields, checks customer verification, and transitions to Open | SHIP-59, SHIP-60, SHIP-62 |
@@ -148,7 +155,8 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-65 | Job detail endpoint, customer view | 3 | Returns full job including budget, for the owning customer only | SHIP-61 |
 | SHIP-66 | Job list endpoint, customer view | 3 | Returns the customer's own jobs, filterable by status, paginated | SHIP-65 |
 | SHIP-67 | Budget field stored and never serialised to providers | 3 | A provider-facing serialisation test proves the field cannot leak | SHIP-65 |
-| SHIP-68 | Job expiry scheduled task | 5 | Open jobs close at the earlier of 14 days or the pickup date passing | SHIP-57 |
+| SHIP-67a | Scheduled task runner | 3 | cmd/worker claims due work with FOR UPDATE SKIP LOCKED and survives running twice | SHIP-7 |
+| SHIP-68 | Job expiry scheduled task | 5 | Open jobs close at the earlier of 14 days or the pickup date passing | SHIP-57, SHIP-67a |
 | SHIP-69 | Expiry warning 48 hours ahead | 2 | A domain event fires 48 hours before a job would expire | SHIP-68 |
 | SHIP-70 | Extend job expiry endpoint | 2 | A customer can extend an expiring job in one call | SHIP-68 |
 | SHIP-71 | Flutter job creation: locations step | 3 | Pickup and drop-off captured with validation and address lookup | SHIP-49, SHIP-60 |
@@ -177,7 +185,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-86 | Withdraw bid endpoint | 2 | A provider can withdraw before acceptance; status becomes Withdrawn | SHIP-84 |
 | SHIP-87 | Counter-offer endpoint for both parties | 5 | Customer and provider can counter; each counter supersedes the prior offer | SHIP-84 |
 | SHIP-88 | Offer supersede and history chain | 3 | Only the latest valid offer is acceptable; full chain remains readable | SHIP-87 |
-| SHIP-89 | Bid expiry scheduled task | 3 | Bids expire on their own terms and emit an event | SHIP-84 |
+| SHIP-89 | Bid expiry scheduled task | 3 | Bids expire on their own terms and emit an event | SHIP-84, SHIP-67a |
 | SHIP-90 | Negotiating presentation status | 2 | A job with active offers presents as Negotiating without closing to new bids | SHIP-87, SHIP-57 |
 | SHIP-91 | Database constraint: one accepted bid per job | 2 | A partial unique index makes a second accepted bid impossible at the database level | SHIP-80 |
 | SHIP-92 | Award endpoint, transactional happy path | 5 | POST /v1/jobs/{id}/award accepts one bid and moves the job to Awarded in one transaction | SHIP-91, SHIP-88 |
@@ -215,7 +223,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-116 | Proof exception reason capture | 3 | A reasoned exception can be recorded in place of a photo | SHIP-115 |
 | SHIP-117 | Exception flags the job for moderation | 2 | An exception-completed job enters the moderation queue | SHIP-116 |
 | SHIP-118 | Delivered validation requires proof or exception | 3 | Delivered is rejected without either; verified by test | SHIP-116, SHIP-57 |
-| SHIP-119 | 72-hour auto-complete task | 3 | A Delivered job with no dispute becomes Completed after 72 hours | SHIP-118 |
+| SHIP-119 | 72-hour auto-complete task | 3 | A Delivered job with no dispute becomes Completed after 72 hours | SHIP-118, SHIP-67a |
 | SHIP-120 | Driver portal token landing and job view | 5 | Opening the link shows only that job's delivery detail | SHIP-23, SHIP-108 |
 | SHIP-121 | Driver portal milestone controls | 3 | Large touch targets record each milestone from a mobile browser | SHIP-120, SHIP-111 |
 | SHIP-122 | Driver portal photo capture and upload | 5 | Browser camera captures proof and uploads via pre-signed URL | SHIP-121, SHIP-114 |

@@ -1,5 +1,17 @@
 # Shipper  
-  
+
+> **Superseded — kept as the original concept note, not as a specification.**
+>
+> This was the first sketch of the product and it has since been overtaken in three
+> material ways. It describes a **Next.js client with a Next.js BFF**; there is no BFF
+> tier and the client is **Flutter** (`Docs/06` §2.1, §7). It lists roles as
+> **Driver / Customer / Admin**; the roles are **customer, provider, assigned driver and
+> administrator**, with the assigned driver holding no account at all (`Docs/01` §3). And
+> it treats Redis as a BFF cache; Redis backs the device registry, idempotency keys and
+> rate limits (`Docs/06` §2.1).
+>
+> **`Docs/01`–`10` are the specification.** Read this only for the original intent.
+
 This application is a bidding platform for good transportation services located in Australia.  
 2 Applications and 3 user roles  
 1. Client app  

@@ -46,6 +46,7 @@ func main() {
 
 func run() error {
 	dir := flag.String("dir", defaultDir, "directory holding migration files (used by create only)")
+	domain := flag.String("domain", "", "which reserved block to draw the number from (used by create only)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -65,7 +66,7 @@ func run() error {
 	case "force":
 		return force(args[1:])
 	case "create":
-		return create(*dir, args[1:])
+		return createCmd(*dir, *domain, args[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -79,10 +80,16 @@ func usage() {
   migrate down [n|all]   reverse the last migration (default 1), the last n, or all
   migrate version        print the current schema version
   migrate force <v>      set the recorded version to v without running migrations
-  migrate create <name>  write the next pair of empty migration files
+  migrate create <name> -domain <d>
+                         write the next pair of empty migration files, numbered inside
+                         the block reserved for that domain, e.g.
+                         migrate create users_table -domain shared
 
 The database is taken from DATABASE_URL. Migrations are compiled into this binary; the
--dir flag only affects where `+"`create`"+` writes new files.
+-dir and -domain flags only affect `+"`create`"+`.
+
+Migration numbers are allocated in per-domain blocks so that two branches cannot claim the
+same one. The reserved ranges are in migrations/blocks.go.
 `)
 }
 
@@ -210,14 +217,71 @@ var (
 	nonNameChars   = regexp.MustCompile(`[^a-z0-9]+`)
 )
 
-// create writes the next numbered up/down pair.
+// createCmd parses create's own flags before delegating.
 //
-// Sequence numbers rather than timestamps: with a single ordered backlog there is no
-// concurrent-branch problem for them to solve, and a gap in a sequence is immediately
-// visible where a missing timestamp is not.
-func create(dir string, args []string) error {
+// The standard flag package stops at the first non-flag argument, so with only the global set
+// `migrate create users -domain jobs` puts "-domain" and "jobs" into the positional arguments
+// and reports a confusing complaint about the number of names. Giving the subcommand its own
+// set means both orderings work, which matters because this is the command every new domain
+// runs first and the error it produces is the whole user interface of the block scheme.
+//
+// The globals are the defaults, so `migrate -domain jobs create users` keeps working too.
+func createCmd(dir, domain string, args []string) error {
+	fs := flag.NewFlagSet("create", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	d := fs.String("dir", dir, "directory holding migration files")
+	dom := fs.String("domain", domain, "which reserved block to draw the number from")
+
+	flags, positional := splitFlags(args)
+	if err := fs.Parse(flags); err != nil {
+		return err
+	}
+	return create(*d, *dom, positional)
+}
+
+// splitFlags separates flag arguments from positional ones so that either ordering parses.
+//
+// The flag package stops at the first argument that is not a flag, which is why
+// `create users -domain shared` would otherwise treat "-domain" and "shared" as extra names.
+// Every flag this command takes has a value, so an argument beginning with "-" and containing
+// no "=" consumes the one after it.
+func splitFlags(args []string) (flags, positional []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			positional = append(positional, a)
+			continue
+		}
+		flags = append(flags, a)
+		if !strings.Contains(a, "=") && i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	return flags, positional
+}
+
+// create writes the next numbered up/down pair inside the domain's reserved block.
+//
+// Sequence numbers rather than timestamps, because a gap in a sequence is immediately visible
+// where a missing timestamp is not. An earlier version of this comment said the concurrent-
+// branch problem timestamps solve did not apply here, on the grounds that the backlog is a
+// single ordered queue. That stopped being true the moment two branches could be open at once:
+// both would read this directory, both would compute the same next number, and the collision
+// would survive review because the two filenames differ. Reserved per-domain blocks restore
+// the property the original comment assumed — see migrations/blocks.go.
+func create(dir, domain string, args []string) error {
 	if len(args) != 1 {
 		return errors.New("create: expected exactly one name, e.g. `create users_table`")
+	}
+	if domain == "" {
+		return errors.New("create: -domain is required, e.g. `-domain jobs`; " +
+			"see migrations/blocks.go for the reserved ranges")
+	}
+
+	block, err := migrations.BlockFor(domain)
+	if err != nil {
+		return fmt.Errorf("create: %w", err)
 	}
 
 	name := strings.Trim(nonNameChars.ReplaceAllString(strings.ToLower(args[0]), "_"), "_")
@@ -230,15 +294,26 @@ func create(dir string, args []string) error {
 		return fmt.Errorf("reading %s: %w", dir, err)
 	}
 
-	next := 1
+	// The next free number *within this block*, not across the directory. This is the whole
+	// mechanism: two branches in different domains draw from ranges that cannot overlap.
+	next := block.First
 	for _, e := range entries {
 		match := sequencePrefix.FindStringSubmatch(e.Name())
 		if match == nil {
 			continue
 		}
-		if n, err := strconv.Atoi(match[1]); err == nil && n >= next {
+		n, err := strconv.Atoi(match[1])
+		if err != nil || n < block.First || n > block.Last {
+			continue
+		}
+		if n >= next {
 			next = n + 1
 		}
+	}
+
+	if next > block.Last {
+		return fmt.Errorf("create: %s has used every number from %d to %d; widen its block in migrations/blocks.go",
+			domain, block.First, block.Last)
 	}
 
 	for _, direction := range []string{"up", "down"} {

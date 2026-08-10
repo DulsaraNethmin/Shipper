@@ -47,12 +47,41 @@ func (e Environment) valid() bool {
 
 // Config is the whole of the service's configuration.
 type Config struct {
-	Env      Environment
-	HTTP     HTTP
-	Log      Log
-	Database Database
-	Redis    Redis
-	Kafka    Kafka
+	Env         Environment
+	HTTP        HTTP
+	Log         Log
+	Database    Database
+	Redis       Redis
+	Kafka       Kafka
+	Idempotency Idempotency
+	App         App
+}
+
+// App is what the mobile client is told about itself at launch (SHIP-167).
+//
+// It lives in configuration rather than in code because Docs/07 §6 makes raising the floor "an
+// operational decision with an owner, not a side effect of a deploy" — and because Flutter has
+// no over-the-air path for Dart code, so anything that has to change under pressure has to
+// change server-side (Docs/06 §5.3).
+type App struct {
+	// MinimumIOSBuild and MinimumAndroidBuild are build numbers, not version strings.
+	//
+	// Docs/07 §8 requires every build to carry a unique, monotonically increasing build
+	// number, which makes the comparison an integer one. Comparing semantic versions
+	// would mean agreeing on an ordering for pre-release suffixes, and getting that
+	// slightly wrong would either lock out a valid build or admit one that should have
+	// been blocked.
+	MinimumIOSBuild     int
+	MinimumAndroidBuild int
+
+	// IOSStoreURL and AndroidStoreURL are where a blocked build sends the user.
+	//
+	// Empty during the pilot: distribution is TestFlight and Play internal testing with no
+	// public listing (Docs/01 §8), so there is no store page to link to yet. The client
+	// shows the prompt without a link when these are blank, which is why an empty value is
+	// allowed rather than refused at startup.
+	IOSStoreURL     string
+	AndroidStoreURL string
 }
 
 // HTTP configures the public API listener.
@@ -102,6 +131,23 @@ type Kafka struct {
 	Brokers []string
 }
 
+// Idempotency configures how long the platform remembers what it answered a
+// state-changing request, so that a retry replays rather than repeats it (SHIP-15).
+type Idempotency struct {
+	// TTL is how long a completed response stays replayable.
+	//
+	// It has to outlast the client's retry behaviour, not the request. A phone can be
+	// out of coverage for hours and drain its queue on the drive home (SHIP-124,
+	// SHIP-125), so this is measured in hours rather than minutes.
+	TTL time.Duration
+
+	// InFlightTTL bounds how long a claim survives with no response recorded against it,
+	// which is what happens when the process handling the original request dies. Until
+	// it lapses, retries of that request are refused — so it wants to be comfortably
+	// longer than the slowest handler and much shorter than TTL.
+	InFlightTTL time.Duration
+}
+
 // credentialBearingDefaults are variables whose built-in defaults embed a local
 // throwaway credential. They make a fresh clone work against docker-compose and are
 // refused outside development — see loader.validate.
@@ -140,6 +186,16 @@ func Load() (*Config, error) {
 		Kafka: Kafka{
 			Brokers: l.csv("KAFKA_BROKERS", []string{"localhost:29092"}),
 		},
+		Idempotency: Idempotency{
+			TTL:         l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
+			InFlightTTL: l.duration("IDEMPOTENCY_IN_FLIGHT_TTL", 60*time.Second),
+		},
+		App: App{
+			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
+			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
+			IOSStoreURL:         l.str("IOS_STORE_URL", ""),
+			AndroidStoreURL:     l.str("ANDROID_STORE_URL", ""),
+		},
 	}
 
 	l.validate(cfg)
@@ -163,6 +219,8 @@ func (c Config) LogValue() slog.Value {
 		slog.String("database_url", redactURL(c.Database.URL)),
 		slog.String("redis_url", redactURL(c.Redis.URL)),
 		slog.String("kafka_brokers", strings.Join(c.Kafka.Brokers, ",")),
+		slog.Duration("idempotency_ttl", c.Idempotency.TTL),
+		slog.Duration("idempotency_in_flight_ttl", c.Idempotency.InFlightTTL),
 	)
 }
 
@@ -313,6 +371,13 @@ func (l *loader) validate(cfg *Config) {
 	if cfg.Database.MaxIdleConns > cfg.Database.MaxOpenConns {
 		l.errf("DATABASE_MAX_IDLE_CONNS (%d) cannot exceed DATABASE_MAX_OPEN_CONNS (%d)",
 			cfg.Database.MaxIdleConns, cfg.Database.MaxOpenConns)
+	}
+
+	// A claim that outlived the replay window would refuse a client's retries for longer
+	// than it could ever answer them, which is the worst of both.
+	if cfg.Idempotency.InFlightTTL > cfg.Idempotency.TTL {
+		l.errf("IDEMPOTENCY_IN_FLIGHT_TTL (%s) cannot exceed IDEMPOTENCY_TTL (%s)",
+			cfg.Idempotency.InFlightTTL, cfg.Idempotency.TTL)
 	}
 
 	// Everything below this point is a deployment-safety rule. Development is exempt by

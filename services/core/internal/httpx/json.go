@@ -11,14 +11,17 @@ import (
 // marshal produces a clean 500 rather than a 200 followed by a truncated body — the
 // latter being far harder to diagnose from the client's end.
 //
-// This is a minimal helper, not the API error contract. SHIP-12 defines the single error
-// shape with a machine-readable code that every endpoint returns.
+// This writes success bodies. Failures go through [WriteError], which puts them in the
+// standard error contract (SHIP-12).
 func WriteJSON(w http.ResponseWriter, status int, v any) {
 	body, err := json.Marshal(v)
 	if err != nil {
+		// The fallback is a literal rather than a marshalled errorEnvelope, because the
+		// one thing already established here is that marshalling can fail.
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"internal_error"}`))
+		_, _ = w.Write([]byte(`{"error":{"code":"internal_error",` +
+			`"message":"Something went wrong at our end."}}`))
 		return
 	}
 
