@@ -1,4 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Flutter's template declares INTERNET only in the debug and profile manifests, for hot
+         reload. A release build therefore has no network access at all, and every API call
+         fails — on the one build type nobody exercises during development, because debug and
+         profile both work. Declared here so it applies to every build type.
+
+         An install-time permission: no prompt, no runtime request, and so no rationale copy. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <!-- SHIP-179. Android has no purpose-string attribute: the system prompt is a fixed
          sentence, so the explanation has to be in-app copy shown before the prompt. It lives in
          lib/core/permissions/permission_copy.dart, and permission_copy_test.dart asserts that

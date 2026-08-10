@@ -62,19 +62,23 @@ void main() {
       );
     });
 
-    test('asks for nothing that has no copy explaining it', () {
-      // Android's own prompt is a fixed sentence, so every runtime permission needs in-app
-      // copy or the user is asked a question with no context. This is the list; adding a
-      // permission without writing its rationale fails here.
+    test('asks for nothing at run time that has no copy explaining it', () {
+      // Android's own prompt is a fixed sentence, so every *runtime* permission needs in-app
+      // copy or the user is asked a question with no context. Adding one without writing its
+      // rationale fails here.
       final requested = RegExp(r'android\.permission\.([A-Z_]+)')
           .allMatches(manifest)
-          .map((m) => m.group(1))
+          .map((m) => m.group(1)!)
           .toSet();
 
-      const explained = {'CAMERA': true, 'POST_NOTIFICATIONS': true};
+      // Install-time permissions are granted without a prompt, so there is no moment at which
+      // copy could be shown. They are listed rather than pattern-matched, so that a new one is
+      // a decision somebody made here.
+      const installTime = {'INTERNET'};
+      const explained = {'CAMERA', 'POST_NOTIFICATIONS'};
 
       expect(
-        requested.difference(explained.keys.toSet()),
+        requested.difference(explained).difference(installTime),
         isEmpty,
         reason: 'a permission was added without rationale copy in PermissionCopy',
       );
