@@ -93,6 +93,7 @@ SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `m
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
+| **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -239,7 +240,7 @@ in §4 are deliberately absent.
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-16 SHIP-17 SHIP-18 SHIP-19 SHIP-21
 SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38
-SHIP-59a SHIP-149 SHIP-167
+SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 
 ## 11. Keeping this file honest

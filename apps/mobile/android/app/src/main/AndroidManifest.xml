@@ -1,4 +1,22 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- SHIP-179. Android has no purpose-string attribute: the system prompt is a fixed
+         sentence, so the explanation has to be in-app copy shown before the prompt. It lives in
+         lib/core/permissions/permission_copy.dart, and permission_copy_test.dart asserts that
+         every permission declared here has copy written for it.
+
+         Photo proof of delivery (Docs/01 §4.4). -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+
+    <!-- Declaring CAMERA otherwise makes Google Play treat a camera as a hardware requirement
+         and hide the app from devices without one. Docs/01 §4.4 allows a recorded exception
+         reason instead of a photo, so the app genuinely works without a camera and must not
+         exclude anybody on its account. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+
+    <!-- Push, from Android 13. Docs/07 §5 asks at the moment its value is obvious — after a
+         first bid arrives — and the app stays fully usable when it is refused. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
     <application
         android:label="Shipper"
         android:name="${applicationName}"

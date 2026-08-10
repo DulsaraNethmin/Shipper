@@ -26,6 +26,17 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- SHIP-179. iOS renders this verbatim in the camera prompt, and Apple rejects both a
+	     missing purpose string and a vague one. It is kept identical to
+	     PermissionCopy.cameraPurpose in lib/core/permissions/permission_copy.dart, and
+	     test/core/permissions/permission_copy_test.dart fails if the two drift apart.
+
+	     There is no equivalent key for notifications — iOS writes that prompt itself. The
+	     notification rationale is in-app copy shown before the system prompt, which is what
+	     Docs/07 §5 asks for regardless: the ask happens after a first bid arrives, at the
+	     moment its value is obvious, and not on first launch. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Shipper uses the camera to photograph goods at pickup and delivery, as proof the job was completed. If you cannot take a photo, you can record the reason instead.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
