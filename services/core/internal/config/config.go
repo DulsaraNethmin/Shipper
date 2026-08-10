@@ -54,7 +54,34 @@ type Config struct {
 	Redis       Redis
 	Kafka       Kafka
 	Idempotency Idempotency
+	Identity    Identity
 	App         App
+}
+
+// Identity configures credentials and sessions (SHIP-29 onwards).
+//
+// It is configuration rather than compiled-in constants because the values are expected to
+// change without a release: the argon2id cost is raised as hardware improves. Docs/10 §5 is the
+// specification.
+type Identity struct {
+	// Argon2 is the cost new password hashes are written at.
+	//
+	// Verification does not read it. The parameters travel with each hash in its PHC string,
+	// so raising these values leaves every stored password verifiable and upgrades each one at
+	// its owner's next sign-in, with no migration (Docs/10 §5).
+	Argon2 Argon2
+}
+
+// Argon2 is the password hashing cost.
+//
+// It mirrors identity.Argon2Profile, which is the type the domain takes. Two shapes rather than
+// one shared type on purpose: internal/config does not import a domain, the domain does not
+// import configuration, and the two meet in cmd/api — which is the rule that keeps every domain
+// independently buildable (Docs/06 §4.1).
+type Argon2 struct {
+	MemoryKiB   uint32
+	Iterations  uint32
+	Parallelism uint8
 }
 
 // App is what the mobile client is told about itself at launch (SHIP-167).
@@ -190,6 +217,16 @@ func Load() (*Config, error) {
 			TTL:         l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
 			InFlightTTL: l.duration("IDEMPOTENCY_IN_FLIGHT_TTL", 60*time.Second),
 		},
+		Identity: Identity{
+			// m=64 MiB, t=3, p=4 — Docs/10 §5. The bounds are the range the identity
+			// package will run; a value outside them is refused here rather than at the
+			// first sign-in.
+			Argon2: Argon2{
+				MemoryKiB:   uint32(l.boundedInt("IDENTITY_ARGON2_MEMORY_KIB", 64*1024, 1024, 1<<20)),
+				Iterations:  uint32(l.boundedInt("IDENTITY_ARGON2_ITERATIONS", 3, 1, 64)),
+				Parallelism: uint8(l.boundedInt("IDENTITY_ARGON2_PARALLELISM", 4, 1, 64)),
+			},
+		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
 			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
@@ -221,6 +258,10 @@ func (c Config) LogValue() slog.Value {
 		slog.String("kafka_brokers", strings.Join(c.Kafka.Brokers, ",")),
 		slog.Duration("idempotency_ttl", c.Idempotency.TTL),
 		slog.Duration("idempotency_in_flight_ttl", c.Idempotency.InFlightTTL),
+		// The cost is worth having in the startup line: a deployment that has silently
+		// fallen back to a cheap profile is otherwise invisible.
+		slog.String("argon2", fmt.Sprintf("m=%d,t=%d,p=%d",
+			c.Identity.Argon2.MemoryKiB, c.Identity.Argon2.Iterations, c.Identity.Argon2.Parallelism)),
 	)
 }
 
@@ -306,6 +347,28 @@ func (l *loader) positiveInt(key string, def int) int {
 	return n
 }
 
+// boundedInt reads a whole number that has a range, and reports the range when it is missed.
+//
+// The alternative — accept anything positive and fail later where the value is used — produces
+// an error a long way from the variable that caused it. A cost parameter that is out of range is
+// a startup problem, and this is startup.
+func (l *loader) boundedInt(key string, def, low, high int) int {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		l.errf("%s: %q is not a whole number", key, v)
+		return def
+	}
+	if n < low || n > high {
+		l.errf("%s: must be between %d and %d, got %d", key, low, high, n)
+		return def
+	}
+	return n
+}
+
 func (l *loader) port(key string, def int) int {
 	v, ok := l.lookup(key)
 	if !ok {
@@ -378,6 +441,14 @@ func (l *loader) validate(cfg *Config) {
 	if cfg.Idempotency.InFlightTTL > cfg.Idempotency.TTL {
 		l.errf("IDEMPOTENCY_IN_FLIGHT_TTL (%s) cannot exceed IDEMPOTENCY_TTL (%s)",
 			cfg.Idempotency.InFlightTTL, cfg.Idempotency.TTL)
+	}
+
+	// argon2 divides its memory between the lanes and rounds down, so a profile with more
+	// lanes than kibibytes to give them is not a slow hash but an undefined one.
+	if cfg.Identity.Argon2.MemoryKiB < 8*uint32(cfg.Identity.Argon2.Parallelism) {
+		l.errf("IDENTITY_ARGON2_MEMORY_KIB (%d) leaves less than 8 KiB for each of "+
+			"IDENTITY_ARGON2_PARALLELISM (%d) lanes",
+			cfg.Identity.Argon2.MemoryKiB, cfg.Identity.Argon2.Parallelism)
 	}
 
 	// Everything below this point is a deployment-safety rule. Development is exempt by

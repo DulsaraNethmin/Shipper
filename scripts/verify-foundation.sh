@@ -472,6 +472,42 @@ status="$(curl -s -o /dev/null -w '%{http_code}' \
 ok "it answers without credentials"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-29  passwords are stored as argon2id, and nothing reversible is stored"
+
+pushd "$ROOT/services/core" >/dev/null
+if ! password_log="$(go test ./internal/identity/ -run TestPassword -count=1 -v 2>&1)"; then
+  echo "$password_log"
+  popd >/dev/null
+  fail "the password tests do not pass"
+fi
+popd >/dev/null
+ok "round trip, wrong password, salting, tampering and truncation all hold"
+
+# The stored form itself, read out of the test that produced it rather than asserted twice.
+# A hash is not a secret; the password that made it is a literal in the test file.
+sample="$(grep -oE '\$argon2id\$v=19\$m=[0-9]+,t=[0-9]+,p=[0-9]+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+' \
+  <<<"$password_log" | head -1)"
+[[ -n "$sample" ]] || { echo "$password_log"; fail "no PHC string appeared in the test output"; }
+ok "the stored form is a PHC string, carrying its variant, version and all three costs"
+
+# The parameters being inside the hash is what allows the cost to be raised later without
+# invalidating a single stored password (Docs/10 §5).
+costs="$(cut -d'$' -f4 <<<"$sample")"
+[[ "$costs" =~ ^m=[0-9]+,t=[0-9]+,p=[0-9]+$ ]] || fail "the costs are not in the hash: $costs"
+ok "the costs travel with the hash — $costs — so raising the profile needs no migration"
+
+# Reversibility is a property of the schema as much as of the code: one credential column, and
+# it holds a derived key.
+credential_column="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(string_agg(table_name || '.' || column_name, ', ' order by table_name), 'none')
+     from information_schema.columns
+    where table_schema = 'public'
+      and column_name ~ '(password|secret|passphrase)'")"
+[[ "$credential_column" == "users.password_hash" ]] \
+  || fail "expected users.password_hash and nothing else, found: $credential_column"
+ok "the schema holds exactly one credential column, users.password_hash"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
