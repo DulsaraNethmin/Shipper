@@ -106,8 +106,13 @@ go run ./cmd/migrate down all >/dev/null 2>&1 || true   # start from a known sta
 
 go run ./cmd/migrate up >/dev/null
 version_after_up="$(go run ./cmd/migrate version)"
-[[ "$version_after_up" == "version 1" ]] || fail "after up, expected 'version 1', got '$version_after_up'"
-ok "migrate up applied migration 1"
+# The highest number on disk, rather than a literal. Migrations are allocated in per-domain
+# blocks (migrations/blocks.go), so the newest one is not the count of them and hard-coding
+# either would make this line a chore to update on every schema change.
+highest_migration="$(ls migrations/*.up.sql | sed -E 's#.*/0*([0-9]+)_.*#\1#' | sort -n | tail -1)"
+[[ "$version_after_up" == "version $highest_migration" ]] \
+  || fail "after up, expected 'version $highest_migration', got '$version_after_up'"
+ok "migrate up applied every migration, ending at $highest_migration"
 
 "$PSQL" "$DATABASE_URL" -tAc \
   "select 1 from pg_proc where proname = 'set_updated_at';" | grep -q 1 \
@@ -117,11 +122,11 @@ ok "migrate up applied migration 1"
   || fail "citext extension was not created"
 ok "the migration's objects exist in the database"
 
-go run ./cmd/migrate down >/dev/null
+go run ./cmd/migrate down all >/dev/null
 version_after_down="$(go run ./cmd/migrate version)"
 [[ "$version_after_down" == "no migrations applied" ]] \
   || fail "after down, expected 'no migrations applied', got '$version_after_down'"
-ok "migrate down reversed it"
+ok "migrate down reversed every one of them"
 
 if "$PSQL" "$DATABASE_URL" -tAc \
   "select 1 from pg_proc where proname = 'set_updated_at';" | grep -q 1; then
@@ -371,6 +376,102 @@ ttl="$(redis-cli -u "$REDIS_URL" ttl "$stored")"
 ok "the entry is in Redis under $stored, expiring in ${ttl}s"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-28  the users table, with its constraints enforced by the database"
+
+"$PSQL" "$DATABASE_URL" -tAc \
+  "select 1 from information_schema.tables where table_name = 'users';" | grep -q 1 \
+  || fail "the users table does not exist"
+ok "users exists"
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into users (id, email, phone, password_hash, role)
+   values (gen_random_uuid(), 'verify-$$@example.com', '+6140000$$', 'x', 'customer');" >/dev/null \
+  || fail "a valid account could not be created"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "insert into users (id, email, phone, password_hash, role)
+   values (gen_random_uuid(), 'VERIFY-$$@EXAMPLE.COM', '+6140001$$', 'x', 'customer');" >/dev/null 2>&1; then
+  fail "the same address in different case was accepted as a second account"
+fi
+ok "email uniqueness is case-insensitive, so one address is one account"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "insert into users (id, email, phone, password_hash, role)
+   values (gen_random_uuid(), 'role-$$@example.com', '+6140002$$', 'x', 'admin');" >/dev/null 2>&1; then
+  fail "'admin' was accepted as a role; admin sign-in is a separate system (SHIP-147)"
+fi
+ok "role is constrained to customer and provider"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-149  the audit log is append-only in the database, not by convention"
+
+audit_id="$("$PSQL" "$DATABASE_URL" -tAc \
+  "insert into audit_log (id, actor_type, action, target_type, target_id)
+   values (gen_random_uuid(), 'system', 'job.expired', 'job', gen_random_uuid())
+   returning id;")"
+[[ -n "$audit_id" ]] || fail "an audit entry could not be appended"
+ok "an entry can be appended"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "update audit_log set reason = 'rewritten' where id = '$audit_id';" >/dev/null 2>&1; then
+  fail "an audit entry was rewritten"
+fi
+ok "UPDATE is refused"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "delete from audit_log where id = '$audit_id';" >/dev/null 2>&1; then
+  fail "an audit entry was deleted"
+fi
+ok "DELETE is refused, so the trail survives a psql prompt"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-167  the app is told the minimum build it may be"
+
+status="$(curl -s -o "$WORKDIR/min-version.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/app/minimum-version")"
+[[ "$status" == "200" ]] || fail "GET /v1/app/minimum-version returned $status"
+
+ios_floor="$(json "$WORKDIR/min-version.json" '["ios"]["minimum_build"]')"
+android_floor="$(json "$WORKDIR/min-version.json" '["android"]["minimum_build"]')"
+[[ "$ios_floor" =~ ^[0-9]+$ ]]     || fail "ios.minimum_build is not a number: $ios_floor"
+[[ "$android_floor" =~ ^[0-9]+$ ]] || fail "android.minimum_build is not a number: $android_floor"
+ok "both platforms report a build floor the launch gate can compare against (iOS $ios_floor, Android $android_floor)"
+
+# The floor follows configuration, so raising it is an operational act rather than a release
+# (Docs/07 §6). Restarting with a different value is the whole mechanism.
+kill -TERM "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+
+SHIPPER_ENV=development \
+HTTP_PORT="$VERIFY_PORT" \
+LOG_FORMAT=json \
+LOG_LEVEL=debug \
+DATABASE_URL="$DATABASE_URL" \
+REDIS_URL="$REDIS_URL" \
+MIN_SUPPORTED_IOS_BUILD=4242 \
+  "$WORKDIR/shipper-api" >>"$WORKDIR/server.log" 2>&1 &
+SERVER_PID=$!
+
+for _ in $(seq 1 50); do
+  curl -fsS "http://localhost:$VERIFY_PORT/health" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+
+curl -fsS -o "$WORKDIR/min-version-raised.json" \
+  "http://localhost:$VERIFY_PORT/v1/app/minimum-version" \
+  || fail "the service did not come back up after the floor was raised"
+raised="$(json "$WORKDIR/min-version-raised.json" '["ios"]["minimum_build"]')"
+[[ "$raised" == "4242" ]] || fail "the floor did not follow MIN_SUPPORTED_IOS_BUILD, got $raised"
+ok "the floor is raised by configuration, not by a release"
+
+# The gate has to work for a build too old to authenticate — otherwise the builds it exists
+# to retire are exactly the ones that cannot discover they must update (Docs/07 §6).
+status="$(curl -s -o /dev/null -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/app/minimum-version")"
+[[ "$status" == "200" ]] || fail "the version gate requires authentication (status $status)"
+ok "it answers without credentials"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
@@ -383,4 +484,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
