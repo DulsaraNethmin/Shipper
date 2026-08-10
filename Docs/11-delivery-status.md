@@ -58,7 +58,7 @@ endpoint is demonstrated by its own tests instead and says so in the row: the wa
 adapters have none to demonstrate — nothing consumes them until SHIP-33, SHIP-36 and
 SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `make web-dev`.
 
-### M0 — Foundation (18 of 30)
+### M0 — Foundation (19 of 30)
 
 | Ticket | What |
 |---|---|
@@ -72,6 +72,7 @@ SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `m
 | **SHIP-15a** | Conventions (`Docs/10`) and the shared-surface mechanisms |
 | **SHIP-15b** | The spelling check scoped for client code — *see below* |
 | **SHIP-20** | Go CI — build, boundaries, spelling, tests, migration round trip |
+| **SHIP-22** | Admin panel scaffold — pnpm workspace, Next.js App Router, placeholder shell |
 
 ### Elsewhere
 
@@ -229,7 +230,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b
-SHIP-20 SHIP-28 SHIP-32 SHIP-35 SHIP-59a SHIP-149 SHIP-167
+SHIP-20 SHIP-22 SHIP-28 SHIP-32 SHIP-35 SHIP-59a SHIP-149 SHIP-167
 ```
 
 ## 11. Keeping this file honest

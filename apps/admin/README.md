@@ -3,10 +3,29 @@
 The privileged support and moderation interface (`Docs/06` §2). Separate from the customer
 and provider experience by design.
 
-## Not yet scaffolded
+## Scaffolded, and nothing more than that
 
-This directory is a placeholder created by **SHIP-1**. The Next.js project arrives in
-**SHIP-22**, and the substance of the panel is milestone **M6** (SHIP-147…SHIP-166).
+**SHIP-22** landed the Next.js project: App Router, TypeScript in strict mode, Tailwind with
+shadcn/ui, inside the pnpm workspace at the repository root (`Docs/10` §8.4). The substance
+of the panel is milestone **M6** (SHIP-147…SHIP-166).
+
+```
+make web-dev app=admin     run it at http://localhost:3001
+make web-build             build every web application
+make web-check             lint, type-check and build
+```
+
+What exists is a **placeholder authenticated shell**: the chrome an administrator will see
+around every screen, with the M6 sections listed and inert, and no data of any kind.
+
+**There is no sign-in form, deliberately.** Administrator authentication is SHIP-147 and is
+a separate system from user authentication — a placeholder login is a hole somebody
+eventually wires to the wrong verifier. The shell says who is signed in (nobody) and leaves
+it there.
+
+No screen reads from the API and no component takes marketplace data as a prop. That is
+also deliberate: a table has to decide which columns exist, and the ticket that first
+decides should be one that has read `Docs/01` §4.3 on what a budget is.
 
 ## Things that are already decided
 
