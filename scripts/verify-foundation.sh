@@ -508,6 +508,68 @@ credential_column="$("$PSQL" "$DATABASE_URL" -tAc \
 ok "the schema holds exactly one credential column, users.password_hash"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-38  one row per device, holding refresh state, a label and last seen"
+
+"$PSQL" "$DATABASE_URL" -tAc \
+  "select 1 from information_schema.tables where table_name = 'device_sessions';" | grep -q 1 \
+  || fail "the device_sessions table does not exist"
+ok "device_sessions exists, at migration 000100 inside identity's reserved block"
+
+columns="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(column_name || ':' || data_type, ' ' order by column_name)
+     from information_schema.columns
+    where table_schema = 'public' and table_name = 'device_sessions';")"
+for want in "id:uuid" "user_id:uuid" "refresh_token_hash:text" "device_label:text" \
+            "last_seen_at:timestamp with time zone" "created_at:timestamp with time zone" \
+            "updated_at:timestamp with time zone"; do
+  grep -qF "$want" <<<"$columns" || fail "expected a column $want; found: $columns"
+done
+ok "refresh state, device label and last seen are there, every timestamp with its zone"
+
+# The token is opaque and stored hashed (Docs/10 §5), so what the column may not hold is the
+# token. Uniqueness is the part the database has to enforce: one token, one session.
+# -q as well as -tA: without it psql appends its own "INSERT 0 1" status line to the value, and
+# a captured id with a command tag stuck to it produces a uuid syntax error later rather than a
+# constraint failure — which is a check that passes for the wrong reason.
+verify_user="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into users (id, email, phone, password_hash, role)
+   values (gen_random_uuid(), 'session-$$@example.com', '+6140003$$', 'x', 'customer')
+   returning id;")"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions (id, user_id, refresh_token_hash, device_label)
+   values (gen_random_uuid(), '$verify_user', 'hash-$$', 'Verify iPhone');" >/dev/null \
+  || fail "a device session could not be created"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions (id, user_id, refresh_token_hash, device_label)
+   values (gen_random_uuid(), '$verify_user', 'hash-$$', 'Verify Pixel');" >/dev/null 2>&1; then
+  fail "two sessions hold the same refresh token hash"
+fi
+ok "a refresh token hash belongs to exactly one session"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "delete from users where id = '$verify_user';" >/dev/null 2>&1; then
+  fail "deleting the account took its sessions with it; the foreign key is not RESTRICT"
+fi
+ok "ON DELETE RESTRICT holds, so sessions cannot vanish with a deleted account"
+
+trigger="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from pg_trigger tr
+     join pg_class cl on cl.oid = tr.tgrelid
+     join pg_proc p   on p.oid  = tr.tgfoid
+    where cl.relname = 'device_sessions' and p.proname = 'set_updated_at'
+      and not tr.tgisinternal;")"
+[[ "$trigger" == "1" ]] || fail "device_sessions has no set_updated_at trigger"
+
+fk_index="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from pg_index i
+     join pg_class t     on t.oid = i.indrelid
+     join pg_attribute a on a.attrelid = t.oid and a.attnum = i.indkey[0]
+    where t.relname = 'device_sessions' and a.attname = 'user_id';")"
+[[ "$fk_index" -ge 1 ]] || fail "the foreign key on device_sessions.user_id is not indexed"
+ok "the updated_at trigger is attached and the foreign key is indexed"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"

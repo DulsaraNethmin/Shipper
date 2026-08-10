@@ -51,7 +51,7 @@ Their histories differ because wave 0 reached `main` through a detour — merged
 
 ## 3. Done
 
-Verified by `make verify` — **51 checks**, and `make check` green.
+Verified by `make verify` — **56 checks**, and `make check` green.
 
 ### M0 — Foundation (18 of 30)
 
@@ -74,6 +74,7 @@ Verified by `make verify` — **51 checks**, and `make check` green.
 |---|---|---|
 | **SHIP-28** | M1 | `users` — citext email, phone, role, status, verification timestamps |
 | **SHIP-29** | M1 | argon2id password hashing, parameters stored in the PHC string |
+| **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 
@@ -221,7 +222,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b
-SHIP-20 SHIP-28 SHIP-29 SHIP-149 SHIP-167
+SHIP-20 SHIP-28 SHIP-29 SHIP-38 SHIP-149 SHIP-167
 ```
 
 ## 11. Keeping this file honest
