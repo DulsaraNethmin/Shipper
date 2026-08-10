@@ -51,7 +51,7 @@ Their histories differ because wave 0 reached `main` through a detour — merged
 
 ## 3. Done
 
-Verified by `make verify` — **47 checks**, and `make check` green.
+Verified by `make verify` — **62 checks**, and `make check` green.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -80,8 +80,11 @@ SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `m
 | Ticket | Milestone | What |
 |---|---|---|
 | **SHIP-28** | M1 | `users` — citext email, phone, role, status, verification timestamps |
+| **SHIP-29** | M1 | argon2id password hashing, parameters stored in the PHC string |
 | **SHIP-32** | M1 | Email adapter — console in development, generic HTTP provider in staging |
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
+| **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
+| **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -117,7 +120,6 @@ It is a ticket rather than an untracked commit because `Docs/09` says a letter s
 
 | Ticket | Exists | Missing |
 |---|---|---|
-| **SHIP-29** | `password_hash` column on `users` | argon2id itself. No hashing code anywhere |
 | **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
 | **SHIP-134** | `outbox` table, `internal/events` writer | The publisher. That is M5 and stays there |
 
@@ -225,13 +227,14 @@ Tracks do not touch §1 or §2 of this file either: three agents doing the same 
 Authoritative. `make status` counts these and cross-checks them against the backlog and
 against what commit subjects claim. Add a ticket here in the same change that finishes it.
 
-A ticket belongs here only when its *Done when* line in `Docs/09` is demonstrable. The three
+A ticket belongs here only when its *Done when* line in `Docs/09` is demonstrable. The two
 in §4 are deliberately absent.
 
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-32 SHIP-35 SHIP-59a SHIP-149 SHIP-167
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38
+SHIP-59a SHIP-149 SHIP-167
 ```
 
 ## 11. Keeping this file honest

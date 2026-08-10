@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"log/slog"
 	"strings"
 	"testing"
@@ -16,7 +17,13 @@ var allKeys = []string{
 	"DATABASE_URL", "DATABASE_MAX_OPEN_CONNS", "DATABASE_MAX_IDLE_CONNS", "DATABASE_CONN_MAX_LIFETIME",
 	"REDIS_URL",
 	"KAFKA_BROKERS",
+	"IDENTITY_ARGON2_MEMORY_KIB", "IDENTITY_ARGON2_ITERATIONS", "IDENTITY_ARGON2_PARALLELISM",
+	"IDENTITY_ACCESS_TOKEN_TTL", "IDENTITY_ACCESS_TOKEN_KEYS", "IDENTITY_ACCESS_TOKEN_ACTIVE_KID",
 }
+
+// deploymentSigningKeys is a keyset a staging or production configuration can legitimately be
+// given: thirty-two bytes, and not the development key this repository publishes.
+const deploymentSigningKeys = "2026-08:ZGVwbG95bWVudC1zaWduaW5nLWtleS0wMTIzNDU2YWM="
 
 // clearEnv blanks every configuration variable for the duration of the test. An empty
 // value is treated as absent by loader.lookup, which is what makes this equivalent to
@@ -72,6 +79,10 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("DATABASE_MAX_IDLE_CONNS", "8")
 	t.Setenv("REDIS_URL", "redis://cache.internal:6379/1")
 	t.Setenv("KAFKA_BROKERS", "a:9092, b:9092 ,c:9092")
+	t.Setenv("IDENTITY_ARGON2_MEMORY_KIB", "32768")
+	t.Setenv("IDENTITY_ACCESS_TOKEN_TTL", "10m")
+	t.Setenv("IDENTITY_ACCESS_TOKEN_KEYS", deploymentSigningKeys)
+	t.Setenv("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", "2026-08")
 
 	cfg, err := Load()
 	if err != nil {
@@ -92,6 +103,18 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	}
 	if cfg.Database.MaxOpenConns != 40 {
 		t.Errorf("Database.MaxOpenConns = %d, want 40", cfg.Database.MaxOpenConns)
+	}
+	if cfg.Identity.Argon2.MemoryKiB != 32768 {
+		t.Errorf("Identity.Argon2.MemoryKiB = %d, want 32768", cfg.Identity.Argon2.MemoryKiB)
+	}
+	if cfg.Identity.AccessTokenTTL != 10*time.Minute {
+		t.Errorf("Identity.AccessTokenTTL = %s, want 10m", cfg.Identity.AccessTokenTTL)
+	}
+	if cfg.Identity.AccessTokenActiveKID != "2026-08" {
+		t.Errorf("Identity.AccessTokenActiveKID = %q, want 2026-08", cfg.Identity.AccessTokenActiveKID)
+	}
+	if got := len(cfg.Identity.AccessTokenKeys["2026-08"]); got != 32 {
+		t.Errorf("the signing key decoded to %d bytes, want 32", got)
 	}
 
 	want := []string{"a:9092", "b:9092", "c:9092"}
@@ -215,10 +238,12 @@ func TestDevelopmentAcceptsTheDefaults(t *testing.T) {
 
 func TestDeploymentGuards(t *testing.T) {
 	base := map[string]string{
-		"SHIPPER_ENV":  "production",
-		"DATABASE_URL": "postgres://u:p@db.internal:5432/shipper?sslmode=require",
-		"REDIS_URL":    "redis://cache.internal:6379/0",
-		"LOG_FORMAT":   "json",
+		"SHIPPER_ENV":                      "production",
+		"DATABASE_URL":                     "postgres://u:p@db.internal:5432/shipper?sslmode=require",
+		"REDIS_URL":                        "redis://cache.internal:6379/0",
+		"LOG_FORMAT":                       "json",
+		"IDENTITY_ACCESS_TOKEN_KEYS":       deploymentSigningKeys,
+		"IDENTITY_ACCESS_TOKEN_ACTIVE_KID": "2026-08",
 	}
 
 	t.Run("valid production configuration loads", func(t *testing.T) {
@@ -256,6 +281,110 @@ func TestDeploymentGuards(t *testing.T) {
 			t.Fatalf("Load() returned %v, want a refusal of sslmode=disable", err)
 		}
 	})
+
+	// The published development key, set deliberately rather than left to default. The
+	// credential-default guard does not see this one, and it is the likelier mistake: somebody
+	// copies deploy/.env.example into a real environment and changes the parts that break.
+	t.Run("the published development key is refused", func(t *testing.T) {
+		clearEnv(t)
+		for k, v := range base {
+			t.Setenv(k, v)
+		}
+		t.Setenv("IDENTITY_ACCESS_TOKEN_KEYS",
+			"dev:"+base64.StdEncoding.EncodeToString([]byte(developmentSigningKey)))
+		t.Setenv("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", "dev")
+
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "development key") {
+			t.Fatalf("Load() returned %v, want a refusal of the published development key", err)
+		}
+	})
+}
+
+// TestIdentityConfiguration covers the two settings a deployment gets wrong quietly: a keyset
+// that cannot sign, and a token lifetime that defeats revocation.
+func TestIdentityConfiguration(t *testing.T) {
+	t.Run("defaults follow Docs/10 §5", func(t *testing.T) {
+		clearEnv(t)
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() returned %v, want nil", err)
+		}
+		if cfg.Identity.Argon2 != (Argon2{MemoryKiB: 65536, Iterations: 3, Parallelism: 4}) {
+			t.Errorf("argon2 default is %+v, want m=64 MiB, t=3, p=4", cfg.Identity.Argon2)
+		}
+		if cfg.Identity.AccessTokenTTL != 15*time.Minute {
+			t.Errorf("access token TTL default is %s, want 15m", cfg.Identity.AccessTokenTTL)
+		}
+	})
+
+	t.Run("more than one key, so rotation is a configuration change", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("IDENTITY_ACCESS_TOKEN_KEYS",
+			"old:b2xkLXNpZ25pbmcta2V5LTAxMjM0NTY3ODlhYmNkZWY=,new:bmV3LXNpZ25pbmcta2V5LTAxMjM0NTY3ODlhYmNkZWY=")
+		t.Setenv("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", "new")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() returned %v, want nil", err)
+		}
+		if len(cfg.Identity.AccessTokenKeys) != 2 {
+			t.Fatalf("loaded %d keys, want 2 — the outgoing key must stay in the set",
+				len(cfg.Identity.AccessTokenKeys))
+		}
+		if cfg.Identity.AccessTokenActiveKID != "new" {
+			t.Errorf("active kid = %q, want new", cfg.Identity.AccessTokenActiveKID)
+		}
+	})
+
+	bad := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{"active key names nothing", map[string]string{
+			"IDENTITY_ACCESS_TOKEN_ACTIVE_KID": "not-loaded",
+		}, "names no key"},
+		{"a key with no identifier", map[string]string{
+			"IDENTITY_ACCESS_TOKEN_KEYS": "bm90LWEtcGFpci0wMTIzNDU2Nzg5YWJjZGVmZ2hpams=",
+		}, "no key identifier"},
+		{"a secret that is not base64", map[string]string{
+			"IDENTITY_ACCESS_TOKEN_KEYS": "k1:not base64 at all",
+		}, "not standard base64"},
+		{"a secret too short for HS256", map[string]string{
+			"IDENTITY_ACCESS_TOKEN_KEYS": "k1:c2hvcnQ=",
+		}, "at least 32"},
+		{"the same identifier twice", map[string]string{
+			"IDENTITY_ACCESS_TOKEN_KEYS": "k1:b2xkLXNpZ25pbmcta2V5LTAxMjM0NTY3ODlhYmNkZWY=,k1:bmV3LXNpZ25pbmcta2V5LTAxMjM0NTY3ODlhYmNkZWY=",
+		}, "appears twice"},
+		{"a token lifetime that defeats revocation", map[string]string{
+			"IDENTITY_ACCESS_TOKEN_TTL": "24h",
+		}, "cannot be revoked before it expires"},
+		{"argon2 memory below its lanes", map[string]string{
+			"IDENTITY_ARGON2_MEMORY_KIB": "1024", "IDENTITY_ARGON2_PARALLELISM": "200",
+		}, "leaves less than 8 KiB"},
+		{"argon2 memory out of range", map[string]string{
+			"IDENTITY_ARGON2_MEMORY_KIB": "16",
+		}, "must be between"},
+	}
+
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			_, err := Load()
+			if err == nil {
+				t.Fatal("Load() returned nil, want an error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error was %q, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
 }
 
 func TestRedactURL(t *testing.T) {
@@ -286,15 +415,24 @@ func TestLogValueOmitsCredentials(t *testing.T) {
 		Database: Database{URL: "postgres://user:hunter2@host:5432/db"},
 		Redis:    Redis{URL: "redis://alice:s3cret@cache:6379/0"},
 		Log:      Log{Level: slog.LevelInfo, Format: "json"},
+		Identity: Identity{
+			AccessTokenActiveKID: "2026-08",
+			AccessTokenKeys:      map[string][]byte{"2026-08": []byte("a-signing-key-nobody-should-see")},
+		},
 	}
 
 	rendered := cfg.LogValue().String()
-	for _, secret := range []string{"hunter2", "s3cret"} {
+	for _, secret := range []string{"hunter2", "s3cret", "a-signing-key-nobody-should-see"} {
 		if strings.Contains(rendered, secret) {
 			t.Errorf("LogValue() rendered %q, which contains the credential %q", rendered, secret)
 		}
 	}
 	if !strings.Contains(rendered, "host:5432") {
 		t.Errorf("LogValue() rendered %q, want the host retained for diagnosis", rendered)
+	}
+	// Which key is active is what a rotation needs to confirm from a log line, and it says
+	// nothing anybody can sign with.
+	if !strings.Contains(rendered, "2026-08") {
+		t.Errorf("LogValue() rendered %q, want the active key identifier retained", rendered)
 	}
 }

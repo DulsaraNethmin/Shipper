@@ -14,6 +14,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -54,7 +55,52 @@ type Config struct {
 	Redis       Redis
 	Kafka       Kafka
 	Idempotency Idempotency
+	Identity    Identity
 	App         App
+}
+
+// Identity configures credentials and sessions (SHIP-29, SHIP-37).
+//
+// Both halves are configuration rather than compiled-in constants because both are expected to
+// change without a release: the argon2id cost is raised as hardware improves, and a signing key
+// is rotated on a schedule or in a hurry. Docs/10 §5 is the specification.
+type Identity struct {
+	// Argon2 is the cost new password hashes are written at.
+	//
+	// Verification does not read it. The parameters travel with each hash in its PHC string,
+	// so raising these values leaves every stored password verifiable and upgrades each one at
+	// its owner's next sign-in, with no migration (Docs/10 §5).
+	Argon2 Argon2
+
+	// AccessTokenTTL is how long an issued access token stays valid. Docs/10 §5 fixes it at
+	// fifteen minutes: long enough that a phone on a poor connection is not refreshing
+	// constantly, short enough that revoking a device session takes effect quickly — an
+	// access token is not checked against the database, so nothing shortens it once issued.
+	AccessTokenTTL time.Duration
+
+	// AccessTokenKeys is the HMAC signing keyset, by key identifier.
+	//
+	// More than one so a key can be rotated by configuration: the incoming key becomes active
+	// and signs, while the outgoing one stays in the set and keeps verifying the tokens it
+	// already signed until the last of them expires.
+	AccessTokenKeys map[string][]byte
+
+	// AccessTokenActiveKID names the key in AccessTokenKeys that signs new tokens. It travels
+	// in each token's `kid` header, which is how a verifier knows which key to use before it
+	// can trust anything else in the token.
+	AccessTokenActiveKID string
+}
+
+// Argon2 is the password hashing cost.
+//
+// It mirrors identity.Argon2Profile, which is the type the domain takes. Two shapes rather than
+// one shared type on purpose: internal/config does not import a domain, the domain does not
+// import configuration, and the two meet in cmd/api — which is the rule that keeps every domain
+// independently buildable (Docs/06 §4.1).
+type Argon2 struct {
+	MemoryKiB   uint32
+	Iterations  uint32
+	Parallelism uint8
 }
 
 // App is what the mobile client is told about itself at launch (SHIP-167).
@@ -151,7 +197,33 @@ type Idempotency struct {
 // credentialBearingDefaults are variables whose built-in defaults embed a local
 // throwaway credential. They make a fresh clone work against docker-compose and are
 // refused outside development — see loader.validate.
-var credentialBearingDefaults = []string{"DATABASE_URL", "REDIS_URL"}
+var credentialBearingDefaults = []string{"DATABASE_URL", "REDIS_URL", "IDENTITY_ACCESS_TOKEN_KEYS"}
+
+// The development signing key, which is in the repository and therefore public.
+//
+// It exists for the same reason the database password does: a fresh clone has to run without
+// setup. validate refuses it outside development, so the failure mode it is guarding against —
+// a staging deployment signing tokens anybody can forge — is a startup error rather than a
+// discovery.
+const (
+	developmentActiveKID  = "dev"
+	developmentSigningKey = "shipper-local-development-signing-key-not-a-secret"
+)
+
+// developmentSigningKeys builds a fresh map each time rather than sharing one package-level
+// value, so that a caller holding the loaded configuration cannot change what the next Load
+// returns.
+func developmentSigningKeys() map[string][]byte {
+	return map[string][]byte{developmentActiveKID: []byte(developmentSigningKey)}
+}
+
+// minimumSigningKeyBytes mirrors the same constant in internal/identity, which is where the
+// keyset enforces it.
+//
+// Two copies rather than one shared constant, because internal/config does not import a domain
+// and the domain does not import configuration (Docs/06 §4.1). Checking it here as well means a
+// short key is refused at startup rather than at the first sign-in.
+const minimumSigningKeyBytes = 32
 
 // Load reads configuration from the process environment.
 //
@@ -190,6 +262,19 @@ func Load() (*Config, error) {
 			TTL:         l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
 			InFlightTTL: l.duration("IDEMPOTENCY_IN_FLIGHT_TTL", 60*time.Second),
 		},
+		Identity: Identity{
+			// m=64 MiB, t=3, p=4 — Docs/10 §5. The bounds are the range the identity
+			// package will run; a value outside them is refused here rather than at the
+			// first sign-in.
+			Argon2: Argon2{
+				MemoryKiB:   uint32(l.boundedInt("IDENTITY_ARGON2_MEMORY_KIB", 64*1024, 1024, 1<<20)),
+				Iterations:  uint32(l.boundedInt("IDENTITY_ARGON2_ITERATIONS", 3, 1, 64)),
+				Parallelism: uint8(l.boundedInt("IDENTITY_ARGON2_PARALLELISM", 4, 1, 255)),
+			},
+			AccessTokenTTL:       l.duration("IDENTITY_ACCESS_TOKEN_TTL", 15*time.Minute),
+			AccessTokenKeys:      l.signingKeys("IDENTITY_ACCESS_TOKEN_KEYS", developmentSigningKeys()),
+			AccessTokenActiveKID: l.str("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", developmentActiveKID),
+		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
 			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
@@ -221,6 +306,16 @@ func (c Config) LogValue() slog.Value {
 		slog.String("kafka_brokers", strings.Join(c.Kafka.Brokers, ",")),
 		slog.Duration("idempotency_ttl", c.Idempotency.TTL),
 		slog.Duration("idempotency_in_flight_ttl", c.Idempotency.InFlightTTL),
+		// The cost is worth having in the startup line: a deployment that has silently
+		// fallen back to a cheap profile is otherwise invisible.
+		slog.String("argon2", fmt.Sprintf("m=%d,t=%d,p=%d",
+			c.Identity.Argon2.MemoryKiB, c.Identity.Argon2.Iterations, c.Identity.Argon2.Parallelism)),
+		slog.Duration("access_token_ttl", c.Identity.AccessTokenTTL),
+		// The identifier and the count, never the key material. Which key is active and how
+		// many are loaded is exactly what a rotation needs to confirm from a log line, and
+		// neither says anything an attacker can sign with.
+		slog.String("access_token_active_kid", c.Identity.AccessTokenActiveKID),
+		slog.Int("access_token_keys", len(c.Identity.AccessTokenKeys)),
 	)
 }
 
@@ -306,6 +401,81 @@ func (l *loader) positiveInt(key string, def int) int {
 	return n
 }
 
+// signingKeys reads a keyset written as comma-separated `kid:base64secret` pairs.
+//
+// One variable rather than one per key, because the number of keys changes during a rotation and
+// a scheme that needs a new variable name to add a key is a scheme nobody rotates. Standard
+// base64 for the secret so that key material is bytes rather than whatever survived a shell.
+//
+// No error message here ever contains a secret, only the identifier it was filed under. A
+// configuration error that echoes the value it could not parse puts key material in the startup
+// log, where it is collected, shipped and retained.
+func (l *loader) signingKeys(key string, def map[string][]byte) map[string][]byte {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+
+	keys := map[string][]byte{}
+	for _, pair := range strings.Split(v, ",") {
+		if pair = strings.TrimSpace(pair); pair == "" {
+			continue
+		}
+
+		kid, encoded, separated := strings.Cut(pair, ":")
+		kid = strings.TrimSpace(kid)
+		if !separated || kid == "" {
+			l.errf("%s: expected kid:base64secret pairs; one entry has no key identifier", key)
+			continue
+		}
+		if _, duplicate := keys[kid]; duplicate {
+			l.errf("%s: the key identifier %q appears twice", key, kid)
+			continue
+		}
+
+		secret, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
+		if err != nil {
+			l.errf("%s: the secret for key %q is not standard base64", key, kid)
+			continue
+		}
+		if len(secret) < minimumSigningKeyBytes {
+			l.errf("%s: the secret for key %q is %d bytes; HS256 wants at least %d",
+				key, kid, len(secret), minimumSigningKeyBytes)
+			continue
+		}
+
+		keys[kid] = secret
+	}
+
+	if len(keys) == 0 {
+		l.errf("%s: no usable signing key", key)
+		return def
+	}
+	return keys
+}
+
+// boundedInt reads a whole number that has a range, and reports the range when it is missed.
+//
+// The alternative — accept anything positive and fail later where the value is used — produces
+// an error a long way from the variable that caused it. A cost parameter that is out of range is
+// a startup problem, and this is startup.
+func (l *loader) boundedInt(key string, def, low, high int) int {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		l.errf("%s: %q is not a whole number", key, v)
+		return def
+	}
+	if n < low || n > high {
+		l.errf("%s: must be between %d and %d, got %d", key, low, high, n)
+		return def
+	}
+	return n
+}
+
 func (l *loader) port(key string, def int) int {
 	v, ok := l.lookup(key)
 	if !ok {
@@ -380,6 +550,30 @@ func (l *loader) validate(cfg *Config) {
 			cfg.Idempotency.InFlightTTL, cfg.Idempotency.TTL)
 	}
 
+	// argon2 divides its memory between the lanes and rounds down, so a profile with more
+	// lanes than kibibytes to give them is not a slow hash but an undefined one.
+	if cfg.Identity.Argon2.MemoryKiB < 8*uint32(cfg.Identity.Argon2.Parallelism) {
+		l.errf("IDENTITY_ARGON2_MEMORY_KIB (%d) leaves less than 8 KiB for each of "+
+			"IDENTITY_ARGON2_PARALLELISM (%d) lanes",
+			cfg.Identity.Argon2.MemoryKiB, cfg.Identity.Argon2.Parallelism)
+	}
+
+	// A signature nobody can produce is not a token anybody can use, and this is the only
+	// place it can be caught: the failure is otherwise the first sign-in after a deploy.
+	if _, ok := cfg.Identity.AccessTokenKeys[cfg.Identity.AccessTokenActiveKID]; !ok {
+		l.errf("IDENTITY_ACCESS_TOKEN_ACTIVE_KID: %q names no key in IDENTITY_ACCESS_TOKEN_KEYS",
+			cfg.Identity.AccessTokenActiveKID)
+	}
+
+	// An access token is not checked against the database, so nothing can shorten one that has
+	// already been issued: a long TTL quietly turns "revoke this device" into "revoke this
+	// device, eventually". The cap is generous rather than exact — Docs/10 §5 says fifteen
+	// minutes, and this only refuses the values that would defeat the design.
+	if cfg.Identity.AccessTokenTTL > time.Hour {
+		l.errf("IDENTITY_ACCESS_TOKEN_TTL (%s) is longer than an hour; an issued access token "+
+			"cannot be revoked before it expires", cfg.Identity.AccessTokenTTL)
+	}
+
 	// Everything below this point is a deployment-safety rule. Development is exempt by
 	// design: the whole point of the defaults is that a fresh clone runs without setup.
 	if cfg.Env.IsDevelopment() || !cfg.Env.valid() {
@@ -401,5 +595,21 @@ func (l *loader) validate(cfg *Config) {
 
 	if strings.Contains(cfg.Database.URL, "sslmode=disable") {
 		l.errf("DATABASE_URL: sslmode=disable is not permitted when SHIPPER_ENV is %s", cfg.Env)
+	}
+
+	// The credential-default rule above catches a variable that was never set. This catches
+	// the other way in: the development key copied out of deploy/.env.example into a real
+	// environment, which is a signing key published in this repository.
+	//
+	// Only when the variable was set explicitly — an unset one has already been refused above,
+	// and reporting it twice would say the same thing in two ways.
+	if !l.defaulted["IDENTITY_ACCESS_TOKEN_KEYS"] {
+		for kid, secret := range cfg.Identity.AccessTokenKeys {
+			if string(secret) == developmentSigningKey {
+				l.errf("IDENTITY_ACCESS_TOKEN_KEYS: key %q is the development key from "+
+					"deploy/.env.example, which is public; it may not be used when "+
+					"SHIPPER_ENV is %s", kid, cfg.Env)
+			}
+		}
 	}
 }
