@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log/slog"
 	"net/http"
 	"time"
 
@@ -33,10 +32,13 @@ const apiPrefix = "/" + apiVersion
 //   - Operational endpoints outside it. /health is consumed by load balancers and
 //     monitoring, not by API clients, and versioning it would break every health check on
 //     the day v2 ships.
-func newRouter(log *slog.Logger, startedAt time.Time, idempotencyStore httpx.IdempotencyStore) http.Handler {
+//
+// Which routes exist is not decided here. Each domain declares its own in routes_<domain>.go
+// and they arrive through the manifest, so adding a domain does not edit this file — see
+// manifest.go for why that matters.
+func newRouter(deps Deps, idempotencyStore httpx.IdempotencyStore) http.Handler {
 	root := http.NewServeMux()
-
-	root.Handle("GET /health", healthHandler(startedAt))
+	attach(root, GroupOperational, deps)
 
 	// StripPrefix means every pattern inside the group is written without /v1, so a
 	// route moves between versions by being registered in a different group rather than
@@ -53,7 +55,7 @@ func newRouter(log *slog.Logger, startedAt time.Time, idempotencyStore httpx.Ide
 	// ServeMux writes as plain text. Normalising after storing would replay the raw form
 	// instead.
 	v1 := http.NewServeMux()
-	registerV1(v1)
+	attach(v1, GroupV1, deps)
 	root.Handle(apiPrefix+"/", http.StripPrefix(apiPrefix,
 		httpx.Idempotent(idempotencyStore, nil)(httpx.StandardErrors(v1))))
 
@@ -62,22 +64,40 @@ func newRouter(log *slog.Logger, startedAt time.Time, idempotencyStore httpx.Ide
 	// panicking handler still produces a request line with its 500; StandardErrors is
 	// innermost so it sees the 404 and 405 that ServeMux produces itself and can put
 	// them in the error contract (SHIP-12).
+	//
+	// Do not tidy this. Changing the order, or removing the second StandardErrors above,
+	// breaks idempotent replay in a way no test outside internal/httpx will notice
+	// (Docs/10 §4.2).
 	return httpx.Chain(root,
 		httpx.RequestID,
-		httpx.Logger(log),
-		httpx.Recover(log),
+		httpx.Logger(deps.Logger),
+		httpx.Recover(deps.Logger),
 		httpx.StandardErrors,
 	)
 }
 
-// registerV1 registers the versioned public API.
+// The two routes that belong to the service itself rather than to any domain.
 //
-// This is where the product endpoints arrive: identity from SHIP-30, jobs from SHIP-61,
-// bidding from SHIP-84, delivery from SHIP-106. Each domain will register its own routes
-// here once it has handlers to register, and cmd/api stays the only place that knows the
-// whole surface.
-func registerV1(mux *http.ServeMux) {
-	mux.Handle("GET /{$}", apiRootHandler())
+// Product endpoints do not go here. Identity's arrive in routes_identity.go from SHIP-30,
+// jobs' in routes_jobs.go from SHIP-61, and so on — one file per domain, so that two domains
+// being built at the same time never edit the same one.
+func init() {
+	register(
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/health",
+			Group:   GroupOperational,
+			Auth:    Public,
+			Handler: func(d Deps) http.Handler { return healthHandler(d) },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/{$}",
+			Group:   GroupV1,
+			Auth:    Public,
+			Handler: func(Deps) http.Handler { return apiRootHandler() },
+		},
+	)
 }
 
 // apiRootResponse is the body of GET /v1/.
@@ -125,7 +145,7 @@ type healthResponse struct {
 // It is also deliberately outside the /v1 group: operational endpoints are consumed by
 // load balancers and monitoring, not by API clients, and versioning them would mean the
 // health check breaks on the day v2 ships.
-func healthHandler(startedAt time.Time) http.HandlerFunc {
+func healthHandler(d Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		info := buildinfo.Get()
 
@@ -135,7 +155,7 @@ func healthHandler(startedAt time.Time) http.HandlerFunc {
 			Commit:  info.Commit,
 			BuiltAt: info.BuiltAt,
 			Dirty:   info.Dirty,
-			Uptime:  time.Since(startedAt).Round(time.Second).String(),
+			Uptime:  d.Clock.Now().Sub(d.StartedAt).Round(time.Second).String(),
 		})
 	}
 }

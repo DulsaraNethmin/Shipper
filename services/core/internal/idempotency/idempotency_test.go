@@ -11,13 +11,16 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/redistest"
 )
 
-// newTestStore returns a store against the local Redis, skipping the test when there is
-// none.
+// newTestStore returns a store against the local Redis, failing the test when there is
+// none unless -short was given.
 //
-// Skipping rather than failing keeps `make test` green on a clone with no stack running,
-// while `make up && make test` exercises the real thing. The Lua script, the TTLs, and the
+// It used to skip instead, which kept `make test` green on a clone with no stack running —
+// and also kept it green when CI had no Redis either, having run none of these tests.
+// `make up && make test` exercises the real thing. The Lua script, the TTLs, and the
 // atomicity of the claim are all properties of Redis rather than of this code, so testing
 // them against a fake would prove nothing about the behaviour that matters.
 func newTestStore(t *testing.T, ttl, inFlightTTL time.Duration) (*RedisStore, string) {
@@ -44,7 +47,12 @@ func newTestStore(t *testing.T, ttl, inFlightTTL time.Duration) (*RedisStore, st
 
 	if err := client.Ping(ctx).Err(); err != nil {
 		_ = client.Close()
-		t.Skipf("no Redis at %s (%v) — run `make up`", url, err)
+		// Skipping is reserved for -short. These seven tests cover the atomic claim, the
+		// in-flight lapse and the replay window, and an earlier version of this helper
+		// skipped them whenever Redis was absent — so a run with no stack reported
+		// success having exercised none of it. redistest owns that decision now, so it
+		// is made the same way everywhere (Docs/10 §7.2).
+		redistest.Unavailable(t, err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
 

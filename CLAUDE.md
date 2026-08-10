@@ -2,7 +2,11 @@
 
 Australian road-transport marketplace. Customers publish delivery jobs, verified transport providers bid privately, the customer awards one, and the delivery is tracked to completion. Marketplace only — Shipper never holds payment in the MVP.
 
-**M0 is under way.** `SHIP-1`…`SHIP-15` have landed: the monorepo structure, the local stack, the Go service with health, configuration, logging and migrations, and now the domain package skeleton with its boundary lint, the standard error contract, the `/v1` route group, request-ID propagation, and Redis-backed idempotency. No domain logic is written yet — the eight domain packages hold their documentation and nothing else. Everything above `SHIP-16` is still planning documents. Work proceeds ticket by ticket through `Docs/09-delivery-backlog.md`.
+**M0 is under way.** `SHIP-1`…`SHIP-15` have landed: the monorepo structure, the local stack, the Go service with health, configuration, logging and migrations, the domain package skeleton with its boundary lint, the standard error contract, the `/v1` route group, request-ID propagation, and Redis-backed idempotency.
+
+`SHIP-15a` then added what makes more than one person able to work at once: the conventions in `Docs/10`, reserved migration blocks, a self-registering route manifest with a golden file, a real-database test harness that fails rather than skips, and the shared infrastructure packages (`db`, `authctx`, `clock`, `validate`, `events`). Alongside it came `SHIP-20` (CI, at last), `SHIP-28` (`users`), `SHIP-149` (the append-only audit log) and `SHIP-167` (the version gate, which has to precede the first device build).
+
+No domain logic is written yet — the eight domain packages still hold their documentation and nothing else. Work proceeds ticket by ticket through `Docs/09-delivery-backlog.md`, and `Docs/10` says how.
 
 ## Documents are the source of truth
 
@@ -19,6 +23,7 @@ Read the relevant document before implementing. These are decisions, not suggest
 | `Docs/07` | Flutter client architecture |
 | `Docs/08` | Build order and repo structure |
 | `Docs/09` | The ticket backlog |
+| `Docs/10` | Engineering conventions — the implementation decisions two people would otherwise answer differently |
 
 If something contradicts a document, the document wins — or the document needs updating first. Do not resolve a contradiction silently in code.
 
@@ -131,19 +136,37 @@ Meeting all six makes the branch **ready to merge**, not merged. Hand it to the 
 | Action | Who |
 |---|---|
 | Write code, create branches, edit files | Claude |
-| Propose commit messages (as scratch files) | Claude |
-| **`git commit`** | **Owner only** |
+| **`git commit`** — **on its own `ship-*` / `x-*` branch only** | Claude |
+| `git commit` on `main` or `develop` | **Never** |
 | **`git merge`** — ticket branches and pull requests alike | **Owner only** |
 | **`git push`** | Owner, unless explicitly asked |
 
-Claude prepares work and stops at the commit. It does not commit, merge, or self-approve.
+**The commit rule is branch-scoped, and that is a deliberate narrowing.** The original rule — stage nothing, commit nothing — was written for one agent handing one branch to one owner. It does not survive several branches being built at once: the owner becomes the serialisation point for every one of them, which is the bottleneck the parallelism exists to remove. And the Definition of Done requires green CI, which runs on commits.
+
+So Claude may commit to a branch it created whose name matches `ship-<n>` or `x-<n>`. It may not commit to `main` or `develop`, may not merge anything, may not open or approve its own pull request, and may not add `Co-Authored-By` trailers. **What enters `develop` and `main` remains entirely the owner's decision**, which is what the rule was protecting.
 
 The flow:
 
 1. **Ticket branch → `develop`**, merged with `--no-ff`. **Never squash.** Every commit is preserved, and the merge commit records which ticket the work belonged to. This pairs with keeping branches: the full topology stays inspectable.
 2. **`develop` → `main`** by pull request, in release-sized batches rather than one per ticket.
 
-Rebase on `develop` before requesting a merge. Never request a merge with failing CI.
+Catch up to `develop` before requesting a merge, and never request one with failing CI.
+
+**Prefer `git merge develop` into the ticket branch over `git rebase` when the branch has touched a shared file.** Resolving a conflict in the route manifest or the error registry is exactly where a route or a code gets dropped, and a rebase rewrites history so the loss leaves no trace. A merge commit keeps the resolution reviewable. `git log --first-parent develop` still gives the one-line-per-ticket view either way.
+
+After resolving any conflict, re-run `make check` **and** look at the golden files — `services/core/cmd/api/routes_golden.txt` is the one that catches a silently dropped endpoint.
+
+### Working in more than one branch at once
+
+Each concurrent piece of work gets its own git worktree, never the primary tree.
+
+| Item | Rule |
+|---|---|
+| Test database | Set `TEST_DATABASE_URL` per worktree in its gitignored `deploy/.env`. One variable is the whole isolation mechanism |
+| Ports | `HTTP_PORT` and `VERIFY_PORT` per worktree, likewise |
+| Compose | One shared stack. `COMPOSE_PROJECT_NAME` is pinned in the `Makefile` so worktrees do not each start their own and fight over 5432, 6379 and 29092 |
+| **`git stash`** | **Never.** The stash is shared across worktrees through one `.git`, and this repository already carries the scar — `CLAUDE.md` was committed with `Stashed changes` conflict markers in it |
+| Shared files | Do not edit from a domain branch: `cmd/api/routes.go`, `internal/boundaries/boundaries.go`, `internal/httpx/**`, `go.mod`, the root `Makefile`, migrations in the shared block, `CLAUDE.md`, `Docs/**`. See `Docs/10` §9.2 |
 
 Because history is not squashed, `git log --oneline` shows every individual commit. For the one-line-per-ticket view, use:
 
@@ -184,16 +207,18 @@ make ps / logs      Stack status; follow stack logs
 make migrate-up     Apply all pending migrations
 make migrate-down   Reverse the last migration (make migrate-down n=all for everything)
 make migrate-version
-make migrate-create name=<snake_case_name>
+make migrate-create name=<snake_case_name> domain=<domain>
 
 make run            Run the API on the host
 make build          Build bin/shipper-api and bin/shipper-migrate
-make test           go test ./... -race
+make test           Build the test template, then go test ./... -race
+make test-db-template  Rebuild the database every integration test is cloned from
 make vet
 make lint-imports   Check the domain boundaries (SHIP-11)
-make check          vet + lint-imports + test — what CI runs for the Go service
+make lint-spelling  Check Australian English
+make check          vet + lint-imports + lint-spelling + test — what CI runs
 
-make verify         Demonstrate the SHIP-1..15 acceptance criteria end to end
+make verify         Demonstrate every foundation ticket's acceptance criterion end to end
 make psql / redis   Open a shell against the local database or cache
 make kafka-smoke    Create a topic, produce, consume, delete
 ```
@@ -209,6 +234,16 @@ variables yourself.
 `make verify` needs two host clients the stack does not provide:
 `brew install libpq redis`.
 
+**`migrate-create` requires `domain=`.** Migration numbers are allocated in reserved
+per-domain blocks so two branches cannot draw the same one; the ranges are in
+`services/core/migrations/blocks.go` and two tests enforce them.
+
+**Integration tests need the stack.** They clone a template database rather than migrating
+one per run, and they **fail rather than skip** when PostgreSQL or Redis is missing — a test
+that quietly does not run is worse than one that does not exist, because it is counted. Run
+`make test`, not bare `go test`: `deploy/.env` is read by `make` alone, so `go test` on its own
+looks for PostgreSQL on the default port. `go test -short` skips them deliberately.
+
 The Flutter, admin, and driver-portal commands arrive with SHIP-16, SHIP-22, and SHIP-23.
 
 ## Repository layout
@@ -220,22 +255,30 @@ apps/mobile/          Flutter — placeholder until SHIP-16
 apps/admin/           Next.js — placeholder until SHIP-22
 apps/driver-portal/   Next.js — placeholder until SHIP-23
 services/core/        Go — the versioned public API and domain
-  cmd/api/            entrypoint, wiring, graceful shutdown
+  cmd/api/            entrypoint, wiring, graceful shutdown, the route manifest
   cmd/migrate/        migration tool, migrations embedded in the binary
   cmd/lintboundaries/ the domain boundary lint
   internal/           the eight domains: identity, profiles, fleet, jobs,
                       bidding, delivery, notifications, admin
   internal/platform/  integration adapters: email, sms, push, storage, geocoding
+  internal/authctx/   the authenticated subject, readable by every domain
+  internal/boundaries/  the import lint rules
+  internal/buildinfo/ version and commit, injected at link time
+  internal/clock/     the injectable clock
   internal/config/    environment configuration
+  internal/db/        the Runner seam and the transaction helper
+  internal/events/    the outbox writer and the domain event type
   internal/httpx/     middleware: request ID, logging, recovery, error contract,
                       idempotency, and the JSON helpers
   internal/idempotency/ the Redis-backed idempotency store
-  internal/boundaries/  the import lint rules
   internal/logging/   slog handler construction
-  internal/buildinfo/ version and commit, injected at link time
-  migrations/         SQL schema history
+  internal/testsupport/ pgtest and redistest — real infrastructure for tests
+  internal/validate/  field-level validation in the error contract's shape
+  migrations/         SQL schema history, in reserved per-domain blocks
 deploy/               docker-compose for local Postgres, Redis, Kafka
-scripts/              verify-foundation.sh — the SHIP-1..15 acceptance run
+scripts/              verify-foundation.sh, check-spelling.sh
+mk/                   per-track make targets, glob-included by the root Makefile
+.github/workflows/    go.yml (SHIP-20); Flutter and the store pipelines follow
 ```
 
 The eight domain packages hold documentation and nothing else: no domain logic has been
@@ -246,6 +289,11 @@ Adding a package directly under `internal/` fails the lint until it is classifie
 domain or as infrastructure in `internal/boundaries/boundaries.go`. That is deliberate —
 it makes a ninth domain a decision someone recorded rather than something that happened.
 
+The infrastructure list is **seeded ahead of the code**: `pagination`, `ratelimit` and `money`
+are registered but not yet written. Whoever first needs one writes the package and edits
+nothing shared. A domain that needs internal structure uses a sub-package — `internal/jobs/expiry`
+is attributed to `jobs`, may import it, and needs no registration.
+
 ## API conventions
 
 - **Every failure uses the standard error contract** — one shape, a machine-readable
@@ -253,10 +301,23 @@ it makes a ninth domain a decision someone recorded rather than something that h
   `message`. See `services/core/README.md` for the shape and the code list.
 - **Product endpoints live under `/v1`**; operational endpoints do not (SHIP-13).
 - **Every state-changing request carries an `Idempotency-Key`** and is refused without one
-  (SHIP-15). The middleware fails closed if Redis is unreachable. **SHIP-44 must supply
-  the authenticated subject as the middleware's `scope`** — until it does, keys share one
-  namespace.
+  (SHIP-15). The middleware fails closed if Redis is unreachable.
+- **Routes are declared, not registered.** A domain adds `cmd/api/routes_<domain>.go` with an
+  `init` that calls `register(Route{…})`, and edits no shared file. Every route states its
+  auth class. `routes_golden.txt` records the whole served surface, because a route dropped in
+  a merge produces no compile error and no test failure — only a missing endpoint.
+- **Handlers live in the domain**, in `http.go`, not in `cmd/api`. A domain importing
+  `internal/httpx` is sitting on infrastructure, not crossing a boundary.
 - **Log through `httpx.LoggerFrom(ctx)`**, which is already bound to the request ID
   (SHIP-14). Outbound HTTP clients wrap their transport in `httpx.PropagateRequestID`.
+
+### The one hard gate before authenticated endpoints
+
+**No authenticated state-changing endpoint may merge before SHIP-44 supplies the idempotency
+middleware's `scope`.** It is wired with `nil` today, so every key lands in
+`idem:v1:anonymous:<key>` — harmless while nothing is authenticated, and a cross-tenant read the
+moment something is: a client that guesses another client's key gets that client's response
+body. SHIP-44 passes the authenticated subject and closes it. Until then, protected endpoints
+wait.
 
 Path-filter CI workflows from the first commit — macOS runners for iOS builds cost roughly ten times Linux minutes, and a Go-only change must not trigger one.

@@ -54,6 +54,34 @@ type Config struct {
 	Redis       Redis
 	Kafka       Kafka
 	Idempotency Idempotency
+	App         App
+}
+
+// App is what the mobile client is told about itself at launch (SHIP-167).
+//
+// It lives in configuration rather than in code because Docs/07 §6 makes raising the floor "an
+// operational decision with an owner, not a side effect of a deploy" — and because Flutter has
+// no over-the-air path for Dart code, so anything that has to change under pressure has to
+// change server-side (Docs/06 §5.3).
+type App struct {
+	// MinimumIOSBuild and MinimumAndroidBuild are build numbers, not version strings.
+	//
+	// Docs/07 §8 requires every build to carry a unique, monotonically increasing build
+	// number, which makes the comparison an integer one. Comparing semantic versions
+	// would mean agreeing on an ordering for pre-release suffixes, and getting that
+	// slightly wrong would either lock out a valid build or admit one that should have
+	// been blocked.
+	MinimumIOSBuild     int
+	MinimumAndroidBuild int
+
+	// IOSStoreURL and AndroidStoreURL are where a blocked build sends the user.
+	//
+	// Empty during the pilot: distribution is TestFlight and Play internal testing with no
+	// public listing (Docs/01 §8), so there is no store page to link to yet. The client
+	// shows the prompt without a link when these are blank, which is why an empty value is
+	// allowed rather than refused at startup.
+	IOSStoreURL     string
+	AndroidStoreURL string
 }
 
 // HTTP configures the public API listener.
@@ -161,6 +189,12 @@ func Load() (*Config, error) {
 		Idempotency: Idempotency{
 			TTL:         l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
 			InFlightTTL: l.duration("IDEMPOTENCY_IN_FLIGHT_TTL", 60*time.Second),
+		},
+		App: App{
+			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
+			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
+			IOSStoreURL:         l.str("IOS_STORE_URL", ""),
+			AndroidStoreURL:     l.str("ANDROID_STORE_URL", ""),
 		},
 	}
 

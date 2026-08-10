@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/buildinfo"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/logging"
@@ -88,9 +89,16 @@ func run() error {
 	idempotencyStore := idempotency.NewRedisStore(redisClient,
 		cfg.Idempotency.TTL, cfg.Idempotency.InFlightTTL)
 
+	deps := Deps{
+		Config:    cfg,
+		Logger:    log,
+		Clock:     clock.System{},
+		StartedAt: startedAt,
+	}
+
 	srv := &http.Server{
 		Addr:    cfg.HTTP.Addr(),
-		Handler: newRouter(log, startedAt, idempotencyStore),
+		Handler: newRouter(deps, idempotencyStore),
 
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,
