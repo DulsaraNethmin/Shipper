@@ -53,7 +53,12 @@ Their histories differ because wave 0 reached `main` through a detour — merged
 
 Verified by `make verify` — **47 checks**, and `make check` green.
 
-### M0 — Foundation (18 of 30)
+`make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
+endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
+adapters have none to demonstrate — nothing consumes them until SHIP-33, SHIP-36 and
+SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `make web-dev`.
+
+### M0 — Foundation (20 of 30)
 
 | Ticket | What |
 |---|---|
@@ -67,12 +72,17 @@ Verified by `make verify` — **47 checks**, and `make check` green.
 | **SHIP-15a** | Conventions (`Docs/10`) and the shared-surface mechanisms |
 | **SHIP-15b** | The spelling check scoped for client code — *see below* |
 | **SHIP-20** | Go CI — build, boundaries, spelling, tests, migration round trip |
+| **SHIP-22** | Admin panel scaffold — pnpm workspace, Next.js App Router, placeholder shell |
+| **SHIP-23** | Driver portal scaffold — placeholder job page, no token route, no account |
 
 ### Elsewhere
 
 | Ticket | Milestone | What |
 |---|---|---|
 | **SHIP-28** | M1 | `users` — citext email, phone, role, status, verification timestamps |
+| **SHIP-32** | M1 | Email adapter — console in development, generic HTTP provider in staging |
+| **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
+| **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 
@@ -221,7 +231,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b
-SHIP-20 SHIP-28 SHIP-149 SHIP-167
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-32 SHIP-35 SHIP-59a SHIP-149 SHIP-167
 ```
 
 ## 11. Keeping this file honest

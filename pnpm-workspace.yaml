@@ -1,0 +1,20 @@
+# The pnpm workspace (Docs/10 §8.4).
+#
+# One lockfile and one node_modules store for every web surface in the repository, which is
+# the same argument Docs/08 makes for the monorepo itself: the admin panel and the driver
+# portal consume the same versioned API and will eventually share the same status
+# enumeration (SHIP-56a), and two independently drifting dependency trees make that harder
+# than it needs to be.
+#
+# The applications are listed rather than globbed. apps/ also holds the Flutter client, which
+# is not a Node package, and a new web surface should be a line somebody wrote rather than a
+# directory that appeared.
+packages:
+  - "apps/admin"
+  - "apps/driver-portal"
+
+# Postinstall scripts are opt-in. Neither application needs one today; sharp and
+# unrs-resolver ask for one and work without it.
+allowBuilds:
+  sharp: false
+  unrs-resolver: false
