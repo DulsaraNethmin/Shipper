@@ -44,12 +44,14 @@
 | Disputed | Completed | Admin resolves dispute with delivery accepted |
 | Disputed | Cancelled | Admin resolves as cancelled/failed delivery |
 
+**This table is authoritative for the transition guard.** Two consequences are easy to miss and both are deliberate. `Awarded → En route to pickup` is permitted directly, so `Driver assigned` is skippable — a provider who is driving the job themselves need not nominate anyone. And `Picked up → In transit` may be applied by the platform as a presentation change rather than by an actor. Where `01` §4.4 numbers the five recordable milestones as a sequence, it is describing what a driver records, not constraining what the guard accepts.
+
 ## 3. Transition controls
 
 - Only the customer can award a job, and the selected bid must be active.
 - Awarding a job atomically marks one bid accepted and all others closed.
 - Delivery-status updates must be made only by the awarded provider, their assigned driver, or an administrator acting with an audit reason.
-- “Delivered” requires a timestamp, recipient name or delivery note, and at least one form of proof if the policy requires it.
+- “Delivered” requires a delivery timestamp, a recipient name, a delivery note, and photo proof — or, in place of the photo, a reasoned exception recorded under §6.4. See `01` §4.4, which is authoritative for the field set.
 - Core job details cannot change after award without a documented change process.
 - Cancellation after pickup requires support intervention unless the parties agree and the workflow is explicitly supported.
 - A dispute freezes automatic completion until an administrator resolves it.

@@ -91,6 +91,10 @@ A deleted user becomes a stable pseudonymous identifier, so the counterparty's o
 
 **Decision required:** the retention period for pseudonymised transaction records. Owner: legal. This is the one genuinely open element — the split above is a design decision, but how long the retained side persists is a question of Australian limitation periods, tax and business record-keeping obligations, and insurance requirements. Needed before account deletion is implemented.
 
+## 4. Policy positions
+
+These are the draft positions to be confirmed with advisers. `07` §5 cites this section for the push-content rule.
+
 | Policy area | Draft position | Approval needed |
 |---|---|---|
 | Service role | Marketplace facilitator, not transport carrier | Legal |
