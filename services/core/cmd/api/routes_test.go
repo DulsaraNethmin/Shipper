@@ -11,13 +11,23 @@ import (
 	"time"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/buildinfo"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 )
 
+func testDeps() Deps {
+	return Deps{
+		Config:    &config.Config{},
+		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		Clock:     clock.System{},
+		StartedAt: time.Now(),
+	}
+}
+
 func testRouter() http.Handler {
-	return newRouter(slog.New(slog.NewJSONHandler(io.Discard, nil)), time.Now(),
-		idempotency.NewMemoryStore())
+	return newRouter(testDeps(), idempotency.NewMemoryStore())
 }
 
 // SHIP-6's acceptance criterion: GET /health returns 200 with version and commit.
