@@ -11,6 +11,7 @@
 # directory that appeared.
 packages:
   - "apps/admin"
+  - "apps/driver-portal"
 
 # Postinstall scripts are opt-in. Neither application needs one today; sharp and
 # unrs-resolver ask for one and work without it.
