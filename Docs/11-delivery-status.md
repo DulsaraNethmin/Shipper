@@ -71,7 +71,13 @@ endpoint is demonstrated by its own tests instead and says so in the row: the wa
 adapters have none to demonstrate — nothing consumes them until SHIP-33, SHIP-36 and
 SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `make web-dev`.
 
-### M0 — Foundation (20 of 30)
+The Flutter client is demonstrated by `make flutter-check` — the analyzer, the tests, and the
+environment test run once per build flavour — and SHIP-16 and SHIP-19 by installing the built
+`.app` and `.apk` on an iPhone 17 simulator and a Pixel_10a emulator and reading the API
+version off both screens. `make verify` does not cover it: that script exercises HTTP
+endpoints, and none of these tickets adds one.
+
+### M0 — Foundation (25 of 30)
 
 | Ticket | What |
 |---|---|
@@ -88,8 +94,8 @@ SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `m
 | **SHIP-17** | Feature folders per `Docs/07` §2, Riverpod and `go_router`, and a boundary test |
 | **SHIP-18** | `dio` client — three environments by `--dart-define`, and the Android emulator's host |
 | **SHIP-19** | Health round trip — the API version on screen, on both simulators |
-| **SHIP-21** | Flutter CI — analyzer, tests, per-flavour environment tests, codegen diff |
 | **SHIP-20** | Go CI — build, boundaries, spelling, tests, migration round trip |
+| **SHIP-21** | Flutter CI — analyzer, tests, per-flavour environment tests, codegen diff |
 | **SHIP-22** | Admin panel scaffold — pnpm workspace, Next.js App Router, placeholder shell |
 | **SHIP-23** | Driver portal scaffold — placeholder job page, no token route, no account |
 
