@@ -10,7 +10,7 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-10, closing wave 1 — eight tickets landed across three branches, and the Flutter track was deferred for a reason that is not about the code. See §7.
+**Last updated:** 2026-08-10, closing wave 1 in full — fourteen tickets across four branches. The Flutter track was deferred mid-wave for a missing toolchain and completed once it was installed; §7 keeps that sequence rather than tidying it away.
 
 ---
 
@@ -18,34 +18,38 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 29 | 70 |
-| Remaining | 172 | 549 |
+| **Done** | 35 | 82 |
+| Remaining | 166 | 537 |
 | **Total** | 201 | 619 |
 
 | Milestone | Done | Points |
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
-| **M0** Foundation | 20 / 30 | 47 / 75 |
+| **M0** Foundation | 25 / 30 | 58 / 75 |
 | **M1** Identity | 6 / 28 | 15 / 78 |
 | **M2** Jobs | 1 / 26 | 3 / 78 |
 | **M3** Bidding and award | 0 / 27 | 0 / 95 |
 | **M4** Delivery | 0 / 29 | 0 / 101 |
 | **M5** Notifications | 0 / 13 | 0 / 45 |
 | **M6** Admin | 1 / 20 | 3 / 65 |
-| **M7** Hardening | 1 / 19 | 2 / 56 |
+| **M7** Hardening | 2 / 19 | 3 / 56 |
+
+**M0 has five tickets left and four of them are not code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. **SHIP-17a is the only buildable M0 ticket still open.**
 
 **The first domain logic exists, and it is in exactly one package.** `internal/identity` holds argon2id password storage and access-token issue; the other seven domains still contain `doc.go` and nothing else. Everything outside `identity` remains foundation and adapters.
 
 That distinction is worth keeping in mind rather than rounding away: `identity` now has code that other domains will want to call, and the rule that stops them calling it directly — one domain never imports another — has its first real opportunity to be broken from here on.
+
+**All four deployables now exist and run.** The Flutter client builds and runs on both simulators, the two Next.js surfaces build and serve, and the Go service serves `/health` to the app. Nothing above the foundation is wired to a real endpoint yet — the app fetches `/health` and nothing else — but the shape `Docs/08` describes is on disk rather than in a document.
 
 ## 2. Branch state
 
 | Branch | At | Holds |
 |---|---|---|
 | `main` | PR #9 | Wave 0 only. **Nothing from wave 1, and not this file** |
-| `develop` | PR #14 | Everything below. **Cut new branches from here** |
+| `develop` | PR #17 | Everything below. **Cut new branches from here** |
 
-**`develop` is 23 commits ahead of `main`** — the whole of wave 1 plus the tracker itself. `main` has not been updated since wave 0, which is by design: `develop → main` goes in release-sized batches rather than one per ticket, and wave 1 is the first batch worth cutting.
+**`develop` is 36 commits ahead of `main`** — the whole of wave 1 plus the tracker itself. `main` has not been updated since wave 0, which is by design: `develop → main` goes in release-sized batches rather than one per ticket, and wave 1 is the first batch worth cutting.
 
 `main` also shows 7 commits `develop` does not have. Those are the detour, not divergent work: wave 0 reached `main` by being merged (PR #6), reverted (PR #7), and reapplied (PR #9). The content is identical; only the shape of the history differs.
 
@@ -170,7 +174,7 @@ X-5 and X-6 need no third party at all — they are decisions somebody can make 
 
 ## 6. Ready to start now
 
-Strict build order says the next ticket is the lowest-numbered open one, **SHIP-16** — which is blocked on a toolchain rather than on code, so it is not the one to pick up. These all have satisfied dependencies:
+Strict build order says the next ticket is the lowest-numbered open one, **SHIP-17a**, and for once that is also the right answer — see below. These all have satisfied dependencies:
 
 | Ticket | Pts | Area |
 |---|---|---|
@@ -178,37 +182,46 @@ Strict build order says the next ticket is the lowest-numbered open one, **SHIP-
 | SHIP-30 | 3 | Registration endpoint — `users` and argon2id both exist now |
 | SHIP-31, 34 | 5 | Email verification token, phone OTP issue and storage |
 | SHIP-39 | 5 | Refresh token rotation — `device_sessions` exists, and it needs an expiry column |
+| SHIP-48 | 3 | Flutter secure storage — `apps/mobile` exists now, and API 24 was chosen for it |
 | SHIP-56 | 3 | `jobs` table |
 | SHIP-67a | 3 | `cmd/worker` scheduler |
 | SHIP-114 | 5 | Object storage, pre-signed upload |
 
-**SHIP-17a is now the highest-value one on that list**, which it was not before wave 1. The two Next.js surfaces exist and the Flutter client will be written against the same contract; until `contracts/openapi.yaml` exists, every client is guessing at field names, and `Docs/10` §8.1 says so. It also unblocks `TestEveryRouteIsInTheContract`, which is one of the three route-surface guards `Docs/10` §4.1 names and the only one not yet enforceable.
+**SHIP-17a is now the highest-value one on that list, and wave 1 is what made it so.** All three clients exist — a Flutter app with a `dio` client, an admin panel, a driver portal — and every one of them will consume the same endpoints. Until `contracts/openapi.yaml` exists they are guessing at field names, and `Docs/10` §8.1 says the contract is what lets client work proceed *alongside* the endpoint it consumes rather than behind it. That was an abstract benefit before there were clients. It is now three codebases that will each invent their own field names in the next wave if the contract is not there first.
+
+It also unblocks `TestEveryRouteIsInTheContract`, one of the three route-surface guards `Docs/10` §4.1 names and the only one still unenforceable.
 
 **SHIP-30 is a state-changing route and SHIP-44 has not landed, and it is still safe to build.** §8's gate names *authenticated* endpoints for a precise reason worth knowing before someone reads it as a blanket freeze: `replayOrRefuse` compares a fingerprint over method, path and body, and refuses a reused key with `409 idempotency_key_reused` rather than replaying. Reading another caller's stored response therefore requires sending their exact body — which, for register, means already holding their email and password. The public endpoints on `Docs/10` §4.1's allow-list all carry the caller's own secret material in the body, and that is what protects them while the scope is `nil`.
 
 The gate binds where the body does *not* distinguish callers — `POST /v1/auth/logout` with an empty body is the same request from everybody, and under a shared `anonymous` scope one user's response replays to another. That is the case SHIP-44 closes.
 
-## 7. Wave 1 — what landed, and what did not
+## 7. Wave 1 — what landed
 
-Eight tickets across three branches. Two of the three planned tracks completed; the third was stopped by a missing toolchain rather than by anything in the code.
+Fourteen tickets across four branches. All three tracks completed, but not all at once: the Flutter track was blocked mid-wave, deferred, and finished after the block cleared.
 
 | Track | Planned | Landed |
 |---|---|---|
 | **A** Go platform | SHIP-29, 38, 37 | All three, plus a fix to SHIP-149's verify section |
-| **B** Flutter | SHIP-16, 17, 18, 19, 21, 179 | **None.** `Docs/07` §9's decisions closed instead |
+| **B** Flutter | SHIP-16, 17, 18, 19, 21, 179 | All six — **after a pause, see below** |
 | **C** Web + adapters | SHIP-22, 23, 32, 35, 59a | All five |
 
-The exit criterion was "M0 complete except SHIP-24…27; the app shows the API version from `/health` on both simulators; email and SMS log to console; a signed access token can be issued and verified." **Three of those four hold.** The simulator one does not, and cannot yet — see below.
+The exit criterion was "M0 complete except SHIP-24…27; the app shows the API version from `/health` on both simulators; email and SMS log to console; a signed access token can be issued and verified."
 
-### Why Track B stopped
+**All four now hold**, with one correction to the first: M0 is complete except SHIP-24…27 **and SHIP-17a**, which the criterion overlooked. SHIP-17a is not blocked by anything; it was simply not in any track.
 
-The machine has no Flutter SDK, no Dart, no Android SDK and no CocoaPods, and carries Xcode **Command Line Tools** rather than Xcode — so `xcodebuild` and `simctl` both refuse and there is no iOS simulator to run anything on.
+### Track B was deferred, then unblocked
 
-Every *Done when* in SHIP-16, 17, 18, 19, 21 and 179 is a build-or-run criterion. Writing the code anyway would have produced six tickets nobody could honestly mark done, which is the failure `Docs/10` §7.2 describes in a different key: work that is counted without being demonstrated.
+This section previously read "Track B landed **None**", and that was true when it was written. Keeping the sequence visible is the point — a tracker that is quietly rewritten to look like the plan always worked teaches nothing.
 
-What was done instead is the part that needed no toolchain — `Docs/07` §9's open decisions, closed **in `Docs/07`**, where `Docs/10` §10 had already been claiming for a wave that they were. Riverpod, Drift, and the OS floors, with the reasoning. That leaves the Flutter track a smaller piece of work when it resumes, because none of its decisions are still open.
+**What happened.** The machine had no Flutter SDK, no Dart, no Android SDK and no CocoaPods, and carried Xcode **Command Line Tools** rather than Xcode, so `xcodebuild` and `simctl` both refused and there was no simulator to run anything on. Every *Done when* in the track is a build-or-run criterion. Writing the code anyway would have produced six tickets nobody could honestly mark done — the failure `Docs/10` §7.2 describes in another key: work counted without being demonstrated.
 
-**To resume:** install the Flutter SDK, Xcode proper, the Android SDK and CocoaPods, then take SHIP-16 onwards on `ship-16-21-flutter-foundation`, which is parked and empty. Nothing else blocks it, and no other ticket depends on it.
+So the track was cut down to the part needing no toolchain — `Docs/07` §9's open decisions, closed **in `Docs/07`**, where `Docs/10` §10 had already spent a wave claiming they were. Riverpod, Drift, and the OS floors, with the reasoning.
+
+**Then the toolchain was installed** — Xcode 26.6 with the iOS 26.5 runtime, Flutter 3.44.9, CocoaPods, Android SDK 36 with cmdline-tools, licences, an `arm64-v8a` system image and a Pixel AVD — and the full track ran on `ship-16-21-flutter-foundation` and landed all six tickets.
+
+**The deferral paid for itself.** Because the decisions were already closed in `Docs/07`, the track that resumed had nothing left to argue about and went straight to code.
+
+**One defect worth naming**, because it would have survived to a store review: Flutter's template declares `INTERNET` only in the debug and profile manifests, for hot reload. The release manifest had no network permission at all, so every screen would have worked in development and the shipped app would have failed to reach the API.
 
 ### Decisions taken during the wave
 
@@ -227,6 +240,8 @@ These were settled before the tracks started, so that three agents did not answe
 - **`go.mod` was never touched**, because the dependencies each track needed were already direct. That was luck as much as planning; a wave whose tracks each need a new module has a `go.sum` conflict waiting, and `Docs/10` §9.2 is right that adding one is a request rather than a commit.
 - **A ticket for the shared surface is worth cutting up front.** SHIP-15b existed because the spelling lint would have failed both client tracks on their first commit — found by reading the lint, not by CI going red. A wave that opens a new kind of source file should expect one of these.
 - **`make verify` is where a ticket stops being believed and starts being demonstrated**, and it caught its own defect this wave: two SHIP-149 checks had been passing without reaching the trigger they name.
+- **A blocked track is worth splitting rather than stalling or faking.** Track B could not demonstrate a single *Done when* without a toolchain, but the decisions in `Docs/07` §9 needed no toolchain at all. Doing that part first meant the resumed track argued about nothing.
+- **Check the tools before planning the wave, not after dispatching it.** The Flutter toolchain was missing from the start; finding that out at dispatch cost a re-plan mid-wave. `flutter doctor` — or its equivalent for whatever a track needs — belongs in the readiness check beside the dependency check.
 
 ### Wave rules, unchanged
 
@@ -258,6 +273,12 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 **A ticket for the web CI workflows.** `.github/workflows/README.md` already anticipates an admin-panel workflow and a driver-portal workflow, each path-filtered to its own app. Both surfaces now exist and neither has one, and the backlog has only SHIP-20 (Go) and SHIP-21 (Flutter). This is a lettered ticket waiting to be written, in the SHIP-15b mould.
 
 **`device_sessions` has no expiry column.** SHIP-38's *Done when* named refresh state, device label and last seen, and the implementation stopped exactly there — correctly, as a scope decision. But a refresh token has to expire, so **SHIP-39 either adds the column or explains where expiry lives instead.** Flagged here so it is a decision rather than a discovery.
+
+**The mobile bundle identifier has no owner and stops being changeable.** `apps/mobile` currently uses a provisional `au.com.shipper` for both the iOS bundle id and the Android application id. **Once X-2 and X-3 publish a build, neither can be changed** — a new identifier is a new app listing, with a new install base. Confirm it before SHIP-25 or SHIP-27, not after. The staging and production hostnames baked into the API client (`api.staging.shipper.com.au`, `api.shipper.com.au`) are provisional in the same way, though those are only configuration; `SHIPPER_API_BASE_URL` overrides them meanwhile.
+
+**`Docs/07` §8 requires staging and production installable on one device, and the client cannot do that yet.** SHIP-18 selects the environment with `--dart-define`, which changes the base URL but not the identifier, so the second build replaces the first. Holding both at once needs a distinct application id per environment — real Xcode and Gradle flavours. **That work belongs with SHIP-24…27**, which are blocked on X-2 and X-3 anyway, but it is not currently in any of their *Done when* lines.
+
+**`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 
 ## 10. The done list, in a form a script can read
 
