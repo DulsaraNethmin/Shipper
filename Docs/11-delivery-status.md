@@ -79,6 +79,7 @@ SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `m
 |---|---|---|
 | **SHIP-28** | M1 | `users` — citext email, phone, role, status, verification timestamps |
 | **SHIP-32** | M1 | Email adapter — console in development, generic HTTP provider in staging |
+| **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 
@@ -227,7 +228,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b
-SHIP-20 SHIP-28 SHIP-32 SHIP-149 SHIP-167
+SHIP-20 SHIP-28 SHIP-32 SHIP-35 SHIP-149 SHIP-167
 ```
 
 ## 11. Keeping this file honest
