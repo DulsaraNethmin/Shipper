@@ -101,21 +101,12 @@ void main() {
       expect(PermissionCopy.notificationsPurpose, contains('addresses'));
     });
 
-    test('is written in Australian English', () {
-      // scripts/check-spelling.sh covers the words it knows; this covers the one that matters
-      // most here, since a permission prompt is copy a customer reads.
-      for (final copy in [
-        PermissionCopy.cameraPurpose,
-        PermissionCopy.cameraDeclined,
-        PermissionCopy.notificationsTitle,
-        PermissionCopy.notificationsPurpose,
-        PermissionCopy.notificationsDeclined,
-      ]) {
-        expect(copy.toLowerCase(), isNot(contains('authorize')));
-        expect(copy.toLowerCase(), isNot(contains('canceled')));
-        expect(copy.toLowerCase(), isNot(contains('customize')));
-      }
-    });
+    // Australian English is not asserted here. `scripts/check-spelling.sh` already covers
+    // `apps/**` for exactly the words that matter in copy a customer reads — `cancelled` is a
+    // job status and `licence` is what a provider is verified against (`Docs/10` §9.3) — and CI
+    // runs it on this workflow. A second check here would have to spell out the American forms
+    // to look for them, which then needs a waiver from the first check: two mechanisms, one
+    // guarantee, and the weaker one adding the noise the lint's own header warns about.
   });
 }
 
