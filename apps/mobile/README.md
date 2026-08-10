@@ -94,6 +94,29 @@ Drift is decided but **not yet a dependency**. SHIP-17 is structure; the queue i
 `lib/core/queue/` holds the reasoning and nothing else, because an unused native dependency in
 both platform builds buys nothing that a folder and a paragraph do not.
 
+## Generated model code is committed
+
+`freezed` and `json_serializable` write the `.freezed.dart` and `.g.dart` halves of every
+model, and **both are committed**. `make flutter-codegen` regenerates them; CI regenerates and
+asserts `git diff --exit-code`.
+
+That is the pattern `Docs/10` §8.2 already prescribes for `make codegen` — generated files
+committed, CI checking the diff — applied here for the same two reasons. A fresh clone
+compiles without a build step nobody documented, and `flutter analyze` stays one command
+rather than one command that only works after another. The diff check is what stops a
+hand-edit to a generated file surviving.
+
+## The health screen
+
+`/` shows the API version fetched from `GET /health` (SHIP-19). It is a development surface,
+replaced by the role-aware shell in M1, and it earns its place by being the only thing that
+exercises the whole path — build flavour, base URL, transport, decoding, failure mapping — end
+to end on a real device before anything depends on it.
+
+It prints the resolved base URL underneath, because the most likely reason it fails is that it
+is pointed somewhere there is no API, and a version that will not load tells you nothing about
+which address did not answer.
+
 ## Deployment floors
 
 **iOS 14.0 and Android API 24**, decided in `Docs/07` §9. They are deployment targets, not

@@ -1,6 +1,7 @@
-import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+
+import 'package:shipper/core/health/health_screen.dart';
 
 /// Route paths, named once.
 ///
@@ -27,25 +28,13 @@ final routerProvider = Provider<GoRouter>((ref) {
   return GoRouter(
     initialLocation: Routes.home,
     routes: <RouteBase>[
+      // The connectivity check (SHIP-19), which stands in until the role-aware shell replaces
+      // it in M1. Docs/07 §1 makes that shell the thing that decides which half of the
+      // marketplace a signed-in user sees.
       GoRoute(
         path: Routes.home,
-        builder: (context, state) => const _HomePlaceholder(),
+        builder: (context, state) => const HealthScreen(),
       ),
     ],
   );
 });
-
-/// Stands in until the post-login shell arrives at SHIP-49.
-///
-/// SHIP-19 replaces what sits at [Routes.home] with the connectivity check, and the real
-/// role-aware shell replaces that in M1.
-class _HomePlaceholder extends StatelessWidget {
-  const _HomePlaceholder();
-
-  @override
-  Widget build(BuildContext context) {
-    return const Scaffold(
-      body: Center(child: Text('Shipper')),
-    );
-  }
-}

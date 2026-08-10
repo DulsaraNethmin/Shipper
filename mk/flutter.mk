@@ -16,6 +16,15 @@ FLUTTER ?= flutter
 flutter-deps: ## Resolve Dart package dependencies exactly as pubspec.lock pins them
 	cd $(MOBILE) && $(FLUTTER) pub get
 
+# freezed and json_serializable write the .freezed.dart and .g.dart halves of every model.
+# The generated files are committed, and CI regenerates and asserts `git diff --exit-code` —
+# the pattern Docs/10 §8.2 already prescribes for `make codegen`. Committing them is what keeps
+# a fresh clone compiling and keeps `flutter analyze` a single step; the diff check is what
+# stops a hand-edit to a generated file surviving.
+.PHONY: flutter-codegen
+flutter-codegen: ## Regenerate the freezed and json_serializable model code
+	cd $(MOBILE) && dart run build_runner build
+
 .PHONY: flutter-analyze
 flutter-analyze: ## Static analysis; fails on any analyzer error, warning or lint
 	cd $(MOBILE) && $(FLUTTER) analyze
