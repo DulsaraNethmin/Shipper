@@ -405,7 +405,12 @@ ok "role is constrained to customer and provider"
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-149  the audit log is append-only in the database, not by convention"
 
-audit_id="$("$PSQL" "$DATABASE_URL" -tAc \
+# -q matters here and only here. Without it psql appends the command tag to the result, so
+# this captures "<uuid>\nINSERT 0 1" rather than a uuid — and the two checks below then fail
+# with `invalid input syntax for type uuid` instead of with the append-only trigger, which
+# their `if` cannot tell apart from success. Both reported a pass while exercising nothing.
+# The other captures in this file are SELECTs, which emit no tag under -tA.
+audit_id="$("$PSQL" "$DATABASE_URL" -qtAc \
   "insert into audit_log (id, actor_type, action, target_type, target_id)
    values (gen_random_uuid(), 'system', 'job.expired', 'job', gen_random_uuid())
    returning id;")"
@@ -470,6 +475,174 @@ status="$(curl -s -o /dev/null -w '%{http_code}' \
   "http://localhost:$VERIFY_PORT/v1/app/minimum-version")"
 [[ "$status" == "200" ]] || fail "the version gate requires authentication (status $status)"
 ok "it answers without credentials"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-29  passwords are stored as argon2id, and nothing reversible is stored"
+
+pushd "$ROOT/services/core" >/dev/null
+if ! password_log="$(go test ./internal/identity/ -run TestPassword -count=1 -v 2>&1)"; then
+  echo "$password_log"
+  popd >/dev/null
+  fail "the password tests do not pass"
+fi
+popd >/dev/null
+ok "round trip, wrong password, salting, tampering and truncation all hold"
+
+# The stored form itself, read out of the test that produced it rather than asserted twice.
+# A hash is not a secret; the password that made it is a literal in the test file.
+sample="$(grep -oE '\$argon2id\$v=19\$m=[0-9]+,t=[0-9]+,p=[0-9]+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+' \
+  <<<"$password_log" | head -1)"
+[[ -n "$sample" ]] || { echo "$password_log"; fail "no PHC string appeared in the test output"; }
+ok "the stored form is a PHC string, carrying its variant, version and all three costs"
+
+# The parameters being inside the hash is what allows the cost to be raised later without
+# invalidating a single stored password (Docs/10 §5).
+costs="$(cut -d'$' -f4 <<<"$sample")"
+[[ "$costs" =~ ^m=[0-9]+,t=[0-9]+,p=[0-9]+$ ]] || fail "the costs are not in the hash: $costs"
+ok "the costs travel with the hash — $costs — so raising the profile needs no migration"
+
+# Reversibility is a property of the schema as much as of the code: one credential column, and
+# it holds a derived key.
+credential_column="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(string_agg(table_name || '.' || column_name, ', ' order by table_name), 'none')
+     from information_schema.columns
+    where table_schema = 'public'
+      and column_name ~ '(password|secret|passphrase)'")"
+[[ "$credential_column" == "users.password_hash" ]] \
+  || fail "expected users.password_hash and nothing else, found: $credential_column"
+ok "the schema holds exactly one credential column, users.password_hash"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-38  one row per device, holding refresh state, a label and last seen"
+
+"$PSQL" "$DATABASE_URL" -tAc \
+  "select 1 from information_schema.tables where table_name = 'device_sessions';" | grep -q 1 \
+  || fail "the device_sessions table does not exist"
+ok "device_sessions exists, at migration 000100 inside identity's reserved block"
+
+columns="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(column_name || ':' || data_type, ' ' order by column_name)
+     from information_schema.columns
+    where table_schema = 'public' and table_name = 'device_sessions';")"
+for want in "id:uuid" "user_id:uuid" "refresh_token_hash:text" "device_label:text" \
+            "last_seen_at:timestamp with time zone" "created_at:timestamp with time zone" \
+            "updated_at:timestamp with time zone"; do
+  grep -qF "$want" <<<"$columns" || fail "expected a column $want; found: $columns"
+done
+ok "refresh state, device label and last seen are there, every timestamp with its zone"
+
+# The token is opaque and stored hashed (Docs/10 §5), so what the column may not hold is the
+# token. Uniqueness is the part the database has to enforce: one token, one session.
+# -q as well as -tA: without it psql appends its own "INSERT 0 1" status line to the value, and
+# a captured id with a command tag stuck to it produces a uuid syntax error later rather than a
+# constraint failure — which is a check that passes for the wrong reason.
+verify_user="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into users (id, email, phone, password_hash, role)
+   values (gen_random_uuid(), 'session-$$@example.com', '+6140003$$', 'x', 'customer')
+   returning id;")"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions (id, user_id, refresh_token_hash, device_label)
+   values (gen_random_uuid(), '$verify_user', 'hash-$$', 'Verify iPhone');" >/dev/null \
+  || fail "a device session could not be created"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions (id, user_id, refresh_token_hash, device_label)
+   values (gen_random_uuid(), '$verify_user', 'hash-$$', 'Verify Pixel');" >/dev/null 2>&1; then
+  fail "two sessions hold the same refresh token hash"
+fi
+ok "a refresh token hash belongs to exactly one session"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "delete from users where id = '$verify_user';" >/dev/null 2>&1; then
+  fail "deleting the account took its sessions with it; the foreign key is not RESTRICT"
+fi
+ok "ON DELETE RESTRICT holds, so sessions cannot vanish with a deleted account"
+
+trigger="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from pg_trigger tr
+     join pg_class cl on cl.oid = tr.tgrelid
+     join pg_proc p   on p.oid  = tr.tgfoid
+    where cl.relname = 'device_sessions' and p.proname = 'set_updated_at'
+      and not tr.tgisinternal;")"
+[[ "$trigger" == "1" ]] || fail "device_sessions has no set_updated_at trigger"
+
+fk_index="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from pg_index i
+     join pg_class t     on t.oid = i.indrelid
+     join pg_attribute a on a.attrelid = t.oid and a.attnum = i.indkey[0]
+    where t.relname = 'device_sessions' and a.attname = 'user_id';")"
+[[ "$fk_index" -ge 1 ]] || fail "the foreign key on device_sessions.user_id is not indexed"
+ok "the updated_at trigger is attached and the foreign key is indexed"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-37  a short-lived signed token carrying the user, the role and an expiry"
+
+pushd "$ROOT/services/core" >/dev/null
+if ! token_log="$(go test ./internal/identity/ -run 'TestAccessToken|TestKeyset|TestNewAccessToken' -count=1 -v 2>&1)"; then
+  echo "$token_log"
+  popd >/dev/null
+  fail "the access token tests do not pass"
+fi
+popd >/dev/null
+ok "the TTL, kid selection, rotation and the driver-audience refusal all hold"
+
+# A real token, decoded here rather than by the library that produced it. Asking the issuer what
+# it issued would prove very little; this reads the bytes that would go over the wire.
+access_token="$(grep -oE 'access token: [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' <<<"$token_log" \
+  | head -1 | awk '{print $3}')"
+[[ -n "$access_token" ]] || { echo "$token_log"; fail "no access token appeared in the test output"; }
+
+python3 - "$access_token" >"$WORKDIR/token.json" <<'PYTHON'
+import base64, json, sys
+
+def segment(s):
+    return json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+
+header, payload, _signature = sys.argv[1].split(".")
+header, payload = segment(header), segment(payload)
+
+json.dump({
+    "alg":         header.get("alg"),
+    "kid":         header.get("kid"),
+    "claim_names": " ".join(sorted(payload)),
+    "iss":         payload.get("iss"),
+    "aud":         payload.get("aud"),
+    "sub":         payload.get("sub"),
+    "role":        payload.get("role"),
+    "lifetime":    payload.get("exp", 0) - payload.get("iat", 0),
+}, sys.stdout)
+PYTHON
+
+[[ "$(json "$WORKDIR/token.json" '["alg"]')" == "HS256" ]] \
+  || fail "the token is not signed with HS256"
+kid="$(json "$WORKDIR/token.json" '["kid"]')"
+[[ -n "$kid" && "$kid" != "None" ]] \
+  || fail "the token names no signing key, so a key could never be rotated"
+ok "HS256, naming its key in the header as kid=$kid"
+
+# Exactly the claim set Docs/10 §5 fixes, checked as a whole. A missing claim breaks something
+# loudly; an added one sits there being believed, which is the direction that matters.
+claims="$(json "$WORKDIR/token.json" '["claim_names"]')"
+[[ "$claims" == "aud exp iat iss jti role sid sub" ]] \
+  || fail "the claims are '$claims', and Docs/10 §5 says exactly: aud exp iat iss jti role sid sub"
+ok "the claim set is exactly sub, role, sid, iat, exp, jti, iss and aud"
+
+for forbidden in permissions scope scopes verified email_verified phone_verified status; do
+  grep -qw "$forbidden" <<<"$claims" && fail "the token carries '$forbidden'"
+done
+ok "no permission and no verification state — the platform decides both, freshly (Docs/07 §3)"
+
+[[ "$(json "$WORKDIR/token.json" '["iss"]')" == "shipper" ]] || fail "iss is not shipper"
+[[ "$(json "$WORKDIR/token.json" '["aud"]')" == "shipper-mobile" ]] \
+  || fail "aud is not shipper-mobile, which is what separates this from the driver token"
+[[ "$(json "$WORKDIR/token.json" '["role"]')" =~ ^(customer|provider)$ ]] \
+  || fail "role is not one of the two the platform issues"
+[[ "$(json "$WORKDIR/token.json" '["sub"]')" =~ ^[0-9a-f-]{36}$ ]] || fail "sub is not a user id"
+ok "iss=shipper, aud=shipper-mobile, and sub carries the user id"
+
+[[ "$(json "$WORKDIR/token.json" '["lifetime"]')" == "900" ]] \
+  || fail "the token lives $(json "$WORKDIR/token.json" '["lifetime"]') seconds, and Docs/10 §5 says 900"
+ok "it expires fifteen minutes after it was issued, measured against an injected clock"
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"

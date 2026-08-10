@@ -196,6 +196,10 @@ tidy: ## Tidy go.mod and go.sum
 lint-spelling: ## Check Australian English (CLAUDE.md, Docs/10 §9.3)
 	@./scripts/check-spelling.sh
 
+.PHONY: status
+status: ## Where the delivery is: Docs/11 counted against the backlog and the commit history
+	@./scripts/delivery-status.sh
+
 .PHONY: check
 check: vet lint-imports lint-spelling test ## Everything CI will run for the Go service (SHIP-20)
 

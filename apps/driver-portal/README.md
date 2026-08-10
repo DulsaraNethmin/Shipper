@@ -4,10 +4,33 @@ A responsive web portal that an assigned driver opens from a link. **No account,
 no app install** (`Docs/06` §2). The provider forwards the link; there is no SMS integration
 in the MVP (`Docs/08` Step 0).
 
-## Not yet scaffolded
+## Scaffolded, and nothing more than that
 
-This directory is a placeholder created by **SHIP-1**. The Next.js project arrives in
-**SHIP-23**, and the portal itself in **SHIP-120**…**SHIP-123**.
+**SHIP-23** landed the Next.js project: App Router, TypeScript in strict mode, Tailwind with
+shadcn/ui, inside the pnpm workspace at the repository root (`Docs/10` §8.4). The portal
+itself is **SHIP-120**…**SHIP-123**.
+
+```
+make web-dev app=driver-portal    run it at http://localhost:3002
+make web-build                    build every web application
+make web-check                    lint, type-check and build
+```
+
+Two routes exist, both static and both inert:
+
+| Route | What it is |
+|---|---|
+| `/` | What this surface is, for anyone who arrives without a link. There is no way in from here — the link is the only entry |
+| `/job` | The placeholder delivery page: milestones, proof, and the two things it will never show |
+
+**The placeholder route carries no token, deliberately.** The real page is reached at a
+token-bearing URL and renders only after the platform has validated it (SHIP-108, SHIP-120).
+A scaffold route that accepted a token would be a shape inviting somebody to render a job
+beside a token this application never checked — and authorisation is the platform's
+decision, never the client's (`Docs/07` §3).
+
+No web font is fetched and nothing is loaded from the API. This is the surface most likely
+to be opened on a phone with two bars of signal.
 
 ## The invariant that defines this surface
 
