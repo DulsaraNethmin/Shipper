@@ -110,6 +110,97 @@ func (postgresStore) markPhoneVerified(ctx context.Context, r db.Runner, userID 
 	return tag.RowsAffected() == 1, nil
 }
 
+// emailTokenColumns is the projection every read of a verification token shares.
+const emailTokenColumns = `id, user_id, email, token_hash, expires_at, consumed_at, consumed_reason, created_at`
+
+// insertEmailToken writes a freshly issued verification token (SHIP-31).
+func (postgresStore) insertEmailToken(ctx context.Context, r db.Runner, t emailVerificationToken) error {
+	_, err := r.Exec(ctx, `
+		INSERT INTO email_verification_tokens (id, user_id, email, token_hash, expires_at)
+		VALUES ($1, $2, $3, $4, $5)`,
+		t.ID, t.UserID, t.Email, t.TokenHash, t.ExpiresAt)
+	if err != nil {
+		return fmt.Errorf("identity: inserting a verification token: %w", err)
+	}
+	return nil
+}
+
+// supersedeEmailTokens retires whatever the account currently holds, so that a newly issued
+// token is the only live one.
+//
+// This is what keeps uq_email_verification_tokens_live satisfiable — and, more to the point,
+// what stops a link left in an old mailbox working after a replacement has been asked for.
+func (postgresStore) supersedeEmailTokens(ctx context.Context, r db.Runner, userID uuid.UUID) error {
+	_, err := r.Exec(ctx, `
+		UPDATE email_verification_tokens
+		   SET consumed_at = now(), consumed_reason = $2
+		 WHERE user_id = $1 AND consumed_at IS NULL`, userID, consumedSuperseded)
+	if err != nil {
+		return fmt.Errorf("identity: superseding outstanding verification tokens: %w", err)
+	}
+	return nil
+}
+
+// emailTokenByHash reads a token whether or not it is still live.
+//
+// Consumed and expired rows are returned rather than filtered out, because the caller answers
+// differently for each: an expired token means "ask for another", a consumed one on an already
+// verified account means the person clicked the link twice, and neither is the same as a token
+// this platform never issued.
+func (postgresStore) emailTokenByHash(ctx context.Context, r db.Runner, hash string) (emailVerificationToken, error) {
+	row := r.QueryRow(ctx,
+		`SELECT `+emailTokenColumns+` FROM email_verification_tokens WHERE token_hash = $1`, hash)
+
+	var t emailVerificationToken
+	if err := row.Scan(&t.ID, &t.UserID, &t.Email, &t.TokenHash, &t.ExpiresAt,
+		&t.ConsumedAt, &t.ConsumedReason, &t.CreatedAt); err != nil {
+		return emailVerificationToken{}, err
+	}
+	return t, nil
+}
+
+// consumeEmailToken marks a token used, reporting whether this call was the one that did it.
+//
+// The guard is in the WHERE clause rather than in a check the caller made a moment ago, which is
+// what makes "single use" hold when two confirmations arrive at once: PostgreSQL decides, and
+// the loser is told the token is no longer valid rather than both being told they verified it.
+func (postgresStore) consumeEmailToken(ctx context.Context, r db.Runner, id uuid.UUID, at time.Time) (bool, error) {
+	tag, err := r.Exec(ctx, `
+		UPDATE email_verification_tokens
+		   SET consumed_at = $2, consumed_reason = $3
+		 WHERE id = $1 AND consumed_at IS NULL`, id, at, consumedVerified)
+	if err != nil {
+		return false, fmt.Errorf("identity: consuming a verification token: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// countEmailTokensSince is what the resend limit counts over. Superseded rows are included
+// deliberately: the limit is on how many messages were sent, and every one of them was.
+func (postgresStore) countEmailTokensSince(ctx context.Context, r db.Runner, userID uuid.UUID, since time.Time) (int, error) {
+	var n int
+	if err := r.QueryRow(ctx, `
+		SELECT count(*) FROM email_verification_tokens
+		 WHERE user_id = $1 AND created_at >= $2`, userID, since).Scan(&n); err != nil {
+		return 0, fmt.Errorf("identity: counting recent verification tokens: %w", err)
+	}
+	return n, nil
+}
+
+// lastEmailTokenAt is when the account was last sent one, for the resend cooldown.
+func (postgresStore) lastEmailTokenAt(ctx context.Context, r db.Runner, userID uuid.UUID) (time.Time, bool, error) {
+	var at *time.Time
+	if err := r.QueryRow(ctx, `
+		SELECT max(created_at) FROM email_verification_tokens WHERE user_id = $1`,
+		userID).Scan(&at); err != nil {
+		return time.Time{}, false, fmt.Errorf("identity: reading the last verification token: %w", err)
+	}
+	if at == nil {
+		return time.Time{}, false, nil
+	}
+	return *at, true, nil
+}
+
 // isNoRows reports whether a read found nothing, which is an outcome rather than a failure at
 // every call site in this package.
 func isNoRows(err error) bool { return errors.Is(err, db.ErrNoRows) }

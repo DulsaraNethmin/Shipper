@@ -68,6 +68,7 @@ const (
 type Service struct {
 	pool   *pgxpool.Pool
 	hasher *PasswordHasher
+	email  EmailSender
 	clock  clock.Clock
 	store  postgresStore
 }
@@ -78,15 +79,19 @@ type Service struct {
 // database on purpose, so that a failover does not take every instance down at once (see the
 // note on Deps in cmd/api). What is refused here is a *missing collaborator*, which is a wiring
 // mistake rather than a transient condition: a service with no hasher would accept a password
-// and store nothing derivable from it.
-func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, clk clock.Clock) (*Service, error) {
+// and store nothing derivable from it, and one with no email sender would register accounts that
+// can never be verified.
+func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, sender EmailSender, clk clock.Clock) (*Service, error) {
 	if hasher == nil {
 		return nil, errors.New("identity: a service needs a password hasher")
+	}
+	if sender == nil {
+		return nil, errors.New("identity: a service needs an email sender")
 	}
 	if clk == nil {
 		return nil, errors.New("identity: a service needs a clock")
 	}
-	return &Service{pool: pool, hasher: hasher, clock: clk}, nil
+	return &Service{pool: pool, hasher: hasher, email: sender, clock: clk}, nil
 }
 
 // RegisterCommand is one registration request, in the domain's own terms (SHIP-30).
@@ -169,6 +174,14 @@ func (c RegisterCommand) Validate() error {
 // of each other. uq_users_email and uq_users_phone refuse the second one whatever the
 // application believed, and this turns that refusal into the error the client is given. Same
 // reasoning as SHIP-91's partial unique index (Docs/06 §4.1).
+//
+// # Why the account and its verification token are one transaction
+//
+// SHIP-31 requires the token to be issued *on registration*. Two statements without a
+// transaction would let a failure between them produce an account nobody can verify and no
+// record of why — recoverable only through the resend endpoint, by somebody who has not been
+// told they need it. The email goes out after the commit, because a message cannot be un-sent
+// if the transaction rolls back.
 func (s *Service) Register(ctx context.Context, cmd RegisterCommand) (User, error) {
 	cmd.Normalise()
 	if err := cmd.Validate(); err != nil {
@@ -197,10 +210,22 @@ func (s *Service) Register(ctx context.Context, cmd RegisterCommand) (User, erro
 		return User{}, errUnavailable
 	}
 
-	created, err := s.store.insertUser(ctx, s.pool, user, hash)
-	if err != nil {
+	var (
+		created User
+		raw     string
+	)
+	if err := db.InTx(ctx, s.pool, func(ctx context.Context, r db.Runner) error {
+		created, err = s.store.insertUser(ctx, r, user, hash)
+		if err != nil {
+			return err
+		}
+		raw, err = s.issueEmailVerification(ctx, r, created)
+		return err
+	}); err != nil {
 		return User{}, err
 	}
+
+	s.sendVerificationEmail(ctx, created, raw)
 	return created, nil
 }
 

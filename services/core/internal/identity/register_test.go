@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -18,9 +19,38 @@ import (
 // does not check first, it inserts and reads the refusal — so a mocked store would report every
 // one of these tests as passing while proving nothing at all.
 
+// recordingSender stands in for the email adapter, and keeps what it was asked to send.
+//
+// It is a test double for a *port*, not for persistence — which is the distinction Docs/06 §4.1
+// draws. Mocking the database would hide the constraints that make these rules true; mocking the
+// mail provider is how the token that only exists in the message becomes readable by the test
+// that has to present it back.
+type recordingSender struct {
+	sent []sentMessage
+	err  error
+}
+
+type sentMessage struct{ to, subject, body string }
+
+func (s *recordingSender) Send(_ context.Context, to, subject, body string) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.sent = append(s.sent, sentMessage{to, subject, body})
+	return nil
+}
+
+func (s *recordingSender) last(t *testing.T) sentMessage {
+	t.Helper()
+	if len(s.sent) == 0 {
+		t.Fatal("nothing was sent")
+	}
+	return s.sent[len(s.sent)-1]
+}
+
 // newTestService builds a service against a fresh database, at a cost profile a laptop can run
 // hundreds of times (Docs/10 §5).
-func newTestService(t *testing.T) (*Service, *pgxpool.Pool) {
+func newTestService(t *testing.T) (*Service, *pgxpool.Pool, *recordingSender) {
 	t.Helper()
 
 	pool := pgtest.DB(t)
@@ -30,11 +60,12 @@ func newTestService(t *testing.T) (*Service, *pgxpool.Pool) {
 		t.Fatalf("building the hasher: %v", err)
 	}
 
-	svc, err := NewService(pool, hasher, clock.System{})
+	mail := &recordingSender{}
+	svc, err := NewService(pool, hasher, mail, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
-	return svc, pool
+	return svc, pool, mail
 }
 
 func validRegistration() RegisterCommand {
@@ -48,7 +79,7 @@ func validRegistration() RegisterCommand {
 
 // TestRegisterCreatesAnUnverifiedAccount is SHIP-30's acceptance criterion, first half.
 func TestRegisterCreatesAnUnverifiedAccount(t *testing.T) {
-	svc, pool := newTestService(t)
+	svc, pool, _ := newTestService(t)
 
 	user, err := svc.Register(t.Context(), validRegistration())
 	if err != nil {
@@ -103,7 +134,7 @@ func TestRegisterCreatesAnUnverifiedAccount(t *testing.T) {
 // TestRegisterStoresOnlyADerivedPassword: nothing reversible anywhere (SHIP-29's rule, at the
 // endpoint that first writes one).
 func TestRegisterStoresOnlyADerivedPassword(t *testing.T) {
-	svc, pool := newTestService(t)
+	svc, pool, _ := newTestService(t)
 
 	cmd := validRegistration()
 	user, err := svc.Register(t.Context(), cmd)
@@ -138,7 +169,7 @@ func TestRegisterStoresOnlyADerivedPassword(t *testing.T) {
 // index's refusal rather than checking first — so this also proves the error mapping reaches
 // the right constraint.
 func TestRegisterRejectsADuplicateEmail(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, _, _ := newTestService(t)
 
 	if _, err := svc.Register(t.Context(), validRegistration()); err != nil {
 		t.Fatalf("the first registration failed: %v", err)
@@ -158,7 +189,7 @@ func TestRegisterRejectsADuplicateEmail(t *testing.T) {
 // the case normalisation exists for: without it the two are different strings and uq_users_phone
 // never sees a collision.
 func TestRegisterRejectsADuplicatePhone(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, _, _ := newTestService(t)
 
 	if _, err := svc.Register(t.Context(), validRegistration()); err != nil {
 		t.Fatalf("the first registration failed: %v", err)
@@ -178,7 +209,7 @@ func TestRegisterRejectsADuplicatePhone(t *testing.T) {
 // TestRegisterAssignsTheChosenRole is SHIP-45's first half; the immutability half is in
 // migrations/schema_test.go, where the trigger that enforces it lives.
 func TestRegisterAssignsTheChosenRole(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, _, _ := newTestService(t)
 
 	for _, role := range []Role{RoleCustomer, RoleProvider} {
 		t.Run(role.String(), func(t *testing.T) {
@@ -201,7 +232,7 @@ func TestRegisterAssignsTheChosenRole(t *testing.T) {
 // TestRegisterRefusesAdminAsARole. There is no third role: administrators sign in through a
 // separate system (SHIP-147), and ck_users_role refuses the value at the database as well.
 func TestRegisterRefusesAdminAsARole(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, _, _ := newTestService(t)
 
 	cmd := validRegistration()
 	cmd.Role = Role("admin")
@@ -331,7 +362,7 @@ func TestRegisterWithoutADatabaseIsUnavailableNotAPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
-	svc, err := NewService(nil, hasher, clock.System{})
+	svc, err := NewService(nil, hasher, &recordingSender{}, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}

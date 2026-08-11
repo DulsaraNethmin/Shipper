@@ -3,7 +3,9 @@ package main
 import (
 	"net/http"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/email"
 )
 
 // The identity domain's routes (SHIP-30 onwards).
@@ -65,7 +67,7 @@ func identityHandler(d Deps) *identity.Handler {
 		panic("cmd/api: identity password hasher: " + err.Error())
 	}
 
-	svc, err := identity.NewService(d.Pool, hasher, d.Clock)
+	svc, err := identity.NewService(d.Pool, hasher, newEmailSender(d.Config), d.Clock)
 	if err != nil {
 		panic("cmd/api: identity service: " + err.Error())
 	}
@@ -75,4 +77,38 @@ func identityHandler(d Deps) *identity.Handler {
 		panic("cmd/api: identity handler: " + err.Error())
 	}
 	return handler
+}
+
+// newEmailSender picks the email implementation for this environment (SHIP-32, SHIP-31).
+//
+// This is the composition root doing the one thing only it can: identity declares what it needs
+// of a sender in its own ports.go and imports nothing from internal/platform/email, and the
+// adapter knows nothing about identity. Go satisfies the interface structurally, and the two
+// meet here (Docs/06 §4.1).
+//
+// email.UseConsole owns the rule rather than a switch written here, and it leans towards the
+// console for anything it does not recognise. Choosing wrongly towards the console costs a
+// developer a puzzled minute; choosing wrongly towards the provider sends real email from a
+// machine that should never have had the credential.
+//
+// A staging or production deployment with no provider configured stops the process, and that is
+// the correct direction. The alternative is a service that registers accounts, reports success,
+// and silently sends no verification message — so every account it creates is one nobody can
+// finish setting up, discovered a day later by the people who signed up.
+func newEmailSender(cfg *config.Config) identity.EmailSender {
+	if email.UseConsole(cfg.Env) {
+		return email.NewConsole()
+	}
+
+	sender, err := email.NewProvider(email.Options{
+		BaseURL: cfg.Email.ProviderBaseURL,
+		APIKey:  cfg.Email.ProviderAPIKey,
+		Sender:  cfg.Email.Sender,
+	})
+	if err != nil {
+		panic("cmd/api: email provider: " + err.Error() +
+			" — set EMAIL_PROVIDER_BASE_URL, EMAIL_PROVIDER_API_KEY and EMAIL_SENDER, or run " +
+			"with SHIPPER_ENV=development to log messages to the console instead")
+	}
+	return sender
 }

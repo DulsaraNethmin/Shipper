@@ -56,7 +56,34 @@ type Config struct {
 	Kafka       Kafka
 	Idempotency Idempotency
 	Identity    Identity
+	Email       Email
 	App         App
+}
+
+// Email configures the transactional email adapter (SHIP-32), first consumed by the
+// verification message SHIP-31 sends.
+//
+// Which implementation is built is decided from Env and not from here: development logs to the
+// console and sends nothing; staging and production hand the message to the provider. These
+// three values are all the provider needs, because the adapter speaks a generic HTTP contract
+// rather than a vendor's SDK — so naming a vendor is setting them and changing no code
+// (Docs/11 §7).
+//
+// They are deliberately not validated here. An empty base URL is correct in development, and in
+// staging it is caught where the adapter is constructed, which is at startup and with a message
+// that says which variable is missing.
+type Email struct {
+	// ProviderBaseURL is the root of the vendor's API. Empty in development, where nothing
+	// reaches it.
+	ProviderBaseURL string
+
+	// ProviderAPIKey is presented as a bearer credential and is never logged.
+	ProviderAPIKey string
+
+	// Sender is the From address every message is dispatched with. One address for the whole
+	// service in the MVP; per-domain senders are a deliverability decision nobody has needed
+	// to make yet.
+	Sender string
 }
 
 // Identity configures credentials and sessions (SHIP-29, SHIP-37).
@@ -275,6 +302,11 @@ func Load() (*Config, error) {
 			AccessTokenKeys:      l.signingKeys("IDENTITY_ACCESS_TOKEN_KEYS", developmentSigningKeys()),
 			AccessTokenActiveKID: l.str("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", developmentActiveKID),
 		},
+		Email: Email{
+			ProviderBaseURL: l.str("EMAIL_PROVIDER_BASE_URL", ""),
+			ProviderAPIKey:  l.str("EMAIL_PROVIDER_API_KEY", ""),
+			Sender:          l.str("EMAIL_SENDER", "no-reply@shipper.com.au"),
+		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
 			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
@@ -316,6 +348,11 @@ func (c Config) LogValue() slog.Value {
 		// neither says anything an attacker can sign with.
 		slog.String("access_token_active_kid", c.Identity.AccessTokenActiveKID),
 		slog.Int("access_token_keys", len(c.Identity.AccessTokenKeys)),
+		// Whether a base URL is set, not what it is, and never the key. "Email is going to
+		// the console" is the line somebody needs when a verification message has not
+		// arrived, and it is the one thing a hostname would not tell them.
+		slog.Bool("email_provider_configured", c.Email.ProviderBaseURL != ""),
+		slog.String("email_sender", c.Email.Sender),
 	)
 }
 

@@ -859,6 +859,71 @@ ok "the role survived the attempt"
 ok "every other column still updates, so the trigger is scoped to the transition it guards"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-31  a single-use, expiring verification token is generated and stored on registration"
+
+token_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select token_hash || ' ' || email || ' ' ||
+          coalesce(consumed_at::text, 'live') || ' ' ||
+          (expires_at > now())::text || ' ' ||
+          (expires_at <= now() + interval '24 hours' + interval '1 minute')::text
+     from email_verification_tokens where user_id = '$registered_id';")"
+[[ -n "$token_row" ]] || fail "registration stored no verification token"
+
+read -r token_hash token_email token_consumed token_future token_within <<<"$token_row"
+[[ "$token_email" == "$reg_email" ]] || fail "the token records '$token_email', not the address it was sent to"
+[[ "$token_consumed" == "live" ]] || fail "a freshly issued token is already consumed"
+[[ "$token_future" == "true" && "$token_within" == "true" ]] \
+  || fail "the expiry is not within the next 24 hours (future=$token_future within=$token_within)"
+ok "one live token, recorded against the address it was sent to, expiring within a day"
+
+# The console email adapter logs the message in full, which is how a developer completes
+# verification without a mailbox — and here it is how the token that exists only in the message
+# becomes readable at all. It is deliberately the *only* place it exists.
+verification_token="$(python3 - "$WORKDIR/server.log" "$reg_email" <<'PYTHON'
+import json, re, sys
+
+found = ""
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        record = json.loads(line)
+    except ValueError:
+        continue
+    if record.get("msg") != "email (console, not sent)" or record.get("to") != sys.argv[2]:
+        continue
+    match = re.search(r"[A-Za-z0-9_-]{43}", record.get("body", ""))
+    if match:
+        found = match.group(0)
+print(found)
+PYTHON
+)"
+[[ -n "$verification_token" ]] || fail "no verification email was logged for $reg_email"
+ok "the verification message was sent, carrying a 43-character token"
+
+# The row holds the hash of what was sent, and not what was sent. Computed here rather than
+# asserted: anyone who could read this table would otherwise be able to verify every unverified
+# address on the platform.
+computed_hash="$(printf '%s' "$verification_token" | shasum -a 256 | cut -d' ' -f1)"
+[[ "$computed_hash" == "$token_hash" ]] \
+  || fail "the stored hash is not SHA-256 of the token that was sent ($token_hash vs $computed_hash)"
+ok "the stored value is the SHA-256 of the token, so the token itself is nowhere in the database"
+
+stored_token_count="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from email_verification_tokens where token_hash = '$verification_token';")"
+[[ "$stored_token_count" == "0" ]] || fail "the token itself appears in the table"
+ok "searching the table for the token finds nothing"
+
+# One live token per account, enforced by a partial unique index rather than by the code that
+# remembers to supersede the old one. Without it a link left in an old mailbox outlives its
+# replacement for a full day.
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "insert into email_verification_tokens (id, user_id, email, token_hash, expires_at)
+   values (gen_random_uuid(), '$registered_id', '$reg_email', 'a-second-live-token-$$',
+           now() + interval '1 day');" >/dev/null 2>&1; then
+  fail "a second live token was accepted for one account"
+fi
+ok "a second live token is refused by uq_email_verification_tokens_live"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
@@ -871,4 +936,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-30, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-31, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
