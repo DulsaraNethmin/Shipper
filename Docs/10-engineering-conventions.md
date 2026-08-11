@@ -168,7 +168,13 @@ var CodeProhibitedCategory = httpx.RegisterCode(
     "prohibited_category", "The goods category may not be published.")
 ```
 
-Named `<domain>_<condition>`, lower snake case. A test in `cmd/api` asserts uniqueness across the whole registry and regenerates `Docs/10-api-error-codes.md`, which is the list clients branch on. Conflicts in that generated file are resolved by regenerating it, never by hand.
+Named `<domain>_<condition>`, lower snake case. Registration refuses a duplicate, a code that is not lower snake case, and a code with no description — the description is what the generated document says the code means, and a client given only a name guesses.
+
+**The tests are in `cmd/api`, because that is the only package that links every domain in at once.** `TestErrorCodesAreUniqueAndWellFormed` checks the whole registry; `TestErrorCodeDocumentIsCurrent` regenerates `Docs/10-api-error-codes.md`, which is the list clients branch on; `TestProtocolCodesMatchTheContract` holds `x-protocol-codes` in `contracts/components/schemas/error.yaml` to the fifteen the code actually registers, because that list is hand-written and a hand-written list drifts.
+
+Regenerate the document with `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update`. **Resolve a conflict in it by regenerating, never by choosing a side** — choosing a side drops a domain's codes with nothing to show for it.
+
+This section described a mechanism that did not exist until SHIP-15c. It was written at SHIP-15a, `Docs/11` §3 listed it as built, and neither was true: `internal/httpx` had the codes as plain constants, there was no `RegisterCode`, and the generated document had never been written. Nothing was broken, because no domain had yet raised a code of its own — which is exactly how a documented mechanism stays absent long enough for two domains to invent two taxonomies in the same wave.
 
 Clients branch on `code`, never on `message`.
 
