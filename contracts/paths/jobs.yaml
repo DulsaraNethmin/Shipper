@@ -207,6 +207,99 @@ JobByID:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+CancelJob:
+  post:
+    operationId: cancelJob
+    summary: Cancel a job
+    tags: [Jobs]
+    description: |
+      Ends a job the caller owns, before it has been awarded (SHIP-64).
+
+      **A verb under the resource rather than a field on the job.** Job status is not settable
+      (Docs/02 §2): a client names an intent and the platform decides what the state becomes.
+      No request schema in this document has a `status` field and none ever will.
+
+      ## What can be cancelled
+
+      A job in `draft`, `open` or `negotiating`. Docs/02 §2 permits nothing else towards
+      `cancelled` from a customer, so once a bid has been awarded the answer is
+      `jobs_not_cancellable` and a `409` — ending the job is then a support matter, and after
+      pickup it is a dispute (Docs/02 §6.2).
+
+      ## Cancelling an already-cancelled job succeeds
+
+      It answers `200` with the job and records nothing further: no second transition, no
+      second event. Retrying with the *same* `Idempotency-Key` replays the original response;
+      this covers the other case, where a phone lost its connection, was restarted, and
+      generated a fresh key for the same intent. Docs/02 §3.1 asks for a queued update that has
+      been overtaken to be absorbed rather than reported as an error.
+
+      **A job belonging to another customer answers `404`, not `403`** — see the note on
+      editing a draft.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      description: |
+        Required, though every field in it is optional: send `{}` when there is nothing to say.
+        The API takes a JSON body on every state-changing request, and one endpoint excepted
+        from that is a second answer to what a request looks like.
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobCancellation'
+    responses:
+      '200':
+        description: |
+          The job is cancelled, and is returned in full. Also the answer when it already was.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          Docs/02 §2 has no route from this job's status to `cancelled`
+          (`jobs_not_cancellable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The reason was rejected (`validation_failed`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- parameters --------------------------------------------------------------------------------
 
 JobID:
@@ -299,6 +392,22 @@ JobDraft:
       $ref: '#/TimeWindow'
     dropoff_window:
       $ref: '#/TimeWindow'
+
+JobCancellation:
+  type: object
+  additionalProperties: false
+  description: |
+    Why the customer is cancelling. Every field is optional — `{}` is a complete request.
+  properties:
+    reason:
+      type: string
+      maxLength: 500
+      description: |
+        Free text, recorded against the transition in the job's history and read by support
+        rather than by a driver. A customer abandoning their own draft owes nobody an
+        explanation, so this is never required of them; Docs/01 §3 requires one only of an
+        administrator changing a commercial record.
+      example: Found a cheaper option elsewhere.
 
 Address:
   type: object

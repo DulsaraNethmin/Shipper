@@ -9,7 +9,7 @@
 //
 // Docs/01 §4.3 keeps the customer's maximum private from providers — not as an amount, not as a
 // band, not as a "budget supplied" flag. SHIP-67 adds the column and the serialisation test that
-// proves it cannot leak. Both endpoints here are owner-only, so a budget field would be safe on
+// proves it cannot leak. Every endpoint here is owner-only, so a budget field would be safe on
 // them specifically; it is absent anyway, because the field arrives with the ticket that owns the
 // proof rather than with the first response that could carry it.
 //
@@ -122,6 +122,19 @@ type draftRequest struct {
 
 	PickupWindow  *windowBody `json:"pickup_window"`
 	DropoffWindow *windowBody `json:"dropoff_window"`
+}
+
+// cancelRequest is the body of POST /v1/jobs/{id}/cancel.
+//
+// A plain string rather than a pointer, unlike every field of [draftRequest]. The three-way
+// distinction those need — absent, null, explicitly empty — has no meaning here: there is no
+// stored reason to leave alone or to clear, only one being supplied now or not at all.
+//
+// A body is still required, even though every field in it is optional. httpx.DecodeJSON refuses
+// an empty body, and making this endpoint the one exception would be a second answer to what a
+// request looks like for the sake of saving a client two characters.
+type cancelRequest struct {
+	Reason string `json:"reason"`
 }
 
 // fields turns the request into the domain's command, reporting anything it could not parse.
@@ -385,13 +398,9 @@ func (h *Handler) Update() http.Handler {
 			return err
 		}
 
-		jobID, err := uuid.Parse(r.PathValue("id"))
+		jobID, err := jobIDFrom(r)
 		if err != nil {
-			// A path parameter of the wrong shape is bad_request rather than not_found,
-			// which is the httpx registry's own description of that code. It also
-			// discloses nothing: the answer is the same whether or not any job exists.
-			return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
-				"The job id in the path is not a valid identifier.").WithCause(err)
+			return err
 		}
 
 		var req draftRequest
@@ -422,6 +431,73 @@ func (h *Handler) Update() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, jobFrom(updated))
 		return nil
 	})
+}
+
+// Cancel handles POST /v1/jobs/{id}/cancel (SHIP-64).
+//
+// A verb under the resource rather than a `PATCH` setting a field, because job status is not a
+// settable field (Docs/02 §2, CLAUDE.md). `{"status": "cancelled"}` would be a client naming a
+// state; this is a client naming an intent, and the platform decides what the state becomes —
+// which is the whole distinction the guard exists to enforce. It is also why an already-cancelled
+// job answers 200 rather than 409: the caller asked for an outcome that holds.
+//
+// State-changing, so it carries an Idempotency-Key like every other mutating route (SHIP-15). The
+// middleware absorbs a retry that reuses its key; [Service.Cancel] absorbs the one that does not.
+//
+// A job belonging to somebody else answers 404, byte-identically to a job that does not exist.
+// See [apiError].
+func (h *Handler) Cancel() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		customerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req cancelRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var cancelled Job
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			cancelled, err = h.svc.Cancel(ctx, runner, customerID, jobID, req.Reason)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, jobFrom(cancelled))
+		return nil
+	})
+}
+
+// jobIDFrom reads and parses the {id} path parameter.
+//
+// A path parameter of the wrong shape is bad_request rather than not_found, which is the httpx
+// registry's own description of that code. It also discloses nothing: the answer is the same
+// whether or not any job exists.
+//
+// One function rather than one copy per handler, because the alternative is three answers to what
+// a malformed id produces and a client that has to handle all three.
+func jobIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The job id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
 }
 
 // callerID is the authenticated customer's account id.
@@ -496,6 +572,10 @@ func apiError(err error) error {
 	case errors.Is(err, ErrJobNotDraft):
 		return httpx.NewError(http.StatusConflict, CodeNotADraft,
 			"This job has been published and can no longer be edited as a draft.").WithCause(err)
+
+	case errors.Is(err, ErrJobNotCancellable):
+		return httpx.NewError(http.StatusConflict, CodeNotCancellable,
+			"This job can no longer be cancelled. Reload it to see its current status.").WithCause(err)
 
 	case errors.Is(err, ErrNothingToUpdate):
 		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,

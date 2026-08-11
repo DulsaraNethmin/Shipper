@@ -221,3 +221,128 @@ ok "neither endpoint accepts a status field; the unknown field is reported, not 
 [[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$job_id';")" == "Draft" ]] \
   || fail "the job moved"
 ok "the job is still a Draft"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-64  POST /v1/jobs/{id}/cancel ends a Draft or an unawarded Open job"
+
+# new_draft <name> — a fresh draft owned by the job customer, answering with its id.
+#
+# One per check below, because a cancellation is terminal: reusing $job_id would make every
+# check after the first one depend on the order they happen to run in.
+new_draft() {
+  local out="$WORKDIR/jobs-$1.json"
+  [[ "$(job_request POST "$jobs_customer_token" "verify-jobs-$1-$$" /v1/jobs '{}' "$out")" == "201" ]] \
+    || { cat "$out"; fail "could not create a draft for $1"; }
+  json "$out" '["id"]'
+}
+
+# move_job <job-id> <from> <to> — put a job into a state no endpoint can reach yet.
+#
+# SHIP-63 publishes and SHIP-92 awards, and neither exists. The only way to reach Open or
+# Awarded is therefore the protocol 000402's trigger demands: a job_status_history row written
+# in the same transaction, naming this job and this exact move, pointed at by a
+# transaction-local setting. A bare `UPDATE jobs SET status` is refused — which is the point.
+# This fixture cannot bypass the guard even deliberately, so a check that runs after it is
+# looking at a job that got where it is honestly.
+#
+# The SQL is single-quoted on purpose: `$$` in a double-quoted shell string is the process id,
+# which is how a dollar-quoted PL/pgSQL block would silently become nonsense. Values come in as
+# psql variables instead.
+move_job() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -v job="$1" -v from_status="$2" -v to_status="$3" -v actor="$jobs_customer_id" \
+    >/dev/null <<'SQL'
+BEGIN;
+INSERT INTO job_status_history
+    (id, job_id, from_status, to_status, actor_type, actor_id, actor_recorded_at)
+VALUES (gen_random_uuid(), :'job', :'from_status', :'to_status', 'customer', :'actor', now());
+SELECT set_config('shipper.job_status_transition',
+                  (SELECT id::text FROM job_status_history
+                    WHERE job_id = :'job' AND to_status = :'to_status'), true);
+UPDATE jobs SET status = :'to_status' WHERE id = :'job';
+COMMIT;
+SQL
+}
+
+draft_to_cancel="$(new_draft cancel-draft)"
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-cancel-draft-do-$$" \
+  "/v1/jobs/$draft_to_cancel/cancel" '{"reason": "Found a cheaper option elsewhere."}' \
+  "$WORKDIR/jobs-cancelled.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-cancelled.json"; fail "cancelling a draft returned $status, want 200"; }
+[[ "$(json "$WORKDIR/jobs-cancelled.json" '["status"]')" == "cancelled" ]] \
+  || fail "the response says $(json "$WORKDIR/jobs-cancelled.json" '["status"]')"
+ok "a customer cancels their own draft"
+
+# The row, not the answer the endpoint gave about itself — and the history row beside it,
+# because 000402 refuses the status write without one. A job that reached Cancelled with no
+# recorded transition would mean the guard had been bypassed.
+cancelled_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || h.from_status || '->' || h.to_status || ' ' || h.actor_type
+     from jobs j join job_status_history h on h.job_id = j.id
+    where j.id = '$draft_to_cancel';")"
+[[ "$cancelled_row" == "Cancelled Draft->Cancelled customer" ]] \
+  || fail "the stored transition is '$cancelled_row', want 'Cancelled Draft->Cancelled customer'"
+ok "the move went through the guard and left the record 000402 requires"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select reason from job_status_history where job_id = '$draft_to_cancel';")" \
+  == "Found a cheaper option elsewhere." ]] || fail "the customer's reason was not recorded"
+ok "the reason is recorded against the transition, for support to read"
+
+# Published, then cancelled. This is the half of SHIP-64's Done when that a Draft-only
+# implementation would pass without.
+open_to_cancel="$(new_draft cancel-open)"
+move_job "$open_to_cancel" Draft Open || fail "could not publish a job for the Open case"
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-cancel-open-do-$$" \
+  "/v1/jobs/$open_to_cancel/cancel" '{}' "$WORKDIR/jobs-cancel-open.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-cancel-open.json"; fail "cancelling an Open job returned $status, want 200"; }
+[[ "$(json "$WORKDIR/jobs-cancel-open.json" '["status"]')" == "cancelled" ]] \
+  || fail "the Open job did not reach cancelled"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select from_status from job_status_history where job_id = '$open_to_cancel' and to_status = 'Cancelled';")" \
+  == "Open" ]] || fail "the recorded move is not Open->Cancelled"
+ok "an unawarded Open job is cancelled too, and a body with no reason is a complete request"
+
+# An awarded job is refused, and the refusal comes from Docs/02 §2's table rather than from a
+# list inside the endpoint.
+awarded_job="$(new_draft cancel-awarded)"
+move_job "$awarded_job" Draft Open   || fail "could not publish the job to be awarded"
+move_job "$awarded_job" Open Awarded || fail "could not move a job to Awarded"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-cancel-awarded-do-$$" \
+  "/v1/jobs/$awarded_job/cancel" '{}' "$WORKDIR/jobs-cancel-awarded.json")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/jobs-cancel-awarded.json"; fail "cancelling an awarded job returned $status, want 409"; }
+[[ "$(json "$WORKDIR/jobs-cancel-awarded.json" '["error"]["code"]')" == "jobs_not_cancellable" ]] \
+  || { cat "$WORKDIR/jobs-cancel-awarded.json"; fail "expected code=jobs_not_cancellable"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$awarded_job';")" == "Awarded" ]] \
+  || fail "the refused cancellation moved the job"
+ok "an awarded job cannot be cancelled — Docs/02 §6.2 makes that a support matter"
+
+# Cancelling again, with a different key so the idempotency middleware is not what absorbs it.
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-cancel-again-$$" \
+  "/v1/jobs/$draft_to_cancel/cancel" '{}' "$WORKDIR/jobs-cancel-again.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-cancel-again.json"; fail "cancelling twice returned $status, want 200"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$draft_to_cancel';")" == "1" ]] \
+  || fail "cancelling twice recorded the transition twice"
+ok "a second cancellation with a fresh key is absorbed, and records nothing further"
+
+# A stranger's cancellation is a 404, byte-identical to a job that does not exist. The rule is
+# per endpoint rather than per domain: a job is discoverable through whichever route forgets it.
+victim="$(new_draft cancel-victim)"
+status="$(job_request POST "$jobs_other_token" "verify-jobs-cancel-stranger-$$" \
+  "/v1/jobs/$victim/cancel" '{}' "$WORKDIR/jobs-cancel-stranger.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/jobs-cancel-stranger.json"; fail "a stranger's cancellation returned $status, want 404"; }
+status="$(job_request POST "$jobs_other_token" "verify-jobs-cancel-nothing-$$" \
+  "/v1/jobs/00000000-0000-7000-8000-000000000001/cancel" '{}' "$WORKDIR/jobs-cancel-nothing.json")"
+[[ "$status" == "404" ]] || fail "cancelling a job that does not exist returned $status, want 404"
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/jobs-cancel-stranger.json" "$WORKDIR/jobs-cancel-nothing.json" \
+  || fail "somebody else's job answers differently from no job at all"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$victim';")" == "Draft" ]] \
+  || fail "the stranger's refused cancellation reached the row"
+ok "a stranger cannot cancel, and cannot tell the job apart from one that never existed"

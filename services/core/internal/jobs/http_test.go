@@ -40,6 +40,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs", handler.Create())
 	mux.Handle("PATCH /v1/jobs/{id}", handler.Update())
+	mux.Handle("POST /v1/jobs/{id}/cancel", handler.Cancel())
 	return mux
 }
 
@@ -292,6 +293,84 @@ func TestAMalformedJobIDIsRefusedBeforeAnythingIsRead(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+}
+
+// TestCancelEndpointAnswersWithTheCancelledJob is SHIP-64's acceptance criterion at the wire, and
+// the first time an endpoint in this service moves a job.
+func TestCancelEndpointAnswersWithTheCancelledJob(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newCustomer(t, pool, "http-cancel@example.com", "+61400000628")
+
+	created := decode[jobResponse](t, as(t, router, customer, http.MethodPost, "/v1/jobs", `{}`))
+
+	rec := as(t, router, customer, http.MethodPost, "/v1/jobs/"+created.ID+"/cancel",
+		`{"reason": "Found a cheaper option elsewhere."}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+	if body := decode[jobResponse](t, rec); body.Status != "cancelled" {
+		t.Errorf("status = %q, want cancelled", body.Status)
+	}
+
+	// Read from the column rather than from the answer the endpoint gave about itself.
+	if got := statusOf(t, pool, uuid.MustParse(created.ID)); got != StatusCancelled {
+		t.Errorf("the stored job is %s, want Cancelled", got)
+	}
+}
+
+// A job that cannot be cancelled is a 409 with a code the client can act on, rather than a bare
+// 403 or a silent success.
+func TestCancellingAnAwardedJobIsAConflict(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newCustomer(t, pool, "http-cancel-awarded@example.com", "+61400000629")
+
+	created := decode[jobResponse](t, as(t, router, customer, http.MethodPost, "/v1/jobs", `{}`))
+	job := uuid.MustParse(created.ID)
+	publish(t, pool, job, customer)
+	move(t, pool, job, StatusAwarded, User(ActorCustomer, customer))
+
+	rec := as(t, router, customer, http.MethodPost, "/v1/jobs/"+created.ID+"/cancel", `{}`)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (%s)", rec.Code, rec.Body)
+	}
+	if body := decode[errorEnvelope](t, rec); body.Error.Code != string(CodeNotCancellable) {
+		t.Errorf("code = %q, want %s", body.Error.Code, CodeNotCancellable)
+	}
+}
+
+// TestCancellingSomebodyElsesJobIsIndistinguishableFromItNotExisting applies SHIP-62's disclosure
+// rule to the new endpoint, and compares the bodies byte for byte rather than the statuses.
+//
+// The rule is the reason it is worth repeating per endpoint: a job is discoverable through
+// whichever route forgets it, not through the strictest one.
+func TestCancellingSomebodyElsesJobIsIndistinguishableFromItNotExisting(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	owner := newCustomer(t, pool, "http-cancel-owner@example.com", "+61400000630")
+	stranger := newCustomer(t, pool, "http-cancel-stranger@example.com", "+61400000631")
+
+	created := decode[jobResponse](t, as(t, router, owner, http.MethodPost, "/v1/jobs", `{}`))
+
+	theirs := as(t, router, stranger, http.MethodPost, "/v1/jobs/"+created.ID+"/cancel", `{}`)
+	nothing := as(t, router, stranger, http.MethodPost,
+		"/v1/jobs/"+uuid.Must(uuid.NewV7()).String()+"/cancel", `{}`)
+
+	if theirs.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 — 403 would confirm the job exists (%s)", theirs.Code, theirs.Body)
+	}
+	if theirs.Body.String() != nothing.Body.String() {
+		t.Errorf("a stranger can tell somebody else's job from no job at all:\n %s\n %s",
+			theirs.Body, nothing.Body)
+	}
+
+	if got := statusOf(t, pool, uuid.MustParse(created.ID)); got != StatusDraft {
+		t.Errorf("the job is %s after a refused cancellation", got)
 	}
 }
 

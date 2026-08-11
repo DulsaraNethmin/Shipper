@@ -15,11 +15,11 @@ import (
 // into one of them is a line every concurrent branch also touches, and a badly resolved conflict
 // there drops an endpoint with no compile error and no failing test.
 //
-// # Why both routes require a user
+// # Why every route requires a user
 //
-// A job belongs to a customer. There is no field in either request for naming which one — the
-// owner is whoever the token says is calling — so neither endpoint has a meaning without a
-// credential. That is also what makes the pair safe under SHIP-44's scoped idempotency: keys land
+// A job belongs to a customer. There is no field in any request for naming which one — the
+// owner is whoever the token says is calling — so no endpoint here has a meaning without a
+// credential. That is also what makes them safe under SHIP-44's scoped idempotency: keys land
 // in idem:v1:<subject>:<key> rather than the shared anonymous namespace, which is the gate
 // CLAUDE.md holds authenticated state-changing endpoints behind and which SHIP-44 closed.
 //
@@ -42,6 +42,16 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Update() },
+		},
+		Route{
+			// A verb under the resource, because job status is not a settable field
+			// (Docs/02 §2). A PATCH carrying `{"status": "cancelled"}` would be a client
+			// naming a state; this is a client naming an intent.
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/cancel",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return jobsHandler(d).Cancel() },
 		},
 	)
 }

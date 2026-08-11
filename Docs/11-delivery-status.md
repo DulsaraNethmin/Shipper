@@ -738,6 +738,49 @@ ownership check and the write are one decision against one version of the row, a
 instant the `SELECT` returns and two concurrent edits interleave into a job carrying half of each.
 `UpdateDraft` refuses a pool the way `Transition` does.
 
+### What SHIP-64 built, and why it is the run that mattered
+
+`POST /v1/jobs/{id}/cancel` ends a job its owner has not yet had awarded. **It is the first endpoint
+in the service that moves a job**, which makes it the first real client of SHIP-57's guard:
+creation lands at Draft because 000400 defaults the column, and an edit never touches `status`, so
+everything the guard built — the permitted table, the history row, the trigger that refuses a status
+write without one, the event — had until now only ever run from a test.
+
+**A verb under the resource, not a field on the job.** `PATCH {"status": "cancelled"}` would be a
+client naming a state; this is a client naming an intent and the platform deciding what the state
+becomes. That is the whole distinction `Docs/02` §2 exists to hold, and it is why no request schema
+in this domain has a `status` field.
+
+**"Unawarded" is enforced by `Docs/02` §2's table rather than by a list in `cancel.go`.** The
+endpoint asks `Permitted(status, Cancelled)` — the same exported function the guard itself uses —
+so Draft, Open and Negotiating are cancellable and everything from Awarded onward is not, without a
+second copy of the lifecycle anywhere. `Docs/02` §6.2 is the reason it stops there: once a provider
+has committed, ending the job is a support matter, and after pickup the route out is Disputed.
+
+**Cancelling a job that is already Cancelled answers 200 and writes nothing.** The idempotency
+middleware absorbs the retry that reuses its key; this absorbs the one that does not — a phone that
+lost its connection, was restarted, and generated a fresh key for the same intent. `ErrAlreadyInStatus`
+was separated from `ErrTransitionNotPermitted` at SHIP-57 precisely so a caller could make this
+choice, and `Docs/02` §3.1 makes the same call for a queued update that has been overtaken: absorbed,
+not reported as an error. No second history row, no second event — verify checks the count rather
+than the status.
+
+**A new sentinel rather than a mapping from the general one.** `ErrJobNotCancellable` is narrower
+than `ErrTransitionNotPermitted` on purpose: mapping the general sentinel to `jobs_not_cancellable`
+at the transport edge would give SHIP-63's publish the wrong code the day it lands. One code per
+intent, not one per guard failure.
+
+**The disclosure rule is applied per endpoint, and that is deliberate rather than repetitive.** A
+stranger's cancellation answers 404 byte-identically to a job that does not exist, and `make verify`
+compares the bodies. A job is discoverable through whichever route forgets the rule, not through the
+strictest one.
+
+**`make verify` moves a job to Awarded with SQL, because no endpoint can.** SHIP-63 publishes and
+SHIP-92 awards; neither exists. The fixture writes the `job_status_history` row and names it in the
+transaction-local setting, which is the only protocol 000402 accepts — a bare `UPDATE jobs SET
+status` is refused. So even a fixture written to bypass the guard cannot, which is worth more than
+the check it sets up.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

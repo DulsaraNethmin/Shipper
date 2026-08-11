@@ -84,6 +84,16 @@ var (
 
 	// ErrNothingToUpdate means a PATCH named no field at all.
 	ErrNothingToUpdate = errors.New("jobs: the request changes nothing")
+
+	// ErrJobNotCancellable means Docs/02 §2 has no `→ Cancelled` row for the status the job
+	// is in.
+	//
+	// Narrower than ErrTransitionNotPermitted on purpose. The general sentinel names a move
+	// the caller asked for, and a customer pressing "cancel" did not ask for a move — they
+	// asked for an outcome. SHIP-63's publish will want the same treatment and a different
+	// code, which is why the mapping is not made from the general sentinel at the transport
+	// edge: one code per intent, not one code per guard failure.
+	ErrJobNotCancellable = errors.New("jobs: this job can no longer be cancelled")
 )
 
 // The error codes this domain's endpoints answer with (Docs/10 §4.4).
@@ -112,4 +122,15 @@ var (
 	// which is a different action from asking the user to sign in or giving up.
 	CodeNotADraft = httpx.RegisterCode("jobs_not_a_draft",
 		"The job has been published and can no longer be edited as a draft. Reload it to see its current status.")
+
+	// CodeNotCancellable is returned when a cancellation arrives for a job Docs/02 §2 has no
+	// route out of towards Cancelled.
+	//
+	// 409 rather than 403, on the same reasoning as jobs_not_a_draft: the caller is permitted
+	// and the request contradicts the state the job is in. The client reloads and offers what
+	// is actually available — which, once a provider has committed, is raising a dispute
+	// rather than cancelling (Docs/02 §6.2).
+	CodeNotCancellable = httpx.RegisterCode("jobs_not_cancellable",
+		"The job can no longer be cancelled. Once a provider has been awarded the work, ending "+
+			"the job is a support matter rather than a state change. Reload it to see its current status.")
 )
