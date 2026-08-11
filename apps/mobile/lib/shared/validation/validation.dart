@@ -8,5 +8,6 @@
 /// fetched, not compiled in. Dart has no over-the-air update path (`Docs/07` §1), so a
 /// hard-coded limit is a store release away from being corrected.
 ///
-/// Empty until M1.
+/// `validators.dart` holds the signup checks (SHIP-51, SHIP-53, SHIP-54) and its own header
+/// carries the one place that rule is knowingly bent, and what stops the bend from mattering.
 library;

@@ -7,6 +7,8 @@ import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
+import 'package:shipper/features/identity/registration_complete_screen.dart';
+import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/signed_out_screen.dart';
 
 /// Route paths, named once.
@@ -19,8 +21,17 @@ abstract final class Routes {
   /// Where a cold start lands while the keychain is being read.
   static const starting = '/';
 
-  /// The signed-out shell. Registration, sign-in and verification hang off it from SHIP-51.
+  /// The signed-out shell. Registration hangs off it from SHIP-51; sign-in is SHIP-55.
   static const signIn = '/sign-in';
+
+  /// The registration form (SHIP-51).
+  static const register = '/register';
+
+  /// Where the signup journey ends (SHIP-51).
+  ///
+  /// A stub, and honestly so: the real ending signs the new account in, which needs
+  /// `POST /v1/auth/login` — SHIP-41, consumed by SHIP-55. Neither exists yet.
+  static const registered = '/register/done';
 
   /// The signed-in shell. Role-aware from SHIP-52.
   static const home = '/home';
@@ -37,6 +48,20 @@ abstract final class Routes {
 
 /// Locations either shell may show. See [Routes.health].
 const _sessionAgnostic = <String>{Routes.health};
+
+/// Locations a signed-out user may be at (SHIP-51).
+///
+/// **Signing up happens entirely while signed out, and that is the platform's design rather
+/// than an oversight.** `POST /v1/auth/register` returns an account and no token — registering
+/// is not signing in — so every screen in the journey runs with no session at all. A guard that
+/// sent a signed-out user to the sign-in shell from *every* location, which is what SHIP-49 did
+/// while there was nothing else to reach, would bounce the user out of registration on the first
+/// redirect.
+const _signedOutLocations = <String>{
+  Routes.signIn,
+  Routes.register,
+  Routes.registered,
+};
 
 /// Where the session says this location should be, or `null` to leave it alone.
 ///
@@ -60,7 +85,8 @@ String? redirectFor(SessionState session, String location) {
     // nothing deep-links: SHIP-143 introduces the first payloads that do, and it is the ticket
     // that has to remember the arriving location across the restore.
     SessionRestoring() => location == Routes.starting ? null : Routes.starting,
-    SessionSignedOut() => location == Routes.signIn ? null : Routes.signIn,
+    SessionSignedOut() =>
+      _signedOutLocations.contains(location) ? null : Routes.signIn,
     SessionSignedIn() => location == Routes.home ? null : Routes.home,
   };
 }
@@ -96,6 +122,14 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.signIn,
         builder: (context, state) => const SignedOutScreen(),
+      ),
+      GoRoute(
+        path: Routes.register,
+        builder: (context, state) => const RegistrationScreen(),
+      ),
+      GoRoute(
+        path: Routes.registered,
+        builder: (context, state) => const RegistrationCompleteScreen(),
       ),
       GoRoute(
         path: Routes.home,

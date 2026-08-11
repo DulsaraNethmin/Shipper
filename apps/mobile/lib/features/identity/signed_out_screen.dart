@@ -44,13 +44,21 @@ class SignedOutScreen extends ConsumerWidget {
                 style: theme.textTheme.bodyMedium,
               ),
               const SizedBox(height: 24),
-              // Disabled rather than absent, because Docs/07 §3 allows the app to hide or
-              // disable and never to decide. What these will do is call the platform; until
-              // SHIP-51 and SHIP-55 there is nothing to call, and a button that navigates
-              // nowhere is worse than one that visibly is not ready yet.
-              const FilledButton(onPressed: null, child: Text('Sign in')),
+              // Sign-in stays disabled rather than absent, because Docs/07 §3 allows the app to
+              // hide or disable and never to decide. There is no POST /v1/auth/login to call
+              // until SHIP-41, and a button that navigates nowhere is worse than one that
+              // visibly is not ready yet. Registration became real at SHIP-51.
+              const FilledButton(
+                key: Key('sign-in'),
+                onPressed: null,
+                child: Text('Sign in'),
+              ),
               const SizedBox(height: 8),
-              const OutlinedButton(onPressed: null, child: Text('Create an account')),
+              OutlinedButton(
+                key: const Key('create-account'),
+                onPressed: () => context.go(Routes.register),
+                child: const Text('Create an account'),
+              ),
               const SizedBox(height: 24),
               const _DevelopmentSession(),
               TextButton(

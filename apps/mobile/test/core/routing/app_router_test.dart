@@ -40,6 +40,26 @@ void main() {
       expect(redirectFor(signedOut, Routes.starting), Routes.signIn);
     });
 
+    test('the whole signup journey is reachable while signed out', () {
+      // POST /v1/auth/register returns an account and no token — registering is not signing in
+      // — so every screen in the journey runs with no session at all. SHIP-49's guard sent a
+      // signed-out user to the sign-in shell from every other location, which would have
+      // bounced them straight back out of registration on the first redirect.
+      const signedOut = SessionState.signedOut();
+
+      for (final location in [Routes.register, Routes.registered]) {
+        expect(redirectFor(signedOut, location), isNull, reason: location);
+      }
+    });
+
+    test('a signed-in user has no business in the signup journey', () {
+      const signedIn = SessionState.signedIn();
+
+      for (final location in [Routes.register, Routes.registered]) {
+        expect(redirectFor(signedIn, location), Routes.home, reason: location);
+      }
+    });
+
     test('signed in reaches the signed-in shell and nothing else', () {
       const signedIn = SessionState.signedIn();
 

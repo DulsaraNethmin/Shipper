@@ -48,6 +48,23 @@ final class ApiErrorResponse extends ApiFailure {
   @override
   String get userMessage => message;
 
+  /// [details] keyed by the field each names, for rendering beside the input that caused it.
+  ///
+  /// The platform sends dotted JSON paths matching what the client serialised — `email`,
+  /// `goods.category` — precisely so a form can do this (`internal/validate`). Collecting every
+  /// problem rather than the first is the other half of that decision: a six-field form answered
+  /// one error at a time takes six round trips to fill in, on a phone, in a truck yard.
+  ///
+  /// A field named twice keeps the first message, which is the one the platform recorded first.
+  Map<String, String> get fieldMessages {
+    final byField = <String, String>{};
+    for (final detail in details) {
+      if (detail.field.isEmpty || detail.message.isEmpty) continue;
+      byField.putIfAbsent(detail.field, () => detail.message);
+    }
+    return byField;
+  }
+
   @override
   String toString() => 'ApiErrorResponse($statusCode, $code, requestId: $requestId)';
 
