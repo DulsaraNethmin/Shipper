@@ -1,0 +1,189 @@
+# Registration, verification and credentials — the identity domain.
+#
+# The counterpart of cmd/api/routes_identity.go. Docs/10 §8.1 keeps the two in step: a domain
+# adds one route file and one fragment, and edits neither this file's siblings nor the middle of
+# a shared document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence
+# for the contract to describe less than the service returns.
+#
+# # Every operation here is public, and every one is state-changing
+#
+# That combination is on cmd/api's publicMutatingRoutes allow-list for one reason: each is how a
+# caller obtains their own credentials. An endpoint that takes a verification token sent to an
+# address cannot itself require the session that verifying the address leads to.
+#
+# They all require `Idempotency-Key`. A phone that retries after a dropped connection must not
+# end up with two accounts, or with a duplicate-address error for the account it just created.
+
+Register:
+  post:
+    operationId: register
+    summary: Create an unverified account
+    tags: [Identity]
+    description: |
+      Creates an account with the role it will keep (SHIP-30, SHIP-45).
+
+      Both contact channels start unverified. Docs/04 §2 requires email and phone verified
+      before a customer may publish, and Docs/01 §4.1 allows drafts before then — so an
+      unverified account is a state the product has a use for, not an intermediate one.
+
+      **The role is fixed here and cannot be changed afterwards.** A provider's bid history
+      and a customer's job history are not interchangeable, so changing role means a new
+      account. The rule is enforced by a database trigger, not by application logic alone.
+
+      **No token is returned.** Registering is not signing in: `POST /v1/auth/login` (SHIP-41)
+      issues the first access token, after the password has been presented at the endpoint that
+      exists to take it.
+
+      ## Duplicates
+
+      A duplicate email or mobile number is refused with `identity_email_taken` or
+      `identity_phone_taken`. This is the one place the platform tells an unauthenticated caller
+      whether an address is known; the resend and OTP endpoints deliberately do not, because
+      there the disclosure buys the caller nothing.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [email, phone, password, role]
+            additionalProperties: false
+            properties:
+              email:
+                type: string
+                format: email
+                maxLength: 254
+                description: Stored case-insensitively; `Alice@Example.com` and `alice@example.com` are one account.
+                example: alice@example.com
+              phone:
+                type: string
+                description: |
+                  An Australian mobile number in any of the forms a person types it. It is
+                  normalised to E.164 before storage, so `0412 345 678` and `+61412345678` are
+                  one account. A number that already carries a country code is left alone.
+                example: '0412 345 678'
+              password:
+                type: string
+                minLength: 10
+                maxLength: 128
+                description: |
+                  Length is the only rule (NIST SP 800-63B). Composition requirements produce
+                  `Password1!` — a narrower search space and a harder password to remember.
+                example: correct-horse-battery-staple
+              role:
+                type: string
+                enum: [customer, provider]
+                description: |
+                  Fixed at registration and immutable afterwards. `admin` is not a value here:
+                  administrators sign in through a separate system (SHIP-147).
+                example: customer
+    responses:
+      '201':
+        description: The account was created.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Account'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '409':
+        description: |
+          The email address or the mobile number already has an account —
+          `identity_email_taken` or `identity_phone_taken`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: One or more fields were rejected. `details` names each of them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# ---------------------------------------------------------------------------------------
+# Shared pieces
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    One value per action, reused for every retry of that action. The first request with a
+    given key executes and its response is stored; later requests with the same key get that
+    response back without the handler running again.
+
+    A state-changing request without one is refused with `idempotency_key_required`.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6f1b2c8a-0d54-4a7e-9d3a-1f2e3c4b5a60
+
+Account:
+  type: object
+  required: [id, email, phone, role, status, email_verified, phone_verified, created_at]
+  additionalProperties: false
+  description: |
+    An account, as its own owner sees it. Verification is reported as two booleans rather than
+    as the timestamps the database holds: the client's question is which screen comes next, and
+    "since when" is a support and audit question.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: UUIDv7, so it sorts by creation time without leaking a sequence.
+      example: 0191f3c2-8a4d-7c31-9f52-3b7e1d4a6c88
+    email:
+      type: string
+      format: email
+      example: alice@example.com
+    phone:
+      type: string
+      description: E.164, as normalised on the way in.
+      example: '+61412345678'
+    role:
+      type: string
+      enum: [customer, provider]
+      example: customer
+    status:
+      type: string
+      enum: [active, restricted, suspended]
+      description: |
+        Whether the account may be used at all. This is **not** provider verification, which
+        is a separate eligibility decision with five states of its own (Docs/04 §4).
+      example: active
+    email_verified:
+      type: boolean
+      example: false
+    phone_verified:
+      type: boolean
+      example: false
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T04:11:52.418Z'

@@ -1,13 +1,46 @@
 package identity
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+)
+
+// The machine-readable error codes this domain raises (SHIP-30).
+//
+// Declared here, in the domain, rather than in a shared list — Docs/10 §4.4. A single file of
+// every code in the platform is a file every domain edits, which is the merge hazard the route
+// manifest and the contract fragments both exist to avoid. httpx.RegisterCode refuses a
+// duplicate, so two domains cannot quietly mean different things by one string.
+//
+// The description is what Docs/10-api-error-codes.md says the code means, and that document is
+// what three client codebases branch on. Regenerate it after adding one:
+//
+//	go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update
+var (
+	// CodeEmailTaken means the address already has an account.
+	//
+	// Registration is the one place this platform tells an unauthenticated caller whether an
+	// address is known, and it is a deliberate trade rather than an oversight. The
+	// alternative — accepting the registration and sending "you already have an account" by
+	// email — is what a bank does; here it would leave a person who mistyped their address
+	// staring at a success screen for an account that does not exist. The resend and OTP
+	// endpoints, where the disclosure buys the caller nothing, do not make it.
+	CodeEmailTaken = httpx.RegisterCode("identity_email_taken",
+		"An account already exists for this email address. Sign in, or reset the password.")
+
+	// CodePhoneTaken means the number already has an account. Same trade as CodeEmailTaken,
+	// and the number has to be unique for a different reason as well: two accounts sharing
+	// one number would make an OTP ambiguous about which of them it verifies.
+	CodePhoneTaken = httpx.RegisterCode("identity_phone_taken",
+		"An account already exists for this mobile number. Sign in, or reset the password.")
+)
 
 // The sentinel errors this domain raises.
 //
 // Docs/10 §2.1 puts them here rather than beside the code that returns them, so that a caller
-// deciding what to do about a failure has one file to read. The machine-readable error codes
-// that reach a client are a separate list and arrive with the first endpoint (SHIP-30); these
-// are for Go callers.
+// deciding what to do about a failure has one file to read. The codes above are what a *client*
+// sees; these are for Go callers, and http.go is where one becomes the other.
 var (
 	// ErrEmptyPassword is returned rather than hashing the empty string, which would
 	// otherwise produce a perfectly valid hash that any empty submission then matches.
@@ -49,6 +82,17 @@ var (
 	// nothing — `exp` sits in the payload the client already holds and can decode without
 	// any key, so this tells them only what they could have worked out themselves.
 	ErrTokenExpired = errors.New("identity: the access token has expired")
+
+	// ErrEmailTaken means the address already has an account (SHIP-30).
+	//
+	// It is raised from the unique-index violation rather than from a SELECT that ran first.
+	// A check-then-insert is a race with a window wide enough to lose in practice — two
+	// registrations for one address arriving together — and the database already refuses the
+	// second one. Docs/06 §4.1 is the same argument the one-accepted-bid index rests on.
+	ErrEmailTaken = errors.New("identity: that email address already has an account")
+
+	// ErrPhoneTaken means the number already has an account (SHIP-30).
+	ErrPhoneTaken = errors.New("identity: that mobile number already has an account")
 
 	// ErrTokenInvalid means the token is not one this platform will honour: unparseable,
 	// wrongly signed, the wrong algorithm, the wrong audience, signed by a retired key, or

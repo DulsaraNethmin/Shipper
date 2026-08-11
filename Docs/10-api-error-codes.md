@@ -46,5 +46,7 @@ them where the call is made, beside the thing the user was trying to do.
 
 ## Domain codes
 
-None yet. The first arrives with the first domain rule that needs one — a
-registration in that domain's own package, and no edit to anything shared.
+| Code | Meaning |
+|---|---|
+| `identity_email_taken` | An account already exists for this email address. Sign in, or reset the password. |
+| `identity_phone_taken` | An account already exists for this mobile number. Sign in, or reset the password. |

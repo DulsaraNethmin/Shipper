@@ -92,6 +92,12 @@ tags:
     description: |
       Endpoints the mobile client calls about itself rather than about a user — the upgrade
       gate, and anything else that must work before sign-in.
+  - name: Identity
+    description: |
+      Registration, verification, credentials and sessions. Every operation under this tag is
+      public and state-changing, because each is how a caller obtains their own credentials —
+      an endpoint that takes a verification code sent to a phone cannot require the session
+      that verifying the phone leads to.
 
 # One $ref per domain. Adding a domain adds one line here and one file under paths/.
 #
@@ -119,6 +125,8 @@ paths:
     $ref: './paths/service.yaml#/APIRoot'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
+  /v1/auth/register:
+    $ref: './paths/identity.yaml#/Register'
 
 components:
   schemas:

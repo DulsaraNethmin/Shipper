@@ -25,9 +25,20 @@
 //   - token.go (SHIP-37) — access token issue: HS256 over a keyset selected by a kid header,
 //     fifteen minutes, and a claim set that carries no permissions and no verification state.
 //     Issue only; the middleware that verifies these is SHIP-44.
-//   - model.go — the two roles, mirroring ck_users_role.
+//   - service.go, postgres.go, http.go (SHIP-30) — registration: the domain rules, the SQL, and
+//     POST /v1/auth/register. Duplicate addresses and numbers are refused by uq_users_email and
+//     uq_users_phone rather than by a SELECT that ran first, because a check-then-insert is a
+//     race two taps on a slow connection will lose.
+//   - model.go — the two roles mirroring ck_users_role, the three account states mirroring
+//     ck_users_status, and the User the endpoints return.
 //
-// The rest of the layout in Docs/10 §2.1 arrives with the tickets that need it: service.go
-// and postgres.go at SHIP-30, ports.go when this domain first needs something of an adapter,
-// http.go with the first endpoint.
+// The rest of the layout in Docs/10 §2.1 arrives with the tickets that need it: ports.go when
+// this domain first needs something of an adapter.
+//
+// # Two things in http.go that should not be here
+//
+// apiHandler and decodeJSON are what Docs/10 §4.3 calls httpx.H and httpx.DecodeJSON, neither of
+// which exists in internal/httpx. They are written here because a domain branch does not edit a
+// shared surface mid-wave, and they are flagged in Docs/11 §9 so that the second domain to need
+// a handler promotes them rather than copying them.
 package identity

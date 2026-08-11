@@ -85,7 +85,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **66 checks**, and `make check` green.
+Verified by `make verify` — **74 checks**, and `make check` green.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -128,6 +128,7 @@ endpoints, and none of these tickets adds one.
 |---|---|---|
 | **SHIP-28** | M1 | `users` — citext email, phone, role, status, verification timestamps |
 | **SHIP-29** | M1 | argon2id password hashing, parameters stored in the PHC string |
+| **SHIP-30** | M1 | `POST /v1/auth/register` — an unverified account, duplicates refused by the index — *see below* |
 | **SHIP-32** | M1 | Email adapter — console in development, generic HTTP provider in staging |
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
@@ -208,6 +209,42 @@ The gate §8 has been describing since wave 1. Three points, and it held back ev
 **SHIP-15c's own acceptance criterion is now demonstrated.** SHIP-44 landed with no field added to `Deps` and no edit to its literal in `main.go`. The verifier is passed to `newRouter` alongside the idempotency store, because it is a collaborator of the router rather than something a handler is built from.
 
 **What is not demonstrated by `make verify`: the 401 itself.** There is no protected route in the service yet — SHIP-44 is the middleware, not an endpoint — so the rejection paths are covered by tests in `internal/httpx` and `cmd/api` rather than by curl. The first route with `Auth: RequireUser` is where that section gets written.
+
+### What the identity endpoints built, and what they found
+
+**The first product endpoint in the service is `POST /v1/auth/register`.** Everything before it
+was operational, or `/v1/app/minimum-version`, which is the app asking about itself. This is the
+first route with a domain behind it, and so the first exercise of every mechanism SHIP-15a and
+SHIP-15c put in place: a route file no shared file knew about, a contract fragment referenced by
+one added line, error codes registered from the domain, and a golden file that changed by exactly
+one row.
+
+**Duplicate rejection is the database's, not the application's.** `Register` inserts and reads
+the refusal out of `uq_users_email` or `uq_users_phone` rather than selecting first. A
+check-then-insert is a race lost in practice rather than in theory — two taps on a slow
+connection — and the index refuses the second registration whatever the application believed.
+Same argument as SHIP-91's partial unique index.
+
+**Phone numbers are normalised to E.164 at the boundary, and that is what makes the index
+mean anything.** `0412 345 678` and `+61412345678` are two different strings, so without
+normalisation `uq_users_phone` never sees the collision and one handset ends up with two
+accounts — which would make an OTP ambiguous about which account it verifies. The normaliser
+strips only the punctuation people write numbers with and *keeps* anything else, so
+`0412 34a 678` is refused rather than silently repaired into somebody else's number. That was a
+real defect in the first version of the function, caught by its own test.
+
+**Registration is the one endpoint that discloses whether an address is known.** A duplicate is
+answered with `identity_email_taken` or `identity_phone_taken`. The alternative — accept, and
+send "you already have an account" by email — is what a bank does, and here it would leave a
+person who mistyped their address staring at a success screen for an account that does not exist.
+The resend and OTP endpoints do not make that disclosure, because there it buys the caller
+nothing.
+
+**`httpx.H` and `httpx.DecodeJSON` do not exist**, and `Docs/10` §4.3 has specified both since
+SHIP-15a. That is the shape `httpx.RegisterCode` was in until SHIP-15c: documented, listed as
+built, and absent, because no domain had needed it yet. `internal/httpx` is a shared surface and
+not a domain branch's to edit, so the two are written unexported in `internal/identity/http.go`
+and flagged in §9 — the second domain to want them should promote them rather than copy them.
 
 ## 4. Partly done — do not treat these as finished
 
@@ -352,6 +389,17 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **`Docs/07` §8 requires staging and production installable on one device, and the client cannot do that yet.** SHIP-18 selects the environment with `--dart-define`, which changes the base URL but not the identifier, so the second build replaces the first. Holding both at once needs a distinct application id per environment — real Xcode and Gradle flavours. **That work belongs with SHIP-24…27**, which are blocked on X-2 and X-3 anyway, but it is not currently in any of their *Done when* lines.
 
+**`httpx.H` and `httpx.DecodeJSON` are specified in `Docs/10` §4.3 and do not exist.** Both are
+named there as the way every handler is written, and neither has ever been in `internal/httpx` —
+the same shape `httpx.RegisterCode` was in for two waves. SHIP-30 needed them, could not edit a
+shared surface mid-wave, and so wrote `apiHandler` and `decodeJSON` unexported inside
+`internal/identity/http.go` with the reason on them. **The second domain to need a handler should
+promote the pair into `internal/httpx` rather than copy them**, which is shared-platform work and
+belongs to whoever owns `cmd/api` in that cycle. Two domains with two decoders is two answers to
+"what happens to an unknown field". The body limit is the part that actually bites: `decodeJSON`
+carries a literal 1 MiB that must stay equal to `httpx`'s unexported `maxIdempotentRequestBody`,
+and a copy in a second package is a second place for it to drift.
+
 **`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 
 ## 10. The done list, in a form a script can read
@@ -365,7 +413,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 

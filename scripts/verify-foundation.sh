@@ -722,6 +722,101 @@ ok "iss=shipper, aud=shipper-mobile, and sub carries the user id"
 ok "it expires fifteen minutes after it was issued, measured against an injected clock"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-30  POST /v1/auth/register creates an unverified account and rejects duplicates"
+
+# Every value is suffixed with the process id, because this runs against the developer's own
+# database rather than a throwaway one and the accounts it creates stay there. A fixed address
+# would pass once and then report "already taken" forever.
+reg_email="register-$$@example.com"
+reg_phone_local="04120$$"
+reg_phone_e164="+61${reg_phone_local:1}"
+
+# post_json <key> <path> <body> <outfile> — one state-changing request, answering with its status.
+post_json() {
+  curl -s -X POST -o "$4" -w '%{http_code}' \
+    -H "Idempotency-Key: $1" -H 'Content-Type: application/json' \
+    -d "$3" "http://localhost:$VERIFY_PORT$2"
+}
+
+status="$(post_json "verify-reg-$$" /v1/auth/register \
+  "{\"email\":\"$reg_email\",\"phone\":\"$reg_phone_local\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/register.json"; fail "POST /v1/auth/register returned $status, want 201"; }
+ok "an account is created and answered with 201"
+
+registered_id="$(json "$WORKDIR/register.json" '["id"]')"
+[[ "$registered_id" =~ ^[0-9a-f-]{36}$ ]] || fail "the response carries no account id: $registered_id"
+[[ "$(json "$WORKDIR/register.json" '["role"]')" == "customer" ]] \
+  || fail "the account did not take the role it was registered with"
+[[ "$(json "$WORKDIR/register.json" '["status"]')" == "active" ]] \
+  || fail "a new account is not active"
+
+# The half of the criterion that is easiest to lose: *unverified*. Docs/04 §2 requires both
+# channels verified before a customer may publish, so an account that arrived verified would
+# skip the whole of SHIP-31, 33, 34 and 36 without anything failing.
+[[ "$(json "$WORKDIR/register.json" '["email_verified"]')" == "False" ]] \
+  || fail "a brand new account reports its email as verified"
+[[ "$(json "$WORKDIR/register.json" '["phone_verified"]')" == "False" ]] \
+  || fail "a brand new account reports its phone as verified"
+ok "it is unverified on both channels, and says so"
+
+# The response is one thing; the row is another. Read the columns the endpoint claims to have
+# written, from the database rather than from the answer it gave about itself.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select phone || ' ' || role || ' ' || status || ' ' ||
+          coalesce(email_verified_at::text, 'null') || ' ' ||
+          coalesce(phone_verified_at::text, 'null')
+     from users where id = '$registered_id';")"
+[[ "$stored" == "$reg_phone_e164 customer active null null" ]] \
+  || fail "the stored row is '$stored', want '$reg_phone_e164 customer active null null'"
+ok "the row holds the number in E.164 and both verification timestamps null"
+
+# The password is not recoverable from what was stored. SHIP-29 proves the format; this proves
+# the endpoint uses it rather than writing the plaintext into the same column.
+stored_hash="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select password_hash from users where id = '$registered_id';")"
+[[ "$stored_hash" == \$argon2id\$* ]] || fail "the stored credential is not a PHC string: $stored_hash"
+grep -q 'correct-horse-battery-staple' <<<"$stored_hash" && fail "the password is in the stored value"
+ok "the credential column holds an argon2id hash, not the password"
+
+status="$(post_json "verify-reg-dupe-email-$$" /v1/auth/register \
+  "{\"email\":\"$reg_email\",\"phone\":\"0499${$}0\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/register-dupe-email.json")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/register-dupe-email.json"; fail "a duplicate email returned $status, want 409"; }
+[[ "$(json "$WORKDIR/register-dupe-email.json" '["error"]["code"]')" == "identity_email_taken" ]] \
+  || fail "expected code=identity_email_taken"
+ok "a second account on the same address is refused by uq_users_email"
+
+# The same number in the form a person types it rather than the form it is stored in. Without
+# normalisation these are two different strings and the index never sees a collision — which is
+# the defect that would give one handset two accounts and make an OTP ambiguous.
+status="$(post_json "verify-reg-dupe-phone-$$" /v1/auth/register \
+  "{\"email\":\"other-$$@example.com\",\"phone\":\"${reg_phone_local:0:4} ${reg_phone_local:4}\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/register-dupe-phone.json")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/register-dupe-phone.json"; fail "a duplicate phone returned $status, want 409"; }
+[[ "$(json "$WORKDIR/register-dupe-phone.json" '["error"]["code"]')" == "identity_phone_taken" ]] \
+  || fail "expected code=identity_phone_taken"
+ok "the same number written differently is still the same number"
+
+status="$(post_json "verify-reg-invalid-$$" /v1/auth/register \
+  '{"email":"not-an-address","phone":"123","password":"short","role":"driver"}' \
+  "$WORKDIR/register-invalid.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/register-invalid.json"; fail "an invalid registration returned $status, want 422"; }
+fields="$(json "$WORKDIR/register-invalid.json" '["error"]["details"]' | tr -d "[]{}'\" " | tr ',' '\n' | grep '^field:' | cut -d: -f2 | sort | tr '\n' ' ')"
+[[ "$fields" == "email password phone role " ]] \
+  || fail "the rejected fields are '$fields', want all four at once"
+ok "every bad field is reported at once, so the form takes one round trip and not four"
+
+# Registration is public — it is how a caller obtains credentials in the first place — and it is
+# still behind the idempotency middleware like every other state-changing request.
+status="$(curl -s -X POST -o "$WORKDIR/register-nokey.json" -w '%{http_code}' \
+  -H 'Content-Type: application/json' -d '{}' "http://localhost:$VERIFY_PORT/v1/auth/register")"
+[[ "$status" == "400" ]] || fail "registration without an Idempotency-Key returned $status"
+[[ "$(json "$WORKDIR/register-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || fail "expected code=idempotency_key_required"
+ok "it needs an Idempotency-Key, so a retry cannot produce a second account"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
@@ -734,4 +829,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28, SHIP-44, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-30, SHIP-37, SHIP-38, SHIP-44, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
