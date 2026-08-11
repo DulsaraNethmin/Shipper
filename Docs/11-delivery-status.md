@@ -85,12 +85,14 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **66 checks**, and `make check` green.
+Verified by `make verify` — **105 checks**, and `make check` green.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
-adapters have none to demonstrate — nothing consumes them until SHIP-33, SHIP-36 and
-SHIP-60 — and the two web surfaces are demonstrated by `make web-build` and `make web-dev`.
+adapters have none to demonstrate — geocoding is not consumed until SHIP-60 — and the two web
+surfaces are demonstrated by `make web-build` and `make web-dev`. The email adapter is consumed
+from SHIP-31 and the SMS adapter from SHIP-34, and both are exercised through the console
+implementation, which is what `make verify` reads the token and the code out of.
 
 The Flutter client is demonstrated by `make flutter-check` — the analyzer, the tests, and the
 environment test run once per build flavour — and SHIP-16 and SHIP-19 by installing the built
@@ -128,6 +130,12 @@ endpoints, and none of these tickets adds one.
 |---|---|---|
 | **SHIP-28** | M1 | `users` — citext email, phone, role, status, verification timestamps |
 | **SHIP-29** | M1 | argon2id password hashing, parameters stored in the PHC string |
+| **SHIP-30** | M1 | `POST /v1/auth/register` — an unverified account, duplicates refused by the index — *see below* |
+| **SHIP-31** | M1 | Email verification tokens — single-use, one live per account, stored as SHA-256 |
+| **SHIP-33** | M1 | `POST /v1/auth/verify-email` and `/v1/auth/resend-verify` — single-use, and a double click is not an error |
+| **SHIP-34** | M1 | `POST /v1/auth/request-otp` — six digits, argon2id, two rate limits, and a deliberately uninformative answer |
+| **SHIP-36** | M1 | `POST /v1/auth/verify-phone` — one failure code, and the wrong-guess path commits |
+| **SHIP-45** | M1 | Role fixed at registration, immutable afterwards by a `BEFORE UPDATE` trigger on `users` |
 | **SHIP-32** | M1 | Email adapter — console in development, generic HTTP provider in staging |
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
@@ -212,6 +220,78 @@ The gate §8 has been describing since wave 1. Three points, and it held back ev
 **SHIP-15c's own acceptance criterion is now demonstrated.** SHIP-44 landed with no field added to `Deps` and no edit to its literal in `main.go`. The verifier is passed to `newRouter` alongside the idempotency store, because it is a collaborator of the router rather than something a handler is built from.
 
 **What is not demonstrated by `make verify`: the 401 itself.** There is no protected route in the service yet — SHIP-44 is the middleware, not an endpoint — so the rejection paths are covered by tests in `internal/httpx` and `cmd/api` rather than by curl. The first route with `Auth: RequireUser` is where that section gets written.
+
+### What the identity endpoints built, and what they found
+
+**The first product endpoint in the service is `POST /v1/auth/register`.** Everything before it
+was operational, or `/v1/app/minimum-version`, which is the app asking about itself. This is the
+first route with a domain behind it, and so the first exercise of every mechanism SHIP-15a and
+SHIP-15c put in place: a route file no shared file knew about, a contract fragment referenced by
+one added line, error codes registered from the domain, and a golden file that changed by exactly
+one row.
+
+**Duplicate rejection is the database's, not the application's.** `Register` inserts and reads
+the refusal out of `uq_users_email` or `uq_users_phone` rather than selecting first. A
+check-then-insert is a race lost in practice rather than in theory — two taps on a slow
+connection — and the index refuses the second registration whatever the application believed.
+Same argument as SHIP-91's partial unique index.
+
+**Phone numbers are normalised to E.164 at the boundary, and that is what makes the index
+mean anything.** `0412 345 678` and `+61412345678` are two different strings, so without
+normalisation `uq_users_phone` never sees the collision and one handset ends up with two
+accounts — which would make an OTP ambiguous about which account it verifies. The normaliser
+strips only the punctuation people write numbers with and *keeps* anything else, so
+`0412 34a 678` is refused rather than silently repaired into somebody else's number. That was a
+real defect in the first version of the function, caught by its own test.
+
+**Registration is the one endpoint that discloses whether an address is known.** A duplicate is
+answered with `identity_email_taken` or `identity_phone_taken`. The alternative — accept, and
+send "you already have an account" by email — is what a bank does, and here it would leave a
+person who mistyped their address staring at a success screen for an account that does not exist.
+The resend and OTP endpoints do not make that disclosure, because there it buys the caller
+nothing.
+
+**Two hashes, chosen opposite ways, and the reason is the search space.** The email
+verification token is 32 bytes from `crypto/rand` and is stored as SHA-256; the phone OTP is six
+digits and is stored as argon2id at the configured profile. A work factor exists to make a
+*small* space expensive, so it is worth 64 MiB on 10^6 possibilities and worth nothing on 2^256.
+Getting this the other way round is the mistake worth naming: SHA-256 over six digits is a table
+a laptop builds in under a second, and argon2id on the email token would turn the confirm
+endpoint into a denial-of-service lever anybody can pull without an account.
+
+**`request-otp` answers identically for every outcome, and that is the design rather than
+laziness.** Unknown number, known number, already verified, inside the cooldown, past the hourly
+cap: `202` with the same body and a **fixed** `retry_after_seconds`. Reporting the true remaining
+cooldown would say "this number was sent a code recently", which says "this number has an
+account" — and that makes "does this person use Shipper" answerable one number at a time by
+anybody. The rate limit is therefore demonstrated by counting rows rather than by reading a
+status. Registration is the deliberate exception, for the reason on `CodeEmailTaken`.
+
+**The OTP rate limit is read from PostgreSQL, and it is not SHIP-47.** SHIP-47's Redis token
+bucket is about request volume across the authentication surface. This one is about how many
+*messages* an account causes — a bill, and somebody's handset — so it has to survive a Redis
+flush, and the table already records every code that was sent.
+
+**The wrong-guess path in `verify-phone` commits, and that is the one place in the domain where
+a failure is deliberately not an error inside its transaction.** `db.InTx` rolls back on any
+error, so incrementing the attempt counter and then returning `ErrOTPInvalid` from inside the
+closure would roll the increment back with it — the column would stay at zero and the five-guess
+limit would limit nothing. The closure therefore returns `nil` on a wrong guess, having recorded
+it, and the error is produced from the outcome after the commit. It is worth the awkwardness, and
+it is worth the comment: the obvious tidy-up reintroduces the defect silently.
+
+**`created_at` is written from the injected clock rather than defaulted**, on both new tables.
+The two timestamps in a row have to come from one clock: `expires_at` is computed in Go and
+`created_at` was defaulting to the database's `now()`, so `expires_at > created_at` failed under
+a `clock.Fixed` in tests and would fail under ordinary skew in production. The rate limits count
+over `created_at`, which is the second reason it has to agree with the clock the service reasons
+about.
+
+**`httpx.H` and `httpx.DecodeJSON` do not exist**, and `Docs/10` §4.3 has specified both since
+SHIP-15a. That is the shape `httpx.RegisterCode` was in until SHIP-15c: documented, listed as
+built, and absent, because no domain had needed it yet. `internal/httpx` is a shared surface and
+not a domain branch's to edit, so the two are written unexported in `internal/identity/http.go`
+and flagged in §9 — the second domain to want them should promote them rather than copy them.
 
 ### What the jobs lifecycle foundation built (SHIP-56, SHIP-57, SHIP-57a)
 
@@ -431,6 +511,17 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **`Docs/07` §8 requires staging and production installable on one device, and the client cannot do that yet.** SHIP-18 selects the environment with `--dart-define`, which changes the base URL but not the identifier, so the second build replaces the first. Holding both at once needs a distinct application id per environment — real Xcode and Gradle flavours. **That work belongs with SHIP-24…27**, which are blocked on X-2 and X-3 anyway, but it is not currently in any of their *Done when* lines.
 
+**`httpx.H` and `httpx.DecodeJSON` are specified in `Docs/10` §4.3 and do not exist.** Both are
+named there as the way every handler is written, and neither has ever been in `internal/httpx` —
+the same shape `httpx.RegisterCode` was in for two waves. SHIP-30 needed them, could not edit a
+shared surface mid-wave, and so wrote `apiHandler` and `decodeJSON` unexported inside
+`internal/identity/http.go` with the reason on them. **The second domain to need a handler should
+promote the pair into `internal/httpx` rather than copy them**, which is shared-platform work and
+belongs to whoever owns `cmd/api` in that cycle. Two domains with two decoders is two answers to
+"what happens to an unknown field". The body limit is the part that actually bites: `decodeJSON`
+carries a literal 1 MiB that must stay equal to `httpx`'s unexported `maxIdempotentRequestBody`,
+and a copy in a second package is a second place for it to drift.
+
 **`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 
 ## 10. The done list, in a form a script can read
@@ -444,7 +535,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-31 SHIP-32 SHIP-33 SHIP-34 SHIP-35 SHIP-36 SHIP-37 SHIP-38 SHIP-44 SHIP-45
 SHIP-56 SHIP-57 SHIP-57a SHIP-67a
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```

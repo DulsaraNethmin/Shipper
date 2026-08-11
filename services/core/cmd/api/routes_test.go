@@ -27,6 +27,13 @@ const testKID = "test"
 
 func testIdentityConfig() config.Identity {
 	return config.Identity{
+		// The cheapest profile internal/identity will run. It has to be a real one: the
+		// identity handler is built during attach, from every test in this package that
+		// constructs a router, and a zero profile stops the process at startup rather than
+		// producing a hasher nothing can verify against. 64 MiB per hash across parallel
+		// packages would thrash a laptop (Docs/10 §5), and no test here hashes anything.
+		Argon2: config.Argon2{MemoryKiB: 1024, Iterations: 1, Parallelism: 1},
+
 		AccessTokenTTL:       15 * time.Minute,
 		AccessTokenKeys:      map[string][]byte{testKID: testSigningKey},
 		AccessTokenActiveKID: testKID,

@@ -1,0 +1,528 @@
+# Registration, verification and credentials — the identity domain.
+#
+# The counterpart of cmd/api/routes_identity.go. Docs/10 §8.1 keeps the two in step: a domain
+# adds one route file and one fragment, and edits neither this file's siblings nor the middle of
+# a shared document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence
+# for the contract to describe less than the service returns.
+#
+# # Every operation here is public, and every one is state-changing
+#
+# That combination is on cmd/api's publicMutatingRoutes allow-list for one reason: each is how a
+# caller obtains their own credentials. An endpoint that takes a verification token sent to an
+# address cannot itself require the session that verifying the address leads to.
+#
+# They all require `Idempotency-Key`. A phone that retries after a dropped connection must not
+# end up with two accounts, or with a duplicate-address error for the account it just created.
+
+Register:
+  post:
+    operationId: register
+    summary: Create an unverified account
+    tags: [Identity]
+    description: |
+      Creates an account with the role it will keep (SHIP-30, SHIP-45).
+
+      Both contact channels start unverified. Docs/04 §2 requires email and phone verified
+      before a customer may publish, and Docs/01 §4.1 allows drafts before then — so an
+      unverified account is a state the product has a use for, not an intermediate one.
+
+      **The role is fixed here and cannot be changed afterwards.** A provider's bid history
+      and a customer's job history are not interchangeable, so changing role means a new
+      account. The rule is enforced by a database trigger, not by application logic alone.
+
+      **No token is returned.** Registering is not signing in: `POST /v1/auth/login` (SHIP-41)
+      issues the first access token, after the password has been presented at the endpoint that
+      exists to take it.
+
+      ## Duplicates
+
+      A duplicate email or mobile number is refused with `identity_email_taken` or
+      `identity_phone_taken`. This is the one place the platform tells an unauthenticated caller
+      whether an address is known; the resend and OTP endpoints deliberately do not, because
+      there the disclosure buys the caller nothing.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [email, phone, password, role]
+            additionalProperties: false
+            properties:
+              email:
+                type: string
+                format: email
+                maxLength: 254
+                description: Stored case-insensitively; `Alice@Example.com` and `alice@example.com` are one account.
+                example: alice@example.com
+              phone:
+                type: string
+                description: |
+                  An Australian mobile number in any of the forms a person types it. It is
+                  normalised to E.164 before storage, so `0412 345 678` and `+61412345678` are
+                  one account. A number that already carries a country code is left alone.
+                example: '0412 345 678'
+              password:
+                type: string
+                minLength: 10
+                maxLength: 128
+                description: |
+                  Length is the only rule (NIST SP 800-63B). Composition requirements produce
+                  `Password1!` — a narrower search space and a harder password to remember.
+                example: correct-horse-battery-staple
+              role:
+                type: string
+                enum: [customer, provider]
+                description: |
+                  Fixed at registration and immutable afterwards. `admin` is not a value here:
+                  administrators sign in through a separate system (SHIP-147).
+                example: customer
+    responses:
+      '201':
+        description: The account was created.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Account'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '409':
+        description: |
+          The email address or the mobile number already has an account —
+          `identity_email_taken` or `identity_phone_taken`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: One or more fields were rejected. `details` names each of them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+VerifyEmail:
+  post:
+    operationId: verifyEmail
+    summary: Confirm an email address
+    tags: [Identity]
+    description: |
+      Consumes the token that was emailed at registration and marks the address verified
+      (SHIP-33). The token is single-use and expires after 24 hours.
+
+      Public, and it has to be: proving an address is a step before the caller has any session.
+      The token in the body *is* the credential, and it was sent to the address being proved.
+
+      ## Outcomes
+
+      - `200` — the address is verified. The account is returned.
+      - `identity_verification_token_expired` — the token was genuine and its day is up. Ask
+        for another with `POST /v1/auth/resend-verify`.
+      - `identity_verification_token_invalid` — everything else: unknown, already used,
+        superseded by a resend, or issued for an address the account no longer has. These are
+        deliberately not distinguished; telling somebody holding a guessed token which part of
+        the guess was wrong is free help.
+
+      **Presenting the same token twice answers `200`,** provided it was the token that
+      verified the address and the address is still verified. That is somebody clicking a link
+      twice, which is not an error.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [token]
+            additionalProperties: false
+            properties:
+              token:
+                type: string
+                description: The value from the verification message. 43 characters, base64url.
+                example: 9qE2vT7bYw1sJk4pNc0aRlX8oZgHdM3uQiV6yB5tCfE
+    responses:
+      '200':
+        description: The address is verified.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Account'
+      '400':
+        description: |
+          The token is not usable — `identity_verification_token_invalid` or
+          `identity_verification_token_expired`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ResendVerify:
+  post:
+    operationId: resendVerification
+    summary: Send another email verification message
+    tags: [Identity]
+    description: |
+      Issues a new verification token and sends it, retiring whatever the account was holding
+      (SHIP-31, SHIP-33). The previous link stops working.
+
+      ## This endpoint deliberately tells you nothing
+
+      **The answer is always `202` with the same body**, whether the address belongs to an
+      account, is already verified, was sent a message moments ago, or has never been seen —
+      the same reasoning as `POST /v1/auth/request-otp`. `retry_after_seconds` is a fixed
+      interval, not the true remaining cooldown.
+
+      Registration is the deliberate exception to that rule: it *does* report a duplicate
+      address, because there the caller is trying to create the account and saying nothing
+      would leave somebody who mistyped their address on a success screen.
+
+      ## Rate limits
+
+      One message per minute and five per hour, per account. Exceeding either sends nothing and
+      still answers `202`.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [email]
+            additionalProperties: false
+            properties:
+              email:
+                type: string
+                format: email
+                example: alice@example.com
+    responses:
+      '202':
+        description: |
+          The request was accepted. Whether a message was sent is deliberately not stated.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          Retry-After:
+            description: The same value as `retry_after_seconds`, in the standard header.
+            schema:
+              type: integer
+            example: 60
+        content:
+          application/json:
+            schema:
+              $ref: '#/Accepted'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '422':
+        description: The address is not one this platform can send to.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+RequestOTP:
+  post:
+    operationId: requestOTP
+    summary: Send a one-time code to a mobile number
+    tags: [Identity]
+    description: |
+      Sends a six-digit verification code by SMS (SHIP-34). It expires in ten minutes.
+
+      ## This endpoint deliberately tells you nothing
+
+      **The answer is always `202` with the same body**, whether the number belongs to an
+      account, has already been verified, was sent a code moments ago, or has never been seen.
+      A different status for a known number would turn this into a way of asking "does this
+      person have a Shipper account", answerable one number at a time by anybody. The only
+      observable difference is whether a message arrives, which the caller can only see if they
+      are holding the handset.
+
+      `retry_after_seconds` is a **fixed** interval, not the true remaining cooldown — the true
+      one would carry the same disclosure. Run the resend timer from it (SHIP-54).
+
+      ## Rate limits
+
+      Two, both applied per account: no more than one code per minute, and no more than five per
+      hour. Exceeding either sends nothing and still answers `202`. A text message costs money
+      and wakes a real handset, so an unbounded resend is a bill directed at whoever owns the
+      number.
+
+      ## Wrong guesses
+
+      Five wrong codes retire the live one. `POST /v1/auth/verify-phone` then answers
+      `identity_otp_invalid` until a new code is requested.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/PhoneRequest'
+    responses:
+      '202':
+        description: |
+          The request was accepted. Whether a message was sent is deliberately not stated.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          Retry-After:
+            description: The same value as `retry_after_seconds`, in the standard header.
+            schema:
+              type: integer
+            example: 60
+        content:
+          application/json:
+            schema:
+              $ref: '#/Accepted'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '422':
+        description: The number is not a number this platform can send to.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+VerifyPhone:
+  post:
+    operationId: verifyPhone
+    summary: Confirm a mobile number with a one-time code
+    tags: [Identity]
+    description: |
+      Marks the number verified after a correct code (SHIP-36). The code is consumed, so it
+      cannot be used again.
+
+      ## One failure code, deliberately
+
+      Wrong code, expired code, no outstanding code, five wrong guesses already used, or a
+      number with no account at all: every one of them answers `identity_otp_invalid`. Six
+      digits is a guessable space, so every distinction is information handed to whoever is
+      guessing — including whether the number has an account at all.
+
+      The remedy is the same in every case: `POST /v1/auth/request-otp` for a new code.
+
+      ## Attempts
+
+      Five wrong guesses retire the outstanding code. Nothing tells the caller how many are
+      left; the answer is the same before and after.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [phone, code]
+            additionalProperties: false
+            properties:
+              phone:
+                type: string
+                description: The number the code was sent to, in any of the forms a person types it.
+                example: '0412 345 678'
+              code:
+                type: string
+                pattern: '^[0-9]{6}$'
+                example: '408213'
+    responses:
+      '200':
+        description: The number is verified.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Account'
+      '400':
+        description: The code is not usable — `identity_otp_invalid`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: The number or the code was missing or malformed.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# ---------------------------------------------------------------------------------------
+# Shared pieces
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    One value per action, reused for every retry of that action. The first request with a
+    given key executes and its response is stored; later requests with the same key get that
+    response back without the handler running again.
+
+    A state-changing request without one is refused with `idempotency_key_required`.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6f1b2c8a-0d54-4a7e-9d3a-1f2e3c4b5a60
+
+Account:
+  type: object
+  required: [id, email, phone, role, status, email_verified, phone_verified, created_at]
+  additionalProperties: false
+  description: |
+    An account, as its own owner sees it. Verification is reported as two booleans rather than
+    as the timestamps the database holds: the client's question is which screen comes next, and
+    "since when" is a support and audit question.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: UUIDv7, so it sorts by creation time without leaking a sequence.
+      example: 0191f3c2-8a4d-7c31-9f52-3b7e1d4a6c88
+    email:
+      type: string
+      format: email
+      example: alice@example.com
+    phone:
+      type: string
+      description: E.164, as normalised on the way in.
+      example: '+61412345678'
+    role:
+      type: string
+      enum: [customer, provider]
+      example: customer
+    status:
+      type: string
+      enum: [active, restricted, suspended]
+      description: |
+        Whether the account may be used at all. This is **not** provider verification, which
+        is a separate eligibility decision with five states of its own (Docs/04 §4).
+      example: active
+    email_verified:
+      type: boolean
+      example: false
+    phone_verified:
+      type: boolean
+      example: false
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T04:11:52.418Z'
+
+PhoneRequest:
+  type: object
+  required: [phone]
+  additionalProperties: false
+  properties:
+    phone:
+      type: string
+      description: |
+        An Australian mobile number in any of the forms a person types it. It is normalised to
+        E.164 before it is compared with the account, so `0412 345 678` and `+61412345678` are
+        the same number.
+      example: '0412 345 678'
+
+Accepted:
+  type: object
+  required: [retry_after_seconds]
+  additionalProperties: false
+  description: |
+    The answer from an endpoint that will not say whether it did anything. One shape and one
+    status for every outcome — see the operation description.
+  properties:
+    retry_after_seconds:
+      type: integer
+      description: |
+        How long to wait before asking again. A **fixed** value, not the true remaining
+        cooldown: the true one would disclose that this contact detail has been used recently,
+        which discloses that it belongs to an account.
+      example: 60
