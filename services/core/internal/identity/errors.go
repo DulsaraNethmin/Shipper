@@ -40,4 +40,23 @@ var (
 	// ErrInvalidRole means a role outside the two the users table permits. Docs/01 has no
 	// third role: administrators sign in through a separate system entirely (SHIP-147).
 	ErrInvalidRole = errors.New("identity: not a role this platform issues tokens for")
+
+	// ErrTokenExpired means the access token was genuine and its fifteen minutes are up
+	// (SHIP-44).
+	//
+	// Distinct from ErrTokenInvalid because it is the one verification failure a client can
+	// act on: refresh and retry, rather than sign in again. Reporting it precisely leaks
+	// nothing — `exp` sits in the payload the client already holds and can decode without
+	// any key, so this tells them only what they could have worked out themselves.
+	ErrTokenExpired = errors.New("identity: the access token has expired")
+
+	// ErrTokenInvalid means the token is not one this platform will honour: unparseable,
+	// wrongly signed, the wrong algorithm, the wrong audience, signed by a retired key, or
+	// carrying claims the issuer would never have written.
+	//
+	// Deliberately one error for all of those. A caller can do nothing different about any of
+	// them, and telling an unauthenticated caller which part of their forgery was detected is
+	// help they have not earned. The underlying cause is wrapped, so the log keeps what the
+	// response withholds.
+	ErrTokenInvalid = errors.New("identity: the access token is not valid")
 )

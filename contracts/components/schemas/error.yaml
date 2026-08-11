@@ -24,7 +24,7 @@ Error:
             the contract in the same way a field name is. **This is the only part of the body
             a client may branch on.**
 
-            The fifteen protocol-level codes below are owned by `internal/httpx`. Domains
+            The sixteen protocol-level codes below are owned by `internal/httpx`. Domains
             declare their own on top of these, named `<domain>_<condition>` — a closed `enum`
             is deliberately not used here, because it would make every domain adding a code
             edit this shared file, which is exactly what the fragment layout exists to avoid
@@ -33,6 +33,7 @@ Error:
             - bad_request
             - validation_failed
             - unauthenticated
+            - token_expired
             - forbidden
             - not_found
             - method_not_allowed

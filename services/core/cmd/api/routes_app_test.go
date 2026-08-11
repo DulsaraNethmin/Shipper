@@ -14,8 +14,8 @@ func routerWithApp(t *testing.T, app config.App) http.Handler {
 	t.Helper()
 
 	deps := testDeps()
-	deps.Config = &config.Config{App: app}
-	return newRouter(deps, idempotency.NewMemoryStore())
+	deps.Config = &config.Config{App: app, Identity: testIdentityConfig()}
+	return newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator())
 }
 
 func getMinimumVersion(t *testing.T, router http.Handler) (int, minimumVersionResponse) {

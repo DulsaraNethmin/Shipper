@@ -239,12 +239,56 @@ func manifest() string {
 	return b.String()
 }
 
-// attach registers every route of a group onto a mux.
-func attach(mux *http.ServeMux, group Group, deps Deps) {
-	for _, r := range routes() {
+// guards maps an auth class to the middleware that enforces it.
+//
+// A class with no entry is not served. That is the whole design: RequireDriverToken and
+// RequireAdmin are declared in this file because the manifest has to be able to express them, and
+// the middleware behind each arrives with SHIP-108 and SHIP-147. Until then a route declaring one
+// stops the process at startup rather than being served open, which is the only acceptable
+// direction for that mistake to fail in.
+type guards map[Auth]func(http.Handler) http.Handler
+
+// attach registers every route of a group onto a mux, wrapped in whatever its auth class requires
+// (SHIP-44).
+//
+// Until SHIP-44 this ignored Route.Auth entirely, and the class was enforced only by
+// TestNoMutatingRouteIsPublic — a test that a route was *declared* correctly, not that the
+// declaration did anything. Reading it here is what turns the manifest from documentation into
+// the thing that decides.
+func attach(mux *http.ServeMux, group Group, deps Deps, g guards) {
+	attachRoutes(mux, routes(), group, deps, g)
+}
+
+// attachRoutes is attach over an explicit route list.
+//
+// Split out so a test can exercise the auth-class wiring against routes of its own. The
+// alternative — registering a route from a _test.go init — would put it in the real registry for
+// every other test in this package, which breaks TestRouteTableMatchesGolden and
+// TestEveryRouteIsInTheContract, both of which compare the served surface with a committed file.
+func attachRoutes(mux *http.ServeMux, rs []Route, group Group, deps Deps, g guards) {
+	for _, r := range rs {
 		if r.Group != group {
 			continue
 		}
-		mux.Handle(r.Method+" "+r.Pattern, r.Handler(deps))
+
+		handler := r.Handler(deps)
+
+		if r.Auth != Public {
+			guard, enforced := g[r.Auth]
+			if !enforced {
+				// Panicking at startup rather than returning an error: this is the same
+				// class of mistake as a route with no handler, and register already
+				// panics on that. A service that came up serving an endpoint whose auth
+				// class nothing implements is worse than one that refuses to start.
+				panic(fmt.Sprintf(
+					"route %s %s requires %s and no middleware enforces it in this group. "+
+						"Serving it would make it public. Either wire the middleware in "+
+						"newRouter or do not declare the route yet",
+					r.Method, r.fullPath(), r.Auth))
+			}
+			handler = guard(handler)
+		}
+
+		mux.Handle(r.Method+" "+r.Pattern, handler)
 	}
 }
