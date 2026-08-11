@@ -258,7 +258,7 @@ check: ## Everything CI will run (SHIP-20). Tracks extend it with `CHECKS +=` in
 # --- Acceptance -----------------------------------------------------------------------
 
 .PHONY: verify
-verify: ## Demonstrate the SHIP-1..15 acceptance criteria end to end
+verify: ## Demonstrate every acceptance criterion that reaches an endpoint, end to end
 	./scripts/verify-foundation.sh
 
 # --- Per-track targets ------------------------------------------------------------------

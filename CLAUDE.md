@@ -170,7 +170,7 @@ Each concurrent piece of work gets its own git worktree, never the primary tree.
 | Ports | `HTTP_PORT` and `VERIFY_PORT` per worktree, likewise |
 | Compose | One shared stack. `COMPOSE_PROJECT_NAME` is pinned in the `Makefile` so worktrees do not each start their own and fight over 5432, 6379 and 29092 |
 | **`git stash`** | **Never.** The stash is shared across worktrees through one `.git`, and this repository already carries the scar — `CLAUDE.md` was committed with `Stashed changes` conflict markers in it |
-| Shared files | Do not edit from a domain branch: `cmd/api/routes.go`, `internal/boundaries/boundaries.go`, `internal/httpx/**`, `go.mod`, the root `Makefile`, migrations in the shared block, `CLAUDE.md`, `Docs/**`. See `Docs/10` §9.2 |
+| Shared files | Do not edit from a domain branch: `cmd/api/routes.go`, `internal/boundaries/boundaries.go`, `internal/httpx/**`, `go.mod`, the root `Makefile`, migrations in the shared block, `scripts/verify-foundation.sh`, `CLAUDE.md`, `Docs/**`. A domain's own `scripts/verify/<n>-<domain>.sh` is not shared — that is what the split is for. See `Docs/10` §9.2 |
 
 Because history is not squashed, `git log --oneline` shows every individual commit. For the one-line-per-ticket view, use:
 
@@ -280,7 +280,10 @@ services/core/        Go — the versioned public API and domain
   internal/validate/  field-level validation in the error contract's shape
   migrations/         SQL schema history, in reserved per-domain blocks
 deploy/               docker-compose for local Postgres, Redis, Kafka
-scripts/              verify-foundation.sh, check-spelling.sh
+scripts/              verify-foundation.sh — the acceptance harness; the checks are
+                      one file per milestone or domain in scripts/verify/, so a track
+                      adds a file and edits none. Also check-spelling.sh and
+                      delivery-status.sh
 mk/                   per-track make targets, glob-included by the root Makefile
 .github/workflows/    go.yml (SHIP-20); Flutter and the store pipelines follow
 ```

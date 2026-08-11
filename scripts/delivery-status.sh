@@ -19,6 +19,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 BACKLOG="Docs/09-delivery-backlog.md"
 TRACKER="Docs/11-delivery-status.md"
+DONE="Docs/11-done.txt"
 REF="${1:-HEAD}"
 
 [[ -f "$BACKLOG" ]] || { echo "cannot find $BACKLOG" >&2; exit 1; }
@@ -67,21 +68,27 @@ claimed="$(git log --format='%s' "$REF" 2>/dev/null \
 
 printf '\n%sDelivery status%s  %s(%s)%s\n\n' "$bold" "$off" "$dim" "$(git rev-parse --abbrev-ref "$REF" 2>/dev/null || echo "$REF")" "$off"
 
-# --- the tracker's own list, which is authoritative -------------------------------------
+# --- the declared list, which is authoritative -------------------------------------------
 #
-# Docs/11 §10 holds a ```done fenced block. It is what a person asserts is finished; git is
-# the check on it, not the source, because a commit subject names one ticket even when the
-# change closed two.
+# Docs/11-done.txt is what a person asserts is finished; git is the check on it, not the
+# source, because a commit subject names one ticket even when the change closed two.
+#
+# It is a file rather than the fenced block it used to be in Docs/11 §10, so that it can be
+# merge=union while the prose around it is not — the reasoning is in the file's own header
+# (SHIP-15e). Comments and blank lines are stripped; the convention is one ticket per line but
+# any whitespace separates, so a hand-merge that joins two lines still reads correctly.
 
-declared=""
-if [[ -f "$TRACKER" ]]; then
-    declared="$(awk '/^```done/ {inside = 1; next} /^```/ {inside = 0} inside' "$TRACKER" \
-        | tr ' ' '\n' | sed '/^$/d' | sort -u)"
-fi
+[[ -f "$DONE" ]] || { echo "cannot find $DONE — it holds the done list Docs/11 §10 describes" >&2; exit 1; }
 
-if [[ -z "$declared" ]]; then
-    echo "  no \`\`\`done block found in $TRACKER — falling back to commit subjects" >&2
-    declared="$claimed"
+declared="$(sed -e 's/#.*//' "$DONE" | tr ' \t' '\n\n' | sed '/^$/d' | sort -u)"
+
+[[ -n "$declared" ]] || { echo "$DONE names no tickets" >&2; exit 1; }
+
+# The list moved out of Docs/11, and a block that reappears there would be a second list
+# nothing reads — which is the drift this whole script exists to catch, in its own house.
+if grep -q '^```done' "$TRACKER" 2>/dev/null; then
+    echo "  $TRACKER has a \`\`\`done block again; the list lives in $DONE and nothing reads that one" >&2
+    exit 1
 fi
 
 done_points=0
@@ -154,7 +161,7 @@ if [[ -n "$unclaimed" ]]; then
 fi
 
 if [[ -n "$undeclared" ]]; then
-    printf '\n  %slanded in git but not in %s §10%s\n' "$yellow" "$TRACKER" "$off"
+    printf '\n  %slanded in git but not in %s%s\n' "$yellow" "$DONE" "$off"
     printf '    %s\n' "$(tr '\n' ' ' <<<"$undeclared")"
     printf '    %sadd them — a tracker updated later is a tracker that is wrong%s\n\n' "$dim" "$off"
     exit 1

@@ -159,9 +159,11 @@ The ordering in `newRouter` is deliberate and documented in place: `RequestID` o
 
 Handlers have the signature `func(http.ResponseWriter, *http.Request) error`, adapted by `httpx.H`, which writes any returned error through `WriteError`. Returning an error rather than writing one removes the "forgot to return after writing" defect, which otherwise emits two response bodies.
 
-Request bodies are decoded by `httpx.DecodeJSON` with `DisallowUnknownFields` and a **1 MiB** limit. That limit must stay equal to `maxIdempotentRequestBody`; if they diverge, the fingerprint is computed over a body the handler never saw.
+Request bodies are decoded by `httpx.DecodeJSON` with `DisallowUnknownFields` and a **1 MiB** limit. **That limit and the idempotency middleware's are one constant, `maxRequestBody`, not two that agree.** The middleware reads and fingerprints the body before the handler sees it, so a handler permitted the larger body would be replayed against a fingerprint computed over bytes it never read. Two constants can drift and a test can only notice afterwards; one cannot drift at all.
 
 Unknown fields are rejected on requests, to catch client typos. Responses stay additive per `Docs/07` §6 — add fields, never repurpose or remove them, and clients tolerate fields they do not know.
+
+This section, like §4.4 below it, described a mechanism that did not exist. `httpx.H` and `httpx.DecodeJSON` were specified here at SHIP-15a and neither was in `internal/httpx` until **SHIP-15e**. SHIP-30 needed both, could not edit a shared surface mid-wave, and wrote them unexported in `internal/identity` as `apiHandler` and `decodeJSON` — with the 1 MiB limit as a second literal beside a comment asking the first not to move. They were promoted before a second domain copied them, which is the point at which the cost stops being notional: two domains with two decoders is two answers to what happens to an unknown field, and two limits is the divergence the paragraph above forbids.
 
 ### 4.4 Error codes
 
@@ -291,9 +293,18 @@ The existing Redis tests skip themselves when Redis is absent, which the CI note
 
 ### 7.3 Demonstrating "done"
 
-`scripts/verify-foundation.sh` demonstrates the acceptance criterion of every foundation ticket end to end, against a running stack. It grows a section per milestone.
+`scripts/verify-foundation.sh` demonstrates the acceptance criterion of every ticket that reaches an HTTP endpoint or a database constraint, end to end, against a running stack.
 
 **A ticket is not done until its section exists and passes.** `Docs/09` makes *Done when* the acceptance criterion; this is the mechanism that keeps it demonstrable rather than believed.
+
+**A section is a file, and a track adds one without editing anything shared** (SHIP-15e). `scripts/verify-foundation.sh` is the harness — `ticket`, `ok`, `fail`, `json`, `post_json`, `mint_token`, the service lifecycle, the count and the summary — and the checks live in `scripts/verify/NN-<name>.sh`, sourced in lexical order, exactly as the root `Makefile` includes `mk/*.mk`. The number decides when a section runs and the ranges are reserved per milestone or domain, the same way migration numbers are; the table is in the runner's header. Sections are *sourced*, so a section may use every helper and variable the runner set, and everything before it left behind.
+
+Two rules the split depends on:
+
+- **A file not named `NN-<name>.sh` is refused, not skipped.** A section that silently does not run is the same defect as a route dropped in a merge — no error, no failure, and an acceptance criterion that has quietly stopped being demonstrated.
+- **The summary is collected from the `ticket` calls, not written down.** The list of demonstrated tickets used to be a literal on the last line, which is a line every track would edit and which said `SHIP-1..SHIP-15` long after it had stopped being true.
+
+It was one 1148-line file until wave 3, which is the first wave with two tracks adding endpoints. One client can append to a single file; two cannot.
 
 ## 8. Clients
 
@@ -339,7 +350,9 @@ The import lint is what makes this safe on the Go side: two domains physically c
 
 These belong to whoever is doing shared-platform work in a given cycle, and are not edited from a domain branch:
 
-`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `CLAUDE.md` and `Docs/**`
+`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `scripts/verify-foundation.sh` · `CLAUDE.md` and `Docs/**`
+
+**`scripts/verify-foundation.sh` is on that list and `scripts/verify/<your-domain>.sh` is not**, which is the whole point of splitting it (§7.3). The same asymmetry as `mk/*.mk` and `cmd/api/routes_<domain>.go`: the shared file is the mechanism, and a track's contribution is a file of its own.
 
 **`Deps` is pre-seeded so that no domain has a reason to edit it.** It carries the configuration, the logger, the clock, the PostgreSQL pool and the Redis client, and a domain builds everything else — a keyset, a hasher, a token issuer, a repository — inside its own `Handler` closure, from those. All of them are pure functions of a pool, a client and configuration, so the field a domain wants almost always is not one.
 
@@ -355,13 +368,16 @@ The root `Makefile` ends with `-include mk/*.mk`, so a track adds `mk/<track>.mk
 
 #### Resolving a conflict in a file with no context
 
-Three files in this repository carry one independent line per endpoint and no surrounding syntax to make a bad resolution obvious. Each has its own recipe, and none of them is "read the hunk and pick the right side".
+Four files in this repository carry one independent line per entry and no surrounding syntax to make a bad resolution obvious. Each has its own recipe, and none of them is "read the hunk and pick the right side".
 
 | File | Mechanism | Recipe |
 |---|---|---|
 | `cmd/api/routes_golden.txt` | `merge=union` in `.gitattributes` | Never conflicts. The union is a superset in the wrong order, which fails `TestRouteTableMatchesGolden` — regenerate with `-update` and read the diff |
+| `Docs/11-done.txt` | `merge=union` in `.gitattributes` | Never conflicts. A superset is caught by `make status`, which fails on a ticket git has never seen. One ticket per line, because a union resolves line by line |
 | `Docs/10-api-error-codes.md` | Generated from the registry | **Regenerate, never hand-merge.** `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update` |
 | `contracts/openapi.yaml` `paths:` | Sorted, one `$ref` pair per path | **Take both sides and re-sort.** Then `make test` — `TestPathsBlockIsSortedAndComplete` checks the result |
+
+`Docs/11-done.txt` is a file rather than the fenced block it was inside `Docs/11` §10 for exactly this reason: a git attribute applies to a whole file, and `Docs/11` §3 is prose that must never be union-merged. Separating them was the only way to treat them differently (SHIP-15e).
 
 `openapi.yaml` is deliberately **not** union-merged, and the asymmetry is the point: a union-merged YAML document is either invalid or valid and subtly wrong — two keys interleaved, a `$ref` orphaned from its entry — and the second is harder to notice than a conflict. A conflict there is ugly and obvious, which is what you want in a file that parses.
 

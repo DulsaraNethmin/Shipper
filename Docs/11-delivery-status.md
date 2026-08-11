@@ -103,7 +103,9 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **105 checks**, and `make check` green.
+Verified by `make verify` — **105 checks**, and `make check` green. Since SHIP-15e the checks
+live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
+its section by adding a file.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -139,6 +141,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-15a** | Conventions (`Docs/10`) and the shared-surface mechanisms |
 | **SHIP-15b** | The spelling check scoped for client code — *see below* |
 | **SHIP-15c** | Wave-2 shared surfaces: pre-seeded `Deps`, worktree test isolation, a fourth boundary rule, `httpx.RegisterCode` — *see below* |
+| **SHIP-15e** | Wave-3 shared surfaces: `scripts/verify/` split out, `httpx.H` and `httpx.DecodeJSON` promoted, the done list moved and union-merged — *see below* |
 | **SHIP-16** | Flutter scaffold — iOS and Android only, floors at iOS 14.0 and Android API 24 |
 | **SHIP-17** | Feature folders per `Docs/07` §2, Riverpod and `go_router`, and a boundary test |
 | **SHIP-17a** | `contracts/openapi.yaml` from per-domain fragments, and three tests holding it to the service |
@@ -229,6 +232,84 @@ Same mould as SHIP-15b, one wave later and larger. Wave 1's three tracks produce
 **The import lint had a hole shaped exactly like the next ticket.** Its three rules were all about domains and adapters, so infrastructure could import a domain and the lint stayed green — and because every domain imports `httpx`, one such import couples all eight transitively through a file no domain contains. SHIP-44 is the first ticket with a motive. The rule needed no refactoring to adopt, which is the moment to add one.
 
 **Deliberately out of scope: splitting `scripts/verify-foundation.sh`.** It is 660 lines in one file with no include mechanism, and it is the sixth shared surface. Wave 2's track split gives it exactly one client — only the identity track appends — so it can wait. Named here so wave 3 treats it as a decision rather than a discovery.
+
+### What SHIP-15e built
+
+The wave-3 pre-step, and the same argument as SHIP-15b and SHIP-15c one wave later: a letter
+suffix marks work the plan assumed and no ticket owned. **Wave 2 had one track adding HTTP
+endpoints. Wave 3 has two** — identity and jobs — and that single fact is what each of the four
+parts is about.
+
+| Surface | Before | After |
+|---|---|---|
+| `scripts/verify-foundation.sh` | 1148 lines, 29 sections, one file, no include mechanism | A harness plus `scripts/verify/NN-<name>.sh`, sourced in lexical order. **A track adds a file** |
+| `httpx.H`, `httpx.DecodeJSON` | Specified in `Docs/10` §4.3, absent, and written unexported inside `internal/identity` | In `internal/httpx`, with tests, and `identity` uses them like everybody else |
+| The 1 MiB body limit | Two literals in two packages, each with a comment asking the other not to move | **One constant.** Divergence is no longer expressible |
+| The done list | A fenced block in this file that every track appends to | `Docs/11-done.txt`, one ticket per line, `merge=union` |
+| `make web-check` | lint → typecheck → build, which fails on a tree that has never been built | lint → build → typecheck, and the workaround deleted from both workflows |
+
+**The verify script is split the way `mk/*.mk` is split, and the numbering is the way migrations
+are numbered.** Ranges are reserved per milestone or domain — `40–49` is identity's, `50–59` is
+jobs's — so two branches cannot draw the same one and neither has to read the other's file. The
+runner keeps everything shared: `ticket`, `ok`, `fail`, `json`, `post_json`, the token minting,
+the service lifecycle, `$pass` and the summary. Sections are *sourced* rather than executed, so
+they run in the runner's shell and nothing about the existing checks had to change — the whole
+1148 lines moved across by line range, and the count is still exactly 105.
+
+**Three helpers moved from a section into the harness, because wave 3 needs them twice.**
+`post_json` was defined inside SHIP-30's section and `mint_token`, `b64url` and `$auth_header`
+inside SHIP-44's. Track A's first `RequireUser` route and Track B's job endpoints both want a
+token and both want to post one. Two copies of a signing routine would be two answers to what a
+valid token looks like.
+
+**The summary line is no longer written down.** It was a literal listing every ticket, on the
+last line of the file — a line both endpoint tracks would have edited, and one that had said
+`SHIP-1..SHIP-15` long after it stopped being true. `ticket "SHIP-1  …"` already names its
+ticket in the first word, so the runner collects them and prints the list itself.
+
+**A file in `scripts/verify/` that is not named `NN-<name>.sh` is refused rather than skipped.**
+A section that silently does not run is the same defect as a route dropped in a merge: no error,
+no failure, and an acceptance criterion that has quietly stopped being demonstrated.
+
+**`httpx.H` and `httpx.DecodeJSON` were promoted, not amended away.** The choice was the one
+SHIP-15c faced with `RegisterCode` — build the mechanism, or correct `Docs/10` to match reality
+— and it went the same way for the same reason: the second domain that needs it is in this
+wave. Neither had a test while it lived in `identity`; both do now, including a mutation-checked
+one for the defect the signature exists to remove (a handler that writes *and* returns nil must
+produce one body, not two).
+
+**The body limit is one constant rather than two that agree.** `Docs/10` §4.3 required
+`decodeJSON`'s 1 MiB to equal `httpx`'s `maxIdempotentRequestBody`, and enforced it with a
+comment in each place asking the other not to move. Both now read `maxRequestBody`. The
+idempotency middleware fingerprints the body *before* the handler sees it, so a handler allowed
+the larger body would be replayed against bytes it never read — a test could only catch that
+afterwards, and one constant cannot drift at all.
+
+**The done list moved out of §10, and that is the whole of the `merge=union` decision** §9 had
+been holding. §3 is prose and a union there interleaves two narratives — worse than a conflict,
+because it is harder to see. A git attribute applies to a whole file, so the two could only be
+treated differently by separating them. `Docs/11-done.txt` is one ticket per line, which is also
+load-bearing: a union resolves line by line, and the old block put several tickets on one line,
+so two tracks appending to the same line would have conflicted regardless. `make status` reads
+the new file, and **fails if a ` ```done ` block ever reappears here** — a second list is a list
+nothing reads.
+
+The union was run rather than assumed, in a scratch repository and with its counterfactual: two
+branches each appending two tickets merge clean, all four present, no conflict markers — and the
+identical merge without the attribute conflicts. An attribute nobody has watched work is an
+attribute nobody knows works, which is the same argument SHIP-11 makes about the import lint.
+
+**The web-check reorder deleted its own workaround.** SHIP-23a found the defect and could not
+fix it: `mk/web.mk` belongs to the web surfaces, so both workflows carried a `make web-build`
+step and a comment pointing at §9 instead. Demonstrated by deleting `.next` from both
+applications — the state CI is always in and a developer never is — and running `make web-check`
+to green.
+
+**What demonstrates the *Done when*.** "Two tracks add HTTP endpoints without editing a file the
+other does" is a claim about a mechanism, so it was exercised rather than asserted: a throwaway
+`scripts/verify/50-jobs.sh` was dropped in, `make verify` picked it up with no edit to the runner
+and reported 106 checks across 9 sections, and it was removed again. Same shape as SHIP-11's
+throwaway module — a mechanism nobody has watched work is a mechanism nobody knows works.
 
 ### What SHIP-44 built, and what it closed
 
@@ -674,15 +755,15 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **~~A ticket for the web CI workflows.~~ Written as SHIP-23a at SHIP-15c, and built — see §3.** Two workflows, path-filtered per surface, and the filter demonstrated against a changed-file matrix rather than believed.
 
-**`make web-check` runs its type-check before its build, and that order is wrong.** Next.js 16 generates `LayoutProps` and the route types into `.next/types` during a build, so `tsc --noEmit` fails on any tree that has never been built. Nobody had noticed, because a developer always has built. **The fix is one line** — `web-check: web-lint web-build web-typecheck` in `mk/web.mk`. SHIP-23a did not make it: `mk/web.mk` belongs to the web surfaces rather than to a CI ticket, and both workflows carry a `make web-build` step and a comment naming this entry instead. **Delete the workaround in the same change that reorders the target.**
+**~~`make web-check` runs its type-check before its build.~~ Decided and fixed at SHIP-15e — see §3.** `web-check` is now `web-lint web-build web-typecheck`, and the `make web-build` workaround is deleted from both web workflows. Demonstrated by removing `.next` from both applications and running the target to green — the state CI is always in and a developer never is.
 
 **`flutter_secure_storage` is held at 10.x because version 11 needs `compileSdk = 37`.** The client compiles against 36 today, and Android Gradle Plugin 9.0.1 names 36 as its own maximum recommended — so taking 11 means moving the SDK and probably the Gradle plugin together. There is no urgency: 10.3.1 uses the same Keystore-wrapped ciphers and the same API 23 requirement. **Decide it with SHIP-24 and SHIP-26**, which are the tickets that touch the Android build configuration anyway.
 
 **Biometric unlock is still open, and SHIP-48 is where `Docs/07` §9 said it would close.** It did not, and the reason is that the thing it would sit in front of does not exist yet: an optional local unlock is a gate on a sign-in screen, and the first sign-in screen is SHIP-55. Nothing in the session design moves either way — `Docs/07` §3 already fixes its position as a convenience over the stored token and never a substitute for it — so the cost of leaving it is another wave of nothing happening. `flutter_secure_storage` offers it as an option on the store this ticket built (`AndroidOptions.biometric`, and iOS access-control flags), which means adopting it later is a change to two constants rather than a change to the design. **Decide at SHIP-55.**
 
-**§10's done block should probably be `merge=union`, and §3 probably should not.** Every track appends to both, so the last merge of a wave always conflicts here — it happened twice in wave 2, and both resolutions were unions. A union is *safe* for §10 specifically: it is a flat list of independent tokens with no syntax to break, a union is always a superset, and `make status` **fails** when §10 claims a ticket git has never seen — so a bad union is caught rather than passing quietly. That is the same argument `.gitattributes` already makes for `routes_golden.txt`. §3 is prose and a union would interleave two narratives, which is worse than a conflict. **Decide before wave 3 dispatches**, because the cost lands at the merge gate rather than during the work.
+**~~§10's done block should probably be `merge=union`, and §3 probably should not.~~ Decided and done at SHIP-15e — see §3.** Both halves were kept: the list is `merge=union` and §3 is not. Since a git attribute applies to a whole file, the list moved to `Docs/11-done.txt`, one ticket per line — which the recommendation had not noticed matters, because a union resolves line by line and the old block put several tickets on one line.
 
-**`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.** 660 lines in one file, and every ticket with an HTTP acceptance criterion appends to it. SHIP-15c left it alone deliberately: wave 2's split gives it exactly one client, so splitting it would have been a large change to a shared file for no benefit this wave. **It stops being deferrable the moment two tracks both add endpoints** — which is wave 3. Split it the same way `mk/*.mk` is split, or accept a conflict in the one file that demonstrates every acceptance criterion.
+**~~`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.~~ Decided and split at SHIP-15e — see §3.** It is a harness plus one file per milestone or domain in `scripts/verify/`, numbered in reserved ranges the way migrations are, and a track adds a file rather than editing one. The count is unchanged at 105, which is the evidence the move lost nothing.
 
 **`device_sessions` has no expiry column.** SHIP-38's *Done when* named refresh state, device label and last seen, and the implementation stopped exactly there — correctly, as a scope decision. But a refresh token has to expire, so **SHIP-39 either adds the column or explains where expiry lives instead.** Flagged here so it is a decision rather than a discovery.
 
@@ -690,35 +771,41 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **`Docs/07` §8 requires staging and production installable on one device, and the client cannot do that yet.** SHIP-18 selects the environment with `--dart-define`, which changes the base URL but not the identifier, so the second build replaces the first. Holding both at once needs a distinct application id per environment — real Xcode and Gradle flavours. **That work belongs with SHIP-24…27**, which are blocked on X-2 and X-3 anyway, but it is not currently in any of their *Done when* lines.
 
-**`httpx.H` and `httpx.DecodeJSON` are specified in `Docs/10` §4.3 and do not exist.** Both are
-named there as the way every handler is written, and neither has ever been in `internal/httpx` —
-the same shape `httpx.RegisterCode` was in for two waves. SHIP-30 needed them, could not edit a
-shared surface mid-wave, and so wrote `apiHandler` and `decodeJSON` unexported inside
-`internal/identity/http.go` with the reason on them. **The second domain to need a handler should
-promote the pair into `internal/httpx` rather than copy them**, which is shared-platform work and
-belongs to whoever owns `cmd/api` in that cycle. Two domains with two decoders is two answers to
-"what happens to an unknown field". The body limit is the part that actually bites: `decodeJSON`
-carries a literal 1 MiB that must stay equal to `httpx`'s unexported `maxIdempotentRequestBody`,
-and a copy in a second package is a second place for it to drift.
+**~~`httpx.H` and `httpx.DecodeJSON` are specified in `Docs/10` §4.3 and do not exist.~~ Decided
+and built at SHIP-15e — see §3.** Promoted rather than copied, before the jobs track became the
+second domain to want them, and `internal/identity` uses them like everybody else. The choice
+was between building the mechanism and amending `Docs/10` §4.3 to match reality, and building
+won for the same reason it did with `RegisterCode` at SHIP-15c. The body limit — the part that
+actually bites, since a second literal is a second place for it to drift — is now one constant
+in `internal/httpx` rather than two that agree by comment.
 
 **`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 
 ## 10. The done list, in a form a script can read
 
-Authoritative. `make status` counts these and cross-checks them against the backlog and
-against what commit subjects claim. Add a ticket here in the same change that finishes it.
+**The list is `Docs/11-done.txt`**, one ticket per line. It is still authoritative and it is
+still updated in the same change that finishes a ticket — it has simply moved out of this
+document. `make status` reads it, counts it against the backlog, and cross-checks it against
+what commit subjects claim.
 
-A ticket belongs here only when its *Done when* line in `Docs/09` is demonstrable. The two
-in §4 are deliberately absent.
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. The two in
+§4 are deliberately absent.
 
-```done
-SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
-SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-23a SHIP-28 SHIP-29 SHIP-30 SHIP-31 SHIP-32 SHIP-33 SHIP-34 SHIP-35 SHIP-36 SHIP-37 SHIP-38 SHIP-44 SHIP-45
-SHIP-48 SHIP-49
-SHIP-56 SHIP-57 SHIP-57a SHIP-67a
-SHIP-59a SHIP-149 SHIP-167 SHIP-179
-```
+**It moved so that it could be `merge=union`, which this document must never be** (SHIP-15e).
+Every track in a wave appends to the list, so the last merge of a wave conflicted here every
+time — twice in wave 2, both resolved as unions. A union is safe for a flat list of independent
+tokens: it is always a superset, and `make status` **fails** when the list names a ticket git
+has never seen, so a bad union is caught rather than passing quietly. It is not safe for §3,
+which is prose, where a union interleaves two narratives and is harder to notice than a
+conflict. A git attribute applies to a whole file, so the two could only be treated differently
+by separating them. `.gitattributes` and the file's own header carry the full argument.
+
+One ticket per line is part of it: `merge=union` resolves line by line, and the old block put
+several tickets on one line, so two tracks appending to the same line would have conflicted
+anyway.
+
+A ` ```done ` block reappearing in this document is now a `make status` failure, because a
+second list is a list nothing reads.
 
 ## 11. Keeping this file honest
 

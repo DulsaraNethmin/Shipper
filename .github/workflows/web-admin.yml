@@ -83,22 +83,6 @@ jobs:
       - name: install exactly what the lockfile pins
         run: make web-install
 
-      # This step exists because of a defect, and it should be deleted when the defect is fixed.
-      #
-      # `make web-check` is lint → typecheck → build. On a clean checkout the typecheck fails:
-      # Next.js 16 generates `LayoutProps` and the route types into .next/types during a build,
-      # and `tsc --noEmit` has nothing to resolve them against until one has run. It is
-      # invisible locally because a developer has always built at least once already, and CI is
-      # the first thing that ever ran the target on an empty tree.
-      #
-      # The fix is one line in mk/web.mk — web-check should be lint → build → typecheck — and
-      # that file belongs to the web surfaces rather than to this workflow, so it is raised in
-      # Docs/11 §9 instead of being changed here. Until then this runs the build first; the
-      # build inside web-check is then incremental against this one's .next cache, so the cost
-      # is small and `make web-check` still runs in full, undrifted.
-      - name: generate the Next.js route types
-        run: make web-build
-
       # `make web-check` rather than a list of steps, for the reason
       # .github/workflows/README.md gives about the Go workflow: a workflow that reimplements
       # what a make target already does drifts from it, and the check that gets dropped is

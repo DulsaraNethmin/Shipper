@@ -70,12 +70,6 @@ jobs:
       - name: install exactly what the lockfile pins
         run: make web-install
 
-      # A workaround for the ordering defect in mk/web.mk's web-check target, explained in full
-      # in web-admin.yml and raised in Docs/11 §9. Delete both when web-check runs the build
-      # before the type-check.
-      - name: generate the Next.js route types
-        run: make web-build
-
       - name: make web-check
         run: make web-check
 
