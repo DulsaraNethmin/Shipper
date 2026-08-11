@@ -1,28 +1,26 @@
-import 'dart:async';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import 'package:shipper/core/auth/session_controller.dart';
+import 'package:shipper/core/auth/development_session.dart';
+import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/routing/app_router.dart';
 
 /// Where a signed-out cold start lands (SHIP-49).
 ///
-/// A placeholder for the registration and sign-in screens, which arrive at SHIP-51 and
-/// SHIP-55 against endpoints built in an earlier wave — `Docs/11` §7 forbids a screen
-/// depending on an endpoint from its own wave, and there is no `POST /v1/auth/login` yet.
+/// The way into signup from SHIP-51, and still a placeholder for the sign-in screen, which is
+/// SHIP-55 against `POST /v1/auth/login` — SHIP-41, an endpoint that does not exist yet.
+/// `Docs/11` §7 forbids a screen depending on an endpoint from its own wave.
 ///
 /// It sits in `features/identity` rather than in `core/routing` because that is where the real
 /// screens go, and a placeholder in the wrong folder is a move-and-rename for whoever writes
 /// them. The signed-*in* shell is core, for the opposite reason: every feature is shown inside
 /// it, so a feature cannot own it.
-class SignedOutScreen extends ConsumerWidget {
+class SignedOutScreen extends StatelessWidget {
   const SignedOutScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
     return Scaffold(
@@ -44,15 +42,26 @@ class SignedOutScreen extends ConsumerWidget {
                 style: theme.textTheme.bodyMedium,
               ),
               const SizedBox(height: 24),
-              // Disabled rather than absent, because Docs/07 §3 allows the app to hide or
-              // disable and never to decide. What these will do is call the platform; until
-              // SHIP-51 and SHIP-55 there is nothing to call, and a button that navigates
-              // nowhere is worse than one that visibly is not ready yet.
-              const FilledButton(onPressed: null, child: Text('Sign in')),
+              // Sign-in stays disabled rather than absent, because Docs/07 §3 allows the app to
+              // hide or disable and never to decide. There is no POST /v1/auth/login to call
+              // until SHIP-41, and a button that navigates nowhere is worse than one that
+              // visibly is not ready yet. Registration became real at SHIP-51.
+              const FilledButton(
+                key: Key('sign-in'),
+                onPressed: null,
+                child: Text('Sign in'),
+              ),
               const SizedBox(height: 8),
-              const OutlinedButton(onPressed: null, child: Text('Create an account')),
+              OutlinedButton(
+                key: const Key('create-account'),
+                // Signup starts at the role, not at the form: the platform fixes the role at
+                // registration and refuses to change it afterwards (SHIP-45), so it is the one
+                // decision that deserves its own screen.
+                onPressed: () => context.go(Routes.chooseRole),
+                child: const Text('Create an account'),
+              ),
               const SizedBox(height: 24),
-              const _DevelopmentSession(),
+              const _DevelopmentSessions(),
               TextButton(
                 onPressed: () => context.go(Routes.health),
                 child: const Text('Connectivity'),
@@ -65,37 +74,31 @@ class SignedOutScreen extends ConsumerWidget {
   }
 }
 
-/// Puts a token in the keychain so the cold-start routing can be demonstrated (SHIP-49).
+/// The debug-only routes into each signed-in shell (SHIP-49, extended at SHIP-52).
 ///
-/// **Debug builds only, and that is enforced rather than intended.** `kDebugMode` is a
-/// compile-time constant, so in a profile or release build the tree-shaker removes this widget
-/// and the string it carries entirely — there is no flag to misconfigure and nothing to strip
-/// later.
-///
-/// It exists because SHIP-49's *Done when* is a routing criterion and this wave has no
-/// endpoint that issues a refresh token. Demonstrating "routes to the signed-in shell on cold
-/// start" needs a token in the keychain, and the two ways to get one are this or a fake sign-in
-/// path in production code. The value written is not a credential and the platform will refuse
-/// it the moment SHIP-50 tries to refresh with it, which is the correct outcome: the device
-/// believing it has a session has never been the same thing as having one.
-class _DevelopmentSession extends ConsumerWidget {
-  const _DevelopmentSession();
-
-  /// Recognisable in a keychain dump, and obviously not a real token.
-  static const _placeholder = 'development-placeholder-not-a-credential';
+/// The reasoning, the placeholder token and the [kDebugMode] guard all live in
+/// `core/auth/development_session.dart`, because the end of the signup journey needs the same
+/// affordance. What is here is only the choice of which sessions are worth reaching by hand, and
+/// there are three because the shell has three answers: no role yet, which is what a restored
+/// cold start actually looks like until SHIP-50 refreshes, and one for each half of the
+/// marketplace.
+class _DevelopmentSessions extends StatelessWidget {
+  const _DevelopmentSessions();
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     if (!kDebugMode) return const SizedBox.shrink();
 
     return Column(
       children: [
-        TextButton(
-          key: const Key('development-session'),
-          onPressed: () => unawaited(
-            ref.read(sessionProvider.notifier).signIn(refreshToken: _placeholder),
-          ),
-          child: const Text('Store a development session'),
+        const DevelopmentSessionButton(label: 'Store a development session'),
+        const DevelopmentSessionButton(
+          label: 'Signed in as a customer',
+          role: UserRole.customer,
+        ),
+        const DevelopmentSessionButton(
+          label: 'Signed in as a provider',
+          role: UserRole.provider,
         ),
         Text(
           'Debug builds only. Restart the app to see the cold-start route.',

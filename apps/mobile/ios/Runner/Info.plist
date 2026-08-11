@@ -8,6 +8,41 @@
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
 	<string>Shipper</string>
+	<!-- SHIP-53. Hands an incoming URL to Flutter, which turns its path and query into a route
+	     for go_router to match. Without it iOS delivers the URL and nothing reads it.
+
+	     It applies to universal links as well as to the scheme below, so the entitlement work in
+	     SHIP-24 will not have to come back and turn it on. -->
+	<key>FlutterDeepLinkingEnabled</key>
+	<true/>
+	<!-- SHIP-53 chose the verification deep link, because internal/identity/verification.go
+	     deliberately left the scheme to this ticket and sends a bare code meanwhile:
+
+	         shipper:///verify-email?token=<token>
+
+	     Three slashes, so the host is empty and the path is what go_router matches. A custom
+	     scheme needs no registered domain, no Associated Domains entitlement and no Apple
+	     Developer Program membership — X-1 and X-2 block all three, and the alternative was
+	     leaving "or deep-link a code" undemonstrable for the whole of the pilot build-out.
+
+	     It is not the production form. An HTTPS universal link is, because a custom scheme can be
+	     claimed by any other app on the device, and because a link in an email has to do
+	     something sensible for somebody who has not installed this one. That needs SHIP-24…27 and
+	     a registered domain. No Dart changes when it arrives: a link of either kind resolves to
+	     the same route with the same query parameter. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>au.com.shipper</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>shipper</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>

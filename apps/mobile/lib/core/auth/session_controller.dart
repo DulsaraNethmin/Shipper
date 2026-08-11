@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_store.dart';
+import 'package:shipper/core/auth/user_role.dart';
 
 /// Owns the session, and answers the question a cold start asks (SHIP-49).
 ///
@@ -66,10 +67,16 @@ class SessionController extends Notifier<SessionState> {
   /// The write completes before the state changes, so a crash between the two cannot leave a
   /// signed-in app with nothing in the keychain — the failure that would survive a restart as
   /// a session the device cannot restore.
-  Future<void> signIn({required String refreshToken}) async {
+  /// [role] selects which half of the marketplace the shell draws (SHIP-52). It is optional
+  /// because the two callers know different amounts: a sign-in reads it from the access token
+  /// the platform signed, and a restore has only the keychain, which holds no role at all. It is
+  /// deliberately **not** persisted beside the token — the role is the platform's claim about
+  /// the account and belongs in the token the platform signs, not in a value on this device that
+  /// every later refresh would then have to agree with.
+  Future<void> signIn({required String refreshToken, UserRole? role}) async {
     await ref.read(tokenStoreProvider).writeRefreshToken(refreshToken);
     if (!ref.mounted) return;
-    state = const SessionState.signedIn();
+    state = SessionState.signedIn(role: role);
   }
 
   /// Ends the session on this device.

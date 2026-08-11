@@ -40,6 +40,26 @@ void main() {
       expect(redirectFor(signedOut, Routes.starting), Routes.signIn);
     });
 
+    test('the whole signup journey is reachable while signed out', () {
+      // POST /v1/auth/register returns an account and no token — registering is not signing in
+      // — so every screen in the journey runs with no session at all. SHIP-49's guard sent a
+      // signed-out user to the sign-in shell from every other location, which would have
+      // bounced them straight back out of registration on the first redirect.
+      const signedOut = SessionState.signedOut();
+
+      for (final location in [Routes.register, Routes.registered]) {
+        expect(redirectFor(signedOut, location), isNull, reason: location);
+      }
+    });
+
+    test('a signed-in user has no business in the signup journey', () {
+      const signedIn = SessionState.signedIn();
+
+      for (final location in [Routes.register, Routes.registered]) {
+        expect(redirectFor(signedIn, location), Routes.home, reason: location);
+      }
+    });
+
     test('signed in reaches the signed-in shell and nothing else', () {
       const signedIn = SessionState.signedIn();
 
@@ -54,6 +74,58 @@ void main() {
       expect(redirectFor(const SessionState.restoring(), Routes.health), isNull);
       expect(redirectFor(const SessionState.signedOut(), Routes.health), isNull);
       expect(redirectFor(const SessionState.signedIn(), Routes.health), isNull);
+    });
+  });
+
+  group('a deep link that arrives while the keychain is being read', () {
+    // SHIP-49 wrote this case down as dropped and named SHIP-143 as the ticket that would have
+    // to fix it. SHIP-53 got there first: a verification link is opened at a cold start, which
+    // is exactly when the session is restoring, so for that link it is not a rare case but the
+    // only case.
+
+    test('is held, and delivered once the session answers', () {
+      final redirector = Redirector();
+      final link = Uri.parse('/verify-email?token=abc');
+
+      // The restore is still in flight, so the app cannot show it yet.
+      expect(redirector(const SessionState.restoring(), link), Routes.starting);
+      expect(redirector(const SessionState.restoring(), Uri.parse(Routes.starting)), isNull);
+
+      // The keychain answers, and the link is reissued — with its query, which is the whole
+      // point: the screen without the token is worse than not arriving at all.
+      expect(
+        redirector(const SessionState.signedOut(), Uri.parse(Routes.starting)),
+        '/verify-email?token=abc',
+      );
+    });
+
+    test('is still put through the guard rather than exempted by being held', () {
+      final redirector = Redirector();
+
+      expect(redirector(const SessionState.restoring(), Uri.parse(Routes.home)), Routes.starting);
+      expect(
+        redirector(const SessionState.signedOut(), Uri.parse(Routes.starting)),
+        Routes.signIn,
+        reason: 'a link into the signed-in shell on a signed-out device is still refused',
+      );
+    });
+
+    test('is delivered once and not again on a later sign-out', () {
+      final redirector = Redirector();
+
+      redirector(const SessionState.restoring(), Uri.parse('/verify-email?token=abc'));
+      redirector(const SessionState.signedOut(), Uri.parse(Routes.starting));
+
+      // Somebody signs in, then out. Reissuing the held link here would take them back to a
+      // screen they finished with, minutes later, for no reason they could see.
+      expect(redirector(const SessionState.signedOut(), Uri.parse(Routes.starting)), Routes.signIn);
+    });
+
+    test('an ordinary cold start with no link behaves exactly as it did', () {
+      final redirector = Redirector();
+
+      expect(redirector(const SessionState.restoring(), Uri.parse(Routes.starting)), isNull);
+      expect(redirector(const SessionState.signedOut(), Uri.parse(Routes.starting)), Routes.signIn);
     });
   });
 
