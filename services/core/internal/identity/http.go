@@ -19,24 +19,13 @@
 package identity
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
-
-// maxRequestBody is the largest body a handler in this package will decode.
-//
-// It must stay equal to httpx's maxIdempotentRequestBody (Docs/10 §4.3). The idempotency
-// middleware reads and fingerprints the body before the handler sees it, so a handler with the
-// larger limit would fingerprint a body it never read; the constant there is unexported, so
-// this is a literal with the rule written beside it rather than a reference.
-const maxRequestBody = 1 << 20 // 1 MiB
 
 // Handler serves this domain's routes.
 //
@@ -114,9 +103,9 @@ func accountFrom(u User) accountResponse {
 // not end up with two accounts, or with a duplicate-address error for the account it just
 // successfully created.
 func (h *Handler) Register() http.Handler {
-	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		var req registerRequest
-		if err := decodeJSON(r, &req); err != nil {
+		if err := httpx.DecodeJSON(r, &req); err != nil {
 			return err
 		}
 
@@ -158,9 +147,9 @@ type acceptedResponse struct {
 // request and will not tell the caller what came of it. A 200 with a body claiming the message
 // was sent would be a lie for every number that has no account.
 func (h *Handler) RequestOTP() http.Handler {
-	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		var req phoneRequest
-		if err := decodeJSON(r, &req); err != nil {
+		if err := httpx.DecodeJSON(r, &req); err != nil {
 			return err
 		}
 
@@ -196,9 +185,9 @@ type emailRequest struct {
 // any session at all. The token in the body is the credential, and it was sent to the address
 // being proved.
 func (h *Handler) VerifyEmail() http.Handler {
-	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		var req verifyEmailRequest
-		if err := decodeJSON(r, &req); err != nil {
+		if err := httpx.DecodeJSON(r, &req); err != nil {
 			return err
 		}
 
@@ -219,9 +208,9 @@ func (h *Handler) VerifyEmail() http.Handler {
 // never arrived, which is also why a send failure at registration is logged rather than
 // returned.
 func (h *Handler) ResendVerification() http.Handler {
-	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		var req emailRequest
-		if err := decodeJSON(r, &req); err != nil {
+		if err := httpx.DecodeJSON(r, &req); err != nil {
 			return err
 		}
 
@@ -249,9 +238,9 @@ type verifyPhoneRequest struct {
 // Public, and it carries both the number and the code because the caller has no session yet —
 // the code is what establishes that they hold the handset the number reaches.
 func (h *Handler) VerifyPhone() http.Handler {
-	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		var req verifyPhoneRequest
-		if err := decodeJSON(r, &req); err != nil {
+		if err := httpx.DecodeJSON(r, &req); err != nil {
 			return err
 		}
 
@@ -311,89 +300,6 @@ func apiError(err error) error {
 	default:
 		return err
 	}
-}
-
-// apiHandler adapts a handler that returns an error to one that writes a response.
-//
-// # This belongs in internal/httpx and is not there
-//
-// Docs/10 §4.3 specifies exactly this — "handlers have the signature
-// func(http.ResponseWriter, *http.Request) error, adapted by httpx.H" — and httpx.H does not
-// exist. Neither does httpx.DecodeJSON, which the same section names. That is the shape
-// httpx.RegisterCode was in until SHIP-15c: documented, believed, and absent, because no domain
-// had yet needed it.
-//
-// internal/httpx is a shared surface and not this branch's to edit (Docs/10 §9.2), so the
-// mechanism is written here, unexported, and flagged in Docs/11 §9 for whoever owns cmd/api
-// next. The second domain to want it should promote these two functions rather than copy them.
-//
-// The signature earns its place regardless of where it lives: returning an error rather than
-// writing one removes the "forgot to return after writing" defect, which otherwise emits two
-// response bodies and a status the client cannot make sense of.
-func apiHandler(fn func(http.ResponseWriter, *http.Request) error) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := fn(w, r); err != nil {
-			httpx.WriteError(w, r, err)
-		}
-	})
-}
-
-// decodeJSON reads a request body into v, refusing anything it does not fully understand.
-//
-// See apiHandler for why this is here rather than in internal/httpx.
-//
-// Unknown fields are rejected (Docs/10 §4.3). Responses stay additive so that an old build
-// tolerates a new field, but a request is the other direction: a client that sends `pasword`
-// has made a mistake that will otherwise look like a validation failure on a field it believes
-// it supplied.
-func decodeJSON(r *http.Request, v any) error {
-	if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
-		return httpx.NewError(http.StatusUnsupportedMediaType, httpx.CodeUnsupportedMediaType,
-			"This endpoint accepts application/json.")
-	}
-
-	if r.Body == nil {
-		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
-			"The request needs a JSON body.")
-	}
-
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxRequestBody+1))
-	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(v); err != nil {
-		var unknown *json.UnmarshalTypeError
-		switch {
-		case errors.Is(err, io.EOF):
-			return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
-				"The request needs a JSON body.").WithCause(err)
-		case errors.As(err, &unknown):
-			return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
-				"The %s field is not the expected type.", unknown.Field).WithCause(err)
-		case strings.Contains(err.Error(), "unknown field"):
-			// encoding/json reports this as a plain error with no type of its own, so
-			// there is nothing else to match on. The message is quoted rather than
-			// reworded because it names the offending field.
-			return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
-				"The request contains a field this endpoint does not accept: %s",
-				strings.TrimPrefix(err.Error(), "json: ")).WithCause(err)
-		default:
-			return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
-				"The request body is not valid JSON.").WithCause(err)
-		}
-	}
-
-	// A second value in the stream means the client sent two documents, which is never what
-	// was intended and would otherwise be silently ignored.
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
-			"The request body must be a single JSON object.")
-	}
-	return nil
-}
-
-func isJSONContentType(value string) bool {
-	media, _, _ := strings.Cut(value, ";")
-	return strings.EqualFold(strings.TrimSpace(media), "application/json")
 }
 
 // logFor returns the request-scoped logger, which is already bound to the request ID (SHIP-14).

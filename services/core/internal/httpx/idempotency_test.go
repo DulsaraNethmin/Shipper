@@ -418,7 +418,7 @@ func TestAnOversizedRequestBodyIsRejected(t *testing.T) {
 	h := Idempotent(idempotency.NewMemoryStore(), nil)(handler)
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, bidRequest("key-1", strings.Repeat("x", maxIdempotentRequestBody+1)))
+	h.ServeHTTP(rec, bidRequest("key-1", strings.Repeat("x", maxRequestBody+1)))
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", rec.Code)

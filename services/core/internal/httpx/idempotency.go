@@ -38,11 +38,6 @@ const (
 	// maxIdempotencyKeyLen bounds what becomes part of a Redis key.
 	maxIdempotencyKeyLen = 255
 
-	// maxIdempotentRequestBody is the largest request body that can be fingerprinted.
-	// The API takes JSON; images go directly to object storage through pre-signed URLs
-	// and never through this service (Docs/06 §5.2), so nothing legitimate comes close.
-	maxIdempotentRequestBody = 1 << 20 // 1 MiB
-
 	// maxReplayableResponse bounds what is held in Redis per key. A response above it is
 	// still sent, but is not stored — see the comment at the call site.
 	maxReplayableResponse = 64 << 10 // 64 KiB
@@ -269,19 +264,25 @@ func validIdempotencyKey(key string) bool {
 
 // readIdempotentBody reads the request body so it can be fingerprinted, bounded so that a
 // large upload cannot be turned into a large allocation.
+//
+// The bound is maxRequestBody, the same constant [DecodeJSON] reads a handler's body with, and
+// it is deliberately one constant rather than two that happen to agree: this runs before the
+// handler, so a handler allowed the larger body would be fingerprinted on bytes it never saw
+// (Docs/10 §4.3). Until SHIP-15e there were two literals, one here and one in internal/identity,
+// each with a comment asking the other not to move.
 func readIdempotentBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return nil, nil
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxIdempotentRequestBody+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	if err != nil {
 		return nil, NewError(http.StatusBadRequest, CodeBadRequest,
 			"The request body could not be read.").WithCause(err)
 	}
-	if len(body) > maxIdempotentRequestBody {
+	if len(body) > maxRequestBody {
 		return nil, NewError(http.StatusRequestEntityTooLarge, CodePayloadTooLarge,
-			"The request body may be at most %d bytes.", maxIdempotentRequestBody)
+			"The request body may be at most %d bytes.", maxRequestBody)
 	}
 	return body, nil
 }

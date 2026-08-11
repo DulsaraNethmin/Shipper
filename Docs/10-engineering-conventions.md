@@ -159,9 +159,11 @@ The ordering in `newRouter` is deliberate and documented in place: `RequestID` o
 
 Handlers have the signature `func(http.ResponseWriter, *http.Request) error`, adapted by `httpx.H`, which writes any returned error through `WriteError`. Returning an error rather than writing one removes the "forgot to return after writing" defect, which otherwise emits two response bodies.
 
-Request bodies are decoded by `httpx.DecodeJSON` with `DisallowUnknownFields` and a **1 MiB** limit. That limit must stay equal to `maxIdempotentRequestBody`; if they diverge, the fingerprint is computed over a body the handler never saw.
+Request bodies are decoded by `httpx.DecodeJSON` with `DisallowUnknownFields` and a **1 MiB** limit. **That limit and the idempotency middleware's are one constant, `maxRequestBody`, not two that agree.** The middleware reads and fingerprints the body before the handler sees it, so a handler permitted the larger body would be replayed against a fingerprint computed over bytes it never read. Two constants can drift and a test can only notice afterwards; one cannot drift at all.
 
 Unknown fields are rejected on requests, to catch client typos. Responses stay additive per `Docs/07` §6 — add fields, never repurpose or remove them, and clients tolerate fields they do not know.
+
+This section, like §4.4 below it, described a mechanism that did not exist. `httpx.H` and `httpx.DecodeJSON` were specified here at SHIP-15a and neither was in `internal/httpx` until **SHIP-15e**. SHIP-30 needed both, could not edit a shared surface mid-wave, and wrote them unexported in `internal/identity` as `apiHandler` and `decodeJSON` — with the 1 MiB limit as a second literal beside a comment asking the first not to move. They were promoted before a second domain copied them, which is the point at which the cost stops being notional: two domains with two decoders is two answers to what happens to an unknown field, and two limits is the divergence the paragraph above forbids.
 
 ### 4.4 Error codes
 

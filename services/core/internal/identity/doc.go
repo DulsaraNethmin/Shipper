@@ -53,10 +53,11 @@
 // interval for every outcome, and verify-phone has exactly one failure code. The reasoning is on
 // CodeEmailTaken and CodeOTPInvalid, and it is a decision rather than an inconsistency.
 //
-// # Two things in http.go that should not be here
+// # Two things that used to be in http.go
 //
-// apiHandler and decodeJSON are what Docs/10 §4.3 calls httpx.H and httpx.DecodeJSON, neither of
-// which exists in internal/httpx. They are written here because a domain branch does not edit a
-// shared surface mid-wave, and they are flagged in Docs/11 §9 so that the second domain to need
-// a handler promotes them rather than copying them.
+// apiHandler and decodeJSON lived here for one wave, because Docs/10 §4.3 named httpx.H and
+// httpx.DecodeJSON as the way every handler is written and neither existed, and a domain branch
+// does not edit a shared surface mid-wave. SHIP-15e promoted both into internal/httpx before a
+// second domain copied them, which is what Docs/11 §9 had asked for. Handlers here now use
+// httpx.H and httpx.DecodeJSON like everybody else.
 package identity
