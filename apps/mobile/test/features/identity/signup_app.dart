@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/token_store.dart';
+import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 
 import '../../core/auth/fake_token_store.dart';
@@ -28,16 +29,34 @@ Widget signupApp(FakeIdentityRepository identity, {FakeTokenStore? store}) {
   );
 }
 
-/// Boots the app and walks it from the signed-out shell into the registration form.
+/// Boots the app and walks it from the signed-out shell to the role screen, which is where
+/// signup starts (SHIP-52).
 ///
 /// The route is reached the way a person reaches it, so a guard that bounced a signed-out user
-/// off the registration screen — which is what SHIP-49's guard did before SHIP-51 widened it —
-/// fails here rather than only on a device.
-Future<void> openRegistration(WidgetTester tester, FakeIdentityRepository identity) async {
+/// out of the journey — which is what SHIP-49's guard did before SHIP-51 widened it — fails here
+/// rather than only on a device.
+Future<void> openSignup(WidgetTester tester, FakeIdentityRepository identity) async {
   await tester.pumpWidget(signupApp(identity));
   await tester.pumpAndSettle();
 
   await tester.tap(find.byKey(const Key('create-account')));
+  await tester.pumpAndSettle();
+}
+
+/// Walks on to the registration form, choosing [role] on the way when one is given.
+Future<void> openRegistration(
+  WidgetTester tester,
+  FakeIdentityRepository identity, {
+  UserRole? role,
+}) async {
+  await openSignup(tester, identity);
+
+  if (role != null) {
+    await tester.tap(find.byKey(Key('role-${role.name}')));
+    await tester.pumpAndSettle();
+  }
+
+  await tester.tap(find.byKey(const Key('role-continue')));
   await tester.pumpAndSettle();
 }
 

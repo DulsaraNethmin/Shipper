@@ -122,12 +122,12 @@ return signedIn(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  restoring,TResult Function()?  signedOut,TResult Function()?  signedIn,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  restoring,TResult Function()?  signedOut,TResult Function( UserRole? role)?  signedIn,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case SessionRestoring() when restoring != null:
 return restoring();case SessionSignedOut() when signedOut != null:
 return signedOut();case SessionSignedIn() when signedIn != null:
-return signedIn();case _:
+return signedIn(_that.role);case _:
   return orElse();
 
 }
@@ -145,12 +145,12 @@ return signedIn();case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  restoring,required TResult Function()  signedOut,required TResult Function()  signedIn,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  restoring,required TResult Function()  signedOut,required TResult Function( UserRole? role)  signedIn,}) {final _that = this;
 switch (_that) {
 case SessionRestoring():
 return restoring();case SessionSignedOut():
 return signedOut();case SessionSignedIn():
-return signedIn();}
+return signedIn(_that.role);}
 }
 /// A variant of `when` that fallback to returning `null`
 ///
@@ -164,12 +164,12 @@ return signedIn();}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  restoring,TResult? Function()?  signedOut,TResult? Function()?  signedIn,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  restoring,TResult? Function()?  signedOut,TResult? Function( UserRole? role)?  signedIn,}) {final _that = this;
 switch (_that) {
 case SessionRestoring() when restoring != null:
 return restoring();case SessionSignedOut() when signedOut != null:
 return signedOut();case SessionSignedIn() when signedIn != null:
-return signedIn();case _:
+return signedIn(_that.role);case _:
   return null;
 
 }
@@ -245,32 +245,66 @@ String toString() {
 
 
 class SessionSignedIn implements SessionState {
-  const SessionSignedIn();
+  const SessionSignedIn({this.role});
   
 
+ final  UserRole? role;
 
-
+/// Create a copy of SessionState
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SessionSignedInCopyWith<SessionSignedIn> get copyWith => _$SessionSignedInCopyWithImpl<SessionSignedIn>(this, _$identity);
 
 
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SessionSignedIn);
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SessionSignedIn&&(identical(other.role, role) || other.role == role));
 }
 
 
 @override
-int get hashCode => runtimeType.hashCode;
+int get hashCode => Object.hash(runtimeType,role);
 
 @override
 String toString() {
-  return 'SessionState.signedIn()';
+  return 'SessionState.signedIn(role: $role)';
 }
 
 
 }
 
+/// @nodoc
+abstract mixin class $SessionSignedInCopyWith<$Res> implements $SessionStateCopyWith<$Res> {
+  factory $SessionSignedInCopyWith(SessionSignedIn value, $Res Function(SessionSignedIn) _then) = _$SessionSignedInCopyWithImpl;
+@useResult
+$Res call({
+ UserRole? role
+});
 
 
+
+
+}
+/// @nodoc
+class _$SessionSignedInCopyWithImpl<$Res>
+    implements $SessionSignedInCopyWith<$Res> {
+  _$SessionSignedInCopyWithImpl(this._self, this._then);
+
+  final SessionSignedIn _self;
+  final $Res Function(SessionSignedIn) _then;
+
+/// Create a copy of SessionState
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? role = freezed,}) {
+  return _then(SessionSignedIn(
+role: freezed == role ? _self.role : role // ignore: cast_nullable_to_non_nullable
+as UserRole?,
+  ));
+}
+
+
+}
 
 // dart format on

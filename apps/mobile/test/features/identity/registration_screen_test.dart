@@ -51,6 +51,12 @@ void main() {
       await tester.tap(find.byKey(const Key('create-account')));
       await tester.pumpAndSettle();
 
+      // Signup starts at the role, because the platform fixes it at registration (SHIP-45).
+      expect(find.byKey(const Key('role-customer')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('role-continue')));
+      await tester.pumpAndSettle();
+
       expect(find.byKey(const Key('register-email')), findsOneWidget);
     });
 

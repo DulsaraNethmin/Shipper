@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/identity/signup_controller.dart';
@@ -128,7 +129,7 @@ class _RegistrationScreenState extends ConsumerState<RegistrationScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Create an account'),
-        leading: BackButton(onPressed: () => context.go(Routes.signIn)),
+        leading: BackButton(onPressed: () => context.go(Routes.chooseRole)),
       ),
       body: SafeArea(
         child: Form(
@@ -137,6 +138,8 @@ class _RegistrationScreenState extends ConsumerState<RegistrationScreen> {
           child: ListView(
             padding: const EdgeInsets.all(24),
             children: [
+              _RoleSummary(role: signup.role),
+              const SizedBox(height: 24),
               if (showBanner) ...[
                 FailureBanner(failure),
                 const SizedBox(height: 16),
@@ -219,6 +222,40 @@ class _RegistrationScreenState extends ConsumerState<RegistrationScreen> {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The role chosen on the previous screen, shown rather than decided invisibly (SHIP-52).
+///
+/// **This is the last screen on which changing it costs nothing.** The platform fixes the role
+/// at registration and a `BEFORE UPDATE` trigger on `users` refuses to change it afterwards
+/// (SHIP-45), so a person who meant to sign up as a provider needs a second account. Saying so
+/// here is cheaper than the support conversation.
+class _RoleSummary extends StatelessWidget {
+  const _RoleSummary({required this.role});
+
+  final UserRole role;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Card(
+      key: const Key('register-role'),
+      margin: EdgeInsets.zero,
+      child: ListTile(
+        title: Text(role.label, style: theme.textTheme.titleMedium),
+        subtitle: Text(
+          'Fixed once the account exists. Change it now if it is wrong.',
+          style: theme.textTheme.bodySmall,
+        ),
+        trailing: TextButton(
+          key: const Key('register-change-role'),
+          onPressed: () => context.go(Routes.chooseRole),
+          child: const Text('Change'),
         ),
       ),
     );

@@ -9,6 +9,7 @@ import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
 import 'package:shipper/features/identity/registration_complete_screen.dart';
 import 'package:shipper/features/identity/registration_screen.dart';
+import 'package:shipper/features/identity/role_selection_screen.dart';
 import 'package:shipper/features/identity/signed_out_screen.dart';
 
 /// Route paths, named once.
@@ -23,6 +24,9 @@ abstract final class Routes {
 
   /// The signed-out shell. Registration hangs off it from SHIP-51; sign-in is SHIP-55.
   static const signIn = '/sign-in';
+
+  /// The first step of signup: which half of the marketplace this account is (SHIP-52).
+  static const chooseRole = '/register/role';
 
   /// The registration form (SHIP-51).
   static const register = '/register';
@@ -59,6 +63,7 @@ const _sessionAgnostic = <String>{Routes.health};
 /// redirect.
 const _signedOutLocations = <String>{
   Routes.signIn,
+  Routes.chooseRole,
   Routes.register,
   Routes.registered,
 };
@@ -122,6 +127,10 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.signIn,
         builder: (context, state) => const SignedOutScreen(),
+      ),
+      GoRoute(
+        path: Routes.chooseRole,
+        builder: (context, state) => const RoleSelectionScreen(),
       ),
       GoRoute(
         path: Routes.register,

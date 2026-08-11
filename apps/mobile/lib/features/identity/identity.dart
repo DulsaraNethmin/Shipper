@@ -12,12 +12,13 @@
 ///   body of registration and of both verification confirms.
 /// - `identity_repository.dart` — the five public identity endpoints, all built in wave 2.
 /// - `signup_controller.dart` — the journey's state, and one idempotency key per action.
+/// - `role_selection_screen.dart` — which half of the marketplace, chosen first (SHIP-52).
 /// - `registration_screen.dart` — create an account (SHIP-51).
 /// - `registration_complete_screen.dart` — where the journey ends, honestly stubbed.
 ///
-/// Role selection is SHIP-52, verification SHIP-53 and SHIP-54, sign-in SHIP-55. Each consumes
-/// an endpoint built in an earlier wave — `Docs/11` §7 forbids a screen depending on an endpoint
-/// from its own wave, and `POST /v1/auth/login` does not exist at all yet.
+/// Verification is SHIP-53 and SHIP-54, sign-in SHIP-55. Each consumes an endpoint built in an
+/// earlier wave — `Docs/11` §7 forbids a screen depending on an endpoint from its own wave, and
+/// `POST /v1/auth/login` does not exist at all yet.
 ///
 /// ## The whole journey happens signed out
 ///

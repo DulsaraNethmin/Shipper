@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import 'package:shipper/core/auth/development_session.dart';
 import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/identity/signup_controller.dart';
 
@@ -66,6 +67,19 @@ class RegistrationCompleteScreen extends ConsumerWidget {
               style: theme.textTheme.bodySmall,
             ),
             const SizedBox(height: 24),
+            // Debug builds only, and tree-shaken out of anything else — see
+            // core/auth/development_session.dart for why it exists and what it is not.
+            //
+            // It is here because SHIP-52's *Done when* is "role is chosen during signup and
+            // drives the post-login shell", and this is the only point in the app where both
+            // halves of that sentence meet: the role a person just chose, and the shell it
+            // selects. Without a sign-in endpoint the link between them is otherwise only
+            // demonstrable as two separate things. SHIP-55 replaces this with the real sign-in.
+            DevelopmentSessionButton(
+              label: 'Preview the ${signup.role.label.toLowerCase()} shell',
+              role: signup.role,
+            ),
+            const SizedBox(height: 8),
             FilledButton(
               key: const Key('registered-done'),
               onPressed: () {
