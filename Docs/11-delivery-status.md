@@ -98,6 +98,13 @@ environment test run once per build flavour — and SHIP-16 and SHIP-19 by insta
 version off both screens. `make verify` does not cover it: that script exercises HTTP
 endpoints, and none of these tickets adds one.
 
+**SHIP-48 adds a second Flutter command, and it is not in `make check`.**
+`make flutter-integration d=<device>` runs `apps/mobile/integration_test/` on a booted
+simulator, against the real Keychain and the real Keystore. It is out of `flutter-check` and
+out of `CHECKS` deliberately — it needs a device, and the Flutter CI job is a Linux runner
+until SHIP-24…27 — so it is a check a person invokes when the storage or the session changes.
+The file's own header says which invocation demonstrates which claim.
+
 ### M0 — Foundation (27 of 32)
 
 | Ticket | What |
@@ -133,6 +140,7 @@ endpoints, and none of these tickets adds one.
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
+| **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -208,6 +216,45 @@ The gate §8 has been describing since wave 1. Three points, and it held back ev
 **SHIP-15c's own acceptance criterion is now demonstrated.** SHIP-44 landed with no field added to `Deps` and no edit to its literal in `main.go`. The verifier is passed to `newRouter` alongside the idempotency store, because it is a collaborator of the router rather than something a handler is built from.
 
 **What is not demonstrated by `make verify`: the 401 itself.** There is no protected route in the service yet — SHIP-44 is the middleware, not an endpoint — so the rejection paths are covered by tests in `internal/httpx` and `cmd/api` rather than by curl. The first route with `Auth: RequireUser` is where that section gets written.
+
+### What SHIP-48 built, and how it was demonstrated
+
+It reaches no HTTP endpoint — the endpoints that issue a refresh token are SHIP-41 and
+SHIP-42 — so `make verify` does not cover it, in the same way it does not cover SHIP-16 or
+SHIP-19. It is demonstrated by `make flutter-check`, by `make flutter-integration` on a device,
+and by inspecting the stored value on an emulator.
+
+**"Never in preferences" is enforced from four directions, not asserted once.** The *Done when*
+line is the kind that a plausible implementation satisfies while being wrong, so:
+
+| Check | Where | Fails when |
+|---|---|---|
+| The real platform seam records key, value and options | `test/core/auth/token_store_test.dart` | Anything but `flutter_secure_storage` is behind the store |
+| `shared_preferences` is absent from `lib/` **and from the lockfile** | `token_store_is_not_preferences_test.dart` | Somebody runs `pub add`, before writing a line |
+| One folder imports the package; that folder opens no file | same | A second set of options, or a token cached to disk |
+| The real Keychain and Keystore, on a device | `integration_test/session_test.dart` | The token never leaves the process |
+
+The mutation was run rather than imagined: replacing `SecureTokenStore` with an in-memory map
+fails eight tests across both files.
+
+**On Android the storage was inspected on the device.** After a token is stored,
+`/data/data/au.com.shipper/shared_prefs/FlutterSecureStorage.xml` holds ciphertext under an
+`androidx.security.crypto` keyset, and the plaintext token appears nowhere in the application's
+data directory. On iOS the equivalent is two invocations of `make flutter-integration` with
+`only=`, the second reading in a new process what the first wrote.
+
+**Two things were found while building it.**
+
+`Docs/07` §9 justified the Android floor of API 24 with `EncryptedSharedPreferences`, and the
+package no longer uses it — Google deprecated the library behind it. The floor is unchanged,
+because the Keystore-wrapped ciphers that replaced it need API 23 just the same, but the
+sentence justifying the floor had stopped being true. `Docs/07` §9 is corrected and says that
+it was wrong, rather than quietly reading as though it never was.
+
+`flutter_secure_storage` is held at **10.x**, not 11. Version 11 compiles against Android SDK
+37 and fails the build against the 36 this project targets. Moving `compileSdk` is an
+Android-wide change that also wants a newer Gradle plugin, which belongs with the signing work
+rather than inside a three-point storage ticket — §9 carries it.
 
 ## 4. Partly done — do not treat these as finished
 
@@ -344,6 +391,10 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **~~A ticket for the web CI workflows.~~ Written as SHIP-23a at SHIP-15c.** Two points, path-filtered per surface, dependencies SHIP-22 and SHIP-23 both met. It belongs to a client track rather than to platform work.
 
+**`flutter_secure_storage` is held at 10.x because version 11 needs `compileSdk = 37`.** The client compiles against 36 today, and Android Gradle Plugin 9.0.1 names 36 as its own maximum recommended — so taking 11 means moving the SDK and probably the Gradle plugin together. There is no urgency: 10.3.1 uses the same Keystore-wrapped ciphers and the same API 23 requirement. **Decide it with SHIP-24 and SHIP-26**, which are the tickets that touch the Android build configuration anyway.
+
+**Biometric unlock is still open, and SHIP-48 is where `Docs/07` §9 said it would close.** It did not, and the reason is that the thing it would sit in front of does not exist yet: an optional local unlock is a gate on a sign-in screen, and the first sign-in screen is SHIP-55. Nothing in the session design moves either way — `Docs/07` §3 already fixes its position as a convenience over the stored token and never a substitute for it — so the cost of leaving it is another wave of nothing happening. `flutter_secure_storage` offers it as an option on the store this ticket built (`AndroidOptions.biometric`, and iOS access-control flags), which means adopting it later is a change to two constants rather than a change to the design. **Decide at SHIP-55.**
+
 **`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.** 660 lines in one file, and every ticket with an HTTP acceptance criterion appends to it. SHIP-15c left it alone deliberately: wave 2's split gives it exactly one client, so splitting it would have been a large change to a shared file for no benefit this wave. **It stops being deferrable the moment two tracks both add endpoints** — which is wave 3. Split it the same way `mk/*.mk` is split, or accept a conflict in the one file that demonstrates every acceptance criterion.
 
 **`device_sessions` has no expiry column.** SHIP-38's *Done when* named refresh state, device label and last seen, and the implementation stopped exactly there — correctly, as a scope decision. But a refresh token has to expire, so **SHIP-39 either adds the column or explains where expiry lives instead.** Flagged here so it is a decision rather than a discovery.
@@ -366,6 +417,7 @@ in §4 are deliberately absent.
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
 SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
+SHIP-48
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 
