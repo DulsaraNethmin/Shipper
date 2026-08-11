@@ -285,6 +285,10 @@ The existing Redis tests skip themselves when Redis is absent, which the CI note
 
 `contracts/openapi.yaml`, assembled from per-domain fragments under `contracts/paths/`. A Go test validates real handler responses against the schema.
 
+**The fragment layout mirrors the route files exactly** — `cmd/api/routes_jobs.go` is described by `contracts/paths/jobs.yaml` — so a domain adds one route file and one fragment and edits neither the `paths` block of anybody else's fragment nor the middle of a shared document. The one shared line per domain is its `$ref` in `contracts/openapi.yaml`, which is a one-line addition rather than a merge of interleaved YAML.
+
+Three tests in `cmd/api` hold the contract to the service, and they are the reason it can be trusted rather than merely published: `TestEveryRouteIsInTheContract` compares it with the route manifest in **both** directions, `TestResponsesMatchTheContract` drives the real router and validates what the handlers put on the wire, and `TestErrorResponsesMatchTheContract` checks the failures `net/http` writes rather than a handler. Response schemas are `additionalProperties: false`: §4.3's additive rule binds *clients*, and is not a licence for the contract to describe less than the service returns.
+
 `Docs/07` §2 already requires the Flutter client to be generated from or validated against a published contract. Until that contract exists, client work is guessing at field names — and the contract is also what allows client work to proceed alongside the endpoint it consumes rather than behind it.
 
 ### 8.2 Status enumerations in three languages

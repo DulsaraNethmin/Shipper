@@ -1,0 +1,66 @@
+# Endpoints the mobile client calls about itself rather than about a user.
+#
+# The counterpart of cmd/api/routes_app.go.
+
+MinimumVersion:
+  get:
+    operationId: getMinimumVersion
+    summary: The lowest build still permitted, per platform
+    tags: [App]
+    description: |
+      The upgrade gate (SHIP-167). A client whose own build number is below the floor for its
+      platform must block with an update prompt (SHIP-168).
+
+      **Public and unauthenticated on purpose.** The app calls this at launch, before it has
+      decided whether it can sign in — and a build old enough to be blocked may be old enough
+      that its authentication no longer works, which would otherwise leave it unable to
+      discover that it needs updating.
+
+      The floor is read from configuration on every request, so raising it is an operational
+      decision made by changing the environment and restarting, not by cutting a release
+      (Docs/07 §6).
+
+      It sits inside `/v1` because it is a product endpoint the app calls. That creates an
+      obligation: whatever v2 does, this path must keep answering for as long as any v1 build
+      survives, or the gate stops working for exactly the builds it exists to retire.
+    responses:
+      '200':
+        description: The current floor for each platform.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ios, android]
+              additionalProperties: false
+              description: |
+                Keyed by platform rather than flattened into `ios_*` and `android_*` fields, so
+                that adding a platform is an added key rather than a reshaped response — and so
+                the client reads only the entry it cares about.
+              properties:
+                ios:
+                  $ref: '#/PlatformFloor'
+                android:
+                  $ref: '#/PlatformFloor'
+      '405':
+        $ref: '../openapi.yaml#/components/responses/MethodNotAllowed'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+
+PlatformFloor:
+  type: object
+  required: [minimum_build]
+  additionalProperties: false
+  properties:
+    minimum_build:
+      type: integer
+      description: The lowest build number still permitted for this platform.
+      example: 42
+    store_url:
+      type: string
+      description: |
+        Where to send the user. Omitted during the pilot, when distribution is TestFlight and
+        Play internal testing and there is no public listing to link to.
+      example: https://apps.apple.com/au/app/shipper/id000000000

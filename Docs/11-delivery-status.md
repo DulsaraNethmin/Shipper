@@ -10,7 +10,7 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-10, closing wave 1 in full — fourteen tickets across four branches. The Flutter track was deferred mid-wave for a missing toolchain and completed once it was installed; §7 keeps that sequence rather than tidying it away.
+**Last updated:** 2026-08-11, on SHIP-17a — the published API contract, and the first release of wave 1 to `main`. The previous update closed wave 1 in full: fourteen tickets across four branches, with the Flutter track deferred mid-wave for a missing toolchain and completed once it was installed. §7 keeps that sequence rather than tidying it away.
 
 ---
 
@@ -18,14 +18,14 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 35 | 82 |
-| Remaining | 166 | 537 |
+| **Done** | 36 | 85 |
+| Remaining | 165 | 534 |
 | **Total** | 201 | 619 |
 
 | Milestone | Done | Points |
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
-| **M0** Foundation | 25 / 30 | 58 / 75 |
+| **M0** Foundation | 26 / 30 | 61 / 75 |
 | **M1** Identity | 6 / 28 | 15 / 78 |
 | **M2** Jobs | 1 / 26 | 3 / 78 |
 | **M3** Bidding and award | 0 / 27 | 0 / 95 |
@@ -34,7 +34,9 @@
 | **M6** Admin | 1 / 20 | 3 / 65 |
 | **M7** Hardening | 2 / 19 | 3 / 56 |
 
-**M0 has five tickets left and four of them are not code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. **SHIP-17a is the only buildable M0 ticket still open.**
+**M0 has four tickets left and none of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. Every buildable M0 ticket is now done, so the foundation milestone is finished as far as this repository can finish it.
+
+**The published contract exists (SHIP-17a), and it is checked rather than believed.** `contracts/openapi.yaml` is assembled from per-domain fragments under `contracts/paths/`, and three tests in `cmd/api` hold it to the service: the manifest and the contract must agree in both directions, live handler responses must satisfy the published schemas, and the error contract must match the `Error` schema for failures that `net/http` writes rather than a handler. That closes `TestEveryRouteIsInTheContract`, the last of the three route-surface guards in `Docs/10` §4.1 to become enforceable.
 
 **The first domain logic exists, and it is in exactly one package.** `internal/identity` holds argon2id password storage and access-token issue; the other seven domains still contain `doc.go` and nothing else. Everything outside `identity` remains foundation and adapters.
 
@@ -46,12 +48,14 @@ That distinction is worth keeping in mind rather than rounding away: `identity` 
 
 | Branch | At | Holds |
 |---|---|---|
-| `main` | PR #9 | Wave 0 only. **Nothing from wave 1, and not this file** |
-| `develop` | PR #17 | Everything below. **Cut new branches from here** |
+| `main` | PR #19 | **Wave 1, released 11 August 2026.** Level with `develop` |
+| `develop` | PR #18 | Everything below. **Cut new branches from here** |
 
-**`develop` is 36 commits ahead of `main`** — the whole of wave 1 plus the tracker itself. `main` has not been updated since wave 0, which is by design: `develop → main` goes in release-sized batches rather than one per ticket, and wave 1 is the first batch worth cutting.
+**Wave 1 has been released.** PR #19 brought 38 commits and 16 tickets across, and `main` is no longer behind `develop` on content. This was the first `develop → main` batch since wave 0, which is by design: releases go in release-sized batches rather than one per ticket.
 
-`main` also shows 7 commits `develop` does not have. Those are the detour, not divergent work: wave 0 reached `main` by being merged (PR #6), reverted (PR #7), and reapplied (PR #9). The content is identical; only the shape of the history differs.
+The previous version of this section said `develop` was at PR #17 and 36 commits ahead. It was #18 and 38 by the time anyone read it, and that is not an error to guard against — a commit cannot record the number of the pull request that merges it. **The numbers in this table are always one update behind reality, and the fix is to correct them in the next update rather than to try to make them self-aware.**
+
+`main` still shows commits `develop` does not have. Those are the detour, not divergent work: wave 0 reached `main` by being merged (PR #6), reverted (PR #7), and reapplied (PR #9), and PR #19's own merge commit sits on `main` alone. The content is identical; only the shape of the history differs.
 
 ### The wave-1 branches, in merge order
 
@@ -65,6 +69,15 @@ That distinction is worth keeping in mind rather than rounding away: `identity` 
 `ship-16-21-flutter-foundation` exists and is parked at PR #11's merge, holding nothing. It is the branch the Flutter track resumes on — see §7.
 
 **A warning worth keeping.** Reverting a merge does not undo it: the commits stay ancestors forever, so re-merging the same branch brings nothing across and reports success. If a merge to `main` is ever reverted again, the fix is to revert *the revert*, not to merge again.
+
+**PR #19 had exactly the shape that warning describes, and was checked rather than trusted.** The revert `d733c95` sits on `main` and is *not* in `develop`'s ancestry — the setup where a merge silently resurrects deletions. It was safe only because the reapply `c1cb64b` had already restored the content, leaving the revert nothing to take away. The check that established this before merging is worth reusing on any release whose history has a revert in it:
+
+```
+git merge-tree --write-tree main develop   # the tree the merge would produce
+git rev-parse develop^{tree}               # the tree develop actually has
+```
+
+Identical hashes mean the merge result is exactly `develop`'s content. Different hashes mean something is being dropped or added, and the release needs looking at before it is cut, not after.
 
 ## 3. Done
 
@@ -96,6 +109,7 @@ endpoints, and none of these tickets adds one.
 | **SHIP-15b** | The spelling check scoped for client code — *see below* |
 | **SHIP-16** | Flutter scaffold — iOS and Android only, floors at iOS 14.0 and Android API 24 |
 | **SHIP-17** | Feature folders per `Docs/07` §2, Riverpod and `go_router`, and a boundary test |
+| **SHIP-17a** | `contracts/openapi.yaml` from per-domain fragments, and three tests holding it to the service |
 | **SHIP-18** | `dio` client — three environments by `--dart-define`, and the Android emulator's host |
 | **SHIP-19** | Health round trip — the API version on screen, on both simulators |
 | **SHIP-20** | Go CI — build, boundaries, spelling, tests, migration round trip |
@@ -174,22 +188,22 @@ X-5 and X-6 need no third party at all — they are decisions somebody can make 
 
 ## 6. Ready to start now
 
-Strict build order says the next ticket is the lowest-numbered open one, **SHIP-17a**, and for once that is also the right answer — see below. These all have satisfied dependencies:
+Strict build order says the next ticket is the lowest-numbered open one. With SHIP-17a done that is **SHIP-30**, but read the note on SHIP-44 below before planning around it. These all have satisfied dependencies:
 
 | Ticket | Pts | Area |
 |---|---|---|
-| SHIP-17a | 3 | `contracts/openapi.yaml` — see the note below, this one has grown teeth |
 | SHIP-30 | 3 | Registration endpoint — `users` and argon2id both exist now |
 | SHIP-31, 34 | 5 | Email verification token, phone OTP issue and storage |
 | SHIP-39 | 5 | Refresh token rotation — `device_sessions` exists, and it needs an expiry column |
+| **SHIP-44** | 3 | **Authentication middleware — the gate in §8, and its dependencies are already met** |
 | SHIP-48 | 3 | Flutter secure storage — `apps/mobile` exists now, and API 24 was chosen for it |
 | SHIP-56 | 3 | `jobs` table |
 | SHIP-67a | 3 | `cmd/worker` scheduler |
 | SHIP-114 | 5 | Object storage, pre-signed upload |
 
-**SHIP-17a is now the highest-value one on that list, and wave 1 is what made it so.** All three clients exist — a Flutter app with a `dio` client, an admin panel, a driver portal — and every one of them will consume the same endpoints. Until `contracts/openapi.yaml` exists they are guessing at field names, and `Docs/10` §8.1 says the contract is what lets client work proceed *alongside* the endpoint it consumes rather than behind it. That was an abstract benefit before there were clients. It is now three codebases that will each invent their own field names in the next wave if the contract is not there first.
+**SHIP-44 was missing from this list until now, and that mattered.** Its dependencies are SHIP-37 and SHIP-12, both of which have been done since wave 1. §8 describes it as a hard gate ahead, which reads as future work and is why nobody noticed it was buildable today. It is three points, and until it lands every authenticated state-changing endpoint in M1 through M6 is held behind it — so it is worth clearing *before* the next wave rather than inside one, where it would serialise a whole track behind a single agent's first commit.
 
-It also unblocks `TestEveryRouteIsInTheContract`, one of the three route-surface guards `Docs/10` §4.1 names and the only one still unenforceable.
+**The identity package is the real constraint on the next wave, not the gate.** SHIP-30, 31, 34, 39, 40, 41, 42, 43, 44 and 45 all live in `internal/identity`, and `Docs/10` §9.1 gives one package directory to one agent at a time. That is roughly thirty points on one track no matter how many agents are available. Parallelism in wave 2 has to come from elsewhere — `jobs` (SHIP-56), `cmd/worker` (SHIP-67a), storage (SHIP-114), the Flutter client (SHIP-48), and the web CI workflows named in §9.
 
 **SHIP-30 is a state-changing route and SHIP-44 has not landed, and it is still safe to build.** §8's gate names *authenticated* endpoints for a precise reason worth knowing before someone reads it as a blanket freeze: `replayOrRefuse` compares a fingerprint over method, path and body, and refuses a reused key with `409 idempotency_key_reused` rather than replaying. Reading another caller's stored response therefore requires sending their exact body — which, for register, means already holding their email and password. The public endpoints on `Docs/10` §4.1's allow-list all carry the caller's own secret material in the body, and that is what protects them while the scope is `nil`.
 
@@ -254,6 +268,8 @@ These were settled before the tracks started, so that three agents did not answe
 
 **SHIP-44 is a choke point, and the reason is a live security hole.** `httpx.Idempotent` is wired with `scope == nil`, so every key lands in `idem:v1:anonymous:<key>`. Harmless while nothing is authenticated; the moment something is, a client that guesses another client's key gets that client's response body. **No authenticated state-changing endpoint may merge before SHIP-44 supplies the authenticated subject.** During that wave exactly one agent touches `cmd/api` and `internal/httpx`.
 
+**It is buildable now — see §6.** Its dependencies, SHIP-37 and SHIP-12, have both been done since wave 1. Describing it here as a gate "ahead" is what kept it out of §6's ready list, and the practical consequence of clearing it first is large: it is three points that currently hold back every authenticated endpoint in five milestones.
+
 **SHIP-91…95 never parallelise.** Own branch, nothing else on it. The partial unique index, the lock ordering, the idempotency interaction and the race tests are one design; two people produce two lock orderings, which is a deadlock or a lost update. Consider using a second agent adversarially instead — one implements 91–94, another writes SHIP-95 from `Docs/02` §3 and `Docs/08`'s four named races *without reading the implementation*.
 
 **Also single-owner, for reasons in `Docs/10`:** SHIP-57 (the status guard), SHIP-67 with SHIP-83 (budget privacy — test the serialised response, not struct fields), both token verifiers, and the middleware ordering in `newRouter`.
@@ -269,6 +285,8 @@ Lookup(ctx context.Context, address string) (lat, lng float64, formatted string,
 ```
 
 and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, geocoding.ErrNotFound)` would also be an import. The reasoning is correct and the lint agrees. But a neutral infrastructure package holding a coordinate type — the same shape as the pre-seeded `pagination`, `ratelimit` and `money` — would let both sides name it with no dependency edge either way, and that option was unavailable only because `internal/boundaries` was a forbidden shared edit mid-wave. **Decide at SHIP-60, before three domains adopt the wide signature.**
+
+**`httpx.RegisterCode` is documented but does not exist.** `Docs/10` §4.4 shows domains declaring their own error codes with it, and §3's table above lists it as one of the mechanisms SHIP-15a built. Neither is true in code: `internal/httpx` has the fifteen protocol-level codes as plain constants and no registration function, and the generated `Docs/10-api-error-codes.md` that §4.4 says clients branch on has never been written. Nothing is broken today, because no domain has raised a code of its own — SHIP-58's `prohibited_category` is the first that will. **Decide before then whether to build the registry or to amend `Docs/10` §4.4**, because a document describing a mechanism that is not there is worse than one that says the mechanism is coming. Found while writing SHIP-17a's contract, which had to describe the code list and discovered there was no generated source for it.
 
 **A ticket for the web CI workflows.** `.github/workflows/README.md` already anticipates an admin-panel workflow and a driver-portal workflow, each path-filtered to its own app. Both surfaces now exist and neither has one, and the backlog has only SHIP-20 (Go) and SHIP-21 (Flutter). This is a lettered ticket waiting to be written, in the SHIP-15b mould.
 
@@ -290,7 +308,7 @@ in §4 are deliberately absent.
 
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
-SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-16 SHIP-17 SHIP-18 SHIP-19 SHIP-21
+SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
 SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
