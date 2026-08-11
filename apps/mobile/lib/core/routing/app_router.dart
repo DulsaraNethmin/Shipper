@@ -8,6 +8,7 @@ import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
 import 'package:shipper/features/identity/email_verification_screen.dart';
+import 'package:shipper/features/identity/phone_verification_screen.dart';
 import 'package:shipper/features/identity/registration_complete_screen.dart';
 import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/role_selection_screen.dart';
@@ -41,6 +42,14 @@ abstract final class Routes {
   /// needs the entitlement work in SHIP-24…27 and resolves to this same route with this same
   /// query parameter.
   static const verifyEmail = '/verify-email';
+
+  /// Confirm the mobile number (SHIP-54).
+  ///
+  /// No deep link, and that is deliberate rather than unfinished: the code goes to the handset
+  /// as six digits by SMS, and a link in a text message is a phishing pattern rather than a
+  /// convenience. iOS and Android both offer the code to the keyboard from the message, which is
+  /// what `AutofillHints.oneTimeCode` is for.
+  static const verifyPhone = '/verify-phone';
 
   /// Where the signup journey ends (SHIP-51).
   ///
@@ -77,6 +86,7 @@ const _signedOutLocations = <String>{
   Routes.chooseRole,
   Routes.register,
   Routes.verifyEmail,
+  Routes.verifyPhone,
   Routes.registered,
 };
 
@@ -208,6 +218,10 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (context, state) => EmailVerificationScreen(
           deepLinkedToken: state.uri.queryParameters['token'],
         ),
+      ),
+      GoRoute(
+        path: Routes.verifyPhone,
+        builder: (context, state) => const PhoneVerificationScreen(),
       ),
       GoRoute(
         path: Routes.registered,

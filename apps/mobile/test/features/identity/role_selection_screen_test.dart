@@ -175,6 +175,7 @@ void main() {
     final identity = FakeIdentityRepository();
     await registerThrough(tester, identity, role: UserRole.provider);
     await verifyEmailThrough(tester);
+    await verifyPhoneThrough(tester);
 
     await tester.tap(find.byKey(const Key('development-session-provider')));
     await tester.pumpAndSettle();

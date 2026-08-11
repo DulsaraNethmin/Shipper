@@ -217,9 +217,9 @@ class _Verified extends StatelessWidget {
                 const SizedBox(height: 32),
                 FilledButton(
                   key: const Key('verify-email-continue'),
-                  // SHIP-54 puts phone verification here. Until then the journey ends at the
-                  // screen that says what was created and what is not yet possible.
-                  onPressed: () => context.go(Routes.registered),
+                  // Docs/04 §2 requires both channels verified before a customer may publish,
+                  // so the mobile number is the next step and not an optional extra.
+                  onPressed: () => context.go(Routes.verifyPhone),
                   child: const Text('Continue'),
                 ),
               ],

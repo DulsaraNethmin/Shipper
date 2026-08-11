@@ -175,6 +175,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-51** | M1 | Flutter registration screen — the first client screen to call a product endpoint, and one idempotency key per action — *see below* |
 | **SHIP-52** | M1 | Flutter role selection — chosen first because the platform fixes it, and the session's role selects the shell — *see below* |
 | **SHIP-53** | M1 | Flutter email verification — typed or deep-linked, and the app's first deep link scheme — *see below* |
+| **SHIP-54** | M1 | Flutter phone verification — a code on opening, and a resend the platform's interval throttles — *see below* |
 | **SHIP-56** | M2 | `jobs` — the twelve statuses of `Docs/02` §1 as a `CHECK`, held to the Go constants by test |
 | **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
@@ -474,6 +475,70 @@ between them is returned by the platform, so that split is SHIP-52. The connecti
 (SHIP-19) moved to `/health` and is reachable from both shells and during the restore, because
 putting it behind the session would have made "can this build reach the API" unanswerable on a
 fresh install — which is exactly when it is asked.
+
+### What the registration journey built (SHIP-51…54)
+
+Four screens — role, form, email, mobile — and **the whole of it runs signed out**, which is the
+platform's design rather than an oversight the client works around. `POST /v1/auth/register`
+returns an account and no token: registering is not signing in, and `POST /v1/auth/login` is
+SHIP-41. SHIP-49's guard sent a signed-out user to the sign-in shell from *every* location, so
+the first thing this work had to do was widen that to a set of locations rather than one.
+
+**Inline validation is two sources and one presentation.** `shared/validation/validators.dart`
+catches what cannot be anything but a mistake — a blank field, an address with no `@`, four
+digits where six were asked for — and the platform's `validation_failed` `details` land under
+the same inputs, in the dotted paths the form serialised. That is what makes a limit changeable
+server-side actually work on a build already installed: the message with the new number comes
+from the platform. The one number duplicated is the password minimum, and `validators.dart`
+carries the argument for why that duplication is safe in the direction it can fail.
+
+**`ActionKey` is the idempotency rule written down in both directions, and the second direction
+is the one that is easy to get wrong.** A fresh key per attempt duplicates a record after a
+dropped connection; a shared key across two taps of "send another code" replays the first `202`
+so no second message is ever sent — which, from the handset, is indistinguishable from an SMS
+running late. A key is therefore retained in exactly one case: the previous attempt failed
+without saying whether the platform acted on it, and the body is identical.
+
+**The role is chosen before the form, and the shell has four answers rather than two.** Before,
+because SHIP-45 fixes it with a `BEFORE UPDATE` trigger and a permanent decision should not look
+like a preference. Four, because a restored cold start holds a refresh token and *no role* —
+the role is a claim in the access token (SHIP-37), so it arrives with SHIP-50's first refresh —
+and guessing customer there would show every provider the wrong half of the marketplace on every
+launch. The fourth is a role this build has never heard of, which says "update the app" rather
+than crashing.
+
+**SHIP-53 chose the deep-link scheme, which `internal/identity/verification.go` had explicitly
+left to it**: `shipper:///verify-email?token=…`, a custom scheme, because an HTTPS universal and
+app link needs a registered domain and both store accounts and X-1, X-2 and X-3 have not started.
+No Dart changes when that arrives — a link of either kind resolves to the same route with the same
+query parameter.
+
+**It also found a defect SHIP-49 had written down and assigned to the wrong ticket.** SHIP-49
+recorded that a deep link arriving during the keychain read is dropped, judged it acceptable while
+nothing deep-linked, and named SHIP-143 as the ticket that would fix it. A verification link opens
+at a cold start, which *is* the restore window, so for this link it was not a rare case but the
+only case: tap the link, land on the sign-in screen. `Redirector` now holds the whole URI —
+query included, since the screen without its token is worse than not arriving — reissues it once
+the session answers, and still puts it through the guard.
+
+**How it was demonstrated.** `make flutter-check` covers 166 host tests, including the guard as a
+table and each screen driven through the real widget tree. The journey itself was run on an
+iPhone 17 simulator against this worktree's API on 8092, through
+`apps/mobile/integration_test/signup_test.dart` — which is out of `flutter-check` for the reason
+`session_test.dart` is, and takes the verification token and OTP as `--dart-define`s because they
+exist only in the service log, by design. An account registered through the form arrives in
+PostgreSQL as `role=provider` with both `verified_at` columns set by the app's own screens. The
+deep link was demonstrated on the Pixel emulator with
+`am start -a android.intent.action.VIEW -d "shipper:///verify-email?token=…"`, which cold-starts
+the app and lands on "Email confirmed"; on iOS the scheme is registered and the system offers to
+open the app, but `simctl openurl` raises a confirmation prompt that needs a real tap, so the iOS
+half is confirmed as far as the operating system recognising the scheme.
+
+**One thing this lane could not finish, and it is small.** The verification email still carries a
+bare code rather than a link, because the message body is in
+`services/core/internal/identity/verification.go` and this lane owns `apps/mobile/**` only. The
+screen accepts either, so nothing is broken — but until somebody edits that function, the deep
+link is a capability with no message using it.
 
 ### What SHIP-23a built
 

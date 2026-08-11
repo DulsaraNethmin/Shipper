@@ -100,6 +100,7 @@ void main() {
       final identity = FakeIdentityRepository();
       await registerThrough(tester, identity);
       await verifyEmailThrough(tester);
+      await verifyPhoneThrough(tester);
 
       // There is no sign-in endpoint on the platform yet (SHIP-41, consumed by SHIP-55), so the
       // screen says that rather than offering a button that cannot work.

@@ -95,3 +95,13 @@ Future<void> verifyEmailThrough(
   await tester.tap(find.byKey(const Key('verify-email-continue')));
   await tester.pumpAndSettle();
 }
+
+/// Confirms the mobile number, which is the last step before the journey's end.
+Future<void> verifyPhoneThrough(WidgetTester tester, {String code = '408213'}) async {
+  await tester.enterText(find.byKey(const Key('verify-phone-code')), code);
+  await tester.tap(find.byKey(const Key('verify-phone-submit')));
+  await tester.pumpAndSettle();
+
+  await tester.tap(find.byKey(const Key('verify-phone-continue')));
+  await tester.pumpAndSettle();
+}
