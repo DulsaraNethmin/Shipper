@@ -38,8 +38,12 @@ func (r *recordingSink) Emit(_ context.Context, _ db.Runner, e events.Event) err
 // its own has a predictable one.
 var testInstant = time.Date(2026, 8, 11, 3, 30, 0, 0, time.UTC)
 
+// newTestService builds the service the transition tests use.
+//
+// No geocoder, deliberately: these tests are about the guard, and a job inserted straight through
+// the pool has no address for one to resolve. The draft tests supply the stub.
 func newTestService(sink EventSink) *Service {
-	return NewService(sink, clock.NewFixed(testInstant))
+	return NewService(sink, clock.NewFixed(testInstant), nil)
 }
 
 func newCustomer(t *testing.T, pool *pgxpool.Pool, email, phone string) uuid.UUID {
@@ -512,10 +516,14 @@ func TestTwoTransitionsAtOnceCannotBothWin(t *testing.T) {
 // TestNewServiceRefusesToBeBuiltWithoutItsCollaborators keeps the panic honest. A service with no
 // event sink would run perfectly and lose every domain event, which is the kind of failure that
 // is noticed a milestone later.
+//
+// A nil geocoder is deliberately not among them: it means "addresses are stored unresolved",
+// which is a state the domain supports, and SHIP-59a already requires every path to cope with an
+// address that did not resolve.
 func TestNewServiceRefusesToBeBuiltWithoutItsCollaborators(t *testing.T) {
 	cases := map[string]func(){
-		"no sink":  func() { NewService(nil, clock.System{}) },
-		"no clock": func() { NewService(&recordingSink{}, nil) },
+		"no sink":  func() { NewService(nil, clock.System{}, nil) },
+		"no clock": func() { NewService(&recordingSink{}, nil, nil) },
 	}
 
 	for name, build := range cases {

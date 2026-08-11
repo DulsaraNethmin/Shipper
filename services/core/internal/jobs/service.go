@@ -30,16 +30,30 @@ const EventStatusChanged = "job.status_changed"
 type Service struct {
 	events EventSink
 	clock  clock.Clock
+	geo    Geocoder
 	store  postgresStore
 }
 
 // NewService builds the domain service.
 //
-// Both arguments are required and it panics without them, in the same spirit as
+// The sink and the clock are required and it panics without them, in the same spirit as
 // httpx.RegisterCode: this is called once from the composition root, a missing collaborator is a
 // programming mistake rather than a runtime condition, and the alternative is a service that
 // starts and then loses every domain event it should have emitted.
-func NewService(sink EventSink, c clock.Clock) *Service {
+//
+// # The geocoder may be nil, and that is not the same kind of omission
+//
+// A nil Geocoder means addresses are stored exactly as the customer typed them, with no
+// coordinate. That is a supported state rather than a broken one: SHIP-59a already requires an
+// unrecognised address not to fail the job, so every path through this domain has to cope with an
+// unresolved location anyway, and a deployment with no maps vendor configured lands on the same
+// path rather than a special one.
+//
+// It is also the honest answer to the situation cmd/api is in today — no vendor is named and no
+// GEOCODING_* configuration exists — because the alternative is worse. Falling back to the
+// deterministic stub outside development would write plausible-looking coordinates that are
+// fiction, and a fictional coordinate on a real job is harder to notice than none at all.
+func NewService(sink EventSink, c clock.Clock, geo Geocoder) *Service {
 	if sink == nil {
 		panic("jobs: NewService needs an EventSink; a transition that emits no event is " +
 			"a state change nothing downstream will ever hear about (Docs/10 §6.1)")
@@ -47,7 +61,7 @@ func NewService(sink EventSink, c clock.Clock) *Service {
 	if c == nil {
 		panic("jobs: NewService needs a clock (Docs/10 §6.3)")
 	}
-	return &Service{events: sink, clock: c}
+	return &Service{events: sink, clock: c, geo: geo}
 }
 
 // Transition is the guarded function. Every job status change in the platform passes through it.

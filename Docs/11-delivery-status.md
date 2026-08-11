@@ -176,6 +176,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
+| **SHIP-60** | M2 | The address value object — validated, normalised, and resolved where the platform can; a failed lookup never fails the job — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -578,6 +579,77 @@ test can arrange and a `curl` cannot.
 API and the migration tool only. `mk/worker.mk` carries `worker-build` and `worker-run` instead,
 because the root `Makefile` is a shared surface and three tracks were open. Folding the third
 binary into `build` belongs to whoever owns that file next.
+
+### What SHIP-60 built, and the decision §9 had been holding for it
+
+`internal/jobs/location.go` holds `Address` — four parts, because the suburb, the state and the
+postcode are values SHIP-79 and SHIP-81 will compare and a single freeform column would have three
+different things parsing them back out — and `Location`, which is an address together with what the
+platform resolved it to. The street line stays freeform: unit numbers, lot numbers, PO boxes and
+roadside mail boxes are all legitimate first lines of an Australian address.
+
+Normalisation does three things and no more: whitespace is collapsed, the state is resolved to its
+abbreviation from any form a person types (`nsw`, `NSW`, `New South Wales`), and the postcode loses
+any spaces. **Case is deliberately untouched** — upper-casing the suburb is the Australia Post
+convention and it is also how *McDonald Street* stops looking like a place a person wrote.
+
+Two things the schema deliberately does not enforce, both because they are reference data rather
+than facts: whether a postcode belongs to its state (the allocations have exceptions — 2600 is ACT
+inside the NSW range — and change when Australia Post says so), and any upper bound on the size of a
+load. The eight states *are* a `CHECK`, paired with the Go constants by a test, the way `Docs/10`
+§3.4 requires of every enumeration.
+
+**`Resolved` is a field rather than a test on the numbers.** (0, 0) is a real point in the Gulf of
+Guinea, so "we looked and found it" is a claim two floats cannot make. The columns carry the same
+distinction as a NULLable pair bound by `ck_jobs_pickup_coordinate_is_a_pair`, and the response
+omits the coordinate object entirely rather than sending zeros.
+
+**A failed lookup does not fail the job**, which is SHIP-59a's rule reaching its first consumer.
+Three routes arrive at the same place — no geocoder configured, the provider did not recognise the
+address, the lookup did not complete — and all three store the address as typed with no coordinate.
+The address itself is deliberately never logged: it is somebody's home, and an application log has a
+different retention period and a much wider audience than the job record.
+
+#### The adapter-value-type decision: no neutral geo package, and here is the trigger
+
+§9 has carried this since wave 1 and named SHIP-60 as the moment to settle it. **Settled: the
+geocoding port keeps its five-return signature, and no `internal/geo` package is created.**
+
+The recommendation's premise turned out not to hold. It warned about deciding "before three domains
+adopt the wide signature" — but the width is not what a domain adopts. It appears exactly once, in
+`jobs/ports.go`, and is converted into `Location` in the next statement; no store method, no
+handler, no response type and no test carries five return values. What a second domain would adopt
+is a *coordinate type*, and a wide signature does not force that type to be wide.
+
+Three further reasons, in the order they weighed:
+
+1. **A struct would not remove the `found bool`.** Not-found is an outcome whatever shape the answer
+   has, so the ergonomic gain is one return value — not the comma-ok pattern, which `Docs/06` §4.1
+   argues is better than a sentinel precisely because the compiler checks it.
+2. **The second consumer is speculative.** What would justify a neutral package is shared distance
+   arithmetic, and no ticket asks for any. SHIP-79 has a provider declare a service area and
+   SHIP-81 filters on it; neither names a radius in kilometres. `money`, `pagination` and
+   `ratelimit` are seeded ahead of the code because their consumers are certain; this one's is not.
+3. **The cost is immediate and the benefit is not.** It needs an entry in `internal/boundaries`,
+   which is a shared file, in the middle of a wave — the same reason the option was unavailable when
+   the recommendation was written.
+
+**The trigger for revisiting is named rather than left to judgement: the first ticket that needs the
+distance between two coordinates in a domain other than `jobs`.** SHIP-81 is the likely one. At that
+point `internal/geo` is written — `Point` and the haversine, nothing else — the port narrows to
+`Lookup(ctx, address) (geo.Point, bool, error)`, and the change is confined to `jobs/ports.go`, the
+two adapter methods and one conversion function. Writing a second copy of a haversine is the signal;
+a wide signature is not.
+
+**One consequence to expect: staging and production get no geocoder at all.** No document names a
+maps vendor and `internal/config` has no `GEOCODING_*` fields to build one from — adding them is a
+shared-surface change SHIP-60 could not make from a domain branch. `cmd/api` therefore passes `nil`
+outside development and logs it once at startup. Falling back to the deterministic stub was the
+alternative and is worse: it writes coordinates that are stable, plausible, inside Australia and
+entirely fictional, and a fictional coordinate on a real job is much harder to notice than none.
+**This is a request rather than a finding — see §9's note on the mobile bundle identifier for the
+shape.** Whoever next owns `internal/config` adds the two variables and `newGeocoder` in
+`cmd/api/routes_jobs.go` builds the provider from them.
 
 ## 4. Partly done — do not treat these as finished
 
