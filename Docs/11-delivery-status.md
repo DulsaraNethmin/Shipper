@@ -818,6 +818,53 @@ answer on the wire and very different defects.
 bids made against the details as they were; reading has no such reason, and a customer who cannot
 see their own Open job cannot be shown its bids.
 
+### What SHIP-66 built, and the package it was the first to need
+
+`GET /v1/jobs` returns the calling customer's own jobs, newest first, filterable by status and paged
+by cursor.
+
+**`internal/pagination` now exists**, which is the pre-seeded infrastructure list working exactly as
+`Docs/10` §6 intended: the entry has named SHIP-66 as its owner since wave 2, and writing the
+package required editing no shared file — not `internal/boundaries`, not `Deps`, not `cmd/api`. It
+holds the encoding and the bounds and nothing else: a `Cursor` is a list of opaque strings and the
+domain decides what they mean, which is what lets a later domain order by something other than a
+timestamp with one implementation between them.
+
+**The cursor is versioned, and that is the part worth keeping.** A cursor is held across an app
+restart and across a deployment, so the failure to prevent is not a rejected cursor but an accepted
+one that means something else now. A one-byte prefix and an insisted-on field count make a stale
+token a clear refusal. The split of responsibility is deliberate: `pagination` establishes the
+*shape*, and `jobs` establishes the *meaning* — a cursor whose two fields decode but do not parse as
+a timestamp and a UUID would otherwise reach the query as a zero time and silently answer with the
+first page.
+
+**Two fields, not one, and `created_at` alone would be a bug.** It is not unique — two drafts saved
+in the same millisecond are ordinary — so a cursor that could not break the tie would repeat or skip
+a job at exactly the page boundary, which is the failure keyset pagination exists to avoid arriving
+by another route. `ORDER BY created_at DESC, id DESC` matches `idx_jobs_customer`, so the list
+needed no index of its own.
+
+**The page sizes are constants in `internal/pagination`, and `Docs/10` §4.5 says they come from
+configuration.** They do not, because `internal/config` has no fields for them and adding two is a
+shared-surface change a domain branch cannot make — the same position SHIP-60 reached over
+`GEOCODING_*`. They are in `pagination` rather than in `jobs` because every list endpoint needs the
+same answer. **This is a request:** whoever next owns `internal/config` moves them, and no caller
+changes, because callers ask `pagination.Limit`.
+
+**A limit above the maximum is narrowed rather than refused, and a limit of `0` is refused.** The
+asymmetry is deliberate: a client asking for more than the platform will give is asking for a page,
+and refusing it would turn a server-side tuning change into a broken client — whereas `?limit=abc`
+is a client defect that answering with the default would hide.
+
+**`data` is always an array, never `null`.** `pagination.NewPage` is a constructor for that one
+reason: a nil slice marshals to `null`, and a client iterating it breaks the first time a new
+customer with no jobs opens the app and never again in testing.
+
+**One status per request rather than several.** SHIP-76 shows the customer's jobs grouped by status,
+and reading the list once and grouping it beats one request per group; widening the parameter later
+is additive. The filter takes the wire form and refuses the stored one — `?status=Draft` is a `400`,
+not an empty list, because an empty list would tell a client its filter worked.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

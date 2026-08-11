@@ -89,6 +89,23 @@ func (s Status) Wire() string {
 	return strings.ReplaceAll(strings.ToLower(string(s)), " ", "_")
 }
 
+// StatusFromWire is [Status.Wire] read backwards: the status a client named, or false.
+//
+// Derived from the same twelve constants rather than tabulated, for the reason Wire is. A lookup
+// table beside the list is a second list that can disagree with the first, and here it would
+// disagree in the direction that matters most — a status a client can filter on but the platform
+// no longer recognises, answering "no jobs" rather than "no such status".
+//
+// Needed from SHIP-66, where `?status=` is the one query parameter with a domain vocabulary.
+func StatusFromWire(wire string) (Status, bool) {
+	for _, known := range Statuses {
+		if known.Wire() == wire {
+			return known, true
+		}
+	}
+	return "", false
+}
+
 // permitted is the transition table of Docs/02 §2, which that document calls authoritative for
 // the guard.
 //

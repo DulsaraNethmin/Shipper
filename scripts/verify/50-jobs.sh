@@ -424,3 +424,119 @@ sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
   || fail "somebody else's job answers differently from no job at all"
 grep -q 'sofa' "$WORKDIR/jobs-detail-stranger.json" && fail "the refusal leaked the job's contents"
 ok "a stranger gets the same 404 a missing job gets, and learns nothing from it"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-66  GET /v1/jobs lists the customer's own jobs, filtered and paginated"
+
+# The second customer gets a job of their own, so "only the caller's" is a claim with something
+# to be wrong about rather than a list that happens to be short.
+status="$(job_request POST "$jobs_other_token" "verify-jobs-list-other-$$" /v1/jobs \
+  '{"goods_description": "belongs to somebody else"}' "$WORKDIR/jobs-list-other.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-list-other.json"; fail "could not create the other customer's job"; }
+
+status="$(job_get "$jobs_customer_token" /v1/jobs "$WORKDIR/jobs-list.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-list.json"; fail "GET /v1/jobs returned $status, want 200"; }
+grep -q 'belongs to somebody else' "$WORKDIR/jobs-list.json" \
+  && fail "the list carries another customer's job"
+ok "a customer sees their own jobs and nobody else's"
+
+# Newest first, and the envelope is Docs/10 §4.5's — data, next_cursor, has_more.
+python3 - "$WORKDIR/jobs-list.json" <<'PY' || fail "the list is not the envelope Docs/10 §4.5 describes"
+import json, sys
+page = json.load(open(sys.argv[1]))
+if set(page) - {"data", "next_cursor", "has_more"}:
+    print("unexpected keys:", set(page), file=sys.stderr); sys.exit(1)
+if not isinstance(page["data"], list) or "has_more" not in page:
+    print("wrong shape:", page, file=sys.stderr); sys.exit(1)
+created = [job["created_at"] for job in page["data"]]
+if created != sorted(created, reverse=True):
+    print("not newest first:", created, file=sys.stderr); sys.exit(1)
+PY
+ok "the envelope is data/next_cursor/has_more, newest first"
+
+# The filter takes the wire form of the status, which is the form every other response uses.
+status="$(job_get "$jobs_customer_token" '/v1/jobs?status=cancelled' "$WORKDIR/jobs-list-cancelled.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-list-cancelled.json"; fail "filtering returned $status"; }
+python3 - "$WORKDIR/jobs-list-cancelled.json" <<'PY' || fail "the status filter did not filter"
+import json, sys
+page = json.load(open(sys.argv[1]))
+wrong = [job["status"] for job in page["data"] if job["status"] != "cancelled"]
+if wrong or not page["data"]:
+    print("statuses:", wrong or "none at all", file=sys.stderr); sys.exit(1)
+PY
+ok "?status= narrows the list, and takes the wire form every response uses"
+
+# The stored form is not the wire form and neither is a status that does not exist. Both are
+# refused rather than answered with an empty list, which would tell a client its filter worked.
+status="$(job_get "$jobs_customer_token" '/v1/jobs?status=Draft' "$WORKDIR/jobs-list-badstatus.json")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/jobs-list-badstatus.json"; fail "?status=Draft returned $status, want 400"; }
+status="$(job_get "$jobs_customer_token" '/v1/jobs?status=nonsense' "$WORKDIR/jobs-list-badstatus.json")"
+[[ "$status" == "400" ]] || fail "?status=nonsense returned $status, want 400"
+ok "a status that is not one of the twelve is refused, not answered with an empty list"
+
+# Paging, followed the way a client follows it: take next_cursor, send it back, stop at
+# has_more=false. The page size is 1 so the boundary is crossed several times.
+python3 - "$jobs_customer_token" "$VERIFY_PORT" "$auth_header" <<'PY' || fail "paging did not reach every job exactly once"
+import json, sys, urllib.parse, urllib.request
+
+token, port, header = sys.argv[1], sys.argv[2], sys.argv[3]
+base = f"http://localhost:{port}/v1/jobs"
+
+def get(url):
+    request = urllib.request.Request(url, headers={header: f"Bearer {token}"})
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)
+
+whole = get(f"{base}?limit=100")
+if whole["has_more"]:
+    print("the fixture has more than 100 jobs; this check assumes it does not", file=sys.stderr)
+    sys.exit(1)
+expected = {job["id"] for job in whole["data"]}
+
+seen, url, pages = [], f"{base}?limit=1", 0
+while True:
+    pages += 1
+    if pages > len(expected) + 2:
+        print("paging did not terminate; the cursor is not advancing", file=sys.stderr)
+        sys.exit(1)
+    page = get(url)
+    seen.extend(job["id"] for job in page["data"])
+    if not page["has_more"]:
+        if page.get("next_cursor"):
+            print("the last page carries a cursor", file=sys.stderr)
+            sys.exit(1)
+        break
+    if len(page["data"]) != 1:
+        print("a page before the last holds", len(page["data"]), "jobs, want the limit of 1", file=sys.stderr)
+        sys.exit(1)
+    url = f"{base}?limit=1&cursor={urllib.parse.quote(page['next_cursor'])}"
+
+if sorted(seen) != sorted(expected) or len(seen) != len(set(seen)):
+    print("paged over", sorted(seen), "want", sorted(expected), file=sys.stderr)
+    sys.exit(1)
+print(f"    {len(expected)} jobs over {pages} pages of one")
+PY
+ok "paging one job at a time reaches every job exactly once, and terminates"
+
+# A cursor this endpoint did not issue is refused rather than read as "start again", which would
+# quietly restart a client's paging loop from the top.
+status="$(job_get "$jobs_customer_token" '/v1/jobs?cursor=not-a-cursor' "$WORKDIR/jobs-list-badcursor.json")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/jobs-list-badcursor.json"; fail "a mangled cursor returned $status, want 400"; }
+status="$(job_get "$jobs_customer_token" '/v1/jobs?limit=0' "$WORKDIR/jobs-list-badlimit.json")"
+[[ "$status" == "400" ]] || fail "?limit=0 returned $status, want 400"
+status="$(job_get "$jobs_customer_token" '/v1/jobs?limit=5000' "$WORKDIR/jobs-list-biglimit.json")"
+[[ "$status" == "200" ]] || fail "?limit=5000 returned $status, want it narrowed to the maximum"
+ok "a mangled cursor and a nonsense limit are refused; an over-large limit is narrowed"
+
+# A customer with no jobs gets an empty array rather than null. A client iterating null breaks the
+# first time a new customer opens the app, and never again in testing.
+status="$(post_json "verify-jobs-fresh-$$" /v1/auth/register \
+  "{\"email\":\"job-fresh-$$@example.com\",\"phone\":\"04133$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/jobs-fresh.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-fresh.json"; fail "could not register a customer with no jobs"; }
+status="$(job_get "$(mint_token "$(json "$WORKDIR/jobs-fresh.json" '["id"]')")" /v1/jobs \
+  "$WORKDIR/jobs-list-empty.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-list-empty.json"; fail "an empty list returned $status"; }
+[[ "$(tr -d ' \n' < "$WORKDIR/jobs-list-empty.json")" == '{"data":[],"has_more":false}' ]] \
+  || { cat "$WORKDIR/jobs-list-empty.json"; fail "an empty list is not an empty array"; }
+ok "a customer with no jobs gets an empty array, never null"

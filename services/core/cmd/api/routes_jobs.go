@@ -30,6 +30,13 @@ import (
 func init() {
 	register(
 		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return jobsHandler(d).List() },
+		},
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/jobs",
 			Group:   GroupV1,

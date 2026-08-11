@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -13,21 +14,26 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
-// The wire contract of SHIP-61 and SHIP-62.
+// The wire contract of SHIP-61, SHIP-62, SHIP-64, SHIP-65 and SHIP-66.
 //
 // These drive the handlers on a mux of their own rather than through cmd/api's router, because what
 // is being checked here is the domain's own half: what it accepts, what it refuses, and what shape
 // it puts on the wire. The middleware around them — authentication, idempotency, the error envelope
 // — belongs to cmd/api and is tested there.
 
-// newTestRouter mounts both handlers on the patterns cmd/api registers them under.
+// newTestRouter mounts every handler on the pattern cmd/api registers it under.
 //
 // A real ServeMux rather than calling the handlers directly, because the path parameter is part of
-// what is being tested: Update reads {id} through r.PathValue, and a handler invoked without a
-// pattern would see an empty one and pass a test that the served route would fail.
+// what is being tested: Update and Detail read {id} through r.PathValue, and a handler invoked
+// without a pattern would see an empty one and pass a test that the served route would fail.
+//
+// A handler added here and not to cmd/api/routes_jobs.go is an endpoint that exists only in the
+// tests, so the two lists are worth reading against each other — routes_golden.txt is what makes
+// the other direction visible.
 func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	t.Helper()
 
@@ -38,6 +44,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("GET /v1/jobs", handler.List())
 	mux.Handle("POST /v1/jobs", handler.Create())
 	mux.Handle("GET /v1/jobs/{id}", handler.Detail())
 	mux.Handle("PATCH /v1/jobs/{id}", handler.Update())
@@ -459,5 +466,160 @@ func TestJobEndpointsAnswer503WithNoDatabase(t *testing.T) {
 	}
 	if body := decode[errorEnvelope](t, rec); body.Error.Code != "service_unavailable" {
 		t.Errorf("code = %q, want service_unavailable", body.Error.Code)
+	}
+}
+
+// jobPage is the envelope Docs/10 §4.5 gives every list, decoded.
+type jobPage struct {
+	Data       []jobResponse `json:"data"`
+	NextCursor string        `json:"next_cursor"`
+	HasMore    bool          `json:"has_more"`
+}
+
+// TestListEndpointPagesThroughTheCallersOwnJobs is SHIP-66's acceptance criterion at the wire, over
+// the cursor a client actually receives rather than the domain value behind it.
+//
+// The client is followed the way a client would follow it: take next_cursor, send it back, stop
+// when has_more is false. A cursor that did not survive the encode/decode round trip fails here and
+// nowhere else.
+func TestListEndpointPagesThroughTheCallersOwnJobs(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	mine := newCustomer(t, pool, "http-list@example.com", "+61400000635")
+	theirs := newCustomer(t, pool, "http-list-other@example.com", "+61400000636")
+
+	for range 5 {
+		as(t, router, mine, http.MethodPost, "/v1/jobs", `{}`)
+	}
+	as(t, router, theirs, http.MethodPost, "/v1/jobs", `{"goods_description": "not yours"}`)
+
+	seen := map[string]int{}
+	target := "/v1/jobs?limit=2"
+
+	for pages := 0; ; pages++ {
+		if pages > 5 {
+			t.Fatal("paging did not terminate; the cursor is not advancing")
+		}
+
+		rec := as(t, router, mine, http.MethodGet, target, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+		}
+
+		page := decode[jobPage](t, rec)
+		for _, job := range page.Data {
+			seen[job.ID]++
+		}
+		if !page.HasMore {
+			if page.NextCursor != "" {
+				t.Error("the last page carries a cursor to a page that does not exist")
+			}
+			break
+		}
+		if page.NextCursor == "" {
+			t.Fatal("has_more is true and there is no cursor to follow")
+		}
+		target = "/v1/jobs?limit=2&cursor=" + url.QueryEscape(page.NextCursor)
+	}
+
+	if len(seen) != 5 {
+		t.Fatalf("paging returned %d distinct jobs, want the caller's 5", len(seen))
+	}
+	for id, times := range seen {
+		if times != 1 {
+			t.Errorf("%s appeared %d times across the pages", id, times)
+		}
+	}
+
+	// The other customer's job never appeared, which is checked by its contents rather than by
+	// its id: a list that leaked it would leak the whole shape.
+	all := as(t, router, mine, http.MethodGet, "/v1/jobs", "")
+	if strings.Contains(all.Body.String(), "not yours") {
+		t.Errorf("the list carries another customer's job: %s", all.Body)
+	}
+}
+
+// An empty list is `"data": []`, never `null`.
+//
+// A client writing `for (final j in body['data'])` breaks on null the first time a new customer
+// opens the app, and never again in testing.
+func TestAnEmptyListSendsAnEmptyArray(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newCustomer(t, pool, "http-list-empty@example.com", "+61400000637")
+
+	rec := as(t, router, customer, http.MethodGet, "/v1/jobs", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"data":[],"has_more":false}` {
+		t.Errorf("an empty list is %s", got)
+	}
+}
+
+// The status filter takes the wire form, and a status that is not one of the twelve is a
+// bad_request rather than an empty list — which would tell a client its filter worked.
+func TestTheListFiltersOnTheWireStatus(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newCustomer(t, pool, "http-list-status@example.com", "+61400000638")
+
+	first := decode[jobResponse](t, as(t, router, customer, http.MethodPost, "/v1/jobs", `{}`))
+	as(t, router, customer, http.MethodPost, "/v1/jobs", `{}`)
+	publish(t, pool, uuid.MustParse(first.ID), customer)
+
+	open := decode[jobPage](t, as(t, router, customer, http.MethodGet, "/v1/jobs?status=open", ""))
+	if len(open.Data) != 1 || open.Data[0].ID != first.ID {
+		t.Errorf("?status=open returned %d jobs", len(open.Data))
+	}
+
+	drafts := decode[jobPage](t, as(t, router, customer, http.MethodGet, "/v1/jobs?status=draft", ""))
+	if len(drafts.Data) != 1 {
+		t.Errorf("?status=draft returned %d jobs", len(drafts.Data))
+	}
+
+	// The stored form is not the wire form, and only the wire form is accepted — otherwise
+	// two spellings of one status would both work and clients would drift onto either.
+	for _, wrong := range []string{"Draft", "not-a-status", "en route to pickup"} {
+		rec := as(t, router, customer, http.MethodGet, "/v1/jobs?status="+url.QueryEscape(wrong), "")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("?status=%q returned %d, want 400 (%s)", wrong, rec.Code, rec.Body)
+		}
+	}
+}
+
+// TestAListRefusesACursorItDidNotIssue is the domain half of the cursor's validation.
+//
+// internal/pagination establishes the shape — this version, two fields. Only the domain knows the
+// fields have to be a timestamp and a UUID, and a cursor that decoded but did not parse would
+// otherwise reach the query as a zero time and silently answer with the first page.
+func TestAListRefusesACursorItDidNotIssue(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newCustomer(t, pool, "http-list-cursor@example.com", "+61400000639")
+
+	as(t, router, customer, http.MethodPost, "/v1/jobs", `{}`)
+
+	twoFieldsOfNonsense := pagination.Cursor{"yesterday", "not-a-uuid"}.Encode()
+
+	for _, cursor := range []string{"!!!", "YWJj", twoFieldsOfNonsense} {
+		rec := as(t, router, customer, http.MethodGet,
+			"/v1/jobs?cursor="+url.QueryEscape(cursor), "")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("cursor %q returned %d, want 400 (%s)", cursor, rec.Code, rec.Body)
+		}
+		if body := decode[errorEnvelope](t, rec); body.Error.Code != "bad_request" {
+			t.Errorf("cursor %q gave code %q, want bad_request", cursor, body.Error.Code)
+		}
+	}
+
+	// A limit that is not a positive whole number is a client defect, and answering it with the
+	// default would hide one.
+	for _, limit := range []string{"0", "-1", "twenty"} {
+		rec := as(t, router, customer, http.MethodGet, "/v1/jobs?limit="+limit, "")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("limit %q returned %d, want 400 (%s)", limit, rec.Code, rec.Body)
+		}
 	}
 }

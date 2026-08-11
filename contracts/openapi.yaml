@@ -143,7 +143,7 @@ paths:
   /v1/auth/verify-phone:
     $ref: './paths/identity.yaml#/VerifyPhone'
   /v1/jobs:
-    $ref: './paths/jobs.yaml#/CreateJob'
+    $ref: './paths/jobs.yaml#/Jobs'
   /v1/jobs/{id}:
     $ref: './paths/jobs.yaml#/JobByID'
   /v1/jobs/{id}/cancel:

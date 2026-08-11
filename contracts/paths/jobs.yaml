@@ -22,7 +22,63 @@
 # request schema is `additionalProperties: false`, so a client that sends `"status": "open"` is
 # told the field does not exist rather than having it quietly ignored.
 
-CreateJob:
+Jobs:
+  get:
+    operationId: listJobs
+    summary: List the customer's own jobs
+    tags: [Jobs]
+    description: |
+      The authenticated customer's jobs, newest first (SHIP-66).
+
+      **There is no parameter for whose jobs to list.** The owner is whoever the token says is
+      calling, so there is no filter here to forget and no way to widen the query by asking.
+
+      Each entry is the same `Job` schema the detail operation returns, whole rather than
+      summarised — a summary shape would be a second thing to keep in step, and the fields it
+      would drop are the ones a draft usually has none of and that are already omitted when
+      empty.
+
+      ## Paging
+
+      Keyset, not offset (Docs/10 §4.5). Pass `cursor` back exactly as it was received; it is
+      opaque and this endpoint is the only thing that can read it. Offset paging duplicates and
+      skips rows when the set changes between pages, and a customer creating a job while paging
+      through their list is not hypothetical.
+
+      `has_more` says whether asking again would return anything. A `limit` above the maximum is
+      narrowed to it rather than refused, so raising the maximum later cannot break a client.
+    parameters:
+      - $ref: '#/StatusFilter'
+      - $ref: '#/Limit'
+      - $ref: '#/CursorParameter'
+    responses:
+      '200':
+        description: |
+          One page of jobs. `data` is an empty array when the customer has none — never `null`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/JobPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
   post:
     operationId: createJob
     summary: Create a job draft
@@ -362,6 +418,46 @@ JobID:
     format: uuid
   example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
 
+StatusFilter:
+  name: status
+  in: query
+  required: false
+  description: |
+    Narrow the list to one status. Absent means every status.
+
+    One value rather than several, because a client that wants the whole picture — the app
+    groups the customer's jobs by status — is better served by reading the list once than by one
+    request per group.
+  schema:
+    $ref: '#/JobStatus'
+
+Limit:
+  name: limit
+  in: query
+  required: false
+  description: |
+    How many jobs to return. Absent is 20; anything above 100 is narrowed to 100 rather than
+    refused, so raising the maximum later cannot break a client. A value that is not a whole
+    number of at least 1 is refused, because that is a client defect rather than a request.
+  schema:
+    type: integer
+    minimum: 1
+    maximum: 100
+    default: 20
+  example: 20
+
+CursorParameter:
+  name: cursor
+  in: query
+  required: false
+  description: |
+    A position in the list, from the `next_cursor` of a previous page. **Opaque** — pass back
+    exactly what was received. Its contents are this endpoint's business and its encoding may
+    change; a cursor from an encoding no longer served is refused rather than misread.
+  schema:
+    type: string
+  example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
+
 IdempotencyKey:
   name: Idempotency-Key
   in: header
@@ -582,6 +678,35 @@ Job:
       type: string
       format: date-time
       example: '2026-08-11T03:34:12.000Z'
+
+JobPage:
+  type: object
+  required: [data, has_more]
+  additionalProperties: false
+  description: |
+    One page of a collection, in the envelope Docs/10 §4.5 gives every list in this API. A single
+    resource is returned as a bare object, so a client can tell the two apart without knowing the
+    endpoint.
+  properties:
+    data:
+      type: array
+      description: |
+        The jobs, newest first. An **empty array** when there are none — never `null`, so a
+        client can iterate it without checking.
+      items:
+        $ref: '#/Job'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` to fetch the next page. Absent on the last page.
+      example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
+    has_more:
+      type: boolean
+      description: |
+        Whether asking again with `next_cursor` would return anything. Always present, and
+        carried rather than inferred from the cursor's absence — which is also what the first
+        request looks like.
+      example: false
 
 JobStatus:
   type: string

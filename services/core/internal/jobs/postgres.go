@@ -323,6 +323,72 @@ func (postgresStore) job(ctx context.Context, r db.Runner, id uuid.UUID) (Job, e
 	return j, nil
 }
 
+// jobsFor reads one customer's jobs, newest first, from a keyset position (SHIP-66).
+//
+// # Why the statement is one shape rather than built from the query
+//
+// Both optional conditions are written as `$n IS NULL OR …` rather than appended when they apply.
+// A built statement renumbers its parameters as clauses come and go, and the defect that invites is
+// the one draftColumns already avoids: a clause dropped from the SQL and not from the argument
+// list, silently shifting every value after it. PostgreSQL folds a comparison against a NULL
+// parameter at plan time, so the fixed statement costs nothing at the two call shapes that exist.
+//
+// # The ordering and the index
+//
+// ORDER BY created_at DESC, id DESC matches idx_jobs_customer (customer_id, created_at DESC),
+// which 000400 created for exactly this read. The id is the tie-break: created_at is not unique,
+// and an ordering that is not total makes a keyset cursor repeat or skip the rows that share a
+// timestamp.
+//
+// The row comparison `(created_at, id) < ($3, $4)` is the keyset itself, and it must be a row
+// comparison rather than `created_at <= $3 AND id < $4` — the second is wrong for every row whose
+// timestamp is strictly older, and it is wrong quietly, by dropping them.
+func (postgresStore) jobsFor(ctx context.Context, r db.Runner, customerID uuid.UUID,
+	status Status, after JobCursor, limit int) ([]Job, error) {
+	const q = `
+		SELECT ` + jobColumns + `
+		FROM jobs
+		WHERE customer_id = $1
+		  AND ($2::text IS NULL OR status = $2)
+		  AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4))
+		ORDER BY created_at DESC, id DESC
+		LIMIT $5`
+
+	var wanted any
+	if status != "" {
+		wanted = string(status)
+	}
+
+	// The two cursor parameters go NULL together: a position is both fields or neither, which
+	// is what JobCursor.IsZero says and what the row comparison above needs to be true of.
+	var since, sinceID any
+	if !after.IsZero() {
+		since, sinceID = after.CreatedAt.UTC(), after.ID
+	}
+
+	rows, err := r.Query(ctx, q, customerID, wanted, since, sinceID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("jobs: list the jobs of %s: %w", customerID, err)
+	}
+	defer rows.Close()
+
+	var out []Job
+	for rows.Next() {
+		// pgx.Rows satisfies pgx.Row, so the one scanner serves the single-row reads and
+		// this one alike — which is what stops a column being added to jobColumns and to
+		// three of the four places that read it.
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("jobs: scanning the jobs of %s: %w", customerID, err)
+		}
+		out = append(out, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("jobs: reading the jobs of %s: %w", customerID, err)
+	}
+	return out, nil
+}
+
 // recordTransition writes the history row and returns the platform's clock reading.
 //
 // server_recorded_at is not supplied. It defaults from now(), which is transaction start time,
