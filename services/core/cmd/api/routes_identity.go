@@ -36,6 +36,16 @@ func init() {
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Register() },
 		},
 		Route{
+			// Public, and the shortest justification on the allow-list: this is the
+			// endpoint that produces the credential every protected route requires
+			// (SHIP-41).
+			Method:  http.MethodPost,
+			Pattern: "/auth/login",
+			Group:   GroupV1,
+			Auth:    Public,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).Login() },
+		},
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/auth/verify-email",
 			Group:   GroupV1,

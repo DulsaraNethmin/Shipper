@@ -60,6 +60,53 @@ func (postgresStore) userByEmail(ctx context.Context, r db.Runner, email string)
 	return scanUser(row)
 }
 
+// credentialByEmail reads an account together with the stored password hash (SHIP-41).
+//
+// It is a separate method from userByEmail rather than a flag on it, and the name says what it
+// returns, because the hash is the one thing User deliberately does not carry: nothing outside
+// this package has a use for it, and a struct that holds it is a struct that eventually gets
+// logged or serialised. Sign-in is the only caller, and having to name a different method is what
+// makes reaching for the credential visible in review.
+//
+// The hash is returned as a bare string rather than inside User for the same reason. A local
+// variable goes out of scope; a field travels.
+func (postgresStore) credentialByEmail(ctx context.Context, r db.Runner, email string) (User, string, error) {
+	row := r.QueryRow(ctx,
+		`SELECT `+userColumns+`, password_hash FROM users WHERE email = $1`, email)
+
+	var (
+		u    User
+		hash string
+	)
+	if err := row.Scan(
+		&u.ID, &u.Email, &u.Phone, &u.Role, &u.Status,
+		&u.EmailVerifiedAt, &u.PhoneVerifiedAt, &u.CreatedAt, &hash,
+	); err != nil {
+		return User{}, "", err
+	}
+	return u, hash, nil
+}
+
+// updatePasswordHash replaces the stored credential with one written at the current profile
+// (SHIP-29, SHIP-41).
+//
+// This is how "the costs travel with the hash, so raising the profile needs no migration" stops
+// being a property of the format and becomes something that actually happens: sign-in is the only
+// moment the plaintext exists, so it is the only moment a stronger hash can be written without
+// asking anybody to reset anything.
+//
+// RowsAffected is not checked. The row was read in this transaction and users are never deleted
+// (Docs/05 §3.1 pseudonymises instead), so zero rows is not a case that arises — and failing a
+// sign-in whose password verified, because a background upgrade found nothing to upgrade, would
+// be the wrong trade.
+func (postgresStore) updatePasswordHash(ctx context.Context, r db.Runner, userID uuid.UUID, hash string) error {
+	if _, err := r.Exec(ctx,
+		`UPDATE users SET password_hash = $2 WHERE id = $1`, userID, hash); err != nil {
+		return fmt.Errorf("identity: upgrading a stored password hash: %w", err)
+	}
+	return nil
+}
+
 // userByID reads an account by its identifier.
 func (postgresStore) userByID(ctx context.Context, r db.Runner, id uuid.UUID) (User, error) {
 	row := r.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE id = $1`, id)
@@ -394,6 +441,90 @@ func (postgresStore) revokeDeviceSession(ctx context.Context, r db.Runner, id uu
 		return false, fmt.Errorf("identity: revoking a device session: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+// revokeOwnDeviceSession ends a session that belongs to a named account (SHIP-43, SHIP-46).
+//
+// The owner is in the WHERE clause rather than checked by the caller a moment earlier, and that
+// is the whole authorisation decision for both endpoints made where it cannot be skipped: a
+// caller who names somebody else's session identifier updates nothing, whatever the handler above
+// believed. Docs/07 §3 puts the decision on the platform, and a decision expressed as a predicate
+// on the write is one no later refactor can leave out.
+//
+// It is a second method rather than a parameter on revokeDeviceSession because SHIP-40's caller
+// genuinely has no user to scope by — it revokes on the strength of a token, having just learnt
+// which session that token belonged to.
+//
+// Guarded on revoked_at IS NULL for the reason revokeDeviceSession gives, so the bool means "this
+// call ended it" rather than "it is ended".
+func (postgresStore) revokeOwnDeviceSession(ctx context.Context, r db.Runner, id, userID uuid.UUID, at time.Time, reason string) (bool, error) {
+	tag, err := r.Exec(ctx, `
+		UPDATE device_sessions
+		   SET revoked_at = $3, revoked_reason = $4
+		 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`, id, userID, at, reason)
+	if err != nil {
+		return false, fmt.Errorf("identity: revoking a device session: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// deviceSessionOwnedBy reports whether an identifier names a session on this account (SHIP-46).
+//
+// It exists because revokeOwnDeviceSession's row count cannot answer the question the revoke
+// endpoint has to: zero rows means "not yours", "no such session", or "already revoked", and the
+// last is a success while the first two are a 404. Read and update run in one transaction, so the
+// pair cannot disagree.
+func (postgresStore) deviceSessionOwnedBy(ctx context.Context, r db.Runner, id, userID uuid.UUID) (bool, error) {
+	var exists bool
+	err := r.QueryRow(ctx,
+		`SELECT true FROM device_sessions WHERE id = $1 AND user_id = $2`, id, userID).Scan(&exists)
+	switch {
+	case isNoRows(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("identity: reading a device session: %w", err)
+	default:
+		return exists, nil
+	}
+}
+
+// liveDeviceSessionsByUser reads the sessions that can currently act as an account, newest use
+// first (SHIP-46).
+//
+// **Revoked and lapsed sessions are excluded, and that is the endpoint's whole meaning.** The
+// list answers "which devices can act as me, and let me stop one"; a session that has been
+// revoked or whose refresh token has expired can do neither, and offering it invites revoking
+// something already dead. The rows are still there — Docs/10 §3.3 ends a session by marking it,
+// never by deleting it — and remain readable for support and for SHIP-149's audit.
+//
+// limit is applied by the caller as a bound on the *response*, not as paging: see the note on
+// [Service.Devices].
+func (postgresStore) liveDeviceSessionsByUser(ctx context.Context, r db.Runner, userID uuid.UUID, now time.Time, limit int) ([]deviceSession, error) {
+	rows, err := r.Query(ctx, `
+		SELECT `+deviceSessionColumns+`
+		  FROM device_sessions
+		 WHERE user_id = $1
+		   AND revoked_at IS NULL
+		   AND refresh_token_expires_at > $2
+		 ORDER BY last_seen_at DESC, id DESC
+		 LIMIT $3`, userID, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("identity: listing device sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []deviceSession
+	for rows.Next() {
+		s, err := scanDeviceSession(rows)
+		if err != nil {
+			return nil, fmt.Errorf("identity: reading a device session: %w", err)
+		}
+		sessions = append(sessions, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("identity: listing device sessions: %w", err)
+	}
+	return sessions, nil
 }
 
 // insertConsumedRefreshToken records a refresh token that has been rotated away (SHIP-40).

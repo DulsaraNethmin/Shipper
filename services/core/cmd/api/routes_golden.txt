@@ -1,5 +1,6 @@
 GET    /health                                  public       operational
 GET    /v1/app/minimum-version                  public       v1
+POST   /v1/auth/login                           public       v1
 POST   /v1/auth/refresh                         public       v1
 POST   /v1/auth/register                        public       v1
 POST   /v1/auth/request-otp                     public       v1

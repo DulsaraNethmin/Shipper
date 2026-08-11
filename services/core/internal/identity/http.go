@@ -254,6 +254,54 @@ func (h *Handler) VerifyPhone() http.Handler {
 	})
 }
 
+// signInRequest is the body of POST /v1/auth/login (SHIP-41).
+//
+// The device label is required rather than optional, and that is a decision with a consequence
+// for SHIP-46: a device list of four rows all reading "Unknown device" cannot be acted on, and
+// the only moment a label can be collected is the one where the person is looking at a sign-in
+// screen on the device being named. A client that has nothing better to send should send the
+// handset's own model name, which is what Docs/07 §3's session design assumes.
+type signInRequest struct {
+	Email       string `json:"email"`
+	Password    string `json:"password"`
+	DeviceLabel string `json:"device_label"`
+}
+
+// Login handles POST /v1/auth/login (SHIP-41).
+//
+// # Why it is public
+//
+// It is the endpoint that produces the credential every protected route requires, so it cannot
+// require one — the same justification the rest of cmd/api's publicMutatingRoutes allow-list
+// rests on, and the shortest of them.
+//
+// # Why it carries an Idempotency-Key like every other mutation
+//
+// A sign-in creates a row. A phone that retries after a dropped connection would otherwise leave
+// a device session nobody is holding a token for — invisible to its owner except as a duplicate
+// line in their device list, and live for thirty days. The middleware replaying the first
+// response is what makes the retry return the pair the first attempt issued.
+func (h *Handler) Login() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		var req signInRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pair, err := h.svc.SignIn(r.Context(), SignInCommand{
+			Email:       req.Email,
+			Password:    req.Password,
+			DeviceLabel: req.DeviceLabel,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, h.tokenPairFrom(pair))
+		return nil
+	})
+}
+
 // refreshRequest is the body of POST /v1/auth/refresh (SHIP-42).
 //
 // The token travels in the request body rather than in the header a bearer token uses, and that
@@ -376,6 +424,25 @@ func apiError(err error) error {
 	case errors.Is(err, ErrOTPInvalid):
 		return httpx.NewError(http.StatusBadRequest, CodeOTPInvalid,
 			"That code is not valid. Ask for a new one and try again.").WithCause(err)
+
+	// 400 rather than 401, and the rule the whole domain follows: a credential in the request
+	// body is refused with 400, a credential in the bearer header with 401. See
+	// CodeCredentialsInvalid for both halves of the argument.
+	case errors.Is(err, ErrCredentialsInvalid):
+		return httpx.NewError(http.StatusBadRequest, CodeCredentialsInvalid,
+			"That email address and password do not match an account.").WithCause(err)
+
+	// 403 rather than 400: the caller is known — they have just proved it — and is not
+	// permitted. This is the only place account standing is disclosed.
+	case errors.Is(err, ErrAccountSuspended):
+		return httpx.NewError(http.StatusForbidden, CodeAccountSuspended,
+			"This account has been suspended. Contact support.").WithCause(err)
+
+	// 404 for a session that belongs to somebody else as well as for one that does not exist,
+	// which is what stops the revoke endpoint being used to probe identifiers (SHIP-46).
+	case errors.Is(err, ErrSessionNotFound):
+		return httpx.NewError(http.StatusNotFound, CodeSessionNotFound,
+			"No such device on this account.").WithCause(err)
 
 	// Reuse and refusal are one answer, deliberately. The two sentinels exist so the domain
 	// can log a security event and a test can tell them apart; the caller can do nothing

@@ -84,6 +84,49 @@ var (
 	// credential that arrives in the body.
 	CodeRefreshTokenInvalid = httpx.RegisterCode("identity_refresh_token_invalid",
 		"This session has ended. Sign in again.")
+
+	// CodeCredentialsInvalid is every way a sign-in fails to identify an account holder, and
+	// there is deliberately only one of them (SHIP-41).
+	//
+	// No account with that address, and the right address with the wrong password: one answer.
+	// Two answers would make this endpoint an account-existence oracle that anybody can query
+	// without a credential — worse than registration's disclosure, which at least costs the
+	// caller an address they control and is bounded by SHIP-47's limit. The service also spends
+	// the same argon2id work on both paths, because a distinction the *status code* refuses to
+	// make is one the response *time* would otherwise make for it.
+	//
+	// **It is a 400 rather than a 401, and the rule is worth stating once for the whole
+	// domain: a credential presented in the request body is refused with 400; a credential
+	// presented in the bearer header is refused with 401.** [1] `WWW-Authenticate` is
+	// required on a 401 (RFC 9110 §11.6.1) and would describe a bearer scheme this endpoint does
+	// not accept. [2] SHIP-50's interceptor refreshes on a 401 and replays the request, and a
+	// 401 from sign-in is the one answer that can send a naive implementation round that loop.
+	// verify-email, verify-phone and refresh all already answer this way.
+	CodeCredentialsInvalid = httpx.RegisterCode("identity_credentials_invalid",
+		"That email address and password do not match an account. Deliberately one code for both halves, so this endpoint cannot be used to find out which addresses have accounts.")
+
+	// CodeAccountSuspended means the password was right and the account may not be used
+	// (SHIP-41).
+	//
+	// This is the one place account standing is disclosed, and it is safe here precisely
+	// because it is said *after* the password verified: the caller has just proved they own the
+	// account they are being told about. Refresh deliberately does not say it — the caller there
+	// holds only a token, which may have been stolen.
+	//
+	// Restricted accounts sign in normally. Docs/01 §4.2 narrows what they may *do*, which is a
+	// decision each domain makes at the point of doing it, and an account that cannot sign in
+	// cannot read the messages explaining why it is restricted.
+	CodeAccountSuspended = httpx.RegisterCode("identity_account_suspended",
+		"The account has been suspended. Signing in is refused until support lifts it; contact support rather than retrying.")
+
+	// CodeSessionNotFound means the device session named by the request is not one the caller
+	// owns (SHIP-46).
+	//
+	// A session belonging to somebody else and a session that never existed are deliberately
+	// indistinguishable, which is what stops the revoke endpoint being used to probe whether an
+	// identifier is a real session.
+	CodeSessionNotFound = httpx.RegisterCode("identity_session_not_found",
+		"No such device session on this account. A session belonging to somebody else answers identically.")
 )
 
 // The sentinel errors this domain raises.
@@ -178,6 +221,18 @@ var (
 	// replayed the token, which SHIP-50's interceptor exists to prevent, or somebody else has
 	// a copy — and the platform cannot tell those apart, so it ends the session for both.
 	ErrRefreshTokenReused = errors.New("identity: the refresh token has already been used")
+
+	// ErrCredentialsInvalid means the address and password together name no account
+	// (SHIP-41). See CodeCredentialsInvalid for why the two halves are not distinguished.
+	ErrCredentialsInvalid = errors.New("identity: the email address and password do not match an account")
+
+	// ErrAccountSuspended means the password was right and the account may not hold a session
+	// (SHIP-41). Raised only after the credential verified — see CodeAccountSuspended.
+	ErrAccountSuspended = errors.New("identity: the account is suspended")
+
+	// ErrSessionNotFound means the caller named a device session that is not theirs, or is not
+	// one at all (SHIP-46). The two are one error deliberately.
+	ErrSessionNotFound = errors.New("identity: no such device session on this account")
 
 	// ErrTokenInvalid means the token is not one this platform will honour: unparseable,
 	// wrongly signed, the wrong algorithm, the wrong audience, signed by a retired key, or

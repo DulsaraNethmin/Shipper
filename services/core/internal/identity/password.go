@@ -15,6 +15,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -175,6 +176,36 @@ func (h *PasswordHasher) Verify(encoded, plaintext string) (bool, error) {
 	// Constant time, so the comparison cannot be turned into an oracle by measuring how long
 	// it takes to fail. ConstantTimeCompare reports 0 for differing lengths as well.
 	return subtle.ConstantTimeCompare(derived, stored.key) == 1, nil
+}
+
+// decoySalt is the salt [PasswordHasher.SpendEquivalentWork] derives against.
+//
+// Fixed, and in the source deliberately: it salts nothing, because nothing here is stored or
+// compared. A fresh random salt would suggest the derived key mattered, and the next reader would
+// go looking for where it was kept.
+var decoySalt = []byte("shipper-decoy-salt")[:saltLength]
+
+// SpendEquivalentWork derives a key from plaintext and discards it, so that a sign-in against an
+// address with no account costs what one against a real account costs (SHIP-41).
+//
+// # Why this exists
+//
+// [CodeCredentialsInvalid] gives one answer to "no such address" and to "wrong password", so that
+// sign-in cannot be used to find out which addresses have accounts. Without this, the *response
+// time* would answer anyway and rather more cheaply than the status code refuses to: argon2id at
+// m=64 MiB takes tens of milliseconds, and a lookup that misses takes none of them. A caller
+// timing two requests reads the difference off a wall clock.
+//
+// It is one argon2id derivation at this hasher's profile, which is the cost [PasswordHasher.Verify]
+// is made of. The PHC parse Verify also does is microseconds against that and is not reproduced —
+// what is being equalised is the cost that dominates, not every instruction.
+//
+// The result is deliberately unused, and runtime.KeepAlive is what says so to a reader: without
+// it the call reads like something left behind by a deletion.
+func (h *PasswordHasher) SpendEquivalentWork(plaintext string) {
+	key := argon2.IDKey([]byte(plaintext), decoySalt,
+		h.profile.Iterations, h.profile.MemoryKiB, h.profile.Parallelism, keyLength)
+	runtime.KeepAlive(key)
 }
 
 // NeedsRehash reports whether a stored hash was made at a weaker profile than this hasher

@@ -183,10 +183,19 @@ func normaliseDeviceLabel(submitted string) string { return strings.TrimSpace(su
 // client sends, so the message can be put beside the input that caused it (Docs/10 §4.6).
 func validateDeviceLabel(label string) error {
 	var v validate.Errors
+	validateDeviceLabelInto(&v, label)
+	return v.Err()
+}
+
+// validateDeviceLabelInto is the same check, contributing to a caller's error set.
+//
+// Sign-in validates an address, a password and a label together, and Docs/10 §4.6 wants all three
+// answered at once rather than one per round trip. Having the rule in one function that both
+// shapes call is what stops "what is a usable label" acquiring a second answer.
+func validateDeviceLabelInto(v *validate.Errors, label string) {
 	if v.Required("device_label", label) {
 		v.Length("device_label", label, 1, maxDeviceLabelLength)
 	}
-	return v.Err()
 }
 
 // startSession creates a device session and issues its first token pair (SHIP-39).

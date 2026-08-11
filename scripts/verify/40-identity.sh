@@ -881,3 +881,167 @@ status="$(curl -s -X POST -o "$WORKDIR/refresh-nokey.json" -w '%{http_code}' \
 [[ "$(json "$WORKDIR/refresh-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
   || fail "expected code=idempotency_key_required"
 ok "it needs an Idempotency-Key, so a retry replays the pair rather than rotating twice"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-41  POST /v1/auth/login returns an access and refresh token pair"
+
+# The account registered above, whose password is the literal this file already knows. Signing in
+# is the first endpoint that creates a session rather than being handed one, so from here the
+# sections below no longer have to plant device_sessions rows by hand.
+login_password="correct-horse-battery-staple"
+
+sessions_before="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions where user_id = '$registered_id';")"
+
+status="$(post_json "verify-login-$$" /v1/auth/login \
+  "{\"email\":\"$reg_email\",\"password\":\"$login_password\",\"device_label\":\"Verify iPhone 17\"}" \
+  "$WORKDIR/login.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/login.json"; fail "POST /v1/auth/login returned $status, want 200"; }
+
+login_access="$(json "$WORKDIR/login.json" '["access_token"]')"
+login_refresh="$(json "$WORKDIR/login.json" '["refresh_token"]')"
+[[ "$login_access" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]] \
+  || fail "the sign-in returned no access token"
+[[ "$login_refresh" =~ ^[A-Za-z0-9_-]{43}$ ]] \
+  || fail "the sign-in returned no refresh token, or one of the wrong shape: $login_refresh"
+ok "an access token and a refresh token come back for the right password"
+
+# Read from the service's own TTLs rather than a wall clock, so a handset with a wrong clock
+# still refreshes at the right moment (SHIP-42's decision, reused here rather than restated).
+[[ "$(json "$WORKDIR/login.json" '["expires_in"]')" == "900" ]] \
+  || fail "expires_in is not 900 seconds"
+[[ "$(json "$WORKDIR/login.json" '["refresh_token_expires_in"]')" == "2592000" ]] \
+  || fail "refresh_token_expires_in is not thirty days"
+ok "both lifetimes are reported in seconds — fifteen minutes and thirty days"
+
+# The pair is the same shape refresh returns, and the same schema describes both.
+login_sid="$(python3 - "$login_access" <<'PYTHON'
+import base64, json, sys
+
+_header, payload, _signature = sys.argv[1].split(".")
+claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+print(claims["sub"], claims["sid"])
+PYTHON
+)"
+read -r claim_sub claim_sid <<<"$login_sid"
+[[ "$claim_sub" == "$registered_id" ]] || fail "the access token names $claim_sub, not the account that signed in"
+ok "the access token names the account that presented the password"
+
+session_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select device_label || ' ' || (user_id = '$registered_id')::text || ' ' ||
+          coalesce(revoked_reason, 'live')
+     from device_sessions where id = '$claim_sid';")"
+[[ "$session_row" == "Verify iPhone 17 true live" ]] \
+  || fail "the session the token names says '$session_row', want 'Verify iPhone 17 true live'"
+ok "a live device session exists, owned by that account and carrying the label that was sent"
+
+# The pair is usable rather than merely well shaped: a refresh token nothing will exchange would
+# pass every check above.
+status="$(post_json "verify-login-refresh-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$login_refresh\"}" "$WORKDIR/login-refresh.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/login-refresh.json"; fail "the refresh token sign-in issued was refused ($status)"; }
+login_refresh="$(json "$WORKDIR/login-refresh.json" '["refresh_token"]')"
+ok "the refresh token sign-in issued is one the platform will exchange"
+
+# Only the hash is stored, exactly as rotation stores it.
+leaked="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions where refresh_token_hash = '$login_refresh';")"
+[[ "$leaked" == "0" ]] || fail "sign-in stored the refresh token itself, not its hash"
+ok "searching device_sessions for the token finds nothing — only its hash is kept"
+
+# The two failures anybody can provoke without holding anything are one answer, or this endpoint
+# tells the world which addresses have accounts.
+status="$(post_json "verify-login-wrong-$$" /v1/auth/login \
+  "{\"email\":\"$reg_email\",\"password\":\"not-the-registered-password\",\"device_label\":\"Verify iPhone 17\"}" \
+  "$WORKDIR/login-wrong.json")"
+[[ "$status" == "400" ]] || fail "the wrong password returned $status, want 400"
+wrong_code="$(json "$WORKDIR/login-wrong.json" '["error"]["code"]')"
+
+status="$(post_json "verify-login-unknown-$$" /v1/auth/login \
+  "{\"email\":\"nobody-$$@example.com\",\"password\":\"$login_password\",\"device_label\":\"Verify iPhone 17\"}" \
+  "$WORKDIR/login-unknown.json")"
+[[ "$status" == "400" ]] || fail "an address with no account returned $status, want 400"
+unknown_code="$(json "$WORKDIR/login-unknown.json" '["error"]["code"]')"
+
+[[ "$wrong_code" == "identity_credentials_invalid" && "$unknown_code" == "$wrong_code" ]] \
+  || fail "the wrong password answers '$wrong_code' and an unknown address '$unknown_code'; two answers is an account-existence oracle"
+ok "a wrong password and an address with no account are one answer, with no session created"
+
+# A body-borne credential is refused with 400 across this domain, and 401 is reserved for one
+# presented in the bearer header — see SHIP-46 below, which is the first route that does.
+[[ "$(json "$WORKDIR/login-wrong.json" '["error"]["request_id"]')" != "" ]] \
+  || fail "the refusal carries no request id"
+ok "the refusal is 400 with the request id in the body, not a 401 with a bearer challenge"
+
+# Account standing is disclosed only to somebody who has just proved they own the account.
+suspended_email="suspended-$$@example.com"
+status="$(post_json "verify-suspend-register-$$" /v1/auth/register \
+  "{\"email\":\"$suspended_email\",\"phone\":\"04960$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
+  "$WORKDIR/suspend-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/suspend-register.json"; fail "could not register the account to suspend ($status)"; }
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set status = 'suspended' where email = '$suspended_email';" >/dev/null \
+  || fail "could not suspend the account"
+
+status="$(post_json "verify-login-suspended-$$" /v1/auth/login \
+  "{\"email\":\"$suspended_email\",\"password\":\"$login_password\",\"device_label\":\"Verify iPhone 17\"}" \
+  "$WORKDIR/login-suspended.json")"
+[[ "$status" == "403" ]] || { cat "$WORKDIR/login-suspended.json"; fail "a suspended account returned $status, want 403"; }
+[[ "$(json "$WORKDIR/login-suspended.json" '["error"]["code"]')" == "identity_account_suspended" ]] \
+  || fail "expected code=identity_account_suspended"
+
+status="$(post_json "verify-login-suspended-wrong-$$" /v1/auth/login \
+  "{\"email\":\"$suspended_email\",\"password\":\"not-the-registered-password\",\"device_label\":\"Verify iPhone 17\"}" \
+  "$WORKDIR/login-suspended-wrong.json")"
+[[ "$(json "$WORKDIR/login-suspended-wrong.json" '["error"]["code"]')" == "identity_credentials_invalid" ]] \
+  || fail "a suspended account disclosed its standing to somebody who did not have the password"
+ok "a suspended account is told so, and only after the password verified"
+
+suspended_sessions="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions d join users u on u.id = d.user_id where u.email = '$suspended_email';")"
+[[ "$suspended_sessions" == "0" ]] || fail "a suspended account was given $suspended_sessions device sessions"
+ok "no session is created for an account that may not hold one"
+
+# Signing in creates a row, so a retry after a dropped connection must replay rather than leave a
+# second device live for thirty days that its owner never used.
+status="$(post_json "verify-login-retry-$$" /v1/auth/login \
+  "{\"email\":\"$reg_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Retry\"}" \
+  "$WORKDIR/login-retry-1.json")"
+[[ "$status" == "200" ]] || fail "the sign-in to retry returned $status"
+status="$(post_json "verify-login-retry-$$" /v1/auth/login \
+  "{\"email\":\"$reg_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Retry\"}" \
+  "$WORKDIR/login-retry-2.json")"
+[[ "$status" == "200" ]] || fail "the retried sign-in returned $status"
+[[ "$(json "$WORKDIR/login-retry-1.json" '["refresh_token"]')" == "$(json "$WORKDIR/login-retry-2.json" '["refresh_token"]')" ]] \
+  || fail "the retry issued a second pair rather than replaying the first"
+retried_devices="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions where user_id = '$registered_id' and device_label = 'Verify Retry';")"
+[[ "$retried_devices" == "1" ]] || fail "the retry created $retried_devices devices, want 1"
+ok "a retry with the same Idempotency-Key replays the pair rather than creating a second device"
+
+status="$(curl -s -X POST -o "$WORKDIR/login-nokey.json" -w '%{http_code}' \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$reg_email\",\"password\":\"$login_password\",\"device_label\":\"Verify iPhone 17\"}" \
+  "http://localhost:$VERIFY_PORT/v1/auth/login")"
+[[ "$status" == "400" ]] || fail "sign-in without an Idempotency-Key returned $status"
+[[ "$(json "$WORKDIR/login-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || fail "expected code=idempotency_key_required"
+ok "it is refused without an Idempotency-Key, like every other state-changing request"
+
+# Every field at once, the device label included — so a client is not told about the label only
+# after its password has been verified.
+status="$(post_json "verify-login-invalid-$$" /v1/auth/login \
+  '{"email":"not-an-address","password":"","device_label":""}' "$WORKDIR/login-invalid.json")"
+[[ "$status" == "422" ]] || fail "an unusable sign-in body returned $status, want 422"
+login_fields="$(python3 -c 'import json,sys
+print(" ".join(sorted(d["field"] for d in json.load(open(sys.argv[1]))["error"]["details"])))' \
+  "$WORKDIR/login-invalid.json")"
+[[ "$login_fields" == "device_label email password" ]] \
+  || fail "the details name '$login_fields', want every offending field"
+ok "validation names every offending field at once, including the device label"
+
+sessions_after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions where user_id = '$registered_id';")"
+[[ "$sessions_after" == "$((sessions_before + 2))" ]] \
+  || fail "the account gained $((sessions_after - sessions_before)) devices across this section, want 2"
+ok "only the two successful sign-ins created a device; every refusal created none"

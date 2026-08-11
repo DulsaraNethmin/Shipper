@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **125 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **139 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -171,6 +171,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
 | **SHIP-39** | M1 | Refresh token issue and rotation — opaque, hashed, and the expiry question closed — *see below* |
 | **SHIP-40** | M1 | Refresh token reuse detection — a spent token ends the whole device session — *see below* |
+| **SHIP-41** | M1 | `POST /v1/auth/login` — the endpoint a session starts at, and one answer for every credential failure — *see below* |
 | **SHIP-42** | M1 | `POST /v1/auth/refresh` — the first endpoint that issues a session credential — *see below* |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
@@ -570,6 +571,57 @@ one shape is how a client generator ends up with two types.
 sorts before `/v1/auth/register`. That is the one shared file this track touched, and the wave's
 jobs track is adding lines to the same block; `Docs/10` §9.2's recipe applies (take both sides,
 re-sort, then `make test`).
+
+### What SHIP-41 built, and the two disclosures it closes
+
+**`POST /v1/auth/login` is the tenth route and the endpoint every session starts at.** SHIP-42
+issued the first *credential*; this issues the first credential somebody obtained by proving who
+they are. Everything else in the domain now either exchanges that session's token or ends it, and
+no section of `make verify` has to plant a `device_sessions` row by hand any more.
+
+**One code for a wrong password and for an address with no account —
+`identity_credentials_invalid`.** Two answers would make an unauthenticated endpoint an
+account-existence oracle for any address anybody cares to try, which is a good deal worse than
+registration's deliberate disclosure: that one at least costs the caller an address they control.
+
+**The second half of that disclosure is the response time, and it is the half a plausible
+implementation leaves open.** argon2id at m=64 MiB costs tens of milliseconds and a lookup that
+misses costs none of them, so a caller timing two requests reads off exactly what the status code
+refuses to say. `PasswordHasher.SpendEquivalentWork` derives a key against a fixed salt and
+discards it on the no-such-account path.
+`TestSignInSpendsTheSameWorkWhetherOrNotTheAccountExists` compares the two against each other
+rather than against a figure, so it holds at any profile; mutation-checked by emptying the method,
+which drops the unknown-account path to microseconds.
+
+**A suspended account is told so, and that is the one place account standing is disclosed.** It is
+safe here and nowhere else: it is said *after* the password verified, so the caller has just proved
+they own the account they are being told about. Refresh deliberately says nothing, because the
+caller there holds only a token. `403`, because the caller is known and is not permitted.
+
+**The status rule the whole domain now follows, stated once:** a credential presented in the
+request *body* is refused with `400`; a credential presented in the bearer header is refused
+with `401`. SHIP-42 argued it for refresh from two directions — `WWW-Authenticate` would
+describe a scheme the endpoint does not accept, and SHIP-50's interceptor refreshes on a `401` —
+and both apply unchanged to sign-in. SHIP-46 below is the first route on the other side of the
+rule.
+
+**Sign-in upgrades a password hashed at a weaker profile, which is what makes `Docs/10` §5's claim
+true rather than merely available.** The costs travelling in the PHC string mean the argon2id
+profile *can* be raised without a migration; nothing took the opportunity until now, and sign-in is
+the only moment the plaintext exists to take it with. It is inside the same transaction as the
+session insert — there is no "carry on regardless" available from inside a transaction, because a
+failed statement has already aborted it.
+
+**Each sign-in creates a device, and the contract says so where a client will read it.** There is
+no device identifier to match on, so a client that signs in rather than refreshing leaves the
+previous session live for thirty days and shows its owner a device list they cannot make sense of.
+`device_label` is required for the same reason: four rows reading "Unknown device" cannot be acted
+on at SHIP-46, and the only moment a label can be collected is the one where somebody is looking at
+a sign-in screen on the device being named.
+
+**The `paths:` block gained one line**, sorted — `/v1/auth/login` sorts before `/v1/auth/refresh`.
+The response `$ref`s the `TokenPair` schema SHIP-42 added rather than describing the same four
+fields again.
 
 ### What SHIP-48 built, and how it was demonstrated
 

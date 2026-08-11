@@ -223,6 +223,7 @@ func TestRequestOTPWithoutADatabaseIsUnavailable(t *testing.T) {
 func TestEveryIdentityRouteIsServedAndPublic(t *testing.T) {
 	for path, body := range map[string]string{
 		"/v1/auth/register":      `{"email":"","phone":"","password":"","role":""}`,
+		"/v1/auth/login":         `{"email":"","password":"","device_label":""}`,
 		"/v1/auth/verify-email":  `{"token":""}`,
 		"/v1/auth/resend-verify": `{"email":""}`,
 		"/v1/auth/request-otp":   `{"phone":""}`,
@@ -262,6 +263,115 @@ func TestVerifyEmailRefusesAnEmptyToken(t *testing.T) {
 	}
 	if got := errorCode(t, rec); got != "identity_verification_token_invalid" {
 		t.Errorf("code = %q, want identity_verification_token_invalid", got)
+	}
+}
+
+// TestLoginIsReachableAndPublic (SHIP-41). It is the endpoint that produces the credential every
+// protected route requires, so it is the one route on the allow-list whose justification needs no
+// elaboration — and since SHIP-44 the class is read at wiring time rather than being decoration.
+func TestLoginIsReachableAndPublic(t *testing.T) {
+	rec := postJSON(t, "/v1/auth/login", `{"email":"","password":"","device_label":""}`)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("POST /v1/auth/login is not served")
+	}
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatal("signing in demands a credential, which is the credential it exists to produce")
+	}
+}
+
+// TestLoginValidationIsReportedPerField, end to end and with no database. Every field at once
+// (Docs/10 §4.6), including the device label, which is validated here rather than inside the
+// session creation it is eventually for — so a client is not told about it only after its
+// password has been verified.
+func TestLoginValidationIsReportedPerField(t *testing.T) {
+	rec := postJSON(t, "/v1/auth/login", `{"email":"not-an-address","password":"","device_label":""}`)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body)
+	}
+
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Details []struct {
+				Field string `json:"field"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not JSON: %v (%s)", err, rec.Body)
+	}
+	if body.Error.Code != string(httpx.CodeValidationFailed) {
+		t.Errorf("code = %q, want %q", body.Error.Code, httpx.CodeValidationFailed)
+	}
+
+	named := map[string]bool{}
+	for _, d := range body.Error.Details {
+		named[d.Field] = true
+	}
+	for _, want := range []string{"email", "password", "device_label"} {
+		if !named[want] {
+			t.Errorf("details do not name %q; a client cannot put the message beside the input. Got %v",
+				want, named)
+		}
+	}
+}
+
+// TestLoginRequiresAnIdempotencyKey. Signing in creates a row: a retry after a dropped connection
+// would otherwise leave a device session nobody holds a token for, live for thirty days and
+// visible to its owner only as a duplicate line in their device list.
+func TestLoginRequiresAnIdempotencyKey(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/login",
+		strings.NewReader(`{"email":"a@example.com","password":"a-long-enough-one","device_label":"iPhone"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeIdempotencyKeyRequired) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeIdempotencyKeyRequired)
+	}
+}
+
+// TestLoginRefusesAnUnknownField, in the direction responses are not strict. A client sending
+// `deviceLabel` has made a mistake that would otherwise surface as "device_label is required"
+// about a field it believes it supplied.
+func TestLoginRefusesAnUnknownField(t *testing.T) {
+	rec := postJSON(t, "/v1/auth/login",
+		`{"email":"a@example.com","password":"a-long-enough-one","deviceLabel":"iPhone"}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeBadRequest) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeBadRequest)
+	}
+}
+
+// TestLoginWithoutADatabaseIsUnavailable, for the reason registration's equivalent gives: 503
+// tells a mobile client to retry and 500 tells it to give up. The body is valid so the request
+// reaches the pool check rather than being refused on its way in.
+func TestLoginWithoutADatabaseIsUnavailable(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/login",
+		strings.NewReader(`{"email":"a@example.com","password":"a-long-enough-one","device_label":"iPhone"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnavailable) {
+		t.Errorf("code = %q, want %q — 500 tells the client to give up", got, httpx.CodeUnavailable)
 	}
 }
 

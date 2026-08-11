@@ -126,6 +126,131 @@ Register:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+Login:
+  post:
+    operationId: signIn
+    summary: Exchange a password for a device session
+    tags: [Identity]
+    description: |
+      Verifies the password and starts a device session, returning the first token pair
+      (SHIP-41).
+
+      This is where a session begins. Every later call in the identity domain either exchanges
+      that session's refresh token (`/v1/auth/refresh`) or ends it (`/v1/auth/logout`,
+      `DELETE /v1/auth/sessions/{id}`).
+
+      ## Each sign-in creates a device
+
+      There is no device identifier to match on, so signing in twice from one handset produces
+      two entries in `GET /v1/auth/sessions`. **Sign in once and hold the refresh token**
+      (Docs/07 §3): a client that signs in again rather than refreshing leaves the previous
+      session live for thirty days and shows its owner a device list they cannot make sense of.
+
+      `device_label` is what that list displays. Send something a person will recognise — the
+      handset's model name if they have not been asked for one.
+
+      ## Failures
+
+      One code, `identity_credentials_invalid`, for an address with no account **and** for the
+      wrong password against a real one. The remedy is the same, and two answers would let
+      anybody find out which addresses have accounts without holding any credential. The
+      platform also spends the same password-hashing work on both paths, so the response time
+      does not disclose what the status code withholds.
+
+      **It answers `400`, not `401`**, which is the rule across this domain: a credential
+      presented in the request body is refused with `400`, and a credential presented in the
+      bearer header with `401`. A `401` here would need a `WWW-Authenticate` challenge
+      describing a scheme this endpoint does not accept, and would send a client interceptor
+      that refreshes on `401` around its loop a second time.
+
+      `identity_account_suspended` is the one exception, and it is a `403`. It is said only
+      after the password verified — the caller has just proved they own the account they are
+      being told about.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [email, password, device_label]
+            additionalProperties: false
+            properties:
+              email:
+                type: string
+                format: email
+                maxLength: 254
+                description: Matched case-insensitively, as it is stored.
+                example: alice@example.com
+              password:
+                type: string
+                description: |
+                  Checked for presence only. The length rule at registration is about what may
+                  be chosen, and applying it here would refuse an account whose password
+                  predates the current floor.
+                example: correct-horse-battery-staple
+              device_label:
+                type: string
+                minLength: 1
+                maxLength: 120
+                description: |
+                  Display text for the device list. It authenticates nothing, and two handsets
+                  may legitimately carry the same label.
+                example: Nethmin's iPhone
+    responses:
+      '200':
+        description: The password verified and a device session was created.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/TokenPair'
+      '400':
+        description: |
+          The address and password do not match an account — `identity_credentials_invalid`.
+          Deliberately the same answer for an address with no account.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The password was right and the account is suspended — `identity_account_suspended`.
+          Contact support; retrying will not help.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: One or more fields were rejected. `details` names each of them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 VerifyEmail:
   post:
     operationId: verifyEmail
