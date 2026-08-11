@@ -16,16 +16,23 @@ import (
 // go into one of them is a line every concurrent branch also touches, and a badly resolved
 // conflict there drops an endpoint with no compile error and no failing test.
 //
-// # Why every route here is Public
+// # Why the public routes here are public
 //
-// All of them are how a caller obtains their own credentials, which is the only justification
-// cmd/api's publicMutatingRoutes allow-list accepts. Registration takes a password and returns
-// an account; the verification endpoints take a token or a code that was sent to the contact
-// details being proved. None of them can require the credential they exist to produce.
+// Every route that is, is how a caller obtains their own credentials — the only justification
+// cmd/api's publicMutatingRoutes allow-list accepts. Registration takes a password and returns an
+// account; sign-in takes a password and returns a session; the verification endpoints take a token
+// or a code that was sent to the contact details being proved. None of them can require the
+// credential they exist to produce.
 //
 // They are still behind httpx.Idempotent like every other state-changing request, and they are
 // still rate limited — by their own issue rules today (SHIP-34) and by SHIP-47's token bucket
 // across the whole authentication surface.
+//
+// # And why sign-out is not
+//
+// POST /v1/auth/logout is the first RequireUser route in the service (SHIP-43). The session it
+// ends is the one named by the token being presented, so the credential is not merely a
+// permission check — it is the whole input. See the note on Handler.Logout.
 func init() {
 	register(
 		Route{
@@ -44,6 +51,15 @@ func init() {
 			Group:   GroupV1,
 			Auth:    Public,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Login() },
+		},
+		Route{
+			// The first route in the service that requires a credential (SHIP-43). SHIP-44
+			// built the middleware; nothing had used it until now.
+			Method:  http.MethodPost,
+			Pattern: "/auth/logout",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).Logout() },
 		},
 		Route{
 			Method:  http.MethodPost,

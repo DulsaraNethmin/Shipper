@@ -6,9 +6,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
 )
 
 // The identity routes through the real router (SHIP-30 onwards).
@@ -372,6 +377,108 @@ func TestLoginWithoutADatabaseIsUnavailable(t *testing.T) {
 	}
 	if got := errorCode(t, rec); got != string(httpx.CodeUnavailable) {
 		t.Errorf("code = %q, want %q — 500 tells the client to give up", got, httpx.CodeUnavailable)
+	}
+}
+
+// TestLogoutRefusesACallerWithNoCredential (SHIP-43).
+//
+// The first route in the service with Auth: RequireUser, and so the first place httpx.RequireSubject
+// is reached through the real wiring rather than through a route a test built for itself. The
+// Idempotency-Key is sent deliberately: the middleware chain checks it further out than the auth
+// class is enforced, so a request missing both is refused for the key and never reaches the guard.
+func TestLogoutRefusesACallerWithNoCredential(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/logout", nil)
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Error("no WWW-Authenticate challenge on a 401, which RFC 9110 requires")
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnauthenticated) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeUnauthenticated)
+	}
+}
+
+// TestLogoutRefusesAnExpiredCredentialDistinctly. The one authentication failure a client acts on
+// differently: refresh and retry, rather than sign the user out (SHIP-50).
+func TestLogoutRefusesAnExpiredCredentialDistinctly(t *testing.T) {
+	past := clock.NewFixed(time.Now().Add(-time.Hour).UTC())
+
+	keys, err := identity.NewKeyset(map[string][]byte{testKID: testSigningKey}, testKID)
+	if err != nil {
+		t.Fatalf("building the keyset: %v", err)
+	}
+	issuer, err := identity.NewAccessTokenIssuer(keys, 15*time.Minute, past)
+	if err != nil {
+		t.Fatalf("building the issuer: %v", err)
+	}
+	stale, err := issuer.Issue(uuid.New(), uuid.New(), identity.RoleCustomer)
+	if err != nil {
+		t.Fatalf("issuing: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/logout", nil)
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+stale.Value)
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeTokenExpired) {
+		t.Errorf("code = %q, want %q — a client that cannot tell an expired token from a bad "+
+			"one signs the user out instead of refreshing", got, httpx.CodeTokenExpired)
+	}
+}
+
+// TestLogoutRequiresAnIdempotencyKey. It is state-changing like every other POST, and the
+// requirement is checked before the auth class — so this also pins the ordering the middleware
+// chain depends on (Docs/10 §4.2).
+func TestLogoutRequiresAnIdempotencyKey(t *testing.T) {
+	token, _, _ := testAccessToken(t, identity.RoleCustomer)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/logout", nil)
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeIdempotencyKeyRequired) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeIdempotencyKeyRequired)
+	}
+}
+
+// TestLogoutWithACredentialButNoDatabaseIsUnavailable. The credential got the caller past the
+// guard, which is the half this proves: a 401 here would mean the route is unreachable rather
+// than that the database is away.
+func TestLogoutWithACredentialButNoDatabaseIsUnavailable(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	token, _, _ := testAccessToken(t, identity.RoleCustomer)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/logout", nil)
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnavailable) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeUnavailable)
 	}
 }
 

@@ -1045,3 +1045,106 @@ sessions_after="$("$PSQL" "$DATABASE_URL" -tAc \
 [[ "$sessions_after" == "$((sessions_before + 2))" ]] \
   || fail "the account gained $((sessions_after - sessions_before)) devices across this section, want 2"
 ok "only the two successful sign-ins created a device; every refusal created none"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-43  POST /v1/auth/logout revokes the current device session only"
+
+# post_auth <key> <token> <path> <outfile> — a state-changing request with a bearer credential.
+#
+# Defined here rather than in the harness because SHIP-43 and SHIP-46 are the only callers today
+# and both are in this file. Whoever adds the second domain with protected mutations should move
+# it up beside post_json, which is the shape the harness already uses for the unauthenticated
+# half.
+post_auth() {
+  curl -s -X POST -o "$4" -w '%{http_code}' \
+    -H "Idempotency-Key: $1" -H "$auth_header: Bearer $2" \
+    "http://localhost:$VERIFY_PORT$3"
+}
+
+# Two devices on one account, both created through the real endpoint. "Only" is the half of the
+# criterion a plausible implementation gets wrong, and it cannot be shown with one device.
+status="$(post_json "verify-logout-a-$$" /v1/auth/login \
+  "{\"email\":\"$reg_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Signed Out\"}" \
+  "$WORKDIR/logout-a.json")"
+[[ "$status" == "200" ]] || fail "could not sign in the device to sign out ($status)"
+status="$(post_json "verify-logout-b-$$" /v1/auth/login \
+  "{\"email\":\"$reg_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Still In\"}" \
+  "$WORKDIR/logout-b.json")"
+[[ "$status" == "200" ]] || fail "could not sign in the device that stays signed in ($status)"
+
+signed_out_access="$(json "$WORKDIR/logout-a.json" '["access_token"]')"
+signed_out_refresh="$(json "$WORKDIR/logout-a.json" '["refresh_token"]')"
+still_in_refresh="$(json "$WORKDIR/logout-b.json" '["refresh_token"]')"
+
+signed_out_sid="$(python3 - "$signed_out_access" <<'PYTHON'
+import base64, json, sys
+
+_header, payload, _signature = sys.argv[1].split(".")
+print(json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["sid"])
+PYTHON
+)"
+
+status="$(post_auth "verify-logout-$$" "$signed_out_access" /v1/auth/logout "$WORKDIR/logout.json")"
+[[ "$status" == "204" ]] || { cat "$WORKDIR/logout.json"; fail "POST /v1/auth/logout returned $status, want 204"; }
+[[ ! -s "$WORKDIR/logout.json" ]] || fail "logout answered with a body; 204 has nothing to say"
+ok "signing out answers 204 with no body"
+
+# The row is marked with the reason that says how it ended, rather than deleted (Docs/10 §3.3).
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(revoked_reason, 'live') from device_sessions where id = '$signed_out_sid';")" == "signed_out" ]] \
+  || fail "the session is not marked signed_out"
+ok "the session is marked revoked with reason 'signed_out', not deleted"
+
+status="$(post_json "verify-logout-refresh-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$signed_out_refresh\"}" "$WORKDIR/logout-refresh.json")"
+[[ "$status" == "400" ]] || fail "the signed-out device could still refresh ($status)"
+ok "the refresh token that device was holding stops working"
+
+# The half a plausible implementation gets wrong: signing out every device the account owns looks
+# correct from the device that asked and is only visible from the other one.
+status="$(post_json "verify-logout-other-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$still_in_refresh\"}" "$WORKDIR/logout-other.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/logout-other.json"; fail "the other device was signed out too ($status)"; }
+ok "every other device on the account is untouched — the current session only"
+
+# SHIP-40's invariant survives: a hash is live in device_sessions or spent in the ledger, never
+# both. Moving the live hash across on sign-out is the tidy-looking change that breaks it.
+overlap="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions d
+     join consumed_refresh_tokens c on c.token_hash = d.refresh_token_hash
+    where d.id = '$signed_out_sid';")"
+[[ "$overlap" == "0" ]] || fail "signing out moved the live hash into the ledger, so one hash is in both places"
+ok "the live refresh token hash stays where it is, so SHIP-40's invariant still holds"
+
+# The client has discarded its tokens by the time it reads the response, so a retry — or a stale
+# tab — must not become an error.
+status="$(post_auth "verify-logout-again-$$" "$signed_out_access" /v1/auth/logout "$WORKDIR/logout-again.json")"
+[[ "$status" == "204" ]] || fail "signing out twice returned $status, want 204"
+ok "signing out again is not an error; the state the caller asked for already holds"
+
+# The other half of the status rule sign-in states: a credential in the bearer header, refused
+# with 401 and the challenge RFC 9110 requires. This is the first route in the service that can
+# demonstrate it — SHIP-44 built the middleware and nothing had used it.
+status="$(curl -s -X POST -o "$WORKDIR/logout-anon.json" -D "$WORKDIR/logout-anon.headers" \
+  -w '%{http_code}' -H "Idempotency-Key: verify-logout-anon-$$" \
+  "http://localhost:$VERIFY_PORT/v1/auth/logout")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/logout-anon.json"; fail "signing out with no credential returned $status, want 401"; }
+grep -qi '^WWW-Authenticate: Bearer' "$WORKDIR/logout-anon.headers" \
+  || fail "no WWW-Authenticate challenge on the 401, which RFC 9110 requires"
+[[ "$(json "$WORKDIR/logout-anon.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || fail "expected code=unauthenticated"
+ok "a protected route refuses a caller with no credential — 401, with a bearer challenge"
+
+status="$(post_auth "verify-logout-junk-$$" "not.a.token" /v1/auth/logout "$WORKDIR/logout-junk.json")"
+[[ "$status" == "401" ]] || fail "a malformed bearer token returned $status, want 401"
+[[ "$(json "$WORKDIR/logout-junk.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || fail "a malformed token was answered with something other than 'unauthenticated'"
+ok "a malformed credential is refused the same way, saying nothing about which check refused it"
+
+status="$(curl -s -X POST -o "$WORKDIR/logout-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $signed_out_access" \
+  "http://localhost:$VERIFY_PORT/v1/auth/logout")"
+[[ "$status" == "400" ]] || fail "signing out without an Idempotency-Key returned $status"
+[[ "$(json "$WORKDIR/logout-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || fail "expected code=idempotency_key_required"
+ok "it needs an Idempotency-Key like every other mutation, checked before the auth class"

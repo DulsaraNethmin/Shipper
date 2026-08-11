@@ -20,10 +20,14 @@ package identity
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 
+	"github.com/google/uuid"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
@@ -384,6 +388,72 @@ func (h *Handler) Refresh() http.Handler {
 		}
 
 		httpx.WriteJSON(w, http.StatusOK, h.tokenPairFrom(pair))
+		return nil
+	})
+}
+
+// caller is the authenticated subject in the form this domain's methods take it (SHIP-43).
+//
+// authctx keeps both identifiers as strings so that no domain reading a subject has to depend on
+// the uuid package to compare one. This domain does need the parsed values — they are primary
+// keys here — and doing the conversion once, in one place, is what stops three handlers each
+// deciding what an unparseable subject means.
+type caller struct {
+	UserID    uuid.UUID
+	SessionID uuid.UUID
+}
+
+// callerFrom reads the authenticated subject off the request.
+//
+// It is only correct on a route whose auth class is RequireUser, and [authctx.MustSubject]
+// enforces that by panicking rather than by returning a zero subject: a route declared Public and
+// written as though it were protected is a wiring defect, and an empty user identifier that
+// compared equal to a row's owner would be a serious one.
+//
+// The identifiers are parsed rather than trusted. [AccessTokenVerifier] has already checked that
+// both are UUIDs and neither is nil, so a failure here means the verifier and this parser have
+// come to disagree — reported as an opaque 500, which is what an internal contradiction deserves.
+func callerFrom(r *http.Request) (caller, error) {
+	subject := authctx.MustSubject(r.Context())
+
+	userID, err := uuid.Parse(subject.UserID)
+	if err != nil {
+		return caller{}, fmt.Errorf("identity: the subject's user id %q is not a uuid, "+
+			"which the access token verifier should have refused: %w", subject.UserID, err)
+	}
+	sessionID, err := uuid.Parse(subject.SessionID)
+	if err != nil {
+		return caller{}, fmt.Errorf("identity: the subject's session id %q is not a uuid, "+
+			"which the access token verifier should have refused: %w", subject.SessionID, err)
+	}
+	return caller{UserID: userID, SessionID: sessionID}, nil
+}
+
+// Logout handles POST /v1/auth/logout (SHIP-43).
+//
+// # Why this one requires a credential and the rest of the domain does not
+//
+// It is the first route in the service with `Auth: RequireUser`, and it is the natural first: the
+// session being ended is named by the token being presented, so there is nothing to authorise
+// against and nothing to look up. A body carrying a session identifier would be an endpoint that
+// could end somebody else's session, which is SHIP-46's job and needs SHIP-46's owner check.
+//
+// # 204, and no body
+//
+// There is nothing to say. The client has already discarded its tokens by the time it reads this,
+// and a body would only be something for a client to start branching on.
+func (h *Handler) Logout() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		who, err := callerFrom(r)
+		if err != nil {
+			return err
+		}
+
+		if err := h.svc.SignOut(r.Context(), who.UserID, who.SessionID); err != nil {
+			return apiError(err)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
 		return nil
 	})
 }

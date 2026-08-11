@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **139 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **148 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -173,6 +173,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-40** | M1 | Refresh token reuse detection — a spent token ends the whole device session — *see below* |
 | **SHIP-41** | M1 | `POST /v1/auth/login` — the endpoint a session starts at, and one answer for every credential failure — *see below* |
 | **SHIP-42** | M1 | `POST /v1/auth/refresh` — the first endpoint that issues a session credential — *see below* |
+| **SHIP-43** | M1 | `POST /v1/auth/logout` — the first route in the service that requires a credential — *see below* |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
@@ -622,6 +623,47 @@ a sign-in screen on the device being named.
 **The `paths:` block gained one line**, sorted — `/v1/auth/login` sorts before `/v1/auth/refresh`.
 The response `$ref`s the `TokenPair` schema SHIP-42 added rather than describing the same four
 fields again.
+
+### What SHIP-43 built, and the first route that requires a credential
+
+**`POST /v1/auth/logout` is the first `RequireUser` route in the service.** SHIP-44 built the
+middleware, wired `ResolveSubject` outside `Idempotent` and closed the idempotency-scope hole, and
+then nothing used it for a wave. It does now, through the real chain: `make verify` gets a `401`
+with a `WWW-Authenticate` challenge for a caller with no credential and for one presenting
+nonsense, which is the check wave 2 could not demonstrate at all.
+
+**It is the natural first, and that is not only ordering.** The session being ended is named by the
+token being presented — the `sid` claim — so the credential is not a permission check on top of the
+request, it *is* the request. There is no body. A body carrying a session identifier would be an
+endpoint that can end somebody else's session, which is SHIP-46's job and needs SHIP-46's owner
+check.
+
+**"Only" is the half of the criterion a plausible implementation gets wrong.** Revoking every
+session the account owns looks entirely correct from the device that asked and is visible only from
+the phone in the other pocket. Two devices are signed in through the real endpoint, one signs out,
+and the other still refreshes.
+
+**The owner is a predicate on the write.** `revokeOwnDeviceSession` carries `user_id = $2` rather
+than the handler checking ownership first. Through the endpoint the identifier comes from a token
+this platform signed and cannot name another account's session — which is exactly why the check
+belongs in the statement, where no later caller can leave it out.
+`TestSignOutCannotEndSomebodyElsesSession` is mutation-checked against removing it.
+
+**Signing out never fails.** A session already revoked, and a token naming one that no longer
+exists, both answer `204`: the client has discarded its tokens by the time it reads the response,
+and a failure would leave somebody on a screen they cannot get past. The guarded `UPDATE` also
+means a repeat does not move the instant the session ended.
+
+**The live refresh token hash deliberately stays in `device_sessions`.** SHIP-40's note asked for
+this and it is now enforced by a test and by a `make verify` check: moving it into the ledger would
+put one hash in both places and cost that invariant its whole value, for no gain, because rotation
+checks `revoked_at` first.
+
+**One thing a client has to know, and the contract says so.** The refresh token dies immediately;
+the access token keeps verifying until it expires, because it is signed rather than looked up. That
+window is the fifteen minutes in `expires_in`, and it is the price of not doing a database read on
+every authenticated request. A client discards both rather than relying on the platform to refuse
+the one it still holds.
 
 ### What SHIP-48 built, and how it was demonstrated
 

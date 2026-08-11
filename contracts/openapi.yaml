@@ -94,10 +94,12 @@ tags:
       gate, and anything else that must work before sign-in.
   - name: Identity
     description: |
-      Registration, verification, credentials and sessions. Every operation under this tag is
-      public and state-changing, because each is how a caller obtains their own credentials —
-      an endpoint that takes a verification code sent to a phone cannot require the session
-      that verifying the phone leads to.
+      Registration, verification, credentials and sessions.
+
+      Everything up to and including sign-in is public, because each of those is how a caller
+      obtains their own credentials — an endpoint that takes a verification code sent to a
+      phone cannot require the session that verifying the phone leads to. The operations that
+      manage a session once it exists require one, and say so with a `security` block.
 
 # One $ref per domain. Adding a domain adds one line here and one file under paths/.
 #
@@ -127,6 +129,8 @@ paths:
     $ref: './paths/app.yaml#/MinimumVersion'
   /v1/auth/login:
     $ref: './paths/identity.yaml#/Login'
+  /v1/auth/logout:
+    $ref: './paths/identity.yaml#/Logout'
   /v1/auth/refresh:
     $ref: './paths/identity.yaml#/Refresh'
   /v1/auth/register:

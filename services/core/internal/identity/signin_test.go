@@ -415,6 +415,19 @@ func TestSignInNormalisesTheAddressAndTheLabel(t *testing.T) {
 // TestSignInWithoutADatabaseIsUnavailable, for the reason Register's equivalent gives: 503 tells
 // a mobile client to retry and 500 tells it to give up.
 func TestSignInWithoutADatabaseIsUnavailable(t *testing.T) {
+	svc := serviceWithoutADatabase(t)
+
+	if _, err := svc.SignIn(t.Context(), validSignIn()); !errors.Is(err, errUnavailable) {
+		t.Fatalf("err = %v, want errUnavailable", err)
+	}
+}
+
+// serviceWithoutADatabase builds a service over a nil pool, which is a state the process starts in
+// deliberately — see the note on Deps in cmd/api. Every path has to answer errUnavailable rather
+// than dereferencing it.
+func serviceWithoutADatabase(t *testing.T) *Service {
+	t.Helper()
+
 	hasher, err := NewPasswordHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
@@ -424,10 +437,7 @@ func TestSignInWithoutADatabaseIsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
-
-	if _, err := svc.SignIn(t.Context(), validSignIn()); !errors.Is(err, errUnavailable) {
-		t.Fatalf("err = %v, want errUnavailable", err)
-	}
+	return svc
 }
 
 func storedPasswordHash(t *testing.T, pool *pgxpool.Pool, user User) string {

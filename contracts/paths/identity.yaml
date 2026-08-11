@@ -8,14 +8,21 @@
 # tolerate fields they do not recognise, which is a rule about client behaviour and not a licence
 # for the contract to describe less than the service returns.
 #
-# # Every operation here is public, and every one is state-changing
+# # Which operations here are public, and why
 #
-# That combination is on cmd/api's publicMutatingRoutes allow-list for one reason: each is how a
-# caller obtains their own credentials. An endpoint that takes a verification token sent to an
-# address cannot itself require the session that verifying the address leads to.
+# Everything up to and including sign-in is: each is how a caller obtains their own credentials,
+# which is the one justification cmd/api's publicMutatingRoutes allow-list accepts. An endpoint
+# that takes a verification token sent to an address cannot itself require the session that
+# verifying the address leads to.
 #
-# They all require `Idempotency-Key`. A phone that retries after a dropped connection must not
-# end up with two accounts, or with a duplicate-address error for the account it just created.
+# From SHIP-43 the domain also has operations that require one — sign-out and the device list —
+# and they carry a `security` block naming `BearerAccessToken`. They answer `401` with a
+# `WWW-Authenticate` challenge, which is the other half of the rule sign-in states: a credential
+# in the request body is refused with `400`, a credential in the bearer header with `401`.
+#
+# Every state-changing operation requires `Idempotency-Key`. A phone that retries after a dropped
+# connection must not end up with two accounts, or with a duplicate-address error for the account
+# it just created.
 
 Register:
   post:
@@ -239,6 +246,61 @@ Login:
           application/json:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+Logout:
+  post:
+    operationId: signOut
+    summary: End the device session this token belongs to
+    tags: [Identity]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Revokes the device session the access token was issued against, and no other (SHIP-43).
+
+      **Which session ends is decided by the token, not by the request.** There is nothing to
+      send: the `sid` claim names the device the call came from. Ending a session on a device
+      you are not holding is `DELETE /v1/auth/sessions/{id}`, which checks that the session is
+      yours.
+
+      Signing out on one device leaves every other device signed in. A person signing out at a
+      shared terminal must not lose the session on the phone in their pocket.
+
+      ## After this call
+
+      The refresh token on this device stops working immediately. The access token keeps
+      verifying until it expires — it is signed rather than looked up — so a client must
+      discard both rather than relying on the platform to refuse the one it still holds. That
+      window is the fifteen minutes in `expires_in` and is the price of not doing a database
+      read on every request.
+
+      ## It always succeeds
+
+      A session already revoked, and a token naming a session that no longer exists, both answer
+      `204`. The client is discarding its tokens either way, and a failure here would only leave
+      somebody on a screen they cannot get past.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '204':
+        description: The session is ended. No body.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
       '500':
         $ref: '../openapi.yaml#/components/responses/InternalError'
       '503':
