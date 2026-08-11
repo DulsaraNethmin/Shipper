@@ -85,7 +85,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **98 checks**, and `make check` green.
+Verified by `make verify` — **105 checks**, and `make check` green.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -134,6 +134,7 @@ endpoints, and none of these tickets adds one.
 | **SHIP-31** | M1 | Email verification tokens — single-use, one live per account, stored as SHA-256 |
 | **SHIP-33** | M1 | `POST /v1/auth/verify-email` and `/v1/auth/resend-verify` — single-use, and a double click is not an error |
 | **SHIP-34** | M1 | `POST /v1/auth/request-otp` — six digits, argon2id, two rate limits, and a deliberately uninformative answer |
+| **SHIP-36** | M1 | `POST /v1/auth/verify-phone` — one failure code, and the wrong-guess path commits |
 | **SHIP-45** | M1 | Role fixed at registration, immutable afterwards by a `BEFORE UPDATE` trigger on `users` |
 | **SHIP-32** | M1 | Email adapter — console in development, generic HTTP provider in staging |
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
@@ -266,6 +267,14 @@ status. Registration is the deliberate exception, for the reason on `CodeEmailTa
 bucket is about request volume across the authentication surface. This one is about how many
 *messages* an account causes — a bill, and somebody's handset — so it has to survive a Redis
 flush, and the table already records every code that was sent.
+
+**The wrong-guess path in `verify-phone` commits, and that is the one place in the domain where
+a failure is deliberately not an error inside its transaction.** `db.InTx` rolls back on any
+error, so incrementing the attempt counter and then returning `ErrOTPInvalid` from inside the
+closure would roll the increment back with it — the column would stay at zero and the five-guess
+limit would limit nothing. The closure therefore returns `nil` on a wrong guess, having recorded
+it, and the error is produced from the outcome after the commit. It is worth the awkwardness, and
+it is worth the comment: the obvious tidy-up reintroduces the defect silently.
 
 **`created_at` is written from the injected clock rather than defaulted**, on both new tables.
 The two timestamps in a row have to come from one clock: `expires_at` is computed in Go and
@@ -447,7 +456,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-31 SHIP-32 SHIP-33 SHIP-34 SHIP-35 SHIP-37 SHIP-38 SHIP-44 SHIP-45
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-31 SHIP-32 SHIP-33 SHIP-34 SHIP-35 SHIP-36 SHIP-37 SHIP-38 SHIP-44 SHIP-45
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 

@@ -213,3 +213,53 @@ func TestRequestOTPWithoutADatabaseIsUnavailable(t *testing.T) {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
 	}
 }
+
+// TestEveryIdentityRouteIsServedAndPublic (SHIP-33, SHIP-36).
+//
+// One table rather than a test per route, because what is being asserted is the same thing five
+// times: the route reaches a handler, and the auth class it declares is one the router can
+// actually serve. Since SHIP-44 the second half is real — a class with no middleware behind it
+// panics at startup rather than being served open.
+func TestEveryIdentityRouteIsServedAndPublic(t *testing.T) {
+	for path, body := range map[string]string{
+		"/v1/auth/register":      `{"email":"","phone":"","password":"","role":""}`,
+		"/v1/auth/verify-email":  `{"token":""}`,
+		"/v1/auth/resend-verify": `{"email":""}`,
+		"/v1/auth/request-otp":   `{"phone":""}`,
+		"/v1/auth/verify-phone":  `{"phone":"","code":""}`,
+	} {
+		t.Run(path, func(t *testing.T) {
+			rec := postJSON(t, path, body)
+
+			if rec.Code == http.StatusNotFound {
+				t.Fatalf("POST %s is not served", path)
+			}
+			if rec.Code == http.StatusUnauthorized {
+				t.Fatalf("POST %s demands a credential, which is what it exists to help produce", path)
+			}
+		})
+	}
+}
+
+// TestVerifyEmailRefusesAnUnknownTokenThroughTheRouter (SHIP-33).
+//
+// Reachable with no database because an empty token is refused before the pool is looked at,
+// which is also the property that stops a guessing loop costing a connection each.
+func TestVerifyEmailRefusesAnEmptyToken(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/verify-email", strings.NewReader(`{"token":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != "identity_verification_token_invalid" {
+		t.Errorf("code = %q, want identity_verification_token_invalid", got)
+	}
+}

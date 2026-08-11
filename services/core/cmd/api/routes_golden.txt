@@ -4,4 +4,5 @@ POST   /v1/auth/register                        public       v1
 POST   /v1/auth/request-otp                     public       v1
 POST   /v1/auth/resend-verify                   public       v1
 POST   /v1/auth/verify-email                    public       v1
+POST   /v1/auth/verify-phone                    public       v1
 GET    /v1/{$}                                  public       v1

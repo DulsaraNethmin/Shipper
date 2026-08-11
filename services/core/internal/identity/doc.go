@@ -29,11 +29,29 @@
 //     POST /v1/auth/register. Duplicate addresses and numbers are refused by uq_users_email and
 //     uq_users_phone rather than by a SELECT that ran first, because a check-then-insert is a
 //     race two taps on a slow connection will lose.
+//   - verification.go (SHIP-31, SHIP-33) — email verification tokens: issue, resend, and confirm.
+//   - otp.go (SHIP-34, SHIP-36) — phone one-time codes: issue, rate limit, and confirm.
+//   - ports.go — what this domain needs of the email and SMS adapters, declared here because the
+//     consumer declares the interface.
 //   - model.go — the two roles mirroring ck_users_role, the three account states mirroring
 //     ck_users_status, and the User the endpoints return.
 //
-// The rest of the layout in Docs/10 §2.1 arrives with the tickets that need it: ports.go when
-// this domain first needs something of an adapter.
+// # Two hashes, chosen opposite ways
+//
+// The email token is 32 bytes from crypto/rand and is stored as SHA-256; the phone code is six
+// digits and is stored as argon2id. A work factor exists to make a *small* search space
+// expensive, so it is worth 64 MiB on 10^6 possibilities and worth nothing on 2^256. Getting it
+// the other way round is the mistake worth naming: SHA-256 over six digits is a table a laptop
+// builds in under a second, and argon2id on the email token would make the confirm endpoint a
+// denial-of-service lever anybody can pull without an account.
+//
+// # What the endpoints deliberately do not say
+//
+// Registration reports a duplicate address, because the caller is trying to create the account
+// and silence would leave somebody who mistyped their address on a success screen. Nothing else
+// here reports whether contact details are known: resend and request-otp answer 202 with a fixed
+// interval for every outcome, and verify-phone has exactly one failure code. The reasoning is on
+// CodeEmailTaken and CodeOTPInvalid, and it is a decision rather than an inconsistency.
 //
 // # Two things in http.go that should not be here
 //

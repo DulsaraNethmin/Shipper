@@ -49,6 +49,7 @@ them where the call is made, beside the thing the user was trying to do.
 | Code | Meaning |
 |---|---|
 | `identity_email_taken` | An account already exists for this email address. Sign in, or reset the password. |
+| `identity_otp_invalid` | That code is not valid. Ask for a new one and try again. |
 | `identity_phone_taken` | An account already exists for this mobile number. Sign in, or reset the password. |
 | `identity_verification_token_expired` | This verification link has expired. Ask for a new one. |
 | `identity_verification_token_invalid` | This verification link is no longer valid. Ask for a new one. |

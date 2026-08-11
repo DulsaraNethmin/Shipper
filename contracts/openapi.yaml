@@ -133,6 +133,8 @@ paths:
     $ref: './paths/identity.yaml#/ResendVerify'
   /v1/auth/verify-email:
     $ref: './paths/identity.yaml#/VerifyEmail'
+  /v1/auth/verify-phone:
+    $ref: './paths/identity.yaml#/VerifyPhone'
 
 components:
   schemas:

@@ -355,6 +355,87 @@ RequestOTP:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+VerifyPhone:
+  post:
+    operationId: verifyPhone
+    summary: Confirm a mobile number with a one-time code
+    tags: [Identity]
+    description: |
+      Marks the number verified after a correct code (SHIP-36). The code is consumed, so it
+      cannot be used again.
+
+      ## One failure code, deliberately
+
+      Wrong code, expired code, no outstanding code, five wrong guesses already used, or a
+      number with no account at all: every one of them answers `identity_otp_invalid`. Six
+      digits is a guessable space, so every distinction is information handed to whoever is
+      guessing — including whether the number has an account at all.
+
+      The remedy is the same in every case: `POST /v1/auth/request-otp` for a new code.
+
+      ## Attempts
+
+      Five wrong guesses retire the outstanding code. Nothing tells the caller how many are
+      left; the answer is the same before and after.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [phone, code]
+            additionalProperties: false
+            properties:
+              phone:
+                type: string
+                description: The number the code was sent to, in any of the forms a person types it.
+                example: '0412 345 678'
+              code:
+                type: string
+                pattern: '^[0-9]{6}$'
+                example: '408213'
+    responses:
+      '200':
+        description: The number is verified.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Account'
+      '400':
+        description: The code is not usable — `identity_otp_invalid`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: The number or the code was missing or malformed.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # ---------------------------------------------------------------------------------------
 # Shared pieces
 

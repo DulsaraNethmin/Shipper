@@ -238,6 +238,33 @@ func (h *Handler) ResendVerification() http.Handler {
 	})
 }
 
+// verifyPhoneRequest is the body of POST /v1/auth/verify-phone (SHIP-36).
+type verifyPhoneRequest struct {
+	Phone string `json:"phone"`
+	Code  string `json:"code"`
+}
+
+// VerifyPhone handles POST /v1/auth/verify-phone (SHIP-36).
+//
+// Public, and it carries both the number and the code because the caller has no session yet —
+// the code is what establishes that they hold the handset the number reaches.
+func (h *Handler) VerifyPhone() http.Handler {
+	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+		var req verifyPhoneRequest
+		if err := decodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		user, err := h.svc.VerifyPhone(r.Context(), req.Phone, req.Code)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, accountFrom(user))
+		return nil
+	})
+}
+
 // apiError turns this domain's errors into the API's error contract.
 //
 // The mapping lives at the transport edge on purpose: the service answers in domain terms, and
@@ -270,6 +297,10 @@ func apiError(err error) error {
 	case errors.Is(err, ErrVerificationTokenExpired):
 		return httpx.NewError(http.StatusBadRequest, CodeVerificationTokenExpired,
 			"This verification link has expired. Ask for a new one.").WithCause(err)
+
+	case errors.Is(err, ErrOTPInvalid):
+		return httpx.NewError(http.StatusBadRequest, CodeOTPInvalid,
+			"That code is not valid. Ask for a new one and try again.").WithCause(err)
 
 	case errors.Is(err, errUnavailable):
 		// 503 rather than 500, because the two say different things to a mobile client:

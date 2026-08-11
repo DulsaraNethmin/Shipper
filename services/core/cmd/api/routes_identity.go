@@ -56,6 +56,13 @@ func init() {
 			Auth:    Public,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).RequestOTP() },
 		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/auth/verify-phone",
+			Group:   GroupV1,
+			Auth:    Public,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).VerifyPhone() },
+		},
 	)
 }
 

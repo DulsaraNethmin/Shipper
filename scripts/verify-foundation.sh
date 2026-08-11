@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# Demonstrates the "Done when" criterion of every ticket in SHIP-1..SHIP-15.
+# Demonstrates the "Done when" criterion of every foundation and identity ticket that reaches an
+# HTTP endpoint or a database constraint. The exact list is printed at the end of a successful
+# run, and that line is the one to update when a section is added — the header used to say
+# "SHIP-1..SHIP-15" long after it had stopped being true.
 #
 # Docs/09 makes the acceptance criterion the definition of done: if it cannot be shown,
 # the ticket is not finished. This script is how it gets shown — on a developer machine
@@ -1071,6 +1074,65 @@ unknown_tokens="$("$PSQL" "$DATABASE_URL" -tAc \
 ok "and stores nothing for the address that has no account"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-36  POST /v1/auth/verify-phone marks the number verified after a correct OTP"
+
+# The code sent at SHIP-34 was superseded by nothing since, so it is still the live one.
+status="$(post_json "verify-phone-wrong-$$" /v1/auth/verify-phone \
+  "{\"phone\":\"$reg_phone_local\",\"code\":\"000000\"}" "$WORKDIR/verify-phone-wrong.json")"
+if [[ "$status" != "400" ]]; then
+  cat "$WORKDIR/verify-phone-wrong.json"
+  fail "a wrong code returned $status, want 400"
+fi
+[[ "$(json "$WORKDIR/verify-phone-wrong.json" '["error"]["code"]')" == "identity_otp_invalid" ]] \
+  || fail "expected code=identity_otp_invalid"
+ok "a wrong code is refused"
+
+# The attempt is recorded, and that is the half most easily lost: an increment that rolled back
+# with the error would leave the counter at zero and the five-guess limit limiting nothing.
+attempts="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select attempts from phone_otps where user_id = '$registered_id' and consumed_at is null;")"
+[[ "$attempts" == "1" ]] || fail "attempts = $attempts after one wrong guess, want 1"
+ok "the wrong guess was counted, so the attempt limit counts something"
+
+# Every failure looks alike, including the one that would otherwise say whether a number has an
+# account at all.
+status="$(post_json "verify-phone-unknown-$$" /v1/auth/verify-phone \
+  '{"phone":"+61499999998","code":"000000"}' "$WORKDIR/verify-phone-unknown.json")"
+[[ "$status" == "400" ]] || fail "an unknown number returned $status"
+[[ "$(json "$WORKDIR/verify-phone-unknown.json" '["error"]["code"]')" == "identity_otp_invalid" ]] \
+  || fail "an unknown number is distinguishable from a wrong code"
+ok "a number with no account is answered exactly as a wrong code is"
+
+status="$(post_json "verify-phone-$$" /v1/auth/verify-phone \
+  "{\"phone\":\"$reg_phone_local\",\"code\":\"$otp_code\"}" "$WORKDIR/verify-phone.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/verify-phone.json"; fail "POST /v1/auth/verify-phone returned $status, want 200"; }
+[[ "$(json "$WORKDIR/verify-phone.json" '["phone_verified"]')" == "True" ]] \
+  || fail "the response does not report the number as verified"
+ok "the correct code verifies the number"
+
+phone_state="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (u.phone_verified_at is not null)::text || ' ' || coalesce(o.consumed_reason, 'live')
+     from users u join phone_otps o on o.user_id = u.id
+    where u.id = '$registered_id'
+    order by o.created_at desc limit 1;")"
+[[ "$phone_state" == "true verified" ]] || fail "the row says '$phone_state', want 'true verified'"
+ok "the column is set and the code is consumed, both in the database"
+
+# Both channels verified is what Docs/04 §2 requires before a customer may publish, and this run
+# has now established both on one account.
+both_verified="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (email_verified_at is not null and phone_verified_at is not null)::text
+     from users where id = '$registered_id';")"
+[[ "$both_verified" == "true" ]] || fail "the account is not verified on both channels"
+ok "the account is now verified on both channels, which is Docs/04 §2's baseline"
+
+# The code is spent. Replaying it must not verify anything a second time.
+status="$(post_json "verify-phone-replay-$$" /v1/auth/verify-phone \
+  "{\"phone\":\"$reg_phone_local\",\"code\":\"$otp_code\"}" "$WORKDIR/verify-phone-replay.json")"
+[[ "$status" == "400" ]] || fail "a consumed code was accepted again (status $status)"
+ok "the consumed code cannot be used again"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
@@ -1083,4 +1145,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-31, SHIP-33, SHIP-34, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-31, SHIP-33, SHIP-34, SHIP-36, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"

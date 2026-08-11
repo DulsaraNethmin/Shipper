@@ -39,6 +39,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
 const (
@@ -291,4 +292,122 @@ func (s *Service) sendOTP(ctx context.Context, user User, code string) {
 			slog.String("user_id", user.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// VerifyPhone confirms a number against the code that was sent to it (SHIP-36).
+//
+// # Why every failure is one error
+//
+// Wrong code, expired code, no outstanding code, attempts exhausted, and a number with no
+// account at all all return [ErrOTPInvalid]. The email token can afford to report expiry
+// separately because only somebody holding a genuine token ever sees it; six digits is a
+// guessable space, so every distinction here is information handed to whoever is guessing —
+// including the one that matters most, which is whether the number has an account.
+//
+// # Why the wrong-guess path commits
+//
+// The attempt counter is the online defence, and an increment that rolled back with the error
+// would count nothing: a caller could guess indefinitely and the column would stay at zero.
+// So the transaction returns *nil* on a wrong guess, having recorded it, and the error is
+// produced afterwards from the outcome it carried out. That is the one place in this package
+// where a failure is deliberately not an error inside the transaction, and it is worth the
+// awkwardness — the alternative is a limit that does not limit anything.
+func (s *Service) VerifyPhone(ctx context.Context, submittedPhone, code string) (User, error) {
+	phone := normalisePhone(submittedPhone)
+
+	var v validate.Errors
+	if v.Required("phone", phone) && !validE164(phone) {
+		v.Add("phone", validate.CodeInvalid, "Enter an Australian mobile number, like 0412 345 678.")
+	}
+	v.Required("code", code)
+	if err := v.Err(); err != nil {
+		return User{}, err
+	}
+
+	// Checked before anything is hashed. argon2id at the production profile is 64 MiB per
+	// call, and this endpoint needs no account — a caller posting arbitrary strings would
+	// otherwise be able to choose how much memory the service allocates.
+	if !numericCode(code) {
+		return User{}, ErrOTPInvalid
+	}
+
+	if s.pool == nil {
+		return User{}, errUnavailable
+	}
+
+	var (
+		user     User
+		verified bool
+	)
+	if err := db.InTx(ctx, s.pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		user, err = s.store.userByPhone(ctx, r, phone)
+		if err != nil {
+			if isNoRows(err) {
+				// No account. Indistinguishable from a wrong code, which is the point.
+				return nil
+			}
+			return fmt.Errorf("identity: reading the account for a code: %w", err)
+		}
+
+		otp, err := s.store.liveOTP(ctx, r, user.ID)
+		if err != nil {
+			if isNoRows(err) {
+				// Nothing outstanding: never asked for, already used, or exhausted.
+				return nil
+			}
+			return fmt.Errorf("identity: reading the live one-time code: %w", err)
+		}
+
+		now := s.clock.Now().UTC()
+		if otp.Phone != phone || otp.expiredAt(now) {
+			// An expired code is left live rather than retired, so the next request has
+			// something to supersede and the account is not silently left with none.
+			return nil
+		}
+
+		matches, err := s.hasher.Verify(otp.CodeHash, code)
+		if err != nil {
+			// An unreadable hash is a data defect rather than a wrong code, and reporting
+			// it as a wrong code would hide the defect behind an ordinary failure.
+			return fmt.Errorf("identity: verifying a one-time code: %w", err)
+		}
+
+		if !matches {
+			attempts, err := s.store.recordOTPAttempt(ctx, r, otp.ID)
+			if err != nil {
+				return err
+			}
+			if attempts >= otpMaxAttempts {
+				// Retired rather than left to be guessed at. 'exhausted' is a separate
+				// reason from 'superseded' because it is a support conversation and
+				// possibly an attack, and the two should not look alike in the table.
+				if _, err := s.store.consumeOTP(ctx, r, otp.ID, now, consumedExhausted); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		if _, err := s.store.consumeOTP(ctx, r, otp.ID, now, consumedVerified); err != nil {
+			return err
+		}
+		if _, err := s.store.markPhoneVerified(ctx, r, user.ID, now); err != nil {
+			return err
+		}
+
+		user, err = s.store.userByID(ctx, r, user.ID)
+		if err != nil {
+			return err
+		}
+		verified = true
+		return nil
+	}); err != nil {
+		return User{}, err
+	}
+
+	if !verified {
+		return User{}, ErrOTPInvalid
+	}
+	return user, nil
 }

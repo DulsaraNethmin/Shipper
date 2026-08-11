@@ -52,6 +52,19 @@ var (
 	// received it.
 	CodeVerificationTokenExpired = httpx.RegisterCode("identity_verification_token_expired",
 		"This verification link has expired. Ask for a new one.")
+
+	// CodeOTPInvalid is every way a phone verification code fails, and there is deliberately
+	// only one of them.
+	//
+	// Wrong code, expired code, no outstanding code, five wrong guesses already, a number with
+	// no account at all: one answer. The email token can afford to distinguish expiry because
+	// only somebody holding a genuine token sees it; a six-digit code is guessable, so every
+	// distinction is a bit of information handed to whoever is guessing — including the one
+	// that matters most, which is whether the number has an account.
+	//
+	// The remedy is the same for all of them: ask for a new code.
+	CodeOTPInvalid = httpx.RegisterCode("identity_otp_invalid",
+		"That code is not valid. Ask for a new one and try again.")
 )
 
 // The sentinel errors this domain raises.
@@ -118,6 +131,10 @@ var (
 
 	// ErrVerificationTokenExpired means the token was genuine and has lapsed (SHIP-33).
 	ErrVerificationTokenExpired = errors.New("identity: the verification token has expired")
+
+	// ErrOTPInvalid is every unusable phone verification code (SHIP-36). See CodeOTPInvalid
+	// for why there is only one.
+	ErrOTPInvalid = errors.New("identity: the one-time code is not usable")
 
 	// ErrTokenInvalid means the token is not one this platform will honour: unparseable,
 	// wrongly signed, the wrong algorithm, the wrong audience, signed by a retired key, or
