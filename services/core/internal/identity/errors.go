@@ -136,6 +136,17 @@ var (
 	// for why there is only one.
 	ErrOTPInvalid = errors.New("identity: the one-time code is not usable")
 
+	// ErrRefreshTokenInvalid is every way a refresh token cannot be exchanged (SHIP-39):
+	// empty, never issued, already rotated away, past its expiry, belonging to a revoked
+	// session, or held by an account that may no longer sign in.
+	//
+	// Deliberately one error for all of them, and the remedy is the same in every case — sign
+	// in again. Distinguishing them would tell somebody holding a stolen or guessed token
+	// which part of it the platform recognised, and in the suspended-account case it would
+	// disclose account standing to whoever is holding the token rather than to the person who
+	// owns it.
+	ErrRefreshTokenInvalid = errors.New("identity: the refresh token is not usable")
+
 	// ErrTokenInvalid means the token is not one this platform will honour: unparseable,
 	// wrongly signed, the wrong algorithm, the wrong audience, signed by a retired key, or
 	// carrying claims the issuer would never have written.

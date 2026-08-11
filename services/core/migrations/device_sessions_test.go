@@ -27,9 +27,14 @@ func newSession(t *testing.T, pool *pgxpool.Pool, user uuid.UUID, hash, label st
 		t.Fatalf("generating an id: %v", err)
 	}
 
+	// refresh_token_expires_at is supplied rather than defaulted (SHIP-39). The column is NOT
+	// NULL with no default on purpose: a session row with no expiry is a credential that never
+	// lapses, which is the defect 000103 exists to prevent, so a helper that omitted it would
+	// be testing a row the service can never write.
 	_, err = pool.Exec(t.Context(),
-		`INSERT INTO device_sessions (id, user_id, refresh_token_hash, device_label)
-		 VALUES ($1, $2, $3, $4)`,
+		`INSERT INTO device_sessions
+		     (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+		 VALUES ($1, $2, $3, now() + interval '30 days', $4)`,
 		id, user, hash, label)
 	if err != nil {
 		t.Fatalf("inserting a session for %s: %v", user, err)
@@ -80,8 +85,9 @@ func TestDeviceSessionRequiresARealUser(t *testing.T) {
 		id, _ := uuid.NewV7()
 		stranger, _ := uuid.NewV7()
 		_, err := pool.Exec(t.Context(),
-			`INSERT INTO device_sessions (id, user_id, refresh_token_hash, device_label)
-			 VALUES ($1, $2, 'h', 'Pixel 8')`, id, stranger)
+			`INSERT INTO device_sessions
+			     (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+			 VALUES ($1, $2, 'h', now() + interval '30 days', 'Pixel 8')`, id, stranger)
 		if err == nil {
 			t.Fatal("a session was created for an account that does not exist")
 		}
@@ -114,8 +120,9 @@ func TestDeviceSessionRefreshHashIsUnique(t *testing.T) {
 
 	id, _ := uuid.NewV7()
 	_, err := pool.Exec(t.Context(),
-		`INSERT INTO device_sessions (id, user_id, refresh_token_hash, device_label)
-		 VALUES ($1, $2, 'the-same-hash', 'Pixel 8')`, id, second)
+		`INSERT INTO device_sessions
+		     (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+		 VALUES ($1, $2, 'the-same-hash', now() + interval '30 days', 'Pixel 8')`, id, second)
 	if err == nil {
 		t.Fatal("two sessions hold the same refresh token hash")
 	}
@@ -137,8 +144,9 @@ func TestDeviceSessionLabelIsConstrained(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			id, _ := uuid.NewV7()
 			_, err := pool.Exec(t.Context(),
-				`INSERT INTO device_sessions (id, user_id, refresh_token_hash, device_label)
-				 VALUES ($1, $2, $3, $4)`, id, user, "hash-"+name, label)
+				`INSERT INTO device_sessions
+				     (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+				 VALUES ($1, $2, $3, now() + interval '30 days', $4)`, id, user, "hash-"+name, label)
 			if err == nil {
 				t.Fatal("a device nobody could identify in their own device list was accepted")
 			}
@@ -220,8 +228,9 @@ func TestDeviceSessionTimestampsCarryTheirZone(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterating: %v", err)
 	}
-	if found != 3 {
-		t.Errorf("found %d timestamp columns, want 3 (last_seen_at, created_at, updated_at)", found)
+	if found != 4 {
+		t.Errorf("found %d timestamp columns, want 4 (refresh_token_expires_at, last_seen_at, "+
+			"created_at, updated_at)", found)
 	}
 }
 
@@ -260,5 +269,48 @@ func TestDeviceSessionMigrationIsInTheIdentityBlock(t *testing.T) {
 	}
 	if block.Domain != "identity" {
 		t.Errorf("version 100 is in the %q block, want identity", block.Domain)
+	}
+}
+
+// TestDeviceSessionRefreshExpiryIsRequired is SHIP-39's expiry decision, enforced by the schema
+// rather than remembered by the code that writes the row.
+//
+// A session with no expiry is a refresh token that never lapses, which is a stolen phone signed
+// in forever. Docs/11 §9 carried the question from SHIP-38 and 000103 answers it here — so the
+// column is NOT NULL with no default, and an INSERT that omits it fails rather than quietly
+// producing an immortal credential.
+func TestDeviceSessionRefreshExpiryIsRequired(t *testing.T) {
+	pool := pgtest.DB(t)
+	user := newUser(t, pool, "no-expiry@example.com", "+61400000106", "customer")
+
+	id, _ := uuid.NewV7()
+	_, err := pool.Exec(t.Context(),
+		`INSERT INTO device_sessions (id, user_id, refresh_token_hash, device_label)
+		 VALUES ($1, $2, 'hash-no-expiry', 'iPhone')`, id, user)
+	if err == nil {
+		t.Fatal("a session was created with no refresh token expiry, which is a credential " +
+			"that never lapses")
+	}
+	if !strings.Contains(err.Error(), "refresh_token_expires_at") {
+		t.Errorf("expected the NOT NULL on refresh_token_expires_at to refuse it, got: %v", err)
+	}
+}
+
+// TestDeviceSessionRefreshExpiryMustBeInTheFuture catches the clock or configuration mistake
+// where it happens, rather than as a device that can never stay signed in.
+func TestDeviceSessionRefreshExpiryMustBeInTheFuture(t *testing.T) {
+	pool := pgtest.DB(t)
+	user := newUser(t, pool, "past-expiry@example.com", "+61400000107", "customer")
+
+	id, _ := uuid.NewV7()
+	_, err := pool.Exec(t.Context(), `
+		INSERT INTO device_sessions
+		    (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label, created_at)
+		VALUES ($1, $2, 'hash-past-expiry', now() - interval '1 day', 'iPhone', now())`, id, user)
+	if err == nil {
+		t.Fatal("a session was created holding a token that had already expired")
+	}
+	if !strings.Contains(err.Error(), "ck_device_sessions_refresh_expiry") {
+		t.Errorf("expected ck_device_sessions_refresh_expiry to refuse it, got: %v", err)
 	}
 }

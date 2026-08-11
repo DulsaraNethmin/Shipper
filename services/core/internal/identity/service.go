@@ -68,6 +68,7 @@ const (
 type Service struct {
 	pool   *pgxpool.Pool
 	hasher *PasswordHasher
+	issuer *AccessTokenIssuer
 	email  EmailSender
 	sms    SMSSender
 	clock  clock.Clock
@@ -82,9 +83,15 @@ type Service struct {
 // mistake rather than a transient condition: a service with no hasher would accept a password
 // and store nothing derivable from it, and one with no email or SMS sender would register
 // accounts that can never be verified.
-func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, sender EmailSender, texter SMSSender, clk clock.Clock) (*Service, error) {
+func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, issuer *AccessTokenIssuer, sender EmailSender, texter SMSSender, clk clock.Clock) (*Service, error) {
 	if hasher == nil {
 		return nil, errors.New("identity: a service needs a password hasher")
+	}
+	if issuer == nil {
+		// SHIP-39 onwards. A session is a refresh token and the access tokens it produces, so
+		// a service that could create one without an issuer would be a service that hands out
+		// half a credential — a refresh token the caller cannot exchange for anything.
+		return nil, errors.New("identity: a service needs an access token issuer")
 	}
 	if sender == nil {
 		return nil, errors.New("identity: a service needs an email sender")
@@ -95,7 +102,10 @@ func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, sender EmailSender, 
 	if clk == nil {
 		return nil, errors.New("identity: a service needs a clock")
 	}
-	return &Service{pool: pool, hasher: hasher, email: sender, sms: texter, clock: clk}, nil
+	return &Service{
+		pool: pool, hasher: hasher, issuer: issuer,
+		email: sender, sms: texter, clock: clk,
+	}, nil
 }
 
 // RegisterCommand is one registration request, in the domain's own terms (SHIP-30).

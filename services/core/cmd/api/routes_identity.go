@@ -96,7 +96,23 @@ func identityHandler(d Deps) *identity.Handler {
 		panic("cmd/api: identity password hasher: " + err.Error())
 	}
 
-	svc, err := identity.NewService(d.Pool, hasher, newEmailSender(d.Config), newSMSSender(d.Config), d.Clock)
+	// The keyset and the issuer are built here rather than carried on Deps, which is the
+	// pattern the note on Deps describes: both are pure functions of the configuration, so
+	// neither is a reason to grow the shared struct. newRouter builds a *verifier* over the
+	// same keys and passes it to the middleware — two objects over one keyset, because issuing
+	// needs the active key and a TTL while verifying needs the whole set and no TTL.
+	keys, err := identity.NewKeyset(d.Config.Identity.AccessTokenKeys, d.Config.Identity.AccessTokenActiveKID)
+	if err != nil {
+		panic("cmd/api: identity keyset: " + err.Error())
+	}
+
+	issuer, err := identity.NewAccessTokenIssuer(keys, d.Config.Identity.AccessTokenTTL, d.Clock)
+	if err != nil {
+		panic("cmd/api: identity access token issuer: " + err.Error())
+	}
+
+	svc, err := identity.NewService(d.Pool, hasher, issuer,
+		newEmailSender(d.Config), newSMSSender(d.Config), d.Clock)
 	if err != nil {
 		panic("cmd/api: identity service: " + err.Error())
 	}

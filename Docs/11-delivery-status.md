@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **105 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **109 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -169,6 +169,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
+| **SHIP-39** | M1 | Refresh token issue and rotation — opaque, hashed, and the expiry question closed — *see below* |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
@@ -401,6 +402,70 @@ SHIP-15a. That is the shape `httpx.RegisterCode` was in until SHIP-15c: document
 built, and absent, because no domain had needed it yet. `internal/httpx` is a shared surface and
 not a domain branch's to edit, so the two are written unexported in `internal/identity/http.go`
 and flagged in §9 — the second domain to want them should promote them rather than copy them.
+
+### What SHIP-39 built, and the expiry decision it settles
+
+**§9 has carried "`device_sessions` has no expiry column" since SHIP-38, and it is now decided:
+the expiry is an explicit column, `device_sessions.refresh_token_expires_at`, added by
+`000103`.** The reasoning is in the migration's own header at length, because a decision recorded
+only in a status document is one nobody reads at the point of changing it. In brief, the three
+candidates were:
+
+| Where expiry could live | Verdict |
+|---|---|
+| A Redis key TTL | **Refused by `Docs/10` §5.** Redis may hold a denylist as a fast path, but a security control a cache flush can undo is not one — which is why `device_sessions` is in PostgreSQL at all |
+| Derived from `last_seen_at + TTL`, no new column | **Refused.** `last_seen_at` is a *display* column (`000100`), and SHIP-46 will write it from a device-list read. A lifetime derived from it means every future write to a display field silently extends a credential, with nothing to fail on |
+| An explicit column | **Chosen.** An expiry that is written can be read, indexed and audited, and "has this session lapsed" becomes a query rather than arithmetic somebody has to remember |
+
+**It is the *token's* expiry, not the *session's*, and the name says so.** Rotation rewrites it on
+every use, so the window slides: thirty days of inactivity ends a session and a device in daily
+use never reaches it. `Docs/07` §3 asks for a "longer-lived" token rotated on every use, and a
+sliding window is what that means — the other reading, an absolute cap from sign-in, would sign a
+driver out mid-delivery on a schedule. **An absolute cap is deliberately not added**: it is a
+second control with a product consequence rather than a mechanism, and a column nothing writes to
+would be guessing at a design nobody has argued. It is another column and another migration if it
+is ever wanted.
+
+**`NOT NULL` with no default, and that is the control rather than a style choice.** A session row
+with no expiry is a credential that never lapses — a stolen phone signed in forever. There is no
+`DEFAULT` for the reason `insertEmailToken` gives about `created_at`: the value is computed in Go
+from the injected clock, and a database-side default would come from a second clock that can
+disagree with it. `make verify` demonstrates the refusal rather than asserting it.
+
+**The TTL is a constant in `internal/identity`, not configuration**, and that is a scope decision
+worth naming. `internal/config` is a shared surface (`Docs/10` §9.2) and three tracks were open;
+the constant sits beside the password limits in `service.go`, which make the same argument.
+`000103`'s comment says where it would go if it moves.
+
+**Rotation is one row, one hash, and no separate revocation step.** The session holds exactly one
+refresh token hash; rotation overwrites it, so the token presented matches nothing the moment the
+transaction commits. There is no "mark the old one used" that could be forgotten and no window in
+which both work.
+
+**`FOR UPDATE` on the read is what makes rotation single-winner**, and it is checked
+deterministically rather than by racing two goroutines and hoping they overlap. A phone on a poor
+connection fires the same refresh twice; without the lock both transactions read the same row and
+the device ends up holding a token the row has already replaced. `TestARefreshHoldsTheSessionRowUntilItCommits`
+holds the row in one transaction, proves a second reader blocks, and proves it sees the *rotated*
+row after the commit. Mutation-checked: removing `FOR UPDATE` makes the second read return the
+stale row immediately and the test fails on its first assertion. The two-goroutine test alongside
+it deliberately asserts only the invariant, because a test whose coverage depends on scheduling
+reports a mistake intermittently.
+
+**`Service` now takes an `*AccessTokenIssuer`**, which is a signature change to `NewService` and
+the first real consumer of SHIP-37. A service that could create a session without one would hand
+out half a credential: a refresh token the caller cannot exchange for anything. The keyset and the
+issuer are built inside `identityHandler`, from configuration, with no field added to `Deps` —
+which is SHIP-15c's acceptance criterion holding for a second wave.
+
+**One thing the block scheme costs, found here and worth knowing before the next domain hits it.**
+`cmd/migrate` uses stock golang-migrate, which applies only migrations *above* the recorded
+version. A developer database that has jobs migrations applied sits at `000402`, so a new identity
+migration at `000103` is silently skipped by `make migrate-up` — it reports "no change" and the
+column never appears. Tests and CI are unaffected: `make test-db-template` drops and rebuilds from
+scratch, and CI runs `up → down all → up` against an empty database. The local fix is
+`make migrate-down n=all && make migrate-up`. This will bite every migration in `identity`,
+`profiles` and `fleet` from now on, because their blocks sit below `jobs`.
 
 ### What SHIP-48 built, and how it was demonstrated
 

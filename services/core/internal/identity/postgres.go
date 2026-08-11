@@ -315,6 +315,82 @@ func (postgresStore) lastOTPAt(ctx context.Context, r db.Runner, userID uuid.UUI
 	return *at, true, nil
 }
 
+// deviceSessionColumns is the projection every read of a device session shares (SHIP-39).
+const deviceSessionColumns = `id, user_id, refresh_token_hash, refresh_token_expires_at, ` +
+	`device_label, last_seen_at, created_at`
+
+// insertDeviceSession writes a newly created session (SHIP-39).
+//
+// created_at and last_seen_at are written rather than defaulted, from the same clock that
+// computed refresh_token_expires_at. The columns carry DEFAULT now() as a safety net for any
+// other writer, but a row whose timestamps come from two clocks can violate
+// ck_device_sessions_refresh_expiry under ordinary skew between the service and the database —
+// the same reasoning insertEmailToken gives.
+func (postgresStore) insertDeviceSession(ctx context.Context, r db.Runner, s deviceSession) error {
+	_, err := r.Exec(ctx, `
+		INSERT INTO device_sessions
+		    (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label,
+		     last_seen_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		s.ID, s.UserID, s.RefreshTokenHash, s.RefreshTokenExpiresAt, s.DeviceLabel,
+		s.LastSeenAt, s.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("identity: inserting a device session: %w", err)
+	}
+	return nil
+}
+
+// deviceSessionByRefreshHash reads the session a refresh token belongs to, locking it for the
+// duration of the transaction (SHIP-39).
+//
+// FOR UPDATE is what makes rotation single-winner. Two refreshes presenting the same token
+// arrive together — a phone retrying over a flaky connection — and without the lock both read
+// the same row, both write a new hash, and the device ends up holding a token the session has
+// already replaced. With it, the second one blocks and then re-evaluates the predicate against
+// the committed row, finds the hash gone, and takes the not-live path instead.
+func (postgresStore) deviceSessionByRefreshHash(ctx context.Context, r db.Runner, hash string) (deviceSession, error) {
+	row := r.QueryRow(ctx,
+		`SELECT `+deviceSessionColumns+`
+		   FROM device_sessions
+		  WHERE refresh_token_hash = $1
+		  FOR UPDATE`, hash)
+	return scanDeviceSession(row)
+}
+
+// rotateDeviceSession replaces the session's refresh token with the next one (SHIP-39).
+//
+// The previous hash is in the WHERE clause rather than trusted from a read that happened a
+// moment ago, and RowsAffected is checked. Callers today hold the row lock from
+// deviceSessionByRefreshHash, so this cannot fail — which is exactly why it is worth having: a
+// later caller that forgets the lock gets an error rather than a lost update.
+func (postgresStore) rotateDeviceSession(ctx context.Context, r db.Runner, s deviceSession, previousHash string) error {
+	tag, err := r.Exec(ctx, `
+		UPDATE device_sessions
+		   SET refresh_token_hash = $2, refresh_token_expires_at = $3, last_seen_at = $4
+		 WHERE id = $1 AND refresh_token_hash = $5`,
+		s.ID, s.RefreshTokenHash, s.RefreshTokenExpiresAt, s.LastSeenAt, previousHash)
+	if err != nil {
+		return fmt.Errorf("identity: rotating a device session: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("identity: rotating device session %s affected %d rows, want 1",
+			s.ID, tag.RowsAffected())
+	}
+	return nil
+}
+
+// scanDeviceSession reads one row in the order deviceSessionColumns declares.
+func scanDeviceSession(row interface{ Scan(...any) error }) (deviceSession, error) {
+	var s deviceSession
+	if err := row.Scan(
+		&s.ID, &s.UserID, &s.RefreshTokenHash, &s.RefreshTokenExpiresAt,
+		&s.DeviceLabel, &s.LastSeenAt, &s.CreatedAt,
+	); err != nil {
+		return deviceSession{}, err
+	}
+	return s, nil
+}
+
 // isNoRows reports whether a read found nothing, which is an outcome rather than a failure at
 // every call site in this package.
 func isNoRows(err error) bool { return errors.Is(err, db.ErrNoRows) }

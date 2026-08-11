@@ -103,14 +103,21 @@ verify_user="$("$PSQL" "$DATABASE_URL" -qtAc \
   "insert into users (id, email, phone, password_hash, role)
    values (gen_random_uuid(), 'session-$$@example.com', '+6140003$$', 'x', 'customer')
    returning id;")"
+# refresh_token_expires_at is supplied because SHIP-39 made it NOT NULL with no default, and a
+# session with no expiry is exactly what that column exists to refuse. SHIP-39's own section
+# below checks the refusal; here the column is only what makes an otherwise valid row valid.
 "$PSQL" "$DATABASE_URL" -q -c \
-  "insert into device_sessions (id, user_id, refresh_token_hash, device_label)
-   values (gen_random_uuid(), '$verify_user', 'hash-$$', 'Verify iPhone');" >/dev/null \
+  "insert into device_sessions
+       (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+   values (gen_random_uuid(), '$verify_user', 'hash-$$', now() + interval '30 days',
+           'Verify iPhone');" >/dev/null \
   || fail "a device session could not be created"
 
 if "$PSQL" "$DATABASE_URL" -q -c \
-  "insert into device_sessions (id, user_id, refresh_token_hash, device_label)
-   values (gen_random_uuid(), '$verify_user', 'hash-$$', 'Verify Pixel');" >/dev/null 2>&1; then
+  "insert into device_sessions
+       (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+   values (gen_random_uuid(), '$verify_user', 'hash-$$', now() + interval '30 days',
+           'Verify Pixel');" >/dev/null 2>&1; then
   fail "two sessions hold the same refresh token hash"
 fi
 ok "a refresh token hash belongs to exactly one session"
@@ -607,3 +614,59 @@ status="$(post_json "verify-phone-replay-$$" /v1/auth/verify-phone \
   "{\"phone\":\"$reg_phone_local\",\"code\":\"$otp_code\"}" "$WORKDIR/verify-phone-replay.json")"
 [[ "$status" == "400" ]] || fail "a consumed code was accepted again (status $status)"
 ok "the consumed code cannot be used again"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-39  a refresh token that expires, rotated on every use"
+
+# The behaviour — a new token each time, the predecessor refused, one winner when two arrive
+# together — is demonstrated end to end against the running service in SHIP-42's section below,
+# because that is where the endpoint exists. What is checked here is the half that lives in the
+# schema: the expiry decision Docs/11 §9 carried from SHIP-38, and which 000103 settles.
+
+expiry_column="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select data_type || ' null=' || is_nullable || ' default=' || coalesce(column_default, 'none')
+     from information_schema.columns
+    where table_schema = 'public' and table_name = 'device_sessions'
+      and column_name = 'refresh_token_expires_at';")"
+[[ -n "$expiry_column" ]] \
+  || fail "device_sessions has no refresh_token_expires_at; a refresh token that never expires is a stolen phone signed in forever"
+[[ "$expiry_column" == "timestamp with time zone null=NO default=none" ]] \
+  || fail "refresh_token_expires_at is '$expiry_column', want 'timestamp with time zone null=NO default=none'"
+ok "the refresh token's expiry is an explicit column, NOT NULL, and not defaulted by the database"
+
+# NOT NULL with no default is the whole control. A default would let a writer omit the expiry
+# and get one from the database's clock rather than from the clock that computed it.
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions (id, user_id, refresh_token_hash, device_label)
+   values (gen_random_uuid(), '$verify_user', 'no-expiry-$$', 'Verify iPhone');" >/dev/null 2>&1; then
+  fail "a session was created with no refresh token expiry"
+fi
+ok "a session with no expiry is refused, so no credential can be issued without a lifetime"
+
+# An expiry already in the past at the moment of issue is a clock or configuration mistake, and
+# it is worth catching where it happens rather than as a device that can never stay signed in.
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions
+       (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label, created_at)
+   values (gen_random_uuid(), '$verify_user', 'past-expiry-$$',
+           now() - interval '1 day', 'Verify iPhone', now());" >/dev/null 2>&1; then
+  fail "a session was created holding a token that had already expired"
+fi
+ok "ck_device_sessions_refresh_expiry refuses a token that expired before it was issued"
+
+# The expiry is its own column rather than being derived from last_seen_at, which 000100
+# describes as display text for the device list. Deriving a credential's lifetime from a display
+# column means every future write to it silently extends the credential — so the two must be
+# separately writable, and this shows they are.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions
+       (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label, last_seen_at)
+   values (gen_random_uuid(), '$verify_user', 'sliding-$$',
+           now() + interval '30 days', 'Verify iPhone', now() - interval '10 days');" >/dev/null \
+  || fail "a session could not be created with an expiry and a last_seen_at that disagree"
+independent="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (refresh_token_expires_at > last_seen_at + interval '35 days')::text
+     from device_sessions where refresh_token_hash = 'sliding-$$';")"
+[[ "$independent" == "true" ]] \
+  || fail "the expiry appears to be derived from last_seen_at rather than written independently"
+ok "expiry and last seen are separate columns, so a device-list read cannot extend a session"
