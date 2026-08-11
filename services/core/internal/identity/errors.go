@@ -147,6 +147,19 @@ var (
 	// owns it.
 	ErrRefreshTokenInvalid = errors.New("identity: the refresh token is not usable")
 
+	// ErrRefreshTokenReused means a token that had already been rotated away was presented
+	// again, and the whole device session has been revoked as a result (SHIP-40).
+	//
+	// **The caller is told exactly what ErrRefreshTokenInvalid tells them** — apiError maps
+	// both to one code, and the remedy is the same. This exists so the service can log a
+	// security event with the session attached, and so a test can tell "the session was
+	// revoked" from "the token was refused", which are different claims about what happened.
+	//
+	// Docs/07 §3 is what makes it a revocation rather than a refusal: either the device
+	// replayed the token, which SHIP-50's interceptor exists to prevent, or somebody else has
+	// a copy — and the platform cannot tell those apart, so it ends the session for both.
+	ErrRefreshTokenReused = errors.New("identity: the refresh token has already been used")
+
 	// ErrTokenInvalid means the token is not one this platform will honour: unparseable,
 	// wrongly signed, the wrong algorithm, the wrong audience, signed by a retired key, or
 	// carrying claims the issuer would never have written.

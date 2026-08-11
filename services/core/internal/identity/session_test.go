@@ -2,6 +2,7 @@ package identity
 
 import (
 	"errors"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -137,20 +138,28 @@ func TestRefreshRotation(t *testing.T) {
 		}
 	})
 
-	t.Run("the predecessor no longer works", func(t *testing.T) {
-		if _, err := svc.Refresh(t.Context(), first.Refresh.Value); !errors.Is(err, ErrRefreshTokenInvalid) {
-			t.Errorf("presenting the rotated token returned %v, want ErrRefreshTokenInvalid — "+
-				"a predecessor that still refreshes is a credential rotation did not retire", err)
-		}
-	})
-
-	t.Run("the successor does", func(t *testing.T) {
+	// The successor is exercised before the predecessor, and the order is load-bearing:
+	// presenting a spent token revokes the whole session (SHIP-40), so checking the
+	// predecessor first would leave nothing for this subtest to refresh with.
+	t.Run("the successor works", func(t *testing.T) {
 		third, err := svc.Refresh(t.Context(), second.Refresh.Value)
 		if err != nil {
 			t.Fatalf("refreshing with the new token: %v", err)
 		}
 		if third.Refresh.Value == second.Refresh.Value {
 			t.Error("the second rotation returned the token it was given")
+		}
+		second = third
+	})
+
+	t.Run("the predecessor no longer works", func(t *testing.T) {
+		// ErrRefreshTokenReused rather than ErrRefreshTokenInvalid, because SHIP-40 sharpens
+		// what "invalidated" means: the platform recognises the token as one it issued and
+		// spent, and ends the session rather than merely refusing the request. Both are the
+		// same answer to the caller.
+		if _, err := svc.Refresh(t.Context(), first.Refresh.Value); !errors.Is(err, ErrRefreshTokenReused) {
+			t.Errorf("presenting the rotated token returned %v, want ErrRefreshTokenReused — "+
+				"a predecessor that still refreshes is a credential rotation did not retire", err)
 		}
 	})
 }
@@ -553,5 +562,265 @@ func TestAServiceWithNoIssuerIsRefused(t *testing.T) {
 	if _, err := NewService(nil, hasher, nil,
 		&recordingSender{}, &recordingTexter{}, clock.System{}); err == nil {
 		t.Error("a service was built with no access token issuer")
+	}
+}
+
+// --- SHIP-40: reuse detection ------------------------------------------------------------
+
+// sessionRevocation reads how a session ended, or "live" if it has not.
+func sessionRevocation(t *testing.T, pool *pgxpool.Pool, sessionID string) string {
+	t.Helper()
+
+	var state string
+	if err := pool.QueryRow(t.Context(),
+		`SELECT coalesce(revoked_reason, 'live') FROM device_sessions WHERE id = $1`,
+		sessionID).Scan(&state); err != nil {
+		t.Fatalf("reading the revocation: %v", err)
+	}
+	return state
+}
+
+// TestPresentingAConsumedTokenRevokesTheWholeSession is SHIP-40's acceptance criterion, and the
+// emphasis is on *the whole session*.
+//
+// Refusing the reused token alone would be the plausible implementation and would leave the
+// person who stole it holding a working session: they rotate, the legitimate device's token
+// becomes the spent one, and it is the owner who gets signed out. Revoking the session ends it
+// for both, which is the only outcome the platform can choose without being able to tell them
+// apart.
+func TestPresentingAConsumedTokenRevokesTheWholeSession(t *testing.T) {
+	svc, pool, user := newSessionService(t, clock.System{})
+
+	first, err := svc.startSession(t.Context(), pool, user, "iPhone")
+	if err != nil {
+		t.Fatalf("starting the session: %v", err)
+	}
+	second, err := svc.Refresh(t.Context(), first.Refresh.Value)
+	if err != nil {
+		t.Fatalf("refreshing: %v", err)
+	}
+
+	if _, err := svc.Refresh(t.Context(), first.Refresh.Value); !errors.Is(err, ErrRefreshTokenReused) {
+		t.Fatalf("presenting the spent token returned %v, want ErrRefreshTokenReused", err)
+	}
+
+	t.Run("the revocation survived the refusal", func(t *testing.T) {
+		// The one that a plausible implementation loses: db.InTx rolls back on any error, so
+		// returning the refusal from inside the closure would undo the revocation with it and
+		// leave the session live. VerifyPhone documents the same trap.
+		if got := sessionRevocation(t, pool, first.SessionID.String()); got != "refresh_token_reused" {
+			t.Errorf("the session is %q, want refresh_token_reused — the revocation was rolled "+
+				"back by the error that reports it", got)
+		}
+	})
+
+	t.Run("the token the legitimate device holds stops working too", func(t *testing.T) {
+		if _, err := svc.Refresh(t.Context(), second.Refresh.Value); !errors.Is(err, ErrRefreshTokenInvalid) {
+			t.Errorf("the live token still refreshed (%v); the session was not invalidated, "+
+				"only the reused token was refused", err)
+		}
+	})
+}
+
+// TestReuseIsDetectedManyRotationsLater is the case a cheaper design silently fails.
+//
+// Keeping only the *previous* hash beside the current one satisfies the criterion for exactly
+// one generation. A token stolen and then left while the legitimate device refreshes a few times
+// matches neither column, is answered "unknown", and the session survives — which is precisely
+// the situation reuse detection exists for.
+func TestReuseIsDetectedManyRotationsLater(t *testing.T) {
+	svc, pool, user := newSessionService(t, clock.System{})
+
+	pair, err := svc.startSession(t.Context(), pool, user, "iPhone")
+	if err != nil {
+		t.Fatalf("starting the session: %v", err)
+	}
+	stolen := pair.Refresh.Value
+
+	for i := range 5 {
+		pair, err = svc.Refresh(t.Context(), pair.Refresh.Value)
+		if err != nil {
+			t.Fatalf("rotation %d: %v", i+1, err)
+		}
+	}
+
+	if _, err := svc.Refresh(t.Context(), stolen); !errors.Is(err, ErrRefreshTokenReused) {
+		t.Fatalf("a token spent five rotations ago returned %v, want ErrRefreshTokenReused — "+
+			"only the most recent consumption is being remembered", err)
+	}
+	if got := sessionRevocation(t, pool, pair.SessionID.String()); got != "refresh_token_reused" {
+		t.Errorf("the session is %q, want refresh_token_reused", got)
+	}
+}
+
+// TestAnUnknownTokenRevokesNothing is the other half of reuse detection, and the half that stops
+// it being a weapon.
+//
+// If a token matching nothing revoked something, anybody could end sessions by guessing. Only a
+// token this platform issued and has already rotated away is evidence of anything.
+func TestAnUnknownTokenRevokesNothing(t *testing.T) {
+	svc, pool, user := newSessionService(t, clock.System{})
+
+	pair, err := svc.startSession(t.Context(), pool, user, "iPhone")
+	if err != nil {
+		t.Fatalf("starting the session: %v", err)
+	}
+
+	// ErrRefreshTokenInvalid and not ErrRefreshTokenReused: the two are separate sentinels and
+	// neither wraps the other, so this assertion excludes reuse rather than merely allowing it.
+	if _, err := svc.Refresh(t.Context(), "9qE2vT7bYw1sJk4pNc0aRlX8oZgHdM3uQiV6yB5tCfE"); !errors.Is(err, ErrRefreshTokenInvalid) {
+		t.Errorf("got %v, want ErrRefreshTokenInvalid — a token nobody issued is not reuse", err)
+	}
+	if got := sessionRevocation(t, pool, pair.SessionID.String()); got != "live" {
+		t.Fatalf("a guessed token ended a session (%q); anybody could sign anybody out", got)
+	}
+	if _, err := svc.Refresh(t.Context(), pair.Refresh.Value); err != nil {
+		t.Errorf("the session stopped working after an unrelated guess: %v", err)
+	}
+}
+
+// TestReplayingAReusedTokenDoesNotRewriteTheRevocation. The instant a session ended is what a
+// support conversation and a device list both read, and a third presentation must not move it.
+func TestReplayingAReusedTokenDoesNotRewriteTheRevocation(t *testing.T) {
+	clk := clock.NewFixed(time.Date(2026, time.August, 11, 9, 0, 0, 0, time.UTC))
+	svc, pool, user := newSessionService(t, clk)
+
+	pair, err := svc.startSession(t.Context(), pool, user, "iPhone")
+	if err != nil {
+		t.Fatalf("starting the session: %v", err)
+	}
+	if _, err := svc.Refresh(t.Context(), pair.Refresh.Value); err != nil {
+		t.Fatalf("refreshing: %v", err)
+	}
+
+	if _, err := svc.Refresh(t.Context(), pair.Refresh.Value); !errors.Is(err, ErrRefreshTokenReused) {
+		t.Fatalf("the first reuse returned %v", err)
+	}
+	var firstRevocation time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT revoked_at FROM device_sessions WHERE id = $1`, pair.SessionID).Scan(&firstRevocation); err != nil {
+		t.Fatalf("reading revoked_at: %v", err)
+	}
+
+	clk.Advance(time.Hour)
+	if _, err := svc.Refresh(t.Context(), pair.Refresh.Value); !errors.Is(err, ErrRefreshTokenReused) {
+		t.Fatalf("the second reuse returned %v", err)
+	}
+
+	var secondRevocation time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT revoked_at FROM device_sessions WHERE id = $1`, pair.SessionID).Scan(&secondRevocation); err != nil {
+		t.Fatalf("reading revoked_at: %v", err)
+	}
+	if !secondRevocation.Equal(firstRevocation) {
+		t.Errorf("revoked_at moved from %s to %s on a replay", firstRevocation, secondRevocation)
+	}
+}
+
+// TestARefreshTokenHashIsLiveOrSpentAndNeverBoth is the invariant 000104 is shaped around.
+//
+// It is what makes two lookups an answer rather than an ambiguity: the live column, then the
+// ledger. A hash in both places would make "is this token current" depend on which query ran
+// first.
+func TestARefreshTokenHashIsLiveOrSpentAndNeverBoth(t *testing.T) {
+	svc, pool, user := newSessionService(t, clock.System{})
+
+	pair, err := svc.startSession(t.Context(), pool, user, "iPhone")
+	if err != nil {
+		t.Fatalf("starting the session: %v", err)
+	}
+	for range 3 {
+		pair, err = svc.Refresh(t.Context(), pair.Refresh.Value)
+		if err != nil {
+			t.Fatalf("refreshing: %v", err)
+		}
+	}
+
+	var overlap int
+	if err := pool.QueryRow(t.Context(), `
+		SELECT count(*)
+		FROM device_sessions d
+		JOIN consumed_refresh_tokens c ON c.token_hash = d.refresh_token_hash`).Scan(&overlap); err != nil {
+		t.Fatalf("looking for an overlap: %v", err)
+	}
+	if overlap != 0 {
+		t.Errorf("%d hashes are live and spent at once", overlap)
+	}
+
+	// And every rotation left its predecessor behind: three rotations, three spent tokens.
+	var spent int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM consumed_refresh_tokens WHERE session_id = $1`,
+		pair.SessionID).Scan(&spent); err != nil {
+		t.Fatalf("counting spent tokens: %v", err)
+	}
+	if spent != 3 {
+		t.Errorf("%d spent tokens recorded after three rotations, want 3", spent)
+	}
+}
+
+// TestSpentTokensAreStoredHashed. The ledger is a credential table in exactly the way
+// device_sessions is, and a spent token is still a token somebody's phone once held.
+func TestSpentTokensAreStoredHashed(t *testing.T) {
+	svc, pool, user := newSessionService(t, clock.System{})
+
+	pair, err := svc.startSession(t.Context(), pool, user, "iPhone")
+	if err != nil {
+		t.Fatalf("starting the session: %v", err)
+	}
+	if _, err := svc.Refresh(t.Context(), pair.Refresh.Value); err != nil {
+		t.Fatalf("refreshing: %v", err)
+	}
+
+	var raw int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM consumed_refresh_tokens WHERE token_hash = $1`,
+		pair.Refresh.Value).Scan(&raw); err != nil {
+		t.Fatalf("searching for the token: %v", err)
+	}
+	if raw != 0 {
+		t.Error("the spent token itself appears in consumed_refresh_tokens")
+	}
+
+	var hashed int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM consumed_refresh_tokens WHERE token_hash = $1`,
+		hashRefreshToken(pair.Refresh.Value)).Scan(&hashed); err != nil {
+		t.Fatalf("searching for the hash: %v", err)
+	}
+	if hashed != 1 {
+		t.Errorf("%d rows hold the hash of the spent token, want 1", hashed)
+	}
+}
+
+// TestRevokedReasonsMatchTheConstraint is Docs/10 §3.4's pairing: the Go constants and the
+// database CHECK are two copies of one list, and this is what stops them drifting.
+//
+// The drift that matters is a Go constant the constraint does not permit — a revocation path
+// that fails at the write, in production, on the one code path nobody exercises by hand.
+func TestRevokedReasonsMatchTheConstraint(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	var definition string
+	if err := pool.QueryRow(t.Context(), `
+		SELECT pg_get_constraintdef(oid)
+		FROM pg_constraint
+		WHERE conname = 'ck_device_sessions_revoked_reason'`).Scan(&definition); err != nil {
+		t.Fatalf("reading the constraint: %v", err)
+	}
+
+	inConstraint := map[string]bool{}
+	for _, quoted := range regexp.MustCompile(`'([a-z_]+)'`).FindAllStringSubmatch(definition, -1) {
+		inConstraint[quoted[1]] = true
+	}
+
+	for _, reason := range revokedReasons {
+		if !inConstraint[reason] {
+			t.Errorf("the Go constant %q is not permitted by the constraint: %s", reason, definition)
+		}
+		delete(inConstraint, reason)
+	}
+	for reason := range inConstraint {
+		t.Errorf("the constraint permits %q and no Go constant names it: %s", reason, definition)
 	}
 }

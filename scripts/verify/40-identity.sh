@@ -670,3 +670,73 @@ independent="$("$PSQL" "$DATABASE_URL" -tAc \
 [[ "$independent" == "true" ]] \
   || fail "the expiry appears to be derived from last_seen_at rather than written independently"
 ok "expiry and last seen are separate columns, so a device-list read cannot extend a session"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-40  presenting a consumed refresh token invalidates the whole device session"
+
+# Like SHIP-39 above, the behaviour is driven end to end in SHIP-42's section, where the
+# endpoint exists. What is checked here is the state the behaviour rests on: a spent token has
+# to stay recognisable, and a session has to be able to end.
+
+"$PSQL" "$DATABASE_URL" -tAc \
+  "select 1 from information_schema.tables where table_name = 'consumed_refresh_tokens';" | grep -q 1 \
+  || fail "consumed_refresh_tokens does not exist; a rotated token would be indistinguishable from one nobody issued"
+ok "consumed_refresh_tokens exists, at migration 000104 inside identity's reserved block"
+
+# Unique, because the hash is what reuse detection looks a session up by and the answer decides
+# what gets revoked.
+hash_index="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from pg_index i
+     join pg_class t on t.oid = i.indrelid
+     join pg_class x on x.oid = i.indexrelid
+    where t.relname = 'consumed_refresh_tokens' and i.indisunique
+      and x.relname = 'uq_consumed_refresh_tokens_hash';")"
+[[ "$hash_index" == "1" ]] || fail "consumed_refresh_tokens.token_hash is not uniquely indexed"
+ok "a spent token hash belongs to exactly one session"
+
+# The three revocation reasons, constrained by the database rather than by application logic —
+# and a session ends by being marked, never by being deleted (Docs/10 §3.3).
+revoked_columns="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(column_name, ' ' order by column_name)
+     from information_schema.columns
+    where table_schema = 'public' and table_name = 'device_sessions'
+      and column_name in ('revoked_at', 'revoked_reason');")"
+[[ "$revoked_columns" == "revoked_at revoked_reason" ]] \
+  || fail "device_sessions cannot record that a session ended; found '$revoked_columns'"
+ok "a session ends by being marked revoked, with a reason, rather than by being deleted"
+
+# One user, one session, used from here down. A fresh account rather than $registered_id,
+# because this section revokes what it creates.
+reuse_user="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into users (id, email, phone, password_hash, role)
+   values (gen_random_uuid(), 'reuse-$$@example.com', '+6140004$$', 'x', 'customer')
+   returning id;")"
+reuse_session="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into device_sessions
+       (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+   values (gen_random_uuid(), '$reuse_user', 'reuse-live-$$', now() + interval '30 days',
+           'Verify iPhone')
+   returning id;")"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "update device_sessions set revoked_at = now() where id = '$reuse_session';" >/dev/null 2>&1; then
+  fail "a session was revoked with no reason recorded"
+fi
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "update device_sessions set revoked_at = now(), revoked_reason = 'because'
+    where id = '$reuse_session';" >/dev/null 2>&1; then
+  fail "an unrecognised revocation reason was accepted"
+fi
+ok "ck_device_sessions_revoked and ck_device_sessions_revoked_reason both hold"
+
+# The invariant 000104 is shaped around: a hash is live in device_sessions or spent in the
+# ledger, never both. Two lookups are only an answer while that holds.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into consumed_refresh_tokens (id, session_id, token_hash, consumed_at)
+   values (gen_random_uuid(), '$reuse_session', 'reuse-spent-$$', now());" >/dev/null \
+  || fail "a spent token could not be recorded"
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "delete from device_sessions where id = '$reuse_session';" >/dev/null 2>&1; then
+  fail "deleting the session took the evidence that its tokens were spent with it"
+fi
+ok "ON DELETE RESTRICT holds, so a deleted session cannot turn spent tokens back into unknown ones"

@@ -228,9 +228,9 @@ func TestDeviceSessionTimestampsCarryTheirZone(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterating: %v", err)
 	}
-	if found != 4 {
-		t.Errorf("found %d timestamp columns, want 4 (refresh_token_expires_at, last_seen_at, "+
-			"created_at, updated_at)", found)
+	if found != 5 {
+		t.Errorf("found %d timestamp columns, want 5 (refresh_token_expires_at, last_seen_at, "+
+			"revoked_at, created_at, updated_at)", found)
 	}
 }
 

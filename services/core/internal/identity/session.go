@@ -31,12 +31,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
@@ -65,6 +67,31 @@ const (
 	// handed a constraint violation.
 	maxDeviceLabelLength = 120
 )
+
+// The reasons a device session stops being usable. They are exactly the values
+// ck_device_sessions_revoked_reason permits (000104), so the Go constants and the database
+// constraint cannot drift into disagreeing (Docs/10 §3.4) — TestRevokedReasonsMatchTheConstraint
+// is what holds the two together.
+//
+// Three, and each has a ticket behind it rather than being a value somebody might want later.
+const (
+	// revokedReasonTokenReused is SHIP-40: a token that had already been rotated away was
+	// presented again.
+	revokedReasonTokenReused = "refresh_token_reused"
+
+	// revokedReasonSignedOut is SHIP-43: the person signed this device out.
+	revokedReasonSignedOut = "signed_out"
+
+	// revokedReasonByOwner is SHIP-46: the person revoked it from their device list.
+	revokedReasonByOwner = "revoked_by_owner"
+)
+
+// revokedReasons is the closed list, for the test that reads the CHECK constraint back.
+var revokedReasons = []string{
+	revokedReasonTokenReused,
+	revokedReasonSignedOut,
+	revokedReasonByOwner,
+}
 
 // RefreshToken is an issued refresh token and the instant it stops being usable.
 //
@@ -100,8 +127,16 @@ type deviceSession struct {
 	DeviceLabel string
 	LastSeenAt  time.Time
 
+	// RevokedAt and RevokedReason are nil while the session is live (SHIP-40). The row is
+	// marked rather than deleted: "signed out three weeks ago" is what makes a device list
+	// readable, and Docs/10 §3.3 forbids deletion as a way of ending something.
+	RevokedAt     *time.Time
+	RevokedReason *string
+
 	CreatedAt time.Time
 }
+
+func (s deviceSession) revoked() bool { return s.RevokedAt != nil }
 
 func (s deviceSession) refreshExpiredAt(now time.Time) bool {
 	return !now.Before(s.RefreshTokenExpiresAt)
@@ -227,22 +262,29 @@ func (s *Service) pairFor(user User, session deviceSession, rawRefresh string) (
 //
 // The session row holds exactly one hash. Rotation overwrites it, so the token that was
 // presented matches nothing the moment the transaction commits — there is no separate
-// revocation step that could be forgotten, and no window in which both tokens work.
+// revocation step that could be forgotten, and no window in which both tokens work. The spent
+// hash is written to consumed_refresh_tokens in the same transaction (SHIP-40), which is what
+// turns a second presentation from "unknown token" into "reuse".
 //
 // # Why every refusal is one error
 //
-// Unknown token, expired token, suspended account: all [ErrRefreshTokenInvalid]. The remedy is
-// identical for every one of them — sign in again — and naming which check refused a credential
-// is help only somebody probing has a use for. The same reasoning as [CodeOTPInvalid], one
-// credential along.
+// Unknown token, expired token, revoked session, suspended account: all
+// [ErrRefreshTokenInvalid]. The remedy is identical for every one of them — sign in again — and
+// naming which check refused a credential is help only somebody probing has a use for. The same
+// reasoning as [CodeOTPInvalid], one credential along.
+//
+// [ErrRefreshTokenReused] is the one exception, and it is not a distinction the *caller* sees:
+// apiError maps both to one code. It exists so the service can log a security event and so a
+// test can tell "the session was revoked" from "the token was refused", which are different
+// claims.
 //
 // # Why the transaction's outcome is separated from its error
 //
-// Nothing on this path needs the distinction yet, and SHIP-40's does: detecting a reused token
-// writes a revocation, and returning an error from inside db.InTx rolls the whole closure back —
-// so the revocation would be undone by the very error that reports it. VerifyPhone documents the
-// same trap in the same package. The shape is here from the start so that adding the reuse branch
-// is a branch rather than a restructuring of a working refresh.
+// Detecting a reused token writes a revocation, and returning an error from inside db.InTx rolls
+// the whole closure back — so the revocation would be undone by the very error that reports it.
+// VerifyPhone documents the same trap in the same package: the closure returns nil having
+// recorded what happened, and the outcome becomes an error after the commit. The obvious tidy-up
+// reintroduces the defect silently, which is why it is written down twice.
 func (s *Service) Refresh(ctx context.Context, presented string) (TokenPair, error) {
 	raw := strings.TrimSpace(presented)
 	if raw == "" {
@@ -285,14 +327,19 @@ func (s *Service) rotate(ctx context.Context, r db.Runner, hash string) (pair To
 	if err != nil {
 		if isNoRows(err) {
 			// No session holds this token. It was never issued, or it has already been
-			// rotated away — SHIP-40 is the ticket that tells those two apart and revokes
-			// the session for the second.
-			return TokenPair{}, ErrRefreshTokenInvalid, nil
+			// rotated away, and those are answered very differently (SHIP-40).
+			return s.detectReuse(ctx, r, hash, now)
 		}
 		return TokenPair{}, nil, fmt.Errorf("identity: reading a device session: %w", err)
 	}
 
-	if session.refreshExpiredAt(now) {
+	switch {
+	case session.revoked():
+		// SHIP-40's revocation, SHIP-43's sign-out and SHIP-46's revoke all land here. The
+		// session is over, and the token that survives on the device buys nothing.
+		return TokenPair{}, ErrRefreshTokenInvalid, nil
+
+	case session.refreshExpiredAt(now):
 		return TokenPair{}, ErrRefreshTokenInvalid, nil
 	}
 
@@ -319,6 +366,14 @@ func (s *Service) rotate(ctx context.Context, r db.Runner, hash string) (pair To
 		return TokenPair{}, nil, err
 	}
 
+	// The spent hash is recorded before the session takes the new one, and both are in the
+	// caller's transaction. A rotation that committed without the ledger row would leave a
+	// token nothing can recognise as spent — which is the whole of reuse detection, lost with
+	// no symptom until somebody uses a copy.
+	if err := s.store.insertConsumedRefreshToken(ctx, r, session.ID, session.RefreshTokenHash, now); err != nil {
+		return TokenPair{}, nil, err
+	}
+
 	rotated := session
 	rotated.RefreshTokenHash = next
 	rotated.RefreshTokenExpiresAt = now.Add(refreshTokenTTL)
@@ -333,4 +388,50 @@ func (s *Service) rotate(ctx context.Context, r db.Runner, hash string) (pair To
 		return TokenPair{}, nil, err
 	}
 	return pair, nil, nil
+}
+
+// detectReuse decides what a token that matches no live session actually is (SHIP-40).
+//
+// Two possibilities, and they are not the same event:
+//
+//   - **Nobody's token.** A guess, a stale value from a reinstalled app, a copy-paste. Refused,
+//     and nothing else happens. Revoking on this path would hand anybody a way to end sessions
+//     by guessing, which is a denial of service dressed as a security control.
+//   - **A token this platform issued and has already rotated away.** Docs/07 §3: presenting one
+//     twice invalidates the whole device session. Either the device replayed it — SHIP-50's
+//     interceptor exists to stop that, and a client bug is not something the platform can tell
+//     from a theft — or somebody else has a copy, in which case one of the two holders is about
+//     to be signed out and both should be.
+//
+// The revocation is the point, so it must survive: this returns a refusal rather than an error,
+// and the caller commits. See the note on [Service.Refresh].
+func (s *Service) detectReuse(ctx context.Context, r db.Runner, hash string, now time.Time) (TokenPair, error, error) {
+	sessionID, err := s.store.consumedRefreshTokenSession(ctx, r, hash)
+	if err != nil {
+		if isNoRows(err) {
+			return TokenPair{}, ErrRefreshTokenInvalid, nil
+		}
+		return TokenPair{}, nil, fmt.Errorf("identity: reading a consumed refresh token: %w", err)
+	}
+
+	// Guarded on revoked_at IS NULL, so a token replayed a third time does not rewrite the
+	// reason or move the instant the session ended.
+	revoked, err := s.store.revokeDeviceSession(ctx, r, sessionID, now, revokedReasonTokenReused)
+	if err != nil {
+		return TokenPair{}, nil, err
+	}
+
+	// Logged rather than written to audit_log, and that is a scope decision worth naming:
+	// SHIP-149 built the table and its append-only triggers but not the Go write helper
+	// (Docs/11 §4), so there is nothing to call. This is the event that most deserves one, and
+	// whoever finishes SHIP-149 should start here.
+	//
+	// The token is not logged, in any form. A log aggregator holding refresh tokens is the
+	// exposure hashing the column exists to prevent, one system along.
+	httpx.LoggerFrom(ctx).LogAttrs(ctx, slog.LevelWarn,
+		"a consumed refresh token was presented; the device session has been revoked",
+		slog.String("session_id", sessionID.String()),
+		slog.Bool("first_detection", revoked))
+
+	return TokenPair{}, ErrRefreshTokenReused, nil
 }

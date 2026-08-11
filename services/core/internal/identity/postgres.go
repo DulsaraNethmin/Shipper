@@ -317,7 +317,7 @@ func (postgresStore) lastOTPAt(ctx context.Context, r db.Runner, userID uuid.UUI
 
 // deviceSessionColumns is the projection every read of a device session shares (SHIP-39).
 const deviceSessionColumns = `id, user_id, refresh_token_hash, refresh_token_expires_at, ` +
-	`device_label, last_seen_at, created_at`
+	`device_label, last_seen_at, revoked_at, revoked_reason, created_at`
 
 // insertDeviceSession writes a newly created session (SHIP-39).
 //
@@ -367,7 +367,7 @@ func (postgresStore) rotateDeviceSession(ctx context.Context, r db.Runner, s dev
 	tag, err := r.Exec(ctx, `
 		UPDATE device_sessions
 		   SET refresh_token_hash = $2, refresh_token_expires_at = $3, last_seen_at = $4
-		 WHERE id = $1 AND refresh_token_hash = $5`,
+		 WHERE id = $1 AND refresh_token_hash = $5 AND revoked_at IS NULL`,
 		s.ID, s.RefreshTokenHash, s.RefreshTokenExpiresAt, s.LastSeenAt, previousHash)
 	if err != nil {
 		return fmt.Errorf("identity: rotating a device session: %w", err)
@@ -379,12 +379,63 @@ func (postgresStore) rotateDeviceSession(ctx context.Context, r db.Runner, s dev
 	return nil
 }
 
+// revokeDeviceSession ends a session, reporting whether this call was the one that ended it
+// (SHIP-40).
+//
+// Guarded on revoked_at IS NULL rather than on a check the caller made a moment ago, so a token
+// replayed a third time does not rewrite the reason or move the instant the session ended — and
+// so two presentations arriving together produce one revocation, decided by PostgreSQL.
+func (postgresStore) revokeDeviceSession(ctx context.Context, r db.Runner, id uuid.UUID, at time.Time, reason string) (bool, error) {
+	tag, err := r.Exec(ctx, `
+		UPDATE device_sessions
+		   SET revoked_at = $2, revoked_reason = $3
+		 WHERE id = $1 AND revoked_at IS NULL`, id, at, reason)
+	if err != nil {
+		return false, fmt.Errorf("identity: revoking a device session: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// insertConsumedRefreshToken records a refresh token that has been rotated away (SHIP-40).
+//
+// consumed_at comes from the injected clock rather than from a database default, for the reason
+// insertEmailToken gives: it is the instant the service reasons about, and the pruning sweep
+// 000104 anticipates will count over it.
+func (postgresStore) insertConsumedRefreshToken(ctx context.Context, r db.Runner, sessionID uuid.UUID, hash string, at time.Time) error {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return fmt.Errorf("identity: generating a consumed refresh token id: %w", err)
+	}
+
+	if _, err := r.Exec(ctx, `
+		INSERT INTO consumed_refresh_tokens (id, session_id, token_hash, consumed_at)
+		VALUES ($1, $2, $3, $4)`, id, sessionID, hash, at); err != nil {
+		return fmt.Errorf("identity: recording a consumed refresh token: %w", err)
+	}
+	return nil
+}
+
+// consumedRefreshTokenSession reads which session a spent refresh token belonged to (SHIP-40).
+//
+// This is the whole of reuse detection's lookup: no rows means nobody's token, a row means one
+// this platform issued and has already rotated away, and the session it names is what gets
+// revoked. uq_consumed_refresh_tokens_hash is what makes that answer unambiguous.
+func (postgresStore) consumedRefreshTokenSession(ctx context.Context, r db.Runner, hash string) (uuid.UUID, error) {
+	var sessionID uuid.UUID
+	if err := r.QueryRow(ctx,
+		`SELECT session_id FROM consumed_refresh_tokens WHERE token_hash = $1`,
+		hash).Scan(&sessionID); err != nil {
+		return uuid.Nil, err
+	}
+	return sessionID, nil
+}
+
 // scanDeviceSession reads one row in the order deviceSessionColumns declares.
 func scanDeviceSession(row interface{ Scan(...any) error }) (deviceSession, error) {
 	var s deviceSession
 	if err := row.Scan(
 		&s.ID, &s.UserID, &s.RefreshTokenHash, &s.RefreshTokenExpiresAt,
-		&s.DeviceLabel, &s.LastSeenAt, &s.CreatedAt,
+		&s.DeviceLabel, &s.LastSeenAt, &s.RevokedAt, &s.RevokedReason, &s.CreatedAt,
 	); err != nil {
 		return deviceSession{}, err
 	}

@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **109 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **114 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -170,6 +170,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
 | **SHIP-39** | M1 | Refresh token issue and rotation — opaque, hashed, and the expiry question closed — *see below* |
+| **SHIP-40** | M1 | Refresh token reuse detection — a spent token ends the whole device session — *see below* |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
@@ -466,6 +467,64 @@ column never appears. Tests and CI are unaffected: `make test-db-template` drops
 scratch, and CI runs `up → down all → up` against an empty database. The local fix is
 `make migrate-down n=all && make migrate-up`. This will bite every migration in `identity`,
 `profiles` and `fleet` from now on, because their blocks sit below `jobs`.
+
+### What SHIP-40 built, and the design it rejected
+
+**A spent refresh token stays recognisable for as long as its session lives, in a ledger:
+`consumed_refresh_tokens` (`000104`).** Rotation moves the hash across in the same transaction
+that writes the new one, so the invariant is exact — **a refresh token hash is live in
+`device_sessions.refresh_token_hash` or spent in the ledger, never both**. That is what makes two
+lookups an answer rather than an ambiguity, and `make check` asserts the overlap is empty rather
+than trusting the code that maintains it.
+
+**The design that was rejected is the cheap one, and it is worth naming because it looks
+sufficient.** Keeping the *previous* hash beside the current one satisfies the acceptance
+criterion for exactly one generation, and silently stops satisfying it after two: a token stolen
+and then left while the legitimate device refreshes a few times matches neither column, is
+answered "unknown", and the session survives. The criterion is "presenting a consumed token
+invalidates the entire device session", not "presenting the most recently consumed one".
+`TestReuseIsDetectedManyRotationsLater` rotates five times and then presents the first token,
+which is the test the cheap design fails.
+
+**A token that matches nothing revokes nothing, and that is the other half.** Only a token this
+platform issued and has already rotated away is evidence of anything; revoking on an unrecognised
+value would hand anybody a way to end sessions by guessing — a denial of service dressed as a
+security control.
+
+**The revocation is written and the refusal is returned after the commit, which is the same trap
+`VerifyPhone` documents one credential along.** `db.InTx` rolls back on any error, so returning
+`ErrRefreshTokenReused` from inside the closure would undo the revocation with the very error
+that reports it — the session would stay live and the log would say it had been ended.
+Mutation-checked: making that one change turns
+`TestPresentingAConsumedTokenRevokesTheWholeSession` red on both of its subtests, one saying the
+session is still `live` and one saying the stolen device can still refresh.
+
+**The caller cannot tell reuse from any other refusal, and the sentinel exists for the service
+rather than the client.** `ErrRefreshTokenReused` and `ErrRefreshTokenInvalid` map to one code
+(SHIP-42). Two sentinels because "the session was revoked" and "the token was refused" are
+different claims that a test and a log line need to distinguish; one code because the remedy is
+identical and telling somebody holding a stolen token that the platform noticed is free help.
+
+**The reuse event is logged and not audited, and that is a gap with a name.** SHIP-149 built
+`audit_log` and its append-only triggers but not the Go write helper (§4), so there is nothing to
+call. This is the event that most deserves one — whoever finishes SHIP-149 should start here. The
+token is not logged in any form: a log aggregator holding refresh tokens is the exposure hashing
+the column exists to prevent, one system along.
+
+**Revoking a session deliberately does not move its live hash into the ledger.** Refresh checks
+`revoked_at` before anything else, so the token buys nothing either way — and moving it would put
+one hash in both places and cost the invariant its whole value.
+
+**`device_sessions` can now end, and the three reasons each have a ticket.**
+`refresh_token_reused` (SHIP-40), `signed_out` (SHIP-43) and `revoked_by_owner` (SHIP-46) are a
+`CHECK` paired with Go constants and a test that reads the constraint back, per `Docs/10` §3.4.
+Enumerating SHIP-43's and SHIP-46's values now saves the next run a migration; a reason with no
+ticket behind it does not belong there.
+
+**Spent tokens are not pruned, and a session in daily use writes roughly one every fifteen
+minutes of activity.** Deleting the spent tokens of a session that has ended is safe — a revoked
+session refuses every token it ever issued — and belongs to `cmd/worker` (SHIP-67a) as its own
+ticket rather than being smuggled into this one. `000104` says so where somebody would look.
 
 ### What SHIP-48 built, and how it was demonstrated
 
