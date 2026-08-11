@@ -180,6 +180,64 @@ func (h *Handler) RequestOTP() http.Handler {
 	})
 }
 
+// verifyEmailRequest is the body of POST /v1/auth/verify-email (SHIP-33).
+type verifyEmailRequest struct {
+	Token string `json:"token"`
+}
+
+// emailRequest is the body of POST /v1/auth/resend-verify (SHIP-33).
+type emailRequest struct {
+	Email string `json:"email"`
+}
+
+// VerifyEmail handles POST /v1/auth/verify-email (SHIP-33).
+//
+// Public, and it has to be: the caller is proving an address, which is a step before they have
+// any session at all. The token in the body is the credential, and it was sent to the address
+// being proved.
+func (h *Handler) VerifyEmail() http.Handler {
+	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+		var req verifyEmailRequest
+		if err := decodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		user, err := h.svc.VerifyEmail(r.Context(), req.Token)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, accountFrom(user))
+		return nil
+	})
+}
+
+// ResendVerification handles POST /v1/auth/resend-verify (SHIP-33).
+//
+// 202 and the same body for every outcome, exactly as RequestOTP does — see the note on
+// [Service.ResendVerification]. This is the endpoint a person reaches when the first message
+// never arrived, which is also why a send failure at registration is logged rather than
+// returned.
+func (h *Handler) ResendVerification() http.Handler {
+	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+		var req emailRequest
+		if err := decodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		retryAfter, err := h.svc.ResendVerification(r.Context(), req.Email)
+		if err != nil {
+			return apiError(err)
+		}
+
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+		httpx.WriteJSON(w, http.StatusAccepted, acceptedResponse{
+			RetryAfterSeconds: int(retryAfter.Seconds()),
+		})
+		return nil
+	})
+}
+
 // apiError turns this domain's errors into the API's error contract.
 //
 // The mapping lives at the transport edge on purpose: the service answers in domain terms, and
@@ -204,6 +262,14 @@ func apiError(err error) error {
 	case errors.Is(err, ErrPhoneTaken):
 		return httpx.NewError(http.StatusConflict, CodePhoneTaken,
 			"An account already exists for this mobile number.").WithCause(err)
+
+	case errors.Is(err, ErrVerificationTokenInvalid):
+		return httpx.NewError(http.StatusBadRequest, CodeVerificationTokenInvalid,
+			"This verification link is no longer valid. Ask for a new one.").WithCause(err)
+
+	case errors.Is(err, ErrVerificationTokenExpired):
+		return httpx.NewError(http.StatusBadRequest, CodeVerificationTokenExpired,
+			"This verification link has expired. Ask for a new one.").WithCause(err)
 
 	case errors.Is(err, errUnavailable):
 		// 503 rather than 500, because the two say different things to a mobile client:

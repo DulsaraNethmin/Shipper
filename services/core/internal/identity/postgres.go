@@ -60,6 +60,12 @@ func (postgresStore) userByEmail(ctx context.Context, r db.Runner, email string)
 	return scanUser(row)
 }
 
+// userByID reads an account by its identifier.
+func (postgresStore) userByID(ctx context.Context, r db.Runner, id uuid.UUID) (User, error) {
+	row := r.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE id = $1`, id)
+	return scanUser(row)
+}
+
 // userByPhone reads an account by its number, which is stored already normalised to E.164.
 func (postgresStore) userByPhone(ctx context.Context, r db.Runner, phone string) (User, error) {
 	row := r.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE phone = $1`, phone)

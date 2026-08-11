@@ -37,6 +37,20 @@ func init() {
 		},
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/auth/verify-email",
+			Group:   GroupV1,
+			Auth:    Public,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).VerifyEmail() },
+		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/auth/resend-verify",
+			Group:   GroupV1,
+			Auth:    Public,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).ResendVerification() },
+		},
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/auth/request-otp",
 			Group:   GroupV1,
 			Auth:    Public,

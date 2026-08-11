@@ -126,6 +126,157 @@ Register:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+VerifyEmail:
+  post:
+    operationId: verifyEmail
+    summary: Confirm an email address
+    tags: [Identity]
+    description: |
+      Consumes the token that was emailed at registration and marks the address verified
+      (SHIP-33). The token is single-use and expires after 24 hours.
+
+      Public, and it has to be: proving an address is a step before the caller has any session.
+      The token in the body *is* the credential, and it was sent to the address being proved.
+
+      ## Outcomes
+
+      - `200` — the address is verified. The account is returned.
+      - `identity_verification_token_expired` — the token was genuine and its day is up. Ask
+        for another with `POST /v1/auth/resend-verify`.
+      - `identity_verification_token_invalid` — everything else: unknown, already used,
+        superseded by a resend, or issued for an address the account no longer has. These are
+        deliberately not distinguished; telling somebody holding a guessed token which part of
+        the guess was wrong is free help.
+
+      **Presenting the same token twice answers `200`,** provided it was the token that
+      verified the address and the address is still verified. That is somebody clicking a link
+      twice, which is not an error.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [token]
+            additionalProperties: false
+            properties:
+              token:
+                type: string
+                description: The value from the verification message. 43 characters, base64url.
+                example: 9qE2vT7bYw1sJk4pNc0aRlX8oZgHdM3uQiV6yB5tCfE
+    responses:
+      '200':
+        description: The address is verified.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Account'
+      '400':
+        description: |
+          The token is not usable — `identity_verification_token_invalid` or
+          `identity_verification_token_expired`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ResendVerify:
+  post:
+    operationId: resendVerification
+    summary: Send another email verification message
+    tags: [Identity]
+    description: |
+      Issues a new verification token and sends it, retiring whatever the account was holding
+      (SHIP-31, SHIP-33). The previous link stops working.
+
+      ## This endpoint deliberately tells you nothing
+
+      **The answer is always `202` with the same body**, whether the address belongs to an
+      account, is already verified, was sent a message moments ago, or has never been seen —
+      the same reasoning as `POST /v1/auth/request-otp`. `retry_after_seconds` is a fixed
+      interval, not the true remaining cooldown.
+
+      Registration is the deliberate exception to that rule: it *does* report a duplicate
+      address, because there the caller is trying to create the account and saying nothing
+      would leave somebody who mistyped their address on a success screen.
+
+      ## Rate limits
+
+      One message per minute and five per hour, per account. Exceeding either sends nothing and
+      still answers `202`.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [email]
+            additionalProperties: false
+            properties:
+              email:
+                type: string
+                format: email
+                example: alice@example.com
+    responses:
+      '202':
+        description: |
+          The request was accepted. Whether a message was sent is deliberately not stated.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          Retry-After:
+            description: The same value as `retry_after_seconds`, in the standard header.
+            schema:
+              type: integer
+            example: 60
+        content:
+          application/json:
+            schema:
+              $ref: '#/Accepted'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '422':
+        description: The address is not one this platform can send to.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 RequestOTP:
   post:
     operationId: requestOTP

@@ -34,6 +34,24 @@ var (
 	// one number would make an OTP ambiguous about which of them it verifies.
 	CodePhoneTaken = httpx.RegisterCode("identity_phone_taken",
 		"An account already exists for this mobile number. Sign in, or reset the password.")
+
+	// CodeVerificationTokenInvalid covers every way an email verification token is not
+	// usable except one: unknown, already used, superseded by a resend, or issued for an
+	// address the account no longer has.
+	//
+	// Deliberately undifferentiated. A caller can do nothing different about any of them, and
+	// telling somebody holding a guessed token which part of the guess was wrong is free help.
+	CodeVerificationTokenInvalid = httpx.RegisterCode("identity_verification_token_invalid",
+		"This verification link is no longer valid. Ask for a new one.")
+
+	// CodeVerificationTokenExpired means the token was genuine and its day is up.
+	//
+	// Reported separately from `identity_verification_token_invalid` because the remedy is
+	// specific — ask for another — and because it is safe: only somebody holding a token this
+	// platform issued can see it, and they could have worked out its age from the day they
+	// received it.
+	CodeVerificationTokenExpired = httpx.RegisterCode("identity_verification_token_expired",
+		"This verification link has expired. Ask for a new one.")
 )
 
 // The sentinel errors this domain raises.
@@ -93,6 +111,13 @@ var (
 
 	// ErrPhoneTaken means the number already has an account (SHIP-30).
 	ErrPhoneTaken = errors.New("identity: that mobile number already has an account")
+
+	// ErrVerificationTokenInvalid is every unusable email verification token except an expired
+	// one (SHIP-33). See CodeVerificationTokenInvalid for why they are not distinguished.
+	ErrVerificationTokenInvalid = errors.New("identity: the verification token is not usable")
+
+	// ErrVerificationTokenExpired means the token was genuine and has lapsed (SHIP-33).
+	ErrVerificationTokenExpired = errors.New("identity: the verification token has expired")
 
 	// ErrTokenInvalid means the token is not one this platform will honour: unparseable,
 	// wrongly signed, the wrong algorithm, the wrong audience, signed by a retired key, or

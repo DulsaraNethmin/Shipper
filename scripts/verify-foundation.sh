@@ -1014,6 +1014,63 @@ status="$(post_json "verify-otp-bad-$$" /v1/auth/request-otp \
 ok "an unusable number is a field error, which discloses nothing about who has an account"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-33  POST /v1/auth/verify-email marks the address verified and consumes the token"
+
+status="$(post_json "verify-email-bad-$$" /v1/auth/verify-email \
+  '{"token":"9qE2vT7bYw1sJk4pNc0aRlX8oZgHdM3uQiV6yB5tCfE"}' "$WORKDIR/verify-bad.json")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/verify-bad.json"; fail "an unknown token returned $status, want 400"; }
+[[ "$(json "$WORKDIR/verify-bad.json" '["error"]["code"]')" == "identity_verification_token_invalid" ]] \
+  || fail "expected code=identity_verification_token_invalid"
+ok "a token this platform never issued is refused, and says nothing about why"
+
+status="$(post_json "verify-email-$$" /v1/auth/verify-email \
+  "{\"token\":\"$verification_token\"}" "$WORKDIR/verify-email.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/verify-email.json"; fail "POST /v1/auth/verify-email returned $status, want 200"; }
+[[ "$(json "$WORKDIR/verify-email.json" '["email_verified"]')" == "True" ]] \
+  || fail "the response does not report the address as verified"
+[[ "$(json "$WORKDIR/verify-email.json" '["phone_verified"]')" == "False" ]] \
+  || fail "verifying the email verified the phone as well"
+ok "the address is verified, and the phone is not"
+
+verified_state="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (u.email_verified_at is not null)::text || ' ' ||
+          coalesce(t.consumed_reason, 'live')
+     from users u
+     join email_verification_tokens t on t.user_id = u.id
+    where u.id = '$registered_id' and t.token_hash = '$token_hash';")"
+[[ "$verified_state" == "true verified" ]] \
+  || fail "the row says '$verified_state', want 'true verified'"
+ok "the column is set and the token is consumed, both in the database"
+
+# Single use. The second presentation is somebody clicking the link twice, which is not an
+# error — but the token is spent, so nothing further happens.
+status="$(post_json "verify-email-twice-$$" /v1/auth/verify-email \
+  "{\"token\":\"$verification_token\"}" "$WORKDIR/verify-twice.json")"
+[[ "$status" == "200" ]] || fail "clicking the link twice returned $status"
+consumed_count="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from email_verification_tokens
+    where user_id = '$registered_id' and consumed_reason = 'verified';")"
+[[ "$consumed_count" == "1" ]] || fail "$consumed_count tokens are marked verified, want 1"
+ok "clicking twice is not an error, and consumes nothing a second time"
+
+# Resend answers identically whether or not the address is known, which is what stops this
+# endpoint being a way of asking who has an account.
+status="$(post_json "verify-resend-known-$$" /v1/auth/resend-verify \
+  "{\"email\":\"$reg_email\"}" "$WORKDIR/resend-known.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/resend-known.json"; fail "resend returned $status, want 202"; }
+status="$(post_json "verify-resend-unknown-$$" /v1/auth/resend-verify \
+  '{"email":"nobody-at-all@example.com"}' "$WORKDIR/resend-unknown.json")"
+[[ "$status" == "202" ]] || fail "resend for an unknown address returned $status"
+diff -q "$WORKDIR/resend-known.json" "$WORKDIR/resend-unknown.json" >/dev/null \
+  || fail "a known address is answered differently from an unknown one"
+ok "resend answers 202 identically for a known and an unknown address"
+
+unknown_tokens="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from email_verification_tokens where email = 'nobody-at-all@example.com';")"
+[[ "$unknown_tokens" == "0" ]] || fail "a token was stored for an address with no account"
+ok "and stores nothing for the address that has no account"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
@@ -1026,4 +1083,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-31, SHIP-34, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-31, SHIP-33, SHIP-34, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"

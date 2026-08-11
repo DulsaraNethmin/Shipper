@@ -27,12 +27,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
 const (
@@ -50,6 +52,18 @@ const (
 	// makes SHA-256 the right way to store it: guessing is 2^256 and there is nothing for a
 	// work factor to protect against.
 	verificationTokenBytes = 32
+
+	// emailResendCooldown is the shortest interval between two verification messages for one
+	// account, and what the resend endpoint reports back so a client can run its timer.
+	emailResendCooldown = 60 * time.Second
+
+	// emailResendWindow and emailMaxPerWindow bound how many messages one account can cause.
+	//
+	// Lower stakes than the SMS limits — email is free and does not wake anybody — but the
+	// same abuse exists: an address subscribed to a stream of messages it did not ask for,
+	// sent by a service whose reputation pays for it.
+	emailResendWindow = time.Hour
+	emailMaxPerWindow = 5
 )
 
 // The reasons a token stops being live. They are exactly the values
@@ -185,4 +199,189 @@ this message and nothing further will happen.
 			slog.String("user_id", user.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// VerifyEmail confirms an address and consumes the token that proved it (SHIP-33).
+//
+// # Why the outcomes are what they are
+//
+// A token this platform never issued, a token superseded by a resend, and a token whose account
+// has since changed address are all one answer: [ErrVerificationTokenInvalid]. None of them is
+// a state the caller can do anything different about, and distinguishing them tells somebody
+// holding a guessed token which part of the guess was wrong.
+//
+// An **expired** token is reported separately, and safely. The caller is holding a genuine token
+// this platform issued — nobody else can be — so the only thing the distinction reveals is
+// something they could have worked out from the day they received it. It is worth reporting
+// because the remedy is specific: ask for another.
+//
+// A token already consumed by a *successful* verification, on an account that is still verified
+// with the same address, answers **200**. That is somebody clicking the link twice, which is not
+// an error, and the alternative is telling a person who has just verified their address that
+// their address could not be verified.
+func (s *Service) VerifyEmail(ctx context.Context, raw string) (User, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return User{}, ErrVerificationTokenInvalid
+	}
+	if s.pool == nil {
+		return User{}, errUnavailable
+	}
+
+	var user User
+	err := db.InTx(ctx, s.pool, func(ctx context.Context, r db.Runner) error {
+		token, err := s.store.emailTokenByHash(ctx, r, hashVerificationToken(raw))
+		if err != nil {
+			if isNoRows(err) {
+				return ErrVerificationTokenInvalid
+			}
+			return fmt.Errorf("identity: reading a verification token: %w", err)
+		}
+
+		user, err = s.store.userByID(ctx, r, token.UserID)
+		if err != nil {
+			// The foreign key makes this impossible short of a manual deletion, which
+			// ON DELETE RESTRICT also refuses. Reported as invalid rather than as a 500,
+			// because from the caller's side it is: the token names nobody.
+			if isNoRows(err) {
+				return ErrVerificationTokenInvalid
+			}
+			return fmt.Errorf("identity: reading the account for a verification token: %w", err)
+		}
+
+		// The token proves control of the address it was sent to. An account that has since
+		// moved to another address is not verified by it (SHIP-43 is the ticket that makes
+		// this reachable; the check exists now so that it cannot be forgotten then).
+		if !strings.EqualFold(token.Email, user.Email) {
+			return ErrVerificationTokenInvalid
+		}
+
+		if token.consumed() {
+			// The double-click case: this token did verify the address, and the address is
+			// still verified. Anything else is a token that was superseded or is being
+			// replayed, and neither is a success.
+			if token.ConsumedReason != nil && *token.ConsumedReason == consumedVerified && user.EmailVerified() {
+				return nil
+			}
+			return ErrVerificationTokenInvalid
+		}
+
+		now := s.clock.Now().UTC()
+		if token.expiredAt(now) {
+			return ErrVerificationTokenExpired
+		}
+
+		// Guarded on consumed_at IS NULL inside the transaction, so two confirmations
+		// arriving together produce one winner decided by PostgreSQL rather than by a check
+		// that read a moment earlier. The loser is told the token is no longer valid, which
+		// is true.
+		claimed, err := s.store.consumeEmailToken(ctx, r, token.ID, now)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			return ErrVerificationTokenInvalid
+		}
+
+		if _, err := s.store.markEmailVerified(ctx, r, user.ID, now); err != nil {
+			return err
+		}
+
+		// Re-read rather than patching the struct in memory: the response says what the row
+		// holds, and markEmailVerified deliberately leaves an existing timestamp alone.
+		user, err = s.store.userByID(ctx, r, user.ID)
+		return err
+	})
+	if err != nil {
+		return User{}, err
+	}
+	return user, nil
+}
+
+// ResendVerification sends another verification message, if the address belongs to an account
+// that still needs one (SHIP-33).
+//
+// It answers the same way whether or not the address is known, for the reason [Service.RequestOTP]
+// gives at length: a distinguishable answer here makes "does this person have a Shipper account"
+// a question anybody can ask, one address at a time. The retry interval is a fixed constant
+// rather than the true remaining cooldown, because the true one carries the same disclosure.
+//
+// Registration is the deliberate exception to that rule and is not an inconsistency — see the
+// note on [CodeEmailTaken]. There, telling the caller costs nothing they did not already know
+// (they are trying to create the account) and saying nothing would leave somebody who mistyped
+// their address on a success screen for an account that does not exist.
+func (s *Service) ResendVerification(ctx context.Context, submittedEmail string) (retryAfter time.Duration, err error) {
+	email := strings.ToLower(strings.TrimSpace(submittedEmail))
+
+	var v validate.Errors
+	if v.Required("email", email) && !plausibleEmail(email) {
+		v.Add("email", validate.CodeInvalid, "Enter a valid email address.")
+	}
+	if err := v.Err(); err != nil {
+		return 0, err
+	}
+
+	if s.pool == nil {
+		return 0, errUnavailable
+	}
+
+	var (
+		user User
+		raw  string
+		send bool
+	)
+	if err := db.InTx(ctx, s.pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		user, err = s.store.userByEmail(ctx, r, email)
+		if err != nil {
+			if isNoRows(err) {
+				return nil
+			}
+			return fmt.Errorf("identity: reading the account for a resend: %w", err)
+		}
+		if user.EmailVerified() {
+			// Nothing to verify. Sending a message would be confusing and refusing would
+			// disclose the account's verification state.
+			return nil
+		}
+
+		allowed, err := s.resendAllowed(ctx, r, user.ID)
+		if err != nil || !allowed {
+			return err
+		}
+
+		raw, err = s.issueEmailVerification(ctx, r, user)
+		if err != nil {
+			return err
+		}
+		send = true
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	if send {
+		s.sendVerificationEmail(ctx, user, raw)
+	}
+	return emailResendCooldown, nil
+}
+
+// resendAllowed applies the two issue limits, inside the caller's transaction so that two
+// requests racing cannot both see an empty window.
+func (s *Service) resendAllowed(ctx context.Context, r db.Runner, userID uuid.UUID) (bool, error) {
+	now := s.clock.Now().UTC()
+
+	last, ok, err := s.store.lastEmailTokenAt(ctx, r, userID)
+	if err != nil {
+		return false, err
+	}
+	if ok && now.Sub(last) < emailResendCooldown {
+		return false, nil
+	}
+
+	sent, err := s.store.countEmailTokensSince(ctx, r, userID, now.Add(-emailResendWindow))
+	if err != nil {
+		return false, err
+	}
+	return sent < emailMaxPerWindow, nil
 }

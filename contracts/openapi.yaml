@@ -129,6 +129,10 @@ paths:
     $ref: './paths/identity.yaml#/Register'
   /v1/auth/request-otp:
     $ref: './paths/identity.yaml#/RequestOTP'
+  /v1/auth/resend-verify:
+    $ref: './paths/identity.yaml#/ResendVerify'
+  /v1/auth/verify-email:
+    $ref: './paths/identity.yaml#/VerifyEmail'
 
 components:
   schemas:
