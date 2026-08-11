@@ -63,7 +63,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 32 tickets, 82 points
+**Size:** 33 tickets, 87 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -85,6 +85,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-15a | Engineering conventions and the shared-surface mechanisms | 5 | Docs 10 exists; migrations, routes, error codes and test databases each have a mechanism that makes a collision fail a test rather than a merge | SHIP-15 |
 | SHIP-15b | Spelling check scoped for client code | 2 | The Australian English check passes over Flutter and Next.js source while still failing on user-facing copy inside them | SHIP-15a |
 | SHIP-15c | Wave-2 shared surfaces: dependencies, isolation, error codes | 5 | Deps carries the pool and the Redis client, a second worktree's tests cannot drop this one's template, infrastructure importing a domain fails the lint, and httpx.RegisterCode backs a generated code list | SHIP-15a, SHIP-17a |
+| SHIP-15e | Wave-3 shared surfaces: the verify script, the handler helpers, the done list | 5 | A domain adds a verify section by adding a file and editing none; httpx.H and httpx.DecodeJSON exist and internal/identity uses them; the done list is merge=union; make web-check type-checks after the build | SHIP-15c, SHIP-44 |
 | SHIP-16 | Flutter project scaffold for iOS and Android | 2 | App builds and runs on both simulators | SHIP-1 |
 | SHIP-17 | Flutter feature-folder structure and state management choice | 3 | Structure matches Docs 07 §2 and the state approach is documented | SHIP-16 |
 | SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |
