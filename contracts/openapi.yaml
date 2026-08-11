@@ -144,6 +144,8 @@ paths:
     $ref: './paths/identity.yaml#/VerifyPhone'
   /v1/jobs:
     $ref: './paths/jobs.yaml#/CreateJob'
+  /v1/jobs/{id}:
+    $ref: './paths/jobs.yaml#/JobByID'
 
 components:
   schemas:

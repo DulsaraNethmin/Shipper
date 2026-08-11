@@ -86,6 +86,38 @@ func melbourne() *Address {
 	return &Address{Line: "40 Bourke Street", Suburb: "Melbourne", State: StateVIC, Postcode: "3000"}
 }
 
+// publish moves a job to Open the only way a job can be moved: through the guard.
+//
+// Nothing in these three tickets calls Transition in anger — creation lands at Draft by default and
+// an edit does not touch status — so this exists to put a job into a state the edit endpoint has to
+// refuse, and it is the first call site outside service_test.go.
+func publish(t *testing.T, pool *pgxpool.Pool, job, customer uuid.UUID) {
+	t.Helper()
+
+	svc := NewService(&recordingSink{}, clock.NewFixed(testInstant), nil)
+	if err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
+		_, err := svc.Transition(ctx, r, Move{
+			JobID: job, To: StatusOpen, Actor: User(ActorCustomer, customer),
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("publishing %s: %v", job, err)
+	}
+}
+
+// edit runs an update in a transaction, which is what UpdateDraft requires.
+func edit(t *testing.T, pool *pgxpool.Pool, svc *Service, customer, job uuid.UUID, f DraftFields) (Job, error) {
+	t.Helper()
+
+	var updated Job
+	err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		updated, err = svc.UpdateDraft(ctx, r, customer, job, f)
+		return err
+	})
+	return updated, err
+}
+
 // TestCreateDraftIsOwnedByTheCallerAndStartsAsADraft is SHIP-61's acceptance criterion.
 func TestCreateDraftIsOwnedByTheCallerAndStartsAsADraft(t *testing.T) {
 	pool := pgtest.DB(t)
@@ -279,6 +311,207 @@ func TestCreateDraftReportsEveryOffendingFieldAtOnce(t *testing.T) {
 	}
 	if jobs != 0 {
 		t.Errorf("%d jobs were created by a request that failed validation", jobs)
+	}
+}
+
+// TestUpdateDraftChangesOnlyWhatWasNamed is half of SHIP-62's acceptance criterion.
+func TestUpdateDraftChangesOnlyWhatWasNamed(t *testing.T) {
+	pool := pgtest.DB(t)
+	geo := &fakeGeocoder{}
+	svc := newDraftService(t, geo)
+
+	customer := newCustomer(t, pool, "edits@example.com", "+61400000606")
+
+	created, err := svc.CreateDraft(t.Context(), pool, customer, DraftFields{
+		Pickup:           sydney(),
+		Dropoff:          melbourne(),
+		GoodsDescription: text("Two-seater sofa"),
+		HandlingNotes:    text("Ring ahead"),
+		LengthCm:         number(190),
+	})
+	if err != nil {
+		t.Fatalf("creating a draft: %v", err)
+	}
+
+	window := TimeWindow{
+		Start: time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 15, 17, 0, 0, 0, time.UTC),
+	}
+
+	updated, err := edit(t, pool, svc, customer, created.ID, DraftFields{
+		GoodsDescription: text("Three-seater sofa, wrapped"),
+		PickupWindow:     &window,
+
+		// A non-nil pointer to the empty value clears the field, which is the only way a
+		// customer can remove a note they added earlier.
+		HandlingNotes: text(""),
+	})
+	if err != nil {
+		t.Fatalf("editing the draft: %v", err)
+	}
+
+	switch {
+	case updated.GoodsDescription != "Three-seater sofa, wrapped":
+		t.Errorf("goods description = %q", updated.GoodsDescription)
+	case updated.HandlingNotes != "":
+		t.Errorf("handling notes = %q, want cleared", updated.HandlingNotes)
+	case !updated.PickupWindow.Start.Equal(window.Start) || !updated.PickupWindow.End.Equal(window.End):
+		t.Errorf("pickup window = %v", updated.PickupWindow)
+	case updated.Dimensions.LengthCm != 190:
+		t.Errorf("length = %d, want the 190 that was not mentioned", updated.Dimensions.LengthCm)
+	case updated.Pickup.Address != *sydney():
+		t.Errorf("pickup = %#v, want the address that was not mentioned", updated.Pickup.Address)
+	case updated.Status != StatusDraft:
+		t.Errorf("the job is %s, want Draft", updated.Status)
+	}
+
+	// An address that was not mentioned keeps the coordinate it already had, and is not
+	// looked up again — two lookups, both from the create.
+	if _, _, resolved := updated.Pickup.Coordinate(); !resolved {
+		t.Error("an untouched address lost its coordinate")
+	}
+	if len(geo.asked) != 2 {
+		t.Errorf("the geocoder was asked %d times, want 2 — an untouched address was looked up again: %v",
+			len(geo.asked), geo.asked)
+	}
+}
+
+// TestUpdateDraftRejectsEditsByNonOwners is the other half of SHIP-62's acceptance criterion, and
+// the one worth being most careful about.
+func TestUpdateDraftRejectsEditsByNonOwners(t *testing.T) {
+	pool := pgtest.DB(t)
+	svc := newDraftService(t, &fakeGeocoder{})
+
+	owner := newCustomer(t, pool, "owner@example.com", "+61400000607")
+	stranger := newCustomer(t, pool, "stranger@example.com", "+61400000608")
+	provider := newProvider(t, pool, "provider-edit@example.com", "+61400000609")
+
+	created, err := svc.CreateDraft(t.Context(), pool, owner, DraftFields{GoodsDescription: text("A piano")})
+	if err != nil {
+		t.Fatalf("creating a draft: %v", err)
+	}
+
+	for name, caller := range map[string]uuid.UUID{
+		"another customer": stranger,
+		"a provider":       provider,
+		"nobody at all":    uuid.Must(uuid.NewV7()),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := edit(t, pool, svc, caller, created.ID, DraftFields{
+				GoodsDescription: text("A cheap piano"),
+			})
+			if !errors.Is(err, ErrNotJobOwner) {
+				t.Fatalf("err = %v, want ErrNotJobOwner", err)
+			}
+		})
+	}
+
+	// The refusal has to be a refusal, not a rollback that happened to work: the job is
+	// re-read from the table rather than trusted from the error.
+	if stored := reread(t, pool, created.ID); stored.GoodsDescription != "A piano" {
+		t.Errorf("goods description = %q, want it unchanged by the refused edits", stored.GoodsDescription)
+	}
+
+	// A job that does not exist is a different sentinel and the same 404 on the wire. Both
+	// matter: this is what tells the two apart in a test.
+	if _, err := edit(t, pool, svc, owner, uuid.Must(uuid.NewV7()), DraftFields{
+		GoodsDescription: text("nothing"),
+	}); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("err = %v, want ErrJobNotFound", err)
+	}
+}
+
+// Only a draft can be edited. An Open job carries bids made against the details as they were.
+func TestUpdateDraftRefusesAJobThatHasLeftDraft(t *testing.T) {
+	pool := pgtest.DB(t)
+	svc := newDraftService(t, &fakeGeocoder{})
+
+	customer := newCustomer(t, pool, "published@example.com", "+61400000610")
+	created, err := svc.CreateDraft(t.Context(), pool, customer, DraftFields{Pickup: sydney()})
+	if err != nil {
+		t.Fatalf("creating a draft: %v", err)
+	}
+
+	publish(t, pool, created.ID, customer)
+
+	if _, err := edit(t, pool, svc, customer, created.ID, DraftFields{
+		GoodsDescription: text("changed after publication"),
+	}); !errors.Is(err, ErrJobNotDraft) {
+		t.Fatalf("err = %v, want ErrJobNotDraft", err)
+	}
+}
+
+// Replacing an address discards its coordinate, because a coordinate belonging to the previous
+// address would send a driver to the previous place.
+func TestReplacingAnAddressDiscardsTheOldCoordinate(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	// The new address is one the provider does not recognise, so the only way the job could
+	// come back resolved is by keeping the coordinate of the address it no longer has.
+	geo := &fakeGeocoder{unknown: map[string]bool{
+		"40 Bourke Street, Melbourne VIC 3000": true,
+	}}
+	svc := newDraftService(t, geo)
+
+	customer := newCustomer(t, pool, "moved@example.com", "+61400000611")
+	created, err := svc.CreateDraft(t.Context(), pool, customer, DraftFields{Pickup: sydney()})
+	if err != nil {
+		t.Fatalf("creating a draft: %v", err)
+	}
+	if _, _, resolved := created.Pickup.Coordinate(); !resolved {
+		t.Fatal("the original address did not resolve, so this test proves nothing")
+	}
+
+	updated, err := edit(t, pool, svc, customer, created.ID, DraftFields{Pickup: melbourne()})
+	if err != nil {
+		t.Fatalf("editing the draft: %v", err)
+	}
+
+	if _, _, resolved := updated.Pickup.Coordinate(); resolved {
+		t.Errorf("the new address kept the old coordinate: %#v", updated.Pickup)
+	}
+	if updated.Pickup.Formatted != "" {
+		t.Errorf("the new address kept the old formatted answer: %q", updated.Pickup.Formatted)
+	}
+	if stored := reread(t, pool, created.ID); stored.Pickup.Resolved {
+		t.Error("the stored coordinate survived the edit")
+	}
+}
+
+// A PATCH naming nothing is refused rather than answered 200, because a body built from an empty
+// form is a client defect and reporting success hides it.
+func TestUpdateDraftRefusesAnEmptyPatch(t *testing.T) {
+	pool := pgtest.DB(t)
+	svc := newDraftService(t, &fakeGeocoder{})
+
+	customer := newCustomer(t, pool, "empty@example.com", "+61400000612")
+	created, err := svc.CreateDraft(t.Context(), pool, customer, DraftFields{})
+	if err != nil {
+		t.Fatalf("creating a draft: %v", err)
+	}
+
+	if _, err := edit(t, pool, svc, customer, created.ID, DraftFields{}); !errors.Is(err, ErrNothingToUpdate) {
+		t.Fatalf("err = %v, want ErrNothingToUpdate", err)
+	}
+}
+
+// The read, the ownership check and the write are one decision against one version of the row, and
+// lockJob's FOR UPDATE only holds for the length of a transaction.
+func TestUpdateDraftRefusesToRunOutsideATransaction(t *testing.T) {
+	pool := pgtest.DB(t)
+	svc := newDraftService(t, &fakeGeocoder{})
+
+	customer := newCustomer(t, pool, "notx@example.com", "+61400000613")
+	created, err := svc.CreateDraft(t.Context(), pool, customer, DraftFields{})
+	if err != nil {
+		t.Fatalf("creating a draft: %v", err)
+	}
+
+	_, err = svc.UpdateDraft(t.Context(), pool, customer, created.ID, DraftFields{
+		GoodsDescription: text("anything"),
+	})
+	if !errors.Is(err, ErrNotInTransaction) {
+		t.Fatalf("err = %v, want ErrNotInTransaction", err)
 	}
 }
 

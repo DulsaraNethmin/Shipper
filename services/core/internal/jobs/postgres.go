@@ -242,6 +242,46 @@ func (postgresStore) insertDraft(ctx context.Context, r db.Runner, j Job) (Job, 
 	return created, nil
 }
 
+// updateDraft writes every draft column at once, from a job the caller has already locked.
+//
+// Not a dynamically built statement naming only the changed columns, and that is deliberate. The
+// caller holds the row under FOR UPDATE and has applied the patch to the value it read, so
+// writing all of them is writing what is already there — and one fixed statement cannot suffer
+// the defect a built one invites, where a column is omitted from the SET list and its parameter
+// is not, silently shifting every value after it by one.
+//
+// status is not in draftColumns, so this statement cannot move a job even by accident. 000402's
+// trigger returns early when the status is unchanged, which is what lets an ordinary edit pass
+// through a guard that exists for a different column entirely.
+func (postgresStore) updateDraft(ctx context.Context, r db.Runner, j Job) (Job, error) {
+	const q = `
+		UPDATE jobs SET
+			pickup_line = $2, pickup_suburb = $3, pickup_state = $4, pickup_postcode = $5,
+			pickup_latitude = $6, pickup_longitude = $7, pickup_formatted = $8,
+			dropoff_line = $9, dropoff_suburb = $10, dropoff_state = $11, dropoff_postcode = $12,
+			dropoff_latitude = $13, dropoff_longitude = $14, dropoff_formatted = $15,
+			goods_description = $16, length_cm = $17, width_cm = $18, height_cm = $19,
+			weight_kg = $20, vehicle_requirement = $21, handling_notes = $22,
+			pickup_window_start = $23, pickup_window_end = $24,
+			dropoff_window_start = $25, dropoff_window_end = $26
+		WHERE id = $1
+		RETURNING ` + jobColumns
+
+	args := append([]any{j.ID}, draftArgs(j)...)
+
+	updated, err := scanJob(r.QueryRow(ctx, q, args...))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		// The row was locked a few statements ago. Nothing in this platform deletes a job
+		// (Docs/10 §3.3 has no soft deletes and SHIP-171 pseudonymises), so this is
+		// reported rather than assumed away.
+		return Job{}, fmt.Errorf("jobs: %s vanished mid-edit: %w", j.ID, ErrJobNotFound)
+	case err != nil:
+		return Job{}, fmt.Errorf("jobs: update %s: %w", j.ID, err)
+	}
+	return updated, nil
+}
+
 // lockJob reads a job and holds the row for the rest of the transaction.
 //
 // FOR UPDATE rather than a plain read, because a transition is a read-modify-write on the status

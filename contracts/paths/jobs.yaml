@@ -107,7 +107,117 @@ CreateJob:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+JobByID:
+  patch:
+    operationId: updateJobDraft
+    summary: Edit a job draft
+    tags: [Jobs]
+    description: |
+      Applies a partial edit to a draft the caller owns (SHIP-62).
+
+      `PATCH` rather than `PUT`, because the app edits one step of the job wizard at a time and
+      a `PUT` would require it to send every field it is not changing — which is how a client
+      that has not been updated for a new field silently clears it.
+
+      ## Absent, null and empty are three different things
+
+      | The client sends | The platform does |
+      |---|---|
+      | the field omitted, or `null` | leaves it as it was |
+      | an empty value — `""`, `0`, `{}` | clears it |
+      | a value | sets it |
+
+      The middle row is not decoration: without it a customer could add a handling note and
+      never remove it, because `""` would be indistinguishable from not mentioning it.
+
+      An address is replaced as a whole rather than merged part by part, so
+      `{"pickup": {"suburb": "Newtown"}}` is an incomplete address and is rejected. Merging
+      would let an edit produce an address made of two different places with no error reported.
+      **A replaced address discards its coordinate and is resolved again**, because a
+      coordinate belonging to a previous address would send a driver to the previous place.
+
+      A request that names no field at all is refused with `bad_request`.
+
+      ## What is refused
+
+      **Only a draft can be edited.** A job that has been published carries bids made against
+      the details as they were, so an edit is refused with `jobs_not_a_draft` and a `409`. The
+      client's correct response is to reload the job and show its real status.
+
+      **A job belonging to another customer answers `404`, not `403`.** A draft is visible to
+      nobody but its owner, so confirming that a job with that id exists would disclose
+      something the caller had no way to obtain. `not_found` and "none of your business" are
+      deliberately indistinguishable.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobDraft'
+    responses:
+      '200':
+        description: The draft was updated, and is returned in full.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          The job has left `draft` and can no longer be edited (`jobs_not_a_draft`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one
+          entry per offending field.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- parameters --------------------------------------------------------------------------------
+
+JobID:
+  name: id
+  in: path
+  required: true
+  description: The job's identifier, as returned by the endpoint that created it.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
 
 IdempotencyKey:
   name: Idempotency-Key

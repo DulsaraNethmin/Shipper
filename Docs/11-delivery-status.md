@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **105 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **123 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -178,6 +178,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-60** | M2 | The address value object — validated, normalised, and resolved where the platform can; a failed lookup never fails the job — *see below* |
 | **SHIP-61** | M2 | `POST /v1/jobs` — the first authenticated state-changing endpoint in the service — *see below* |
+| **SHIP-62** | M2 | `PATCH /v1/jobs/{id}` — a partial edit of a draft, and a stranger's edit is indistinguishable from no job at all — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -696,6 +697,46 @@ SHIP-62. They moved because `POST` and `PATCH` accept one field set and SHIP-61 
 schemas for one thing is two places for it to drift. The date windows were in no ticket's plan at
 all and are needed by SHIP-68, which expires an Open job at the earlier of fourteen days or the
 pickup date passing.
+
+### What SHIP-62 built, and the two refusals worth reading
+
+`PATCH /v1/jobs/{id}` applies a partial edit to a draft the caller owns. `PATCH` rather than `PUT`,
+because the app edits one step of the job wizard at a time and a `PUT` would require it to send
+every field it is not changing — which is how a client that has not been updated for a new field
+silently clears it.
+
+**Absent, null and empty are three different things**, and the third is not decoration. Every field
+in the request is a pointer, so a non-nil pointer to a zero value clears the field. Without it a
+customer could add a handling note and never remove it, because `""` would be indistinguishable
+from not mentioning it.
+
+**An address is replaced as a whole, never merged part by part**, and a replaced address discards
+its coordinate and is resolved again. Merging would let an edit produce an address made of two
+different places with no error reported; keeping the coordinate would send a driver to the previous
+one. That invariant is why the coordinate lives on `Location` beside the address rather than as two
+more fields on the job — the bad state is unrepresentable rather than merely avoided.
+
+**A stranger's edit answers 404, and byte-identically to a job that does not exist.** A draft is
+visible to nobody but its owner, so a 403 would confirm that a job with that id has been created —
+information the caller had no way to obtain. The domain still keeps `ErrNotJobOwner` and
+`ErrJobNotFound` apart, so a test can tell "the non-owner was refused" from "the job silently
+stopped existing", which are the same answer to a client and very different defects. `make verify`
+compares the two response bodies rather than only their statuses.
+
+**Ownership is checked before status, and the order is load-bearing.** Checking status first would
+let a stranger distinguish somebody else's draft from somebody else's published job by which
+refusal came back — the codes differ even though both are refusals.
+
+**Only a draft can be edited.** An Open job carries bids made against the details as they were, so
+an edit is a 409 with `jobs_not_a_draft` rather than a silent success or a 403; the client's correct
+response is to reload and show the real status. `Docs/02` §3 allows a documented change process
+after award, and that is SHIP-69's, not a `PATCH`.
+
+**The edit runs in a transaction and says so rather than trusting its caller.** The read, the
+ownership check and the write are one decision against one version of the row, and `lockJob`'s
+`FOR UPDATE` only holds for the length of a transaction — outside one the lock is released the
+instant the `SELECT` returns and two concurrent edits interleave into a job carrying half of each.
+`UpdateDraft` refuses a pool the way `Transition` does.
 
 ## 4. Partly done — do not treat these as finished
 

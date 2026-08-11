@@ -39,6 +39,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs", handler.Create())
+	mux.Handle("PATCH /v1/jobs/{id}", handler.Update())
 	return mux
 }
 
@@ -135,23 +136,78 @@ func TestCreateEndpointAnswersWithTheJobItCreated(t *testing.T) {
 
 // Status is never a settable field, and the wire types are where that is enforced against a client
 // rather than against a Go caller.
-func TestCreateRefusesAStatusField(t *testing.T) {
+func TestTheEndpointsRefuseAStatusField(t *testing.T) {
 	pool := pgtest.DB(t)
 	router := newTestRouter(t, pool)
 	customer := newCustomer(t, pool, "http-status@example.com", "+61400000621")
 
-	rec := as(t, router, customer, http.MethodPost, "/v1/jobs", `{"status": "open"}`)
+	created := decode[jobResponse](t, as(t, router, customer, http.MethodPost, "/v1/jobs", `{}`))
 
-	// 400 rather than a quietly ignored field. A client that believes it published a job and
-	// did not will retry forever.
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	cases := map[string]struct {
+		method string
+		target string
+	}{
+		"on create": {http.MethodPost, "/v1/jobs"},
+		"on edit":   {http.MethodPatch, "/v1/jobs/" + created.ID},
 	}
-	if body := decode[errorEnvelope](t, rec); body.Error.Code != "bad_request" {
-		t.Errorf("code = %q, want bad_request", body.Error.Code)
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := as(t, router, customer, tc.method, tc.target, `{"status": "open"}`)
+
+			// 400 rather than a quietly ignored field. A client that believes it
+			// published a job and did not will retry forever.
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+			}
+			if body := decode[errorEnvelope](t, rec); body.Error.Code != "bad_request" {
+				t.Errorf("code = %q, want bad_request", body.Error.Code)
+			}
+			if !strings.Contains(rec.Body.String(), "status") {
+				t.Errorf("the message does not name the offending field: %s", rec.Body)
+			}
+		})
 	}
-	if !strings.Contains(rec.Body.String(), "status") {
-		t.Errorf("the message does not name the offending field: %s", rec.Body)
+
+	// And the job did not move.
+	if got := statusOf(t, pool, uuid.MustParse(created.ID)); got != StatusDraft {
+		t.Errorf("the job is %s, want Draft", got)
+	}
+}
+
+// TestEditingSomebodyElsesJobIsIndistinguishableFromItNotExisting is SHIP-62's ownership rule at
+// the wire, and the disclosure question is the whole of it.
+func TestEditingSomebodyElsesJobIsIndistinguishableFromItNotExisting(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	owner := newCustomer(t, pool, "http-owner@example.com", "+61400000622")
+	stranger := newCustomer(t, pool, "http-stranger@example.com", "+61400000623")
+
+	created := decode[jobResponse](t, as(t, router, owner, http.MethodPost, "/v1/jobs",
+		`{"goods_description": "A piano"}`))
+
+	theirs := as(t, router, stranger, http.MethodPatch, "/v1/jobs/"+created.ID,
+		`{"goods_description": "A cheap piano"}`)
+	nothing := as(t, router, stranger, http.MethodPatch,
+		"/v1/jobs/"+uuid.Must(uuid.NewV7()).String(), `{"goods_description": "A cheap piano"}`)
+
+	if theirs.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 — 403 would confirm the job exists (%s)", theirs.Code, theirs.Body)
+	}
+	if nothing.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (%s)", nothing.Code, nothing.Body)
+	}
+
+	// Byte-identical, not merely the same status. A message that differed would disclose
+	// exactly what the status code was chosen to hide.
+	if theirs.Body.String() != nothing.Body.String() {
+		t.Errorf("a stranger can tell somebody else's job from no job at all:\n %s\n %s",
+			theirs.Body, nothing.Body)
+	}
+
+	if stored := reread(t, pool, uuid.MustParse(created.ID)); stored.GoodsDescription != "A piano" {
+		t.Errorf("goods description = %q, want it unchanged", stored.GoodsDescription)
 	}
 }
 
@@ -168,6 +224,27 @@ func TestAProviderCannotCreateAJob(t *testing.T) {
 	}
 	if body := decode[errorEnvelope](t, rec); body.Error.Code != string(CodeCustomerOnly) {
 		t.Errorf("code = %q, want %s", body.Error.Code, CodeCustomerOnly)
+	}
+}
+
+// A published job is refused with 409 and a code that tells the client to reload rather than to
+// sign in or give up.
+func TestEditingAPublishedJobIsAConflict(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newCustomer(t, pool, "http-published@example.com", "+61400000625")
+
+	created := decode[jobResponse](t, as(t, router, customer, http.MethodPost, "/v1/jobs", `{}`))
+	publish(t, pool, uuid.MustParse(created.ID), customer)
+
+	rec := as(t, router, customer, http.MethodPatch, "/v1/jobs/"+created.ID,
+		`{"goods_description": "changed"}`)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (%s)", rec.Code, rec.Body)
+	}
+	if body := decode[errorEnvelope](t, rec); body.Error.Code != string(CodeNotADraft) {
+		t.Errorf("code = %q, want %s", body.Error.Code, CodeNotADraft)
 	}
 }
 
@@ -200,6 +277,21 @@ func TestValidationFailuresNameTheField(t *testing.T) {
 		if !named[field] {
 			t.Errorf("no detail names %s: %s", field, rec.Body)
 		}
+	}
+}
+
+// A path parameter of the wrong shape is bad_request, which is httpx's own description of that
+// code — and it discloses nothing, because the answer is the same whether or not a job exists.
+func TestAMalformedJobIDIsRefusedBeforeAnythingIsRead(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newCustomer(t, pool, "http-badid@example.com", "+61400000627")
+
+	rec := as(t, router, customer, http.MethodPatch, "/v1/jobs/not-a-uuid",
+		`{"goods_description": "anything"}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
 	}
 }
 

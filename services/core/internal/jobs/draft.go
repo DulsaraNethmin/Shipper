@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
@@ -84,6 +85,59 @@ func (s *Service) CreateDraft(ctx context.Context, r db.Runner, customerID uuid.
 	job.Dropoff = s.resolve(ctx, "dropoff", job.Dropoff)
 
 	return s.store.insertDraft(ctx, r, job)
+}
+
+// UpdateDraft applies a partial edit to a draft the caller owns (SHIP-62).
+//
+// Three refusals, in this order, and the order is the point:
+//
+//  1. a job that does not exist is [ErrJobNotFound];
+//  2. a job belonging to somebody else is [ErrNotJobOwner];
+//  3. a job that has left Draft is [ErrJobNotDraft].
+//
+// Ownership is checked before status, so a caller who does not own the job learns nothing about
+// what state it is in — the two errors are the same 404 on the wire, but a difference in *which*
+// requests are refused is itself a disclosure. Checking status first would let a stranger
+// distinguish somebody else's draft from somebody else's published job by the shape of the
+// refusal.
+//
+// r must be a transaction. The read, the ownership check and the write are one decision made
+// against one version of the row, and lockJob's FOR UPDATE only holds for the length of a
+// transaction — outside one the lock is released the instant the SELECT returns, and two
+// concurrent edits can then interleave into a job carrying half of each.
+func (s *Service) UpdateDraft(ctx context.Context, r db.Runner, customerID, jobID uuid.UUID, f DraftFields) (Job, error) {
+	if _, inTx := r.(pgx.Tx); !inTx {
+		return Job{}, fmt.Errorf("jobs: editing %s: %w", jobID, ErrNotInTransaction)
+	}
+	if f.IsEmpty() {
+		return Job{}, fmt.Errorf("jobs: editing %s: %w", jobID, ErrNothingToUpdate)
+	}
+
+	fields := f.normalise()
+	if err := fields.validate(); err != nil {
+		return Job{}, err
+	}
+
+	job, err := s.store.lockJob(ctx, r, jobID)
+	if err != nil {
+		return Job{}, err
+	}
+
+	if job.CustomerID != customerID {
+		return Job{}, fmt.Errorf("jobs: %s does not belong to %s: %w", jobID, customerID, ErrNotJobOwner)
+	}
+	if job.Status != StatusDraft {
+		return Job{}, fmt.Errorf("jobs: %s is %s: %w", jobID, job.Status, ErrJobNotDraft)
+	}
+
+	// Applying a supplied address produces a Location with no coordinate, so an address that
+	// has changed is re-resolved and one that was not mentioned keeps the answer it already
+	// had. That is the whole reason the coordinate lives on the same value as the address.
+	edited := fields.applyTo(job)
+	edited.Pickup = s.resolve(ctx, "pickup", edited.Pickup)
+	edited.Dropoff = s.resolve(ctx, "dropoff", edited.Dropoff)
+
+	return s.store.updateDraft(ctx, r, edited)
 }
 
 // normalise tidies every supplied field, returning a copy.

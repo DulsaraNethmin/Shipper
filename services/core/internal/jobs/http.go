@@ -36,6 +36,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
@@ -370,6 +371,59 @@ func (h *Handler) Create() http.Handler {
 	})
 }
 
+// Update handles PATCH /v1/jobs/{id} (SHIP-62).
+//
+// PATCH rather than PUT, because the app edits one step of the job wizard at a time and a PUT
+// would require it to send every field it is not changing — which is how a client that has not
+// been updated for a new field silently clears it.
+//
+// A job belonging to somebody else answers 404, not 403. See [apiError].
+func (h *Handler) Update() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		customerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			// A path parameter of the wrong shape is bad_request rather than not_found,
+			// which is the httpx registry's own description of that code. It also
+			// discloses nothing: the answer is the same whether or not any job exists.
+			return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+				"The job id in the path is not a valid identifier.").WithCause(err)
+		}
+
+		var req draftRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		fields, err := req.fields()
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var updated Job
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			updated, err = h.svc.UpdateDraft(ctx, runner, customerID, jobID, fields)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, jobFrom(updated))
+		return nil
+	})
+}
+
 // callerID is the authenticated customer's account id.
 //
 // Both routes declare RequireUser, so a subject is guaranteed by the time a handler runs — which
@@ -431,9 +485,21 @@ func apiError(err error) error {
 	}
 
 	switch {
+	case errors.Is(err, ErrJobNotFound), errors.Is(err, ErrNotJobOwner):
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such job.").WithCause(err)
+
 	case errors.Is(err, ErrNotCustomer):
 		return httpx.NewError(http.StatusForbidden, CodeCustomerOnly,
 			"Only a customer account can create or edit a job.").WithCause(err)
+
+	case errors.Is(err, ErrJobNotDraft):
+		return httpx.NewError(http.StatusConflict, CodeNotADraft,
+			"This job has been published and can no longer be edited as a draft.").WithCause(err)
+
+	case errors.Is(err, ErrNothingToUpdate):
+		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The request changes nothing. Send at least one field to update.").WithCause(err)
 
 	default:
 		return err

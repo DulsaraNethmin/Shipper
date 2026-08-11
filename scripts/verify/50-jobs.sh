@@ -30,6 +30,12 @@ status="$(post_json "verify-jobs-cust-$$" /v1/auth/register \
 jobs_customer_id="$(json "$WORKDIR/jobs-customer.json" '["id"]')"
 jobs_customer_token="$(mint_token "$jobs_customer_id")"
 
+status="$(post_json "verify-jobs-other-$$" /v1/auth/register \
+  "{\"email\":\"job-other-$$@example.com\",\"phone\":\"04131$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/jobs-other.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-other.json"; fail "could not register the second customer: $status"; }
+jobs_other_token="$(mint_token "$(json "$WORKDIR/jobs-other.json" '["id"]')")"
+
 status="$(post_json "verify-jobs-prov-$$" /v1/auth/register \
   "{\"email\":\"job-provider-$$@example.com\",\"phone\":\"04132$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/jobs-provider.json")"
@@ -143,3 +149,75 @@ status="$(job_request POST "$jobs_customer_token" "verify-jobs-partial-$$" /v1/j
   '{"pickup": {"suburb": "Newtown"}}' "$WORKDIR/jobs-partial.json")"
 [[ "$status" == "422" ]] || { cat "$WORKDIR/jobs-partial.json"; fail "a partial address returned $status, want 422"; }
 ok "a partly filled address is refused, while an absent one is not"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-62  PATCH /v1/jobs/{id} updates a Draft and rejects edits by non-owners"
+
+status="$(job_request PATCH "$jobs_customer_token" "verify-jobs-edit-$$" "/v1/jobs/$job_id" \
+  '{"goods_description": "Three-seater sofa, wrapped", "handling_notes": "", "length_cm": 190}' \
+  "$WORKDIR/jobs-edited.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-edited.json"; fail "PATCH returned $status, want 200"; }
+[[ "$(json "$WORKDIR/jobs-edited.json" '["goods_description"]')" == "Three-seater sofa, wrapped" ]] \
+  || fail "the description was not updated"
+[[ "$(json "$WORKDIR/jobs-edited.json" '["length_cm"]')" == "190" ]] || fail "the length was not set"
+ok "the owner's edit is applied"
+
+# A field that was not mentioned is left alone, and one sent empty is cleared. Those are two
+# different things and a client that could not express the second could never remove a note.
+[[ "$(json "$WORKDIR/jobs-edited.json" '["weight_kg"]')" == "45.5" ]] \
+  || fail "a field that was not mentioned changed: weight_kg"
+[[ "$(json "$WORKDIR/jobs-edited.json" '["pickup"]["line"]')" == "12 Smith Street" ]] \
+  || fail "an address that was not mentioned changed"
+grep -q '"handling_notes"' "$WORKDIR/jobs-edited.json" && fail "the cleared note is still in the response"
+ok "absent means unchanged and empty means cleared, which are not the same request"
+
+# The address that was not mentioned kept the coordinate it already had.
+[[ "$(json "$WORKDIR/jobs-edited.json" '["pickup"]["coordinate"]["latitude"]')" == "$pickup_lat" ]] \
+  || fail "an untouched address lost or changed its coordinate"
+ok "an untouched address keeps its resolved coordinate"
+
+status="$(job_request PATCH "$jobs_other_token" "verify-jobs-stranger-$$" "/v1/jobs/$job_id" \
+  '{"goods_description": "A cheap sofa"}' "$WORKDIR/jobs-stranger.json")"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/jobs-stranger.json"; fail "a stranger's edit returned $status, want 404"; }
+ok "another customer's edit is refused"
+
+# 404 rather than 403, and byte-identical to a job that does not exist. A 403 would confirm that
+# a job with this id has been created, which is something a stranger has no way to learn.
+status="$(job_request PATCH "$jobs_other_token" "verify-jobs-missing-$$" \
+  "/v1/jobs/00000000-0000-7000-8000-000000000000" \
+  '{"goods_description": "A cheap sofa"}' "$WORKDIR/jobs-missing.json")"
+[[ "$status" == "404" ]] || fail "a job that does not exist returned $status, want 404"
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/jobs-stranger.json" "$WORKDIR/jobs-missing.json" \
+  || fail "somebody else's job answers differently from no job at all, which discloses that it exists"
+ok "and is indistinguishable from a job that was never created"
+
+# The refusal is a refusal, not a rollback that happened to work.
+still="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select goods_description from jobs where id = '$job_id';")"
+[[ "$still" == "Three-seater sofa, wrapped" ]] || fail "the refused edit changed the row: $still"
+ok "nothing the stranger sent reached the row"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-57  job status is not a settable field, through the API either"
+
+for verb_and_target in "POST /v1/jobs" "PATCH /v1/jobs/$job_id"; do
+  verb="${verb_and_target%% *}"
+  target="${verb_and_target##* }"
+
+  status="$(job_request "$verb" "$jobs_customer_token" "verify-jobs-setstatus-$verb-$$" \
+    "$target" '{"status": "open"}' "$WORKDIR/jobs-setstatus.json")"
+  [[ "$status" == "400" ]] \
+    || { cat "$WORKDIR/jobs-setstatus.json"; fail "$verb accepted a status field: $status"; }
+  grep -q 'status' "$WORKDIR/jobs-setstatus.json" || fail "the refusal does not name the field"
+done
+ok "neither endpoint accepts a status field; the unknown field is reported, not ignored"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$job_id';")" == "Draft" ]] \
+  || fail "the job moved"
+ok "the job is still a Draft"
