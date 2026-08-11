@@ -1,0 +1,106 @@
+# Endpoints belonging to the service itself rather than to any domain.
+#
+# The counterpart of cmd/api/routes.go. Product endpoints do not go here: identity's arrive in
+# identity.yaml from SHIP-30, jobs' in jobs.yaml from SHIP-61, one file per domain, so that two
+# domains being built at the same time never edit the same fragment.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients*
+# to tolerate fields they do not recognise, which is a rule about client behaviour; it is not a
+# licence for the contract to describe less than the service returns. Strict here is what makes
+# TestResponsesMatchTheContract catch a handler that grew a field nobody documented.
+
+Health:
+  get:
+    operationId: getHealth
+    summary: Liveness and build information
+    tags: [Operational]
+    description: |
+      Reports that the process is alive and which build it is running (SHIP-6).
+
+      It deliberately does **not** check PostgreSQL, Redis or Kafka. This endpoint answers
+      "should this instance be restarted or taken out of rotation", and a database blip is not
+      a reason to kill every instance at once. A readiness endpoint that does check
+      dependencies is a separate thing.
+
+      It sits outside `/v1` because load balancers and monitoring consume it, not API clients —
+      versioning it would break every health check on the day v2 ships.
+
+      SHIP-19 has the Flutter app display `version` from here as its proof of connectivity, so
+      these field names are already a contract with builds installed on devices.
+    responses:
+      '200':
+        description: The process is alive.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status, version, commit, built_at, dirty, uptime]
+              additionalProperties: false
+              properties:
+                status:
+                  type: string
+                  enum: [ok]
+                version:
+                  type: string
+                  description: |
+                    The build's version, injected at link time. Never empty: an unstamped
+                    build reports `dev` rather than nothing, so a client comparing versions
+                    always has something to compare.
+                  example: 1.4.0
+                commit:
+                  type: string
+                  description: Never empty; an unstamped build reports `unknown`.
+                  example: 3932fd2
+                built_at:
+                  type: string
+                  description: Build timestamp, or `unknown` when unstamped.
+                  example: '2026-08-10T04:11:52Z'
+                dirty:
+                  type: boolean
+                  description: Whether the working tree had uncommitted changes at build time.
+                uptime:
+                  type: string
+                  description: Time since the process started, rounded to the second.
+                  example: 1h12m30s
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+
+APIRoot:
+  get:
+    operationId: getAPIRoot
+    summary: Which API version this deployment serves
+    tags: [Operational]
+    description: |
+      Answers the root of the version group with the version it is the root of (SHIP-13).
+
+      Not a product endpoint and never will be. It exists because "which API version does this
+      deployment answer" has an operational answer: during a period when v1 and v2 are both
+      live behind different deployments, this takes one call to establish which one a hostname
+      reached. The build behind it comes from `/health`; this says only what contract is on
+      offer.
+
+      Declared in Go as `/{$}` inside the v1 group — net/http's exact-match syntax, which is
+      not part of the URL. The served path is `/v1/`.
+    responses:
+      '200':
+        description: The version group is served here.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_version]
+              additionalProperties: false
+              properties:
+                api_version:
+                  type: string
+                  example: v1
+      '405':
+        $ref: '../openapi.yaml#/components/responses/MethodNotAllowed'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'

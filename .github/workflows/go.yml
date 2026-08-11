@@ -4,6 +4,11 @@
 # for iOS builds cost roughly ten times Linux minutes, and a Go-only change must not trigger
 # one. The filter includes this file, because a workflow that ignores its own definition will
 # not re-run when that definition is fixed.
+#
+# contracts/** is in the filter because SHIP-17a's tests read contracts/openapi.yaml and
+# validate live handler responses against it. Without it, editing a contract fragment — which
+# is how every domain will publish its endpoints — would not run the one test that checks the
+# fragment against the service.
 name: Go
 
 on:
@@ -11,12 +16,14 @@ on:
     branches: ["**"]
     paths:
       - "services/core/**"
+      - "contracts/**"
       - ".github/workflows/go.yml"
       - "Makefile"
       - "mk/**"
   pull_request:
     paths:
       - "services/core/**"
+      - "contracts/**"
       - ".github/workflows/go.yml"
       - "Makefile"
       - "mk/**"
