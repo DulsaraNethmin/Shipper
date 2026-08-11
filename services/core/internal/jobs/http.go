@@ -433,6 +433,49 @@ func (h *Handler) Update() http.Handler {
 	})
 }
 
+// Detail handles GET /v1/jobs/{id} (SHIP-65).
+//
+// The same [jobResponse] the two writing endpoints answer with, so a client parses one type
+// whatever it did to get the job. That is worth stating because the alternative is tempting and
+// wrong: a "detail" shape with a field or two more would make the create response a subset a
+// client has to special-case, and a subset is where a field quietly goes missing.
+//
+// **Owner-only, and a stranger gets the same 404 a missing job gets.** A draft is visible to
+// nobody but its owner, and a published job is visible to providers only through a shape that does
+// not exist yet (SHIP-82, SHIP-83); until it does, "not yours" and "no such job" are one answer
+// here as they are on every other route in this domain.
+//
+// No idempotency key: a GET changes nothing and the middleware lets read-only methods through
+// untouched.
+func (h *Handler) Detail() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		customerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		// The pool rather than a transaction. One statement is atomic on its own, and a
+		// transaction around a single SELECT buys nothing but a round trip either side.
+		job, err := h.svc.Job(r.Context(), pool, customerID, jobID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, jobFrom(job))
+		return nil
+	})
+}
+
 // Cancel handles POST /v1/jobs/{id}/cancel (SHIP-64).
 //
 // A verb under the resource rather than a `PATCH` setting a field, because job status is not a

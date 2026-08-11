@@ -37,6 +37,13 @@ func init() {
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Create() },
 		},
 		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs/{id}",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return jobsHandler(d).Detail() },
+		},
+		Route{
 			Method:  http.MethodPatch,
 			Pattern: "/jobs/{id}",
 			Group:   GroupV1,

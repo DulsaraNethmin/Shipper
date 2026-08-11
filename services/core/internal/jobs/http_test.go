@@ -39,6 +39,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs", handler.Create())
+	mux.Handle("GET /v1/jobs/{id}", handler.Detail())
 	mux.Handle("PATCH /v1/jobs/{id}", handler.Update())
 	mux.Handle("POST /v1/jobs/{id}/cancel", handler.Cancel())
 	return mux
@@ -371,6 +372,78 @@ func TestCancellingSomebodyElsesJobIsIndistinguishableFromItNotExisting(t *testi
 
 	if got := statusOf(t, pool, uuid.MustParse(created.ID)); got != StatusDraft {
 		t.Errorf("the job is %s after a refused cancellation", got)
+	}
+}
+
+// TestDetailEndpointAnswersWithTheSameShapeTheWritesDo is SHIP-65's acceptance criterion at the
+// wire.
+//
+// Compared byte for byte against the create response rather than field by field, because the
+// property worth holding is that there is one shape: a client that parses the answer to POST must
+// parse the answer to GET with the same type.
+func TestDetailEndpointAnswersWithTheSameShapeTheWritesDo(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newCustomer(t, pool, "http-detail@example.com", "+61400000632")
+
+	body := `{
+		"pickup":  {"line": "12 Smith Street", "suburb": "Newtown", "state": "nsw", "postcode": "2042"},
+		"goods_description": "Two-seater sofa",
+		"weight_kg": 45.5,
+		"handling_notes": "Second-floor walk-up, no lift."
+	}`
+	written := as(t, router, customer, http.MethodPost, "/v1/jobs", body)
+	created := decode[jobResponse](t, written)
+
+	rec := as(t, router, customer, http.MethodGet, "/v1/jobs/"+created.ID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+	if rec.Body.String() != written.Body.String() {
+		t.Errorf("the detail response differs from the create response:\n GET  %s\n POST %s",
+			rec.Body, written.Body)
+	}
+
+	read := decode[jobResponse](t, rec)
+	switch {
+	case read.Status != "draft":
+		t.Errorf("status = %q, want draft", read.Status)
+	case read.GoodsDescription != "Two-seater sofa":
+		t.Errorf("goods_description = %q", read.GoodsDescription)
+	case read.HandlingNotes != "Second-floor walk-up, no lift.":
+		t.Errorf("handling_notes = %q", read.HandlingNotes)
+	case read.Pickup == nil || read.Pickup.State != "NSW":
+		t.Errorf("pickup = %#v", read.Pickup)
+	}
+}
+
+// TestReadingSomebodyElsesJobIsIndistinguishableFromItNotExisting is the half of SHIP-65 that is
+// substantive: "for the owning customer only".
+func TestReadingSomebodyElsesJobIsIndistinguishableFromItNotExisting(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	owner := newCustomer(t, pool, "http-detail-owner@example.com", "+61400000633")
+	stranger := newCustomer(t, pool, "http-detail-stranger@example.com", "+61400000634")
+
+	created := decode[jobResponse](t, as(t, router, owner, http.MethodPost, "/v1/jobs",
+		`{"goods_description": "A piano"}`))
+
+	theirs := as(t, router, stranger, http.MethodGet, "/v1/jobs/"+created.ID, "")
+	nothing := as(t, router, stranger, http.MethodGet,
+		"/v1/jobs/"+uuid.Must(uuid.NewV7()).String(), "")
+
+	if theirs.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 — 403 would confirm the job exists (%s)", theirs.Code, theirs.Body)
+	}
+	if theirs.Body.String() != nothing.Body.String() {
+		t.Errorf("a stranger can tell somebody else's job from no job at all:\n %s\n %s",
+			theirs.Body, nothing.Body)
+	}
+
+	// And nothing about the job leaked into the refusal.
+	if strings.Contains(theirs.Body.String(), "piano") {
+		t.Errorf("the refusal carries the job's contents: %s", theirs.Body)
 	}
 }
 

@@ -346,3 +346,81 @@ sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
 [[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$victim';")" == "Draft" ]] \
   || fail "the stranger's refused cancellation reached the row"
 ok "a stranger cannot cancel, and cannot tell the job apart from one that never existed"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-65  GET /v1/jobs/{id} returns the full job to the owning customer only"
+
+# job_get <token> <path> <outfile> — one authenticated read.
+#
+# No Idempotency-Key, and that is the point of a separate helper rather than a sixth argument to
+# job_request: a GET changes nothing, the middleware lets read-only methods through untouched,
+# and a check that sent a key anyway would be demonstrating something other than what it claims.
+job_get() {
+  curl -s -o "$3" -w '%{http_code}' -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT$2"
+}
+
+status="$(curl -s -o "$WORKDIR/jobs-detail-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$job_id")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/jobs-detail-anon.json"; fail "an unauthenticated read returned $status, want 401"; }
+ok "it cannot be reached without a credential"
+
+status="$(job_get "$jobs_customer_token" "/v1/jobs/$job_id" "$WORKDIR/jobs-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-detail.json"; fail "GET /v1/jobs/{id} returned $status, want 200"; }
+ok "the owner reads their own job"
+
+# Every field the customer supplied comes back, including the ones SHIP-62 changed. "In full"
+# is checked against the columns rather than against a list somebody remembered to write.
+python3 - "$WORKDIR/jobs-detail.json" <<'PY' || fail "the detail response is not the whole job"
+import json, sys
+job = json.load(open(sys.argv[1]))
+expected = {
+    "status": "draft",
+    "goods_description": "Three-seater sofa, wrapped",
+    "weight_kg": 45.5,
+    "length_cm": 190,
+}
+missing = {k: v for k, v in expected.items() if job.get(k) != v}
+if missing:
+    print("wrong or absent:", missing, file=sys.stderr)
+    sys.exit(1)
+if job["pickup"]["state"] != "NSW" or job["dropoff"]["state"] != "VIC":
+    print("an address did not come back:", job.get("pickup"), job.get("dropoff"), file=sys.stderr)
+    sys.exit(1)
+if "coordinate" not in job["pickup"]:
+    print("the resolved coordinate did not come back", file=sys.stderr)
+    sys.exit(1)
+PY
+ok "it carries everything the customer supplied, addresses and coordinates included"
+
+# One shape, whatever the client did to obtain the job. A "detail" response with a field or two
+# more would make every write response a subset a client has to special-case.
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+sys.exit(0 if a == b else 1)
+" "$WORKDIR/jobs-detail.json" "$WORKDIR/jobs-edited.json" \
+  || fail "the read and the write answer with different shapes"
+ok "the same shape the write endpoints answer with, so a client parses one type"
+
+# There is no budget field, and there will not be one until SHIP-67 brings the test proving it
+# cannot reach a provider. This check is here so that the day it does arrive, somebody has to
+# come to this file and say so deliberately.
+grep -q 'budget' "$WORKDIR/jobs-detail.json" && fail "a budget field appeared before SHIP-67"
+ok "no budget field yet — SHIP-67 lands the column together with its serialisation proof"
+
+status="$(job_get "$jobs_other_token" "/v1/jobs/$job_id" "$WORKDIR/jobs-detail-stranger.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/jobs-detail-stranger.json"; fail "a stranger's read returned $status, want 404"; }
+status="$(job_get "$jobs_other_token" "/v1/jobs/00000000-0000-7000-8000-000000000002" \
+  "$WORKDIR/jobs-detail-nothing.json")"
+[[ "$status" == "404" ]] || fail "reading a job that does not exist returned $status, want 404"
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/jobs-detail-stranger.json" "$WORKDIR/jobs-detail-nothing.json" \
+  || fail "somebody else's job answers differently from no job at all"
+grep -q 'sofa' "$WORKDIR/jobs-detail-stranger.json" && fail "the refusal leaked the job's contents"
+ok "a stranger gets the same 404 a missing job gets, and learns nothing from it"

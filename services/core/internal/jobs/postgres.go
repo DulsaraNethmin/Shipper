@@ -303,6 +303,26 @@ func (postgresStore) lockJob(ctx context.Context, r db.Runner, id uuid.UUID) (Jo
 	return j, nil
 }
 
+// job reads one job and holds nothing.
+//
+// The counterpart of [postgresStore.lockJob], and a separate method rather than a flag on it,
+// because the difference is not a detail of the query. FOR UPDATE inside a read-only request
+// serialises every reader of a job behind whatever is writing it, and — worse — a GET that took
+// a row lock and then returned would hold it until the enclosing transaction ended, which for a
+// handler using the pool directly is unbounded. A read that is only ever a read takes no lock.
+func (postgresStore) job(ctx context.Context, r db.Runner, id uuid.UUID) (Job, error) {
+	const q = `SELECT ` + jobColumns + ` FROM jobs WHERE id = $1`
+
+	j, err := scanJob(r.QueryRow(ctx, q, id))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Job{}, fmt.Errorf("jobs: %s: %w", id, ErrJobNotFound)
+	case err != nil:
+		return Job{}, fmt.Errorf("jobs: read %s: %w", id, err)
+	}
+	return j, nil
+}
+
 // recordTransition writes the history row and returns the platform's clock reading.
 //
 // server_recorded_at is not supplied. It defaults from now(), which is transaction start time,

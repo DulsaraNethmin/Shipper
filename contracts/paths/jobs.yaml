@@ -108,6 +108,56 @@ CreateJob:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
 JobByID:
+  get:
+    operationId: getJob
+    summary: Read a job
+    tags: [Jobs]
+    description: |
+      Returns a job in full, to the customer who owns it (SHIP-65).
+
+      **The same schema the create and edit operations answer with.** A client parses one type
+      whatever it did to obtain the job; a "detail" shape carrying a field or two more would
+      make those responses a subset every client has to special-case.
+
+      **A job belonging to another customer answers `404`, not `403`**, byte-identically to a
+      job that does not exist. A draft is visible to nobody but its owner, and a published job
+      reaches a provider through a shape of its own (SHIP-82, SHIP-83) rather than through this
+      one.
+
+      This is the customer's view, so it carries everything the customer supplied. The
+      budget arrives with SHIP-67, which is the ticket that brings the test proving the field
+      cannot reach a provider.
+    parameters:
+      - $ref: '#/JobID'
+    responses:
+      '200':
+        description: The job, in full.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
   patch:
     operationId: updateJobDraft
     summary: Edit a job draft

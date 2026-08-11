@@ -781,10 +781,48 @@ transaction-local setting, which is the only protocol 000402 accepts — a bare 
 status` is refused. So even a fixture written to bypass the guard cannot, which is worth more than
 the check it sets up.
 
+### What SHIP-65 built, and the half of its *Done when* that could not be met
+
+`GET /v1/jobs/{id}` returns a job in full to the customer who owns it, and 404 to everybody else.
+
+**Its *Done when* says "including budget", and the budget column does not exist.** It was
+deliberately not added. `Docs/11` §8 makes SHIP-67 single-owner with SHIP-83 precisely so the column
+and the serialisation test proving it cannot reach a provider land together, and SHIP-67 is not in
+this wave. A field that arrives before its proof is the one arrangement worse than a field that
+arrives late — so the endpoint is complete and the sentence is not. **Recorded here rather than
+resolved silently**, and §4 carries SHIP-65 until SHIP-67 closes it. `make verify` asserts the
+absence of a `budget` key, so the day it appears somebody has to come to that file and say so.
+
+**`Docs/09` cannot be satisfied here as written, and that is worth a decision rather than a
+workaround.** SHIP-67 owns the budget column and **depends on SHIP-65**, so SHIP-65's *Done when*
+asks for a field whose own ticket cannot start until SHIP-65 is finished. No implementation of
+SHIP-65 can meet that line; either the words belong to SHIP-67 or the two tickets are one.
+`CLAUDE.md` says a contradiction with a document is not resolved silently in code, so it is
+recorded here and `Docs/09` is left untouched — **the wording is the repository owner's to correct**.
+
+**The same `jobResponse` the write endpoints answer with**, and `make verify` compares a `GET`
+response with the `PATCH` response that preceded it byte for byte. A "detail" shape carrying a field
+or two more would make every write response a subset a client has to special-case, which is where a
+field quietly goes missing.
+
+**A non-locking read was added beside `lockJob` rather than a flag on it.** `FOR UPDATE` inside a
+`GET` serialises every reader behind whatever is writing, and a handler using the pool directly
+would hold the lock for an unbounded time. `TestReadingAJobDoesNotWaitOnAWriter` holds the row in
+one transaction and reads it from another, so the property is pinned rather than left to a comment.
+
+**Ownership is checked in Go, not in the `WHERE` clause.** `WHERE id = $1 AND customer_id = $2`
+returning nothing cannot say whether the job is somebody else's or nobody's, and those are one
+answer on the wire and very different defects.
+
+**Reading is not restricted to Draft.** Editing stops there (SHIP-62) because an Open job carries
+bids made against the details as they were; reading has no such reason, and a customer who cannot
+see their own Open job cannot be shown its bids.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
 |---|---|---|
+| **SHIP-65** | The endpoint, the owner-only rule, the full customer view | The `budget` field its *Done when* names. The column is SHIP-67's, with the proof that it cannot leak |
 | **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
 | **SHIP-134** | `outbox` table, `internal/events` writer | The publisher. That is M5 and stays there |
 
