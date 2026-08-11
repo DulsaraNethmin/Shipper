@@ -173,10 +173,8 @@ void main() {
     // The debug-only bridge across the gap SHIP-55 closes. It is what makes "chosen at signup"
     // and "drives the shell" one demonstrable flow on a device rather than two separate facts.
     final identity = FakeIdentityRepository();
-    await openRegistration(tester, identity, role: UserRole.provider);
-    await fillRegistration(tester);
-    await tester.tap(find.byKey(const Key('register-submit')));
-    await tester.pumpAndSettle();
+    await registerThrough(tester, identity, role: UserRole.provider);
+    await verifyEmailThrough(tester);
 
     await tester.tap(find.byKey(const Key('development-session-provider')));
     await tester.pumpAndSettle();

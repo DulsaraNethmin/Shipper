@@ -83,10 +83,10 @@ class _RegistrationScreenState extends ConsumerState<RegistrationScreen> {
     if (!mounted) return;
 
     if (account != null) {
-      // SHIP-53 inserts email verification here, and SHIP-54 phone verification after it. Until
-      // then the journey ends at the screen that says what was created and what is not yet
-      // possible, rather than at a step that does not exist.
-      context.go(Routes.registered);
+      // Registration issues and sends the verification token itself (SHIP-31), inside the same
+      // transaction that created the account — so the next screen has something to wait for the
+      // moment it opens.
+      context.go(Routes.verifyEmail);
       return;
     }
 

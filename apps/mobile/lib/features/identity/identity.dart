@@ -14,9 +14,11 @@
 /// - `signup_controller.dart` — the journey's state, and one idempotency key per action.
 /// - `role_selection_screen.dart` — which half of the marketplace, chosen first (SHIP-52).
 /// - `registration_screen.dart` — create an account (SHIP-51).
+/// - `email_verification_screen.dart` — typed or deep-linked (SHIP-53).
+/// - `resend_button.dart` — "send it again", with the interval the platform asked for.
 /// - `registration_complete_screen.dart` — where the journey ends, honestly stubbed.
 ///
-/// Verification is SHIP-53 and SHIP-54, sign-in SHIP-55. Each consumes an endpoint built in an
+/// Phone verification is SHIP-54 and sign-in SHIP-55. Each consumes an endpoint built in an
 /// earlier wave — `Docs/11` §7 forbids a screen depending on an endpoint from its own wave, and
 /// `POST /v1/auth/login` does not exist at all yet.
 ///

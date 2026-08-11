@@ -60,6 +60,16 @@ Future<void> openRegistration(
   await tester.pumpAndSettle();
 }
 
+/// Registers through the form, which is how the verification screens are reached with an account
+/// in hand — the journey's own route, rather than a shortcut past the screen that creates it.
+Future<void> registerThrough(WidgetTester tester, FakeIdentityRepository identity,
+    {UserRole? role}) async {
+  await openRegistration(tester, identity, role: role);
+  await fillRegistration(tester);
+  await tester.tap(find.byKey(const Key('register-submit')));
+  await tester.pumpAndSettle();
+}
+
 /// Fills the registration form. Values default to ones both this device and the platform accept.
 Future<void> fillRegistration(
   WidgetTester tester, {
@@ -71,4 +81,17 @@ Future<void> fillRegistration(
   await tester.enterText(find.byKey(const Key('register-phone')), phone);
   await tester.enterText(find.byKey(const Key('register-password')), password);
   await tester.pump();
+}
+
+/// Confirms the email address, which is the step between registration and whatever follows it.
+Future<void> verifyEmailThrough(
+  WidgetTester tester, {
+  String token = '9qE2vT7bYw1sJk4pNc0aRlX8oZgHdM3uQiV6yB5tCfE',
+}) async {
+  await tester.enterText(find.byKey(const Key('verify-email-token')), token);
+  await tester.tap(find.byKey(const Key('verify-email-submit')));
+  await tester.pumpAndSettle();
+
+  await tester.tap(find.byKey(const Key('verify-email-continue')));
+  await tester.pumpAndSettle();
 }

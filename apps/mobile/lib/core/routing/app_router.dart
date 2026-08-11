@@ -7,6 +7,7 @@ import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
+import 'package:shipper/features/identity/email_verification_screen.dart';
 import 'package:shipper/features/identity/registration_complete_screen.dart';
 import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/role_selection_screen.dart';
@@ -30,6 +31,16 @@ abstract final class Routes {
 
   /// The registration form (SHIP-51).
   static const register = '/register';
+
+  /// Confirm the email address (SHIP-53).
+  ///
+  /// **Also the app's first deep link, and the scheme is `shipper:///verify-email?token=…`.**
+  /// `internal/identity/verification.go` left the choice to this ticket and sends a bare value
+  /// meanwhile. A custom scheme needs no registered domain and no store account, both of which
+  /// are blocked on X-2 and X-3; the production form is an HTTPS universal and app link, which
+  /// needs the entitlement work in SHIP-24…27 and resolves to this same route with this same
+  /// query parameter.
+  static const verifyEmail = '/verify-email';
 
   /// Where the signup journey ends (SHIP-51).
   ///
@@ -65,6 +76,7 @@ const _signedOutLocations = <String>{
   Routes.signIn,
   Routes.chooseRole,
   Routes.register,
+  Routes.verifyEmail,
   Routes.registered,
 };
 
@@ -85,15 +97,63 @@ String? redirectFor(SessionState session, String location) {
   if (_sessionAgnostic.contains(location)) return null;
 
   return switch (session) {
-    // Hold the splash until the keychain answers. This drops a deep link that arrives during
-    // the read — the app lands in the shell rather than on the linked screen. Acceptable while
-    // nothing deep-links: SHIP-143 introduces the first payloads that do, and it is the ticket
-    // that has to remember the arriving location across the restore.
+    // Hold the splash until the keychain answers. Where a deep link that arrives during the
+    // read is *remembered* is [Redirector] — see the note there.
     SessionRestoring() => location == Routes.starting ? null : Routes.starting,
     SessionSignedOut() =>
       _signedOutLocations.contains(location) ? null : Routes.signIn,
     SessionSignedIn() => location == Routes.home ? null : Routes.home,
   };
+}
+
+/// The redirect the router actually installs: [redirectFor], plus the one thing a pure function
+/// of the session and the location cannot do (SHIP-53).
+///
+/// **SHIP-49 wrote down that a deep link arriving during the keychain read is dropped**, judged
+/// it acceptable while nothing deep-linked, and named SHIP-143 — push payloads — as the ticket
+/// that would have to remember the arriving location. SHIP-53 turned out to be the first ticket
+/// that deep-links: `shipper:///verify-email?token=…` arrives at a cold start, which is exactly
+/// when the session is restoring, so it is *always* the dropped case rather than a rare one.
+/// The person taps the link in their email and lands on the sign-in screen.
+///
+/// So the location is held for the few milliseconds the keychain takes and reissued when the
+/// answer arrives. Two properties are worth stating because they are what make this safe:
+///
+/// - **The held location is still put through [redirectFor].** Holding a location does not
+///   exempt it from the guard — a link to the home shell arriving on a signed-out device still
+///   goes to the sign-in screen.
+/// - **It holds the whole URI, query and all.** Holding only the path would deliver somebody to
+///   the verification screen with no token in it, which is worse than not delivering them.
+///
+/// It is a class rather than a closure so it can be tested as a sequence, which is what it is —
+/// its whole behaviour is what the second call does about the first.
+@visibleForTesting
+class Redirector {
+  String? _held;
+
+  /// Where this redirect should go, or `null` to leave it alone.
+  String? call(SessionState session, Uri uri) {
+    final location = uri.path;
+
+    if (session is SessionRestoring) {
+      // Anything other than the splash during the restore is a location somebody asked for and
+      // the app is not ready to show yet.
+      if (location != Routes.starting) _held = uri.toString();
+      return redirectFor(session, location);
+    }
+
+    final held = _held;
+    if (held != null) {
+      // Cleared unconditionally: a location held across one restore must not be reissued on
+      // some later sign-out, which would take somebody back to a screen they had left.
+      _held = null;
+      if (location == Routes.starting) {
+        return redirectFor(session, Uri.parse(held).path) ?? held;
+      }
+    }
+
+    return redirectFor(session, location);
+  }
 }
 
 /// The router, as a provider.
@@ -112,13 +172,16 @@ final routerProvider = Provider<GoRouter>((ref) {
   ref.onDispose(sessionChanged.dispose);
   ref.listen(sessionProvider, (_, next) => sessionChanged.value = next);
 
+  // One per router, and the router is one per application: the hold has to survive every
+  // redirect of a single cold start and nothing longer.
+  final redirector = Redirector();
+
   return GoRouter(
+    // Only the starting location when the platform has not supplied one. go_router prefers the
+    // platform's default route, which is how a cold-start deep link arrives.
     initialLocation: Routes.starting,
     refreshListenable: sessionChanged,
-    redirect: (context, state) => redirectFor(
-      ref.read(sessionProvider),
-      state.matchedLocation,
-    ),
+    redirect: (context, state) => redirector(ref.read(sessionProvider), state.uri),
     routes: <RouteBase>[
       GoRoute(
         path: Routes.starting,
@@ -135,6 +198,16 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.register,
         builder: (context, state) => const RegistrationScreen(),
+      ),
+      GoRoute(
+        path: Routes.verifyEmail,
+        // The token arrives in the query string, which is the form a deep link of either kind
+        // resolves to — a custom scheme now, an HTTPS universal and app link once the domain
+        // and the entitlements exist. `matchedLocation` excludes the query, so the guard above
+        // sees `/verify-email` either way.
+        builder: (context, state) => EmailVerificationScreen(
+          deepLinkedToken: state.uri.queryParameters['token'],
+        ),
       ),
       GoRoute(
         path: Routes.registered,

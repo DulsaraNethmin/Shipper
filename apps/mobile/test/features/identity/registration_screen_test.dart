@@ -76,9 +76,10 @@ void main() {
       });
 
       // The journey continues, still signed out — registering is not signing in, and the
-      // platform returns no token.
-      expect(find.byKey(const Key('registered-heading')), findsOneWidget);
-      expect(find.text('alice@example.com'), findsOneWidget);
+      // platform returns no token. The next step is confirming the address registration just
+      // sent a message to.
+      expect(find.byKey(const Key('verify-email-token')), findsOneWidget);
+      expect(find.textContaining('alice@example.com'), findsOneWidget);
       expect(find.byKey(const Key('shell-signed-in')), findsNothing);
     });
 
@@ -97,10 +98,8 @@ void main() {
 
     testWidgets('the journey ends where it honestly can, and says so', (tester) async {
       final identity = FakeIdentityRepository();
-      await openRegistration(tester, identity);
-      await fillRegistration(tester);
-      await tester.tap(find.byKey(const Key('register-submit')));
-      await tester.pumpAndSettle();
+      await registerThrough(tester, identity);
+      await verifyEmailThrough(tester);
 
       // There is no sign-in endpoint on the platform yet (SHIP-41, consumed by SHIP-55), so the
       // screen says that rather than offering a button that cannot work.
