@@ -105,7 +105,7 @@ out of `CHECKS` deliberately — it needs a device, and the Flutter CI job is a 
 until SHIP-24…27 — so it is a check a person invokes when the storage or the session changes.
 The file's own header says which invocation demonstrates which claim.
 
-### M0 — Foundation (27 of 32)
+### M0 — Foundation (28 of 32)
 
 | Ticket | What |
 |---|---|
@@ -128,6 +128,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-21** | Flutter CI — analyzer, tests, per-flavour environment tests, codegen diff |
 | **SHIP-22** | Admin panel scaffold — pnpm workspace, Next.js App Router, placeholder shell |
 | **SHIP-23** | Driver portal scaffold — placeholder job page, no token route, no account |
+| **SHIP-23a** | Web CI — one path-filtered workflow per surface, and a Go change starts neither — *see below* |
 
 ### Elsewhere
 
@@ -288,6 +289,38 @@ between them is returned by the platform, so that split is SHIP-52. The connecti
 putting it behind the session would have made "can this build reach the API" unanswerable on a
 fresh install — which is exactly when it is asked.
 
+### What SHIP-23a built
+
+Two workflows, `web-admin.yml` and `web-driver-portal.yml`, path-filtered per surface as
+`.github/workflows/README.md` has anticipated since SHIP-1.
+
+**The filter was demonstrated rather than assumed**, by evaluating every workflow's `paths:`
+block against representative changed-file sets:
+
+| A change to | Go | Flutter | Admin panel | Driver portal |
+|---|---|---|---|---|
+| `services/core/**` | runs | — | — | — |
+| `apps/mobile/**` | — | runs | — | — |
+| `apps/admin/**` | — | — | runs | — |
+| `apps/driver-portal/**` | — | — | — | runs |
+| `pnpm-lock.yaml` | — | — | runs | runs |
+| `Docs/**` | — | — | — | — |
+
+The first row is the *Done when* line: **a Go-only change starts neither web workflow.**
+
+**Both run `make web-check`, which covers both surfaces**, because `mk/web.mk` drives pnpm with
+`-r` across the workspace and names no application — deliberately, so a third surface is a line
+in `pnpm-workspace.yaml`. So a change to the admin panel also checks the driver portal. That is
+redundancy rather than a gap, and the saving worth having is against Go and Flutter changes,
+which the filter already collects.
+
+**It also found a defect, which is the sort of thing a first clean-tree run finds.**
+`make web-check` is lint → typecheck → build, and on a checkout that has never been built the
+typecheck fails: Next.js 16 generates `LayoutProps` and the route types into `.next/types`
+during a build, and `tsc --noEmit` has nothing to resolve them against until one has run. It is
+invisible locally, because a developer has always built at least once. The workflows run the
+build first as a workaround and say so; the fix is one line in `mk/web.mk` and is in §9.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -421,7 +454,9 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **~~`httpx.RegisterCode` is documented but does not exist.~~ Decided and built at SHIP-15c.** The registry, the uniqueness tests in `cmd/api`, and the generated `Docs/10-api-error-codes.md` all exist; `Docs/10` §4.4 is now true and says so, including that it was not. The choice was between building the mechanism and amending the document to match reality, and building won because SHIP-30 and SHIP-57 both need it on separate tracks in the same wave.
 
-**~~A ticket for the web CI workflows.~~ Written as SHIP-23a at SHIP-15c.** Two points, path-filtered per surface, dependencies SHIP-22 and SHIP-23 both met. It belongs to a client track rather than to platform work.
+**~~A ticket for the web CI workflows.~~ Written as SHIP-23a at SHIP-15c, and built — see §3.** Two workflows, path-filtered per surface, and the filter demonstrated against a changed-file matrix rather than believed.
+
+**`make web-check` runs its type-check before its build, and that order is wrong.** Next.js 16 generates `LayoutProps` and the route types into `.next/types` during a build, so `tsc --noEmit` fails on any tree that has never been built. Nobody had noticed, because a developer always has built. **The fix is one line** — `web-check: web-lint web-build web-typecheck` in `mk/web.mk`. SHIP-23a did not make it: `mk/web.mk` belongs to the web surfaces rather than to a CI ticket, and both workflows carry a `make web-build` step and a comment naming this entry instead. **Delete the workaround in the same change that reorders the target.**
 
 **`flutter_secure_storage` is held at 10.x because version 11 needs `compileSdk = 37`.** The client compiles against 36 today, and Android Gradle Plugin 9.0.1 names 36 as its own maximum recommended — so taking 11 means moving the SDK and probably the Gradle plugin together. There is no urgency: 10.3.1 uses the same Keystore-wrapped ciphers and the same API 23 requirement. **Decide it with SHIP-24 and SHIP-26**, which are the tickets that touch the Android build configuration anyway.
 
@@ -448,7 +483,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
+SHIP-20 SHIP-22 SHIP-23 SHIP-23a SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
 SHIP-48 SHIP-49
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
