@@ -10,7 +10,7 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-11, on SHIP-15c — wave-2 preparation: the shared surfaces three tracks would otherwise collide in, and three mechanisms that were documented but absent. The update before it was SHIP-17a, the published API contract and the first release of wave 1 to `main`. §7 keeps wave 1's sequence rather than tidying it away.
+**Last updated:** 2026-08-11, on SHIP-44 — the authentication middleware, which closes the idempotency-scope hole §8 has been carrying as a gate. It follows SHIP-15c, the wave-2 preparation, on the same day. §7 keeps wave 1's sequence rather than tidying it away.
 
 ---
 
@@ -18,8 +18,8 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 37 | 90 |
-| Remaining | 166 | 536 |
+| **Done** | 38 | 93 |
+| Remaining | 165 | 533 |
 | **Total** | 203 | 626 |
 
 The totals grew by two tickets rather than shrinking: SHIP-15c and SHIP-23a were added to `Docs/09` in the same change, both work the plan assumed and no ticket owned.
@@ -28,7 +28,7 @@ The totals grew by two tickets rather than shrinking: SHIP-15c and SHIP-23a were
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
 | **M0** Foundation | 27 / 32 | 66 / 82 |
-| **M1** Identity | 6 / 28 | 15 / 78 |
+| **M1** Identity | 7 / 28 | 18 / 78 |
 | **M2** Jobs | 1 / 26 | 3 / 78 |
 | **M3** Bidding and award | 0 / 27 | 0 / 95 |
 | **M4** Delivery | 0 / 29 | 0 / 101 |
@@ -38,7 +38,7 @@ The totals grew by two tickets rather than shrinking: SHIP-15c and SHIP-23a were
 
 **M0 has five tickets left and only one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. SHIP-23a is the web CI that `Docs/09` now carries as a ticket rather than this file carrying it as a recommendation; it is unblocked and belongs to a client track.
 
-**Wave 2 is prepared but not started.** SHIP-15c closed the shared surfaces its three tracks would otherwise have met in, and SHIP-44 is the one ticket that has to land before any of them — see §8.
+**Wave 2 is prepared and its gate is cleared.** SHIP-15c closed the shared surfaces its three tracks would otherwise have met in, and SHIP-44 has landed — so the freeze on authenticated state-changing endpoints in §8 is lifted. The tracks can start.
 
 **The published contract exists (SHIP-17a), and it is checked rather than believed.** `contracts/openapi.yaml` is assembled from per-domain fragments under `contracts/paths/`, and three tests in `cmd/api` hold it to the service: the manifest and the contract must agree in both directions, live handler responses must satisfy the published schemas, and the error contract must match the `Error` schema for failures that `net/http` writes rather than a handler. That closes `TestEveryRouteIsInTheContract`, the last of the three route-surface guards in `Docs/10` §4.1 to become enforceable.
 
@@ -85,7 +85,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **62 checks**, and `make check` green.
+Verified by `make verify` — **66 checks**, and `make check` green.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -132,6 +132,7 @@ endpoints, and none of these tickets adds one.
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
+| **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -189,6 +190,25 @@ Same mould as SHIP-15b, one wave later and larger. Wave 1's three tracks produce
 
 **Deliberately out of scope: splitting `scripts/verify-foundation.sh`.** It is 660 lines in one file with no include mechanism, and it is the sixth shared surface. Wave 2's track split gives it exactly one client — only the identity track appends — so it can wait. Named here so wave 3 treats it as a decision rather than a discovery.
 
+### What SHIP-44 built, and what it closed
+
+The gate §8 has been describing since wave 1. Three points, and it held back every authenticated state-changing endpoint in five milestones.
+
+**The hole was real and is now closed.** `httpx.Idempotent` was wired with `scope == nil`, so every stored response landed in `idem:v1:anonymous:<key>`. Harmless while nothing was authenticated; the moment something is, a client that guesses another client's key is handed that client's response body — somebody else's job, address or bid. `httpx.SubjectScope` namespaces by caller, and `make verify` now demonstrates it against a running service: two callers, one key, identical body, two separate Redis entries.
+
+**`Route.Auth` was decoration until now.** `attach` ignored it entirely and the class was enforced only by `TestNoMutatingRouteIsPublic` — a test that a route was *declared* correctly, not that the declaration did anything. It is now read at wiring time, and **a class with no middleware behind it panics at startup rather than being served open.** That is the state `RequireDriverToken` (SHIP-108) and `RequireAdmin` (SHIP-147) are in today.
+
+**Authentication is deliberately two middlewares, and that is worth knowing before somebody tidies it.** `ResolveSubject` runs group-wide, outside `Idempotent`, and never rejects; `RequireSubject` runs per route and does. Both halves are forced:
+
+- The scope must be computed after the subject exists, so resolution has to sit further out than idempotency.
+- `POST /v1/auth/refresh` is public and is called by exactly the client whose access token has just expired. A middleware that refused a bad credential on sight would lock that client out of the endpoint that replaces it.
+
+**`token_expired` is a new protocol code**, and the sixteenth. Expiry is the one authentication failure a client acts on differently — refresh rather than sign out — and reporting it precisely discloses nothing, because `exp` sits in the payload the client already holds. Every other failure is one undifferentiated `unauthenticated`: naming which check refused a credential is help only somebody probing has a use for.
+
+**SHIP-15c's own acceptance criterion is now demonstrated.** SHIP-44 landed with no field added to `Deps` and no edit to its literal in `main.go`. The verifier is passed to `newRouter` alongside the idempotency store, because it is a collaborator of the router rather than something a handler is built from.
+
+**What is not demonstrated by `make verify`: the 401 itself.** There is no protected route in the service yet — SHIP-44 is the middleware, not an endpoint — so the rejection paths are covered by tests in `internal/httpx` and `cmd/api` rather than by curl. The first route with `Auth: RequireUser` is where that section gets written.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -218,14 +238,13 @@ X-5 and X-6 need no third party at all — they are decisions somebody can make 
 
 ## 6. Ready to start now
 
-Strict build order says the next ticket is the lowest-numbered open one. With SHIP-15c done that is **SHIP-23a**, and the lowest-numbered *platform* one is **SHIP-30** — but read the note on SHIP-44 below before planning around either. These all have satisfied dependencies:
+Strict build order says the next ticket is the lowest-numbered open one. With SHIP-15c and SHIP-44 done that is **SHIP-23a**, and the lowest-numbered *platform* one is **SHIP-30**. These all have satisfied dependencies:
 
 | Ticket | Pts | Area |
 |---|---|---|
 | SHIP-30 | 3 | Registration endpoint — `users` and argon2id both exist now |
 | SHIP-31, 34 | 5 | Email verification token, phone OTP issue and storage |
 | SHIP-39 | 5 | Refresh token rotation — `device_sessions` exists, and it needs an expiry column |
-| **SHIP-44** | 3 | **Authentication middleware — the gate in §8, and its dependencies are already met** |
 | SHIP-48 | 3 | Flutter secure storage — `apps/mobile` exists now, and API 24 was chosen for it |
 | SHIP-56 | 3 | `jobs` table |
 | SHIP-67a | 3 | `cmd/worker` scheduler |
@@ -234,13 +253,11 @@ Strict build order says the next ticket is the lowest-numbered open one. With SH
 
 **SHIP-114 is on this list no longer, and it is not blocked either.** Its dependencies are met, but `internal/platform/storage/` is `doc.go` alone and `deploy/docker-compose.yml` has no MinIO or equivalent. Its *Done when* — "receives a short-lived pre-signed URL and uploads directly" — cannot be demonstrated on this machine, and wave 1 already paid for counting a ticket whose acceptance criterion needs a tool nobody installed. **It needs a lettered ticket adding object storage to the local stack first**, as shared-platform work. Until then it is neither ready nor blocked on a third party, which is a third category this file did not have.
 
-**SHIP-44 was missing from this list until now, and that mattered.** Its dependencies are SHIP-37 and SHIP-12, both of which have been done since wave 1. §8 describes it as a hard gate ahead, which reads as future work and is why nobody noticed it was buildable today. It is three points, and until it lands every authenticated state-changing endpoint in M1 through M6 is held behind it — so it is worth clearing *before* the next wave rather than inside one, where it would serialise a whole track behind a single agent's first commit.
+**SHIP-44 has landed, and the way it was nearly missed is worth keeping.** Its dependencies — SHIP-37 and SHIP-12 — had both been done since wave 1, but §8 described it as a hard gate *ahead*, which reads as future work, and that is why it sat out of this list while blocking five milestones. A ticket described only as a constraint on other work stops being read as work itself.
 
 **The identity package is the real constraint on the next wave, not the gate.** SHIP-30, 31, 34, 39, 40, 41, 42, 43, 44 and 45 all live in `internal/identity`, and `Docs/10` §9.1 gives one package directory to one agent at a time. That is roughly thirty points on one track no matter how many agents are available. Parallelism in wave 2 has to come from elsewhere — `jobs` (SHIP-56), `cmd/worker` (SHIP-67a), the Flutter client (SHIP-48), and SHIP-23a. Storage is not one of the options, for the reason above.
 
-**SHIP-30 is a state-changing route and SHIP-44 has not landed, and it is still safe to build.** §8's gate names *authenticated* endpoints for a precise reason worth knowing before someone reads it as a blanket freeze: `replayOrRefuse` compares a fingerprint over method, path and body, and refuses a reused key with `409 idempotency_key_reused` rather than replaying. Reading another caller's stored response therefore requires sending their exact body — which, for register, means already holding their email and password. The public endpoints on `Docs/10` §4.1's allow-list all carry the caller's own secret material in the body, and that is what protects them while the scope is `nil`.
-
-The gate binds where the body does *not* distinguish callers — `POST /v1/auth/logout` with an empty body is the same request from everybody, and under a shared `anonymous` scope one user's response replays to another. That is the case SHIP-44 closes.
+**Public routes still share the anonymous scope, and that remains safe.** `replayOrRefuse` fingerprints method, path and body, so reading another caller's stored response requires sending their exact request — which, on every route on `Docs/10` §4.1's allow-list, means already holding the secret material in their body. `make verify` checks that the anonymous scope still works, because scoping idempotency into uselessness would be a subtler regression than leaving it shared.
 
 ## 7. Wave 1 — what landed
 
@@ -299,13 +316,17 @@ These were settled before the tracks started, so that three agents did not answe
 
 ## 8. Hard gates ahead
 
-**SHIP-44 is a choke point, and the reason is a live security hole.** `httpx.Idempotent` is wired with `scope == nil`, so every key lands in `idem:v1:anonymous:<key>`. Harmless while nothing is authenticated; the moment something is, a client that guesses another client's key gets that client's response body. **No authenticated state-changing endpoint may merge before SHIP-44 supplies the authenticated subject.** During that wave exactly one agent touches `cmd/api` and `internal/httpx`.
+**~~SHIP-44 is a choke point.~~ Cleared — see §3.** `httpx.Idempotent` is wired with `httpx.SubjectScope`, and the freeze on authenticated state-changing endpoints is lifted. `make verify` demonstrates the separation against a running service rather than asserting it.
 
-**It is buildable now — see §6.** Its dependencies, SHIP-37 and SHIP-12, have both been done since wave 1. Describing it here as a gate "ahead" is what kept it out of §6's ready list, and the practical consequence of clearing it first is large: it is three points that currently hold back every authenticated endpoint in five milestones.
+Kept here rather than deleted, because the shape recurs: this was described only as a constraint on *other* work, and so was never read as work itself while its dependencies had been met since wave 1. A gate with satisfied dependencies belongs in §6 the moment it becomes buildable.
+
+**The next gate of the same kind is SHIP-108, and it has no entry yet.** The driver's job-scoped token is a second verifier, and `Docs/10` §5 requires that neither token system can be exchanged for the other. `identity.AccessTokenVerifier` refuses the driver audience today and there is a test for it — but the other direction cannot be tested until the driver verifier exists. **Whoever writes SHIP-108 writes both directions**, which is the reason this file has always kept both verifiers with one owner.
+
+**One thing SHIP-44 did not do: `RequireDriverToken` and `RequireAdmin` are declarable and unenforced.** A route declaring either now panics at startup rather than being served open, so the failure direction is safe. SHIP-108 and SHIP-147 supply the middleware.
 
 **SHIP-91…95 never parallelise.** Own branch, nothing else on it. The partial unique index, the lock ordering, the idempotency interaction and the race tests are one design; two people produce two lock orderings, which is a deadlock or a lost update. Consider using a second agent adversarially instead — one implements 91–94, another writes SHIP-95 from `Docs/02` §3 and `Docs/08`'s four named races *without reading the implementation*.
 
-**Also single-owner, for reasons in `Docs/10`:** SHIP-57 (the status guard), SHIP-67 with SHIP-83 (budget privacy — test the serialised response, not struct fields), both token verifiers, and the middleware ordering in `newRouter`.
+**Also single-owner, for reasons in `Docs/10`:** SHIP-57 (the status guard), SHIP-67 with SHIP-83 (budget privacy — test the serialised response, not struct fields), both token verifiers, and the middleware ordering in `newRouter` — which is now load-bearing in a second way, since `ResolveSubject` sitting outside `Idempotent` is what makes the scope work at all.
 
 ## 9. Open recommendations nobody has decided
 
@@ -344,7 +365,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 

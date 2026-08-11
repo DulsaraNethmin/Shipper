@@ -149,6 +149,10 @@ The ordering in `newRouter` is deliberate and documented in place: `RequestID` o
 
 `StandardErrors` is applied **twice** — once outside, once inside `Idempotent` — because the idempotency middleware stores what it will later replay, and a replay must be byte-identical to the original response. Normalising after storing would replay the raw form.
 
+**`ResolveSubject` sits outside `Idempotent`, and that ordering is a security property** (SHIP-44). `Idempotent` namespaces stored responses by caller through `httpx.SubjectScope`, so the subject has to be on the context before the scope is computed. Reverse the two and every key silently falls back to the anonymous namespace — where one client that guesses another's key is handed that client's response body. `TestOneCallersIdempotencyKeyCannotReadAnothers` fails on both that reversal and on a `nil` scope.
+
+**Authentication is split in two, and neither half is optional.** `ResolveSubject` is group-wide and *never rejects*; `RequireSubject` is per route, from the manifest's auth class, and does. The split exists because `POST /v1/auth/refresh` is public and is called by exactly the client whose access token has just expired — an endpoint that recovers from a bad credential cannot itself require a good one. A single middleware that rejected on sight would lock that client out of the endpoint that fixes it.
+
 **Do not tidy this.** Changing it breaks idempotent replay in a way no test outside `internal/httpx` will notice.
 
 ### 4.3 Handlers
@@ -161,7 +165,7 @@ Unknown fields are rejected on requests, to catch client typos. Responses stay a
 
 ### 4.4 Error codes
 
-`internal/httpx` owns the protocol-level codes — the fifteen that exist today. **Domain-specific codes are declared in the domain that raises them:**
+`internal/httpx` owns the protocol-level codes — the sixteen that exist today. **Domain-specific codes are declared in the domain that raises them:**
 
 ```go
 var CodeProhibitedCategory = httpx.RegisterCode(
@@ -200,7 +204,7 @@ Hand-written validators returning `[]httpx.FieldError`, in `internal/validate`. 
 
 | Element | Position |
 |---|---|
-| Access token | `golang-jwt/jwt/v5`, HS256, keyset selected by a `kid` header so a key can be rotated by configuration. Claims: `sub`, `role`, `sid`, `iat`, `exp`, `jti`, `iss=shipper`, `aud=shipper-mobile`. TTL 15 minutes |
+| Access token | `golang-jwt/jwt/v5`, HS256, keyset selected by a `kid` header so a key can be rotated by configuration. Claims: `sub`, `role`, `sid`, `iat`, `exp`, `jti`, `iss=shipper`, `aud=shipper-mobile`. TTL 15 minutes. Issued by `identity.AccessTokenIssuer`, verified by `identity.AccessTokenVerifier`, which share one parser so the two cannot drift |
 | Refresh token | **Opaque random, stored hashed** against `device_sessions`. Not a JWT |
 | Driver token | Separate signing key material **and** `aud=shipper-driver`, carrying exactly one `job_id`. Audience is checked before anything else |
 | Password | argon2id, m=64 MiB, t=3, p=4, 16-byte salt, 32-byte key, stored as a **PHC string** in one `password_hash` column |
