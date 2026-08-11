@@ -53,3 +53,6 @@ them where the call is made, beside the thing the user was trying to do.
 | `identity_phone_taken` | An account already exists for this mobile number. Sign in, or reset the password. |
 | `identity_verification_token_expired` | This verification link has expired. Ask for a new one. |
 | `identity_verification_token_invalid` | This verification link is no longer valid. Ask for a new one. |
+| `jobs_customer_only` | Only a customer account can create or edit a job. Providers bid on jobs; they do not publish them. |
+| `jobs_not_a_draft` | The job has been published and can no longer be edited as a draft. Reload it to see its current status. |
+| `jobs_not_cancellable` | The job can no longer be cancelled. Once a provider has been awarded the work, ending the job is a support matter rather than a state change. Reload it to see its current status. |

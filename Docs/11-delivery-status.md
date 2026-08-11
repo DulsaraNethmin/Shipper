@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **105 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **123 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -180,6 +180,9 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
+| **SHIP-60** | M2 | The address value object — validated, normalised, and resolved where the platform can; a failed lookup never fails the job — *see below* |
+| **SHIP-61** | M2 | `POST /v1/jobs` — the first authenticated state-changing endpoint in the service — *see below* |
+| **SHIP-62** | M2 | `PATCH /v1/jobs/{id}` — a partial edit of a draft, and a stranger's edit is indistinguishable from no job at all — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -647,10 +650,294 @@ API and the migration tool only. `mk/worker.mk` carries `worker-build` and `work
 because the root `Makefile` is a shared surface and three tracks were open. Folding the third
 binary into `build` belongs to whoever owns that file next.
 
+### What SHIP-60 built, and the decision §9 had been holding for it
+
+`internal/jobs/location.go` holds `Address` — four parts, because the suburb, the state and the
+postcode are values SHIP-79 and SHIP-81 will compare and a single freeform column would have three
+different things parsing them back out — and `Location`, which is an address together with what the
+platform resolved it to. The street line stays freeform: unit numbers, lot numbers, PO boxes and
+roadside mail boxes are all legitimate first lines of an Australian address.
+
+Normalisation does three things and no more: whitespace is collapsed, the state is resolved to its
+abbreviation from any form a person types (`nsw`, `NSW`, `New South Wales`), and the postcode loses
+any spaces. **Case is deliberately untouched** — upper-casing the suburb is the Australia Post
+convention and it is also how *McDonald Street* stops looking like a place a person wrote.
+
+Two things the schema deliberately does not enforce, both because they are reference data rather
+than facts: whether a postcode belongs to its state (the allocations have exceptions — 2600 is ACT
+inside the NSW range — and change when Australia Post says so), and any upper bound on the size of a
+load. The eight states *are* a `CHECK`, paired with the Go constants by a test, the way `Docs/10`
+§3.4 requires of every enumeration.
+
+**`Resolved` is a field rather than a test on the numbers.** (0, 0) is a real point in the Gulf of
+Guinea, so "we looked and found it" is a claim two floats cannot make. The columns carry the same
+distinction as a NULLable pair bound by `ck_jobs_pickup_coordinate_is_a_pair`, and the response
+omits the coordinate object entirely rather than sending zeros.
+
+**A failed lookup does not fail the job**, which is SHIP-59a's rule reaching its first consumer.
+Three routes arrive at the same place — no geocoder configured, the provider did not recognise the
+address, the lookup did not complete — and all three store the address as typed with no coordinate.
+The address itself is deliberately never logged: it is somebody's home, and an application log has a
+different retention period and a much wider audience than the job record.
+
+#### The adapter-value-type decision: no neutral geo package, and here is the trigger
+
+§9 has carried this since wave 1 and named SHIP-60 as the moment to settle it. **Settled: the
+geocoding port keeps its five-return signature, and no `internal/geo` package is created.**
+
+The recommendation's premise turned out not to hold. It warned about deciding "before three domains
+adopt the wide signature" — but the width is not what a domain adopts. It appears exactly once, in
+`jobs/ports.go`, and is converted into `Location` in the next statement; no store method, no
+handler, no response type and no test carries five return values. What a second domain would adopt
+is a *coordinate type*, and a wide signature does not force that type to be wide.
+
+Three further reasons, in the order they weighed:
+
+1. **A struct would not remove the `found bool`.** Not-found is an outcome whatever shape the answer
+   has, so the ergonomic gain is one return value — not the comma-ok pattern, which `Docs/06` §4.1
+   argues is better than a sentinel precisely because the compiler checks it.
+2. **The second consumer is speculative.** What would justify a neutral package is shared distance
+   arithmetic, and no ticket asks for any. SHIP-79 has a provider declare a service area and
+   SHIP-81 filters on it; neither names a radius in kilometres. `money`, `pagination` and
+   `ratelimit` are seeded ahead of the code because their consumers are certain; this one's is not.
+3. **The cost is immediate and the benefit is not.** It needs an entry in `internal/boundaries`,
+   which is a shared file, in the middle of a wave — the same reason the option was unavailable when
+   the recommendation was written.
+
+**The trigger for revisiting is named rather than left to judgement: the first ticket that needs the
+distance between two coordinates in a domain other than `jobs`.** SHIP-81 is the likely one. At that
+point `internal/geo` is written — `Point` and the haversine, nothing else — the port narrows to
+`Lookup(ctx, address) (geo.Point, bool, error)`, and the change is confined to `jobs/ports.go`, the
+two adapter methods and one conversion function. Writing a second copy of a haversine is the signal;
+a wide signature is not.
+
+**One consequence to expect: staging and production get no geocoder at all.** No document names a
+maps vendor and `internal/config` has no `GEOCODING_*` fields to build one from — adding them is a
+shared-surface change SHIP-60 could not make from a domain branch. `cmd/api` therefore passes `nil`
+outside development and logs it once at startup. Falling back to the deterministic stub was the
+alternative and is worse: it writes coordinates that are stable, plausible, inside Australia and
+entirely fictional, and a fictional coordinate on a real job is much harder to notice than none.
+**This is a request rather than a finding — see §9's note on the mobile bundle identifier for the
+shape.** Whoever next owns `internal/config` adds the two variables and `newGeocoder` in
+`cmd/api/routes_jobs.go` builds the provider from them.
+
+### What SHIP-61 built, and what it is the first of
+
+`POST /v1/jobs` creates a Draft owned by whoever the token says is calling. **There is no field
+for naming a customer**, and that is not merely convenient: a customer id in the body would be an
+authorisation decision made from client input, which `Docs/07` §3 puts on the platform.
+
+**It is the first authenticated state-changing endpoint the service has.** Everything under
+`/v1/auth` is public by necessity, so until now SHIP-44's scoped idempotency had nothing to scope.
+Keys from this endpoint land in `idem:v1:<subject>:<key>`, which is the gate `CLAUDE.md` held
+protected endpoints behind and which SHIP-44 closed.
+
+**Every field is optional**, including both addresses. `Docs/01` §4.1 lets a customer save a draft
+and come back to it and the app captures a job over several steps (SHIP-71…75), so an empty body is
+a legitimate "start a job for me". Completeness is decided at publication (SHIP-63), which is where
+`Docs/02` §2 puts it — "required job details valid". What is checked here is that whatever *was*
+supplied is well formed, and the asymmetry that matters is between an address that is absent and one
+that is half filled in: the first is a draft in progress, the second is a mistake.
+
+**Only a customer account may create a job, and the rule reads `users.role` rather than the token's
+claim.** 000400 said this had to be enforced where the draft is created, because a foreign key
+cannot see another table's column. `jobs` reading `users` is sanctioned rather than a boundary
+crossed — the table is in the shared migration block precisely because it is read across the whole
+service — and what is *not* done is importing `identity` to ask. The verify section demonstrates it
+with a provider whose minted token claims `customer`, which is the case a token-only check would
+pass.
+
+**Status reaches the wire in lower snake case, and `Status.Wire` derives it rather than tabulating
+it.** `Docs/10` §4.7 requires the form; the stored form keeps `Docs/02` §1's own strings. SHIP-56a
+owns the mapping in three languages when it lands, and until then this is the Go copy — derived, so
+it cannot disagree with the constants, and pinned by a test that writes all twelve out, because a
+client already branching on `driver_assigned` cannot have it renamed underneath it.
+
+**The response omits everything that is empty** rather than sending `""` and `0`. A draft is mostly
+empty for most of its life, and a client needs to tell "not filled in" from "filled in with
+nothing". There is no budget field: SHIP-67 brings the column together with the serialisation test
+that proves it cannot reach a provider, rather than the field arriving first and the proof later.
+
+**Two migrations, and one of them moved a ticket earlier than 000400 planned.** 000403 is SHIP-60's
+addresses. 000404 carries the draft's own fields — description, dimensions, weight, vehicle
+requirement, handling notes and the two date windows — which 000400's forward plan attributed to
+SHIP-62. They moved because `POST` and `PATCH` accept one field set and SHIP-61 lands first; two
+schemas for one thing is two places for it to drift. The date windows were in no ticket's plan at
+all and are needed by SHIP-68, which expires an Open job at the earlier of fourteen days or the
+pickup date passing.
+
+### What SHIP-62 built, and the two refusals worth reading
+
+`PATCH /v1/jobs/{id}` applies a partial edit to a draft the caller owns. `PATCH` rather than `PUT`,
+because the app edits one step of the job wizard at a time and a `PUT` would require it to send
+every field it is not changing — which is how a client that has not been updated for a new field
+silently clears it.
+
+**Absent, null and empty are three different things**, and the third is not decoration. Every field
+in the request is a pointer, so a non-nil pointer to a zero value clears the field. Without it a
+customer could add a handling note and never remove it, because `""` would be indistinguishable
+from not mentioning it.
+
+**An address is replaced as a whole, never merged part by part**, and a replaced address discards
+its coordinate and is resolved again. Merging would let an edit produce an address made of two
+different places with no error reported; keeping the coordinate would send a driver to the previous
+one. That invariant is why the coordinate lives on `Location` beside the address rather than as two
+more fields on the job — the bad state is unrepresentable rather than merely avoided.
+
+**A stranger's edit answers 404, and byte-identically to a job that does not exist.** A draft is
+visible to nobody but its owner, so a 403 would confirm that a job with that id has been created —
+information the caller had no way to obtain. The domain still keeps `ErrNotJobOwner` and
+`ErrJobNotFound` apart, so a test can tell "the non-owner was refused" from "the job silently
+stopped existing", which are the same answer to a client and very different defects. `make verify`
+compares the two response bodies rather than only their statuses.
+
+**Ownership is checked before status, and the order is load-bearing.** Checking status first would
+let a stranger distinguish somebody else's draft from somebody else's published job by which
+refusal came back — the codes differ even though both are refusals.
+
+**Only a draft can be edited.** An Open job carries bids made against the details as they were, so
+an edit is a 409 with `jobs_not_a_draft` rather than a silent success or a 403; the client's correct
+response is to reload and show the real status. `Docs/02` §3 allows a documented change process
+after award, and that is SHIP-69's, not a `PATCH`.
+
+**The edit runs in a transaction and says so rather than trusting its caller.** The read, the
+ownership check and the write are one decision against one version of the row, and `lockJob`'s
+`FOR UPDATE` only holds for the length of a transaction — outside one the lock is released the
+instant the `SELECT` returns and two concurrent edits interleave into a job carrying half of each.
+`UpdateDraft` refuses a pool the way `Transition` does.
+
+### What SHIP-64 built, and why it is the run that mattered
+
+`POST /v1/jobs/{id}/cancel` ends a job its owner has not yet had awarded. **It is the first endpoint
+in the service that moves a job**, which makes it the first real client of SHIP-57's guard:
+creation lands at Draft because 000400 defaults the column, and an edit never touches `status`, so
+everything the guard built — the permitted table, the history row, the trigger that refuses a status
+write without one, the event — had until now only ever run from a test.
+
+**A verb under the resource, not a field on the job.** `PATCH {"status": "cancelled"}` would be a
+client naming a state; this is a client naming an intent and the platform deciding what the state
+becomes. That is the whole distinction `Docs/02` §2 exists to hold, and it is why no request schema
+in this domain has a `status` field.
+
+**"Unawarded" is enforced by `Docs/02` §2's table rather than by a list in `cancel.go`.** The
+endpoint asks `Permitted(status, Cancelled)` — the same exported function the guard itself uses —
+so Draft, Open and Negotiating are cancellable and everything from Awarded onward is not, without a
+second copy of the lifecycle anywhere. `Docs/02` §6.2 is the reason it stops there: once a provider
+has committed, ending the job is a support matter, and after pickup the route out is Disputed.
+
+**Cancelling a job that is already Cancelled answers 200 and writes nothing.** The idempotency
+middleware absorbs the retry that reuses its key; this absorbs the one that does not — a phone that
+lost its connection, was restarted, and generated a fresh key for the same intent. `ErrAlreadyInStatus`
+was separated from `ErrTransitionNotPermitted` at SHIP-57 precisely so a caller could make this
+choice, and `Docs/02` §3.1 makes the same call for a queued update that has been overtaken: absorbed,
+not reported as an error. No second history row, no second event — verify checks the count rather
+than the status.
+
+**A new sentinel rather than a mapping from the general one.** `ErrJobNotCancellable` is narrower
+than `ErrTransitionNotPermitted` on purpose: mapping the general sentinel to `jobs_not_cancellable`
+at the transport edge would give SHIP-63's publish the wrong code the day it lands. One code per
+intent, not one per guard failure.
+
+**The disclosure rule is applied per endpoint, and that is deliberate rather than repetitive.** A
+stranger's cancellation answers 404 byte-identically to a job that does not exist, and `make verify`
+compares the bodies. A job is discoverable through whichever route forgets the rule, not through the
+strictest one.
+
+**`make verify` moves a job to Awarded with SQL, because no endpoint can.** SHIP-63 publishes and
+SHIP-92 awards; neither exists. The fixture writes the `job_status_history` row and names it in the
+transaction-local setting, which is the only protocol 000402 accepts — a bare `UPDATE jobs SET
+status` is refused. So even a fixture written to bypass the guard cannot, which is worth more than
+the check it sets up.
+
+### What SHIP-65 built, and the half of its *Done when* that could not be met
+
+`GET /v1/jobs/{id}` returns a job in full to the customer who owns it, and 404 to everybody else.
+
+**Its *Done when* says "including budget", and the budget column does not exist.** It was
+deliberately not added. `Docs/11` §8 makes SHIP-67 single-owner with SHIP-83 precisely so the column
+and the serialisation test proving it cannot reach a provider land together, and SHIP-67 is not in
+this wave. A field that arrives before its proof is the one arrangement worse than a field that
+arrives late — so the endpoint is complete and the sentence is not. **Recorded here rather than
+resolved silently**, and §4 carries SHIP-65 until SHIP-67 closes it. `make verify` asserts the
+absence of a `budget` key, so the day it appears somebody has to come to that file and say so.
+
+**`Docs/09` cannot be satisfied here as written, and that is worth a decision rather than a
+workaround.** SHIP-67 owns the budget column and **depends on SHIP-65**, so SHIP-65's *Done when*
+asks for a field whose own ticket cannot start until SHIP-65 is finished. No implementation of
+SHIP-65 can meet that line; either the words belong to SHIP-67 or the two tickets are one.
+`CLAUDE.md` says a contradiction with a document is not resolved silently in code, so it is
+recorded here and `Docs/09` is left untouched — **the wording is the repository owner's to correct**.
+
+**The same `jobResponse` the write endpoints answer with**, and `make verify` compares a `GET`
+response with the `PATCH` response that preceded it byte for byte. A "detail" shape carrying a field
+or two more would make every write response a subset a client has to special-case, which is where a
+field quietly goes missing.
+
+**A non-locking read was added beside `lockJob` rather than a flag on it.** `FOR UPDATE` inside a
+`GET` serialises every reader behind whatever is writing, and a handler using the pool directly
+would hold the lock for an unbounded time. `TestReadingAJobDoesNotWaitOnAWriter` holds the row in
+one transaction and reads it from another, so the property is pinned rather than left to a comment.
+
+**Ownership is checked in Go, not in the `WHERE` clause.** `WHERE id = $1 AND customer_id = $2`
+returning nothing cannot say whether the job is somebody else's or nobody's, and those are one
+answer on the wire and very different defects.
+
+**Reading is not restricted to Draft.** Editing stops there (SHIP-62) because an Open job carries
+bids made against the details as they were; reading has no such reason, and a customer who cannot
+see their own Open job cannot be shown its bids.
+
+### What SHIP-66 built, and the package it was the first to need
+
+`GET /v1/jobs` returns the calling customer's own jobs, newest first, filterable by status and paged
+by cursor.
+
+**`internal/pagination` now exists**, which is the pre-seeded infrastructure list working exactly as
+`Docs/10` §6 intended: the entry has named SHIP-66 as its owner since wave 2, and writing the
+package required editing no shared file — not `internal/boundaries`, not `Deps`, not `cmd/api`. It
+holds the encoding and the bounds and nothing else: a `Cursor` is a list of opaque strings and the
+domain decides what they mean, which is what lets a later domain order by something other than a
+timestamp with one implementation between them.
+
+**The cursor is versioned, and that is the part worth keeping.** A cursor is held across an app
+restart and across a deployment, so the failure to prevent is not a rejected cursor but an accepted
+one that means something else now. A one-byte prefix and an insisted-on field count make a stale
+token a clear refusal. The split of responsibility is deliberate: `pagination` establishes the
+*shape*, and `jobs` establishes the *meaning* — a cursor whose two fields decode but do not parse as
+a timestamp and a UUID would otherwise reach the query as a zero time and silently answer with the
+first page.
+
+**Two fields, not one, and `created_at` alone would be a bug.** It is not unique — two drafts saved
+in the same millisecond are ordinary — so a cursor that could not break the tie would repeat or skip
+a job at exactly the page boundary, which is the failure keyset pagination exists to avoid arriving
+by another route. `ORDER BY created_at DESC, id DESC` matches `idx_jobs_customer`, so the list
+needed no index of its own.
+
+**The page sizes are constants in `internal/pagination`, and `Docs/10` §4.5 says they come from
+configuration.** They do not, because `internal/config` has no fields for them and adding two is a
+shared-surface change a domain branch cannot make — the same position SHIP-60 reached over
+`GEOCODING_*`. They are in `pagination` rather than in `jobs` because every list endpoint needs the
+same answer. **This is a request:** whoever next owns `internal/config` moves them, and no caller
+changes, because callers ask `pagination.Limit`.
+
+**A limit above the maximum is narrowed rather than refused, and a limit of `0` is refused.** The
+asymmetry is deliberate: a client asking for more than the platform will give is asking for a page,
+and refusing it would turn a server-side tuning change into a broken client — whereas `?limit=abc`
+is a client defect that answering with the default would hide.
+
+**`data` is always an array, never `null`.** `pagination.NewPage` is a constructor for that one
+reason: a nil slice marshals to `null`, and a client iterating it breaks the first time a new
+customer with no jobs opens the app and never again in testing.
+
+**One status per request rather than several.** SHIP-76 shows the customer's jobs grouped by status,
+and reading the list once and grouping it beats one request per group; widening the parameter later
+is additive. The filter takes the wire form and refuses the stored one — `?status=Draft` is a `400`,
+not an empty list, because an empty list would tell a client its filter worked.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
 |---|---|---|
+| **SHIP-65** | The endpoint, the owner-only rule, the full customer view | The `budget` field its *Done when* names. The column is SHIP-67's, with the proof that it cannot leak |
 | **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
 | **SHIP-134** | `outbox` table, `internal/events` writer | The publisher. That is M5 and stays there |
 

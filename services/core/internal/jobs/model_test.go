@@ -229,3 +229,48 @@ func TestMoveValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestStatusWireFormsAreStableAndDistinct writes out all twelve wire forms, deliberately.
+//
+// Status.Wire derives the wire form rather than tabulating it, which is what stops it disagreeing
+// with the constants. What a derivation cannot do is tell anybody that the strings are published:
+// a client already branching on `driver_assigned` cannot have it renamed underneath it, because a
+// store build on a device has no over-the-air path for Dart code (Docs/06 §5.3).
+//
+// So this list is the contract, and a change to Wire that changes any line here is a breaking API
+// change rather than a refactor. SHIP-56a takes the mapping over for all three languages; until
+// then this is where it is held.
+func TestStatusWireFormsAreStableAndDistinct(t *testing.T) {
+	want := map[Status]string{
+		StatusDraft:           "draft",
+		StatusOpen:            "open",
+		StatusNegotiating:     "negotiating",
+		StatusAwarded:         "awarded",
+		StatusDriverAssigned:  "driver_assigned",
+		StatusEnRouteToPickup: "en_route_to_pickup",
+		StatusPickedUp:        "picked_up",
+		StatusInTransit:       "in_transit",
+		StatusDelivered:       "delivered",
+		StatusCompleted:       "completed",
+		StatusCancelled:       "cancelled",
+		StatusDisputed:        "disputed",
+	}
+
+	if len(want) != len(Statuses) {
+		t.Fatalf("this test names %d statuses and there are %d; a status was added without a wire form",
+			len(want), len(Statuses))
+	}
+
+	seen := map[string]Status{}
+	for _, status := range Statuses {
+		got := status.Wire()
+		if got != want[status] {
+			t.Errorf("%s.Wire() = %q, want %q", status, got, want[status])
+		}
+		if first, taken := seen[got]; taken {
+			t.Errorf("%s and %s both serialise as %q, so a client cannot tell them apart",
+				first, status, got)
+		}
+		seen[got] = status
+	}
+}
