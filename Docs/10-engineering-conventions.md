@@ -323,7 +323,13 @@ The import lint is what makes this safe on the Go side: two domains physically c
 
 These belong to whoever is doing shared-platform work in a given cycle, and are not edited from a domain branch:
 
-`cmd/api/routes.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `CLAUDE.md` and `Docs/**`
+`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `CLAUDE.md` and `Docs/**`
+
+**`Deps` is pre-seeded so that no domain has a reason to edit it.** It carries the configuration, the logger, the clock, the PostgreSQL pool and the Redis client, and a domain builds everything else — a keyset, a hasher, a token issuer, a repository — inside its own `Handler` closure, from those. All of them are pure functions of a pool, a client and configuration, so the field a domain wants almost always is not one.
+
+The pool and the client may both be **nil**: the service starts with an unreachable database or cache on purpose, because a rolling deployment during a failover would otherwise take every instance down at once and keep them down. Handlers must not treat either as a promise.
+
+`TestDepsCarriesExactlyWhatIsDeclared` holds the field list, so adding one is a decision with a name attached rather than a line in a merge. The same reasoning as `routes_golden.txt`, for the same reason: a conflict resolved slightly wrong in this struct unwires a domain and produces no compile error.
 
 `deploy/.env.example` is hand-written but **machine-checked**: a test reads the loader calls out of `config.go` and fails when a variable is read but not documented, or documented but not read. Generating the file was the alternative and would have needed every key restructured into a declarative table first — a large change to a file several tracks will be editing, for the same guarantee.
 
