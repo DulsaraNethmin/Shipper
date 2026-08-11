@@ -98,6 +98,20 @@ tags:
 # Note the Go pattern and the contract path differ for the version root: cmd/api declares
 # `/{$}` inside the v1 group, which is net/http's exact-match syntax and not part of the URL.
 # The test that compares the two translates it.
+#
+# ---------------------------------------------------------------------------------------
+# RESOLVING A MERGE CONFLICT IN THIS BLOCK (SHIP-15c)
+#
+#   1. Entries are sorted by path, and there is exactly one $ref pair per path.
+#   2. A conflict here is resolved by taking BOTH sides and re-sorting. Never by choosing one.
+#   3. Then run `make test`. TestPathsBlockIsSortedAndComplete and
+#      TestEveryRouteIsInTheContract both check what a person is most likely to get wrong.
+#
+# Choosing a side is the tempting resolution and it is always wrong: it drops an endpoint from
+# the contract three client codebases are generated from, and there is no compile error to
+# find it. This block is NOT union-merged for the reason in .gitattributes — a union-merged
+# YAML document is invalid or subtly misordered, which is harder to see than a conflict.
+# ---------------------------------------------------------------------------------------
 paths:
   /health:
     $ref: './paths/service.yaml#/Health'

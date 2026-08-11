@@ -106,6 +106,22 @@ reporting a problem sends a screenshot, and a header does not survive one.
 Nothing internal is ever serialised. Attach the underlying failure with `WithCause` and it
 reaches the log, not the client.
 
+**The full code list is `Docs/10-api-error-codes.md`, and it is generated** — from the fifteen
+protocol codes `internal/httpx` owns plus every code each domain declares for itself:
+
+```go
+var CodeProhibitedCategory = httpx.RegisterCode(
+    "prohibited_category", "The goods category may not be published.")
+```
+
+Declaring one edits nothing shared, which is the point: a single file listing every code in the
+platform is a file every domain has to touch. Registration refuses a duplicate, a code that is
+not lower snake case, and a code with no description — the description is what the generated
+document says the code means, and a client with only a name to go on guesses.
+
+Regenerate with `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update`, and resolve a
+conflict in that file by regenerating rather than by choosing a side.
+
 ### Idempotency (SHIP-15)
 
 Every state-changing request under `/v1` must carry an `Idempotency-Key`. Repeating it

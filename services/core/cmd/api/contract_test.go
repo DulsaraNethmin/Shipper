@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -131,6 +133,97 @@ func TestEveryRouteIsInTheContract(t *testing.T) {
 					"  either the route was dropped in a merge, or the contract entry is ahead of the code",
 					method, path)
 			}
+		}
+	}
+}
+
+// contractRoot is the directory holding the assembled contract, relative to this package.
+const contractRoot = "../../../../contracts"
+
+// pathsBlockEntry matches one key of the root document's `paths:` block, in file order:
+//
+//	/v1/app/minimum-version:
+var pathsBlockEntry = regexp.MustCompile(`(?m)^  (/[^\s:]*):\s*$`)
+
+// fragmentRef matches a reference into a fragment: $ref: './paths/identity.yaml#/Register'
+var fragmentRef = regexp.MustCompile(`\$ref:\s*'\./paths/([^#']+)#`)
+
+// TestPathsBlockIsSortedAndComplete guards the one thing the both-directions check cannot see
+// (SHIP-15c).
+//
+// TestEveryRouteIsInTheContract compares the manifest with the contract, which catches a route
+// dropped from one of them. It cannot catch a merge that drops **both** a route and its `$ref`,
+// because it then compares two things that were truncated together and finds them in perfect
+// agreement. That is not a hypothetical shape: a badly resolved conflict in wave 2 takes one
+// side of a hunk that spans `routes_<domain>.go` and this file's `paths:` block at once.
+//
+// So this test checks the contract against the filesystem instead, which no merge resolution
+// touches: every fragment under contracts/paths/ must be referenced from the root. A fragment
+// that has become unreachable is a domain's whole surface silently gone.
+//
+// The sortedness half is what makes the merge recipe above the block workable. "Take both sides
+// and re-sort" is only checkable if sorted is the normal state.
+func TestPathsBlockIsSortedAndComplete(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join(contractRoot, "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("reading the contract: %v", err)
+	}
+
+	// Only the paths: block — components: has two-space keys of its own.
+	body := string(source)
+	start := strings.Index(body, "\npaths:\n")
+	if start < 0 {
+		t.Fatal("the contract has no paths: block")
+	}
+	block := body[start:]
+	if end := strings.Index(block, "\ncomponents:\n"); end >= 0 {
+		block = block[:end]
+	}
+
+	var declared []string
+	for _, m := range pathsBlockEntry.FindAllStringSubmatch(block, -1) {
+		declared = append(declared, m[1])
+	}
+	if len(declared) == 0 {
+		t.Fatal("found no entries in the paths: block; the pattern has stopped matching")
+	}
+
+	if !sort.StringsAreSorted(declared) {
+		sorted := append([]string(nil), declared...)
+		sort.Strings(sorted)
+		t.Errorf("the paths: block is not sorted by path.\n  got:  %v\n  want: %v\n"+
+			"Sorted order is what makes the merge recipe above the block work: a conflict is\n"+
+			"resolved by taking both sides and re-sorting, never by choosing one.", declared, sorted)
+	}
+
+	seen := map[string]bool{}
+	for _, p := range declared {
+		if seen[p] {
+			t.Errorf("the path %q appears twice in the paths: block — a conflict resolved by "+
+				"taking both sides without re-sorting", p)
+		}
+		seen[p] = true
+	}
+
+	// Every fragment on disk must be reachable from the root.
+	referenced := map[string]bool{}
+	for _, m := range fragmentRef.FindAllStringSubmatch(body, -1) {
+		referenced[m[1]] = true
+	}
+
+	entries, err := os.ReadDir(filepath.Join(contractRoot, "paths"))
+	if err != nil {
+		t.Fatalf("reading contracts/paths: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		if !referenced[e.Name()] {
+			t.Errorf("contracts/paths/%s is not referenced from contracts/openapi.yaml.\n"+
+				"  Either its $ref was lost in a merge — which removes a domain's whole surface\n"+
+				"  from the contract with no compile error — or the fragment is unused and should go.",
+				e.Name())
 		}
 	}
 }

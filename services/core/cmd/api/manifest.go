@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 )
@@ -91,12 +94,50 @@ func (a Auth) String() string {
 //
 // It is deliberately one struct rather than a per-domain argument list: a domain's
 // routes_<domain>.go takes what it needs out of it, and adding a dependency for one domain does
-// not change any other domain's signature. It grows as the service does — a pool at SHIP-28's
-// first endpoint, a Redis client at SHIP-47 — and every addition is shared-surface work.
+// not change any other domain's signature.
+//
+// # Do not add a field for your domain's collaborators
+//
+// This struct and its literal in main.go are shared surfaces, and wave 2 is the first wave with
+// three tracks that would each have a reason to grow one (Docs/10 §9.2). Three branches adding
+// three fields to the same struct and three lines to the same literal is a merge conflict in the
+// one file where a badly resolved one silently unwires a domain.
+//
+// So the infrastructure every domain could plausibly need is seeded here ahead of the code, the
+// same way internal/boundaries seeds its infrastructure list. **A domain builds its own
+// collaborators inside its Handler closure**, from what is already below:
+//
+//	Route{Handler: func(d Deps) http.Handler {
+//	    keys, _ := identity.NewKeyset(d.Config.Identity.AccessTokenKeys, …)
+//	    return identity.NewHandler(d.Pool, keys)
+//	}}
+//
+// A keyset, a hasher, a token issuer and a repository are all pure functions of the pool, the
+// Redis client and the configuration. If something genuinely cannot be — an adapter with its own
+// process-wide connection, say — that is a shared-surface change, and it belongs to whoever owns
+// cmd/api in that cycle rather than to the domain that noticed.
 type Deps struct {
 	Config *config.Config
 	Logger *slog.Logger
 	Clock  clock.Clock
+
+	// Pool is the PostgreSQL connection pool, and it is the whole of a domain's access to
+	// the database. Persistence takes a db.Runner, which the pool satisfies, so a handler
+	// hands this straight to its own postgres.go or opens a transaction with db.InTx.
+	//
+	// It may be nil: the service starts with an unreachable database on purpose — see the
+	// note in main.go — so a handler that dereferences it without checking will panic into
+	// httpx.Recover and answer 500. That is the correct answer to "the database is down"
+	// and is why nothing here pretends otherwise.
+	Pool *pgxpool.Pool
+
+	// Redis is the shared cache and token store. Idempotency already has its own store
+	// built over this client; SHIP-47's token bucket and the device registry take the
+	// client itself.
+	//
+	// Nil-able for the same reason as Pool, and more routinely: the idempotency middleware
+	// is built to fail closed against exactly this.
+	Redis *redis.Client
 
 	// StartedAt is when the process came up, for /health's uptime.
 	StartedAt time.Time

@@ -168,7 +168,13 @@ var CodeProhibitedCategory = httpx.RegisterCode(
     "prohibited_category", "The goods category may not be published.")
 ```
 
-Named `<domain>_<condition>`, lower snake case. A test in `cmd/api` asserts uniqueness across the whole registry and regenerates `Docs/10-api-error-codes.md`, which is the list clients branch on. Conflicts in that generated file are resolved by regenerating it, never by hand.
+Named `<domain>_<condition>`, lower snake case. Registration refuses a duplicate, a code that is not lower snake case, and a code with no description — the description is what the generated document says the code means, and a client given only a name guesses.
+
+**The tests are in `cmd/api`, because that is the only package that links every domain in at once.** `TestErrorCodesAreUniqueAndWellFormed` checks the whole registry; `TestErrorCodeDocumentIsCurrent` regenerates `Docs/10-api-error-codes.md`, which is the list clients branch on; `TestProtocolCodesMatchTheContract` holds `x-protocol-codes` in `contracts/components/schemas/error.yaml` to the fifteen the code actually registers, because that list is hand-written and a hand-written list drifts.
+
+Regenerate the document with `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update`. **Resolve a conflict in it by regenerating, never by choosing a side** — choosing a side drops a domain's codes with nothing to show for it.
+
+This section described a mechanism that did not exist until SHIP-15c. It was written at SHIP-15a, `Docs/11` §3 listed it as built, and neither was true: `internal/httpx` had the codes as plain constants, there was no `RegisterCode`, and the generated document had never been written. Nothing was broken, because no domain had yet raised a code of its own — which is exactly how a documented mechanism stays absent long enough for two domains to invent two taxonomies in the same wave.
 
 Clients branch on `code`, never on `message`.
 
@@ -261,7 +267,13 @@ Every constructor that deals in time takes a `clock.Clock`. Four scheduled tasks
 
 `Docs/06` §4.1 requires it: "a mock happily accepts a write that the actual constraint would reject."
 
-`make test-db-template` builds `shipper_test_template` once by running every migration into it. `pgtest.DB(t)` then clones it per test binary with `CREATE DATABASE … TEMPLATE …` — a file copy measured in milliseconds, not a migration run — and drops the clone in `t.Cleanup`.
+`make test-db-template` builds the template once by running every migration into it. `pgtest.DB(t)` then clones it per test binary with `CREATE DATABASE … TEMPLATE …` — a file copy measured in milliseconds, not a migration run — and drops the clone in `t.Cleanup`.
+
+**`TEST_TEMPLATE_DB` is what isolates two worktrees, and it is derived rather than set.** `CREATE DATABASE … TEMPLATE …` resolves the template name at *cluster* scope, and `COMPOSE_PROJECT_NAME` is pinned precisely so that every worktree shares one cluster. Two worktrees with the same template name are two worktrees using one database: `make test` in either drops and rebuilds it while the other is midway through cloning it, and the second run fails somewhere unrelated to what it was testing.
+
+So the `Makefile` derives the name from the directory. `git worktree add` does not create `deploy/.env`, and the cost of forgetting a variable lands on the *other* worktree rather than on the one that forgot — which is the case for a default that cannot be omitted rather than an instruction.
+
+**`TEST_DATABASE_URL` does not isolate anything on a shared cluster.** It selects *which* PostgreSQL the template and its clones live in, and is only useful when a worktree points at a separate one. Three documents and a failure message described it as the isolation mechanism until SHIP-15c; it never was, and one worktree had been running without a distinct template name on the strength of it.
 
 This is needed even with one developer: `go test ./...` already runs packages in parallel, so two packages sharing one database will interfere. `go test -p 4` caps how many do so at once.
 
@@ -323,11 +335,35 @@ The import lint is what makes this safe on the Go side: two domains physically c
 
 These belong to whoever is doing shared-platform work in a given cycle, and are not edited from a domain branch:
 
-`cmd/api/routes.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `CLAUDE.md` and `Docs/**`
+`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `CLAUDE.md` and `Docs/**`
+
+**`Deps` is pre-seeded so that no domain has a reason to edit it.** It carries the configuration, the logger, the clock, the PostgreSQL pool and the Redis client, and a domain builds everything else — a keyset, a hasher, a token issuer, a repository — inside its own `Handler` closure, from those. All of them are pure functions of a pool, a client and configuration, so the field a domain wants almost always is not one.
+
+The pool and the client may both be **nil**: the service starts with an unreachable database or cache on purpose, because a rolling deployment during a failover would otherwise take every instance down at once and keep them down. Handlers must not treat either as a promise.
+
+`TestDepsCarriesExactlyWhatIsDeclared` holds the field list, so adding one is a decision with a name attached rather than a line in a merge. The same reasoning as `routes_golden.txt`, for the same reason: a conflict resolved slightly wrong in this struct unwires a domain and produces no compile error.
 
 `deploy/.env.example` is hand-written but **machine-checked**: a test reads the loader calls out of `config.go` and fails when a variable is read but not documented, or documented but not read. Generating the file was the alternative and would have needed every key restructured into a declarative table first — a large change to a file several tracks will be editing, for the same guarantee.
 
 The root `Makefile` ends with `-include mk/*.mk`, so a track adds `mk/<track>.mk` and gets its targets without editing the shared file. `make help` greps `$(MAKEFILE_LIST)`, which covers included files, so documented targets appear automatically.
+
+**`make check` is extended the same way.** It runs `$(CHECKS)` from a recipe rather than from a prerequisite list, so `mk/<track>.mk` says `CHECKS += web-check` and edits nothing shared. It has to be a recipe: prerequisites are expanded when the rule is read, and the `-include` is the last line of the file, so anything a track appended would arrive too late to be seen.
+
+#### Resolving a conflict in a file with no context
+
+Three files in this repository carry one independent line per endpoint and no surrounding syntax to make a bad resolution obvious. Each has its own recipe, and none of them is "read the hunk and pick the right side".
+
+| File | Mechanism | Recipe |
+|---|---|---|
+| `cmd/api/routes_golden.txt` | `merge=union` in `.gitattributes` | Never conflicts. The union is a superset in the wrong order, which fails `TestRouteTableMatchesGolden` — regenerate with `-update` and read the diff |
+| `Docs/10-api-error-codes.md` | Generated from the registry | **Regenerate, never hand-merge.** `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update` |
+| `contracts/openapi.yaml` `paths:` | Sorted, one `$ref` pair per path | **Take both sides and re-sort.** Then `make test` — `TestPathsBlockIsSortedAndComplete` checks the result |
+
+`openapi.yaml` is deliberately **not** union-merged, and the asymmetry is the point: a union-merged YAML document is either invalid or valid and subtly wrong — two keys interleaved, a `$ref` orphaned from its entry — and the second is harder to notice than a conflict. A conflict there is ugly and obvious, which is what you want in a file that parses.
+
+`TestPathsBlockIsSortedAndComplete` also closes a gap the both-directions check cannot: `TestEveryRouteIsInTheContract` compares the manifest with the contract, so a merge that drops **both** a route and its `$ref` leaves it comparing two things that were truncated together, in perfect agreement. The new test compares the contract with the filesystem instead — every fragment under `contracts/paths/` must be reachable from the root — and no merge resolution touches that.
+
+After resolving any conflict: re-run `make check` **and** read `routes_golden.txt`. That is the file that catches a silently dropped endpoint.
 
 `COMPOSE_PROJECT_NAME` is pinned to `shipper`. Compose otherwise names a project after its directory, so each git worktree would start its own stack and they would fight over ports 5432, 6379 and 29092.
 

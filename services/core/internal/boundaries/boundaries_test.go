@@ -122,6 +122,31 @@ func TestEachRuleIsCaught(t *testing.T) {
 			wantLine: 3,
 		},
 		{
+			// SHIP-15c, and the edge SHIP-44 had the first real motive to create. Every
+			// domain imports httpx, so this single import couples all eight to identity
+			// through a file no domain package contains.
+			name: "infrastructure importing a domain",
+			packages: map[string][]string{
+				"internal/httpx":    {local("internal/identity")},
+				"internal/identity": nil,
+			},
+			wantRule: "infrastructure imports domain",
+			wantFile: "internal/httpx/pkg.go",
+			wantLine: 3,
+		},
+		{
+			// The same rule from the adapter side. Infrastructure is underneath both, so
+			// depending on either makes it a prerequisite of packages unrelated to it.
+			name: "infrastructure importing an adapter",
+			packages: map[string][]string{
+				"internal/events":        {local("internal/platform/push")},
+				"internal/platform/push": nil,
+			},
+			wantRule: "infrastructure imports adapter",
+			wantFile: "internal/events/pkg.go",
+			wantLine: 3,
+		},
+		{
 			name:     "an internal package that is neither a domain nor infrastructure",
 			packages: map[string][]string{"internal/matching": nil},
 			wantRule: "unclassified package",
@@ -202,6 +227,29 @@ func TestPermittedImportsAreLeftAlone(t *testing.T) {
 			packages: map[string][]string{
 				"internal/platform/push":    {local("internal/platform/storage")},
 				"internal/platform/storage": nil,
+			},
+		},
+		{
+			// Rule 4 is about domains and adapters only. Infrastructure sitting on
+			// infrastructure is the seam working: httpx really does import idempotency,
+			// and authctx is what SHIP-44's middleware is meant to reach for instead of
+			// identity.
+			name: "infrastructure on infrastructure",
+			packages: map[string][]string{
+				"internal/httpx":       {local("internal/authctx"), local("internal/idempotency")},
+				"internal/authctx":     nil,
+				"internal/idempotency": nil,
+			},
+		},
+		{
+			// The composition root is where the closure over a domain is supplied, which
+			// is the way out rule 4's message names.
+			name: "the entrypoint closing over a domain for infrastructure",
+			packages: map[string][]string{
+				"cmd/api":           {local("internal/httpx"), local("internal/identity")},
+				"internal/httpx":    {local("internal/authctx")},
+				"internal/authctx":  nil,
+				"internal/identity": nil,
 			},
 		},
 		{

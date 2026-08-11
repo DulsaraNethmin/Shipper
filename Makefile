@@ -148,8 +148,32 @@ build: ## Build the API and migration binaries into bin/
 	cd $(CORE) && go build -ldflags "$(LDFLAGS)" -o ../../bin/shipper-migrate ./cmd/migrate
 	@echo "built bin/shipper-api and bin/shipper-migrate"
 
-TEST_TEMPLATE_DB ?= shipper_test_template
+# --- Test databases -------------------------------------------------------------------
+#
+# TEST_TEMPLATE_DB is what isolates two git worktrees running tests at the same time, and it
+# is worth being precise about why, because three documents used to say it was
+# TEST_DATABASE_URL and that was wrong in a way that destroyed data.
+#
+# `CREATE DATABASE … TEMPLATE …` resolves the template name at *cluster* scope. Every
+# worktree shares one PostgreSQL — COMPOSE_PROJECT_NAME is pinned so they do, deliberately —
+# so two worktrees with the same template name are two worktrees using the same database.
+# One `make test` drops and rebuilds it while the other is midway through cloning it, and
+# the second run fails somewhere that has nothing to do with what it was testing.
+#
+# Pointing TEST_DATABASE_URL somewhere else does not help unless it names a different
+# cluster: the template is still resolved by name inside whichever cluster it reaches.
+#
+# So the default is derived from the directory rather than fixed, because the failure mode
+# of forgetting to set it is silent and belongs to the *other* worktree. `git worktree add`
+# does not create deploy/.env, so a fresh worktree gets isolation without anybody
+# remembering — which is the only kind that holds.
+TEST_TEMPLATE_DB ?= shipper_test_template_$(shell printf '%s' '$(notdir $(CURDIR))' | tr -C 'a-zA-Z0-9' '_' | tr 'A-Z' 'a-z')
+TEST_TEMPLATE_DB := $(TEST_TEMPLATE_DB)
+
+# Where the template and its clones live. Only useful when pointing a worktree at an
+# entirely separate PostgreSQL; on a shared cluster TEST_TEMPLATE_DB above is what separates.
 TEST_DATABASE_URL ?= $(DATABASE_URL)
+
 export TEST_TEMPLATE_DB
 export TEST_DATABASE_URL
 
@@ -158,19 +182,37 @@ test-db-template: ## Build the template database every integration test is clone
 	@# Dropped and rebuilt rather than migrated in place: a template that has drifted from
 	@# the migration chain produces failures in whichever test happens to touch the drift,
 	@# which is a long way from the cause. Rebuilding takes a second and is unambiguous.
-	@# is_template must come off before the drop: PostgreSQL refuses to drop a template.
-	@# This runs unguarded because the database legitimately may not exist yet.
-	@$(PSQL) "$(DATABASE_URL)" -q -c \
-		"ALTER DATABASE $(TEST_TEMPLATE_DB) WITH is_template = false" >/dev/null 2>&1 || true
-	@$(PSQL) "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -q -c \
-		"DROP DATABASE IF EXISTS $(TEST_TEMPLATE_DB) WITH (FORCE)" >/dev/null
-	@$(PSQL) "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -q -c \
-		"CREATE DATABASE $(TEST_TEMPLATE_DB)" >/dev/null
-	@cd $(CORE) && DATABASE_URL="$(subst /$(POSTGRES_DB)?,/$(TEST_TEMPLATE_DB)?,$(DATABASE_URL))" \
-		go run ./cmd/migrate up >/dev/null
-	@$(PSQL) "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -q -c \
-		"ALTER DATABASE $(TEST_TEMPLATE_DB) WITH is_template = true" >/dev/null
-	@echo "template $(TEST_TEMPLATE_DB) is at the current schema"
+	@#
+	@# Every connection here is TEST_DATABASE_URL, not DATABASE_URL. They are the same by
+	@# default; where they differ, the template must be built in the cluster the tests will
+	@# look for it in, and this used to build it in the other one.
+	@set -euo pipefail; \
+	url="$(TEST_DATABASE_URL)"; \
+	template_url="$$(printf '%s' "$$url" \
+		| sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://[^/]*)/[^/?\#]*#\1/$(TEST_TEMPLATE_DB)#')"; \
+	if [[ "$$template_url" == "$$url" ]]; then \
+		echo "test-db-template: could not rewrite TEST_DATABASE_URL to name the template." >&2; \
+		echo "  TEST_DATABASE_URL  $$url" >&2; \
+		echo "  TEST_TEMPLATE_DB   $(TEST_TEMPLATE_DB)" >&2; \
+		echo "Refusing to continue: the unrewritten URL is a real database, and running the" >&2; \
+		echo "migrations into it is how a developer loses their local data. The previous form" >&2; \
+		echo "of this rule matched the literal '/$(POSTGRES_DB)?' and did exactly that on any" >&2; \
+		echo "URL with no query string." >&2; \
+		exit 1; \
+	fi; \
+	test -x "$(PSQL)" || { echo "psql not found. Install it with: brew install libpq" >&2; exit 1; }; \
+	: is_template must come off before the drop, because PostgreSQL refuses to drop a template. \
+	: Unguarded, because the database legitimately may not exist yet. ; \
+	"$(PSQL)" "$$url" -q -c \
+		"ALTER DATABASE $(TEST_TEMPLATE_DB) WITH is_template = false" >/dev/null 2>&1 || true; \
+	"$(PSQL)" "$$url" -v ON_ERROR_STOP=1 -q -c \
+		"DROP DATABASE IF EXISTS $(TEST_TEMPLATE_DB) WITH (FORCE)" >/dev/null; \
+	"$(PSQL)" "$$url" -v ON_ERROR_STOP=1 -q -c \
+		"CREATE DATABASE $(TEST_TEMPLATE_DB)" >/dev/null; \
+	(cd $(CORE) && DATABASE_URL="$$template_url" go run ./cmd/migrate up >/dev/null); \
+	"$(PSQL)" "$$url" -v ON_ERROR_STOP=1 -q -c \
+		"ALTER DATABASE $(TEST_TEMPLATE_DB) WITH is_template = true" >/dev/null; \
+	echo "template $(TEST_TEMPLATE_DB) is at the current schema"
 
 .PHONY: test
 test: test-db-template ## Run the Go tests
@@ -200,8 +242,18 @@ lint-spelling: ## Check Australian English (CLAUDE.md, Docs/10 §9.3)
 status: ## Where the delivery is: Docs/11 counted against the backlog and the commit history
 	@./scripts/delivery-status.sh
 
+# CHECKS is what `make check` runs, and it is a variable so a track can extend it.
+#
+# `mk/<track>.mk` says `CHECKS += web-check` and edits nothing shared, which is the same
+# mechanism the per-track targets already use. The list has to be consumed in the recipe
+# rather than as a prerequisite list: prerequisites are expanded when the rule is read, and
+# `-include mk/*.mk` is the last line of this file, so anything a track appended would arrive
+# too late to be seen.
+CHECKS := vet lint-imports lint-spelling test
+
 .PHONY: check
-check: vet lint-imports lint-spelling test ## Everything CI will run for the Go service (SHIP-20)
+check: ## Everything CI will run (SHIP-20). Tracks extend it with `CHECKS +=` in mk/<track>.mk
+	@$(MAKE) --no-print-directory $(CHECKS)
 
 # --- Acceptance -----------------------------------------------------------------------
 

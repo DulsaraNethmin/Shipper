@@ -19,6 +19,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/buildinfo"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/logging"
 )
@@ -89,10 +90,58 @@ func run() error {
 	idempotencyStore := idempotency.NewRedisStore(redisClient,
 		cfg.Idempotency.TTL, cfg.Idempotency.InFlightTTL)
 
+	// PostgreSQL is the source of truth for every business decision (Docs/06 §4), and from
+	// wave 2 onwards it is what the endpoints are made of. It is built here, once, and
+	// handed to every domain through Deps.
+	//
+	// # Why this warns rather than refusing to start
+	//
+	// db.Open pings and returns an error, and its own comment argues the opposite case —
+	// that nothing works without PostgreSQL, so a bad DATABASE_URL should fail at startup
+	// rather than at the first request. That reasoning is about a *misconfigured* service
+	// and it is right about one: a URL pointing nowhere should never reach production
+	// quietly.
+	//
+	// This is the other case. A rolling deployment during a database failover, or a
+	// restart while PostgreSQL is briefly away, would take down every instance at once and
+	// keep them down — a crash loop timed exactly when the database is least able to
+	// absorb a stampede of reconnections. The same argument the Redis ping above already
+	// makes, and the same conclusion: log it, start, and let the requests that need it
+	// fail per request.
+	//
+	// The endpoints that need the pool are not yet written, so nothing is degraded by this
+	// today. When they are, /health deliberately keeps saying "ok" — it answers "should
+	// this instance be restarted", and a database blip is not a reason to kill the fleet.
+	// A readiness endpoint that does check dependencies is a separate thing.
+	// Bounded for the same reason the Redis ping is: db.Open pings before returning, and an
+	// unreachable host answers a TCP connect by not answering. Without a deadline the
+	// "warn and start" path above would wait on the operating system's connect timeout,
+	// which on a dropped-packet failure is minutes — long enough that a deployment gives up
+	// on the instance first, turning a warning into the crash loop it exists to avoid.
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), 5*time.Second)
+	pool, err := db.Open(openCtx, cfg.Database.URL, db.PoolOptions{
+		MaxConns:        cfg.Database.MaxOpenConns,
+		MinConns:        cfg.Database.MaxIdleConns,
+		MaxConnLifetime: cfg.Database.ConnMaxLifetime,
+	})
+	cancelOpen()
+	if err != nil {
+		log.Warn("postgresql is not reachable at startup; "+
+			"endpoints that need it will fail until it is",
+			slog.String("error", err.Error()))
+	} else {
+		defer pool.Close()
+	}
+
 	deps := Deps{
-		Config:    cfg,
-		Logger:    log,
-		Clock:     clock.System{},
+		Config: cfg,
+		Logger: log,
+		Clock:  clock.System{},
+
+		// Both may be nil, and a domain must not treat either as a promise. See Deps.
+		Pool:  pool,
+		Redis: redisClient,
+
 		StartedAt: startedAt,
 	}
 

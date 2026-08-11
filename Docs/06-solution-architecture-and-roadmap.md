@@ -123,6 +123,14 @@ Interfaces are declared by the domain that **consumes** them, not by the package
 
 This keeps every dependency arrow pointing inward at the domain, and it is the same property the import lint rule enforces — the architectural rule and the automated check are the same rule expressed twice. The lint is `SHIP-11`, described in `08` and implemented in `services/core/cmd/lintboundaries`.
 
+#### Infrastructure sits underneath, and may not reach back up
+
+`internal/httpx`, `internal/db`, `internal/events`, `internal/authctx` and the rest are what every domain and every adapter is built on. So **infrastructure may import neither a domain nor an adapter**, and this is a fourth lint rule rather than a convention (`SHIP-15c`).
+
+The reason is transitivity, and it makes this the easiest of the four rules to break without noticing. Every domain imports `httpx`. One import of `internal/identity` from inside `internal/httpx` couples all eight domains to `identity` — through an edge that appears in no domain's own files, so no amount of reading a domain package reveals it.
+
+`SHIP-44` is the first ticket with a genuine motive: the authentication middleware has to verify a token, and the verifier is in `identity`. The shape that keeps the seam is for the middleware to take a function, with the closure over `identity` supplied in `cmd/api` — the same composition-root answer as every other rule here. Infrastructure importing infrastructure is unrestricted and ordinary; `httpx` importing `authctx` is the seam working.
+
 ## 5. Security and operations baseline
 
 ### 5.1 Platform
