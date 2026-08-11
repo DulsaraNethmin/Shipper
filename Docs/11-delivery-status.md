@@ -143,7 +143,11 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
+| **SHIP-56** | M2 | `jobs` — the twelve statuses of `Docs/02` §1 as a `CHECK`, held to the Go constants by test |
+| **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
+| **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
+| **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -321,6 +325,81 @@ during a build, and `tsc --noEmit` has nothing to resolve them against until one
 invisible locally, because a developer has always built at least once. The workflows run the
 build first as a workaround and say so; the fix is one line in `mk/web.mk` and is in §9.
 
+### What the jobs lifecycle foundation built (SHIP-56, SHIP-57, SHIP-57a)
+
+None of these reaches an HTTP endpoint, so none of them has a `make verify` section. They are
+demonstrated by their own tests, against a real PostgreSQL — which is not a weaker form of
+demonstration here, because half of what they build is a trigger and `Docs/06` §4.1 is right
+that "a mock happily accepts a write that the actual constraint would reject".
+
+**`Docs/11` §9's open recommendation is decided, in favour of the database.** `CLAUDE.md` has
+always said job status is never a settable field; from `000402` that is a control rather than a
+convention. A status change is refused unless a `job_status_history` row **written in the same
+transaction** describes it — same job, same two statuses. That one condition carries three
+guarantees at once: the change went through the guard, it is recorded with an actor and both
+clocks, and it is inside a transaction — because the session variable naming the history row is
+transaction-local, so a caller holding a pool rather than a transaction is refused.
+
+**A job is also created as a Draft and nothing else.** `Docs/02` §2 has one entry point, and an
+`INSERT` naming another status skipped every check on the way in — a job created at `Awarded` has
+no accepted bid behind it, one created at `Delivered` has no proof. That is the half of "never a
+settable field" an `UPDATE` trigger alone does not cover.
+
+**What the database deliberately does not know is which moves are legal.** The transition table
+of `Docs/02` §2 lives in Go, in one place, with a test that walks the document — including the
+moves it is explicit about *refusing*, which is the half that catches a table with something
+extra in it. A second copy in SQL would be a copy that drifts, and a move that is legal in one
+layer and impossible in the other is a defect reproducible from neither.
+
+**`Transition` takes a `db.Runner`, not a pool.** `bidding` owns the award transaction
+(`Docs/10` §3.2) and has to move the job inside it without importing this package, so the guard
+joins whatever transaction its caller opened. SHIP-92 needs nothing added for that.
+
+**One thing to know before writing the first jobs endpoint:** this domain raises sentinel errors
+and registers no `httpx` codes yet. Nothing serves them, and a published code is a string a
+store build on somebody's phone is already branching on. The first endpoint (SHIP-61, SHIP-64)
+maps `ErrTransitionNotPermitted`, `ErrAlreadyInStatus` and `ErrJobNotFound` to codes and
+regenerates `Docs/10-api-error-codes.md`.
+
+### What SHIP-67a built, and the table it deliberately does not have
+
+`cmd/worker` is the fourth deployable's little brother: a ticker plus a claim loop, exactly as
+`Docs/10` §6.2 specifies, and no external scheduler. Four tasks in the backlog need it — job
+expiry (SHIP-68), the warning forty-eight hours ahead (SHIP-69), bid expiry (SHIP-89) and the
+seventy-two hour auto-complete (SHIP-119) — and none of them creates it.
+
+**There is no `scheduled_tasks` table, and that is the design rather than an omission.** Due work
+is rows in domain tables: jobs whose pickup date has passed, bids that have expired, deliveries
+seventy-two hours old. A table of scheduled tasks would be a second record of what is due, kept
+in step with the first by hand. The instinct to reach for one is strong enough to be worth
+naming — and if a later task genuinely needs persistent state of its own, it draws a migration
+from its own domain's block.
+
+**Two workers at once is the normal state of a rolling deployment, and it is safe by
+construction rather than by arrangement.** There is no leader election and no lease: both
+workers tick, both claim, and `SKIP LOCKED` hands the second one the rows the first did not
+take. Nothing goes stale if a worker dies holding a claim, because the claim is a row lock and
+the lock ends with the connection.
+
+**A pass is one transaction — the claim and the work the claim authorises.** A pass that claimed
+rows and committed only half its work is the failure this shape exists to prevent, and it is
+what `TestAFailedPassClaimsNothing` checks.
+
+**`ClaimIDs` refuses a query that does not say `FOR UPDATE SKIP LOCKED`.** Both broken forms
+work perfectly with one worker: without `SKIP LOCKED` the second worker queues behind the first
+instead of sharing, and without `FOR UPDATE` two workers claim the same rows and both act. The
+tests were mutation-checked against both — removing `SKIP LOCKED` makes the second claim block
+until its deadline, and removing the lock entirely makes two workers claim 361 rows out of 200.
+
+**Demonstrated by its own tests, not by `make verify`**, which drives HTTP endpoints and this
+adds none. What has to be shown is two workers at once against one table, which is a thing a
+test can arrange and a `curl` cannot.
+
+**One thing left undone deliberately:** the root `Makefile`'s `build` target still builds the
+API and the migration tool only. `mk/worker.mk` carries `worker-build` and `worker-run` instead,
+because the root `Makefile` is a shared surface and three tracks were open. Folding the third
+binary into `build` belongs to whoever owns that file next.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -442,7 +521,7 @@ Kept here rather than deleted, because the shape recurs: this was described only
 
 ## 9. Open recommendations nobody has decided
 
-**Job status as a database guarantee.** `CLAUDE.md` says job status is never a settable field, but nothing structurally stops a future `postgres.go` writing `UPDATE jobs SET status = …`, and the boundary lint will not catch it. A `BEFORE UPDATE` trigger rejecting any status change without a session variable set inside the guard's transaction would make it a database guarantee — the same argument as enforcing one-accepted-bid in the database. **Decide at SHIP-57.**
+**~~Job status as a database guarantee.~~ Decided and built at SHIP-57 — see §3.** The trigger exists, and it asks for more than the recommendation did: not merely that a session variable is set, but that it names a `job_status_history` row written in the same transaction which describes this job making exactly this move. The weaker form would have been a flag any caller could set; this one cannot be satisfied without leaving the record, which is what makes SHIP-57a's *Done when* structural rather than remembered.
 
 **Whether an adapter's value types get a home.** Wave 1 surfaced a consequence of the consumer-declares-the-interface rule that nobody had hit before. A domain's `ports.go` must name the adapter's method signature and may not import the adapter, so no struct declared in an adapter can appear in one. Geocoding therefore ended up as:
 
@@ -485,6 +564,7 @@ SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
 SHIP-20 SHIP-22 SHIP-23 SHIP-23a SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
 SHIP-48 SHIP-49
+SHIP-56 SHIP-57 SHIP-57a SHIP-67a
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 
