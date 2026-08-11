@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **161 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **170 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -206,7 +206,7 @@ This is the part a new session most needs to know about, because it changes how 
 
 **One row of that table was false for two waves, and it is struck through rather than deleted.** `httpx.RegisterCode` was documented in `Docs/10` §4.4 with a worked example and listed here as built, and neither was true — there was no registration function and no generated code list. Nothing broke, because no domain had raised a code of its own. That is the failure mode worth remembering: a mechanism this file claims exists is one nobody checks for, and it stays absent exactly until two tracks need it in the same week.
 
-Shared packages now available to every domain: `db` (Runner, InTx), `authctx`, `clock`, `validate`, `events` (outbox writer). Registered but not yet written: `pagination`, `ratelimit`, `money` — write them when first needed, no shared edit required.
+Shared packages now available to every domain: `db` (Runner, InTx), `authctx`, `clock`, `validate`, `events` (outbox writer), and — since SHIP-47 — `ratelimit`. Still registered and not yet written: `pagination`, `money` — write them when first needed, no shared edit required. **`ratelimit` is the mechanism's first vindication**: SHIP-47 wrote the package, its first client used it, and `internal/boundaries` was never opened. `CLAUDE.md` still lists `ratelimit` among the unwritten three and needs the one-word correction; it is a shared surface and was not edited from this branch.
 
 ### What SHIP-15b changed, and why it existed at all
 
@@ -715,6 +715,73 @@ creates a session and nothing stops a client signing in a thousand times instead
 the query is capped at a hundred rows. Keyset paging belongs to `internal/pagination`, which is
 registered in `internal/boundaries` and still unwritten; §9 carries it.
 
+### What SHIP-47 built, and the two positions it takes
+
+**`internal/ratelimit` exists, and nothing shared was edited to make it exist.** It was registered
+in `internal/boundaries` ahead of the code, with the description "the Redis token bucket behind
+every limited route", and SHIP-47 is the first client. That is the pre-seeded infrastructure list
+working exactly as SHIP-15a designed it — the alternative was a domain branch editing the boundary
+file mid-wave, which is the merge the seeding exists to prevent.
+
+**A token bucket rather than a fixed window**, because a fixed window lets a caller spend one
+window's allowance in its last instant and the next window's in its first — twice the intended
+rate, on demand, at a moment of their choosing. A bucket also produces an honest `Retry-After`:
+time until the next token, not time until an arbitrary boundary. The refill and the charge are one
+Lua script, for the reason the idempotency store's claim gives — a read and a write are two round
+trips with a window between them, and two attempts arriving together is the case a rate limit is
+*for*.
+
+**Failures are charged and successes are free**, which is what makes this a control on guessing
+rather than a cap on signing in. The bucket is checked on the way in and spent on the way out; a
+check that spent would throttle somebody for knowing their own password.
+
+**The limit is checked before the credential**, so a correct password is refused too while it
+holds. That is the point rather than a rough edge: what the limit protects is the argon2id
+derivation and the database round trip, and a throttle a correct password escaped would be a
+throttle an attacker escapes by guessing right.
+
+**Position one: it fails closed.** An unreachable Redis refuses the sign-in — `503`, because "this
+is temporarily unavailable" is true and "you have done too much" is not. A limiter that failed open
+is one an attacker turns off by making Redis unreachable, on the endpoint the limiter exists to
+protect. The cost is bounded and worth naming: `httpx.Idempotent` already wraps the whole `/v1`
+group and already fails closed on the same Redis, so a client sees no difference during an outage
+— failing closed here only means there is one answer rather than two. `TestSignInWithoutARateLimiterCacheIsRefused`
+holds it.
+
+**A typed nil is still no client, and that was found rather than anticipated.** `Deps.Redis` is a
+`*redis.Client`; assigned to the `redis.UniversalClient` the package takes, a nil one produces an
+interface that is **not** nil, so `client == nil` is false and the first call dereferences it. The
+symptom was a panic and a `500` — which is fail-*open* in the sense that matters, because a 500
+tells nobody a limit was skipped. `ratelimit.New` normalises it once, with a test.
+
+**Position two: `X-Forwarded-For` is not read.** The address comes from `RemoteAddr` and nothing
+else. A forwarded header is whatever the client wrote unless a trusted proxy overwrote it, so
+honouring one would let any caller pick their own bucket — a limit that looks like a limit and is
+not. The other direction has a cost too, and it is a deployment gate rather than a defect: behind a
+load balancer, every request would arrive from one address and share one bucket. §9 carries it, and
+there is no deployment yet to be wrong about.
+
+**Two limits, and each has an independence half the other cannot show.** Five failures per account
+with one back every two minutes; thirty per address with one back every twenty seconds. Both are
+mutation-checked in the direction that matters: keying the account bucket on the address makes one
+account's failures lock out everybody on the same network, and dropping the address from its key
+makes one exhausted address throttle the platform. The figures are constants in `internal/identity`
+rather than configuration, for the reason SHIP-39's TTL gives — `internal/config` is a shared
+surface and three tracks were open. **SHIP-183 is where every public endpoint's limit gets
+considered together**, and that is the ticket that should decide whether any of them belong in
+configuration.
+
+**Only sign-in is limited by this.** Registration, the OTP endpoints and the verification endpoints
+keep the per-account issue rules SHIP-34 gave them and gain nothing here; SHIP-183 owns the pass
+over the rest.
+
+**`make verify` clears the per-address bucket at the point sign-ins begin and again at the end of
+this section.** Every request in the script arrives from `127.0.0.1`, so one bucket is shared by
+every section below — and by every previous run. Without the clean-up a run that stopped part-way
+through SHIP-47 made the *next* run fail in SHIP-41 with a 429 that reads as a broken endpoint.
+That was observed, not imagined. It also lets the per-address figure be asserted exactly rather
+than derived from counting what the sections above happened to spend.
+
 ### What SHIP-48 built, and how it was demonstrated
 
 It reaches no HTTP endpoint — the endpoints that issue a refresh token are SHIP-41 and
@@ -1091,6 +1158,23 @@ was between building the mechanism and amending `Docs/10` §4.3 to match reality
 won for the same reason it did with `RegisterCode` at SHIP-15c. The body limit — the part that
 actually bites, since a second literal is a second place for it to drift — is now one constant
 in `internal/httpx` rather than two that agree by comment.
+
+**`X-Forwarded-For` is deliberately unread, and that is a gate on the first deployment behind a
+load balancer.** SHIP-47's per-address bucket keys on `RemoteAddr`. Honouring a forwarded header
+without a trusted-proxy configuration would let any caller choose their own bucket and evade the
+limit entirely; not honouring one behind a proxy makes every request share one bucket, which
+throttles everybody at thirty failures. Neither is acceptable in production and there is no
+deployment yet to be wrong about. **Decide with the deployment work** — a trusted-proxy hop count
+or a CIDR allow-list in `internal/config`, read by `identity.clientIP`.
+
+**A per-account limit is a lockout somebody else can trigger, and the trade is deliberate.** The
+bucket keys on the submitted address whether or not it has an account — it must, or never being
+throttled would itself disclose that an address is unknown. So a caller can spend somebody else's
+allowance by getting their password wrong for them. The per-address limit is what bounds it: an
+attacker burns their own thirty to fill six accounts' buckets, and the sustained rate lets them
+hold about one account at a time. That is the standard shape and it is worth revisiting rather than
+inheriting: a per-account limit counting *distinct* addresses, or one a successful sign-in clears,
+both remove it. **Decide at SHIP-183**, with the rest of the surface.
 
 **The device list is bounded but not pageable.** `GET /v1/auth/sessions` returns the collection
 envelope with `next_cursor` always null and a hundred-row cap, because `internal/pagination` is

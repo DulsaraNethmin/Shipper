@@ -7,6 +7,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/email"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/sms"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 )
 
 // The identity domain's routes (SHIP-30 onwards).
@@ -164,7 +165,16 @@ func identityHandler(d Deps) *identity.Handler {
 		panic("cmd/api: identity access token issuer: " + err.Error())
 	}
 
-	svc, err := identity.NewService(d.Pool, hasher, issuer,
+	// SHIP-47's token bucket, over the same Redis the idempotency store uses. d.Redis may be
+	// nil — the process starts with an unreachable cache deliberately — and the limiter then
+	// refuses every attempt, which is the fail-closed direction internal/ratelimit argues for.
+	// The prefix keeps these keys distinguishable from the idempotency store's in one database.
+	limiter, err := ratelimit.New(d.Redis, "rl:v1:", d.Clock)
+	if err != nil {
+		panic("cmd/api: identity rate limiter: " + err.Error())
+	}
+
+	svc, err := identity.NewService(d.Pool, hasher, issuer, limiter,
 		newEmailSender(d.Config), newSMSSender(d.Config), d.Clock)
 	if err != nil {
 		panic("cmd/api: identity service: " + err.Error())

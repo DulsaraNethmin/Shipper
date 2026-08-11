@@ -49,7 +49,7 @@ func newSessionService(t *testing.T, clk clock.Clock) (*Service, *pgxpool.Pool, 
 		t.Fatalf("building the hasher: %v", err)
 	}
 
-	svc, err := NewService(pool, hasher, testServiceIssuer(t, clk),
+	svc, err := NewService(pool, hasher, testServiceIssuer(t, clk), testLimiter(t),
 		&recordingSender{}, &recordingTexter{}, clk)
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
@@ -541,7 +541,7 @@ func TestRefreshWithoutADatabaseIsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
-	svc, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}),
+	svc, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
 		&recordingSender{}, &recordingTexter{}, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
@@ -559,9 +559,23 @@ func TestAServiceWithNoIssuerIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
-	if _, err := NewService(nil, hasher, nil,
+	if _, err := NewService(nil, hasher, nil, testLimiter(t),
 		&recordingSender{}, &recordingTexter{}, clock.System{}); err == nil {
 		t.Error("a service was built with no access token issuer")
+	}
+}
+
+// TestAServiceWithNoRateLimiterIsRefused (SHIP-47). A limiter whose Redis client is nil is
+// legitimate — it refuses everything, which is the fail-closed direction — but no limiter at all
+// is a service that would serve sign-in with nothing counting the guesses.
+func TestAServiceWithNoRateLimiterIsRefused(t *testing.T) {
+	hasher, err := NewPasswordHasher(testProfile)
+	if err != nil {
+		t.Fatalf("building the hasher: %v", err)
+	}
+	if _, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}), nil,
+		&recordingSender{}, &recordingTexter{}, clock.System{}); err == nil {
+		t.Error("a service was built with no rate limiter")
 	}
 }
 

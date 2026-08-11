@@ -27,7 +27,8 @@ func newVerifiableService(t *testing.T, clk clock.Clock) (*Service, *pgxpool.Poo
 	}
 
 	mail := &recordingSender{}
-	svc, err := NewService(pool, hasher, testServiceIssuer(t, clk), mail, &recordingTexter{}, clk)
+	svc, err := NewService(pool, hasher, testServiceIssuer(t, clk), testLimiter(t),
+		mail, &recordingTexter{}, clk)
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}

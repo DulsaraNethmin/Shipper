@@ -173,6 +173,17 @@ Login:
       `identity_account_suspended` is the one exception, and it is a `403`. It is said only
       after the password verified — the caller has just proved they own the account they are
       being told about.
+
+      ## Throttling
+
+      Repeated **failures** are limited, per account and per network address (SHIP-47). A
+      successful sign-in costs nothing, so somebody who knows their password is never refused
+      for using it.
+
+      Reaching either limit answers `429` with `Retry-After`, and does so **before** the
+      password is checked — so a correct password is refused too while the limit holds. Wait
+      the header out rather than retrying; retrying while refused does not extend the wait, but
+      it does not shorten it either.
     parameters:
       - $ref: '#/IdempotencyKey'
     requestBody:
@@ -880,6 +891,23 @@ TokenPair:
         refresh issues a new token with a full lifetime, so it is inactivity that ends a
         session rather than time since sign-in.
       example: 2592000
+
+RateLimited:
+  description: |
+    Too many failed attempts — `rate_limited` (SHIP-47). Carries `Retry-After` in seconds, which
+    is the time until the allowance returns rather than the time until a window rolls over.
+  headers:
+    X-Request-Id:
+      $ref: '../openapi.yaml#/components/headers/RequestID'
+    Retry-After:
+      description: Seconds to wait before trying again.
+      schema:
+        type: integer
+      example: 24
+  content:
+    application/json:
+      schema:
+        $ref: '../openapi.yaml#/components/schemas/Error'
 
 Device:
   type: object

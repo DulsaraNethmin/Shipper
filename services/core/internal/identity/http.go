@@ -22,8 +22,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -297,8 +300,17 @@ func (h *Handler) Login() http.Handler {
 			Email:       req.Email,
 			Password:    req.Password,
 			DeviceLabel: req.DeviceLabel,
+			ClientIP:    clientIP(r),
 		})
 		if err != nil {
+			// Retry-After is set here rather than inside the error, because httpx.Error
+			// carries a status, a code and a message and no headers — and a throttled
+			// caller told to come back later without being told when either gives up or
+			// polls. The same shape RequestOTP already uses for its cooldown.
+			var throttled *ThrottledError
+			if errors.As(err, &throttled) {
+				w.Header().Set("Retry-After", retryAfterSeconds(throttled.RetryAfter))
+			}
 			return apiError(err)
 		}
 
@@ -566,6 +578,39 @@ func timestamp(t time.Time) string {
 	return t.UTC().Format("2006-01-02T15:04:05.000Z07:00")
 }
 
+// clientIP is where the request came from, as SHIP-47's per-address limit counts it.
+//
+// **RemoteAddr only. `X-Forwarded-For` is deliberately not read**, and that is a decision with a
+// deployment consequence recorded in Docs/11 §9 rather than an oversight. A forwarded header is
+// whatever the client wrote unless a trusted proxy overwrote it, so honouring one here would let
+// any caller pick their own bucket and evade the limit entirely — which is worse than no limit,
+// because it would look like one. The other direction has a cost too: behind a load balancer that
+// does not yet exist, every request would arrive from one address and share one bucket. Neither is
+// acceptable in production and the answer is a trusted-proxy configuration, which belongs with the
+// deployment work rather than inside a three-point ticket.
+//
+// The port is stripped, so that a caller does not get a fresh bucket per connection.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	// httptest and any transport that reports a bare address land here. Returned as-is
+	// rather than as an empty string, because the domain refuses an empty address.
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+// retryAfterSeconds renders a wait for the header, rounded up.
+//
+// Up rather than to nearest: rounding 1.4 seconds down to one tells a client to retry before the
+// allowance exists, which produces a second refusal and a client that believes the header lies.
+func retryAfterSeconds(d time.Duration) string {
+	seconds := int(math.Ceil(d.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.Itoa(seconds)
+}
+
 // apiError turns this domain's errors into the API's error contract.
 //
 // The mapping lives at the transport edge on purpose: the service answers in domain terms, and
@@ -615,6 +660,13 @@ func apiError(err error) error {
 	case errors.Is(err, ErrAccountSuspended):
 		return httpx.NewError(http.StatusForbidden, CodeAccountSuspended,
 			"This account has been suspended. Contact support.").WithCause(err)
+
+	// 429, with the honest wait in Retry-After. The message says which limit was reached in
+	// the vaguest terms that are still useful, because "this account" and "this network" are
+	// different remedies and neither discloses anything the caller does not already know.
+	case errors.As(err, new(*ThrottledError)):
+		return httpx.NewError(http.StatusTooManyRequests, httpx.CodeRateLimited,
+			"Too many sign-in attempts. Wait a moment and try again.").WithCause(err)
 
 	// 404 for a session that belongs to somebody else as well as for one that does not exist,
 	// which is what stops the revoke endpoint being used to probe identifiers (SHIP-46).

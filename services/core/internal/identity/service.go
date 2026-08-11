@@ -23,6 +23,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
@@ -66,13 +67,14 @@ const (
 // inside a transaction or straight against the pool, decided by the caller rather than by the
 // method.
 type Service struct {
-	pool   *pgxpool.Pool
-	hasher *PasswordHasher
-	issuer *AccessTokenIssuer
-	email  EmailSender
-	sms    SMSSender
-	clock  clock.Clock
-	store  postgresStore
+	pool    *pgxpool.Pool
+	hasher  *PasswordHasher
+	issuer  *AccessTokenIssuer
+	limiter *ratelimit.Limiter
+	email   EmailSender
+	sms     SMSSender
+	clock   clock.Clock
+	store   postgresStore
 }
 
 // NewService builds the domain service.
@@ -83,7 +85,7 @@ type Service struct {
 // mistake rather than a transient condition: a service with no hasher would accept a password
 // and store nothing derivable from it, and one with no email or SMS sender would register
 // accounts that can never be verified.
-func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, issuer *AccessTokenIssuer, sender EmailSender, texter SMSSender, clk clock.Clock) (*Service, error) {
+func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, issuer *AccessTokenIssuer, limiter *ratelimit.Limiter, sender EmailSender, texter SMSSender, clk clock.Clock) (*Service, error) {
 	if hasher == nil {
 		return nil, errors.New("identity: a service needs a password hasher")
 	}
@@ -92,6 +94,12 @@ func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, issuer *AccessTokenI
 		// a service that could create one without an issuer would be a service that hands out
 		// half a credential — a refresh token the caller cannot exchange for anything.
 		return nil, errors.New("identity: a service needs an access token issuer")
+	}
+	if limiter == nil {
+		// SHIP-47. A limiter whose Redis client is nil is legitimate — it refuses
+		// everything, which is the fail-closed direction — but no limiter at all is a
+		// service that would serve sign-in with nothing counting the guesses.
+		return nil, errors.New("identity: a service needs a rate limiter")
 	}
 	if sender == nil {
 		return nil, errors.New("identity: a service needs an email sender")
@@ -103,7 +111,7 @@ func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, issuer *AccessTokenI
 		return nil, errors.New("identity: a service needs a clock")
 	}
 	return &Service{
-		pool: pool, hasher: hasher, issuer: issuer,
+		pool: pool, hasher: hasher, issuer: issuer, limiter: limiter,
 		email: sender, sms: texter, clock: clk,
 	}, nil
 }

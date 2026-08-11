@@ -2,6 +2,7 @@ package identity
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -12,7 +13,9 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/redistest"
 )
 
 // SHIP-41 against a real PostgreSQL, per Docs/06 §4.1.
@@ -33,7 +36,7 @@ func signInService(t *testing.T, profile Argon2Profile) (*Service, *pgxpool.Pool
 		t.Fatalf("building the hasher: %v", err)
 	}
 
-	svc, err := NewService(pool, hasher, testServiceIssuer(t, clock.System{}),
+	svc, err := NewService(pool, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
 		&recordingSender{}, &recordingTexter{}, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
@@ -51,7 +54,32 @@ func validSignIn() SignInCommand {
 		Email:       validRegistration().Email,
 		Password:    validRegistration().Password,
 		DeviceLabel: "Nethmin's iPhone",
+
+		// SHIP-47 counts per address as well as per account, and refuses a command that
+		// carries none — an address the platform cannot determine is not an address with
+		// no limit. Tests supply one for the same reason a client does.
+		ClientIP: "203.0.113.7",
 	}
+}
+
+// testLimiter builds SHIP-47's token bucket over the real Redis, in a namespace of its own.
+//
+// A limiter per test rather than a shared one, because these are buckets: two tests sharing a
+// namespace would have the first one's failed sign-ins throttle the second's, which reads as an
+// unrelated test being flaky. redistest.Client gives the prefix and removes the keys afterwards.
+//
+// Real Redis rather than a fake, per Docs/10 §7.2 and for the reason internal/ratelimit's own
+// tests give: what is being relied on is Redis running a script to completion.
+func testLimiter(t *testing.T) *ratelimit.Limiter {
+	t.Helper()
+
+	client, prefix := redistest.Client(t)
+
+	limiter, err := ratelimit.New(client, prefix, clock.System{})
+	if err != nil {
+		t.Fatalf("building the rate limiter: %v", err)
+	}
+	return limiter
 }
 
 // TestSignInReturnsAPairAndCreatesTheDevice is SHIP-41's acceptance criterion: the endpoint
@@ -432,7 +460,7 @@ func serviceWithoutADatabase(t *testing.T) *Service {
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
-	svc, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}),
+	svc, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
 		&recordingSender{}, &recordingTexter{}, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
@@ -460,4 +488,246 @@ func hasCost(encoded, want string) bool {
 		return false
 	}
 	return slices.Contains(strings.Split(fields[3], ","), want)
+}
+
+// SHIP-47: the two limits on sign-in, against the real Redis.
+//
+// "Repeated failures are throttled per account and per IP" is two claims, and each has an
+// independence half that the other cannot show: filling one account's bucket must not refuse
+// another account from the same address, and filling one address's bucket must not refuse that
+// account from somewhere else. A test that only counts to the limit passes with either bucket
+// missing.
+
+// failSignIn presents the wrong password once and returns whatever came back.
+func failSignIn(t *testing.T, svc *Service, cmd SignInCommand) error {
+	t.Helper()
+
+	cmd.Password = "not-the-password-that-was-registered"
+	_, err := svc.SignIn(t.Context(), cmd)
+	if err == nil {
+		t.Fatal("a wrong password was accepted")
+	}
+	return err
+}
+
+// throttledAfter reports how many attempts were admitted before the limiter refused, running at
+// most limit of them.
+func throttledAfter(t *testing.T, svc *Service, cmd SignInCommand, limit int) int {
+	t.Helper()
+
+	for i := range limit {
+		if errors.As(failSignIn(t, svc, cmd), new(*ThrottledError)) {
+			return i
+		}
+	}
+	return limit
+}
+
+// TestRepeatedFailuresAreThrottledPerAccount is the first half of SHIP-47's criterion.
+func TestRepeatedFailuresAreThrottledPerAccount(t *testing.T) {
+	svc, _, _ := signInService(t, testProfile)
+
+	admitted := throttledAfter(t, svc, validSignIn(), signInAccountCapacity+5)
+	if admitted != signInAccountCapacity {
+		t.Fatalf("%d failures were admitted before the throttle, want the capacity of %d",
+			admitted, signInAccountCapacity)
+	}
+
+	t.Run("the refusal says when to come back", func(t *testing.T) {
+		var throttled *ThrottledError
+		if !errors.As(failSignIn(t, svc, validSignIn()), &throttled) {
+			t.Fatal("the attempt after the limit was not throttled")
+		}
+		if throttled.RetryAfter <= 0 || throttled.RetryAfter > signInAccountInterval {
+			t.Errorf("RetryAfter = %s, want (0, %s]", throttled.RetryAfter, signInAccountInterval)
+		}
+	})
+
+	t.Run("it is a 429 with the rate-limited code", func(t *testing.T) {
+		err := failSignIn(t, svc, validSignIn())
+
+		var apiErr *httpx.Error
+		if !errors.As(apiError(err), &apiErr) {
+			t.Fatalf("apiError produced %T, want *httpx.Error", apiError(err))
+		}
+		if apiErr.Status != 429 || apiErr.Code != httpx.CodeRateLimited {
+			t.Errorf("status = %d code = %q, want 429 and %q",
+				apiErr.Status, apiErr.Code, httpx.CodeRateLimited)
+		}
+	})
+
+	t.Run("and the right password is refused too", func(t *testing.T) {
+		// The limit is checked before the credential, which is the point: what it protects
+		// is the argon2id derivation and the database round trip. A throttle that let a
+		// correct password through would be a throttle an attacker escapes by guessing right.
+		_, err := svc.SignIn(t.Context(), validSignIn())
+		if !errors.As(err, new(*ThrottledError)) {
+			t.Errorf("err = %v, want a throttle — the limit is checked before the credential", err)
+		}
+	})
+}
+
+// TestOneAccountsFailuresDoNotThrottleAnother, from the same address.
+//
+// Mutation-checked: keying the account bucket on something shared — the address, a constant —
+// makes this fail. Without it, one account being guessed at locks out everybody on the same
+// network.
+func TestOneAccountsFailuresDoNotThrottleAnother(t *testing.T) {
+	svc, _, _ := signInService(t, testProfile)
+
+	other, err := svc.Register(t.Context(), RegisterCommand{
+		Email:    "other@example.com",
+		Phone:    "0412 345 679",
+		Password: "correct-horse-battery-staple",
+		Role:     RoleProvider,
+	})
+	if err != nil {
+		t.Fatalf("registering the second account: %v", err)
+	}
+
+	if admitted := throttledAfter(t, svc, validSignIn(), signInAccountCapacity+3); admitted != signInAccountCapacity {
+		t.Fatalf("%d failures admitted, want %d", admitted, signInAccountCapacity)
+	}
+
+	second := validSignIn()
+	second.Email = other.Email
+
+	if _, err := svc.SignIn(t.Context(), second); err != nil {
+		t.Fatalf("a second account on the same address could not sign in: %v", err)
+	}
+}
+
+// TestRepeatedFailuresAreThrottledPerAddress is the other half, and the one an attacker working
+// through a list of addresses runs into.
+//
+// Each attempt uses an address of its own, so every per-account bucket stays full and the only
+// thing that can refuse is the per-address limit.
+func TestRepeatedFailuresAreThrottledPerAddress(t *testing.T) {
+	svc, _, _ := signInService(t, testProfile)
+
+	const from = "198.51.100.4"
+
+	admitted := 0
+	for i := range signInAddressCapacity + 5 {
+		cmd := validSignIn()
+		cmd.Email = fmt.Sprintf("nobody-%d@example.com", i)
+		cmd.ClientIP = from
+
+		if errors.As(failSignIn(t, svc, cmd), new(*ThrottledError)) {
+			break
+		}
+		admitted++
+	}
+
+	if admitted != signInAddressCapacity {
+		t.Fatalf("%d attempts were admitted from one address, want the capacity of %d",
+			admitted, signInAddressCapacity)
+	}
+
+	t.Run("the account it was working through is refused from that address", func(t *testing.T) {
+		cmd := validSignIn()
+		cmd.ClientIP = from
+
+		if _, err := svc.SignIn(t.Context(), cmd); !errors.As(err, new(*ThrottledError)) {
+			t.Errorf("err = %v, want a throttle", err)
+		}
+	})
+
+	t.Run("but not from anywhere else", func(t *testing.T) {
+		// Mutation-checked: dropping the address from the key makes this fail, because one
+		// exhausted address would then throttle the whole platform.
+		cmd := validSignIn()
+		cmd.ClientIP = "198.51.100.5"
+
+		if _, err := svc.SignIn(t.Context(), cmd); err != nil {
+			t.Errorf("a different address was throttled by another's failures: %v", err)
+		}
+	})
+}
+
+// TestSuccessfulSignInsAreNotThrottled. The limit counts *failures*, so somebody who knows their
+// password is never refused for using it — which is what stops a shared device or a busy office
+// running into a control aimed at guessing.
+func TestSuccessfulSignInsAreNotThrottled(t *testing.T) {
+	svc, _, _ := signInService(t, testProfile)
+
+	for i := range signInAccountCapacity * 3 {
+		if _, err := svc.SignIn(t.Context(), validSignIn()); err != nil {
+			t.Fatalf("sign-in %d was refused: %v", i, err)
+		}
+	}
+}
+
+// TestASuspendedAccountIsNotCountedAsAGuess. Its owner has just proved they own it, so refusing
+// them is not evidence of anything and throttling them would leave somebody locked out of the
+// endpoint that tells them why.
+func TestASuspendedAccountIsNotCountedAsAGuess(t *testing.T) {
+	svc, pool, user := signInService(t, testProfile)
+
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE users SET status = 'suspended' WHERE id = $1`, user.ID); err != nil {
+		t.Fatalf("suspending the account: %v", err)
+	}
+
+	for i := range signInAccountCapacity + 3 {
+		_, err := svc.SignIn(t.Context(), validSignIn())
+		if !errors.Is(err, ErrAccountSuspended) {
+			t.Fatalf("attempt %d answered %v, want ErrAccountSuspended — being suspended was "+
+				"counted as an attempt at somebody's password", i, err)
+		}
+	}
+}
+
+// TestSignInWithoutARateLimiterCacheIsRefused is the fail-closed direction, through the domain.
+//
+// A limiter that failed open would be one an attacker turns off by taking Redis down, on the
+// endpoint the limiter exists to protect. It is a 503 rather than a 429 because "this is
+// temporarily unavailable" is true and "you have done too much" is not.
+func TestSignInWithoutARateLimiterCacheIsRefused(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	hasher, err := NewPasswordHasher(testProfile)
+	if err != nil {
+		t.Fatalf("building the hasher: %v", err)
+	}
+	limiter, err := ratelimit.New(nil, "unreachable:", clock.System{})
+	if err != nil {
+		t.Fatalf("building the limiter: %v", err)
+	}
+	svc, err := NewService(pool, hasher, testServiceIssuer(t, clock.System{}), limiter,
+		&recordingSender{}, &recordingTexter{}, clock.System{})
+	if err != nil {
+		t.Fatalf("building the service: %v", err)
+	}
+	if _, err := svc.Register(t.Context(), validRegistration()); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+
+	_, err = svc.SignIn(t.Context(), validSignIn())
+	if !errors.Is(err, errUnavailable) {
+		t.Fatalf("err = %v, want errUnavailable — an unreachable cache let a sign-in through "+
+			"with nothing counting the attempts", err)
+	}
+
+	var apiErr *httpx.Error
+	if !errors.As(apiError(err), &apiErr) {
+		t.Fatalf("apiError produced %T, want *httpx.Error", apiError(err))
+	}
+	if apiErr.Status != 503 {
+		t.Errorf("status = %d, want 503 rather than 429", apiErr.Status)
+	}
+}
+
+// TestSignInWithNoClientAddressIsRefused. An address the platform could not determine is not an
+// address with no limit, and defaulting to one shared bucket would be a limit anybody escapes by
+// arriving over a transport that does not report one.
+func TestSignInWithNoClientAddressIsRefused(t *testing.T) {
+	svc, _, _ := signInService(t, testProfile)
+
+	cmd := validSignIn()
+	cmd.ClientIP = ""
+
+	if _, err := svc.SignIn(t.Context(), cmd); err == nil {
+		t.Fatal("a sign-in with no client address was accepted, so it counted against nothing")
+	}
 }

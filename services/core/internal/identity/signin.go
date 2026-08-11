@@ -22,10 +22,17 @@ package identity
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
@@ -42,6 +49,17 @@ type SignInCommand struct {
 	// text they chose — "Nethmin's iPhone" — and authenticates nothing, so two handsets may
 	// legitimately carry the same one.
 	DeviceLabel string
+
+	// ClientIP is where the attempt came from, for the second of SHIP-47's two limits.
+	//
+	// It is on the command rather than read at the transport edge because "throttle per
+	// account and per address" is a policy this domain owns, and a handler that decided which
+	// limits applied would be a handler making a security decision. The transport's only job
+	// is to say where the request came from, which is the one thing only it knows.
+	//
+	// Empty is refused rather than treated as unlimited: an address the platform cannot
+	// determine is not an address with no limit.
+	ClientIP string
 }
 
 // Normalise puts the command into the form the stored row is in.
@@ -108,6 +126,18 @@ func (s *Service) SignIn(ctx context.Context, cmd SignInCommand) (TokenPair, err
 	if err := cmd.Validate(); err != nil {
 		return TokenPair{}, err
 	}
+
+	// Before the pool and before argon2id, which is the point of a rate limit: what it
+	// protects is the work, and a limit checked after the derivation has already been paid for
+	// is a limit on nothing (SHIP-47).
+	buckets, err := s.signInBuckets(cmd)
+	if err != nil {
+		return TokenPair{}, err
+	}
+	if err := s.admitSignIn(ctx, buckets); err != nil {
+		return TokenPair{}, err
+	}
+
 	if s.pool == nil {
 		return TokenPair{}, errUnavailable
 	}
@@ -118,6 +148,13 @@ func (s *Service) SignIn(ctx context.Context, cmd SignInCommand) (TokenPair, err
 		pair, err = s.signIn(ctx, r, cmd)
 		return err
 	}); err != nil {
+		// Only a refused credential is charged. A validation error never reaches here, a
+		// suspended account is not a guess, and an unavailable database is the platform's
+		// fault rather than the caller's — charging any of them would throttle people for
+		// things that are not attempts at somebody's password.
+		if errors.Is(err, ErrCredentialsInvalid) {
+			s.chargeSignInFailure(ctx, buckets)
+		}
 		return TokenPair{}, err
 	}
 	return pair, nil
@@ -190,4 +227,138 @@ func (s *Service) upgradeStoredPassword(ctx context.Context, r db.Runner, user U
 		return fmt.Errorf("identity: rehashing at the current profile: %w", err)
 	}
 	return s.store.updatePasswordHash(ctx, r, user.ID, next)
+}
+
+// The two limits on sign-in (SHIP-47).
+//
+// Constants here rather than configuration, and it is the scope decision SHIP-39's TTL names:
+// internal/config is a shared surface (Docs/10 §9.2) and three tracks were open. These are also
+// not a lever anybody has asked to pull without a deploy — SHIP-183's API-wide review is where
+// every public endpoint's limit gets considered together, and that is the ticket that should
+// decide whether any of them belong in configuration.
+const (
+	// signInAccountCapacity is how many failed sign-ins one address may make in a burst, and
+	// signInAccountInterval how fast that allowance returns.
+	//
+	// Five is far past mistyping a password and far short of useful guessing: at one back
+	// every two minutes, a caller gets about 720 attempts a day against one address, against a
+	// search space NIST's ten-character floor makes astronomically larger.
+	signInAccountCapacity = 5
+	signInAccountInterval = 2 * time.Minute
+
+	// signInAddressCapacity and signInAddressInterval bound one network address across *all*
+	// accounts, which is the limit that matters against somebody working through a list of
+	// addresses rather than through one password.
+	//
+	// Deliberately much larger than the per-account figure. A household, an office and a
+	// carrier's NAT all present one address, so this has to sit above what a group of people
+	// getting their passwords wrong looks like.
+	signInAddressCapacity = 30
+	signInAddressInterval = 20 * time.Second
+)
+
+// signInLimits is the pair of buckets one attempt is counted against.
+type signInLimits struct {
+	accountKey string
+	addressKey string
+}
+
+// ThrottledError means the caller has been refused for making too many attempts (SHIP-47).
+//
+// It carries the wait because the handler puts it in a `Retry-After` header, and a client that is
+// told to come back later without being told when will either give up or poll.
+//
+// A struct rather than a sentinel for that reason alone: everything else about it — the status,
+// the code, the message — is [apiError]'s to decide, exactly as it is for every other refusal.
+type ThrottledError struct {
+	RetryAfter time.Duration
+}
+
+func (e *ThrottledError) Error() string {
+	return fmt.Sprintf("identity: too many sign-in attempts; retry in %s", e.RetryAfter)
+}
+
+// signInBuckets derives the keys one attempt counts against.
+//
+// # Why the address is hashed
+//
+// The key is what an address looks like in Redis, and a bucket per address means every address
+// anybody has ever tried to sign in as is enumerable from a cache dump — including the ones that
+// have accounts. Hashing costs nothing here: the key is only ever compared with itself.
+//
+// # Why an unknown address is counted the same as a real one
+//
+// Counting only addresses that have accounts would make the *limit* an account-existence oracle,
+// one endpoint after [CodeCredentialsInvalid] and the timing equalisation closed the other two: a
+// caller who is never throttled has learnt that the address is unknown.
+func (s *Service) signInBuckets(cmd SignInCommand) (signInLimits, error) {
+	ip := strings.TrimSpace(cmd.ClientIP)
+	if ip == "" {
+		// Not a validation error the caller could act on: they did not supply this, the
+		// transport did. An address the platform cannot determine is not an address with no
+		// limit, so this fails rather than defaulting to unlimited.
+		return signInLimits{}, fmt.Errorf(
+			"identity: the sign-in command carries no client address, so SHIP-47's per-address " +
+				"limit has nothing to count against")
+	}
+
+	account := sha256.Sum256([]byte(cmd.Email))
+	return signInLimits{
+		accountKey: "signin:account:" + hex.EncodeToString(account[:]),
+		addressKey: "signin:address:" + ip,
+	}, nil
+}
+
+// admitSignIn refuses an attempt whose allowance is gone, on either limit.
+//
+// The account bucket is checked first so that the message a throttled caller waits on is the
+// shorter of the two wherever both are empty — and so that one address hammering one account does
+// not report the network-wide figure, which would tell them how much of somebody *else's*
+// allowance they had used.
+func (s *Service) admitSignIn(ctx context.Context, buckets signInLimits) error {
+	for _, limit := range []struct {
+		key    string
+		bucket ratelimit.Bucket
+	}{
+		{buckets.accountKey, ratelimit.Bucket{Capacity: signInAccountCapacity, Interval: signInAccountInterval}},
+		{buckets.addressKey, ratelimit.Bucket{Capacity: signInAddressCapacity, Interval: signInAddressInterval}},
+	} {
+		decision, err := s.limiter.Allow(ctx, limit.key, limit.bucket)
+		if err != nil {
+			// Fail closed, and answer 503 rather than 429: "this is temporarily
+			// unavailable" is true and "you have done too much" is not. See the note on
+			// internal/ratelimit for why open was not an option — a limiter an attacker
+			// turns off by taking Redis down is not a limiter.
+			return fmt.Errorf("%w: %w", errUnavailable, err)
+		}
+		if !decision.Allowed {
+			return &ThrottledError{RetryAfter: decision.RetryAfter}
+		}
+	}
+	return nil
+}
+
+// chargeSignInFailure records one refused credential against both buckets.
+//
+// # Why a failure to record is logged rather than returned
+//
+// The sign-in has already been refused and the caller is being told so. Turning a Redis blip into
+// a different answer would replace a correct refusal with a 503, which tells the client to retry —
+// and the one thing that must not happen at this point is the platform inviting more attempts. The
+// admission check is where an unreachable Redis fails closed; this is where it is merely counted.
+func (s *Service) chargeSignInFailure(ctx context.Context, buckets signInLimits) {
+	for _, limit := range []struct {
+		key    string
+		bucket ratelimit.Bucket
+	}{
+		{buckets.accountKey, ratelimit.Bucket{Capacity: signInAccountCapacity, Interval: signInAccountInterval}},
+		{buckets.addressKey, ratelimit.Bucket{Capacity: signInAddressCapacity, Interval: signInAddressInterval}},
+	} {
+		if _, err := s.limiter.Spend(ctx, limit.key, limit.bucket); err != nil {
+			httpx.LoggerFrom(ctx).LogAttrs(ctx, slog.LevelWarn,
+				"a failed sign-in could not be counted against its rate limit",
+				slog.String("error", err.Error()))
+			return
+		}
+	}
 }

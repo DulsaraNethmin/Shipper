@@ -885,6 +885,16 @@ ok "it needs an Idempotency-Key, so a retry replays the pair rather than rotatin
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-41  POST /v1/auth/login returns an access and refresh token pair"
 
+# SHIP-47 limits failed sign-ins per account and per network address, and every request in this
+# script arrives from 127.0.0.1 — so one address bucket is shared by every section below, and by
+# every previous run of this script. A run that ended part-way through SHIP-47 would otherwise
+# leave it empty and the *next* run would fail here, with a 429 that looks like a broken endpoint.
+#
+# Cleared once, at the point sign-ins begin, so the run starts from a known state. Nothing above
+# this line signs in.
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
 # The account registered above, whose password is the literal this file already knows. Signing in
 # is the first endpoint that creates a session rather than being handed one, so from here the
 # sections below no longer have to plant device_sessions rows by hand.
@@ -1308,3 +1318,126 @@ grep -qi '^WWW-Authenticate: Bearer' "$WORKDIR/devices-anon.headers" \
 [[ "$(json "$WORKDIR/devices-anon.json" '["error"]["code"]')" == "unauthenticated" ]] \
   || fail "expected code=unauthenticated"
 ok "the device list is unreachable without a credential"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-47  repeated sign-in failures are throttled per account and per IP"
+
+# Every request in this run arrives from 127.0.0.1, so the per-address bucket has been paying for
+# the failed sign-ins the sections above deliberately provoked. It is emptied here rather than
+# reasoned about: an expected figure derived from counting other sections' refusals is arithmetic
+# somebody has to redo whenever one of them changes, and it would be wrong quietly.
+#
+# The per-account buckets go with it, so both halves below start from capacity.
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
+throttle_email="throttle-$$@example.com"
+status="$(post_json "verify-throttle-register-$$" /v1/auth/register \
+  "{\"email\":\"$throttle_email\",\"phone\":\"04940$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
+  "$WORKDIR/throttle-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/throttle-register.json"; fail "could not register the throttle account ($status)"; }
+
+# wrong_password <key-suffix> <email> <outfile> — one failed sign-in.
+wrong_password() {
+  post_json "verify-throttle-$1-$$" /v1/auth/login \
+    "{\"email\":\"$2\",\"password\":\"not-the-registered-password\",\"device_label\":\"Verify Throttle\"}" "$3"
+}
+
+admitted=0
+throttled_status=""
+for attempt in $(seq 1 12); do
+  status="$(wrong_password "acct-$attempt" "$throttle_email" "$WORKDIR/throttle-$attempt.json")"
+  if [[ "$status" == "429" ]]; then
+    throttled_status="$status"
+    cp "$WORKDIR/throttle-$attempt.json" "$WORKDIR/throttle-refused.json"
+    break
+  fi
+  [[ "$status" == "400" ]] || { cat "$WORKDIR/throttle-$attempt.json"; fail "attempt $attempt returned $status, want 400"; }
+  admitted=$((admitted + 1))
+done
+
+[[ "$throttled_status" == "429" ]] || fail "twelve wrong passwords against one account were never throttled"
+[[ "$admitted" == "5" ]] || fail "$admitted wrong passwords were admitted before the throttle, want 5"
+ok "wrong passwords against one account are throttled after five, with a 429"
+
+[[ "$(json "$WORKDIR/throttle-refused.json" '["error"]["code"]')" == "rate_limited" ]] \
+  || fail "expected code=rate_limited"
+ok "the refusal carries the protocol code a client already handles centrally"
+
+# Retry-After is the time until the allowance returns, which is what makes it actionable.
+retry_after="$(curl -s -o /dev/null -D - -X POST \
+  -H "Idempotency-Key: verify-throttle-header-$$" -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$throttle_email\",\"password\":\"x-not-the-password\",\"device_label\":\"Verify Throttle\"}" \
+  "http://localhost:$VERIFY_PORT/v1/auth/login" | tr -d '\r' | awk 'tolower($1) == "retry-after:" { print $2 }')"
+[[ "$retry_after" =~ ^[0-9]+$ && "$retry_after" -gt 0 && "$retry_after" -le 120 ]] \
+  || fail "Retry-After is '$retry_after', want a positive number of seconds no larger than the interval"
+ok "it carries Retry-After — $retry_after seconds, the time until the allowance returns"
+
+# The limit is checked before the password, which is the point: what it protects is the argon2id
+# derivation. A throttle a correct password escaped would be a throttle an attacker escapes by
+# guessing right.
+status="$(post_json "verify-throttle-correct-$$" /v1/auth/login \
+  "{\"email\":\"$throttle_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Throttle\"}" \
+  "$WORKDIR/throttle-correct.json")"
+[[ "$status" == "429" ]] || fail "the right password got through a throttle ($status)"
+ok "the right password is refused too while the limit holds — the limit is checked first"
+
+throttled_devices="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions d join users u on u.id = d.user_id
+    where u.email = '$throttle_email';")"
+[[ "$throttled_devices" == "0" ]] || fail "a throttled account was given $throttled_devices sessions"
+ok "no session was created by any of it"
+
+# Per account, not per platform: a different account is unaffected while its own bucket is full.
+status="$(post_json "verify-throttle-other-$$" /v1/auth/login \
+  "{\"email\":\"$devices_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Not Throttled\"}" \
+  "$WORKDIR/throttle-other.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/throttle-other.json"; fail "another account was throttled by this one's failures ($status)"; }
+ok "another account signs in normally — one account's failures do not throttle the platform"
+
+# Per address, across accounts. Each attempt uses an address of its own, so every per-account
+# bucket stays full and the only thing that can refuse is the network-wide limit.
+address_throttled=""
+for attempt in $(seq 1 60); do
+  status="$(wrong_password "addr-$attempt" "nobody-$attempt-$$@example.com" "$WORKDIR/throttle-addr.json")"
+  if [[ "$status" == "429" ]]; then
+    address_throttled="$attempt"
+    break
+  fi
+  [[ "$status" == "400" ]] || { cat "$WORKDIR/throttle-addr.json"; fail "address attempt $attempt returned $status"; }
+done
+
+[[ -n "$address_throttled" ]] \
+  || fail "sixty failures spread across sixty accounts from one address were never throttled"
+# $admitted was already spent above, by the wrong passwords the per-account check *admitted* from
+# this same address. The ones it refused cost nothing: a request the account bucket turns away
+# never reaches the address bucket.
+[[ "$((address_throttled - 1 + admitted))" == "30" ]] \
+  || fail "$((address_throttled - 1 + admitted)) failures were admitted from one address, want the capacity of 30"
+ok "failures spread across accounts are throttled per address, at the capacity of thirty"
+
+# And it is genuinely a second bucket rather than the account one under another name: the account
+# that was signing in normally a moment ago is now refused from this address too.
+status="$(post_json "verify-throttle-addr-spill-$$" /v1/auth/login \
+  "{\"email\":\"$devices_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Spill\"}" \
+  "$WORKDIR/throttle-spill.json")"
+[[ "$status" == "429" ]] \
+  || fail "an exhausted address let an untouched account through ($status), so the per-address limit counts nothing"
+ok "an account with a full bucket of its own is still refused from an exhausted address"
+
+# The address bucket is now empty, and it is shared with everything that runs after this file —
+# every request in this script arrives from 127.0.0.1, including a later track's. A section that
+# signed in and got a 429 would look like a broken endpoint rather than like this one's leftovers,
+# so the keys are removed rather than left to refill on a twenty-second timer.
+#
+# Deliberately at the end and deliberately narrow: it deletes the per-address buckets and nothing
+# else, so the per-account state above it is untouched and the checks that made it stay meaningful.
+cleared="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del 2>/dev/null || true)"
+remaining="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | wc -l | tr -d ' ')"
+[[ "$remaining" == "0" ]] || fail "$remaining per-address buckets survived the clean-up"
+status="$(post_json "verify-throttle-cleared-$$" /v1/auth/login \
+  "{\"email\":\"$devices_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Cleared\"}" \
+  "$WORKDIR/throttle-cleared.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/throttle-cleared.json"; fail "sign-in is still refused after the address buckets were cleared ($status)"; }
+ok "the per-address buckets are cleared, so a later section is not throttled by this one ($cleared removed)"
