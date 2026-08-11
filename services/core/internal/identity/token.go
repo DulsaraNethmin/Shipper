@@ -253,14 +253,26 @@ func (i *AccessTokenIssuer) Issue(userID, sessionID uuid.UUID, role Role) (Acces
 	return AccessToken{Value: signed, ExpiresAt: expires}, nil
 }
 
-// parse verifies a token and returns its claims.
+// parse verifies a token and returns its claims, reporting the JWT library's own errors.
 //
-// Deliberately unexported, and deliberately the minimum this package's own tests need. The
-// authentication middleware is SHIP-44, and Docs/11 §8 keeps both of this platform's token
-// verifiers with one owner precisely so that "neither token system can be exchanged for the
-// other" is proved once, by somebody holding both. Exporting a half-verifier here would invite a
-// caller to use it before that work exists.
+// It stays unexported and stays on the issuer, because this package's tests use it to assert the
+// mechanics — that fifteen minutes is fifteen minutes, that a rotated-out kid still verifies,
+// that the driver audience is refused. Those assertions want the library's sentinel errors
+// (jwt.ErrTokenExpired, jwt.ErrTokenInvalidAudience) rather than this package's.
+//
+// What a caller outside this package should use is AccessTokenVerifier (SHIP-44), which returns
+// identity's own errors and validates the claims as well as the signature.
 func (i *AccessTokenIssuer) parse(raw string) (*AccessClaims, error) {
+	return parseAccessToken(i.keys, i.clock, raw)
+}
+
+// parseAccessToken is the whole of the cryptographic check, shared by the issuer's own tests and
+// by AccessTokenVerifier.
+//
+// One function rather than two, deliberately. A verifier that drifted from the thing that issues
+// the tokens is the defect that matters most here, and the way it happens is two people
+// maintaining two parsers.
+func parseAccessToken(keys *Keyset, clk clock.Clock, raw string) (*AccessClaims, error) {
 	claims := &AccessClaims{}
 
 	parser := jwt.NewParser(
@@ -270,7 +282,7 @@ func (i *AccessTokenIssuer) parse(raw string) (*AccessClaims, error) {
 		jwt.WithIssuer(IssuerName),
 		jwt.WithAudience(MobileAudience),
 		jwt.WithExpirationRequired(),
-		jwt.WithTimeFunc(func() time.Time { return i.clock.Now() }),
+		jwt.WithTimeFunc(func() time.Time { return clk.Now() }),
 	)
 
 	if _, err := parser.ParseWithClaims(raw, claims, func(t *jwt.Token) (any, error) {
@@ -278,7 +290,7 @@ func (i *AccessTokenIssuer) parse(raw string) (*AccessClaims, error) {
 		if !ok {
 			return nil, fmt.Errorf("%w: the token names no key", ErrNoSigningKey)
 		}
-		return i.keys.key(kid)
+		return keys.key(kid)
 	}); err != nil {
 		return nil, err
 	}

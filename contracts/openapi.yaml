@@ -1,0 +1,218 @@
+openapi: 3.0.3
+
+# The published API contract (SHIP-17a).
+#
+# This is the single description of the surface three clients consume: the Flutter app, the
+# admin panel, and the driver portal (Docs/06 §2.1 — one contract, three consumers). There is
+# no BFF tier, so this document is not one team's view of the platform; it is the platform.
+#
+# # Why the file is assembled rather than written
+#
+# Docs/10 §8.1 requires per-domain fragments under contracts/paths/, and the reason is the same
+# merge hazard that produced the route manifest. If every domain documented its endpoints in
+# this file, every domain would edit these lines, and a path lost in a merge produces no
+# compile error and no failing test — only an endpoint the contract stops describing.
+#
+# So the layout mirrors cmd/api/routes_<domain>.go exactly:
+#
+#     cmd/api/routes_identity.go   ->   contracts/paths/identity.yaml
+#     cmd/api/routes_jobs.go       ->   contracts/paths/jobs.yaml
+#
+# A domain adds one route file and one contract fragment, and edits neither this file's
+# `paths` block nor anybody else's fragment. The one shared line per domain is the $ref below,
+# which is a one-line addition rather than a merge of interleaved YAML.
+#
+# # What keeps it honest
+#
+# TestEveryRouteIsInTheContract (Docs/10 §4.1) cross-checks this document against the route
+# manifest in both directions: a route with no contract entry fails, and a contract entry with
+# no route fails. TestResponsesMatchTheContract drives the real router and validates what the
+# handlers actually return against the schemas below. A contract nobody checks drifts from the
+# service within one wave, and then it is worse than no contract, because clients believe it.
+
+info:
+  title: Shipper API
+  version: 1.0.0
+  description: |
+    The Shipper platform API — an Australian road-transport marketplace where customers
+    publish delivery jobs, verified transport providers bid privately, the customer awards
+    one bid, and the delivery is tracked to completion.
+
+    ## Versioning
+
+    Product endpoints are served under `/v1`. Operational endpoints — `/health` and anything
+    else consumed by load balancers and monitoring rather than by API clients — sit outside
+    the version group deliberately, so that shipping v2 does not break every health check
+    (Docs/06 §5.3).
+
+    More than one version may be live at once. Old app builds persist on devices
+    indefinitely and Flutter has no over-the-air update path for Dart code, so a version is
+    retired only after telemetry shows negligible traffic from the builds that depend on it.
+
+    ## Compatibility
+
+    Responses are additive. Fields are added, never repurposed or removed, and clients must
+    tolerate fields they do not recognise (Docs/07 §6). Requests are stricter: unknown fields
+    are rejected, so that a client typo fails loudly instead of being silently ignored.
+
+    ## Errors
+
+    Every failure — from a validation error to a panic to net/http's own 404 — uses one
+    shape, described by the `Error` schema. Clients branch on `error.code`, never on
+    `error.message`: messages are reworded, translated, and made friendlier, and a store
+    build that switched on message text would break on a copy edit with no way to fix it.
+
+    ## Idempotency
+
+    Every state-changing request carries an `Idempotency-Key` header and is refused without
+    one. Mobile clients retry after dropped connections, and a retry must not duplicate a
+    bid, a milestone, or a proof upload.
+
+  contact:
+    name: Shipper platform
+    url: https://github.com/DulsaraNethmin/Shipper
+
+# Provisional, and flagged as such in Docs/11 §9. The staging and production hostnames are
+# baked into the Flutter client by SHIP-18 but overridable with SHIPPER_API_BASE_URL, and
+# nothing has been registered yet. Confirm them before X-2 or X-3 publishes a build.
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://api.staging.shipper.com.au
+    description: Staging — provisional hostname
+  - url: https://api.shipper.com.au
+    description: Production — provisional hostname
+
+tags:
+  - name: Operational
+    description: |
+      Consumed by load balancers, monitoring and deployment tooling. Not part of the
+      versioned product surface and not called by API clients.
+  - name: App
+    description: |
+      Endpoints the mobile client calls about itself rather than about a user — the upgrade
+      gate, and anything else that must work before sign-in.
+
+# One $ref per domain. Adding a domain adds one line here and one file under paths/.
+#
+# Note the Go pattern and the contract path differ for the version root: cmd/api declares
+# `/{$}` inside the v1 group, which is net/http's exact-match syntax and not part of the URL.
+# The test that compares the two translates it.
+#
+# ---------------------------------------------------------------------------------------
+# RESOLVING A MERGE CONFLICT IN THIS BLOCK (SHIP-15c)
+#
+#   1. Entries are sorted by path, and there is exactly one $ref pair per path.
+#   2. A conflict here is resolved by taking BOTH sides and re-sorting. Never by choosing one.
+#   3. Then run `make test`. TestPathsBlockIsSortedAndComplete and
+#      TestEveryRouteIsInTheContract both check what a person is most likely to get wrong.
+#
+# Choosing a side is the tempting resolution and it is always wrong: it drops an endpoint from
+# the contract three client codebases are generated from, and there is no compile error to
+# find it. This block is NOT union-merged for the reason in .gitattributes — a union-merged
+# YAML document is invalid or subtly misordered, which is harder to see than a conflict.
+# ---------------------------------------------------------------------------------------
+paths:
+  /health:
+    $ref: './paths/service.yaml#/Health'
+  /v1/:
+    $ref: './paths/service.yaml#/APIRoot'
+  /v1/app/minimum-version:
+    $ref: './paths/app.yaml#/MinimumVersion'
+
+components:
+  schemas:
+    Error:
+      $ref: './components/schemas/error.yaml#/Error'
+    FieldError:
+      $ref: './components/schemas/error.yaml#/FieldError'
+
+  headers:
+    RequestID:
+      description: |
+        The request identifier, echoed on every response. It is also in the body of every
+        error, because a user reporting a problem sends a screenshot and a header does not
+        survive one (SHIP-14, SHIP-174).
+      schema:
+        type: string
+      example: 01J8XV3M9K7QW2ZR4T6Y8N0P1C
+
+  securitySchemes:
+    BearerAccessToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        The mobile access token (SHIP-37, SHIP-44). HS256, fifteen minutes, obtained from
+        `/v1/auth/login` and rotated through `/v1/auth/refresh`.
+
+        **The driver portal's token is a different system and is never accepted here.** It
+        carries its own audience and its own key material, and neither can be exchanged for the
+        other (`Docs/10` §5).
+
+  responses:
+    BadRequest:
+      description: The request was malformed, or failed validation.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthenticated:
+      description: |
+        No usable credential was presented (SHIP-44). Carries a `WWW-Authenticate: Bearer`
+        challenge, as RFC 9110 requires.
+
+        **Branch on `error.code`, not on the status.** `token_expired` means the credential was
+        genuine and has lapsed: refresh it and retry, and do not sign the user out.
+        `unauthenticated` means there was no usable credential at all — signing in again is the
+        only way forward.
+
+        A failure is deliberately not explained further. Which check refused a credential is
+        information only somebody probing has a use for.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestID'
+        WWW-Authenticate:
+          description: The authentication scheme this endpoint accepts.
+          schema:
+            type: string
+          example: Bearer error="invalid_token"
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: |
+        No such resource — or the caller has no business knowing whether it exists. The two
+        are deliberately indistinguishable wherever telling them apart would confirm the
+        existence of something private.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MethodNotAllowed:
+      description: The path exists but does not serve this method.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: |
+        A failure the caller cannot act on. Carries no detail beyond the request ID, which is
+        the thing that makes it diagnosable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

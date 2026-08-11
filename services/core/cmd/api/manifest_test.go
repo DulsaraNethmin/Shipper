@@ -6,8 +6,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 )
 
 var updateGolden = flag.Bool("update", false, "rewrite routes_golden.txt from the current manifest")
@@ -52,6 +56,65 @@ func TestRouteTableMatchesGolden(t *testing.T) {
 			"    go test ./cmd/api -run TestRouteTableMatchesGolden -update\n\n"+
 			"If you did not, a route has been lost or gained in a merge.\n\n"+
 			"--- %s\n%s\n+++ actual\n%s", goldenPath, goldenPath, want, got)
+	}
+}
+
+// depsFields is the whole of what a handler may be built from, and the list is closed on
+// purpose (SHIP-15c).
+//
+// Deps and its literal in main.go are shared surfaces, and the failure this guards is a merge
+// rather than a mistake: three tracks each adding one field to one struct and one line to one
+// literal, in the file where a badly resolved conflict unwires a domain without a compile error.
+//
+// Seeding the pool and the Redis client ahead of the endpoints that need them means a domain
+// builds its collaborators in its own Handler closure and edits nothing shared. This test is
+// what turns "adds no field" from an instruction in a comment into something that fails.
+//
+// Adding a field is not forbidden — it is a decision with a name attached. Add it here, and say
+// in review why a closure over the pool, the Redis client and the configuration could not do it.
+var depsFields = []string{
+	"Config",
+	"Logger",
+	"Clock",
+	"Pool",
+	"Redis",
+	"StartedAt",
+}
+
+func TestDepsCarriesExactlyWhatIsDeclared(t *testing.T) {
+	var got []string
+	for i, typ := 0, reflect.TypeOf(Deps{}); i < typ.NumField(); i++ {
+		got = append(got, typ.Field(i).Name)
+	}
+
+	if !slices.Equal(got, depsFields) {
+		t.Errorf("Deps has fields %v, want %v.\n\n"+
+			"A domain builds its own collaborators inside its Handler closure, from the pool,\n"+
+			"the Redis client and the configuration already here — see the comment on Deps.\n"+
+			"If this genuinely needs a new field, add it to depsFields in %s and say why in\n"+
+			"review: Deps and its literal in main.go are edited by every track at once.",
+			got, depsFields, "manifest_test.go")
+	}
+}
+
+// The pool and the Redis client are nil-able, and every domain has to be built expecting it —
+// the service starts with an unreachable database or cache deliberately, so that a failover does
+// not take the whole fleet down with it.
+//
+// This asserts the property the rest of the service is entitled to assume: a Deps with neither
+// still builds a router and still serves the routes that do not need them. A change that made
+// the pool mandatory would fail here rather than in a deployment.
+func TestTheRouterBuildsWithoutADatabaseOrACache(t *testing.T) {
+	deps := testDeps()
+	deps.Pool, deps.Redis = nil, nil
+
+	router := newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator())
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /health returned %d with no pool and no Redis, want 200 (%s)", rec.Code, rec.Body)
 	}
 }
 

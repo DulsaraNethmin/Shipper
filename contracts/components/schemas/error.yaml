@@ -1,0 +1,92 @@
+# The standard error contract (SHIP-12).
+#
+# One shape for every failure the service returns. It lives in components/ rather than in a
+# domain fragment because every domain returns it and none of them owns it — internal/httpx
+# does.
+
+Error:
+  type: object
+  required: [error]
+  additionalProperties: false
+  description: |
+    The single `error` member keeps failure and success bodies structurally distinct, so no
+    client can mistake one for the other.
+  properties:
+    error:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          description: |
+            The machine-readable code. Lower snake case, stable once published, and part of
+            the contract in the same way a field name is. **This is the only part of the body
+            a client may branch on.**
+
+            The sixteen protocol-level codes below are owned by `internal/httpx`. Domains
+            declare their own on top of these, named `<domain>_<condition>` — a closed `enum`
+            is deliberately not used here, because it would make every domain adding a code
+            edit this shared file, which is exactly what the fragment layout exists to avoid
+            (Docs/10 §4.4).
+          x-protocol-codes:
+            - bad_request
+            - validation_failed
+            - unauthenticated
+            - token_expired
+            - forbidden
+            - not_found
+            - method_not_allowed
+            - conflict
+            - unsupported_media_type
+            - payload_too_large
+            - rate_limited
+            - internal_error
+            - service_unavailable
+            - idempotency_key_required
+            - idempotency_key_reused
+            - idempotency_request_in_progress
+          example: validation_failed
+        message:
+          type: string
+          description: |
+            For a person reading a log or a support ticket. Reworded and translated freely —
+            never branched on. Carries no stack trace, no SQL, no panic text, and no internal
+            identifier the caller did not already have.
+          example: The request could not be processed.
+        request_id:
+          type: string
+          description: |
+            The identifier that finds this request in Datadog (SHIP-174). Present in the body
+            as well as the `X-Request-Id` header because a screenshot does not carry headers.
+          example: 01J8XV3M9K7QW2ZR4T6Y8N0P1C
+        details:
+          type: array
+          description: |
+            One entry per offending field, so a client can put each message beside the input
+            that caused it rather than at the top of the form. Carried by
+            `validation_failed`; absent otherwise.
+          items:
+            $ref: '#/FieldError'
+
+FieldError:
+  type: object
+  required: [field, message]
+  additionalProperties: false
+  description: One thing wrong with a request.
+  properties:
+    field:
+      type: string
+      description: |
+        A dotted path into the request body as the client sent it — `pickup.postcode`,
+        `goods.weight_kg` — not the Go field name.
+      example: pickup.postcode
+    code:
+      type: string
+      description: |
+        The field-level reason, from `internal/validate`: `required`, `too_short`,
+        `too_long`, `out_of_range`, `invalid_format`, `not_allowed`.
+      example: invalid_format
+    message:
+      type: string
+      example: Enter a four-digit postcode.

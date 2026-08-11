@@ -63,6 +63,7 @@ There is **no BFF tier**. The Go platform owns the versioned public API directly
 - **Do not abstract PostgreSQL.** The partial unique index enforcing one-accepted-bid and the row locking in the award transaction are load-bearing and PostgreSQL-specific. Test against a real database, not mocked repositories.
 - **Interfaces are declared by the consuming domain**, never by the implementing package. `delivery/ports.go` declares what delivery needs; the storage package knows nothing about delivery.
 - **Domain packages do not import each other**, adapters do not import domains, and domains do not import adapters. Enforced by `make lint-imports` and by a test (SHIP-11). A domain and its adapters meet in `cmd/api` and nowhere else.
+- **Infrastructure imports neither a domain nor an adapter** (SHIP-15c). This is the rule easiest to break by accident and hardest to see afterwards: every domain imports `httpx`, so one import of `identity` from inside `httpx` welds all eight to it through an edge that is in no domain's own files. Infrastructure takes a function or an interface it declares itself, and `cmd/api` supplies the closure.
 - **Domain events are emitted by the domain, not the API layer.**
 - **Anything expected to change under operational pressure lives server-side** — category lists, validation limits, policy copy, feature switches. Flutter has no over-the-air update path for Dart code.
 
@@ -165,7 +166,7 @@ Each concurrent piece of work gets its own git worktree, never the primary tree.
 
 | Item | Rule |
 |---|---|
-| Test database | Set `TEST_DATABASE_URL` per worktree in its gitignored `deploy/.env`. One variable is the whole isolation mechanism |
+| Test database | **Leave `TEST_TEMPLATE_DB` unset.** The `Makefile` derives it from the directory name, and that is the whole isolation mechanism — `CREATE DATABASE … TEMPLATE` resolves at cluster scope, and every worktree shares one cluster. Two worktrees with the same template name are one database: `make test` in either drops it mid-clone in the other. `TEST_DATABASE_URL` does **not** isolate on a shared cluster, whatever an older version of this table said |
 | Ports | `HTTP_PORT` and `VERIFY_PORT` per worktree, likewise |
 | Compose | One shared stack. `COMPOSE_PROJECT_NAME` is pinned in the `Makefile` so worktrees do not each start their own and fight over 5432, 6379 and 29092 |
 | **`git stash`** | **Never.** The stash is shared across worktrees through one `.git`, and this repository already carries the scar — `CLAUDE.md` was committed with `Stashed changes` conflict markers in it |

@@ -106,6 +106,46 @@ reporting a problem sends a screenshot, and a header does not survive one.
 Nothing internal is ever serialised. Attach the underlying failure with `WithCause` and it
 reaches the log, not the client.
 
+**The full code list is `Docs/10-api-error-codes.md`, and it is generated** — from the fifteen
+protocol codes `internal/httpx` owns plus every code each domain declares for itself:
+
+```go
+var CodeProhibitedCategory = httpx.RegisterCode(
+    "prohibited_category", "The goods category may not be published.")
+```
+
+Declaring one edits nothing shared, which is the point: a single file listing every code in the
+platform is a file every domain has to touch. Registration refuses a duplicate, a code that is
+not lower snake case, and a code with no description — the description is what the generated
+document says the code means, and a client with only a name to go on guesses.
+
+Regenerate with `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update`, and resolve a
+conflict in that file by regenerating rather than by choosing a side.
+
+### Authentication (SHIP-44)
+
+Protected routes take a bearer access token: `Authorization: Bearer <access token>`. <!-- spelling:ok — HTTP header name, RFC 9110 -->
+
+The route manifest declares what each endpoint requires, and `attach` enforces it. **An auth class
+with no middleware behind it stops the process at startup rather than serving the route open** —
+which is the state `RequireDriverToken` (SHIP-108) and `RequireAdmin` (SHIP-147) are in today.
+
+| Situation | Answer |
+|---|---|
+| No credential on a protected route | `401 unauthenticated`, `WWW-Authenticate: Bearer` |
+| Expired token | `401 token_expired` — **refresh and retry; do not sign the user out** |
+| Malformed, forged, wrong audience, retired key | `401 unauthenticated`, undifferentiated on purpose |
+| Any of the above on a **public** route | the route answers normally, with no subject attached |
+
+That last row is not an oversight. `POST /v1/auth/refresh` is public and is called by exactly the
+client whose access token has just expired, so the endpoint that recovers from a bad credential
+cannot itself require a good one. Identity is *resolved* group-wide and never rejects; it is
+*required* per route.
+
+Two middlewares, and the order between them and idempotency is a security property rather than a
+style: `ResolveSubject` must run outside `Idempotent`, because the idempotency scope is computed
+from the subject. See `Docs/10` §4.2.
+
 ### Idempotency (SHIP-15)
 
 Every state-changing request under `/v1` must carry an `Idempotency-Key`. Repeating it
@@ -119,6 +159,12 @@ the handler again.
 | Same key, same request, still running | `409 idempotency_request_in_progress` |
 | Same key, **different** request | `409 idempotency_key_reused` |
 | Redis unreachable | `503 service_unavailable` — it fails closed |
+
+**Keys are namespaced by caller** (SHIP-44). An authenticated request stores under
+`idem:v1:user:<user id>:<key>`, so one client cannot read another's stored response by guessing a
+key. Anonymous callers share `idem:v1:anonymous:<key>`, which is safe because the fingerprint
+covers the request body: reading a stranger's response means already holding the secret material
+in their request.
 
 Failing closed is deliberate. A request arriving while Redis is down is disproportionately
 likely to be a retry, and a refusal the client retries costs a moment where a duplicate

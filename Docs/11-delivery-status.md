@@ -10,7 +10,7 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-10, closing wave 1 in full — fourteen tickets across four branches. The Flutter track was deferred mid-wave for a missing toolchain and completed once it was installed; §7 keeps that sequence rather than tidying it away.
+**Last updated:** 2026-08-11, on SHIP-44 — the authentication middleware, which closes the idempotency-scope hole §8 has been carrying as a gate. It follows SHIP-15c, the wave-2 preparation, on the same day. §7 keeps wave 1's sequence rather than tidying it away.
 
 ---
 
@@ -18,15 +18,17 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 35 | 82 |
-| Remaining | 166 | 537 |
-| **Total** | 201 | 619 |
+| **Done** | 38 | 93 |
+| Remaining | 165 | 533 |
+| **Total** | 203 | 626 |
+
+The totals grew by two tickets rather than shrinking: SHIP-15c and SHIP-23a were added to `Docs/09` in the same change, both work the plan assumed and no ticket owned.
 
 | Milestone | Done | Points |
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
-| **M0** Foundation | 25 / 30 | 58 / 75 |
-| **M1** Identity | 6 / 28 | 15 / 78 |
+| **M0** Foundation | 27 / 32 | 66 / 82 |
+| **M1** Identity | 7 / 28 | 18 / 78 |
 | **M2** Jobs | 1 / 26 | 3 / 78 |
 | **M3** Bidding and award | 0 / 27 | 0 / 95 |
 | **M4** Delivery | 0 / 29 | 0 / 101 |
@@ -34,7 +36,11 @@
 | **M6** Admin | 1 / 20 | 3 / 65 |
 | **M7** Hardening | 2 / 19 | 3 / 56 |
 
-**M0 has five tickets left and four of them are not code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. **SHIP-17a is the only buildable M0 ticket still open.**
+**M0 has five tickets left and only one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. SHIP-23a is the web CI that `Docs/09` now carries as a ticket rather than this file carrying it as a recommendation; it is unblocked and belongs to a client track.
+
+**Wave 2 is prepared and its gate is cleared.** SHIP-15c closed the shared surfaces its three tracks would otherwise have met in, and SHIP-44 has landed — so the freeze on authenticated state-changing endpoints in §8 is lifted. The tracks can start.
+
+**The published contract exists (SHIP-17a), and it is checked rather than believed.** `contracts/openapi.yaml` is assembled from per-domain fragments under `contracts/paths/`, and three tests in `cmd/api` hold it to the service: the manifest and the contract must agree in both directions, live handler responses must satisfy the published schemas, and the error contract must match the `Error` schema for failures that `net/http` writes rather than a handler. That closes `TestEveryRouteIsInTheContract`, the last of the three route-surface guards in `Docs/10` §4.1 to become enforceable.
 
 **The first domain logic exists, and it is in exactly one package.** `internal/identity` holds argon2id password storage and access-token issue; the other seven domains still contain `doc.go` and nothing else. Everything outside `identity` remains foundation and adapters.
 
@@ -46,12 +52,14 @@ That distinction is worth keeping in mind rather than rounding away: `identity` 
 
 | Branch | At | Holds |
 |---|---|---|
-| `main` | PR #9 | Wave 0 only. **Nothing from wave 1, and not this file** |
-| `develop` | PR #17 | Everything below. **Cut new branches from here** |
+| `main` | PR #19 | **Wave 1, released 11 August 2026.** Level with `develop` |
+| `develop` | PR #18 | Everything below. **Cut new branches from here** |
 
-**`develop` is 36 commits ahead of `main`** — the whole of wave 1 plus the tracker itself. `main` has not been updated since wave 0, which is by design: `develop → main` goes in release-sized batches rather than one per ticket, and wave 1 is the first batch worth cutting.
+**Wave 1 has been released.** PR #19 brought 38 commits and 16 tickets across, and `main` is no longer behind `develop` on content. This was the first `develop → main` batch since wave 0, which is by design: releases go in release-sized batches rather than one per ticket.
 
-`main` also shows 7 commits `develop` does not have. Those are the detour, not divergent work: wave 0 reached `main` by being merged (PR #6), reverted (PR #7), and reapplied (PR #9). The content is identical; only the shape of the history differs.
+The previous version of this section said `develop` was at PR #17 and 36 commits ahead. It was #18 and 38 by the time anyone read it, and that is not an error to guard against — a commit cannot record the number of the pull request that merges it. **The numbers in this table are always one update behind reality, and the fix is to correct them in the next update rather than to try to make them self-aware.**
+
+`main` still shows commits `develop` does not have. Those are the detour, not divergent work: wave 0 reached `main` by being merged (PR #6), reverted (PR #7), and reapplied (PR #9), and PR #19's own merge commit sits on `main` alone. The content is identical; only the shape of the history differs.
 
 ### The wave-1 branches, in merge order
 
@@ -66,9 +74,18 @@ That distinction is worth keeping in mind rather than rounding away: `identity` 
 
 **A warning worth keeping.** Reverting a merge does not undo it: the commits stay ancestors forever, so re-merging the same branch brings nothing across and reports success. If a merge to `main` is ever reverted again, the fix is to revert *the revert*, not to merge again.
 
+**PR #19 had exactly the shape that warning describes, and was checked rather than trusted.** The revert `d733c95` sits on `main` and is *not* in `develop`'s ancestry — the setup where a merge silently resurrects deletions. It was safe only because the reapply `c1cb64b` had already restored the content, leaving the revert nothing to take away. The check that established this before merging is worth reusing on any release whose history has a revert in it:
+
+```
+git merge-tree --write-tree main develop   # the tree the merge would produce
+git rev-parse develop^{tree}               # the tree develop actually has
+```
+
+Identical hashes mean the merge result is exactly `develop`'s content. Different hashes mean something is being dropped or added, and the release needs looking at before it is cut, not after.
+
 ## 3. Done
 
-Verified by `make verify` — **62 checks**, and `make check` green.
+Verified by `make verify` — **66 checks**, and `make check` green.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -81,7 +98,7 @@ environment test run once per build flavour — and SHIP-16 and SHIP-19 by insta
 version off both screens. `make verify` does not cover it: that script exercises HTTP
 endpoints, and none of these tickets adds one.
 
-### M0 — Foundation (25 of 30)
+### M0 — Foundation (27 of 32)
 
 | Ticket | What |
 |---|---|
@@ -94,8 +111,10 @@ endpoints, and none of these tickets adds one.
 | SHIP-15 | Redis idempotency middleware, fail-closed |
 | **SHIP-15a** | Conventions (`Docs/10`) and the shared-surface mechanisms |
 | **SHIP-15b** | The spelling check scoped for client code — *see below* |
+| **SHIP-15c** | Wave-2 shared surfaces: pre-seeded `Deps`, worktree test isolation, a fourth boundary rule, `httpx.RegisterCode` — *see below* |
 | **SHIP-16** | Flutter scaffold — iOS and Android only, floors at iOS 14.0 and Android API 24 |
 | **SHIP-17** | Feature folders per `Docs/07` §2, Riverpod and `go_router`, and a boundary test |
+| **SHIP-17a** | `contracts/openapi.yaml` from per-domain fragments, and three tests holding it to the service |
 | **SHIP-18** | `dio` client — three environments by `--dart-define`, and the Android emulator's host |
 | **SHIP-19** | Health round trip — the API version on screen, on both simulators |
 | **SHIP-20** | Go CI — build, boundaries, spelling, tests, migration round trip |
@@ -113,6 +132,7 @@ endpoints, and none of these tickets adds one.
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
+| **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -128,12 +148,14 @@ This is the part a new session most needs to know about, because it changes how 
 |---|---|---|
 | Route manifest + golden file | `cmd/api/manifest.go`, `routes_golden.txt` | A route dropped in a merge — which produces no compile error |
 | Reserved migration blocks | `migrations/blocks.go` | Two branches drawing the same migration number |
-| Domain-local error codes | `httpx.RegisterCode` | Every domain editing one registry |
+| ~~Domain-local error codes~~ | ~~`httpx.RegisterCode`~~ | **Documented but never built. Built at SHIP-15c — see below** |
 | Template-cloned test databases | `internal/testsupport/pgtest` | Parallel packages trampling each other's rows |
 | Fail-not-skip | `pgtest`, `redistest` | Tests passing by being skipped |
 | Pre-seeded infrastructure list | `internal/boundaries` | Domain branches editing the boundary file |
 | Config/`.env.example` agreement | `internal/config/documented_test.go` | An undocumented environment variable |
 | `COMPOSE_PROJECT_NAME` pinned | `Makefile` | Worktrees each starting a stack and fighting over ports |
+
+**One row of that table was false for two waves, and it is struck through rather than deleted.** `httpx.RegisterCode` was documented in `Docs/10` §4.4 with a worked example and listed here as built, and neither was true — there was no registration function and no generated code list. Nothing broke, because no domain had raised a code of its own. That is the failure mode worth remembering: a mechanism this file claims exists is one nobody checks for, and it stays absent exactly until two tracks need it in the same week.
 
 Shared packages now available to every domain: `db` (Runner, InTx), `authctx`, `clock`, `validate`, `events` (outbox writer). Registered but not yet written: `pagination`, `ratelimit`, `money` — write them when first needed, no shared edit required.
 
@@ -144,6 +166,48 @@ The Australian English check word-matched case-insensitively over every tracked 
 The check now has two scopes — `Docs/10` §9.3. Words that cannot be a framework symbol still apply everywhere, `apps/**` included, because `cancelled` is a job status and `licence` is what a provider is verified against; the dozen that are framework API names apply everywhere else. A single unrenameable identifier takes a `spelling:ok` line waiver instead of an exclude, which is how the `Authorization` header will be handled in Go at SHIP-44.
 
 It is a ticket rather than an untracked commit because `Docs/09` says a letter suffix marks work the plan assumed and no ticket owned. This was exactly that, found by reading the lint rather than by CI going red.
+
+### What SHIP-15c built, and what it found
+
+Same mould as SHIP-15b, one wave later and larger. Wave 1's three tracks produced exactly one conflict between them because nothing they wrote met in a shared file. Wave 2 is the first wave that adds HTTP endpoints, and its tracks would meet in five: the `Deps` struct and its literal, the `paths:` block, `routes_golden.txt`, the `Load()` literal, and `.env.example`.
+
+| Built | Where | What it prevents |
+|---|---|---|
+| Pre-seeded `Deps` — pool and Redis client | `cmd/api/manifest.go`, `main.go` | Three tracks each adding a field to one struct and a line to one literal |
+| Per-worktree test template, derived not set | `Makefile`, `pgtest` | One worktree's `make test` dropping another's template mid-clone |
+| Fourth boundary rule: infrastructure imports no domain, no adapter | `internal/boundaries` | One import in `httpx` welding all eight domains to `identity` |
+| `httpx.RegisterCode` + generated `Docs/10-api-error-codes.md` | `internal/httpx`, `cmd/api` | Two tracks inventing two error taxonomies in one week |
+| `merge=union` on the golden file; a written recipe for the `paths:` block | `.gitattributes`, `contracts/openapi.yaml` | A conflict resolved by choosing a side, which drops an endpoint silently |
+| `CHECKS` as a variable | `Makefile` | A track's checks being unreachable from `make check` |
+
+**Three things were found while preparing, none of them known before.**
+
+**The worktree test isolation did not work the way four places said it did.** `CLAUDE.md`, `deploy/.env.example`, `Docs/10` §7.1 and `pgtest`'s own failure message all named `TEST_DATABASE_URL` as the mechanism. It never was: `CREATE DATABASE … TEMPLATE` resolves at cluster scope, and `COMPOSE_PROJECT_NAME` is pinned so every worktree shares one cluster deliberately. What isolates is `TEST_TEMPLATE_DB`. Worktree `shipper-wave1-b` had none — recorded reasoning: a Flutter track writes no Go tests — but `make check` runs `make test`, which builds the template first. One `make check` there dropped the primary tree's template.
+
+**`make test-db-template` also had a live data-loss path.** It rewrote the migration URL with `$(subst /$(POSTGRES_DB)?,…)`, a literal that matches nothing on a URL with no query string and then runs every migration into the developer's real database. Latent here only because all four `.env` files carry `?sslmode=disable`. It now rewrites the URL path and refuses to run if the rewrite changed nothing.
+
+**The import lint had a hole shaped exactly like the next ticket.** Its three rules were all about domains and adapters, so infrastructure could import a domain and the lint stayed green — and because every domain imports `httpx`, one such import couples all eight transitively through a file no domain contains. SHIP-44 is the first ticket with a motive. The rule needed no refactoring to adopt, which is the moment to add one.
+
+**Deliberately out of scope: splitting `scripts/verify-foundation.sh`.** It is 660 lines in one file with no include mechanism, and it is the sixth shared surface. Wave 2's track split gives it exactly one client — only the identity track appends — so it can wait. Named here so wave 3 treats it as a decision rather than a discovery.
+
+### What SHIP-44 built, and what it closed
+
+The gate §8 has been describing since wave 1. Three points, and it held back every authenticated state-changing endpoint in five milestones.
+
+**The hole was real and is now closed.** `httpx.Idempotent` was wired with `scope == nil`, so every stored response landed in `idem:v1:anonymous:<key>`. Harmless while nothing was authenticated; the moment something is, a client that guesses another client's key is handed that client's response body — somebody else's job, address or bid. `httpx.SubjectScope` namespaces by caller, and `make verify` now demonstrates it against a running service: two callers, one key, identical body, two separate Redis entries.
+
+**`Route.Auth` was decoration until now.** `attach` ignored it entirely and the class was enforced only by `TestNoMutatingRouteIsPublic` — a test that a route was *declared* correctly, not that the declaration did anything. It is now read at wiring time, and **a class with no middleware behind it panics at startup rather than being served open.** That is the state `RequireDriverToken` (SHIP-108) and `RequireAdmin` (SHIP-147) are in today.
+
+**Authentication is deliberately two middlewares, and that is worth knowing before somebody tidies it.** `ResolveSubject` runs group-wide, outside `Idempotent`, and never rejects; `RequireSubject` runs per route and does. Both halves are forced:
+
+- The scope must be computed after the subject exists, so resolution has to sit further out than idempotency.
+- `POST /v1/auth/refresh` is public and is called by exactly the client whose access token has just expired. A middleware that refused a bad credential on sight would lock that client out of the endpoint that replaces it.
+
+**`token_expired` is a new protocol code**, and the sixteenth. Expiry is the one authentication failure a client acts on differently — refresh rather than sign out — and reporting it precisely discloses nothing, because `exp` sits in the payload the client already holds. Every other failure is one undifferentiated `unauthenticated`: naming which check refused a credential is help only somebody probing has a use for.
+
+**SHIP-15c's own acceptance criterion is now demonstrated.** SHIP-44 landed with no field added to `Deps` and no edit to its literal in `main.go`. The verifier is passed to `newRouter` alongside the idempotency store, because it is a collaborator of the router rather than something a handler is built from.
+
+**What is not demonstrated by `make verify`: the 401 itself.** There is no protected route in the service yet — SHIP-44 is the middleware, not an endpoint — so the rejection paths are covered by tests in `internal/httpx` and `cmd/api` rather than by curl. The first route with `Auth: RequireUser` is where that section gets written.
 
 ## 4. Partly done — do not treat these as finished
 
@@ -174,26 +238,26 @@ X-5 and X-6 need no third party at all — they are decisions somebody can make 
 
 ## 6. Ready to start now
 
-Strict build order says the next ticket is the lowest-numbered open one, **SHIP-17a**, and for once that is also the right answer — see below. These all have satisfied dependencies:
+Strict build order says the next ticket is the lowest-numbered open one. With SHIP-15c and SHIP-44 done that is **SHIP-23a**, and the lowest-numbered *platform* one is **SHIP-30**. These all have satisfied dependencies:
 
 | Ticket | Pts | Area |
 |---|---|---|
-| SHIP-17a | 3 | `contracts/openapi.yaml` — see the note below, this one has grown teeth |
 | SHIP-30 | 3 | Registration endpoint — `users` and argon2id both exist now |
 | SHIP-31, 34 | 5 | Email verification token, phone OTP issue and storage |
 | SHIP-39 | 5 | Refresh token rotation — `device_sessions` exists, and it needs an expiry column |
 | SHIP-48 | 3 | Flutter secure storage — `apps/mobile` exists now, and API 24 was chosen for it |
 | SHIP-56 | 3 | `jobs` table |
 | SHIP-67a | 3 | `cmd/worker` scheduler |
-| SHIP-114 | 5 | Object storage, pre-signed upload |
+| SHIP-23a | 2 | Web CI, path-filtered per surface — written at SHIP-15c |
+| ~~SHIP-114~~ | 5 | **Not buildable as written — see below** |
 
-**SHIP-17a is now the highest-value one on that list, and wave 1 is what made it so.** All three clients exist — a Flutter app with a `dio` client, an admin panel, a driver portal — and every one of them will consume the same endpoints. Until `contracts/openapi.yaml` exists they are guessing at field names, and `Docs/10` §8.1 says the contract is what lets client work proceed *alongside* the endpoint it consumes rather than behind it. That was an abstract benefit before there were clients. It is now three codebases that will each invent their own field names in the next wave if the contract is not there first.
+**SHIP-114 is on this list no longer, and it is not blocked either.** Its dependencies are met, but `internal/platform/storage/` is `doc.go` alone and `deploy/docker-compose.yml` has no MinIO or equivalent. Its *Done when* — "receives a short-lived pre-signed URL and uploads directly" — cannot be demonstrated on this machine, and wave 1 already paid for counting a ticket whose acceptance criterion needs a tool nobody installed. **It needs a lettered ticket adding object storage to the local stack first**, as shared-platform work. Until then it is neither ready nor blocked on a third party, which is a third category this file did not have.
 
-It also unblocks `TestEveryRouteIsInTheContract`, one of the three route-surface guards `Docs/10` §4.1 names and the only one still unenforceable.
+**SHIP-44 has landed, and the way it was nearly missed is worth keeping.** Its dependencies — SHIP-37 and SHIP-12 — had both been done since wave 1, but §8 described it as a hard gate *ahead*, which reads as future work, and that is why it sat out of this list while blocking five milestones. A ticket described only as a constraint on other work stops being read as work itself.
 
-**SHIP-30 is a state-changing route and SHIP-44 has not landed, and it is still safe to build.** §8's gate names *authenticated* endpoints for a precise reason worth knowing before someone reads it as a blanket freeze: `replayOrRefuse` compares a fingerprint over method, path and body, and refuses a reused key with `409 idempotency_key_reused` rather than replaying. Reading another caller's stored response therefore requires sending their exact body — which, for register, means already holding their email and password. The public endpoints on `Docs/10` §4.1's allow-list all carry the caller's own secret material in the body, and that is what protects them while the scope is `nil`.
+**The identity package is the real constraint on the next wave, not the gate.** SHIP-30, 31, 34, 39, 40, 41, 42, 43, 44 and 45 all live in `internal/identity`, and `Docs/10` §9.1 gives one package directory to one agent at a time. That is roughly thirty points on one track no matter how many agents are available. Parallelism in wave 2 has to come from elsewhere — `jobs` (SHIP-56), `cmd/worker` (SHIP-67a), the Flutter client (SHIP-48), and SHIP-23a. Storage is not one of the options, for the reason above.
 
-The gate binds where the body does *not* distinguish callers — `POST /v1/auth/logout` with an empty body is the same request from everybody, and under a shared `anonymous` scope one user's response replays to another. That is the case SHIP-44 closes.
+**Public routes still share the anonymous scope, and that remains safe.** `replayOrRefuse` fingerprints method, path and body, so reading another caller's stored response requires sending their exact request — which, on every route on `Docs/10` §4.1's allow-list, means already holding the secret material in their body. `make verify` checks that the anonymous scope still works, because scoping idempotency into uselessness would be a subtler regression than leaving it shared.
 
 ## 7. Wave 1 — what landed
 
@@ -252,11 +316,17 @@ These were settled before the tracks started, so that three agents did not answe
 
 ## 8. Hard gates ahead
 
-**SHIP-44 is a choke point, and the reason is a live security hole.** `httpx.Idempotent` is wired with `scope == nil`, so every key lands in `idem:v1:anonymous:<key>`. Harmless while nothing is authenticated; the moment something is, a client that guesses another client's key gets that client's response body. **No authenticated state-changing endpoint may merge before SHIP-44 supplies the authenticated subject.** During that wave exactly one agent touches `cmd/api` and `internal/httpx`.
+**~~SHIP-44 is a choke point.~~ Cleared — see §3.** `httpx.Idempotent` is wired with `httpx.SubjectScope`, and the freeze on authenticated state-changing endpoints is lifted. `make verify` demonstrates the separation against a running service rather than asserting it.
+
+Kept here rather than deleted, because the shape recurs: this was described only as a constraint on *other* work, and so was never read as work itself while its dependencies had been met since wave 1. A gate with satisfied dependencies belongs in §6 the moment it becomes buildable.
+
+**The next gate of the same kind is SHIP-108, and it has no entry yet.** The driver's job-scoped token is a second verifier, and `Docs/10` §5 requires that neither token system can be exchanged for the other. `identity.AccessTokenVerifier` refuses the driver audience today and there is a test for it — but the other direction cannot be tested until the driver verifier exists. **Whoever writes SHIP-108 writes both directions**, which is the reason this file has always kept both verifiers with one owner.
+
+**One thing SHIP-44 did not do: `RequireDriverToken` and `RequireAdmin` are declarable and unenforced.** A route declaring either now panics at startup rather than being served open, so the failure direction is safe. SHIP-108 and SHIP-147 supply the middleware.
 
 **SHIP-91…95 never parallelise.** Own branch, nothing else on it. The partial unique index, the lock ordering, the idempotency interaction and the race tests are one design; two people produce two lock orderings, which is a deadlock or a lost update. Consider using a second agent adversarially instead — one implements 91–94, another writes SHIP-95 from `Docs/02` §3 and `Docs/08`'s four named races *without reading the implementation*.
 
-**Also single-owner, for reasons in `Docs/10`:** SHIP-57 (the status guard), SHIP-67 with SHIP-83 (budget privacy — test the serialised response, not struct fields), both token verifiers, and the middleware ordering in `newRouter`.
+**Also single-owner, for reasons in `Docs/10`:** SHIP-57 (the status guard), SHIP-67 with SHIP-83 (budget privacy — test the serialised response, not struct fields), both token verifiers, and the middleware ordering in `newRouter` — which is now load-bearing in a second way, since `ResolveSubject` sitting outside `Idempotent` is what makes the scope work at all.
 
 ## 9. Open recommendations nobody has decided
 
@@ -270,7 +340,11 @@ Lookup(ctx context.Context, address string) (lat, lng float64, formatted string,
 
 and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, geocoding.ErrNotFound)` would also be an import. The reasoning is correct and the lint agrees. But a neutral infrastructure package holding a coordinate type — the same shape as the pre-seeded `pagination`, `ratelimit` and `money` — would let both sides name it with no dependency edge either way, and that option was unavailable only because `internal/boundaries` was a forbidden shared edit mid-wave. **Decide at SHIP-60, before three domains adopt the wide signature.**
 
-**A ticket for the web CI workflows.** `.github/workflows/README.md` already anticipates an admin-panel workflow and a driver-portal workflow, each path-filtered to its own app. Both surfaces now exist and neither has one, and the backlog has only SHIP-20 (Go) and SHIP-21 (Flutter). This is a lettered ticket waiting to be written, in the SHIP-15b mould.
+**~~`httpx.RegisterCode` is documented but does not exist.~~ Decided and built at SHIP-15c.** The registry, the uniqueness tests in `cmd/api`, and the generated `Docs/10-api-error-codes.md` all exist; `Docs/10` §4.4 is now true and says so, including that it was not. The choice was between building the mechanism and amending the document to match reality, and building won because SHIP-30 and SHIP-57 both need it on separate tracks in the same wave.
+
+**~~A ticket for the web CI workflows.~~ Written as SHIP-23a at SHIP-15c.** Two points, path-filtered per surface, dependencies SHIP-22 and SHIP-23 both met. It belongs to a client track rather than to platform work.
+
+**`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.** 660 lines in one file, and every ticket with an HTTP acceptance criterion appends to it. SHIP-15c left it alone deliberately: wave 2's split gives it exactly one client, so splitting it would have been a large change to a shared file for no benefit this wave. **It stops being deferrable the moment two tracks both add endpoints** — which is wave 3. Split it the same way `mk/*.mk` is split, or accept a conflict in the one file that demonstrates every acceptance criterion.
 
 **`device_sessions` has no expiry column.** SHIP-38's *Done when* named refresh state, device label and last seen, and the implementation stopped exactly there — correctly, as a scope decision. But a refresh token has to expire, so **SHIP-39 either adds the column or explains where expiry lives instead.** Flagged here so it is a decision rather than a discovery.
 
@@ -290,8 +364,8 @@ in §4 are deliberately absent.
 
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
-SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-16 SHIP-17 SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38
+SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 

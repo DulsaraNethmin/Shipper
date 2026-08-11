@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 )
@@ -91,12 +94,50 @@ func (a Auth) String() string {
 //
 // It is deliberately one struct rather than a per-domain argument list: a domain's
 // routes_<domain>.go takes what it needs out of it, and adding a dependency for one domain does
-// not change any other domain's signature. It grows as the service does — a pool at SHIP-28's
-// first endpoint, a Redis client at SHIP-47 — and every addition is shared-surface work.
+// not change any other domain's signature.
+//
+// # Do not add a field for your domain's collaborators
+//
+// This struct and its literal in main.go are shared surfaces, and wave 2 is the first wave with
+// three tracks that would each have a reason to grow one (Docs/10 §9.2). Three branches adding
+// three fields to the same struct and three lines to the same literal is a merge conflict in the
+// one file where a badly resolved one silently unwires a domain.
+//
+// So the infrastructure every domain could plausibly need is seeded here ahead of the code, the
+// same way internal/boundaries seeds its infrastructure list. **A domain builds its own
+// collaborators inside its Handler closure**, from what is already below:
+//
+//	Route{Handler: func(d Deps) http.Handler {
+//	    keys, _ := identity.NewKeyset(d.Config.Identity.AccessTokenKeys, …)
+//	    return identity.NewHandler(d.Pool, keys)
+//	}}
+//
+// A keyset, a hasher, a token issuer and a repository are all pure functions of the pool, the
+// Redis client and the configuration. If something genuinely cannot be — an adapter with its own
+// process-wide connection, say — that is a shared-surface change, and it belongs to whoever owns
+// cmd/api in that cycle rather than to the domain that noticed.
 type Deps struct {
 	Config *config.Config
 	Logger *slog.Logger
 	Clock  clock.Clock
+
+	// Pool is the PostgreSQL connection pool, and it is the whole of a domain's access to
+	// the database. Persistence takes a db.Runner, which the pool satisfies, so a handler
+	// hands this straight to its own postgres.go or opens a transaction with db.InTx.
+	//
+	// It may be nil: the service starts with an unreachable database on purpose — see the
+	// note in main.go — so a handler that dereferences it without checking will panic into
+	// httpx.Recover and answer 500. That is the correct answer to "the database is down"
+	// and is why nothing here pretends otherwise.
+	Pool *pgxpool.Pool
+
+	// Redis is the shared cache and token store. Idempotency already has its own store
+	// built over this client; SHIP-47's token bucket and the device registry take the
+	// client itself.
+	//
+	// Nil-able for the same reason as Pool, and more routinely: the idempotency middleware
+	// is built to fail closed against exactly this.
+	Redis *redis.Client
 
 	// StartedAt is when the process came up, for /health's uptime.
 	StartedAt time.Time
@@ -198,12 +239,56 @@ func manifest() string {
 	return b.String()
 }
 
-// attach registers every route of a group onto a mux.
-func attach(mux *http.ServeMux, group Group, deps Deps) {
-	for _, r := range routes() {
+// guards maps an auth class to the middleware that enforces it.
+//
+// A class with no entry is not served. That is the whole design: RequireDriverToken and
+// RequireAdmin are declared in this file because the manifest has to be able to express them, and
+// the middleware behind each arrives with SHIP-108 and SHIP-147. Until then a route declaring one
+// stops the process at startup rather than being served open, which is the only acceptable
+// direction for that mistake to fail in.
+type guards map[Auth]func(http.Handler) http.Handler
+
+// attach registers every route of a group onto a mux, wrapped in whatever its auth class requires
+// (SHIP-44).
+//
+// Until SHIP-44 this ignored Route.Auth entirely, and the class was enforced only by
+// TestNoMutatingRouteIsPublic — a test that a route was *declared* correctly, not that the
+// declaration did anything. Reading it here is what turns the manifest from documentation into
+// the thing that decides.
+func attach(mux *http.ServeMux, group Group, deps Deps, g guards) {
+	attachRoutes(mux, routes(), group, deps, g)
+}
+
+// attachRoutes is attach over an explicit route list.
+//
+// Split out so a test can exercise the auth-class wiring against routes of its own. The
+// alternative — registering a route from a _test.go init — would put it in the real registry for
+// every other test in this package, which breaks TestRouteTableMatchesGolden and
+// TestEveryRouteIsInTheContract, both of which compare the served surface with a committed file.
+func attachRoutes(mux *http.ServeMux, rs []Route, group Group, deps Deps, g guards) {
+	for _, r := range rs {
 		if r.Group != group {
 			continue
 		}
-		mux.Handle(r.Method+" "+r.Pattern, r.Handler(deps))
+
+		handler := r.Handler(deps)
+
+		if r.Auth != Public {
+			guard, enforced := g[r.Auth]
+			if !enforced {
+				// Panicking at startup rather than returning an error: this is the same
+				// class of mistake as a route with no handler, and register already
+				// panics on that. A service that came up serving an endpoint whose auth
+				// class nothing implements is worse than one that refuses to start.
+				panic(fmt.Sprintf(
+					"route %s %s requires %s and no middleware enforces it in this group. "+
+						"Serving it would make it public. Either wire the middleware in "+
+						"newRouter or do not declare the route yet",
+					r.Method, r.fullPath(), r.Auth))
+			}
+			handler = guard(handler)
+		}
+
+		mux.Handle(r.Method+" "+r.Pattern, handler)
 	}
 }
