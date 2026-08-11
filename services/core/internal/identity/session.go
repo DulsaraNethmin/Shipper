@@ -235,6 +235,20 @@ func (s *Service) startSession(ctx context.Context, r db.Runner, user User, devi
 	return s.pairFor(user, session, raw)
 }
 
+// AccessTokenTTL is how long a freshly issued access token lasts.
+//
+// The endpoints that return a pair report this as `expires_in` rather than as an instant
+// (SHIP-42), and they read it from here rather than recomputing it at the transport edge: a
+// handler subtracting a wall-clock "now" from an expiry the *injected* clock produced would
+// disagree with it under a fixed clock in tests and under ordinary skew in production.
+//
+// It is exact rather than approximate, because an expiry is computed as the instant of issue
+// plus the TTL — so at the moment a caller is handed a token, its remaining life is the TTL.
+func (s *Service) AccessTokenTTL() time.Duration { return s.issuer.TTL() }
+
+// RefreshTokenTTL is how long a freshly issued refresh token lasts. See [Service.AccessTokenTTL].
+func (s *Service) RefreshTokenTTL() time.Duration { return refreshTokenTTL }
+
 // pairFor signs the access token that goes with a freshly issued refresh token.
 //
 // One function rather than two call sites, because a sign-in and a refresh must produce

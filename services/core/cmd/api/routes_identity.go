@@ -63,6 +63,17 @@ func init() {
 			Auth:    Public,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).VerifyPhone() },
 		},
+		Route{
+			// Public because it is called by exactly the client whose access token has
+			// just expired (SHIP-42). Requiring one would lock that client out of the
+			// endpoint that replaces it — which is the reason SHIP-44 split subject
+			// resolution from subject enforcement in the first place.
+			Method:  http.MethodPost,
+			Pattern: "/auth/refresh",
+			Group:   GroupV1,
+			Auth:    Public,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).Refresh() },
+		},
 	)
 }
 

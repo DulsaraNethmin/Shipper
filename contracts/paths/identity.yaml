@@ -436,8 +436,133 @@ VerifyPhone:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+Refresh:
+  post:
+    operationId: refreshSession
+    summary: Exchange a refresh token for a new pair
+    tags: [Identity]
+    description: |
+      Returns a new access token and a new refresh token, and retires the one presented
+      (SHIP-39, SHIP-40, SHIP-42).
+
+      **The refresh token rotates on every use.** The token in the request stops working the
+      moment this call succeeds, so a client must store the new one before it makes another
+      request. There is no window in which both are valid.
+
+      Public, and it has to be: the caller is the client whose access token has just expired,
+      so requiring one would lock them out of the endpoint that replaces it.
+
+      ## Presenting a spent token ends the session
+
+      A refresh token presented a second time invalidates the **whole device session**, not just
+      that token — including the token the device is legitimately holding. Either the client
+      replayed it or somebody else has a copy, and the platform cannot tell those apart.
+
+      A client that fires two refreshes at once will do this to itself. Reuse the same
+      `Idempotency-Key` for a retry of the same refresh, and serialise concurrent calls so that
+      only one is in flight (SHIP-50).
+
+      ## Failures
+
+      One code, `identity_refresh_token_invalid`, for every outcome: a token that was never
+      issued, one already rotated away, one past its thirty-day expiry, a session that has been
+      signed out or revoked, and an account that has been suspended. The remedy is the same in
+      every case — sign in again — and distinguishing them would tell somebody holding a stolen
+      token which part of it the platform recognised.
+
+      **It answers `400`, not `401`.** The credential is in the request body rather than in the
+      bearer header, and a `401` here is the one answer that can send a client interceptor that
+      refreshes on `401` around the loop a second time.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [refresh_token]
+            additionalProperties: false
+            properties:
+              refresh_token:
+                type: string
+                description: The refresh token from the last sign-in or refresh. 43 characters, base64url.
+                example: hV8pQ2mXk4tZ7nR1bY6wJ3sL0aD5cF9gE2iU8oT4xM7
+    responses:
+      '200':
+        description: A new pair was issued and the token presented has been retired.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/TokenPair'
+      '400':
+        description: |
+          The refresh token is not usable — `identity_refresh_token_invalid`. If it was one this
+          platform had already rotated away, the whole device session has now been revoked.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # ---------------------------------------------------------------------------------------
 # Shared pieces
+
+TokenPair:
+  type: object
+  required: [access_token, expires_in, refresh_token, refresh_token_expires_in]
+  additionalProperties: false
+  description: |
+    The credentials a client holds after signing in (SHIP-41) or refreshing (SHIP-42).
+
+    **Lifetimes are counts of seconds, not instants.** A client comparing a timestamp against
+    its own clock would refresh at the wrong moment on any handset whose clock is wrong, which
+    on a phone that has been out of signal is not unusual. A duration needs no agreement about
+    what time it is.
+
+    There is no `token_type`: this platform issues one kind of bearer token and the
+    `BearerAccessToken` security scheme describes it.
+  properties:
+    access_token:
+      type: string
+      description: |
+        Send it as a bearer token, per the `BearerAccessToken` security scheme. Hold it in
+        memory only — never in preferences, documents, logs or crash reports (Docs/07 §3).
+      example: eyJhbGciOiJIUzI1NiIsImtpZCI6ImRldiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMTkxZjNjMi04YTRkLTdjMzEtOWY1Mi0zYjdlMWQ0YTZjODgifQ.signature
+    expires_in:
+      type: integer
+      description: How long the access token lasts, in seconds.
+      example: 900
+    refresh_token:
+      type: string
+      description: |
+        Opaque, and **it replaces the one you sent**. Store it in the iOS Keychain or the
+        Android Keystore before making another request; the previous one is already dead, and
+        presenting it again ends the session.
+      example: hV8pQ2mXk4tZ7nR1bY6wJ3sL0aD5cF9gE2iU8oT4xM7
+    refresh_token_expires_in:
+      type: integer
+      description: |
+        How long the refresh token lasts, in seconds — thirty days. The window slides: every
+        refresh issues a new token with a full lifetime, so it is inactivity that ends a
+        session rather than time since sign-in.
+      example: 2592000
 
 IdempotencyKey:
   name: Idempotency-Key

@@ -254,6 +254,92 @@ func (h *Handler) VerifyPhone() http.Handler {
 	})
 }
 
+// refreshRequest is the body of POST /v1/auth/refresh (SHIP-42).
+//
+// The token travels in the request body rather than in the header a bearer token uses, and that
+// is not an oversight. It is not a bearer token for *this* endpoint — it is the thing being
+// exchanged, and that header is where the access token which has just expired would otherwise
+// sit. Putting a second credential there would make "which token did this request present"
+// ambiguous to a client interceptor and to a log.
+type refreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+// tokenPairResponse is what an endpoint that issues a session hands back — a refresh (SHIP-42)
+// today, and sign-in (SHIP-41) next.
+//
+// # Why lifetimes rather than instants
+//
+// `expires_in` is a count of seconds, not a timestamp, because a client that compared a
+// timestamp against its own clock would refresh at the wrong moment on any handset whose clock
+// is wrong — which, on a phone that has been in a truck yard with no signal, is not unusual. A
+// duration needs no agreement about what time it is.
+//
+// # What is deliberately absent
+//
+// No `token_type`. This platform issues one kind of bearer token and the contract's security
+// scheme says so; a field whose value never varies is one the contract has to describe forever
+// and no client can act on.
+//
+// No account object either. A refresh says what credentials the caller now holds and nothing
+// about who they are — the access token carries that, and SHIP-63 reads verification state fresh
+// rather than from anything cached at sign-in.
+type tokenPairResponse struct {
+	AccessToken string `json:"access_token"`
+
+	// ExpiresIn is the life of the access token in seconds.
+	ExpiresIn int `json:"expires_in"`
+
+	RefreshToken string `json:"refresh_token"`
+
+	// RefreshTokenExpiresIn is the life of the refresh token in seconds. A client that has not
+	// refreshed within it is signed out and cannot recover without the password, so it is worth
+	// telling the client rather than leaving it to discover.
+	RefreshTokenExpiresIn int `json:"refresh_token_expires_in"`
+}
+
+func (h *Handler) tokenPairFrom(pair TokenPair) tokenPairResponse {
+	return tokenPairResponse{
+		AccessToken:           pair.Access.Value,
+		ExpiresIn:             int(h.svc.AccessTokenTTL().Seconds()),
+		RefreshToken:          pair.Refresh.Value,
+		RefreshTokenExpiresIn: int(h.svc.RefreshTokenTTL().Seconds()),
+	}
+}
+
+// Refresh handles POST /v1/auth/refresh (SHIP-39, SHIP-40, SHIP-42).
+//
+// # Why it is public
+//
+// It is called by exactly the client whose access token has just expired, so requiring one would
+// lock that client out of the endpoint that replaces it. Docs/11 §3 records the same reasoning
+// from SHIP-44's side: `ResolveSubject` runs group-wide and never rejects, and `RequireSubject`
+// is per route, so a public route still resolves whatever credential is attached without
+// refusing a bad one on sight.
+//
+// # Why a reused token is logged here as well as in the domain
+//
+// It is not. The domain logs it, through httpx.LoggerFrom, which is already bound to the request
+// ID (SHIP-14) — so the security event and the request that caused it are joinable without this
+// layer repeating it. What this layer decides is only which status and code the caller sees, and
+// reuse and refusal share both.
+func (h *Handler) Refresh() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		var req refreshRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pair, err := h.svc.Refresh(r.Context(), req.RefreshToken)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, h.tokenPairFrom(pair))
+		return nil
+	})
+}
+
 // apiError turns this domain's errors into the API's error contract.
 //
 // The mapping lives at the transport edge on purpose: the service answers in domain terms, and
@@ -290,6 +376,14 @@ func apiError(err error) error {
 	case errors.Is(err, ErrOTPInvalid):
 		return httpx.NewError(http.StatusBadRequest, CodeOTPInvalid,
 			"That code is not valid. Ask for a new one and try again.").WithCause(err)
+
+	// Reuse and refusal are one answer, deliberately. The two sentinels exist so the domain
+	// can log a security event and a test can tell them apart; the caller can do nothing
+	// different about either, and telling somebody holding a stolen token that the platform
+	// noticed is free help. See CodeRefreshTokenInvalid for why it is a 400 and not a 401.
+	case errors.Is(err, ErrRefreshTokenInvalid), errors.Is(err, ErrRefreshTokenReused):
+		return httpx.NewError(http.StatusBadRequest, CodeRefreshTokenInvalid,
+			"This session has ended. Sign in again.").WithCause(err)
 
 	case errors.Is(err, errUnavailable):
 		// 503 rather than 500, because the two say different things to a mobile client:

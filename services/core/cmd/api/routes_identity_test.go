@@ -227,6 +227,7 @@ func TestEveryIdentityRouteIsServedAndPublic(t *testing.T) {
 		"/v1/auth/resend-verify": `{"email":""}`,
 		"/v1/auth/request-otp":   `{"phone":""}`,
 		"/v1/auth/verify-phone":  `{"phone":"","code":""}`,
+		"/v1/auth/refresh":       `{"refresh_token":""}`,
 	} {
 		t.Run(path, func(t *testing.T) {
 			rec := postJSON(t, path, body)
@@ -261,5 +262,102 @@ func TestVerifyEmailRefusesAnEmptyToken(t *testing.T) {
 	}
 	if got := errorCode(t, rec); got != "identity_verification_token_invalid" {
 		t.Errorf("code = %q, want identity_verification_token_invalid", got)
+	}
+}
+
+// TestRefreshIsReachableAndPublic (SHIP-42).
+//
+// Public, and it has to be: the caller is the client whose access token has just expired, so
+// requiring one would lock them out of the endpoint that replaces it. Since SHIP-44 the class is
+// read at wiring time, so this also proves the router can serve it rather than panicking on it.
+func TestRefreshIsReachableAndPublic(t *testing.T) {
+	rec := postJSON(t, "/v1/auth/refresh", `{"refresh_token":""}`)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("POST /v1/auth/refresh is not served")
+	}
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatal("refreshing demands a credential, which is the credential it exists to replace")
+	}
+}
+
+// TestRefreshRefusesAnUnusableTokenWithOneCode (SHIP-40, SHIP-42).
+//
+// Reachable with no database because an empty token is refused before the pool is looked at,
+// which is also what stops a guessing loop costing a connection each. The status is deliberately
+// 400 rather than 401: SHIP-50's interceptor refreshes on a 401, and a 401 from this endpoint is
+// the one answer that can send it round the loop again.
+func TestRefreshRefusesAnUnusableTokenWithOneCode(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/refresh", strings.NewReader(`{"refresh_token":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != "identity_refresh_token_invalid" {
+		t.Errorf("code = %q, want identity_refresh_token_invalid", got)
+	}
+}
+
+// TestRefreshRequiresAnIdempotencyKey. Rotation is the most retry-sensitive request in the
+// platform: a client that fires the same refresh twice with two keys revokes its own session
+// (SHIP-40), and the middleware replaying the first response is what makes an honest retry safe.
+func TestRefreshRequiresAnIdempotencyKey(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/refresh",
+		strings.NewReader(`{"refresh_token":"hV8pQ2mXk4tZ7nR1bY6wJ3sL0aD5cF9gE2iU8oT4xM7"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeIdempotencyKeyRequired) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeIdempotencyKeyRequired)
+	}
+}
+
+// TestRefreshWithoutADatabaseIsUnavailable, for the reason registration's equivalent gives: 503
+// tells a mobile client to retry and 500 tells it to give up. The token is non-empty so that the
+// request reaches the pool check rather than being refused on its way in.
+func TestRefreshWithoutADatabaseIsUnavailable(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/refresh",
+		strings.NewReader(`{"refresh_token":"hV8pQ2mXk4tZ7nR1bY6wJ3sL0aD5cF9gE2iU8oT4xM7"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnavailable) {
+		t.Errorf("code = %q, want %q — 500 tells the client to give up", got, httpx.CodeUnavailable)
+	}
+}
+
+// TestRefreshRefusesAnUnknownField, in the direction responses are not strict. A client that
+// sends `refreshToken` has made a mistake that would otherwise surface as "the session has
+// ended" about a token it believes it supplied.
+func TestRefreshRefusesAnUnknownField(t *testing.T) {
+	rec := postJSON(t, "/v1/auth/refresh", `{"refreshToken":"hV8pQ2mXk4tZ7nR1bY6wJ3sL0aD5cF9g"}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeBadRequest) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeBadRequest)
 	}
 }

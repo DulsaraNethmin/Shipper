@@ -65,6 +65,25 @@ var (
 	// The remedy is the same for all of them: ask for a new code.
 	CodeOTPInvalid = httpx.RegisterCode("identity_otp_invalid",
 		"That code is not valid. Ask for a new one and try again.")
+
+	// CodeRefreshTokenInvalid is every way a refresh token cannot be exchanged, and there is
+	// deliberately only one of them (SHIP-42).
+	//
+	// Never issued, already rotated away, expired, a session that has been signed out or
+	// revoked, an account that has been suspended: one answer, and the remedy is the same for
+	// all of them — sign in again. Distinguishing them would tell somebody holding a stolen
+	// token which part of it the platform recognised, and in the reuse case it would tell them
+	// the theft had been noticed.
+	//
+	// **It is a 400 rather than a 401, and the reason is the client's control flow.** SHIP-50's
+	// interceptor refreshes on a 401 and replays the request; a 401 from the refresh endpoint
+	// itself is the one answer that can send a naive implementation round the loop again. The
+	// credential here also travels in the request body rather than in the header a bearer
+	// token uses, so a WWW-Authenticate challenge would describe a scheme this endpoint does
+	// not accept. That matches how verify-email and verify-phone already answer for a
+	// credential that arrives in the body.
+	CodeRefreshTokenInvalid = httpx.RegisterCode("identity_refresh_token_invalid",
+		"This session has ended. Sign in again.")
 )
 
 // The sentinel errors this domain raises.

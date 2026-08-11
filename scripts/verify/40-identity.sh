@@ -740,3 +740,144 @@ if "$PSQL" "$DATABASE_URL" -q -c \
   fail "deleting the session took the evidence that its tokens were spent with it"
 fi
 ok "ON DELETE RESTRICT holds, so a deleted session cannot turn spent tokens back into unknown ones"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-42  POST /v1/auth/refresh rotates the pair and rejects a reused token"
+
+# This section is where SHIP-39 and SHIP-40 stop being schema and start being behaviour: the
+# real endpoint, against the running service, over HTTP.
+#
+# The session is created directly in the database because sign-in is SHIP-41 and does not exist
+# yet — there is no endpoint that issues a first refresh token. The token is generated here and
+# only its SHA-256 is stored, which is exactly what the service does, so the endpoint is being
+# driven with a token it has no other way of knowing.
+refresh_token_1="$(openssl rand -hex 32)"
+refresh_hash_1="$(printf '%s' "$refresh_token_1" | shasum -a 256 | cut -d' ' -f1)"
+
+refresh_session="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into device_sessions
+       (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+   values (gen_random_uuid(), '$registered_id', '$refresh_hash_1', now() + interval '30 days',
+           'Verify iPhone')
+   returning id;")"
+[[ "$refresh_session" =~ ^[0-9a-f-]{36}$ ]] || fail "could not create a session to refresh: $refresh_session"
+
+status="$(post_json "verify-refresh-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$refresh_token_1\"}" "$WORKDIR/refresh.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/refresh.json"; fail "POST /v1/auth/refresh returned $status, want 200"; }
+
+refresh_token_2="$(json "$WORKDIR/refresh.json" '["refresh_token"]')"
+access_token_2="$(json "$WORKDIR/refresh.json" '["access_token"]')"
+[[ -n "$refresh_token_2" && "$refresh_token_2" != "$refresh_token_1" ]] \
+  || fail "the refresh returned the token it was given, so nothing rotated"
+[[ "$access_token_2" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]] \
+  || fail "the refresh returned no access token"
+ok "a new access token and a new refresh token come back"
+
+# Lifetimes are seconds rather than instants, so a handset with a wrong clock still refreshes at
+# the right moment. Fifteen minutes and thirty days are Docs/10 §5 and SHIP-39's constant.
+[[ "$(json "$WORKDIR/refresh.json" '["expires_in"]')" == "900" ]] \
+  || fail "expires_in is not 900 seconds"
+[[ "$(json "$WORKDIR/refresh.json" '["refresh_token_expires_in"]')" == "2592000" ]] \
+  || fail "refresh_token_expires_in is not thirty days"
+ok "both lifetimes are reported in seconds — fifteen minutes and thirty days"
+
+# The access token names the device it was issued to, which is what makes "sign this phone out"
+# reach the access token as well as the refresh one.
+python3 - "$access_token_2" >"$WORKDIR/refresh-claims.json" <<'PYTHON'
+import base64, json, sys
+
+def segment(s):
+    return json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+
+_header, payload, _signature = sys.argv[1].split(".")
+json.dump(segment(payload), sys.stdout)
+PYTHON
+[[ "$(json "$WORKDIR/refresh-claims.json" '["sub"]')" == "$registered_id" ]] \
+  || fail "the access token names a different account"
+[[ "$(json "$WORKDIR/refresh-claims.json" '["sid"]')" == "$refresh_session" ]] \
+  || fail "the access token does not name the device session it was issued against"
+ok "the access token carries the account and the device session it belongs to"
+
+# The row moved, and the predecessor is recorded as spent rather than merely forgotten.
+rotated_state="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (d.refresh_token_hash <> '$refresh_hash_1')::text || ' ' ||
+          (select count(*) from consumed_refresh_tokens c
+            where c.session_id = d.id and c.token_hash = '$refresh_hash_1')::text
+     from device_sessions d where d.id = '$refresh_session';")"
+[[ "$rotated_state" == "true 1" ]] \
+  || fail "the row says '$rotated_state', want 'true 1' — rotated, with the predecessor recorded as spent"
+ok "the session holds the new hash and the old one is in consumed_refresh_tokens"
+
+# And the token itself is nowhere, in either table.
+leaked="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (select count(*) from device_sessions where refresh_token_hash = '$refresh_token_1')
+        + (select count(*) from consumed_refresh_tokens where token_hash = '$refresh_token_1')
+        + (select count(*) from device_sessions where refresh_token_hash = '$refresh_token_2');")"
+[[ "$leaked" == "0" ]] || fail "a refresh token appears in the database in plain form"
+ok "searching both tables for either token finds nothing — only hashes are stored"
+
+# SHIP-40, end to end. The spent token ends the whole session, not merely this request.
+status="$(post_json "verify-refresh-reuse-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$refresh_token_1\"}" "$WORKDIR/refresh-reuse.json")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/refresh-reuse.json"; fail "a reused token returned $status, want 400"; }
+[[ "$(json "$WORKDIR/refresh-reuse.json" '["error"]["code"]')" == "identity_refresh_token_invalid" ]] \
+  || fail "expected code=identity_refresh_token_invalid"
+ok "presenting the spent token is refused, with the same code every other failure gets"
+
+revoked="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(revoked_reason, 'live') from device_sessions where id = '$refresh_session';")"
+[[ "$revoked" == "refresh_token_reused" ]] \
+  || fail "the session is '$revoked', want refresh_token_reused — the revocation did not survive the refusal"
+ok "the device session is revoked, and the revocation survived the error that reported it"
+
+# The half that makes it "the entire device session": the token the legitimate device is holding
+# stops working too. Refusing only the reused one would leave whoever stole it signed in.
+status="$(post_json "verify-refresh-after-reuse-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$refresh_token_2\"}" "$WORKDIR/refresh-after-reuse.json")"
+[[ "$status" == "400" ]] || fail "the live token still refreshed after reuse was detected (status $status)"
+ok "the token the device legitimately held stops working as well — the whole session ended"
+
+# A token nobody issued revokes nothing. Without this, anybody could sign anybody out by
+# guessing, which would make reuse detection a weapon rather than a control.
+other_token="$(openssl rand -hex 32)"
+other_hash="$(printf '%s' "$other_token" | shasum -a 256 | cut -d' ' -f1)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions
+       (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+   values (gen_random_uuid(), '$registered_id', '$other_hash', now() + interval '30 days',
+           'Verify Pixel');" >/dev/null \
+  || fail "could not create a second session"
+
+status="$(post_json "verify-refresh-unknown-$$" /v1/auth/refresh \
+  '{"refresh_token":"9qE2vT7bYw1sJk4pNc0aRlX8oZgHdM3uQiV6yB5tCfE"}' "$WORKDIR/refresh-unknown.json")"
+[[ "$status" == "400" ]] || fail "an unknown token returned $status, want 400"
+still_live="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(revoked_reason, 'live') from device_sessions where refresh_token_hash = '$other_hash';")"
+[[ "$still_live" == "live" ]] || fail "a guessed token ended somebody's session"
+ok "a token nobody issued is refused and revokes nothing"
+
+# An expired refresh token is refused, which is the whole point of 000103's column.
+expired_token="$(openssl rand -hex 32)"
+expired_hash="$(printf '%s' "$expired_token" | shasum -a 256 | cut -d' ' -f1)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into device_sessions
+       (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label, created_at)
+   values (gen_random_uuid(), '$registered_id', '$expired_hash', now() - interval '1 second',
+           'Verify Expired', now() - interval '31 days');" >/dev/null \
+  || fail "could not create a session holding a lapsed token"
+status="$(post_json "verify-refresh-expired-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$expired_token\"}" "$WORKDIR/refresh-expired.json")"
+[[ "$status" == "400" ]] || fail "an expired refresh token returned $status, want 400"
+ok "a refresh token past its expiry is refused, which is what the expiry column is for"
+
+# Rotation is the most retry-sensitive request in the platform — two refreshes with two keys is
+# a client revoking its own session — so the idempotency middleware is what makes an honest
+# retry safe, and the endpoint refuses a request without a key like every other mutation.
+status="$(curl -s -X POST -o "$WORKDIR/refresh-nokey.json" -w '%{http_code}' \
+  -H 'Content-Type: application/json' -d '{"refresh_token":"x"}' \
+  "http://localhost:$VERIFY_PORT/v1/auth/refresh")"
+[[ "$status" == "400" ]] || fail "refresh without an Idempotency-Key returned $status"
+[[ "$(json "$WORKDIR/refresh-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || fail "expected code=idempotency_key_required"
+ok "it needs an Idempotency-Key, so a retry replays the pair rather than rotating twice"

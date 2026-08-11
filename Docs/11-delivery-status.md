@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **114 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **125 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -171,6 +171,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
 | **SHIP-39** | M1 | Refresh token issue and rotation — opaque, hashed, and the expiry question closed — *see below* |
 | **SHIP-40** | M1 | Refresh token reuse detection — a spent token ends the whole device session — *see below* |
+| **SHIP-42** | M1 | `POST /v1/auth/refresh` — the first endpoint that issues a session credential — *see below* |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
@@ -525,6 +526,50 @@ ticket behind it does not belong there.
 minutes of activity.** Deleting the spent tokens of a session that has ended is safe — a revoked
 session refuses every token it ever issued — and belongs to `cmd/worker` (SHIP-67a) as its own
 ticket rather than being smuggled into this one. `000104` says so where somebody would look.
+
+### What SHIP-42 built
+
+**`POST /v1/auth/refresh` is the ninth route and the first that hands back a session
+credential.** It is where SHIP-39 and SHIP-40 stop being schema and become behaviour: `make
+verify` drives the real endpoint over HTTP, rotates, reads the row, presents the spent token,
+and shows the token the device legitimately held stop working with it.
+
+**Public, and it has to be.** The caller is the client whose access token has just expired.
+SHIP-44 anticipated exactly this when it split `ResolveSubject` from `RequireSubject` — a
+middleware that refused a bad credential on sight would lock that client out of the endpoint that
+replaces it.
+
+**It answers `400`, not `401`, and that is a decision rather than an oversight.** SHIP-50's
+interceptor refreshes on a `401` and replays the request; a `401` from the refresh endpoint itself
+is the one answer that can send a naive implementation round the loop a second time. The
+credential is also body-borne, so a `WWW-Authenticate` challenge would describe a scheme this
+endpoint does not use. It matches how `verify-email` and `verify-phone` already answer for a
+credential that arrives in the body.
+
+**One code for every failure — `identity_refresh_token_invalid`.** Never issued, already rotated
+away, expired, session signed out or revoked, account suspended: the remedy is identical and
+distinguishing them would tell somebody holding a stolen token which part of it the platform
+recognised. It is the seventh domain code and the twenty-third overall.
+
+**Lifetimes are reported as seconds, not instants.** A client comparing a timestamp against its
+own clock refreshes at the wrong moment on any handset whose clock is wrong, which on a phone that
+has been out of signal is not unusual. `expires_in` and `refresh_token_expires_in` are read from
+the service's own TTLs rather than subtracted from a wall clock at the transport edge, so a fixed
+clock in a test and ordinary skew in production both give the same answer.
+
+**There is no `token_type` and no account object in the response.** One is a field whose value
+never varies, which the contract would have to describe forever; the other would be verification
+state cached at refresh time, and `Docs/10` §5 keeps that out of the token for the reason SHIP-63
+depends on.
+
+**`contracts/paths/identity.yaml` gains a `TokenPair` schema, and SHIP-41 should reuse it rather
+than describe the same body again.** Sign-in returns the same four fields, and two descriptions of
+one shape is how a client generator ends up with two types.
+
+**The `paths:` block in `contracts/openapi.yaml` gained one line**, sorted — `/v1/auth/refresh`
+sorts before `/v1/auth/register`. That is the one shared file this track touched, and the wave's
+jobs track is adding lines to the same block; `Docs/10` §9.2's recipe applies (take both sides,
+re-sort, then `make test`).
 
 ### What SHIP-48 built, and how it was demonstrated
 
