@@ -85,7 +85,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **84 checks**, and `make check` green.
+Verified by `make verify` — **92 checks**, and `make check` green.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -132,6 +132,7 @@ endpoints, and none of these tickets adds one.
 | **SHIP-29** | M1 | argon2id password hashing, parameters stored in the PHC string |
 | **SHIP-30** | M1 | `POST /v1/auth/register` — an unverified account, duplicates refused by the index — *see below* |
 | **SHIP-31** | M1 | Email verification tokens — single-use, one live per account, stored as SHA-256 |
+| **SHIP-34** | M1 | `POST /v1/auth/request-otp` — six digits, argon2id, two rate limits, and a deliberately uninformative answer |
 | **SHIP-45** | M1 | Role fixed at registration, immutable afterwards by a `BEFORE UPDATE` trigger on `users` |
 | **SHIP-32** | M1 | Email adapter — console in development, generic HTTP provider in staging |
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
@@ -243,6 +244,34 @@ send "you already have an account" by email — is what a bank does, and here it
 person who mistyped their address staring at a success screen for an account that does not exist.
 The resend and OTP endpoints do not make that disclosure, because there it buys the caller
 nothing.
+
+**Two hashes, chosen opposite ways, and the reason is the search space.** The email
+verification token is 32 bytes from `crypto/rand` and is stored as SHA-256; the phone OTP is six
+digits and is stored as argon2id at the configured profile. A work factor exists to make a
+*small* space expensive, so it is worth 64 MiB on 10^6 possibilities and worth nothing on 2^256.
+Getting this the other way round is the mistake worth naming: SHA-256 over six digits is a table
+a laptop builds in under a second, and argon2id on the email token would turn the confirm
+endpoint into a denial-of-service lever anybody can pull without an account.
+
+**`request-otp` answers identically for every outcome, and that is the design rather than
+laziness.** Unknown number, known number, already verified, inside the cooldown, past the hourly
+cap: `202` with the same body and a **fixed** `retry_after_seconds`. Reporting the true remaining
+cooldown would say "this number was sent a code recently", which says "this number has an
+account" — and that makes "does this person use Shipper" answerable one number at a time by
+anybody. The rate limit is therefore demonstrated by counting rows rather than by reading a
+status. Registration is the deliberate exception, for the reason on `CodeEmailTaken`.
+
+**The OTP rate limit is read from PostgreSQL, and it is not SHIP-47.** SHIP-47's Redis token
+bucket is about request volume across the authentication surface. This one is about how many
+*messages* an account causes — a bill, and somebody's handset — so it has to survive a Redis
+flush, and the table already records every code that was sent.
+
+**`created_at` is written from the injected clock rather than defaulted**, on both new tables.
+The two timestamps in a row have to come from one clock: `expires_at` is computed in Go and
+`created_at` was defaulting to the database's `now()`, so `expires_at > created_at` failed under
+a `clock.Fixed` in tests and would fail under ordinary skew in production. The rate limits count
+over `created_at`, which is the second reason it has to agree with the clock the service reasons
+about.
 
 **`httpx.H` and `httpx.DecodeJSON` do not exist**, and `Docs/10` §4.3 has specified both since
 SHIP-15a. That is the shape `httpx.RegisterCode` was in until SHIP-15c: documented, listed as
@@ -417,7 +446,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-31 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44 SHIP-45
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-31 SHIP-32 SHIP-34 SHIP-35 SHIP-37 SHIP-38 SHIP-44 SHIP-45
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 

@@ -924,6 +924,96 @@ fi
 ok "a second live token is refused by uq_email_verification_tokens_live"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-34  a time-limited numeric OTP is generated, rate-limited, and stored hashed"
+
+status="$(post_json "verify-otp-$$" /v1/auth/request-otp \
+  "{\"phone\":\"$reg_phone_local\"}" "$WORKDIR/otp.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/otp.json"; fail "POST /v1/auth/request-otp returned $status, want 202"; }
+[[ "$(json "$WORKDIR/otp.json" '["retry_after_seconds"]')" == "60" ]] \
+  || fail "the response does not carry the resend interval a client runs its timer from"
+ok "a code is requested, and the answer says when to ask again"
+
+otp_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select code_hash || ' ' || phone || ' ' || attempts || ' ' ||
+          (expires_at > now())::text || ' ' ||
+          (expires_at <= now() + interval '10 minutes' + interval '1 minute')::text
+     from phone_otps where user_id = '$registered_id' and consumed_at is null;")"
+[[ -n "$otp_row" ]] || fail "no live code was stored"
+
+read -r otp_hash otp_phone otp_attempts otp_future otp_within <<<"$otp_row"
+[[ "$otp_phone" == "$reg_phone_e164" ]] || fail "the code records '$otp_phone', not the number it was sent to"
+[[ "$otp_attempts" == "0" ]] || fail "a fresh code already has $otp_attempts attempts against it"
+[[ "$otp_future" == "true" && "$otp_within" == "true" ]] \
+  || fail "the code does not expire within ten minutes (future=$otp_future within=$otp_within)"
+ok "one live code, against the number it was sent to, expiring within ten minutes"
+
+# The console SMS adapter logs the body in full on purpose (SHIP-35) — reading the code out of
+# the log is how a developer verifies a number without a handset, and here it is what makes the
+# stored form checkable at all.
+otp_code="$(python3 - "$WORKDIR/server.log" "$reg_phone_e164" <<'PYTHON'
+import json, re, sys
+
+found = ""
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        record = json.loads(line)
+    except ValueError:
+        continue
+    if record.get("msg") != "sms (console, not sent)" or record.get("to") != sys.argv[2]:
+        continue
+    match = re.search(r"\b\d{6}\b", record.get("body", ""))
+    if match:
+        found = match.group(0)
+print(found)
+PYTHON
+)"
+[[ "$otp_code" =~ ^[0-9]{6}$ ]] || fail "no six-digit code was sent to $reg_phone_e164"
+ok "the message carries a six-digit numeric code"
+
+# argon2id, not SHA-256. Six digits is a million possibilities: a table of SHA-256 digests over
+# that space is built by a laptop in under a second, so the work factor is the whole of the
+# offline defence (000102_phone_otps).
+[[ "$otp_hash" == \$argon2id\$* ]] || fail "the stored code is not an argon2id PHC string: $otp_hash"
+ok "it is stored as argon2id, so a stolen table is not a list of codes"
+
+stored_code_count="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from phone_otps where code_hash = '$otp_code' or phone_otps.code_hash like '%$otp_code%';")"
+[[ "$stored_code_count" == "0" ]] || fail "the code itself appears in the table"
+ok "searching the table for the code finds nothing"
+
+# Rate limit, first rule: one code a minute. Demonstrated by the row count rather than by the
+# status, because the status is deliberately identical — see the endpoint's contract entry.
+codes_before="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from phone_otps where user_id = '$registered_id';")"
+status="$(post_json "verify-otp-again-$$" /v1/auth/request-otp \
+  "{\"phone\":\"$reg_phone_local\"}" "$WORKDIR/otp-again.json")"
+[[ "$status" == "202" ]] || fail "a throttled request returned $status, and every outcome must look alike"
+diff -q "$WORKDIR/otp.json" "$WORKDIR/otp-again.json" >/dev/null \
+  || fail "a throttled request answered differently from an accepted one"
+codes_after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from phone_otps where user_id = '$registered_id';")"
+[[ "$codes_before" == "$codes_after" ]] \
+  || fail "a second request inside the cooldown issued another code ($codes_before then $codes_after)"
+ok "a second request within the minute sends nothing, and says exactly what the first said"
+
+# The privacy property this endpoint exists to have. A number with no account is answered
+# identically, so "does this person have a Shipper account" is not a question anybody can ask.
+status="$(post_json "verify-otp-unknown-$$" /v1/auth/request-otp \
+  '{"phone":"+61499999999"}' "$WORKDIR/otp-unknown.json")"
+[[ "$status" == "202" ]] || fail "an unknown number returned $status"
+diff -q "$WORKDIR/otp.json" "$WORKDIR/otp-unknown.json" >/dev/null \
+  || fail "an unknown number is answered differently from a known one"
+unknown_rows="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from phone_otps where phone = '+61499999999';")"
+[[ "$unknown_rows" == "0" ]] || fail "a code was stored for a number with no account"
+ok "a number with no account gets the same answer, and no code is stored or sent"
+
+status="$(post_json "verify-otp-bad-$$" /v1/auth/request-otp \
+  '{"phone":"123"}' "$WORKDIR/otp-bad.json")"
+[[ "$status" == "422" ]] || fail "an unusable number returned $status, want 422"
+ok "an unusable number is a field error, which discloses nothing about who has an account"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
@@ -936,4 +1026,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-31, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-31, SHIP-34, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"

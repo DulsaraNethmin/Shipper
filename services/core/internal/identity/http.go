@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
@@ -130,6 +131,51 @@ func (h *Handler) Register() http.Handler {
 		}
 
 		httpx.WriteJSON(w, http.StatusCreated, accountFrom(user))
+		return nil
+	})
+}
+
+// phoneRequest is the body of the endpoints whose whole input is a mobile number.
+type phoneRequest struct {
+	Phone string `json:"phone"`
+}
+
+// acceptedResponse is what an endpoint answers when it will not say whether it did anything.
+//
+// One shape, one status, one value, whether or not the contact details belong to an account —
+// see the note at the top of this file and the one on [Service.RequestOTP]. The retry interval
+// is a constant rather than the true remaining cooldown, because the true one would say "this
+// number has been sent a code recently", which says "this number has an account".
+//
+// It is still useful to the client: SHIP-54's resend button runs its timer from this.
+type acceptedResponse struct {
+	RetryAfterSeconds int `json:"retry_after_seconds"`
+}
+
+// RequestOTP handles POST /v1/auth/request-otp (SHIP-34).
+//
+// 202 Accepted rather than 200, and the status is doing real work: the platform has accepted the
+// request and will not tell the caller what came of it. A 200 with a body claiming the message
+// was sent would be a lie for every number that has no account.
+func (h *Handler) RequestOTP() http.Handler {
+	return apiHandler(func(w http.ResponseWriter, r *http.Request) error {
+		var req phoneRequest
+		if err := decodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		retryAfter, err := h.svc.RequestOTP(r.Context(), req.Phone)
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Retry-After as well as the body. The header is the standard place for it and the
+		// body is the place a Flutter client will actually read it from, and there is no
+		// cost to both agreeing.
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+		httpx.WriteJSON(w, http.StatusAccepted, acceptedResponse{
+			RetryAfterSeconds: int(retryAfter.Seconds()),
+		})
 		return nil
 	})
 }

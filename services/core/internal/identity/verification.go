@@ -136,6 +136,7 @@ func (s *Service) issueEmailVerification(ctx context.Context, r db.Runner, user 
 		Email:     user.Email,
 		TokenHash: hash,
 		ExpiresAt: now.Add(emailVerificationTokenTTL),
+		CreatedAt: now,
 	}
 
 	if err := s.store.insertEmailToken(ctx, r, token); err != nil {

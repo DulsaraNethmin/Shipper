@@ -168,3 +168,48 @@ func TestRegisterWithoutADatabaseIsUnavailable(t *testing.T) {
 		t.Errorf("code = %q, want %q — 500 tells the client to give up", got, httpx.CodeUnavailable)
 	}
 }
+
+// TestRequestOTPIsReachableAndPublic (SHIP-34). Public for the same reason registration is: the
+// code it sends is how the caller proves the number, and nothing has issued them a session yet.
+func TestRequestOTPIsReachableAndPublic(t *testing.T) {
+	rec := postJSON(t, "/v1/auth/request-otp", `{"phone":""}`)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("POST /v1/auth/request-otp is not served")
+	}
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatal("requesting a code demands a credential the caller cannot have yet")
+	}
+}
+
+// TestRequestOTPRejectsAnUnusableNumberPerField. Reported as a field error rather than as a bare
+// 400, so the client can put the message beside the input.
+func TestRequestOTPRejectsAnUnusableNumberPerField(t *testing.T) {
+	rec := postJSON(t, "/v1/auth/request-otp", `{"phone":"123"}`)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeValidationFailed) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeValidationFailed)
+	}
+}
+
+// TestRequestOTPWithoutADatabaseIsUnavailable, for the reason registration's equivalent gives:
+// 503 tells a mobile client to retry and 500 tells it to give up.
+func TestRequestOTPWithoutADatabaseIsUnavailable(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/request-otp",
+		strings.NewReader(`{"phone":"0412345678"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
+	}
+}

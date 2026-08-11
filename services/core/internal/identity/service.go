@@ -69,6 +69,7 @@ type Service struct {
 	pool   *pgxpool.Pool
 	hasher *PasswordHasher
 	email  EmailSender
+	sms    SMSSender
 	clock  clock.Clock
 	store  postgresStore
 }
@@ -79,19 +80,22 @@ type Service struct {
 // database on purpose, so that a failover does not take every instance down at once (see the
 // note on Deps in cmd/api). What is refused here is a *missing collaborator*, which is a wiring
 // mistake rather than a transient condition: a service with no hasher would accept a password
-// and store nothing derivable from it, and one with no email sender would register accounts that
-// can never be verified.
-func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, sender EmailSender, clk clock.Clock) (*Service, error) {
+// and store nothing derivable from it, and one with no email or SMS sender would register
+// accounts that can never be verified.
+func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, sender EmailSender, texter SMSSender, clk clock.Clock) (*Service, error) {
 	if hasher == nil {
 		return nil, errors.New("identity: a service needs a password hasher")
 	}
 	if sender == nil {
 		return nil, errors.New("identity: a service needs an email sender")
 	}
+	if texter == nil {
+		return nil, errors.New("identity: a service needs an SMS sender")
+	}
 	if clk == nil {
 		return nil, errors.New("identity: a service needs a clock")
 	}
-	return &Service{pool: pool, hasher: hasher, email: sender, clock: clk}, nil
+	return &Service{pool: pool, hasher: hasher, email: sender, sms: texter, clock: clk}, nil
 }
 
 // RegisterCommand is one registration request, in the domain's own terms (SHIP-30).
@@ -155,6 +159,20 @@ func (c RegisterCommand) Validate() error {
 		v.Add("role", validate.CodeNotAllowed, "Choose either customer or provider.")
 	}
 
+	return v.Err()
+}
+
+// validatePhoneField checks a normalised number the way RegisterCommand does, for the endpoints
+// whose whole request body is a number.
+//
+// One function rather than a repeated pair of checks, so that "what counts as a phone number"
+// has one answer across registration, OTP request and phone confirmation. Three copies is how
+// an endpoint ends up accepting something the account can never match.
+func validatePhoneField(phone string) error {
+	var v validate.Errors
+	if v.Required("phone", phone) && !validE164(phone) {
+		v.Add("phone", validate.CodeInvalid, "Enter an Australian mobile number, like 0412 345 678.")
+	}
 	return v.Err()
 }
 

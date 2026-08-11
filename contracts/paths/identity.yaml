@@ -126,6 +126,84 @@ Register:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+RequestOTP:
+  post:
+    operationId: requestOTP
+    summary: Send a one-time code to a mobile number
+    tags: [Identity]
+    description: |
+      Sends a six-digit verification code by SMS (SHIP-34). It expires in ten minutes.
+
+      ## This endpoint deliberately tells you nothing
+
+      **The answer is always `202` with the same body**, whether the number belongs to an
+      account, has already been verified, was sent a code moments ago, or has never been seen.
+      A different status for a known number would turn this into a way of asking "does this
+      person have a Shipper account", answerable one number at a time by anybody. The only
+      observable difference is whether a message arrives, which the caller can only see if they
+      are holding the handset.
+
+      `retry_after_seconds` is a **fixed** interval, not the true remaining cooldown — the true
+      one would carry the same disclosure. Run the resend timer from it (SHIP-54).
+
+      ## Rate limits
+
+      Two, both applied per account: no more than one code per minute, and no more than five per
+      hour. Exceeding either sends nothing and still answers `202`. A text message costs money
+      and wakes a real handset, so an unbounded resend is a bill directed at whoever owns the
+      number.
+
+      ## Wrong guesses
+
+      Five wrong codes retire the live one. `POST /v1/auth/verify-phone` then answers
+      `identity_otp_invalid` until a new code is requested.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/PhoneRequest'
+    responses:
+      '202':
+        description: |
+          The request was accepted. Whether a message was sent is deliberately not stated.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          Retry-After:
+            description: The same value as `retry_after_seconds`, in the standard header.
+            schema:
+              type: integer
+            example: 60
+        content:
+          application/json:
+            schema:
+              $ref: '#/Accepted'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '422':
+        description: The number is not a number this platform can send to.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # ---------------------------------------------------------------------------------------
 # Shared pieces
 
@@ -187,3 +265,32 @@ Account:
       type: string
       format: date-time
       example: '2026-08-11T04:11:52.418Z'
+
+PhoneRequest:
+  type: object
+  required: [phone]
+  additionalProperties: false
+  properties:
+    phone:
+      type: string
+      description: |
+        An Australian mobile number in any of the forms a person types it. It is normalised to
+        E.164 before it is compared with the account, so `0412 345 678` and `+61412345678` are
+        the same number.
+      example: '0412 345 678'
+
+Accepted:
+  type: object
+  required: [retry_after_seconds]
+  additionalProperties: false
+  description: |
+    The answer from an endpoint that will not say whether it did anything. One shape and one
+    status for every outcome — see the operation description.
+  properties:
+    retry_after_seconds:
+      type: integer
+      description: |
+        How long to wait before asking again. A **fixed** value, not the true remaining
+        cooldown: the true one would disclose that this contact detail has been used recently,
+        which discloses that it belongs to an account.
+      example: 60

@@ -44,3 +44,14 @@ import "context"
 type EmailSender interface {
 	Send(ctx context.Context, to, subject, body string) error
 }
+
+// SMSSender delivers a text message, which in the MVP means a phone verification code.
+//
+// Satisfied by *sms.Console in development and *sms.Provider in staging and production
+// (SHIP-35). The adapter does not know it is carrying a one-time code and must not: generating
+// the code, deciding its lifetime, rate-limiting it and comparing it on the way back are all
+// domain rules, and a transport that knew about them would be a domain rule living in the wrong
+// package.
+type SMSSender interface {
+	Send(ctx context.Context, to, body string) error
+}

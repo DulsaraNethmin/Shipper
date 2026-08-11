@@ -61,11 +61,56 @@ func newTestService(t *testing.T) (*Service, *pgxpool.Pool, *recordingSender) {
 	}
 
 	mail := &recordingSender{}
-	svc, err := NewService(pool, hasher, mail, clock.System{})
+	svc, err := NewService(pool, hasher, mail, &recordingTexter{}, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
 	return svc, pool, mail
+}
+
+// newTestServiceWithSMS is newTestService for the tickets that need to read the code out of the
+// message, and a clock they can move.
+func newTestServiceWithSMS(t *testing.T, clk clock.Clock) (*Service, *pgxpool.Pool, *recordingTexter) {
+	t.Helper()
+
+	pool := pgtest.DB(t)
+
+	hasher, err := NewPasswordHasher(testProfile)
+	if err != nil {
+		t.Fatalf("building the hasher: %v", err)
+	}
+
+	texter := &recordingTexter{}
+	svc, err := NewService(pool, hasher, &recordingSender{}, texter, clk)
+	if err != nil {
+		t.Fatalf("building the service: %v", err)
+	}
+	return svc, pool, texter
+}
+
+// recordingTexter is the SMS port's test double, and the only place a one-time code can be read
+// — the table holds an argon2id hash of it and nothing else.
+type recordingTexter struct {
+	sent []sentText
+	err  error
+}
+
+type sentText struct{ to, body string }
+
+func (s *recordingTexter) Send(_ context.Context, to, body string) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.sent = append(s.sent, sentText{to, body})
+	return nil
+}
+
+func (s *recordingTexter) last(t *testing.T) sentText {
+	t.Helper()
+	if len(s.sent) == 0 {
+		t.Fatal("no message was sent")
+	}
+	return s.sent[len(s.sent)-1]
 }
 
 func validRegistration() RegisterCommand {
@@ -362,7 +407,7 @@ func TestRegisterWithoutADatabaseIsUnavailableNotAPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
-	svc, err := NewService(nil, hasher, &recordingSender{}, clock.System{})
+	svc, err := NewService(nil, hasher, &recordingSender{}, &recordingTexter{}, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}

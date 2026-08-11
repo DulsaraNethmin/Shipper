@@ -115,10 +115,16 @@ const emailTokenColumns = `id, user_id, email, token_hash, expires_at, consumed_
 
 // insertEmailToken writes a freshly issued verification token (SHIP-31).
 func (postgresStore) insertEmailToken(ctx context.Context, r db.Runner, t emailVerificationToken) error {
+	// created_at is written rather than defaulted, from the same clock that computed
+	// expires_at. The column has a DEFAULT now() as a safety net for any other writer, but a
+	// row whose two timestamps come from two different clocks is a row that can violate
+	// ck_email_verification_tokens_expiry under ordinary skew between the service and the
+	// database — and the rate limits below count over created_at, so they have to agree with
+	// the clock the service reasons about.
 	_, err := r.Exec(ctx, `
-		INSERT INTO email_verification_tokens (id, user_id, email, token_hash, expires_at)
-		VALUES ($1, $2, $3, $4, $5)`,
-		t.ID, t.UserID, t.Email, t.TokenHash, t.ExpiresAt)
+		INSERT INTO email_verification_tokens (id, user_id, email, token_hash, expires_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		t.ID, t.UserID, t.Email, t.TokenHash, t.ExpiresAt, t.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("identity: inserting a verification token: %w", err)
 	}
@@ -194,6 +200,108 @@ func (postgresStore) lastEmailTokenAt(ctx context.Context, r db.Runner, userID u
 		SELECT max(created_at) FROM email_verification_tokens WHERE user_id = $1`,
 		userID).Scan(&at); err != nil {
 		return time.Time{}, false, fmt.Errorf("identity: reading the last verification token: %w", err)
+	}
+	if at == nil {
+		return time.Time{}, false, nil
+	}
+	return *at, true, nil
+}
+
+// otpColumns is the projection every read of a one-time code shares.
+const otpColumns = `id, user_id, phone, code_hash, expires_at, attempts, consumed_at, consumed_reason, created_at`
+
+// insertOTP writes a freshly issued one-time code (SHIP-34).
+func (postgresStore) insertOTP(ctx context.Context, r db.Runner, o phoneOTP) error {
+	// created_at from the injected clock, for the reason insertEmailToken gives.
+	_, err := r.Exec(ctx, `
+		INSERT INTO phone_otps (id, user_id, phone, code_hash, expires_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		o.ID, o.UserID, o.Phone, o.CodeHash, o.ExpiresAt, o.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("identity: inserting a one-time code: %w", err)
+	}
+	return nil
+}
+
+// supersedeOTPs retires whatever the account currently holds, so a newly issued code is the only
+// live one — which is what a person pressing "resend" expects.
+func (postgresStore) supersedeOTPs(ctx context.Context, r db.Runner, userID uuid.UUID) error {
+	_, err := r.Exec(ctx, `
+		UPDATE phone_otps
+		   SET consumed_at = now(), consumed_reason = $2
+		 WHERE user_id = $1 AND consumed_at IS NULL`, userID, consumedSuperseded)
+	if err != nil {
+		return fmt.Errorf("identity: superseding outstanding one-time codes: %w", err)
+	}
+	return nil
+}
+
+// liveOTP reads the account's outstanding code, locking the row for the duration of the
+// transaction.
+//
+// FOR UPDATE is what makes the attempt counter an actual limit. Without it two guesses arriving
+// together both read attempts = 4, both write 5, and the account has had six tries — repeatable
+// on purpose by anybody who wants more than five.
+func (postgresStore) liveOTP(ctx context.Context, r db.Runner, userID uuid.UUID) (phoneOTP, error) {
+	row := r.QueryRow(ctx, `
+		SELECT `+otpColumns+`
+		  FROM phone_otps
+		 WHERE user_id = $1 AND consumed_at IS NULL
+		 FOR UPDATE`, userID)
+
+	var o phoneOTP
+	if err := row.Scan(&o.ID, &o.UserID, &o.Phone, &o.CodeHash, &o.ExpiresAt, &o.Attempts,
+		&o.ConsumedAt, &o.ConsumedReason, &o.CreatedAt); err != nil {
+		return phoneOTP{}, err
+	}
+	return o, nil
+}
+
+// recordOTPAttempt counts one wrong guess and returns the new total.
+func (postgresStore) recordOTPAttempt(ctx context.Context, r db.Runner, id uuid.UUID) (int, error) {
+	var attempts int
+	if err := r.QueryRow(ctx, `
+		UPDATE phone_otps SET attempts = attempts + 1
+		 WHERE id = $1
+		 RETURNING attempts`, id).Scan(&attempts); err != nil {
+		return 0, fmt.Errorf("identity: recording a one-time code attempt: %w", err)
+	}
+	return attempts, nil
+}
+
+// consumeOTP retires a code, reporting whether this call was the one that did it.
+//
+// The reason is a parameter rather than a constant because a code leaves the live state three
+// ways, and a support conversation needs to tell "it worked" from "somebody guessed at it five
+// times" (ck_phone_otps_reason).
+func (postgresStore) consumeOTP(ctx context.Context, r db.Runner, id uuid.UUID, at time.Time, reason string) (bool, error) {
+	tag, err := r.Exec(ctx, `
+		UPDATE phone_otps SET consumed_at = $2, consumed_reason = $3
+		 WHERE id = $1 AND consumed_at IS NULL`, id, at, reason)
+	if err != nil {
+		return false, fmt.Errorf("identity: consuming a one-time code: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// countOTPsSince is what the window limit counts over. Superseded and exhausted rows are
+// included: the limit is on messages sent, and every one of them was sent.
+func (postgresStore) countOTPsSince(ctx context.Context, r db.Runner, userID uuid.UUID, since time.Time) (int, error) {
+	var n int
+	if err := r.QueryRow(ctx, `
+		SELECT count(*) FROM phone_otps WHERE user_id = $1 AND created_at >= $2`,
+		userID, since).Scan(&n); err != nil {
+		return 0, fmt.Errorf("identity: counting recent one-time codes: %w", err)
+	}
+	return n, nil
+}
+
+// lastOTPAt is when the account was last sent a code, for the resend cooldown.
+func (postgresStore) lastOTPAt(ctx context.Context, r db.Runner, userID uuid.UUID) (time.Time, bool, error) {
+	var at *time.Time
+	if err := r.QueryRow(ctx,
+		`SELECT max(created_at) FROM phone_otps WHERE user_id = $1`, userID).Scan(&at); err != nil {
+		return time.Time{}, false, fmt.Errorf("identity: reading the last one-time code: %w", err)
 	}
 	if at == nil {
 		return time.Time{}, false, nil

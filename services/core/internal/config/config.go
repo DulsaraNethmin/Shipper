@@ -57,6 +57,7 @@ type Config struct {
 	Idempotency Idempotency
 	Identity    Identity
 	Email       Email
+	SMS         SMS
 	App         App
 }
 
@@ -116,6 +117,26 @@ type Identity struct {
 	// in each token's `kid` header, which is how a verifier knows which key to use before it
 	// can trust anything else in the token.
 	AccessTokenActiveKID string
+}
+
+// SMS configures the text-message adapter (SHIP-35), first consumed by the phone verification
+// code SHIP-34 sends.
+//
+// The same shape as [Email] and chosen the same way — from Env, not from here. It matters more
+// here than it does for email: a message costs money and reaches a real handset, so an
+// environment that dispatched by accident would be a bill as well as a nuisance to whoever last
+// used that number for testing.
+type SMS struct {
+	// ProviderBaseURL is the root of the gateway's API. Empty in development.
+	ProviderBaseURL string
+
+	// ProviderAPIKey is presented as a bearer credential and is never logged.
+	ProviderAPIKey string
+
+	// Sender is what the message appears to come from — an alphanumeric sender ID or an
+	// originating number, depending on what the gateway and the destination country permit.
+	// Australia allows both; the choice is made with the vendor.
+	Sender string
 }
 
 // Argon2 is the password hashing cost.
@@ -307,6 +328,11 @@ func Load() (*Config, error) {
 			ProviderAPIKey:  l.str("EMAIL_PROVIDER_API_KEY", ""),
 			Sender:          l.str("EMAIL_SENDER", "no-reply@shipper.com.au"),
 		},
+		SMS: SMS{
+			ProviderBaseURL: l.str("SMS_PROVIDER_BASE_URL", ""),
+			ProviderAPIKey:  l.str("SMS_PROVIDER_API_KEY", ""),
+			Sender:          l.str("SMS_SENDER", "Shipper"),
+		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
 			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
@@ -353,6 +379,8 @@ func (c Config) LogValue() slog.Value {
 		// arrived, and it is the one thing a hostname would not tell them.
 		slog.Bool("email_provider_configured", c.Email.ProviderBaseURL != ""),
 		slog.String("email_sender", c.Email.Sender),
+		slog.Bool("sms_provider_configured", c.SMS.ProviderBaseURL != ""),
+		slog.String("sms_sender", c.SMS.Sender),
 	)
 }
 

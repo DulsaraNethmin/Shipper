@@ -6,6 +6,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/email"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/sms"
 )
 
 // The identity domain's routes (SHIP-30 onwards).
@@ -33,6 +34,13 @@ func init() {
 			Group:   GroupV1,
 			Auth:    Public,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Register() },
+		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/auth/request-otp",
+			Group:   GroupV1,
+			Auth:    Public,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).RequestOTP() },
 		},
 	)
 }
@@ -67,7 +75,7 @@ func identityHandler(d Deps) *identity.Handler {
 		panic("cmd/api: identity password hasher: " + err.Error())
 	}
 
-	svc, err := identity.NewService(d.Pool, hasher, newEmailSender(d.Config), d.Clock)
+	svc, err := identity.NewService(d.Pool, hasher, newEmailSender(d.Config), newSMSSender(d.Config), d.Clock)
 	if err != nil {
 		panic("cmd/api: identity service: " + err.Error())
 	}
@@ -109,6 +117,29 @@ func newEmailSender(cfg *config.Config) identity.EmailSender {
 		panic("cmd/api: email provider: " + err.Error() +
 			" — set EMAIL_PROVIDER_BASE_URL, EMAIL_PROVIDER_API_KEY and EMAIL_SENDER, or run " +
 			"with SHIPPER_ENV=development to log messages to the console instead")
+	}
+	return sender
+}
+
+// newSMSSender picks the SMS implementation for this environment (SHIP-35, SHIP-34).
+//
+// The same shape as newEmailSender and the same reasoning, with one difference in emphasis:
+// sms.UseConsole leaning towards the console matters more here, because a message costs money
+// per send and wakes a real handset belonging to whoever last used that number for testing.
+func newSMSSender(cfg *config.Config) identity.SMSSender {
+	if sms.UseConsole(cfg.Env) {
+		return sms.NewConsole()
+	}
+
+	sender, err := sms.NewProvider(sms.Options{
+		BaseURL: cfg.SMS.ProviderBaseURL,
+		APIKey:  cfg.SMS.ProviderAPIKey,
+		Sender:  cfg.SMS.Sender,
+	})
+	if err != nil {
+		panic("cmd/api: sms provider: " + err.Error() +
+			" — set SMS_PROVIDER_BASE_URL, SMS_PROVIDER_API_KEY and SMS_SENDER, or run with " +
+			"SHIPPER_ENV=development to log messages to the console instead")
 	}
 	return sender
 }
