@@ -29,8 +29,16 @@ web-lint: ## Run ESLint across the web applications
 web-typecheck: ## Type-check the web applications with TypeScript in strict mode
 	$(PNPM) -r run typecheck
 
+# The build sits between the lint and the type-check, and the order is load-bearing rather
+# than arbitrary (SHIP-15e, from the defect SHIP-23a found).
+#
+# Next.js 16 generates LayoutProps and the route types into .next/types during a build, so on a
+# checkout that has never been built `tsc --noEmit` has nothing to resolve them against and
+# fails. It is invisible locally, because a developer has always built at least once; CI on a
+# fresh clone was the first thing ever to run the target on an empty tree. Both web workflows
+# carried a `make web-build` step to work around it until this line was reordered.
 .PHONY: web-check
-web-check: web-lint web-typecheck web-build ## Everything CI should run for the web surfaces
+web-check: web-lint web-build web-typecheck ## Everything CI should run for the web surfaces
 
 # One target rather than one per application, so adding a surface needs no edit here.
 #
