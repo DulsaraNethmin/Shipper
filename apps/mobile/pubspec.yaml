@@ -26,14 +26,42 @@ dependencies:
   freezed_annotation: ^3.1.0
   json_annotation: ^4.12.0
 
+  # SHIP-48. Named by Docs/07 §3 rather than chosen here: the refresh token goes in the iOS
+  # Keychain and the Android Keystore and nowhere else. The Android floor of API 24 in
+  # android/app/build.gradle.kts exists for this package's requirement and for nothing else, so
+  # the two move together or not at all.
+  #
+  # Held at 10.x deliberately. Version 11 compiles against Android SDK 37 and fails the debug
+  # build against the 36 this project targets — and moving compileSdk is an Android-wide change
+  # that also wants a newer Gradle plugin, which belongs with the signing work at SHIP-24…27
+  # rather than inside a three-point storage ticket. 10.3.1 uses the same Keystore-wrapped
+  # ciphers, needs API 23, and its options are the ones token_store.dart asserts on.
+  flutter_secure_storage: ^10.3.1
+
 dev_dependencies:
   flutter_test:
+    sdk: flutter
+
+  # SHIP-48. `flutter test` runs on the host, where there is no Keychain and no Keystore, so
+  # the tests under test/ can only prove that the right call was made with the right options.
+  # integration_test runs the same Dart on a simulator against the real platform, which is the
+  # difference between demonstrating the *Done when* line and asserting it. Not part of
+  # `make flutter-check` — it needs a device, and the Flutter CI job is a Linux runner until
+  # SHIP-24…SHIP-27.
+  integration_test:
     sdk: flutter
 
   flutter_lints: ^6.0.0
   build_runner: ^2.15.1
   freezed: ^3.2.0
   json_serializable: ^6.14.1
+
+  # Already present transitively; declared because token_store_test.dart imports it, and
+  # depend_on_referenced_packages is right that an undeclared import is a dependency nobody
+  # decided on. It is the seam flutter_secure_storage routes every call through, so replacing
+  # the instance is how a test observes what actually reached the Keychain or the Keystore —
+  # SHIP-48's *Done when* is not otherwise demonstrable without a device.
+  flutter_secure_storage_platform_interface: ^2.0.3
 
 flutter:
   uses-material-design: true

@@ -100,7 +100,14 @@ environment test run once per build flavour — and SHIP-16 and SHIP-19 by insta
 version off both screens. `make verify` does not cover it: that script exercises HTTP
 endpoints, and none of these tickets adds one.
 
-### M0 — Foundation (27 of 32)
+**SHIP-48 adds a second Flutter command, and it is not in `make check`.**
+`make flutter-integration d=<device>` runs `apps/mobile/integration_test/` on a booted
+simulator, against the real Keychain and the real Keystore. It is out of `flutter-check` and
+out of `CHECKS` deliberately — it needs a device, and the Flutter CI job is a Linux runner
+until SHIP-24…27 — so it is a check a person invokes when the storage or the session changes.
+The file's own header says which invocation demonstrates which claim.
+
+### M0 — Foundation (28 of 32)
 
 | Ticket | What |
 |---|---|
@@ -123,6 +130,7 @@ endpoints, and none of these tickets adds one.
 | **SHIP-21** | Flutter CI — analyzer, tests, per-flavour environment tests, codegen diff |
 | **SHIP-22** | Admin panel scaffold — pnpm workspace, Next.js App Router, placeholder shell |
 | **SHIP-23** | Driver portal scaffold — placeholder job page, no token route, no account |
+| **SHIP-23a** | Web CI — one path-filtered workflow per surface, and a Go change starts neither — *see below* |
 
 ### Elsewhere
 
@@ -141,6 +149,8 @@ endpoints, and none of these tickets adds one.
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
+| **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
+| **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
 | **SHIP-56** | M2 | `jobs` — the twelve statuses of `Docs/02` §1 as a `CHECK`, held to the Go constants by test |
 | **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
@@ -292,6 +302,108 @@ SHIP-15a. That is the shape `httpx.RegisterCode` was in until SHIP-15c: document
 built, and absent, because no domain had needed it yet. `internal/httpx` is a shared surface and
 not a domain branch's to edit, so the two are written unexported in `internal/identity/http.go`
 and flagged in §9 — the second domain to want them should promote them rather than copy them.
+
+### What SHIP-48 built, and how it was demonstrated
+
+It reaches no HTTP endpoint — the endpoints that issue a refresh token are SHIP-41 and
+SHIP-42 — so `make verify` does not cover it, in the same way it does not cover SHIP-16 or
+SHIP-19. It is demonstrated by `make flutter-check`, by `make flutter-integration` on a device,
+and by inspecting the stored value on an emulator.
+
+**"Never in preferences" is enforced from four directions, not asserted once.** The *Done when*
+line is the kind that a plausible implementation satisfies while being wrong, so:
+
+| Check | Where | Fails when |
+|---|---|---|
+| The real platform seam records key, value and options | `test/core/auth/token_store_test.dart` | Anything but `flutter_secure_storage` is behind the store |
+| `shared_preferences` is absent from `lib/` **and from the lockfile** | `token_store_is_not_preferences_test.dart` | Somebody runs `pub add`, before writing a line |
+| One folder imports the package; that folder opens no file | same | A second set of options, or a token cached to disk |
+| The real Keychain and Keystore, on a device | `integration_test/session_test.dart` | The token never leaves the process |
+
+The mutation was run rather than imagined: replacing `SecureTokenStore` with an in-memory map
+fails eight tests across both files.
+
+**On Android the storage was inspected on the device.** After a token is stored,
+`/data/data/au.com.shipper/shared_prefs/FlutterSecureStorage.xml` holds ciphertext under an
+`androidx.security.crypto` keyset, and the plaintext token appears nowhere in the application's
+data directory. On iOS the equivalent is two invocations of `make flutter-integration` with
+`only=`, the second reading in a new process what the first wrote.
+
+**Two things were found while building it.**
+
+`Docs/07` §9 justified the Android floor of API 24 with `EncryptedSharedPreferences`, and the
+package no longer uses it — Google deprecated the library behind it. The floor is unchanged,
+because the Keystore-wrapped ciphers that replaced it need API 23 just the same, but the
+sentence justifying the floor had stopped being true. `Docs/07` §9 is corrected and says that
+it was wrong, rather than quietly reading as though it never was.
+
+`flutter_secure_storage` is held at **10.x**, not 11. Version 11 compiles against Android SDK
+37 and fails the build against the 36 this project targets. Moving `compileSdk` is an
+Android-wide change that also wants a newer Gradle plugin, which belongs with the signing work
+rather than inside a three-point storage ticket — §9 carries it.
+
+### What SHIP-49 built
+
+Demonstrated the same way, plus the part only a device shows: the built `.apk` and `.app`
+installed on a Pixel emulator and an iPhone 17 simulator, cold-started into each shell.
+Force-stopping the Android build and relaunching it lands in the signed-in shell; signing out
+removes the keystore entry and the next cold start lands signed out.
+
+**The session has three states and the third is the point.** Reading the keychain is
+asynchronous, so a two-state model has to guess for the few frames before the answer arrives —
+and both guesses are visible to the user, as a sign-in screen that flashes or a shell with no
+data in it. `SessionRestoring` is the honest answer for that window and the router holds a
+splash while it is the answer. The guard itself is a pure function of the session and the
+location, tested as a table, and **it is navigation rather than authorisation**: reaching a
+shell by any means still fails server-side on the first request it makes.
+
+**There is a debug-only button that stores a placeholder token, and it is worth knowing about.**
+This wave has no endpoint that issues a refresh token — SHIP-51 and SHIP-55 are the screens
+that will — so a cold start into the signed-in shell needs something in the keychain to read.
+The signed-out screen carries one, behind `kDebugMode`, which is a compile-time constant: a
+profile or release build tree-shakes the widget and its string away entirely, so there is no
+flag to misconfigure. The value it writes is not a credential and the platform will refuse it
+the moment SHIP-50 refreshes with it, which is the correct outcome — a device believing it has
+a session has never been the same thing as having one.
+
+**Both shells are placeholders and neither is role-aware.** `Docs/07` §1 requires the customer
+and provider halves to be genuinely separate inside the one app, and the role that selects
+between them is returned by the platform, so that split is SHIP-52. The connectivity screen
+(SHIP-19) moved to `/health` and is reachable from both shells and during the restore, because
+putting it behind the session would have made "can this build reach the API" unanswerable on a
+fresh install — which is exactly when it is asked.
+
+### What SHIP-23a built
+
+Two workflows, `web-admin.yml` and `web-driver-portal.yml`, path-filtered per surface as
+`.github/workflows/README.md` has anticipated since SHIP-1.
+
+**The filter was demonstrated rather than assumed**, by evaluating every workflow's `paths:`
+block against representative changed-file sets:
+
+| A change to | Go | Flutter | Admin panel | Driver portal |
+|---|---|---|---|---|
+| `services/core/**` | runs | — | — | — |
+| `apps/mobile/**` | — | runs | — | — |
+| `apps/admin/**` | — | — | runs | — |
+| `apps/driver-portal/**` | — | — | — | runs |
+| `pnpm-lock.yaml` | — | — | runs | runs |
+| `Docs/**` | — | — | — | — |
+
+The first row is the *Done when* line: **a Go-only change starts neither web workflow.**
+
+**Both run `make web-check`, which covers both surfaces**, because `mk/web.mk` drives pnpm with
+`-r` across the workspace and names no application — deliberately, so a third surface is a line
+in `pnpm-workspace.yaml`. So a change to the admin panel also checks the driver portal. That is
+redundancy rather than a gap, and the saving worth having is against Go and Flutter changes,
+which the filter already collects.
+
+**It also found a defect, which is the sort of thing a first clean-tree run finds.**
+`make web-check` is lint → typecheck → build, and on a checkout that has never been built the
+typecheck fails: Next.js 16 generates `LayoutProps` and the route types into `.next/types`
+during a build, and `tsc --noEmit` has nothing to resolve them against until one has run. It is
+invisible locally, because a developer has always built at least once. The workflows run the
+build first as a workaround and say so; the fix is one line in `mk/web.mk` and is in §9.
 
 ### What the jobs lifecycle foundation built (SHIP-56, SHIP-57, SHIP-57a)
 
@@ -501,7 +613,13 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **~~`httpx.RegisterCode` is documented but does not exist.~~ Decided and built at SHIP-15c.** The registry, the uniqueness tests in `cmd/api`, and the generated `Docs/10-api-error-codes.md` all exist; `Docs/10` §4.4 is now true and says so, including that it was not. The choice was between building the mechanism and amending the document to match reality, and building won because SHIP-30 and SHIP-57 both need it on separate tracks in the same wave.
 
-**~~A ticket for the web CI workflows.~~ Written as SHIP-23a at SHIP-15c.** Two points, path-filtered per surface, dependencies SHIP-22 and SHIP-23 both met. It belongs to a client track rather than to platform work.
+**~~A ticket for the web CI workflows.~~ Written as SHIP-23a at SHIP-15c, and built — see §3.** Two workflows, path-filtered per surface, and the filter demonstrated against a changed-file matrix rather than believed.
+
+**`make web-check` runs its type-check before its build, and that order is wrong.** Next.js 16 generates `LayoutProps` and the route types into `.next/types` during a build, so `tsc --noEmit` fails on any tree that has never been built. Nobody had noticed, because a developer always has built. **The fix is one line** — `web-check: web-lint web-build web-typecheck` in `mk/web.mk`. SHIP-23a did not make it: `mk/web.mk` belongs to the web surfaces rather than to a CI ticket, and both workflows carry a `make web-build` step and a comment naming this entry instead. **Delete the workaround in the same change that reorders the target.**
+
+**`flutter_secure_storage` is held at 10.x because version 11 needs `compileSdk = 37`.** The client compiles against 36 today, and Android Gradle Plugin 9.0.1 names 36 as its own maximum recommended — so taking 11 means moving the SDK and probably the Gradle plugin together. There is no urgency: 10.3.1 uses the same Keystore-wrapped ciphers and the same API 23 requirement. **Decide it with SHIP-24 and SHIP-26**, which are the tickets that touch the Android build configuration anyway.
+
+**Biometric unlock is still open, and SHIP-48 is where `Docs/07` §9 said it would close.** It did not, and the reason is that the thing it would sit in front of does not exist yet: an optional local unlock is a gate on a sign-in screen, and the first sign-in screen is SHIP-55. Nothing in the session design moves either way — `Docs/07` §3 already fixes its position as a convenience over the stored token and never a substitute for it — so the cost of leaving it is another wave of nothing happening. `flutter_secure_storage` offers it as an option on the store this ticket built (`AndroidOptions.biometric`, and iOS access-control flags), which means adopting it later is a change to two constants rather than a change to the design. **Decide at SHIP-55.**
 
 **`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.** 660 lines in one file, and every ticket with an HTTP acceptance criterion appends to it. SHIP-15c left it alone deliberately: wave 2's split gives it exactly one client, so splitting it would have been a large change to a shared file for no benefit this wave. **It stops being deferrable the moment two tracks both add endpoints** — which is wave 3. Split it the same way `mk/*.mk` is split, or accept a conflict in the one file that demonstrates every acceptance criterion.
 
@@ -535,7 +653,8 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-31 SHIP-32 SHIP-33 SHIP-34 SHIP-35 SHIP-36 SHIP-37 SHIP-38 SHIP-44 SHIP-45
+SHIP-20 SHIP-22 SHIP-23 SHIP-23a SHIP-28 SHIP-29 SHIP-30 SHIP-31 SHIP-32 SHIP-33 SHIP-34 SHIP-35 SHIP-36 SHIP-37 SHIP-38 SHIP-44 SHIP-45
+SHIP-48 SHIP-49
 SHIP-56 SHIP-57 SHIP-57a SHIP-67a
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
