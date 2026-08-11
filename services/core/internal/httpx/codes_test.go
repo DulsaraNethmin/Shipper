@@ -177,10 +177,12 @@ func TestEveryProtocolCodeIsRegistered(t *testing.T) {
 	}
 }
 
-// Docs/10 §4.4 says "the fifteen that exist today", and that number is quoted in Docs/11 §3 as
-// well. Pinning it means the document and the code cannot disagree quietly: adding a protocol
-// code is a deliberate act that updates both.
-func TestTheProtocolSetIsTheFifteenDocumented(t *testing.T) {
+// Docs/10 §4.4 states the size of the protocol set in prose. Pinning it means the document and
+// the code cannot disagree quietly: adding a protocol code is a deliberate act that updates both.
+//
+// It has already earned its keep once — SHIP-44 added token_expired and this is what said so,
+// naming the three other places that had to change with it.
+func TestTheProtocolSetIsTheDocumentedSize(t *testing.T) {
 	var protocol []string
 	for _, info := range RegisteredCodes() {
 		if info.Protocol {
@@ -188,9 +190,13 @@ func TestTheProtocolSetIsTheFifteenDocumented(t *testing.T) {
 		}
 	}
 
-	if len(protocol) != 15 {
-		t.Errorf("there are %d protocol codes, and Docs/10 §4.4 says fifteen: %v\n"+
-			"Adding one is fine — update §4.4 and this test in the same change.",
-			len(protocol), protocol)
+	const documented = 16 // Docs/10 §4.4
+
+	if len(protocol) != documented {
+		t.Errorf("there are %d protocol codes and Docs/10 §4.4 says %d: %v\n"+
+			"Adding one is fine. Update, in the same change: this constant, the count in\n"+
+			"Docs/10 §4.4, x-protocol-codes in contracts/components/schemas/error.yaml, and\n"+
+			"Docs/10-api-error-codes.md (regenerated, not edited).",
+			len(protocol), documented, protocol)
 	}
 }

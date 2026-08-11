@@ -39,6 +39,7 @@ them where the call is made, beside the thing the user was trying to do.
 | `payload_too_large` | The request body exceeds the limit. Images go directly to object storage by pre-signed URL and never through the API. |
 | `rate_limited` | Too many requests. Carries a Retry-After header wherever one can be given honestly. |
 | `service_unavailable` | A dependency this request needs is not answering. Unlike `internal_error` it means try again. |
+| `token_expired` | The access token was genuine and has expired. Refresh it and retry; do not sign the user out. |
 | `unauthenticated` | No usable credential was presented. Distinct from `forbidden` so a client knows to refresh a token rather than give up. |
 | `unsupported_media_type` | This endpoint accepts application/json. |
 | `validation_failed` | The request was well formed and the platform rejected it. Carries `details`, one entry per offending field. |
