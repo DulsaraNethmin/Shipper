@@ -165,7 +165,7 @@ Each concurrent piece of work gets its own git worktree, never the primary tree.
 
 | Item | Rule |
 |---|---|
-| Test database | Set `TEST_DATABASE_URL` per worktree in its gitignored `deploy/.env`. One variable is the whole isolation mechanism |
+| Test database | **Leave `TEST_TEMPLATE_DB` unset.** The `Makefile` derives it from the directory name, and that is the whole isolation mechanism — `CREATE DATABASE … TEMPLATE` resolves at cluster scope, and every worktree shares one cluster. Two worktrees with the same template name are one database: `make test` in either drops it mid-clone in the other. `TEST_DATABASE_URL` does **not** isolate on a shared cluster, whatever an older version of this table said |
 | Ports | `HTTP_PORT` and `VERIFY_PORT` per worktree, likewise |
 | Compose | One shared stack. `COMPOSE_PROJECT_NAME` is pinned in the `Makefile` so worktrees do not each start their own and fight over 5432, 6379 and 29092 |
 | **`git stash`** | **Never.** The stash is shared across worktrees through one `.git`, and this repository already carries the scar — `CLAUDE.md` was committed with `Stashed changes` conflict markers in it |

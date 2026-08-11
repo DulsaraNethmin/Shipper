@@ -261,7 +261,13 @@ Every constructor that deals in time takes a `clock.Clock`. Four scheduled tasks
 
 `Docs/06` §4.1 requires it: "a mock happily accepts a write that the actual constraint would reject."
 
-`make test-db-template` builds `shipper_test_template` once by running every migration into it. `pgtest.DB(t)` then clones it per test binary with `CREATE DATABASE … TEMPLATE …` — a file copy measured in milliseconds, not a migration run — and drops the clone in `t.Cleanup`.
+`make test-db-template` builds the template once by running every migration into it. `pgtest.DB(t)` then clones it per test binary with `CREATE DATABASE … TEMPLATE …` — a file copy measured in milliseconds, not a migration run — and drops the clone in `t.Cleanup`.
+
+**`TEST_TEMPLATE_DB` is what isolates two worktrees, and it is derived rather than set.** `CREATE DATABASE … TEMPLATE …` resolves the template name at *cluster* scope, and `COMPOSE_PROJECT_NAME` is pinned precisely so that every worktree shares one cluster. Two worktrees with the same template name are two worktrees using one database: `make test` in either drops and rebuilds it while the other is midway through cloning it, and the second run fails somewhere unrelated to what it was testing.
+
+So the `Makefile` derives the name from the directory. `git worktree add` does not create `deploy/.env`, and the cost of forgetting a variable lands on the *other* worktree rather than on the one that forgot — which is the case for a default that cannot be omitted rather than an instruction.
+
+**`TEST_DATABASE_URL` does not isolate anything on a shared cluster.** It selects *which* PostgreSQL the template and its clones live in, and is only useful when a worktree points at a separate one. Three documents and a failure message described it as the isolation mechanism until SHIP-15c; it never was, and one worktree had been running without a distinct template name on the strength of it.
 
 This is needed even with one developer: `go test ./...` already runs packages in parallel, so two packages sharing one database will interfere. `go test -p 4` caps how many do so at once.
 

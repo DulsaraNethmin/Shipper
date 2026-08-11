@@ -37,8 +37,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// TemplateName is the database `make test-db-template` builds, and the one every clone is
-// copied from. Override with TEST_TEMPLATE_DB.
+// TemplateName is the fallback template name, used only when TEST_TEMPLATE_DB is unset.
+//
+// `make test` always exports one, derived from the worktree's directory name — see the note on
+// templateName. So this is reached only by a bare `go test`, where the template it names has
+// almost certainly never been built, and the failure in unavailable is the intended outcome
+// rather than an accident: a name that resolved to somebody else's template would be worse.
 const TemplateName = "shipper_test_template"
 
 // DB returns a pool over a fresh database cloned from the template, and drops it when the test
@@ -138,9 +142,10 @@ func unavailable(t *testing.T, err error) {
 // baseURL is the database to connect to in order to create others, and the template for a
 // clone's own URL.
 //
-// TEST_DATABASE_URL comes first so that each git worktree can point at its own PostgreSQL, or
-// its own set of databases on a shared one, by setting a single variable in its gitignored
-// deploy/.env (Docs/10 §7.1).
+// TEST_DATABASE_URL comes first so a worktree can point at an entirely separate PostgreSQL. It
+// does **not** isolate two worktrees sharing one cluster, which is the usual arrangement here —
+// COMPOSE_PROJECT_NAME is pinned so that every worktree uses the same containers. What isolates
+// them is TEST_TEMPLATE_DB; see templateName (Docs/10 §7.1).
 func baseURL() string {
 	if u := os.Getenv("TEST_DATABASE_URL"); u != "" {
 		return u
@@ -151,6 +156,16 @@ func baseURL() string {
 	return "postgres://shipper:shipper@localhost:5432/shipper?sslmode=disable"
 }
 
+// templateName is the template every clone in this process is copied from.
+//
+// This is the variable that separates two git worktrees running tests at once, and the reason is
+// worth stating where somebody will find it. `CREATE DATABASE … TEMPLATE …` resolves the name at
+// *cluster* scope, and every worktree shares one cluster deliberately. Two worktrees with the
+// same template name are two worktrees using one database: `make test` in either drops and
+// rebuilds it while the other is midway through a clone.
+//
+// The Makefile derives a per-directory default, so this is set for anything run through `make`
+// and nobody has to remember it.
 func templateName() string {
 	if n := os.Getenv("TEST_TEMPLATE_DB"); n != "" {
 		return n
