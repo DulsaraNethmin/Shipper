@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -95,7 +96,7 @@ func accountFrom(u User) accountResponse {
 		Status:        u.Status.String(),
 		EmailVerified: u.EmailVerified(),
 		PhoneVerified: u.PhoneVerified(),
-		CreatedAt:     u.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z07:00"),
+		CreatedAt:     timestamp(u.CreatedAt),
 	}
 }
 
@@ -456,6 +457,113 @@ func (h *Handler) Logout() http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 		return nil
 	})
+}
+
+// deviceResponse is one row of the caller's device list (SHIP-46).
+//
+// What is here is what somebody deciding "is that me?" needs: a name they chose, when the device
+// was first used, when it was last used, and which row is the one they are looking at it from.
+// The refresh token hash is not here in any form, and neither is the session's expiry — a session
+// is on this list because it has not lapsed, and an instant that only ever gets compared with now
+// invites a client to do arithmetic on it.
+type deviceResponse struct {
+	ID          string `json:"id"`
+	DeviceLabel string `json:"device_label"`
+
+	CreatedAt  string `json:"created_at"`
+	LastSeenAt string `json:"last_seen_at"`
+
+	Current bool `json:"current"`
+}
+
+// deviceListResponse is the collection envelope of Docs/10 §4.5.
+//
+// The envelope is used even though this endpoint does not page, because §4.7 makes it the shape of
+// every collection and a bare array would be the one exception a client generator has to be told
+// about. `next_cursor` is always null: keyset paging belongs to internal/pagination, which is
+// registered in internal/boundaries and not yet written. See [maxDevicesListed] for why `has_more`
+// is a truncation report rather than an invitation to ask for the rest.
+type deviceListResponse struct {
+	Data       []deviceResponse `json:"data"`
+	NextCursor *string          `json:"next_cursor"`
+	HasMore    bool             `json:"has_more"`
+}
+
+// Devices handles GET /v1/auth/sessions (SHIP-46).
+//
+// Read-only, so no Idempotency-Key: the middleware lets safe methods through untouched, and a key
+// on a request that changes nothing would be a key stored for no reason.
+func (h *Handler) Devices() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		who, err := callerFrom(r)
+		if err != nil {
+			return err
+		}
+
+		devices, truncated, err := h.svc.Devices(r.Context(), who.UserID, who.SessionID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		// A non-nil empty slice, so the field is `[]` rather than `null`. A client that has to
+		// handle both is a client that will one day handle only one.
+		out := make([]deviceResponse, 0, len(devices))
+		for _, d := range devices {
+			out = append(out, deviceResponse{
+				ID:          d.ID.String(),
+				DeviceLabel: d.DeviceLabel,
+				CreatedAt:   timestamp(d.CreatedAt),
+				LastSeenAt:  timestamp(d.LastSeenAt),
+				Current:     d.Current,
+			})
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, deviceListResponse{Data: out, HasMore: truncated})
+		return nil
+	})
+}
+
+// RevokeDevice handles DELETE /v1/auth/sessions/{id} (SHIP-46).
+//
+// # Why DELETE, when nothing is deleted
+//
+// The verb describes what happens to the resource the client is looking at — the device leaves
+// their list — and that is the question a REST verb answers. The row is marked revoked and kept,
+// per Docs/10 §3.3, because "signed out three weeks ago" is what makes the trail readable and
+// because 000104's ON DELETE RESTRICT will not let a session go while its spent tokens name it.
+// The contract says so where a client will read it.
+func (h *Handler) RevokeDevice() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		who, err := callerFrom(r)
+		if err != nil {
+			return err
+		}
+
+		sessionID, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			// The same answer an identifier belonging to somebody else gets. A separate
+			// "that is not a uuid" would tell a caller probing identifiers which of their
+			// guesses were at least the right shape — and there is nothing they could do
+			// differently either way.
+			return apiError(ErrSessionNotFound)
+		}
+
+		if err := h.svc.RevokeDevice(r.Context(), who.UserID, sessionID); err != nil {
+			return apiError(err)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+		return nil
+	})
+}
+
+// timestamp renders an instant the way every response in this domain renders one.
+//
+// One function rather than a format string repeated per struct: two copies is how a field ends up
+// with milliseconds in one response and not in another, which a client parsing both has to
+// discover for itself.
+func timestamp(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000Z07:00")
 }
 
 // apiError turns this domain's errors into the API's error contract.

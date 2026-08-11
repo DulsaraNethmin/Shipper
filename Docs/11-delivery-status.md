@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **148 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **161 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -174,6 +174,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-41** | M1 | `POST /v1/auth/login` — the endpoint a session starts at, and one answer for every credential failure — *see below* |
 | **SHIP-42** | M1 | `POST /v1/auth/refresh` — the first endpoint that issues a session credential — *see below* |
 | **SHIP-43** | M1 | `POST /v1/auth/logout` — the first route in the service that requires a credential — *see below* |
+| **SHIP-46** | M1 | `GET /v1/auth/sessions` and `DELETE /v1/auth/sessions/{id}` — the device list, and the owner check on the query — *see below* |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
@@ -665,6 +666,55 @@ window is the fifteen minutes in `expires_in`, and it is the price of not doing 
 every authenticated request. A client discards both rather than relying on the platform to refuse
 the one it still holds.
 
+### What SHIP-46 built, and where the authorisation decision lives
+
+**`GET /v1/auth/sessions` and `DELETE /v1/auth/sessions/{id}`** — the twelfth and thirteenth
+routes, and the first pair where a caller names a row that might not be theirs. Sign-out could not:
+its session comes from the `sid` claim of a token the platform signed. This one takes an identifier
+from the URL, which is the first time in the service that "may this caller do this to this row" is
+a real question.
+
+**The answer is a predicate on the query, in both directions.** `liveDeviceSessionsByUser` carries
+`user_id = $1` and `deviceSessionOwnedBy` carries `user_id = $2`; neither endpoint checks ownership
+in the handler and then acts. Docs/07 §3 puts the decision on the platform, and a decision written
+into the statement is one no later caller can leave out. Both are mutation-checked — with the
+predicate removed, one account is handed another's device list, and one account signs another's
+devices out, from requests that look entirely ordinary.
+
+**A session belonging to somebody else answers exactly what one that never existed answers**:
+`404`, `identity_session_not_found`. Distinguishing them would make the endpoint a way of finding
+out which identifiers name real sessions, which is the disclosure sign-in refuses to make about
+addresses. An identifier that is not a UUID at all gets the same answer, refused before the pool is
+touched.
+
+**The list leaves out what cannot act as the account** — revoked sessions, and sessions whose
+refresh token has lapsed. The list's question is "which devices can act as me, and let me stop
+one", and neither kind can do the first; offering them invites revoking something already dead and
+pads a list whose whole value is that an unrecognised row stands out. The rows are still there,
+marked rather than deleted, for support and for SHIP-149.
+
+**Reading the list deliberately does not write `last_seen_at`.** SHIP-39's §3 entry anticipated
+that it would, as the reason expiry must not be derived from that column, and 000103's header makes
+the stronger version of the point. It does not: a read is not activity, and a display column that
+every read writes to stops meaning anything. Rotation already records the real thing, at least
+every fifteen minutes of use. There is a `make verify` check and a test for it.
+
+**`DELETE`, and nothing is deleted.** The verb describes what happens to the list the client is
+looking at, which is the question a REST verb answers; the row is marked `revoked_by_owner` and
+kept. `Docs/10` §3.3 requires that, and 000104's `ON DELETE RESTRICT` would refuse the alternative
+anyway while spent tokens still name the session. The contract says so where a client will read it.
+
+**Revoking the current session is permitted**, and is the same action as signing out. Refusing it
+would produce a device list with exactly one row that cannot be acted on. What differs is the
+reason recorded — `signed_out` against `revoked_by_owner` — which is the whole point of SHIP-40
+having enumerated both.
+
+**The response uses `Docs/10` §4.5's collection envelope with `next_cursor` always null**, and the
+`has_more` beside it is a bound on the response rather than an invitation to page. Every sign-in
+creates a session and nothing stops a client signing in a thousand times instead of refreshing, so
+the query is capped at a hundred rows. Keyset paging belongs to `internal/pagination`, which is
+registered in `internal/boundaries` and still unwritten; §9 carries it.
+
 ### What SHIP-48 built, and how it was demonstrated
 
 It reaches no HTTP endpoint — the endpoints that issue a refresh token are SHIP-41 and
@@ -1041,6 +1091,15 @@ was between building the mechanism and amending `Docs/10` §4.3 to match reality
 won for the same reason it did with `RegisterCode` at SHIP-15c. The body limit — the part that
 actually bites, since a second literal is a second place for it to drift — is now one constant
 in `internal/httpx` rather than two that agree by comment.
+
+**The device list is bounded but not pageable.** `GET /v1/auth/sessions` returns the collection
+envelope with `next_cursor` always null and a hundred-row cap, because `internal/pagination` is
+registered in `internal/boundaries` and not yet written (SHIP-46). `has_more` therefore reports a
+truncation a caller cannot page past. It is unreachable for a person — a hundred *live* sessions
+means signing in a hundred times in thirty days without refreshing — and the alternative was
+writing the shared pagination package mid-wave. **Whoever writes `internal/pagination` should adopt
+it here**, and the first endpoint with a genuinely unbounded collection (SHIP-64's job list) is
+where the decision actually has to be made.
 
 **`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 

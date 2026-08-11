@@ -1148,3 +1148,163 @@ status="$(curl -s -X POST -o "$WORKDIR/logout-nokey.json" -w '%{http_code}' \
 [[ "$(json "$WORKDIR/logout-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
   || fail "expected code=idempotency_key_required"
 ok "it needs an Idempotency-Key like every other mutation, checked before the auth class"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-46  a user can list their devices and revoke any one of them"
+
+# A fresh account, because this section counts rows. $registered_id has accumulated sessions from
+# SHIP-41, SHIP-42 and SHIP-43, and a count against it would be a check that passes because of
+# arithmetic somebody has to redo whenever a section above changes.
+devices_email="devices-$$@example.com"
+status="$(post_json "verify-devices-register-$$" /v1/auth/register \
+  "{\"email\":\"$devices_email\",\"phone\":\"04950$$\",\"password\":\"$login_password\",\"role\":\"provider\"}" \
+  "$WORKDIR/devices-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/devices-register.json"; fail "could not register the device-list account ($status)"; }
+devices_user="$(json "$WORKDIR/devices-register.json" '["id"]')"
+
+for device in one two three; do
+  status="$(post_json "verify-devices-$device-$$" /v1/auth/login \
+    "{\"email\":\"$devices_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Device $device\"}" \
+    "$WORKDIR/devices-$device.json")"
+  [[ "$status" == "200" ]] || fail "could not sign in device $device ($status)"
+done
+
+devices_access="$(json "$WORKDIR/devices-one.json" '["access_token"]')"
+devices_current_sid="$(python3 - "$devices_access" <<'PYTHON'
+import base64, json, sys
+
+_header, payload, _signature = sys.argv[1].split(".")
+print(json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["sid"])
+PYTHON
+)"
+
+# get_auth <token> <path> <outfile> — a read with a bearer credential and no Idempotency-Key,
+# because the middleware lets safe methods through untouched.
+get_auth() {
+  curl -s -o "$3" -w '%{http_code}' -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT$2"
+}
+
+status="$(get_auth "$devices_access" /v1/auth/sessions "$WORKDIR/devices-list.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/devices-list.json"; fail "GET /v1/auth/sessions returned $status, want 200"; }
+
+# One line of whitespace-free tokens, because the labels themselves contain spaces and a `read`
+# over them would silently absorb the fields that follow.
+listed="$(python3 -c 'import json,sys
+body = json.load(open(sys.argv[1]))
+rows = body["data"]
+current = [r["id"] for r in rows if r["current"]]
+print(len(rows), len(current), current[0] if current else "-",
+      body["has_more"], "next" if body["next_cursor"] else "null",
+      ",".join(sorted(r["device_label"] for r in rows)).replace(" ", "_"))' \
+  "$WORKDIR/devices-list.json")"
+read -r listed_count current_count current_id has_more next_cursor listed_labels <<<"$listed"
+[[ "$listed_count" == "3" ]] || fail "the list has $listed_count devices, want the 3 that signed in"
+[[ "$listed_labels" == "Verify_Device_one,Verify_Device_three,Verify_Device_two" ]] \
+  || fail "the labels are '$listed_labels', not the ones the devices signed in with"
+ok "every device that signed in is listed, under the label it sent"
+
+[[ "$current_count" == "1" && "$current_id" == "$devices_current_sid" ]] \
+  || fail "$current_count rows claim to be the current device (id '$current_id', want '$devices_current_sid')"
+ok "exactly one row is marked current, and it is the device that made the request"
+
+[[ "$has_more" == "False" && "$next_cursor" == "null" ]] \
+  || fail "the collection envelope says has_more=$has_more next_cursor=$next_cursor"
+ok "the response uses the collection envelope, with nothing left unpaged"
+
+# Reading a list is not activity. 000103's header is explicit that nothing derived from
+# last_seen_at may extend a credential, and a display column every read writes to means nothing.
+before_seen="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select max(last_seen_at)::text from device_sessions where user_id = '$devices_user';")"
+get_auth "$devices_access" /v1/auth/sessions "$WORKDIR/devices-list-2.json" >/dev/null
+after_seen="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select max(last_seen_at)::text from device_sessions where user_id = '$devices_user';")"
+[[ "$after_seen" == "$before_seen" ]] || fail "reading the device list moved last_seen_at"
+ok "reading the list does not move last seen — a read is not activity"
+
+# Somebody else's devices are not on it. This is the failure a single-account check cannot see.
+status="$(get_auth "$(json "$WORKDIR/logout-b.json" '["access_token"]')" /v1/auth/sessions \
+  "$WORKDIR/devices-other.json")"
+[[ "$status" == "200" ]] || fail "the other account could not list its devices ($status)"
+python3 -c 'import json,sys
+labels = [r["device_label"] for r in json.load(open(sys.argv[1]))["data"]]
+sys.exit(1 if any(l.startswith("Verify Device") for l in labels) else 0)' "$WORKDIR/devices-other.json" \
+  || fail "one account was handed another account's device list"
+ok "the list carries the caller's devices and nobody else's"
+
+# Revoking. The device chosen is not the one making the request, which is the case the endpoint
+# exists for — signing out the device in your hand is SHIP-43.
+doomed_id="$(python3 -c 'import json,sys
+print(next(r["id"] for r in json.load(open(sys.argv[1]))["data"]
+           if r["device_label"] == "Verify Device two"))' "$WORKDIR/devices-list.json")"
+doomed_refresh="$(json "$WORKDIR/devices-two.json" '["refresh_token"]')"
+
+status="$(curl -s -X DELETE -o "$WORKDIR/devices-revoke.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-devices-revoke-$$" -H "$auth_header: Bearer $devices_access" \
+  "http://localhost:$VERIFY_PORT/v1/auth/sessions/$doomed_id")"
+[[ "$status" == "204" ]] || { cat "$WORKDIR/devices-revoke.json"; fail "DELETE /v1/auth/sessions/{id} returned $status, want 204"; }
+ok "a device is revoked from the list with DELETE, answering 204"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(revoked_reason, 'live') from device_sessions where id = '$doomed_id';")" == "revoked_by_owner" ]] \
+  || fail "the session is not marked revoked_by_owner"
+ok "the row is marked 'revoked_by_owner' — distinct from a sign-out, and not deleted"
+
+status="$(post_json "verify-devices-revoked-refresh-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$doomed_refresh\"}" "$WORKDIR/devices-revoked-refresh.json")"
+[[ "$status" == "400" ]] || fail "the revoked device could still refresh ($status)"
+ok "the revoked device's refresh token stops working"
+
+status="$(get_auth "$devices_access" /v1/auth/sessions "$WORKDIR/devices-list-3.json")"
+[[ "$status" == "200" ]] || fail "listing after the revoke returned $status"
+remaining="$(python3 -c 'import json,sys
+body = json.load(open(sys.argv[1]))
+print(len(body["data"]),
+      ",".join(sorted(r["device_label"] for r in body["data"])).replace(" ", "_"))' \
+  "$WORKDIR/devices-list-3.json")"
+[[ "$remaining" == "2 Verify_Device_one,Verify_Device_three" ]] \
+  || fail "the list is now '$remaining', want the two devices that were not revoked"
+ok "it leaves the list, and the devices that were not revoked stay on it"
+
+# Somebody else's session, and one that does not exist, answer identically — or this endpoint is a
+# way of finding out which identifiers name real sessions.
+status="$(curl -s -X DELETE -o "$WORKDIR/devices-not-mine.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-devices-not-mine-$$" -H "$auth_header: Bearer $devices_access" \
+  "http://localhost:$VERIFY_PORT/v1/auth/sessions/$signed_out_sid")"
+[[ "$status" == "404" ]] || fail "revoking another account's session returned $status, want 404"
+not_mine_code="$(json "$WORKDIR/devices-not-mine.json" '["error"]["code"]')"
+
+status="$(curl -s -X DELETE -o "$WORKDIR/devices-unknown.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-devices-unknown-$$" -H "$auth_header: Bearer $devices_access" \
+  "http://localhost:$VERIFY_PORT/v1/auth/sessions/$(uuidgen | tr 'A-Z' 'a-z')")"
+[[ "$status" == "404" ]] || fail "revoking a session that does not exist returned $status, want 404"
+unknown_code="$(json "$WORKDIR/devices-unknown.json" '["error"]["code"]')"
+
+[[ "$not_mine_code" == "identity_session_not_found" && "$unknown_code" == "$not_mine_code" ]] \
+  || fail "another account's session answers '$not_mine_code' and an unknown one '$unknown_code'"
+ok "another account's session and one that never existed are one answer, and neither was revoked"
+
+still_there="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(revoked_reason, 'live') from device_sessions
+    where user_id = '$registered_id' and device_label = 'Verify Still In';")"
+[[ "$still_there" == "live" ]] || fail "the other account's device was revoked by a stranger"
+ok "the session a stranger named is still live — the owner check is on the query, not above it"
+
+# The idempotency middleware applies to DELETE like every other mutation.
+status="$(curl -s -X DELETE -o "$WORKDIR/devices-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $devices_access" \
+  "http://localhost:$VERIFY_PORT/v1/auth/sessions/$doomed_id")"
+[[ "$status" == "400" ]] || fail "revoking without an Idempotency-Key returned $status"
+[[ "$(json "$WORKDIR/devices-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || fail "expected code=idempotency_key_required"
+ok "revoking needs an Idempotency-Key, so a retry is not a second decision"
+
+# Both routes are unreachable without a credential — 401 with the challenge RFC 9110 requires.
+status="$(curl -s -o "$WORKDIR/devices-anon.json" -D "$WORKDIR/devices-anon.headers" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/auth/sessions")"
+[[ "$status" == "401" ]] || fail "the device list answered $status to a caller with no credential"
+grep -qi '^WWW-Authenticate: Bearer' "$WORKDIR/devices-anon.headers" \
+  || fail "no WWW-Authenticate challenge on the 401"
+[[ "$(json "$WORKDIR/devices-anon.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || fail "expected code=unauthenticated"
+ok "the device list is unreachable without a credential"

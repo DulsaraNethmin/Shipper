@@ -313,6 +313,136 @@ Logout:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+Sessions:
+  get:
+    operationId: listDevices
+    summary: List the devices signed in to this account
+    tags: [Identity]
+    security:
+      - BearerAccessToken: []
+    description: |
+      The device sessions that can currently act as the account, most recently used first
+      (SHIP-46).
+
+      Exactly one entry has `current: true` — the device this request came from. A client should
+      label it, and should confirm before revoking it, because revoking it signs this device
+      out.
+
+      ## What is not listed
+
+      Sessions that have been revoked, and sessions whose refresh token has lapsed. Neither can
+      act as the account, so offering them invites revoking something already dead and pads a
+      list whose value is that an unrecognised row stands out. The rows still exist — a session
+      ends by being marked, never by being deleted — and remain available to support.
+
+      `last_seen_at` is the last time that device exchanged its refresh token, which happens at
+      least every fifteen minutes of use. **Reading this list does not update it**: a read is
+      not activity, and a display column that every read writes to stops meaning anything.
+
+      ## Paging
+
+      The response uses the standard collection envelope. `next_cursor` is always `null` and
+      `has_more` is `true` only if the account holds more live sessions than the platform will
+      return in one response — a state reachable by signing in repeatedly instead of refreshing,
+      and one to raise with support rather than to page through.
+    responses:
+      '200':
+        description: The caller's live device sessions.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DeviceList'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+SessionByID:
+  delete:
+    operationId: revokeDevice
+    summary: Sign one device out
+    tags: [Identity]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Ends one of the caller's device sessions, named by the `id` from
+      `GET /v1/auth/sessions` (SHIP-46).
+
+      The device's refresh token stops working immediately. Its access token keeps verifying
+      until it expires, for the reason `/v1/auth/logout` gives — it is signed rather than
+      looked up — so this takes effect fully within `expires_in` seconds.
+
+      **`DELETE` describes what happens to your list, not to the row.** The session is marked
+      revoked and kept: "signed out three weeks ago" is what makes a device list and an audit
+      trail readable, and the spent tokens of an ended session still name it.
+
+      **Revoking the current session is permitted** and is the same thing as signing out, so a
+      client should confirm first. What differs is the reason recorded against the row, which
+      is a support and audit distinction rather than a client-visible one.
+
+      ## Failures
+
+      A session belonging to somebody else answers `404`, exactly as one that never existed
+      does — `identity_session_not_found`. Distinguishing them would turn this into a way of
+      finding out which identifiers name real sessions.
+
+      Revoking a session that is already revoked answers `204`. The caller asked for a state
+      and the state holds; reporting a failure would make an honest retry look like a mistake.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The device session identifier, from `GET /v1/auth/sessions`.
+        schema:
+          type: string
+          format: uuid
+        example: 0191f3c2-8a4d-7c31-9f52-3b7e1d4a6c88
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '204':
+        description: The device is signed out. No body.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such device session on this account — `identity_session_not_found`. One belonging
+          to another account answers identically.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 VerifyEmail:
   post:
     operationId: verifyEmail
@@ -750,6 +880,71 @@ TokenPair:
         refresh issues a new token with a full lifetime, so it is inactivity that ends a
         session rather than time since sign-in.
       example: 2592000
+
+Device:
+  type: object
+  required: [id, device_label, created_at, last_seen_at, current]
+  additionalProperties: false
+  description: |
+    One device signed in to the account, as its owner sees it in `GET /v1/auth/sessions`.
+
+    What is here is what somebody deciding "is that me?" needs. There is no token material in any
+    form, and no expiry: a session appears on the list because it has not lapsed.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: Pass this to `DELETE /v1/auth/sessions/{id}` to sign the device out.
+      example: 0191f3c2-8a4d-7c31-9f52-3b7e1d4a6c88
+    device_label:
+      type: string
+      maxLength: 120
+      description: |
+        What was sent as `device_label` at sign-in. It is display text and authenticates
+        nothing, so two entries may legitimately read the same.
+      example: Nethmin's iPhone
+    created_at:
+      type: string
+      format: date-time
+      description: When this device signed in.
+      example: '2026-08-11T04:11:52.418Z'
+    last_seen_at:
+      type: string
+      format: date-time
+      description: |
+        When it last exchanged its refresh token, which happens at least every fifteen minutes
+        of use. Reading the list does not move it.
+      example: '2026-08-12T21:03:07.902Z'
+    current:
+      type: boolean
+      description: |
+        True for the device this request came from, and for exactly one entry. Revoking it
+        signs this device out.
+      example: true
+
+DeviceList:
+  type: object
+  required: [data, next_cursor, has_more]
+  additionalProperties: false
+  description: |
+    The standard collection envelope. `next_cursor` is always `null` here — see the operation
+    description.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/Device'
+    next_cursor:
+      type: string
+      nullable: true
+      description: Always `null` on this endpoint.
+      example: null
+    has_more:
+      type: boolean
+      description: |
+        True only if the account holds more live sessions than one response will carry. There
+        is no cursor to follow; revoke devices you do not recognise, or contact support.
+      example: false
 
 IdempotencyKey:
   name: Idempotency-Key

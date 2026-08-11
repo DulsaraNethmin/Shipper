@@ -8,12 +8,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// SHIP-43 against a real PostgreSQL, per Docs/06 §4.1.
+// SHIP-43 and SHIP-46 against a real PostgreSQL, per Docs/06 §4.1.
 //
-// "Revokes the current device session only" is a claim about two rows, and the half that a
-// plausible implementation gets wrong is the second one: revoking everything the account owns
-// looks correct from the device that asked, and is only visible from the phone in the other
-// pocket.
+// Both criteria are claims about which rows changed and which did not, and in both the half a
+// plausible implementation gets wrong is the second one. Revoking everything the account owns
+// looks correct from the device that asked and is visible only from the phone in the other
+// pocket; a device list that quietly included another account's sessions looks entirely ordinary
+// in a single-account test.
 
 // signInAs starts a session for the account signInService registered, under the given label.
 func signInAs(t *testing.T, svc *Service, label string) TokenPair {
@@ -187,4 +188,324 @@ func TestSignOutWithoutADatabaseIsUnavailable(t *testing.T) {
 	if err := svc.SignOut(t.Context(), uuid.New(), uuid.New()); !errors.Is(err, errUnavailable) {
 		t.Fatalf("err = %v, want errUnavailable", err)
 	}
+}
+
+// SHIP-46 against a real PostgreSQL.
+//
+// A device list is a claim about which rows are returned and which are left out, and the leaving
+// out is the part that matters: a list that quietly included another account's sessions would look
+// entirely ordinary in a single-account test.
+
+// deviceIDs is the list's identifiers, in the order it returned them.
+func deviceIDs(devices []Device) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(devices))
+	for _, d := range devices {
+		ids = append(ids, d.ID)
+	}
+	return ids
+}
+
+// TestDevicesListsTheLiveSessionsAndMarksTheCurrentOne is SHIP-46's first half.
+func TestDevicesListsTheLiveSessionsAndMarksTheCurrentOne(t *testing.T) {
+	svc, pool, user := signInService(t, testProfile)
+
+	phone := signInAs(t, svc, "Nethmin's iPhone")
+	tablet := signInAs(t, svc, "Nethmin's iPad")
+	laptop := signInAs(t, svc, "Nethmin's Pixel")
+
+	devices, truncated, err := svc.Devices(t.Context(), user.ID, tablet.SessionID)
+	if err != nil {
+		t.Fatalf("listing devices: %v", err)
+	}
+	if truncated {
+		t.Error("three devices reported as truncated")
+	}
+
+	t.Run("every live session is there, and nothing else", func(t *testing.T) {
+		got := map[uuid.UUID]bool{}
+		for _, id := range deviceIDs(devices) {
+			got[id] = true
+		}
+		for _, want := range []uuid.UUID{phone.SessionID, tablet.SessionID, laptop.SessionID} {
+			if !got[want] {
+				t.Errorf("the list does not name session %s", want)
+			}
+		}
+		if len(devices) != 3 {
+			t.Errorf("%d devices listed, want 3", len(devices))
+		}
+	})
+
+	t.Run("exactly one row is the current one, and it is the caller's", func(t *testing.T) {
+		var current []uuid.UUID
+		for _, d := range devices {
+			if d.Current {
+				current = append(current, d.ID)
+			}
+		}
+		if len(current) != 1 || current[0] != tablet.SessionID {
+			t.Errorf("current = %v, want exactly [%s]", current, tablet.SessionID)
+		}
+	})
+
+	t.Run("the label the device signed in with is what is shown", func(t *testing.T) {
+		labels := map[uuid.UUID]string{}
+		for _, d := range devices {
+			labels[d.ID] = d.DeviceLabel
+		}
+		if labels[phone.SessionID] != "Nethmin's iPhone" {
+			t.Errorf("label = %q, want the one sent at sign-in", labels[phone.SessionID])
+		}
+	})
+
+	t.Run("reading the list does not move last_seen_at", func(t *testing.T) {
+		var before string
+		if err := pool.QueryRow(t.Context(),
+			`SELECT last_seen_at::text FROM device_sessions WHERE id = $1`,
+			phone.SessionID).Scan(&before); err != nil {
+			t.Fatalf("reading last_seen_at: %v", err)
+		}
+
+		if _, _, err := svc.Devices(t.Context(), user.ID, tablet.SessionID); err != nil {
+			t.Fatalf("listing devices: %v", err)
+		}
+
+		var after string
+		if err := pool.QueryRow(t.Context(),
+			`SELECT last_seen_at::text FROM device_sessions WHERE id = $1`,
+			phone.SessionID).Scan(&after); err != nil {
+			t.Fatalf("reading last_seen_at: %v", err)
+		}
+		if after != before {
+			t.Errorf("last_seen_at moved from %s to %s on a read.\n"+
+				"000103's header is explicit that nothing derived from this column may extend a "+
+				"credential, and a display column every read writes to stops meaning anything.",
+				before, after)
+		}
+	})
+}
+
+// TestDevicesLeavesOutWhatCannotActAsTheAccount. The list answers "which devices can act as me,
+// and let me stop one"; a revoked or lapsed session can do neither.
+func TestDevicesLeavesOutWhatCannotActAsTheAccount(t *testing.T) {
+	svc, pool, user := signInService(t, testProfile)
+
+	live := signInAs(t, svc, "Live")
+	revoked := signInAs(t, svc, "Revoked")
+	lapsed := signInAs(t, svc, "Lapsed")
+
+	if err := svc.SignOut(t.Context(), user.ID, revoked.SessionID); err != nil {
+		t.Fatalf("signing out: %v", err)
+	}
+	// created_at moves with it: ck_device_sessions_refresh_expiry refuses a token that expired
+	// before it was issued, which is the constraint 000103 exists for.
+	if _, err := pool.Exec(t.Context(), `
+		UPDATE device_sessions
+		   SET created_at = now() - interval '31 days',
+		       refresh_token_expires_at = now() - interval '1 second'
+		 WHERE id = $1`, lapsed.SessionID); err != nil {
+		t.Fatalf("lapsing a session: %v", err)
+	}
+
+	devices, _, err := svc.Devices(t.Context(), user.ID, live.SessionID)
+	if err != nil {
+		t.Fatalf("listing devices: %v", err)
+	}
+
+	if len(devices) != 1 || devices[0].ID != live.SessionID {
+		t.Errorf("the list is %v, want only the live session %s", deviceIDs(devices), live.SessionID)
+	}
+}
+
+// TestDevicesListsNobodyElsesSessions.
+//
+// Mutation-checked: removing `user_id = $1` from liveDeviceSessionsByUser makes this fail. That is
+// the failure a single-account test cannot see, and it hands one account's device list to another.
+func TestDevicesListsNobodyElsesSessions(t *testing.T) {
+	svc, _, user := signInService(t, testProfile)
+
+	mine := signInAs(t, svc, "Mine")
+
+	stranger, err := svc.Register(t.Context(), RegisterCommand{
+		Email:    "stranger@example.com",
+		Phone:    "0412 345 679",
+		Password: "correct-horse-battery-staple",
+		Role:     RoleProvider,
+	})
+	if err != nil {
+		t.Fatalf("registering the stranger: %v", err)
+	}
+	if _, err := svc.startSession(t.Context(), pgtestPool(t, svc), stranger, "Not Yours"); err != nil {
+		t.Fatalf("starting the stranger's session: %v", err)
+	}
+
+	devices, _, err := svc.Devices(t.Context(), user.ID, mine.SessionID)
+	if err != nil {
+		t.Fatalf("listing devices: %v", err)
+	}
+
+	for _, d := range devices {
+		if d.DeviceLabel == "Not Yours" {
+			t.Fatalf("the list carries another account's session %s", d.ID)
+		}
+	}
+	if len(devices) != 1 {
+		t.Errorf("%d devices listed, want 1", len(devices))
+	}
+}
+
+// TestDevicesBoundsTheResponse. Every sign-in creates a session and nothing stops a client signing
+// in repeatedly instead of refreshing, so the response has to be bounded whatever the account has
+// done to itself. The rows are planted directly: what is under test is the query's bound, and a
+// hundred argon2id derivations would be a slow way of not testing it.
+func TestDevicesBoundsTheResponse(t *testing.T) {
+	svc, pool, user := signInService(t, testProfile)
+
+	current := signInAs(t, svc, "Current")
+
+	if _, err := pool.Exec(t.Context(), `
+		INSERT INTO device_sessions
+		    (id, user_id, refresh_token_hash, refresh_token_expires_at, device_label)
+		SELECT gen_random_uuid(), $1, 'bound-' || n, now() + interval '30 days', 'Device ' || n
+		  FROM generate_series(1, $2) AS n`, user.ID, maxDevicesListed); err != nil {
+		t.Fatalf("planting sessions: %v", err)
+	}
+
+	devices, truncated, err := svc.Devices(t.Context(), user.ID, current.SessionID)
+	if err != nil {
+		t.Fatalf("listing devices: %v", err)
+	}
+
+	if len(devices) != maxDevicesListed {
+		t.Errorf("%d devices returned, want the bound of %d", len(devices), maxDevicesListed)
+	}
+	if !truncated {
+		t.Error("the list was truncated and has_more would have said otherwise, which is the " +
+			"one thing a caller in that state can act on")
+	}
+}
+
+// TestRevokeDeviceEndsTheNamedSessionAndNoOther is SHIP-46's second half.
+func TestRevokeDeviceEndsTheNamedSessionAndNoOther(t *testing.T) {
+	svc, pool, user := signInService(t, testProfile)
+
+	doomed := signInAs(t, svc, "Lost In A Taxi")
+	kept := signInAs(t, svc, "Still Mine")
+
+	if err := svc.RevokeDevice(t.Context(), user.ID, doomed.SessionID); err != nil {
+		t.Fatalf("revoking: %v", err)
+	}
+
+	t.Run("the reason distinguishes it from a sign-out", func(t *testing.T) {
+		if got := revocationOf(t, pool, doomed.SessionID); got != revokedReasonByOwner {
+			t.Errorf("the session is %q, want %q — a support conversation asks which of the "+
+				"two happened", got, revokedReasonByOwner)
+		}
+	})
+
+	t.Run("its refresh token stops working", func(t *testing.T) {
+		if _, err := svc.Refresh(t.Context(), doomed.Refresh.Value); !errors.Is(err, ErrRefreshTokenInvalid) {
+			t.Errorf("err = %v, want ErrRefreshTokenInvalid", err)
+		}
+	})
+
+	t.Run("it leaves the list, and the others stay", func(t *testing.T) {
+		devices, _, err := svc.Devices(t.Context(), user.ID, kept.SessionID)
+		if err != nil {
+			t.Fatalf("listing devices: %v", err)
+		}
+		if len(devices) != 1 || devices[0].ID != kept.SessionID {
+			t.Errorf("the list is %v, want only %s", deviceIDs(devices), kept.SessionID)
+		}
+	})
+}
+
+// TestRevokeDeviceRefusesASessionThatIsNotTheCallers, and says the same thing about one that does
+// not exist.
+//
+// Mutation-checked: removing `user_id = $2` from deviceSessionOwnedBy makes the first subtest fail
+// — one account signing another's devices out, from a request that looks entirely ordinary.
+func TestRevokeDeviceRefusesASessionThatIsNotTheCallers(t *testing.T) {
+	svc, pool, _ := signInService(t, testProfile)
+
+	victim := signInAs(t, svc, "Somebody Else's iPhone")
+
+	stranger, err := svc.Register(t.Context(), RegisterCommand{
+		Email:    "stranger@example.com",
+		Phone:    "0412 345 679",
+		Password: "correct-horse-battery-staple",
+		Role:     RoleProvider,
+	})
+	if err != nil {
+		t.Fatalf("registering the stranger: %v", err)
+	}
+
+	t.Run("another account's session", func(t *testing.T) {
+		err := svc.RevokeDevice(t.Context(), stranger.ID, victim.SessionID)
+		if !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("err = %v, want ErrSessionNotFound", err)
+		}
+		if got := revocationOf(t, pool, victim.SessionID); got != "live" {
+			t.Errorf("the session is %q, want live — it was ended by somebody who does not own it", got)
+		}
+	})
+
+	t.Run("a session that does not exist answers identically", func(t *testing.T) {
+		if err := svc.RevokeDevice(t.Context(), stranger.ID, uuid.New()); !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("err = %v, want ErrSessionNotFound — telling the two apart makes this a "+
+				"way of finding out which identifiers name real sessions", err)
+		}
+	})
+}
+
+// TestRevokeDeviceIsSafeToRepeat. The caller asked for a state and the state holds; an error would
+// make the honest retry the idempotency middleware exists for look like a mistake.
+func TestRevokeDeviceIsSafeToRepeat(t *testing.T) {
+	svc, _, user := signInService(t, testProfile)
+	phone := signInAs(t, svc, "Nethmin's iPhone")
+
+	if err := svc.RevokeDevice(t.Context(), user.ID, phone.SessionID); err != nil {
+		t.Fatalf("first revoke: %v", err)
+	}
+	if err := svc.RevokeDevice(t.Context(), user.ID, phone.SessionID); err != nil {
+		t.Errorf("second revoke: %v — a session already in the state asked for is not a failure", err)
+	}
+}
+
+// TestRevokeDeviceAcceptsTheCurrentSession. It is the same action as signing out, and refusing it
+// would produce a device list where exactly one row cannot be acted on. What differs is the reason
+// recorded, which is the point of having two.
+func TestRevokeDeviceAcceptsTheCurrentSession(t *testing.T) {
+	svc, pool, user := signInService(t, testProfile)
+	phone := signInAs(t, svc, "Nethmin's iPhone")
+
+	if err := svc.RevokeDevice(t.Context(), user.ID, phone.SessionID); err != nil {
+		t.Fatalf("revoking the current session: %v", err)
+	}
+	if got := revocationOf(t, pool, phone.SessionID); got != revokedReasonByOwner {
+		t.Errorf("the session is %q, want %q", got, revokedReasonByOwner)
+	}
+}
+
+// TestDeviceListingWithoutADatabaseIsUnavailable, both endpoints.
+func TestDeviceListingWithoutADatabaseIsUnavailable(t *testing.T) {
+	svc := serviceWithoutADatabase(t)
+
+	if _, _, err := svc.Devices(t.Context(), uuid.New(), uuid.New()); !errors.Is(err, errUnavailable) {
+		t.Errorf("Devices: err = %v, want errUnavailable", err)
+	}
+	if err := svc.RevokeDevice(t.Context(), uuid.New(), uuid.New()); !errors.Is(err, errUnavailable) {
+		t.Errorf("RevokeDevice: err = %v, want errUnavailable", err)
+	}
+}
+
+// pgtestPool reaches the pool the service was built over, for the one test that has to write on
+// behalf of an account it is not signing in as.
+func pgtestPool(t *testing.T, svc *Service) *pgxpool.Pool {
+	t.Helper()
+
+	if svc.pool == nil {
+		t.Fatal("the service has no pool")
+	}
+	return svc.pool
 }

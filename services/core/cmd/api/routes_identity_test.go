@@ -482,6 +482,132 @@ func TestLogoutWithACredentialButNoDatabaseIsUnavailable(t *testing.T) {
 	}
 }
 
+// TestTheDeviceListRefusesACallerWithNoCredential (SHIP-46).
+//
+// A GET, so nothing in the middleware chain answers before the auth class does — which makes this
+// the shortest statement of the property in the package: the route exists, and it is unreachable
+// without a credential.
+func TestTheDeviceListRefusesACallerWithNoCredential(t *testing.T) {
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/auth/sessions", nil))
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("GET /v1/auth/sessions is not served")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Error("no WWW-Authenticate challenge on a 401, which RFC 9110 requires")
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnauthenticated) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeUnauthenticated)
+	}
+}
+
+// TestRevokingADeviceRefusesACallerWithNoCredential. The Idempotency-Key is sent because the
+// middleware checks it further out than the auth class is enforced.
+func TestRevokingADeviceRefusesACallerWithNoCredential(t *testing.T) {
+	req := httptest.NewRequest(http.MethodDelete, "/v1/auth/sessions/"+uuid.New().String(), nil)
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnauthenticated) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeUnauthenticated)
+	}
+}
+
+// TestRevokingADeviceRequiresAnIdempotencyKey. DELETE is state-changing, and the requirement is
+// not limited to the methods that carry a body.
+func TestRevokingADeviceRequiresAnIdempotencyKey(t *testing.T) {
+	token, _, _ := testAccessToken(t, identity.RoleCustomer)
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/auth/sessions/"+uuid.New().String(), nil)
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeIdempotencyKeyRequired) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeIdempotencyKeyRequired)
+	}
+}
+
+// TestRevokingAnIdentifierThatIsNotAUUIDIsANotFound.
+//
+// Reachable with no database, which is also the point: a malformed identifier is refused before
+// the pool is looked at, and it is refused with the answer a session belonging to somebody else
+// gets. A distinct "that is not a uuid" would tell a caller probing identifiers which of their
+// guesses were at least the right shape.
+func TestRevokingAnIdentifierThatIsNotAUUIDIsANotFound(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	token, _, _ := testAccessToken(t, identity.RoleCustomer)
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/auth/sessions/not-a-uuid", nil)
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != "identity_session_not_found" {
+		t.Errorf("code = %q, want identity_session_not_found", got)
+	}
+}
+
+// TestTheDeviceListWithACredentialButNoDatabaseIsUnavailable. The credential got the caller past
+// the guard, which is the half worth pinning: a 401 here would mean the route is unreachable
+// rather than that the database is away.
+func TestTheDeviceListWithACredentialButNoDatabaseIsUnavailable(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	token, _, _ := testAccessToken(t, identity.RoleCustomer)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/sessions", nil)
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnavailable) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeUnavailable)
+	}
+}
+
+// TestTheDeviceListNeedsNoIdempotencyKey. It is read-only, and the middleware lets safe methods
+// through untouched — a key stored against a request that changes nothing is a key stored for no
+// reason.
+func TestTheDeviceListNeedsNoIdempotencyKey(t *testing.T) {
+	token, _, _ := testAccessToken(t, identity.RoleCustomer)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/sessions", nil)
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if got := errorCode(t, rec); got == string(httpx.CodeIdempotencyKeyRequired) {
+		t.Error("a read-only endpoint demanded an Idempotency-Key")
+	}
+}
+
 // TestRefreshIsReachableAndPublic (SHIP-42).
 //
 // Public, and it has to be: the caller is the client whose access token has just expired, so

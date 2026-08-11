@@ -139,6 +139,10 @@ paths:
     $ref: './paths/identity.yaml#/RequestOTP'
   /v1/auth/resend-verify:
     $ref: './paths/identity.yaml#/ResendVerify'
+  /v1/auth/sessions:
+    $ref: './paths/identity.yaml#/Sessions'
+  /v1/auth/sessions/{id}:
+    $ref: './paths/identity.yaml#/SessionByID'
   /v1/auth/verify-email:
     $ref: './paths/identity.yaml#/VerifyEmail'
   /v1/auth/verify-phone:

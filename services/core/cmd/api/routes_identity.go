@@ -62,6 +62,22 @@ func init() {
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Logout() },
 		},
 		Route{
+			// The device list and its revoke (SHIP-46). Read-only and state-changing on
+			// one resource, so the pair is a GET and a DELETE rather than two POSTs.
+			Method:  http.MethodGet,
+			Pattern: "/auth/sessions",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).Devices() },
+		},
+		Route{
+			Method:  http.MethodDelete,
+			Pattern: "/auth/sessions/{id}",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).RevokeDevice() },
+		},
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/auth/verify-email",
 			Group:   GroupV1,
