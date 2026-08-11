@@ -242,8 +242,18 @@ lint-spelling: ## Check Australian English (CLAUDE.md, Docs/10 §9.3)
 status: ## Where the delivery is: Docs/11 counted against the backlog and the commit history
 	@./scripts/delivery-status.sh
 
+# CHECKS is what `make check` runs, and it is a variable so a track can extend it.
+#
+# `mk/<track>.mk` says `CHECKS += web-check` and edits nothing shared, which is the same
+# mechanism the per-track targets already use. The list has to be consumed in the recipe
+# rather than as a prerequisite list: prerequisites are expanded when the rule is read, and
+# `-include mk/*.mk` is the last line of this file, so anything a track appended would arrive
+# too late to be seen.
+CHECKS := vet lint-imports lint-spelling test
+
 .PHONY: check
-check: vet lint-imports lint-spelling test ## Everything CI will run for the Go service (SHIP-20)
+check: ## Everything CI will run (SHIP-20). Tracks extend it with `CHECKS +=` in mk/<track>.mk
+	@$(MAKE) --no-print-directory $(CHECKS)
 
 # --- Acceptance -----------------------------------------------------------------------
 

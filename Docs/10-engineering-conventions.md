@@ -347,6 +347,24 @@ The pool and the client may both be **nil**: the service starts with an unreacha
 
 The root `Makefile` ends with `-include mk/*.mk`, so a track adds `mk/<track>.mk` and gets its targets without editing the shared file. `make help` greps `$(MAKEFILE_LIST)`, which covers included files, so documented targets appear automatically.
 
+**`make check` is extended the same way.** It runs `$(CHECKS)` from a recipe rather than from a prerequisite list, so `mk/<track>.mk` says `CHECKS += web-check` and edits nothing shared. It has to be a recipe: prerequisites are expanded when the rule is read, and the `-include` is the last line of the file, so anything a track appended would arrive too late to be seen.
+
+#### Resolving a conflict in a file with no context
+
+Three files in this repository carry one independent line per endpoint and no surrounding syntax to make a bad resolution obvious. Each has its own recipe, and none of them is "read the hunk and pick the right side".
+
+| File | Mechanism | Recipe |
+|---|---|---|
+| `cmd/api/routes_golden.txt` | `merge=union` in `.gitattributes` | Never conflicts. The union is a superset in the wrong order, which fails `TestRouteTableMatchesGolden` — regenerate with `-update` and read the diff |
+| `Docs/10-api-error-codes.md` | Generated from the registry | **Regenerate, never hand-merge.** `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update` |
+| `contracts/openapi.yaml` `paths:` | Sorted, one `$ref` pair per path | **Take both sides and re-sort.** Then `make test` — `TestPathsBlockIsSortedAndComplete` checks the result |
+
+`openapi.yaml` is deliberately **not** union-merged, and the asymmetry is the point: a union-merged YAML document is either invalid or valid and subtly wrong — two keys interleaved, a `$ref` orphaned from its entry — and the second is harder to notice than a conflict. A conflict there is ugly and obvious, which is what you want in a file that parses.
+
+`TestPathsBlockIsSortedAndComplete` also closes a gap the both-directions check cannot: `TestEveryRouteIsInTheContract` compares the manifest with the contract, so a merge that drops **both** a route and its `$ref` leaves it comparing two things that were truncated together, in perfect agreement. The new test compares the contract with the filesystem instead — every fragment under `contracts/paths/` must be reachable from the root — and no merge resolution touches that.
+
+After resolving any conflict: re-run `make check` **and** read `routes_golden.txt`. That is the file that catches a silently dropped endpoint.
+
 `COMPOSE_PROJECT_NAME` is pinned to `shipper`. Compose otherwise names a project after its directory, so each git worktree would start its own stack and they would fight over ports 5432, 6379 and 29092.
 
 Dependencies are added deliberately, not opportunistically. If a change genuinely needs a new module, that is a request, not a commit — it takes five minutes and avoids a `go.sum` conflict. Never hand-merge `go.sum`: delete it and run `go mod tidy`.
