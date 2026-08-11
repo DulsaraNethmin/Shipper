@@ -53,3 +53,4 @@ them where the call is made, beside the thing the user was trying to do.
 | `identity_phone_taken` | An account already exists for this mobile number. Sign in, or reset the password. |
 | `identity_verification_token_expired` | This verification link has expired. Ask for a new one. |
 | `identity_verification_token_invalid` | This verification link is no longer valid. Ask for a new one. |
+| `jobs_customer_only` | Only a customer account can create or edit a job. Providers bid on jobs; they do not publish them. |

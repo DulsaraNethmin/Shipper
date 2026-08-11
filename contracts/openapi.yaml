@@ -92,6 +92,13 @@ tags:
     description: |
       Endpoints the mobile client calls about itself rather than about a user — the upgrade
       gate, and anything else that must work before sign-in.
+  - name: Jobs
+    description: |
+      The job lifecycle — drafting, publishing, tracking and closing a delivery job. Every
+      operation is authenticated, and a job is visible to its owning customer, to providers only
+      once it is published, and to the awarded provider's driver only through a job-scoped token.
+
+      The customer's maximum budget never appears in any provider-facing shape (Docs/01 §4.3).
   - name: Identity
     description: |
       Registration, verification, credentials and sessions. Every operation under this tag is
@@ -135,6 +142,8 @@ paths:
     $ref: './paths/identity.yaml#/VerifyEmail'
   /v1/auth/verify-phone:
     $ref: './paths/identity.yaml#/VerifyPhone'
+  /v1/jobs:
+    $ref: './paths/jobs.yaml#/CreateJob'
 
 components:
   schemas:

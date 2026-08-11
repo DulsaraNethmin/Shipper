@@ -177,9 +177,17 @@ func TestRouterAttachesRequestID(t *testing.T) {
 	}
 }
 
+// unroutedPath is a path inside /v1 that no route serves and none is planned to.
+//
+// It was `/v1/jobs` until SHIP-61 made that a real endpoint, at which point both tests below
+// started asserting the 405 the router correctly produces for the wrong method. A stand-in for
+// "unknown" has to be a path nobody will implement, and naming it once means the next endpoint to
+// collide with it changes one line rather than finding two failures that look unrelated.
+const unroutedPath = "/v1/no-such-endpoint"
+
 func TestUnknownRouteIsNotFound(t *testing.T) {
 	rec := httptest.NewRecorder()
-	testRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/jobs", nil))
+	testRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, unroutedPath, nil))
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
@@ -238,7 +246,7 @@ func TestVersionedRoutesAreNotServedAtTheRoot(t *testing.T) {
 // contract, because that is the response a client meets first while it is being written.
 func TestRouterErrorsUseTheStandardContract(t *testing.T) {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v1/jobs", nil)
+	req := httptest.NewRequest(http.MethodGet, unroutedPath, nil)
 	req.Header.Set(httpx.HeaderRequestID, "known-request-id")
 	testRouter().ServeHTTP(rec, req)
 

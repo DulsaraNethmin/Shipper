@@ -177,6 +177,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-60** | M2 | The address value object — validated, normalised, and resolved where the platform can; a failed lookup never fails the job — *see below* |
+| **SHIP-61** | M2 | `POST /v1/jobs` — the first authenticated state-changing endpoint in the service — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -650,6 +651,51 @@ entirely fictional, and a fictional coordinate on a real job is much harder to n
 **This is a request rather than a finding — see §9's note on the mobile bundle identifier for the
 shape.** Whoever next owns `internal/config` adds the two variables and `newGeocoder` in
 `cmd/api/routes_jobs.go` builds the provider from them.
+
+### What SHIP-61 built, and what it is the first of
+
+`POST /v1/jobs` creates a Draft owned by whoever the token says is calling. **There is no field
+for naming a customer**, and that is not merely convenient: a customer id in the body would be an
+authorisation decision made from client input, which `Docs/07` §3 puts on the platform.
+
+**It is the first authenticated state-changing endpoint the service has.** Everything under
+`/v1/auth` is public by necessity, so until now SHIP-44's scoped idempotency had nothing to scope.
+Keys from this endpoint land in `idem:v1:<subject>:<key>`, which is the gate `CLAUDE.md` held
+protected endpoints behind and which SHIP-44 closed.
+
+**Every field is optional**, including both addresses. `Docs/01` §4.1 lets a customer save a draft
+and come back to it and the app captures a job over several steps (SHIP-71…75), so an empty body is
+a legitimate "start a job for me". Completeness is decided at publication (SHIP-63), which is where
+`Docs/02` §2 puts it — "required job details valid". What is checked here is that whatever *was*
+supplied is well formed, and the asymmetry that matters is between an address that is absent and one
+that is half filled in: the first is a draft in progress, the second is a mistake.
+
+**Only a customer account may create a job, and the rule reads `users.role` rather than the token's
+claim.** 000400 said this had to be enforced where the draft is created, because a foreign key
+cannot see another table's column. `jobs` reading `users` is sanctioned rather than a boundary
+crossed — the table is in the shared migration block precisely because it is read across the whole
+service — and what is *not* done is importing `identity` to ask. The verify section demonstrates it
+with a provider whose minted token claims `customer`, which is the case a token-only check would
+pass.
+
+**Status reaches the wire in lower snake case, and `Status.Wire` derives it rather than tabulating
+it.** `Docs/10` §4.7 requires the form; the stored form keeps `Docs/02` §1's own strings. SHIP-56a
+owns the mapping in three languages when it lands, and until then this is the Go copy — derived, so
+it cannot disagree with the constants, and pinned by a test that writes all twelve out, because a
+client already branching on `driver_assigned` cannot have it renamed underneath it.
+
+**The response omits everything that is empty** rather than sending `""` and `0`. A draft is mostly
+empty for most of its life, and a client needs to tell "not filled in" from "filled in with
+nothing". There is no budget field: SHIP-67 brings the column together with the serialisation test
+that proves it cannot reach a provider, rather than the field arriving first and the proof later.
+
+**Two migrations, and one of them moved a ticket earlier than 000400 planned.** 000403 is SHIP-60's
+addresses. 000404 carries the draft's own fields — description, dimensions, weight, vehicle
+requirement, handling notes and the two date windows — which 000400's forward plan attributed to
+SHIP-62. They moved because `POST` and `PATCH` accept one field set and SHIP-61 lands first; two
+schemas for one thing is two places for it to drift. The date windows were in no ticket's plan at
+all and are needed by SHIP-68, which expires an Open job at the earlier of fourteen days or the
+pickup date passing.
 
 ## 4. Partly done — do not treat these as finished
 

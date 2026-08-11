@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -68,6 +69,25 @@ func (s Status) Valid() bool {
 }
 
 func (s Status) String() string { return string(s) }
+
+// Wire is the status as it appears in a response body.
+//
+// Docs/10 §4.7 puts enum values on the wire in lower snake case even where the stored form has
+// spaces, so "En route to pickup" is `en_route_to_pickup` to a client. The comment above said this
+// mapping belonged with SHIP-56a's generator rather than with the first language to need it, and
+// that deferral held until SHIP-61 became the first endpoint that has to serialise a status. It is
+// here now, and SHIP-56a takes it over for all three languages when it lands.
+//
+// **Derived rather than tabulated**, which is the part that matters. A twelve-entry table beside
+// the twelve constants is a second list that can disagree with the first — exactly the drift
+// Docs/10 §3.4 pairs every enumeration with a test to prevent. A transformation cannot disagree
+// with its input. TestStatusWireFormsAreStableAndDistinct still writes all twelve out, because
+// these strings are published: a client already branching on `driver_assigned` cannot have it
+// renamed underneath it, and the test is what makes a change to this function visible as a change
+// to the contract.
+func (s Status) Wire() string {
+	return strings.ReplaceAll(strings.ToLower(string(s)), " ", "_")
+}
 
 // permitted is the transition table of Docs/02 §2, which that document calls authoritative for
 // the guard.
@@ -208,20 +228,126 @@ type StatusChange struct {
 	ServerRecordedAt time.Time
 }
 
-// Job is the job record as SHIP-56 leaves it: who owns it and what state it is in.
+// TimeWindow is when something may happen, as a customer thinks about it.
 //
-// It grows through M2 — category (SHIP-58), addresses (SHIP-60), the draft's own fields
-// (SHIP-62), the budget (SHIP-67) and expiry (SHIP-68) — and each of those arrives with the
-// ticket that gives it meaning rather than as an empty column waiting for one.
+// A window rather than an instant because road transport is not scheduled to the minute: a
+// customer who says "Tuesday or Wednesday" gets more bids than one who says "10:15", and
+// Docs/01 §4.1 asks for date windows for that reason.
+//
+// Either end may be absent on its own. A customer who knows only the earliest date they can
+// release the goods has said something useful, and whether that is enough to publish is
+// SHIP-63's judgement rather than this type's.
+type TimeWindow struct {
+	Start time.Time
+	End   time.Time
+}
+
+// IsZero reports whether neither end was given.
+func (w TimeWindow) IsZero() bool { return w.Start.IsZero() && w.End.IsZero() }
+
+// Dimensions is how big the goods are, in centimetres.
+//
+// Zero means "not supplied", and that is safe rather than sloppy: ck_jobs_length_cm and its two
+// siblings refuse a dimension that is not positive, so zero is a value the column cannot hold
+// and the two readings cannot be confused. The same argument covers [Job.WeightKg].
+type Dimensions struct {
+	LengthCm int
+	WidthCm  int
+	HeightCm int
+}
+
+// IsZero reports whether no dimension was supplied.
+func (d Dimensions) IsZero() bool { return d.LengthCm == 0 && d.WidthCm == 0 && d.HeightCm == 0 }
+
+// Job is the job record: who owns it, what state it is in, and what the customer has said about
+// the delivery so far.
+//
+// It grows further through M2 — the goods category (SHIP-58), the budget (SHIP-67) and expiry
+// (SHIP-68) — and each of those arrives with the ticket that gives it meaning rather than as an
+// empty column waiting for one.
+//
+// **Every field below Status is optional**, because a Draft is allowed to be incomplete: Docs/01
+// §4.1 lets a customer save a draft and come back to it, and SHIP-75 has a partly completed job
+// surviving an app restart. Completeness is decided at publication (SHIP-63), which is where
+// Docs/02 §2 puts it.
 //
 // Status has no setter and is not assigned anywhere outside the transition guard. The database
 // refuses the change regardless (000402), so a struct field that is written by mistake produces
 // a failed transaction rather than a silently moved job.
+//
+// There is no budget field here yet, and when SHIP-67 adds one it will not be carried into any
+// provider-facing shape. Docs/01 §4.3 keeps the customer's maximum private — not as an amount,
+// a band, or a "budget supplied" flag.
 type Job struct {
 	ID         uuid.UUID
 	CustomerID uuid.UUID
 	Status     Status
 
+	// Where the goods are collected and where they are taken, each with whatever the
+	// geocoder made of it (SHIP-60).
+	Pickup  Location
+	Dropoff Location
+
+	// What is being moved, in the customer's words, and how big it is (SHIP-62).
+	GoodsDescription string
+	Dimensions       Dimensions
+	WeightKg         float64
+
+	// What the customer believes the job needs, and anything the driver has to know —
+	// access constraints, stairs, gate codes.
+	VehicleRequirement string
+	HandlingNotes      string
+
+	PickupWindow  TimeWindow
+	DropoffWindow TimeWindow
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// DraftFields is everything a customer may set on a draft, with absent distinguished from empty.
+//
+// One type serves both verbs, and the nil pointer means something slightly different in each —
+// which is the whole reason these are pointers rather than values:
+//
+//   - to [Service.CreateDraft], nil means "not supplied", and the field starts empty;
+//   - to [Service.UpdateDraft], nil means "not mentioned", and the field is left as it was.
+//
+// A non-nil pointer to a zero value is a third thing and is honoured in both. It is how a
+// customer clears a handling note they no longer want, which a value type could not express at
+// all: `""` would be indistinguishable from "did not mention it", and the note would be
+// impossible to remove.
+//
+// **Status is deliberately not here, and never will be.** Job status is not a settable field;
+// every transition passes the guard in [Service.Transition] (Docs/02 §2, CLAUDE.md). The wire
+// types in http.go do not carry it either, so a client that sends one is told the field does not
+// exist rather than having it quietly ignored.
+type DraftFields struct {
+	Pickup  *Address
+	Dropoff *Address
+
+	GoodsDescription *string
+	LengthCm         *int
+	WidthCm          *int
+	HeightCm         *int
+	WeightKg         *float64
+
+	VehicleRequirement *string
+	HandlingNotes      *string
+
+	PickupWindow  *TimeWindow
+	DropoffWindow *TimeWindow
+}
+
+// IsEmpty reports whether nothing at all was supplied.
+//
+// Used by [Service.UpdateDraft] to refuse a PATCH that names no field. An empty patch is almost
+// always a client defect — a request whose body was built from an empty form — and answering
+// 200 to it would tell that client everything is fine.
+func (f DraftFields) IsEmpty() bool {
+	return f.Pickup == nil && f.Dropoff == nil &&
+		f.GoodsDescription == nil &&
+		f.LengthCm == nil && f.WidthCm == nil && f.HeightCm == nil && f.WeightKg == nil &&
+		f.VehicleRequirement == nil && f.HandlingNotes == nil &&
+		f.PickupWindow == nil && f.DropoffWindow == nil
 }

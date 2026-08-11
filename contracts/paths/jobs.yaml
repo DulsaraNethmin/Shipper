@@ -1,0 +1,399 @@
+# Jobs — creating and editing a delivery job, and everything else in the job lifecycle.
+#
+# The counterpart of cmd/api/routes_jobs.go. Docs/10 §8.1 keeps the two in step: a domain adds one
+# route file and one fragment, and edits neither this file's siblings nor the middle of a shared
+# document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence
+# for the contract to describe less than the service returns.
+#
+# # There is no budget field anywhere in this document
+#
+# Docs/01 §4.3 keeps the customer's maximum private from providers — not as an amount, not as a
+# band, and not as a "budget supplied" indicator. Both operations here are owner-only, so the
+# field would be safe on them specifically; it arrives with SHIP-67, which is the ticket that
+# brings the serialisation test proving it cannot leak, rather than with the first response that
+# could have carried it.
+#
+# # Status is returned and is never accepted
+#
+# Job status is not a settable field (Docs/02 §2). No request schema below has one, and every
+# request schema is `additionalProperties: false`, so a client that sends `"status": "open"` is
+# told the field does not exist rather than having it quietly ignored.
+
+CreateJob:
+  post:
+    operationId: createJob
+    summary: Create a job draft
+    tags: [Jobs]
+    description: |
+      Creates a job in `draft`, owned by the authenticated customer (SHIP-61).
+
+      **The owner is whoever the token says is calling.** There is no field for naming a
+      customer, because that would be an authorisation decision made from client input, which
+      Docs/07 §3 puts on the platform.
+
+      **Every field is optional.** Docs/01 §4.1 lets a customer save a draft and come back to
+      it, and the app captures a job over several steps (SHIP-71…75), so an empty body is a
+      legitimate "start a job for me". What is checked is that whatever *was* supplied is well
+      formed. Completeness is decided at publication (SHIP-63).
+
+      Only a customer account may create a job. A provider presenting a valid token is refused
+      with `jobs_customer_only` — the rule is enforced against the account's stored role, not
+      against the role claim in the token.
+
+      ## Addresses
+
+      A supplied address is validated and normalised, and then resolved to a coordinate where
+      the platform can. **A failed lookup does not fail the job** (SHIP-59a): the address is
+      stored exactly as typed, `coordinate` is absent from the response, and publication is
+      unaffected. Clients must not treat a missing coordinate as an error.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobDraft'
+    responses:
+      '201':
+        description: The draft was created.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The account is not a customer account (`jobs_customer_only`). Providers bid on jobs;
+          they do not publish them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one
+          entry per offending field, with a dotted path such as `pickup.postcode`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`). Unlike
+          `internal_error` it means try again.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- parameters --------------------------------------------------------------------------------
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a phone that
+    retries after a dropped connection must not end up with two jobs.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
+
+# --- request schemas ---------------------------------------------------------------------------
+
+JobDraft:
+  type: object
+  additionalProperties: false
+  description: |
+    The fields of a job draft. Used by both operations: a field a customer can set at creation
+    is a field they can change afterwards, and two schemas would be two places for that list to
+    drift.
+
+    There is no `status` field and there will not be one. Job status is not settable; it moves
+    only through the transitions in Docs/02 §2.
+  properties:
+    pickup:
+      $ref: '#/Address'
+    dropoff:
+      $ref: '#/Address'
+    goods_description:
+      type: string
+      maxLength: 2000
+      description: What is being moved, in the customer's own words.
+      example: Two-seater sofa, wrapped, no legs attached
+    length_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: Centimetres. `0` clears the value.
+      example: 190
+    width_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: Centimetres. `0` clears the value.
+      example: 90
+    height_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: Centimetres. `0` clears the value.
+      example: 85
+    weight_kg:
+      type: number
+      minimum: 0
+      maximum: 100000
+      description: Kilograms, to two decimal places. `0` clears the value.
+      example: 45.5
+    vehicle_requirement:
+      type: string
+      maxLength: 200
+      description: |
+        What the customer believes the job needs, in their own words — "van", "ute with a
+        tailgate lifter". Free text today; the capability vocabulary belongs to the fleet
+        domain (SHIP-79) and this field is validated against it when that list exists.
+      example: Ute with a tailgate lifter
+    handling_notes:
+      type: string
+      maxLength: 2000
+      description: |
+        Anything the driver needs to know — access constraints, stairs, gate codes, "ring
+        ahead". Docs/01 §4.3 notes that detail of this kind does more for bid accuracy than a
+        budget signal would.
+      example: |
+        Second-floor walk-up, no lift. Buzzer 4B, ring ahead.
+    pickup_window:
+      $ref: '#/TimeWindow'
+    dropoff_window:
+      $ref: '#/TimeWindow'
+
+Address:
+  type: object
+  additionalProperties: false
+  description: |
+    An Australian address in the four parts a form collects. Replaced as a whole on `PATCH`,
+    never merged part by part.
+
+    Supply all four or none. A partly filled address is rejected with one `required` entry per
+    missing part; an entirely absent one is fine, because a draft is allowed to be incomplete.
+  properties:
+    line:
+      type: string
+      maxLength: 200
+      description: |
+        The street part, freeform. Unit numbers, level numbers, lot numbers, PO boxes and
+        roadside mail boxes are all legitimate and none is parsed.
+      example: 12 Smith Street
+    suburb:
+      type: string
+      maxLength: 100
+      example: Newtown
+    state:
+      type: string
+      description: |
+        An Australian state or territory. Accepted in any case and as the spelled-out name —
+        `nsw`, `NSW` and `New South Wales` are the same value — and always returned as the
+        upper-case abbreviation, which is its canonical form.
+
+        This is the one enum in the API that is not lower snake case on the wire (Docs/10
+        §4.7). A client does not branch on the state, it prints it, and `nsw` would have every
+        client upper-casing it back.
+      example: NSW
+    postcode:
+      type: string
+      pattern: '^[0-9]{4}$'
+      description: |
+        Four digits, leading zero kept — `0800` is Darwin. Whether the postcode belongs to the
+        state is deliberately not checked: the allocations have exceptions and change when
+        Australia Post says they do.
+      example: '2042'
+
+TimeWindow:
+  type: object
+  additionalProperties: false
+  description: |
+    When something may happen. A window rather than an instant, because road transport is not
+    scheduled to the minute and a customer who says "Tuesday or Wednesday" gets more bids than
+    one who says "10:15".
+
+    Either end may be given on its own. `end` must not be before `start`.
+  properties:
+    start:
+      type: string
+      format: date-time
+      description: RFC 3339. An empty string clears it.
+      example: '2026-08-14T09:00:00+10:00'
+    end:
+      type: string
+      format: date-time
+      description: RFC 3339. An empty string clears it.
+      example: '2026-08-15T17:00:00+10:00'
+
+# --- response schemas --------------------------------------------------------------------------
+
+Job:
+  type: object
+  required: [id, status, created_at, updated_at]
+  additionalProperties: false
+  description: |
+    A job as its owner sees it.
+
+    Everything optional is **omitted rather than sent empty**, because a draft is mostly empty
+    for most of its life and a response full of `""` and `0` says nothing about which fields the
+    customer has actually filled in.
+
+    This is the customer's view. There is no provider view of a job yet; when one arrives it is
+    a separate schema rather than this one with fields hidden, because Docs/01 §4.3's budget
+    rule is much easier to keep with two shapes than with one and a redaction step somebody has
+    to remember.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    status:
+      $ref: '#/JobStatus'
+    pickup:
+      $ref: '#/Location'
+    dropoff:
+      $ref: '#/Location'
+    goods_description:
+      type: string
+      example: Two-seater sofa, wrapped, no legs attached
+    length_cm:
+      type: integer
+      example: 190
+    width_cm:
+      type: integer
+      example: 90
+    height_cm:
+      type: integer
+      example: 85
+    weight_kg:
+      type: number
+      example: 45.5
+    vehicle_requirement:
+      type: string
+      example: Ute with a tailgate lifter
+    handling_notes:
+      type: string
+      example: Second-floor walk-up, no lift.
+    pickup_window:
+      $ref: '#/TimeWindowResponse'
+    dropoff_window:
+      $ref: '#/TimeWindowResponse'
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T03:30:00.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T03:34:12.000Z'
+
+JobStatus:
+  type: string
+  description: |
+    One of the twelve statuses in Docs/02 §1, in lower snake case (Docs/10 §4.7). The stored
+    form has spaces and sentence case; this is the wire form, and it is what clients branch on.
+
+    A job is created as `draft` and reaches every other status through a guarded transition. It
+    is never a settable field.
+  enum:
+    - draft
+    - open
+    - negotiating
+    - awarded
+    - driver_assigned
+    - en_route_to_pickup
+    - picked_up
+    - in_transit
+    - delivered
+    - completed
+    - cancelled
+    - disputed
+  example: draft
+
+Location:
+  type: object
+  required: [line, suburb, state, postcode]
+  additionalProperties: false
+  description: An address and, where the platform could resolve it, where it is.
+  properties:
+    line:
+      type: string
+      example: 12 Smith Street
+    suburb:
+      type: string
+      example: Newtown
+    state:
+      type: string
+      example: NSW
+    postcode:
+      type: string
+      example: '2042'
+    coordinate:
+      $ref: '#/Coordinate'
+
+Coordinate:
+  type: object
+  required: [latitude, longitude]
+  additionalProperties: false
+  description: |
+    Where the address resolved to.
+
+    **Absent when it did not resolve**, rather than zeroed. A client cannot then mistake
+    (0, 0) — a real point in the Gulf of Guinea — for a place, and does not have to carry a
+    `resolved` flag beside two numbers it must remember to ignore. A missing coordinate is an
+    ordinary outcome and never an error (SHIP-59a).
+  properties:
+    latitude:
+      type: number
+      example: -33.896
+    longitude:
+      type: number
+      example: 151.179
+    formatted:
+      type: string
+      description: |
+        The geocoder's own rendering of the place it matched, which is not always what the
+        customer typed. Useful for confirming the platform understood the address; omitted when
+        the provider supplied none.
+      example: 12 Smith Street, Newtown NSW 2042
+
+TimeWindowResponse:
+  type: object
+  additionalProperties: false
+  description: A date window, with either end omitted when it was not given.
+  properties:
+    start:
+      type: string
+      format: date-time
+      example: '2026-08-14T09:00:00.000Z'
+    end:
+      type: string
+      format: date-time
+      example: '2026-08-15T17:00:00.000Z'

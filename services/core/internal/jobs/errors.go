@@ -1,13 +1,16 @@
 package jobs
 
-import "errors"
+import (
+	"errors"
 
-// The sentinel errors this domain raises.
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+)
+
+// The sentinel errors this domain raises, and the error codes its endpoints answer with.
 //
-// Docs/10 §2.1 puts them here rather than beside the code that returns them, so a caller
-// deciding what to do about a failure has one file to read. The machine-readable error codes
-// that reach a client are a separate list and arrive with the first endpoint (SHIP-61, SHIP-64);
-// these are for Go callers, and `bidding` awarding a job (SHIP-92) is one of them.
+// Docs/10 §2.1 puts the sentinels here rather than beside the code that returns them, so a caller
+// deciding what to do about a failure has one file to read. They are for Go callers, and
+// `bidding` awarding a job (SHIP-92) is one of them.
 var (
 	// ErrJobNotFound means no job with that identifier exists. It is deliberately not
 	// distinguished from "exists and is none of your business" — that decision belongs to
@@ -48,4 +51,27 @@ var (
 	// update runs. This is caught first because by then the history row would already have
 	// been committed on its own, leaving a record of a transition that never happened.
 	ErrNotInTransaction = errors.New("jobs: a transition must run inside a transaction")
+
+	// ErrNotCustomer means the account creating the job is not a customer account.
+	//
+	// 000400 has no CHECK for it — a foreign key cannot see another table's column — and says
+	// the rule is enforced where the draft is created. This is that enforcement, and it reads
+	// users.role rather than trusting the role claim in the token, because the claim is
+	// evidence about the token and the column is the fact.
+	ErrNotCustomer = errors.New("jobs: only a customer account can create a job")
+)
+
+// The error codes this domain's endpoints answer with (Docs/10 §4.4).
+//
+// Registered rather than declared as constants, so that the generated Docs/10-api-error-codes.md
+// describes them and cmd/api's uniqueness test can see them. Named <domain>_<condition>, which is
+// what stops two domains meaning different things by one string.
+var (
+	// CodeCustomerOnly is returned when a provider account tries to create a job.
+	//
+	// A distinct code rather than a bare 403 because the client can act on it: the app shows
+	// the provider surface, and a provider reaching this has followed a link or a deep route
+	// meant for the other role (Docs/07 §3 — the app may hide, the platform decides).
+	CodeCustomerOnly = httpx.RegisterCode("jobs_customer_only",
+		"Only a customer account can create or edit a job. Providers bid on jobs; they do not publish them.")
 )

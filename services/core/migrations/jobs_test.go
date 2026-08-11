@@ -578,13 +578,13 @@ func TestJobTimestampsCarryTheirZone(t *testing.T) {
 	}
 	defer rows.Close()
 
-	found := 0
+	found := map[string]bool{}
 	for rows.Next() {
 		var name, dataType string
 		if err := rows.Scan(&name, &dataType); err != nil {
 			t.Fatalf("scanning: %v", err)
 		}
-		found++
+		found[name] = true
 		if dataType != "timestamp with time zone" {
 			t.Errorf("jobs.%s is %s, want timestamp with time zone", name, dataType)
 		}
@@ -592,8 +592,18 @@ func TestJobTimestampsCarryTheirZone(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterating: %v", err)
 	}
-	if found != 2 {
-		t.Errorf("found %d timestamp columns, want 2 (created_at, updated_at)", found)
+
+	// Named rather than counted. This asserted a count of two until SHIP-62 added the pickup
+	// and drop-off windows, at which point it failed for a schema that was entirely correct —
+	// a count is a snapshot of how many columns existed on the day it was written, and the
+	// rule being tested is about every timestamp column rather than about how many there are.
+	for _, required := range []string{"created_at", "updated_at"} {
+		if !found[required] {
+			t.Errorf("jobs has no %s column", required)
+		}
+	}
+	if len(found) < 2 {
+		t.Errorf("found %d timestamp columns on jobs, which cannot be right", len(found))
 	}
 }
 
