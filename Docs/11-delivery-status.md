@@ -103,7 +103,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **123 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **208 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -169,6 +169,12 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
+| **SHIP-39** | M1 | Refresh token issue and rotation — opaque, hashed, and the expiry question closed — *see below* |
+| **SHIP-40** | M1 | Refresh token reuse detection — a spent token ends the whole device session — *see below* |
+| **SHIP-41** | M1 | `POST /v1/auth/login` — the endpoint a session starts at, and one answer for every credential failure — *see below* |
+| **SHIP-42** | M1 | `POST /v1/auth/refresh` — the first endpoint that issues a session credential — *see below* |
+| **SHIP-43** | M1 | `POST /v1/auth/logout` — the first route in the service that requires a credential — *see below* |
+| **SHIP-46** | M1 | `GET /v1/auth/sessions` and `DELETE /v1/auth/sessions/{id}` — the device list, and the owner check on the query — *see below* |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
@@ -207,7 +213,7 @@ This is the part a new session most needs to know about, because it changes how 
 
 **One row of that table was false for two waves, and it is struck through rather than deleted.** `httpx.RegisterCode` was documented in `Docs/10` §4.4 with a worked example and listed here as built, and neither was true — there was no registration function and no generated code list. Nothing broke, because no domain had raised a code of its own. That is the failure mode worth remembering: a mechanism this file claims exists is one nobody checks for, and it stays absent exactly until two tracks need it in the same week.
 
-Shared packages now available to every domain: `db` (Runner, InTx), `authctx`, `clock`, `validate`, `events` (outbox writer). Registered but not yet written: `pagination`, `ratelimit`, `money` — write them when first needed, no shared edit required.
+Shared packages now available to every domain: `db` (Runner, InTx), `authctx`, `clock`, `validate`, `events` (outbox writer), and — since SHIP-47 — `ratelimit`. Still registered and not yet written: `pagination`, `money` — write them when first needed, no shared edit required. **`ratelimit` is the mechanism's first vindication**: SHIP-47 wrote the package, its first client used it, and `internal/boundaries` was never opened. `CLAUDE.md` still lists `ratelimit` among the unwritten three and needs the one-word correction; it is a shared surface and was not edited from this branch.
 
 ### What SHIP-15b changed, and why it existed at all
 
@@ -408,6 +414,380 @@ SHIP-15a. That is the shape `httpx.RegisterCode` was in until SHIP-15c: document
 built, and absent, because no domain had needed it yet. `internal/httpx` is a shared surface and
 not a domain branch's to edit, so the two are written unexported in `internal/identity/http.go`
 and flagged in §9 — the second domain to want them should promote them rather than copy them.
+
+### What SHIP-39 built, and the expiry decision it settles
+
+**§9 has carried "`device_sessions` has no expiry column" since SHIP-38, and it is now decided:
+the expiry is an explicit column, `device_sessions.refresh_token_expires_at`, added by
+`000103`.** The reasoning is in the migration's own header at length, because a decision recorded
+only in a status document is one nobody reads at the point of changing it. In brief, the three
+candidates were:
+
+| Where expiry could live | Verdict |
+|---|---|
+| A Redis key TTL | **Refused by `Docs/10` §5.** Redis may hold a denylist as a fast path, but a security control a cache flush can undo is not one — which is why `device_sessions` is in PostgreSQL at all |
+| Derived from `last_seen_at + TTL`, no new column | **Refused.** `last_seen_at` is a *display* column (`000100`), and SHIP-46 will write it from a device-list read. A lifetime derived from it means every future write to a display field silently extends a credential, with nothing to fail on |
+| An explicit column | **Chosen.** An expiry that is written can be read, indexed and audited, and "has this session lapsed" becomes a query rather than arithmetic somebody has to remember |
+
+**It is the *token's* expiry, not the *session's*, and the name says so.** Rotation rewrites it on
+every use, so the window slides: thirty days of inactivity ends a session and a device in daily
+use never reaches it. `Docs/07` §3 asks for a "longer-lived" token rotated on every use, and a
+sliding window is what that means — the other reading, an absolute cap from sign-in, would sign a
+driver out mid-delivery on a schedule. **An absolute cap is deliberately not added**: it is a
+second control with a product consequence rather than a mechanism, and a column nothing writes to
+would be guessing at a design nobody has argued. It is another column and another migration if it
+is ever wanted.
+
+**`NOT NULL` with no default, and that is the control rather than a style choice.** A session row
+with no expiry is a credential that never lapses — a stolen phone signed in forever. There is no
+`DEFAULT` for the reason `insertEmailToken` gives about `created_at`: the value is computed in Go
+from the injected clock, and a database-side default would come from a second clock that can
+disagree with it. `make verify` demonstrates the refusal rather than asserting it.
+
+**The TTL is a constant in `internal/identity`, not configuration**, and that is a scope decision
+worth naming. `internal/config` is a shared surface (`Docs/10` §9.2) and three tracks were open;
+the constant sits beside the password limits in `service.go`, which make the same argument.
+`000103`'s comment says where it would go if it moves.
+
+**Rotation is one row, one hash, and no separate revocation step.** The session holds exactly one
+refresh token hash; rotation overwrites it, so the token presented matches nothing the moment the
+transaction commits. There is no "mark the old one used" that could be forgotten and no window in
+which both work.
+
+**`FOR UPDATE` on the read is what makes rotation single-winner**, and it is checked
+deterministically rather than by racing two goroutines and hoping they overlap. A phone on a poor
+connection fires the same refresh twice; without the lock both transactions read the same row and
+the device ends up holding a token the row has already replaced. `TestARefreshHoldsTheSessionRowUntilItCommits`
+holds the row in one transaction, proves a second reader blocks, and proves it sees the *rotated*
+row after the commit. Mutation-checked: removing `FOR UPDATE` makes the second read return the
+stale row immediately and the test fails on its first assertion. The two-goroutine test alongside
+it deliberately asserts only the invariant, because a test whose coverage depends on scheduling
+reports a mistake intermittently.
+
+**`Service` now takes an `*AccessTokenIssuer`**, which is a signature change to `NewService` and
+the first real consumer of SHIP-37. A service that could create a session without one would hand
+out half a credential: a refresh token the caller cannot exchange for anything. The keyset and the
+issuer are built inside `identityHandler`, from configuration, with no field added to `Deps` —
+which is SHIP-15c's acceptance criterion holding for a second wave.
+
+**One thing the block scheme costs, found here and worth knowing before the next domain hits it.**
+`cmd/migrate` uses stock golang-migrate, which applies only migrations *above* the recorded
+version. A developer database that has jobs migrations applied sits at `000402`, so a new identity
+migration at `000103` is silently skipped by `make migrate-up` — it reports "no change" and the
+column never appears. Tests and CI are unaffected: `make test-db-template` drops and rebuilds from
+scratch, and CI runs `up → down all → up` against an empty database. The local fix is
+`make migrate-down n=all && make migrate-up`. This will bite every migration in `identity`,
+`profiles` and `fleet` from now on, because their blocks sit below `jobs`.
+
+### What SHIP-40 built, and the design it rejected
+
+**A spent refresh token stays recognisable for as long as its session lives, in a ledger:
+`consumed_refresh_tokens` (`000104`).** Rotation moves the hash across in the same transaction
+that writes the new one, so the invariant is exact — **a refresh token hash is live in
+`device_sessions.refresh_token_hash` or spent in the ledger, never both**. That is what makes two
+lookups an answer rather than an ambiguity, and `make check` asserts the overlap is empty rather
+than trusting the code that maintains it.
+
+**The design that was rejected is the cheap one, and it is worth naming because it looks
+sufficient.** Keeping the *previous* hash beside the current one satisfies the acceptance
+criterion for exactly one generation, and silently stops satisfying it after two: a token stolen
+and then left while the legitimate device refreshes a few times matches neither column, is
+answered "unknown", and the session survives. The criterion is "presenting a consumed token
+invalidates the entire device session", not "presenting the most recently consumed one".
+`TestReuseIsDetectedManyRotationsLater` rotates five times and then presents the first token,
+which is the test the cheap design fails.
+
+**A token that matches nothing revokes nothing, and that is the other half.** Only a token this
+platform issued and has already rotated away is evidence of anything; revoking on an unrecognised
+value would hand anybody a way to end sessions by guessing — a denial of service dressed as a
+security control.
+
+**The revocation is written and the refusal is returned after the commit, which is the same trap
+`VerifyPhone` documents one credential along.** `db.InTx` rolls back on any error, so returning
+`ErrRefreshTokenReused` from inside the closure would undo the revocation with the very error
+that reports it — the session would stay live and the log would say it had been ended.
+Mutation-checked: making that one change turns
+`TestPresentingAConsumedTokenRevokesTheWholeSession` red on both of its subtests, one saying the
+session is still `live` and one saying the stolen device can still refresh.
+
+**The caller cannot tell reuse from any other refusal, and the sentinel exists for the service
+rather than the client.** `ErrRefreshTokenReused` and `ErrRefreshTokenInvalid` map to one code
+(SHIP-42). Two sentinels because "the session was revoked" and "the token was refused" are
+different claims that a test and a log line need to distinguish; one code because the remedy is
+identical and telling somebody holding a stolen token that the platform noticed is free help.
+
+**The reuse event is logged and not audited, and that is a gap with a name.** SHIP-149 built
+`audit_log` and its append-only triggers but not the Go write helper (§4), so there is nothing to
+call. This is the event that most deserves one — whoever finishes SHIP-149 should start here. The
+token is not logged in any form: a log aggregator holding refresh tokens is the exposure hashing
+the column exists to prevent, one system along.
+
+**Revoking a session deliberately does not move its live hash into the ledger.** Refresh checks
+`revoked_at` before anything else, so the token buys nothing either way — and moving it would put
+one hash in both places and cost the invariant its whole value.
+
+**`device_sessions` can now end, and the three reasons each have a ticket.**
+`refresh_token_reused` (SHIP-40), `signed_out` (SHIP-43) and `revoked_by_owner` (SHIP-46) are a
+`CHECK` paired with Go constants and a test that reads the constraint back, per `Docs/10` §3.4.
+Enumerating SHIP-43's and SHIP-46's values now saves the next run a migration; a reason with no
+ticket behind it does not belong there.
+
+**Spent tokens are not pruned, and a session in daily use writes roughly one every fifteen
+minutes of activity.** Deleting the spent tokens of a session that has ended is safe — a revoked
+session refuses every token it ever issued — and belongs to `cmd/worker` (SHIP-67a) as its own
+ticket rather than being smuggled into this one. `000104` says so where somebody would look.
+
+### What SHIP-42 built
+
+**`POST /v1/auth/refresh` is the ninth route and the first that hands back a session
+credential.** It is where SHIP-39 and SHIP-40 stop being schema and become behaviour: `make
+verify` drives the real endpoint over HTTP, rotates, reads the row, presents the spent token,
+and shows the token the device legitimately held stop working with it.
+
+**Public, and it has to be.** The caller is the client whose access token has just expired.
+SHIP-44 anticipated exactly this when it split `ResolveSubject` from `RequireSubject` — a
+middleware that refused a bad credential on sight would lock that client out of the endpoint that
+replaces it.
+
+**It answers `400`, not `401`, and that is a decision rather than an oversight.** SHIP-50's
+interceptor refreshes on a `401` and replays the request; a `401` from the refresh endpoint itself
+is the one answer that can send a naive implementation round the loop a second time. The
+credential is also body-borne, so a `WWW-Authenticate` challenge would describe a scheme this
+endpoint does not use. It matches how `verify-email` and `verify-phone` already answer for a
+credential that arrives in the body.
+
+**One code for every failure — `identity_refresh_token_invalid`.** Never issued, already rotated
+away, expired, session signed out or revoked, account suspended: the remedy is identical and
+distinguishing them would tell somebody holding a stolen token which part of it the platform
+recognised. It is the seventh domain code and the twenty-third overall.
+
+**Lifetimes are reported as seconds, not instants.** A client comparing a timestamp against its
+own clock refreshes at the wrong moment on any handset whose clock is wrong, which on a phone that
+has been out of signal is not unusual. `expires_in` and `refresh_token_expires_in` are read from
+the service's own TTLs rather than subtracted from a wall clock at the transport edge, so a fixed
+clock in a test and ordinary skew in production both give the same answer.
+
+**There is no `token_type` and no account object in the response.** One is a field whose value
+never varies, which the contract would have to describe forever; the other would be verification
+state cached at refresh time, and `Docs/10` §5 keeps that out of the token for the reason SHIP-63
+depends on.
+
+**`contracts/paths/identity.yaml` gains a `TokenPair` schema, and SHIP-41 should reuse it rather
+than describe the same body again.** Sign-in returns the same four fields, and two descriptions of
+one shape is how a client generator ends up with two types.
+
+**The `paths:` block in `contracts/openapi.yaml` gained one line**, sorted — `/v1/auth/refresh`
+sorts before `/v1/auth/register`. That is the one shared file this track touched, and the wave's
+jobs track is adding lines to the same block; `Docs/10` §9.2's recipe applies (take both sides,
+re-sort, then `make test`).
+
+### What SHIP-41 built, and the two disclosures it closes
+
+**`POST /v1/auth/login` is the tenth route and the endpoint every session starts at.** SHIP-42
+issued the first *credential*; this issues the first credential somebody obtained by proving who
+they are. Everything else in the domain now either exchanges that session's token or ends it, and
+no section of `make verify` has to plant a `device_sessions` row by hand any more.
+
+**One code for a wrong password and for an address with no account —
+`identity_credentials_invalid`.** Two answers would make an unauthenticated endpoint an
+account-existence oracle for any address anybody cares to try, which is a good deal worse than
+registration's deliberate disclosure: that one at least costs the caller an address they control.
+
+**The second half of that disclosure is the response time, and it is the half a plausible
+implementation leaves open.** argon2id at m=64 MiB costs tens of milliseconds and a lookup that
+misses costs none of them, so a caller timing two requests reads off exactly what the status code
+refuses to say. `PasswordHasher.SpendEquivalentWork` derives a key against a fixed salt and
+discards it on the no-such-account path.
+`TestSignInSpendsTheSameWorkWhetherOrNotTheAccountExists` compares the two against each other
+rather than against a figure, so it holds at any profile; mutation-checked by emptying the method,
+which drops the unknown-account path to microseconds.
+
+**A suspended account is told so, and that is the one place account standing is disclosed.** It is
+safe here and nowhere else: it is said *after* the password verified, so the caller has just proved
+they own the account they are being told about. Refresh deliberately says nothing, because the
+caller there holds only a token. `403`, because the caller is known and is not permitted.
+
+**The status rule the whole domain now follows, stated once:** a credential presented in the
+request *body* is refused with `400`; a credential presented in the bearer header is refused
+with `401`. SHIP-42 argued it for refresh from two directions — `WWW-Authenticate` would
+describe a scheme the endpoint does not accept, and SHIP-50's interceptor refreshes on a `401` —
+and both apply unchanged to sign-in. SHIP-46 below is the first route on the other side of the
+rule.
+
+**Sign-in upgrades a password hashed at a weaker profile, which is what makes `Docs/10` §5's claim
+true rather than merely available.** The costs travelling in the PHC string mean the argon2id
+profile *can* be raised without a migration; nothing took the opportunity until now, and sign-in is
+the only moment the plaintext exists to take it with. It is inside the same transaction as the
+session insert — there is no "carry on regardless" available from inside a transaction, because a
+failed statement has already aborted it.
+
+**Each sign-in creates a device, and the contract says so where a client will read it.** There is
+no device identifier to match on, so a client that signs in rather than refreshing leaves the
+previous session live for thirty days and shows its owner a device list they cannot make sense of.
+`device_label` is required for the same reason: four rows reading "Unknown device" cannot be acted
+on at SHIP-46, and the only moment a label can be collected is the one where somebody is looking at
+a sign-in screen on the device being named.
+
+**The `paths:` block gained one line**, sorted — `/v1/auth/login` sorts before `/v1/auth/refresh`.
+The response `$ref`s the `TokenPair` schema SHIP-42 added rather than describing the same four
+fields again.
+
+### What SHIP-43 built, and the first route that requires a credential
+
+**`POST /v1/auth/logout` is the first `RequireUser` route in the service.** SHIP-44 built the
+middleware, wired `ResolveSubject` outside `Idempotent` and closed the idempotency-scope hole, and
+then nothing used it for a wave. It does now, through the real chain: `make verify` gets a `401`
+with a `WWW-Authenticate` challenge for a caller with no credential and for one presenting
+nonsense, which is the check wave 2 could not demonstrate at all.
+
+**It is the natural first, and that is not only ordering.** The session being ended is named by the
+token being presented — the `sid` claim — so the credential is not a permission check on top of the
+request, it *is* the request. There is no body. A body carrying a session identifier would be an
+endpoint that can end somebody else's session, which is SHIP-46's job and needs SHIP-46's owner
+check.
+
+**"Only" is the half of the criterion a plausible implementation gets wrong.** Revoking every
+session the account owns looks entirely correct from the device that asked and is visible only from
+the phone in the other pocket. Two devices are signed in through the real endpoint, one signs out,
+and the other still refreshes.
+
+**The owner is a predicate on the write.** `revokeOwnDeviceSession` carries `user_id = $2` rather
+than the handler checking ownership first. Through the endpoint the identifier comes from a token
+this platform signed and cannot name another account's session — which is exactly why the check
+belongs in the statement, where no later caller can leave it out.
+`TestSignOutCannotEndSomebodyElsesSession` is mutation-checked against removing it.
+
+**Signing out never fails.** A session already revoked, and a token naming one that no longer
+exists, both answer `204`: the client has discarded its tokens by the time it reads the response,
+and a failure would leave somebody on a screen they cannot get past. The guarded `UPDATE` also
+means a repeat does not move the instant the session ended.
+
+**The live refresh token hash deliberately stays in `device_sessions`.** SHIP-40's note asked for
+this and it is now enforced by a test and by a `make verify` check: moving it into the ledger would
+put one hash in both places and cost that invariant its whole value, for no gain, because rotation
+checks `revoked_at` first.
+
+**One thing a client has to know, and the contract says so.** The refresh token dies immediately;
+the access token keeps verifying until it expires, because it is signed rather than looked up. That
+window is the fifteen minutes in `expires_in`, and it is the price of not doing a database read on
+every authenticated request. A client discards both rather than relying on the platform to refuse
+the one it still holds.
+
+### What SHIP-46 built, and where the authorisation decision lives
+
+**`GET /v1/auth/sessions` and `DELETE /v1/auth/sessions/{id}`** — the twelfth and thirteenth
+routes, and the first pair where a caller names a row that might not be theirs. Sign-out could not:
+its session comes from the `sid` claim of a token the platform signed. This one takes an identifier
+from the URL, which is the first time in the service that "may this caller do this to this row" is
+a real question.
+
+**The answer is a predicate on the query, in both directions.** `liveDeviceSessionsByUser` carries
+`user_id = $1` and `deviceSessionOwnedBy` carries `user_id = $2`; neither endpoint checks ownership
+in the handler and then acts. Docs/07 §3 puts the decision on the platform, and a decision written
+into the statement is one no later caller can leave out. Both are mutation-checked — with the
+predicate removed, one account is handed another's device list, and one account signs another's
+devices out, from requests that look entirely ordinary.
+
+**A session belonging to somebody else answers exactly what one that never existed answers**:
+`404`, `identity_session_not_found`. Distinguishing them would make the endpoint a way of finding
+out which identifiers name real sessions, which is the disclosure sign-in refuses to make about
+addresses. An identifier that is not a UUID at all gets the same answer, refused before the pool is
+touched.
+
+**The list leaves out what cannot act as the account** — revoked sessions, and sessions whose
+refresh token has lapsed. The list's question is "which devices can act as me, and let me stop
+one", and neither kind can do the first; offering them invites revoking something already dead and
+pads a list whose whole value is that an unrecognised row stands out. The rows are still there,
+marked rather than deleted, for support and for SHIP-149.
+
+**Reading the list deliberately does not write `last_seen_at`.** SHIP-39's §3 entry anticipated
+that it would, as the reason expiry must not be derived from that column, and 000103's header makes
+the stronger version of the point. It does not: a read is not activity, and a display column that
+every read writes to stops meaning anything. Rotation already records the real thing, at least
+every fifteen minutes of use. There is a `make verify` check and a test for it.
+
+**`DELETE`, and nothing is deleted.** The verb describes what happens to the list the client is
+looking at, which is the question a REST verb answers; the row is marked `revoked_by_owner` and
+kept. `Docs/10` §3.3 requires that, and 000104's `ON DELETE RESTRICT` would refuse the alternative
+anyway while spent tokens still name the session. The contract says so where a client will read it.
+
+**Revoking the current session is permitted**, and is the same action as signing out. Refusing it
+would produce a device list with exactly one row that cannot be acted on. What differs is the
+reason recorded — `signed_out` against `revoked_by_owner` — which is the whole point of SHIP-40
+having enumerated both.
+
+**The response uses `Docs/10` §4.5's collection envelope with `next_cursor` always null**, and the
+`has_more` beside it is a bound on the response rather than an invitation to page. Every sign-in
+creates a session and nothing stops a client signing in a thousand times instead of refreshing, so
+the query is capped at a hundred rows. Keyset paging belongs to `internal/pagination`, which is
+registered in `internal/boundaries` and still unwritten; §9 carries it.
+
+### What SHIP-47 built, and the two positions it takes
+
+**`internal/ratelimit` exists, and nothing shared was edited to make it exist.** It was registered
+in `internal/boundaries` ahead of the code, with the description "the Redis token bucket behind
+every limited route", and SHIP-47 is the first client. That is the pre-seeded infrastructure list
+working exactly as SHIP-15a designed it — the alternative was a domain branch editing the boundary
+file mid-wave, which is the merge the seeding exists to prevent.
+
+**A token bucket rather than a fixed window**, because a fixed window lets a caller spend one
+window's allowance in its last instant and the next window's in its first — twice the intended
+rate, on demand, at a moment of their choosing. A bucket also produces an honest `Retry-After`:
+time until the next token, not time until an arbitrary boundary. The refill and the charge are one
+Lua script, for the reason the idempotency store's claim gives — a read and a write are two round
+trips with a window between them, and two attempts arriving together is the case a rate limit is
+*for*.
+
+**Failures are charged and successes are free**, which is what makes this a control on guessing
+rather than a cap on signing in. The bucket is checked on the way in and spent on the way out; a
+check that spent would throttle somebody for knowing their own password.
+
+**The limit is checked before the credential**, so a correct password is refused too while it
+holds. That is the point rather than a rough edge: what the limit protects is the argon2id
+derivation and the database round trip, and a throttle a correct password escaped would be a
+throttle an attacker escapes by guessing right.
+
+**Position one: it fails closed.** An unreachable Redis refuses the sign-in — `503`, because "this
+is temporarily unavailable" is true and "you have done too much" is not. A limiter that failed open
+is one an attacker turns off by making Redis unreachable, on the endpoint the limiter exists to
+protect. The cost is bounded and worth naming: `httpx.Idempotent` already wraps the whole `/v1`
+group and already fails closed on the same Redis, so a client sees no difference during an outage
+— failing closed here only means there is one answer rather than two. `TestSignInWithoutARateLimiterCacheIsRefused`
+holds it.
+
+**A typed nil is still no client, and that was found rather than anticipated.** `Deps.Redis` is a
+`*redis.Client`; assigned to the `redis.UniversalClient` the package takes, a nil one produces an
+interface that is **not** nil, so `client == nil` is false and the first call dereferences it. The
+symptom was a panic and a `500` — which is fail-*open* in the sense that matters, because a 500
+tells nobody a limit was skipped. `ratelimit.New` normalises it once, with a test.
+
+**Position two: `X-Forwarded-For` is not read.** The address comes from `RemoteAddr` and nothing
+else. A forwarded header is whatever the client wrote unless a trusted proxy overwrote it, so
+honouring one would let any caller pick their own bucket — a limit that looks like a limit and is
+not. The other direction has a cost too, and it is a deployment gate rather than a defect: behind a
+load balancer, every request would arrive from one address and share one bucket. §9 carries it, and
+there is no deployment yet to be wrong about.
+
+**Two limits, and each has an independence half the other cannot show.** Five failures per account
+with one back every two minutes; thirty per address with one back every twenty seconds. Both are
+mutation-checked in the direction that matters: keying the account bucket on the address makes one
+account's failures lock out everybody on the same network, and dropping the address from its key
+makes one exhausted address throttle the platform. The figures are constants in `internal/identity`
+rather than configuration, for the reason SHIP-39's TTL gives — `internal/config` is a shared
+surface and three tracks were open. **SHIP-183 is where every public endpoint's limit gets
+considered together**, and that is the ticket that should decide whether any of them belong in
+configuration.
+
+**Only sign-in is limited by this.** Registration, the OTP endpoints and the verification endpoints
+keep the per-account issue rules SHIP-34 gave them and gain nothing here; SHIP-183 owns the pass
+over the rest.
+
+**`make verify` clears the per-address bucket at the point sign-ins begin and again at the end of
+this section.** Every request in the script arrives from `127.0.0.1`, so one bucket is shared by
+every section below — and by every previous run. Without the clean-up a run that stopped part-way
+through SHIP-47 made the *next* run fail in SHIP-41 with a 429 that reads as a broken endpoint.
+That was observed, not imagined. It also lets the per-address figure be asserted exactly rather
+than derived from counting what the sections above happened to spend.
 
 ### What SHIP-48 built, and how it was demonstrated
 
@@ -1133,6 +1513,32 @@ was between building the mechanism and amending `Docs/10` §4.3 to match reality
 won for the same reason it did with `RegisterCode` at SHIP-15c. The body limit — the part that
 actually bites, since a second literal is a second place for it to drift — is now one constant
 in `internal/httpx` rather than two that agree by comment.
+
+**`X-Forwarded-For` is deliberately unread, and that is a gate on the first deployment behind a
+load balancer.** SHIP-47's per-address bucket keys on `RemoteAddr`. Honouring a forwarded header
+without a trusted-proxy configuration would let any caller choose their own bucket and evade the
+limit entirely; not honouring one behind a proxy makes every request share one bucket, which
+throttles everybody at thirty failures. Neither is acceptable in production and there is no
+deployment yet to be wrong about. **Decide with the deployment work** — a trusted-proxy hop count
+or a CIDR allow-list in `internal/config`, read by `identity.clientIP`.
+
+**A per-account limit is a lockout somebody else can trigger, and the trade is deliberate.** The
+bucket keys on the submitted address whether or not it has an account — it must, or never being
+throttled would itself disclose that an address is unknown. So a caller can spend somebody else's
+allowance by getting their password wrong for them. The per-address limit is what bounds it: an
+attacker burns their own thirty to fill six accounts' buckets, and the sustained rate lets them
+hold about one account at a time. That is the standard shape and it is worth revisiting rather than
+inheriting: a per-account limit counting *distinct* addresses, or one a successful sign-in clears,
+both remove it. **Decide at SHIP-183**, with the rest of the surface.
+
+**The device list is bounded but not pageable.** `GET /v1/auth/sessions` returns the collection
+envelope with `next_cursor` always null and a hundred-row cap, because `internal/pagination` is
+registered in `internal/boundaries` and not yet written (SHIP-46). `has_more` therefore reports a
+truncation a caller cannot page past. It is unreachable for a person — a hundred *live* sessions
+means signing in a hundred times in thirty days without refreshing — and the alternative was
+writing the shared pagination package mid-wave. **Whoever writes `internal/pagination` should adopt
+it here**, and the first endpoint with a genuinely unbounded collection (SHIP-64's job list) is
+where the decision actually has to be made.
 
 **`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 

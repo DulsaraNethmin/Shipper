@@ -48,9 +48,13 @@ them where the call is made, beside the thing the user was trying to do.
 
 | Code | Meaning |
 |---|---|
+| `identity_account_suspended` | The account has been suspended. Signing in is refused until support lifts it; contact support rather than retrying. |
+| `identity_credentials_invalid` | That email address and password do not match an account. Deliberately one code for both halves, so this endpoint cannot be used to find out which addresses have accounts. |
 | `identity_email_taken` | An account already exists for this email address. Sign in, or reset the password. |
 | `identity_otp_invalid` | That code is not valid. Ask for a new one and try again. |
 | `identity_phone_taken` | An account already exists for this mobile number. Sign in, or reset the password. |
+| `identity_refresh_token_invalid` | This session has ended. Sign in again. |
+| `identity_session_not_found` | No such device session on this account. A session belonging to somebody else answers identically. |
 | `identity_verification_token_expired` | This verification link has expired. Ask for a new one. |
 | `identity_verification_token_invalid` | This verification link is no longer valid. Ask for a new one. |
 | `jobs_customer_only` | Only a customer account can create or edit a job. Providers bid on jobs; they do not publish them. |

@@ -91,6 +91,17 @@ func (u User) EmailVerified() bool { return u.EmailVerifiedAt != nil }
 // PhoneVerified reports whether the number has been confirmed (SHIP-36).
 func (u User) PhoneVerified() bool { return u.PhoneVerifiedAt != nil }
 
+// CanSignIn reports whether the account may hold a session at all (SHIP-39).
+//
+// Suspended is the only state that refuses. Restricted narrows what an account may *do* — which
+// is the domain's decision at the point of doing it — and an account that cannot sign in cannot
+// be told why it is restricted, or read the messages that say so.
+//
+// It is stated here rather than as a status comparison at each call site, because sign-in
+// (SHIP-41), refresh (SHIP-39) and every later gate have to agree about it: three copies is how
+// one path keeps honouring a session the other two have stopped issuing.
+func (u User) CanSignIn() bool { return u.Status != StatusSuspended }
+
 // CanPublish reports whether Docs/04 §2's baseline is met: both contact channels verified.
 //
 // It is stated here, once, rather than as two nil checks at each call site — SHIP-63 is the
