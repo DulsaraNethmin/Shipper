@@ -145,9 +145,26 @@ func run() error {
 		StartedAt: startedAt,
 	}
 
+	// The credential verifier behind every protected route (SHIP-44).
+	//
+	// Built here rather than taken from Deps deliberately. Deps is what a *handler* is built
+	// from, and this is not one — it is a collaborator of the router, exactly like the
+	// idempotency store above, and passing it alongside keeps Deps closed to the domains
+	// arriving next (see the note on Deps).
+	//
+	// Unlike the pool and the cache, this refuses to start. An unreachable database is a
+	// transient condition that recovers on its own; a keyset that cannot be built is a
+	// configuration error that will still be there after every restart, and a service that
+	// came up unable to verify any token would answer 401 to every authenticated request
+	// while reporting itself healthy.
+	authenticate, err := newAccessTokenAuthenticator(cfg.Identity, deps.Clock)
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr:    cfg.HTTP.Addr(),
-		Handler: newRouter(deps, idempotencyStore),
+		Handler: newRouter(deps, idempotencyStore, authenticate),
 
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,

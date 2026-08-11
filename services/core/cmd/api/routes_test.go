@@ -10,24 +10,75 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/buildinfo"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
 )
+
+// testSigningKey is a throwaway, thirty-two bytes so the keyset's own length rule is satisfied.
+var testSigningKey = []byte("cmd-api-test-signing-key-0123456")
+
+const testKID = "test"
+
+func testIdentityConfig() config.Identity {
+	return config.Identity{
+		AccessTokenTTL:       15 * time.Minute,
+		AccessTokenKeys:      map[string][]byte{testKID: testSigningKey},
+		AccessTokenActiveKID: testKID,
+	}
+}
 
 func testDeps() Deps {
 	return Deps{
-		Config:    &config.Config{},
+		Config:    &config.Config{Identity: testIdentityConfig()},
 		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		Clock:     clock.System{},
 		StartedAt: time.Now(),
 	}
 }
 
+// testAuthenticator builds the real thing rather than a stub.
+//
+// The point of exercising it here is that this is the only place the identity verifier, the
+// authctx subject and the httpx middleware are wired together — a stub would test the middleware
+// against itself and leave the translation in auth.go unexercised, which is exactly the part that
+// converts between two Role types and could be silently wrong.
+func testAuthenticator() httpx.Authenticator {
+	authenticate, err := newAccessTokenAuthenticator(testIdentityConfig(), clock.System{})
+	if err != nil {
+		panic("cmd/api test: building the authenticator: " + err.Error())
+	}
+	return authenticate
+}
+
+// testAccessToken mints a token the test router will accept.
+func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sessionID uuid.UUID) {
+	t.Helper()
+
+	keys, err := identity.NewKeyset(map[string][]byte{testKID: testSigningKey}, testKID)
+	if err != nil {
+		t.Fatalf("building the keyset: %v", err)
+	}
+	issuer, err := identity.NewAccessTokenIssuer(keys, 15*time.Minute, clock.System{})
+	if err != nil {
+		t.Fatalf("building the issuer: %v", err)
+	}
+
+	userID, sessionID = uuid.New(), uuid.New()
+	token, err := issuer.Issue(userID, sessionID, role)
+	if err != nil {
+		t.Fatalf("issuing: %v", err)
+	}
+	return token.Value, userID, sessionID
+}
+
 func testRouter() http.Handler {
-	return newRouter(testDeps(), idempotency.NewMemoryStore())
+	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator())
 }
 
 // SHIP-6's acceptance criterion: GET /health returns 200 with version and commit.

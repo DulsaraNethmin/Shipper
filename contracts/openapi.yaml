@@ -137,12 +137,49 @@ components:
         type: string
       example: 01J8XV3M9K7QW2ZR4T6Y8N0P1C
 
+  securitySchemes:
+    BearerAccessToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        The mobile access token (SHIP-37, SHIP-44). HS256, fifteen minutes, obtained from
+        `/v1/auth/login` and rotated through `/v1/auth/refresh`.
+
+        **The driver portal's token is a different system and is never accepted here.** It
+        carries its own audience and its own key material, and neither can be exchanged for the
+        other (`Docs/10` §5).
+
   responses:
     BadRequest:
       description: The request was malformed, or failed validation.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthenticated:
+      description: |
+        No usable credential was presented (SHIP-44). Carries a `WWW-Authenticate: Bearer`
+        challenge, as RFC 9110 requires.
+
+        **Branch on `error.code`, not on the status.** `token_expired` means the credential was
+        genuine and has lapsed: refresh it and retry, and do not sign the user out.
+        `unauthenticated` means there was no usable credential at all — signing in again is the
+        only way forward.
+
+        A failure is deliberately not explained further. Which check refused a credential is
+        information only somebody probing has a use for.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestID'
+        WWW-Authenticate:
+          description: The authentication scheme this endpoint accepts.
+          schema:
+            type: string
+          example: Bearer error="invalid_token"
       content:
         application/json:
           schema:

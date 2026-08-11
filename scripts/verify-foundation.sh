@@ -376,6 +376,83 @@ ttl="$(redis-cli -u "$REDIS_URL" ttl "$stored")"
 ok "the entry is in Redis under $stored, expiring in ${ttl}s"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-44  one caller's idempotency key cannot read another caller's response"
+
+# SHIP-44 adds no endpoint, so most of it is demonstrated by its tests. This is the half that
+# can be shown against a running service, and it is the half that matters: until now every
+# idempotency key landed in idem:v1:anonymous:<key>, so a client that guessed another client's
+# key was handed that client's stored response body (Docs/11 §8).
+#
+# Two tokens are minted here rather than obtained, because no sign-in endpoint exists yet
+# (SHIP-41). They are signed with the development key from deploy/.env.example, which is public
+# and in this repository on purpose — the service refuses it outside development.
+
+# The header name is spelled by RFC 9110 and not by us.
+auth_header="Authorization"  # spelling:ok — HTTP header name, RFC 9110
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+mint_token() {
+  local sub="$1" now exp header payload signing_input signature
+  now="$(date +%s)"
+  exp=$((now + 900))
+  header='{"alg":"HS256","typ":"JWT","kid":"dev"}'
+  payload="{\"sub\":\"$sub\",\"role\":\"customer\",\"sid\":\"$(uuidgen | tr 'A-Z' 'a-z')\",\"iat\":$now,\"exp\":$exp,\"jti\":\"$(uuidgen | tr 'A-Z' 'a-z')\",\"iss\":\"shipper\",\"aud\":\"shipper-mobile\"}"
+  signing_input="$(printf '%s' "$header" | b64url).$(printf '%s' "$payload" | b64url)"
+  signature="$(printf '%s' "$signing_input" \
+    | openssl dgst -sha256 -hmac "shipper-local-development-signing-key-not-a-secret" -binary \
+    | b64url)"
+  printf '%s.%s' "$signing_input" "$signature"
+}
+
+alice_id="$(uuidgen | tr 'A-Z' 'a-z')"
+bob_id="$(uuidgen | tr 'A-Z' 'a-z')"
+alice_token="$(mint_token "$alice_id")"
+bob_token="$(mint_token "$bob_id")"
+
+shared_key="verify-scope-$$"
+
+# The path does not exist, and that is deliberate: within /v1 the idempotency claim is taken
+# before routing, so even a 404 is stored against the key. Method, path and body are identical
+# for both callers, so the scope is the only thing that can separate them.
+for token in "$alice_token" "$bob_token"; do
+  curl -s -X POST -o /dev/null \
+    -H "Idempotency-Key: $shared_key" -H 'Content-Type: application/json' \
+    -H "$auth_header: Bearer $token" \
+    -d '{"amount":1}' "http://localhost:$VERIFY_PORT/v1/not-a-real-endpoint" >/dev/null
+done
+
+# bash 3.2 is what macOS ships, so this stays clear of mapfile and of associative arrays.
+scoped="$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:*:$shared_key" | sort)"
+scoped_count="$(printf '%s\n' "$scoped" | grep -c . || true)"
+
+[[ "$scoped_count" -eq 2 ]] || {
+  printf '  %s\n' "$scoped"
+  fail "two callers sharing one key produced $scoped_count Redis entries, want 2 — the scope is shared"
+}
+grep -q "$alice_id" <<<"$scoped" || fail "no entry is namespaced by the calling user"
+grep -q "$bob_id"   <<<"$scoped" || fail "the second caller's entry is not namespaced by them"
+ok "two callers using the same key wrote two separate entries, namespaced by user"
+
+if grep -q "idem:v1:anonymous:$shared_key" <<<"$scoped"; then
+  fail "an authenticated request still landed in the anonymous namespace"
+fi
+ok "neither landed in idem:v1:anonymous, which is what a nil scope produced"
+
+# The property that lets SHIP-42 work at all: a client whose access token has just expired
+# still has to be able to reach the endpoint that replaces it. A public route must therefore
+# tolerate a credential it cannot verify rather than refusing the request.
+status="$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "$auth_header: Bearer this-is-not-a-token" "http://localhost:$VERIFY_PORT/v1/")"
+[[ "$status" == "200" ]] || fail "a public endpoint returned $status for an unusable token; refresh would be unreachable"
+ok "a public endpoint still answers with an unusable token attached"
+
+status="$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "$auth_header: Bearer $alice_token" "http://localhost:$VERIFY_PORT/v1/")"
+[[ "$status" == "200" ]] || fail "a public endpoint returned $status for a valid token"
+ok "and answers with a valid one, which is what puts the subject on the context"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-28  the users table, with its constraints enforced by the database"
 
 "$PSQL" "$DATABASE_URL" -tAc \
@@ -657,4 +734,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28, SHIP-44, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
