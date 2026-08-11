@@ -817,6 +817,48 @@ status="$(curl -s -X POST -o "$WORKDIR/register-nokey.json" -w '%{http_code}' \
 ok "it needs an Idempotency-Key, so a retry cannot produce a second account"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-45  the role is chosen at registration and cannot be changed afterwards"
+
+status="$(post_json "verify-provider-$$" /v1/auth/register \
+  "{\"email\":\"provider-$$@example.com\",\"phone\":\"0498$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/register-provider.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/register-provider.json"; fail "registering a provider returned $status"; }
+[[ "$(json "$WORKDIR/register-provider.json" '["role"]')" == "provider" ]] \
+  || fail "the account did not take the provider role"
+ok "an account is created as either customer or provider, as asked"
+
+status="$(post_json "verify-admin-role-$$" /v1/auth/register \
+  "{\"email\":\"admin-$$@example.com\",\"phone\":\"0497$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"admin\"}" \
+  "$WORKDIR/register-admin.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/register-admin.json"; fail "'admin' was accepted as a role (status $status)"; }
+ok "there is no third role — administrators sign in through a separate system (SHIP-147)"
+
+# The half that matters, and the reason it is a trigger. A rule the application keeps does not
+# apply to a support query typed at a psql prompt, which is precisely the path somebody would use
+# to change a role "just this once" — and a customer becoming a provider silently rewrites the
+# meaning of every job already attached to the account.
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "update users set role = 'provider' where id = '$registered_id';" >/dev/null 2>&1; then
+  fail "a customer was turned into a provider from a psql prompt"
+fi
+ok "UPDATE ... SET role is refused by the database, not by application logic alone"
+
+surviving_role="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select role from users where id = '$registered_id';")"
+[[ "$surviving_role" == "customer" ]] || fail "the role is now '$surviving_role'"
+ok "the role survived the attempt"
+
+# The trigger has a WHEN clause, so the writes that happen constantly — verification timestamps,
+# account standing — are untouched by it. Without that, every one of them would raise, and the
+# failure would look like a broken endpoint rather than a mis-scoped trigger.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set status = 'restricted' where id = '$registered_id';" >/dev/null \
+  || fail "an unrelated update was refused by the role trigger"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set status = 'active' where id = '$registered_id';" >/dev/null
+ok "every other column still updates, so the trigger is scoped to the transition it guards"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-5  graceful shutdown"
 
 kill -TERM "$SERVER_PID"
@@ -829,4 +871,4 @@ SERVER_PID=""
 grep -q "stopped cleanly" "$WORKDIR/server.log" || fail "the service did not shut down cleanly on SIGTERM"
 ok "drains and stops cleanly on SIGTERM"
 
-printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-30, SHIP-37, SHIP-38, SHIP-44, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"
+printf '\n\033[32m%s checks passed — SHIP-1..SHIP-15, SHIP-28..SHIP-30, SHIP-37, SHIP-38, SHIP-44, SHIP-45, SHIP-149 and SHIP-167 acceptance criteria demonstrated.\033[0m\n\n' "$pass"

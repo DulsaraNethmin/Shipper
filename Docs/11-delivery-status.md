@@ -85,7 +85,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **74 checks**, and `make check` green.
+Verified by `make verify` — **79 checks**, and `make check` green.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -129,6 +129,7 @@ endpoints, and none of these tickets adds one.
 | **SHIP-28** | M1 | `users` — citext email, phone, role, status, verification timestamps |
 | **SHIP-29** | M1 | argon2id password hashing, parameters stored in the PHC string |
 | **SHIP-30** | M1 | `POST /v1/auth/register` — an unverified account, duplicates refused by the index — *see below* |
+| **SHIP-45** | M1 | Role fixed at registration, immutable afterwards by a `BEFORE UPDATE` trigger on `users` |
 | **SHIP-32** | M1 | Email adapter — console in development, generic HTTP provider in staging |
 | **SHIP-35** | M1 | SMS adapter — same shape, and the OTP is legible in the dev log on purpose |
 | **SHIP-37** | M1 | Access token issue — HS256, keyset by `kid`, fifteen minutes, no permissions in the token |
@@ -413,7 +414,7 @@ in §4 are deliberately absent.
 ```done
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
-SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
+SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-30 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44 SHIP-45
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 
