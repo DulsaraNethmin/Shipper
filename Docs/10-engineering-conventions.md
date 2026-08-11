@@ -291,9 +291,18 @@ The existing Redis tests skip themselves when Redis is absent, which the CI note
 
 ### 7.3 Demonstrating "done"
 
-`scripts/verify-foundation.sh` demonstrates the acceptance criterion of every foundation ticket end to end, against a running stack. It grows a section per milestone.
+`scripts/verify-foundation.sh` demonstrates the acceptance criterion of every ticket that reaches an HTTP endpoint or a database constraint, end to end, against a running stack.
 
 **A ticket is not done until its section exists and passes.** `Docs/09` makes *Done when* the acceptance criterion; this is the mechanism that keeps it demonstrable rather than believed.
+
+**A section is a file, and a track adds one without editing anything shared** (SHIP-15e). `scripts/verify-foundation.sh` is the harness — `ticket`, `ok`, `fail`, `json`, `post_json`, `mint_token`, the service lifecycle, the count and the summary — and the checks live in `scripts/verify/NN-<name>.sh`, sourced in lexical order, exactly as the root `Makefile` includes `mk/*.mk`. The number decides when a section runs and the ranges are reserved per milestone or domain, the same way migration numbers are; the table is in the runner's header. Sections are *sourced*, so a section may use every helper and variable the runner set, and everything before it left behind.
+
+Two rules the split depends on:
+
+- **A file not named `NN-<name>.sh` is refused, not skipped.** A section that silently does not run is the same defect as a route dropped in a merge — no error, no failure, and an acceptance criterion that has quietly stopped being demonstrated.
+- **The summary is collected from the `ticket` calls, not written down.** The list of demonstrated tickets used to be a literal on the last line, which is a line every track would edit and which said `SHIP-1..SHIP-15` long after it had stopped being true.
+
+It was one 1148-line file until wave 3, which is the first wave with two tracks adding endpoints. One client can append to a single file; two cannot.
 
 ## 8. Clients
 
@@ -339,7 +348,9 @@ The import lint is what makes this safe on the Go side: two domains physically c
 
 These belong to whoever is doing shared-platform work in a given cycle, and are not edited from a domain branch:
 
-`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `CLAUDE.md` and `Docs/**`
+`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `scripts/verify-foundation.sh` · `CLAUDE.md` and `Docs/**`
+
+**`scripts/verify-foundation.sh` is on that list and `scripts/verify/<your-domain>.sh` is not**, which is the whole point of splitting it (§7.3). The same asymmetry as `mk/*.mk` and `cmd/api/routes_<domain>.go`: the shared file is the mechanism, and a track's contribution is a file of its own.
 
 **`Deps` is pre-seeded so that no domain has a reason to edit it.** It carries the configuration, the logger, the clock, the PostgreSQL pool and the Redis client, and a domain builds everything else — a keyset, a hasher, a token issuer, a repository — inside its own `Handler` closure, from those. All of them are pure functions of a pool, a client and configuration, so the field a domain wants almost always is not one.
 
