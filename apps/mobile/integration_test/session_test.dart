@@ -1,4 +1,4 @@
-// SHIP-48, on a device.
+// SHIP-48 and SHIP-49, on a device.
 //
 // Everything under test/ runs on the host, where there is no Keychain and no Keystore. Those
 // tests prove the right call is made with the right options — which is worth proving, and is
@@ -27,7 +27,8 @@
 //
 // **The same two invocations do not demonstrate anything on Android**, and the second one fails
 // there: `flutter test` reinstalls the APK, and the encrypted entry does not survive the
-// reinstall. Android has a better route to the same claim — install the debug build once, then:
+// reinstall. Android has a better route to the same claim, which is what SHIP-48 was
+// demonstrated with — install the debug build once, then:
 //
 //     adb shell am force-stop au.com.shipper && adb shell am start -n au.com.shipper/.MainActivity
 //     adb shell run-as au.com.shipper cat /data/data/au.com.shipper/shared_prefs/FlutterSecureStorage.xml
@@ -39,8 +40,11 @@
 // process as the read. That is a weaker claim, and the header is here so nobody reads it as the
 // stronger one.
 
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
+import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/token_store.dart';
 
 void main() {
@@ -77,6 +81,29 @@ void main() {
     await store.clear();
 
     expect(await store.readRefreshToken(), isNull);
+  });
+
+  testWidgets('a cold start with an empty keychain lands in the signed-out shell',
+      (tester) async {
+    await store.clear();
+
+    await tester.pumpWidget(const ProviderScope(child: ShipperApp()));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('shell-signed-out')), findsOneWidget);
+  });
+
+  testWidgets('a cold start with a stored token lands in the signed-in shell', (tester) async {
+    await store.clear();
+    await store.writeRefreshToken(token);
+
+    // The real store, read by the real session controller, through the real router. Nothing is
+    // overridden — this is main() minus the runApp.
+    await tester.pumpWidget(const ProviderScope(child: ShipperApp()));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('shell-signed-in')), findsOneWidget);
+    await store.clear();
   });
 
   testWidgets('writing a token leaves it for the next launch', (tester) async {

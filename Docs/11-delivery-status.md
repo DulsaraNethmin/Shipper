@@ -141,6 +141,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-38** | M1 | `device_sessions` — hashed refresh state, device label, last seen |
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
+| **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -255,6 +256,37 @@ it was wrong, rather than quietly reading as though it never was.
 37 and fails the build against the 36 this project targets. Moving `compileSdk` is an
 Android-wide change that also wants a newer Gradle plugin, which belongs with the signing work
 rather than inside a three-point storage ticket — §9 carries it.
+
+### What SHIP-49 built
+
+Demonstrated the same way, plus the part only a device shows: the built `.apk` and `.app`
+installed on a Pixel emulator and an iPhone 17 simulator, cold-started into each shell.
+Force-stopping the Android build and relaunching it lands in the signed-in shell; signing out
+removes the keystore entry and the next cold start lands signed out.
+
+**The session has three states and the third is the point.** Reading the keychain is
+asynchronous, so a two-state model has to guess for the few frames before the answer arrives —
+and both guesses are visible to the user, as a sign-in screen that flashes or a shell with no
+data in it. `SessionRestoring` is the honest answer for that window and the router holds a
+splash while it is the answer. The guard itself is a pure function of the session and the
+location, tested as a table, and **it is navigation rather than authorisation**: reaching a
+shell by any means still fails server-side on the first request it makes.
+
+**There is a debug-only button that stores a placeholder token, and it is worth knowing about.**
+This wave has no endpoint that issues a refresh token — SHIP-51 and SHIP-55 are the screens
+that will — so a cold start into the signed-in shell needs something in the keychain to read.
+The signed-out screen carries one, behind `kDebugMode`, which is a compile-time constant: a
+profile or release build tree-shakes the widget and its string away entirely, so there is no
+flag to misconfigure. The value it writes is not a credential and the platform will refuse it
+the moment SHIP-50 refreshes with it, which is the correct outcome — a device believing it has
+a session has never been the same thing as having one.
+
+**Both shells are placeholders and neither is role-aware.** `Docs/07` §1 requires the customer
+and provider halves to be genuinely separate inside the one app, and the role that selects
+between them is returned by the platform, so that split is SHIP-52. The connectivity screen
+(SHIP-19) moved to `/health` and is reachable from both shells and during the restore, because
+putting it behind the session would have made "can this build reach the API" unanswerable on a
+fresh install — which is exactly when it is asked.
 
 ## 4. Partly done — do not treat these as finished
 
@@ -417,7 +449,7 @@ in §4 are deliberately absent.
 SHIP-1 SHIP-2 SHIP-3 SHIP-4 SHIP-5 SHIP-6 SHIP-7 SHIP-8 SHIP-9
 SHIP-10 SHIP-11 SHIP-12 SHIP-13 SHIP-14 SHIP-15 SHIP-15a SHIP-15b SHIP-15c SHIP-16 SHIP-17 SHIP-17a SHIP-18 SHIP-19 SHIP-21
 SHIP-20 SHIP-22 SHIP-23 SHIP-28 SHIP-29 SHIP-32 SHIP-35 SHIP-37 SHIP-38 SHIP-44
-SHIP-48
+SHIP-48 SHIP-49
 SHIP-59a SHIP-149 SHIP-167 SHIP-179
 ```
 
