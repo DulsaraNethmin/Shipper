@@ -8,7 +8,7 @@
 //
 // # The rules
 //
-// Three, all from Docs/06 §4.1:
+// Four. The first three are Docs/06 §4.1:
 //
 //  1. A domain package may not import another domain package. Domains collaborate through
 //     interfaces they declare themselves, wired together in cmd/api.
@@ -18,10 +18,44 @@
 //     consuming domain, never by the implementing package: jobs/ports.go says what jobs
 //     needs from geocoding, and Go's structural interface satisfaction means no import is
 //     required in either direction.
+//  4. Infrastructure may import neither a domain nor an adapter.
 //
 // Rules 2 and 3 are one rule seen from both ends. Together they mean the arrow between a
 // domain and its adapters does not exist at all — the two meet in the composition root
 // and nowhere else.
+//
+// # Why rule 4 exists (SHIP-15c)
+//
+// The first three rules are all about domains and adapters, so for a long time
+// infrastructure could import a domain and this lint stayed green. That is a bigger hole
+// than it sounds, and the reason is transitivity: **every domain imports httpx**. One
+// import of internal/identity from inside internal/httpx welds every domain in the service
+// to identity, through an edge no domain's own file contains and no reviewer reading a
+// domain package would see.
+//
+// SHIP-44 is the first ticket with a real motive to do it — the authentication middleware
+// has to verify a token, and identity is where the verifier lives. The shape that keeps the
+// seam is for httpx to take a function:
+//
+//	httpx.Authenticate(verify func(context.Context, string) (authctx.Subject, error))
+//
+// with the closure over identity supplied in cmd/api. httpx importing authctx is
+// infrastructure on infrastructure and fine; httpx importing identity is what this rule now
+// refuses.
+//
+// It was adoptable with no refactoring at all: nothing under internal/{authctx, clock,
+// config, db, events, httpx, idempotency, logging, testsupport, validate} imported a domain
+// or an adapter when the rule was written. That is the moment to add a rule — before the
+// first edge, not after the fortieth.
+//
+// Note what rule 4 does *not* say. Infrastructure importing infrastructure is ordinary and
+// unrestricted: httpx already imports idempotency, and that is the seam working rather than
+// leaking.
+//
+// One consequence to expect rather than discover: internal/testsupport is infrastructure,
+// and its files are not _test.go, so a shared fixture that builds a domain's aggregate would
+// break this rule. That fixture belongs in the domain it is about — pgtest hands out a
+// database, and what is written into it is the domain's own business.
 //
 // # Why every package must be classified
 //
@@ -266,9 +300,26 @@ func Check(root string) ([]Violation, error) {
 	return violations, nil
 }
 
-// violates applies the three rules to one import edge.
+// violates applies the four rules to one import edge.
 func violates(from, to Package) (rule, detail string, broken bool) {
 	switch {
+	case from.Kind == KindInfrastructure && to.Kind == KindDomain:
+		return "infrastructure imports domain", fmt.Sprintf(
+			"%s imports %s. Every domain sits on infrastructure, so this one edge couples "+
+				"all eight to %s transitively — and it appears in no domain's own files. "+
+				"Take what you need as a function or an interface declared here and let "+
+				"cmd/api supply the closure over %s (Docs/06 §4.1, SHIP-15c)",
+			from.Path, to.Path, to.Domain, to.Domain), true
+
+	case from.Kind == KindInfrastructure && to.Kind == KindAdapter:
+		return "infrastructure imports adapter", fmt.Sprintf(
+			"%s imports %s. Infrastructure is what every domain and every adapter is built "+
+				"on, so it cannot depend on one of them: this makes the adapter a "+
+				"prerequisite of packages that have nothing to do with it. Declare the "+
+				"interface here and wire the implementation in cmd/api (Docs/06 §4.1, "+
+				"SHIP-15c)",
+			from.Path, to.Path), true
+
 	case from.Kind == KindDomain && to.Kind == KindDomain && from.Domain != to.Domain:
 		return "domain imports domain", fmt.Sprintf(
 			"%s imports %s. Domains do not depend on each other: declare what %s needs in "+
