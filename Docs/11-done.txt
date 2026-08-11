@@ -1,0 +1,92 @@
+# The done list. Docs/11 §10 is about this file; this file is the list.
+#
+# Authoritative. `make status` reads it, counts it against the backlog in Docs/09, and
+# cross-checks it against what commit subjects claim. A ticket belongs here only when its
+# *Done when* line in Docs/09 is demonstrable — the two partly-finished tickets in Docs/11 §4
+# are deliberately absent.
+#
+# Add a ticket in the same change that finishes it, in the same commit as the Docs/11 §3 entry
+# that says what it built.
+#
+# # Why this is a file of its own, and not a fenced block in Docs/11
+#
+# It is `merge=union` in .gitattributes, which no Markdown document could be. Every track in a
+# wave appends to the done list, so the last merge of a wave always conflicted here — twice in
+# wave 2, and both resolutions were unions. A union is safe for *this* content and for very
+# little else: the lines are independent tokens with no syntax to break, a union is always a
+# superset, and `make status` **fails** when the list claims a ticket git has never seen. So a
+# bad union is caught by a check rather than passing quietly. That is the same argument
+# .gitattributes already makes for routes_golden.txt.
+#
+# Docs/11 §3 is prose and is deliberately *not* union-merged: a union there interleaves two
+# narratives, which is worse than a conflict because it is harder to notice. Since a git
+# attribute applies to a whole file, the list had to move out of the document for the two to be
+# treated differently. That move is the whole of the decision (SHIP-15e).
+#
+# # One ticket per line, and that part is load-bearing
+#
+# merge=union resolves line by line. The list used to be grouped several tickets to a line, and
+# two tracks appending to the same line would still have conflicted — the union would have had
+# nothing to keep both of. Order does not matter: the reader sorts.
+
+# M0 — Foundation
+SHIP-1
+SHIP-2
+SHIP-3
+SHIP-4
+SHIP-5
+SHIP-6
+SHIP-7
+SHIP-8
+SHIP-9
+SHIP-10
+SHIP-11
+SHIP-12
+SHIP-13
+SHIP-14
+SHIP-15
+SHIP-15a
+SHIP-15b
+SHIP-15c
+SHIP-15e
+SHIP-16
+SHIP-17
+SHIP-17a
+SHIP-18
+SHIP-19
+SHIP-20
+SHIP-21
+SHIP-22
+SHIP-23
+SHIP-23a
+
+# M1 — Identity and access
+SHIP-28
+SHIP-29
+SHIP-30
+SHIP-31
+SHIP-32
+SHIP-33
+SHIP-34
+SHIP-35
+SHIP-36
+SHIP-37
+SHIP-38
+SHIP-44
+SHIP-45
+SHIP-48
+SHIP-49
+
+# M2 — Jobs
+SHIP-56
+SHIP-57
+SHIP-57a
+SHIP-59a
+SHIP-67a
+
+# M6 — Admin
+SHIP-149
+
+# M7 — Hardening
+SHIP-167
+SHIP-179

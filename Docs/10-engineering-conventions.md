@@ -368,13 +368,16 @@ The root `Makefile` ends with `-include mk/*.mk`, so a track adds `mk/<track>.mk
 
 #### Resolving a conflict in a file with no context
 
-Three files in this repository carry one independent line per endpoint and no surrounding syntax to make a bad resolution obvious. Each has its own recipe, and none of them is "read the hunk and pick the right side".
+Four files in this repository carry one independent line per entry and no surrounding syntax to make a bad resolution obvious. Each has its own recipe, and none of them is "read the hunk and pick the right side".
 
 | File | Mechanism | Recipe |
 |---|---|---|
 | `cmd/api/routes_golden.txt` | `merge=union` in `.gitattributes` | Never conflicts. The union is a superset in the wrong order, which fails `TestRouteTableMatchesGolden` — regenerate with `-update` and read the diff |
+| `Docs/11-done.txt` | `merge=union` in `.gitattributes` | Never conflicts. A superset is caught by `make status`, which fails on a ticket git has never seen. One ticket per line, because a union resolves line by line |
 | `Docs/10-api-error-codes.md` | Generated from the registry | **Regenerate, never hand-merge.** `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update` |
 | `contracts/openapi.yaml` `paths:` | Sorted, one `$ref` pair per path | **Take both sides and re-sort.** Then `make test` — `TestPathsBlockIsSortedAndComplete` checks the result |
+
+`Docs/11-done.txt` is a file rather than the fenced block it was inside `Docs/11` §10 for exactly this reason: a git attribute applies to a whole file, and `Docs/11` §3 is prose that must never be union-merged. Separating them was the only way to treat them differently (SHIP-15e).
 
 `openapi.yaml` is deliberately **not** union-merged, and the asymmetry is the point: a union-merged YAML document is either invalid or valid and subtly wrong — two keys interleaved, a `$ref` orphaned from its entry — and the second is harder to notice than a conflict. A conflict there is ugly and obvious, which is what you want in a file that parses.
 
