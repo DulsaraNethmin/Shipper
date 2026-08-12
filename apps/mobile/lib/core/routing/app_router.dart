@@ -7,6 +7,9 @@ import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
+import 'package:shipper/features/fleet/add_vehicle_screen.dart';
+import 'package:shipper/features/fleet/fleet_screen.dart';
+import 'package:shipper/features/fleet/vehicle_screen.dart';
 import 'package:shipper/features/identity/email_verification_screen.dart';
 import 'package:shipper/features/identity/phone_verification_screen.dart';
 import 'package:shipper/features/identity/registration_complete_screen.dart';
@@ -90,6 +93,30 @@ abstract final class Routes {
   /// [jobDetail] for one job.
   static String jobDetailFor(String jobId) => '/jobs/$jobId';
 
+  /// The provider's own fleet (SHIP-98).
+  ///
+  /// `/fleet/vehicles` rather than `/fleet`, because the fleet is not the only thing that domain
+  /// holds: SHIP-79's service area and specialties are a provider *profile*, served from
+  /// `/v1/fleet/profile`. Naming the collection now is what stops that arriving as a second meaning
+  /// for one path.
+  static const fleet = '/fleet/vehicles';
+
+  /// Adding a vehicle (SHIP-98).
+  ///
+  /// Declared **before** [vehicleDetail] in the router, for the reason [newJob] is declared before
+  /// [jobDetail]: go_router takes the first route that matches, and `new` would otherwise be read
+  /// as a vehicle's identifier.
+  static const newVehicle = '/fleet/vehicles/new';
+
+  /// One vehicle, to the provider who owns it (SHIP-98).
+  ///
+  /// The id is in the path rather than in a constructor argument, which is what makes the screen
+  /// deep-linkable — the same decision, and the same reason, as [jobDetail].
+  static const vehicleDetail = '/fleet/vehicles/:id';
+
+  /// [vehicleDetail] for one vehicle.
+  static String vehicleDetailFor(String vehicleId) => '/fleet/vehicles/$vehicleId';
+
   /// The connectivity check (SHIP-19).
   ///
   /// Reachable from **both** shells on purpose. It is the only screen that demonstrates build
@@ -130,9 +157,19 @@ const _signedOutLocations = <String>{
 ///
 /// **Adding a location here grants no permission.** What the account may actually do is decided
 /// server-side on every request; this decides only where the app is willing to draw.
+///
+/// **It is deliberately blind to the role**, and that is worth saying because SHIP-98 added the
+/// first surface only one half of the marketplace has any use for. Two reasons, and the second is
+/// the one that would have produced a bug: a guard that decided who may be where would be an
+/// authorisation control living on the device, which `Docs/07` §3 forbids; and the role is `null`
+/// for the first round trip of a restored cold start (SHIP-50), so a role-aware redirect would
+/// bounce a provider off their own fleet every time they opened the app from a notification. The
+/// role decides what a screen *draws* — `ProviderOnly` — not where the router is willing to go.
 const _signedInLocations = <String>{
   Routes.home,
   Routes.newJob,
+  Routes.fleet,
+  Routes.newVehicle,
 };
 
 /// Locations a signed-in user may be at whose path carries an identifier (SHIP-77).
@@ -149,6 +186,11 @@ const _signedInLocations = <String>{
 final _signedInPatterns = <RegExp>[
   // `/jobs/new` is matched by the set above first, so the wizard is never read as a job id.
   RegExp(r'^/jobs/[^/]+$'),
+
+  // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
+  // route reachable only through an identifier looks, from the outside, like a card that does
+  // nothing when it is tapped.
+  RegExp(r'^/fleet/vehicles/[^/]+$'),
 ];
 
 /// Whether a signed-in user may be at [location].
@@ -310,6 +352,23 @@ final routerProvider = Provider<GoRouter>((ref) {
         path: Routes.jobDetail,
         builder: (context, state) => JobDetailScreen(
           jobId: state.pathParameters['id'] ?? '',
+        ),
+      ),
+      GoRoute(
+        path: Routes.fleet,
+        builder: (context, state) => const FleetScreen(),
+      ),
+      // Before `vehicleDetail`, deliberately, exactly as `newJob` precedes `jobDetail`: go_router
+      // takes the first route that matches, so `/fleet/vehicles/:id` declared first would make
+      // `/fleet/vehicles/new` a vehicle whose id is the word "new".
+      GoRoute(
+        path: Routes.newVehicle,
+        builder: (context, state) => const AddVehicleScreen(),
+      ),
+      GoRoute(
+        path: Routes.vehicleDetail,
+        builder: (context, state) => VehicleScreen(
+          vehicleId: state.pathParameters['id'] ?? '',
         ),
       ),
       GoRoute(

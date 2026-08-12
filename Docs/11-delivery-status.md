@@ -273,6 +273,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
+| **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
@@ -2499,6 +2500,95 @@ does not decay. `ratelimit` and `pagination` are the evidence it works.
 **§3's table is not generated, per above.** Both refusals are recorded here rather than left
 implicit, because the wave-4 notes recommended one of them and a reader who finds the
 recommendation but not the refusal will do it.
+
+### SHIP-98 — the first provider surface, and the endpoint that does not refuse a customer
+
+`Docs/01` §4.2's whole measure — a provider can add, edit, deactivate and reactivate a vehicle —
+over the six routes SHIP-78 serves and no others. Three routes on the client: `/fleet/vehicles`,
+`/fleet/vehicles/new`, and `/fleet/vehicles/{id}`, declared in that order because go_router takes
+the first match and `new` is otherwise a vehicle whose id is the word "new". The fleet screen splits
+the list into what is on the road and what is not, and adding, editing, taking off the road and
+returning to service each carry their own idempotency key.
+
+**Everything before this ticket was the customer's or belonged to neither half.** So this is where
+`Docs/07` §1 — the two halves stay genuinely separate inside one app — stopped being a statement
+about the shell.
+
+#### The finding: `GET /v1/fleet/vehicles` does not check the caller's role
+
+`internal/fleet/service.go` calls `isProvider` in `Add` and nowhere else. `Vehicles` does not, and
+it is right not to: a customer owns no vehicles, so there is nothing for the endpoint to withhold,
+and it answers **`200` with an empty page**. Confirmed live, along with the rest:
+
+| As a customer | Live answer |
+|---|---|
+| `GET /v1/fleet/vehicles` | `200 {"data":[],"has_more":false}` |
+| `POST /v1/fleet/vehicles` | `403 fleet_provider_only` |
+| `GET /v1/fleet/vehicles/{someone else's id}` | `404 not_found` |
+
+That table is the reason the device has to say whose surface this is rather than drawing it and
+letting the platform refuse. **A customer who reached the fleet screen would not be refused** — they
+would see an empty fleet, an "Add a vehicle" button, a form to fill in, and a `403` only at the end
+of all of it. `ProviderOnly` says so at the start, and the fleet controller is never constructed for
+them, so no request is made on their behalf. `the_fleet_is_the_providers_half_test.dart` asserts
+both halves of that: the surface answers, and `fleet.calls` is empty.
+
+**None of that is an authorisation control and the file says so at length.** A build with
+`ProviderOnly` deleted would show a customer these screens and change nothing about what they could
+do with them, which is the property that makes it safe for the client to hold an opinion at all.
+
+#### The router stays blind to the role, deliberately
+
+The obvious place to keep a customer out is `redirectFor`. It was not used, for two reasons, and the
+second is the one that would have produced a bug. A guard deciding who may be *where* is an
+authorisation control living on the device (`Docs/07` §3). And the role is `null` for the first round
+trip of a restored cold start — the keychain holds a refresh token, the role is a claim in the
+access token — so a role-aware redirect would bounce a provider off their own fleet every time they
+opened the app from a notification, and be reported as "it works the second time". The role decides
+what a screen *draws*; the guard decides only where the app is willing to go.
+
+#### The vehicle vocabulary is compiled in, and here is the bounded cost
+
+`CLAUDE.md` keeps anything that changes under operational pressure server-side. `VehicleType`'s
+eleven values are in the client anyway, because **no endpoint serves the list** and the alternative
+is a free-text box against a closed set the platform refuses with `not_allowed`. What bounds the
+cost is `VehicleType.unknown`: a twelfth type decodes rather than throws, is labelled "Not named by
+this version" rather than as a fault, and is **omitted from a `PATCH` rather than echoed back** — so
+an old build editing such a vehicle can correct its plate without overwriting a type it cannot name.
+All eleven wire names were sent to the live platform and accepted, which is the check worth having
+on a list that cannot be corrected without a store release.
+
+This is **not** the capability vocabulary `vehicle_requirement` will be validated against. That
+belongs to SHIP-79, and `vehicle_requirement` stays free text until it arrives.
+
+#### Two smaller decisions worth finding later
+
+**The edit sends every field the form holds, empties included.** The contract distinguishes absent
+(leave alone), empty (clear) and set, and a form that omitted what somebody had emptied would give
+them no way to take back a load height they once stated. That is not the hazard `PATCH` exists to
+avoid: a field this build has never heard of is never named, so it can never be silently cleared.
+Demonstrated live — `"load_height_cm": 0` cleared the height, and the response omitted it.
+
+**A key on a `DropdownMenuItem` names the copy inside the closed button, not the one in the open
+menu.** A test can find it and cannot tap it. The key belongs on the item's child, which is what the
+menu route rebuilds. Worth knowing before the next screen with a picker.
+
+#### What is not here
+
+`GET` and `PATCH /v1/fleet/profile` — SHIP-79's service area and specialties — are not modelled, not
+called and not assumed. They belong to the same domain, to another track, and to a branch that has
+not merged; the wave rule is that a ticket never depends on same-wave work from another track.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **429 host tests** (up from 353), the analyzer clean, and the
+environment test per build flavour. Separately, every request `ApiFleetRepository` makes was replayed
+byte-for-byte against the API on port 8092 with a real provider session — list, add, read, edit,
+deactivate, reactivate, the `409 fleet_duplicate_registration` a reactivation collides with when a
+replacement is already in service on the same plate, and the `400 idempotency_key_required` a write
+gets without a key. **What is held by widget test alone is the screens**: what is drawn, what is
+tapped, and which of them a customer is refused. `make verify` does not cover this ticket — it
+exercises HTTP endpoints, and this one adds none.
 
 ## 4. Partly done — do not treat these as finished
 
