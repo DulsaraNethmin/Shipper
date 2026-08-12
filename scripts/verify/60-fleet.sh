@@ -462,3 +462,154 @@ status="$(fleet_get "$(mint_token "$(json "$WORKDIR/fleet-fresh.json" '["id"]')"
 [[ "$(tr -d ' \n' < "$WORKDIR/fleet-list-empty.json")" == '{"data":[],"has_more":false}' ]] \
   || { cat "$WORKDIR/fleet-list-empty.json"; fail "an empty fleet is not an empty array"; }
 ok "a provider with no fleet gets an empty array, never null"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79  GET /v1/fleet/profile — a declaration nobody has made is empty, never missing"
+
+status="$(curl -s -o "$WORKDIR/profile-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/fleet/profile")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/profile-anon.json"; fail "an unauthenticated GET returned $status, want 401"; }
+ok "it cannot be reached without a credential"
+
+# The provider registered at the top of this file has declared nothing yet, which is the state
+# every provider is in when they first open the screen.
+status="$(fleet_get "$fleet_provider_token" /v1/fleet/profile "$WORKDIR/profile-empty.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile-empty.json"; fail "GET /v1/fleet/profile returned $status, want 200"; }
+[[ "$(tr -d ' \n' < "$WORKDIR/profile-empty.json")" == '{"service_area":{"states":[],"postcodes":[]},"specialties":[]}' ]] \
+  || { cat "$WORKDIR/profile-empty.json"; fail "an undeclared profile is not three empty arrays"; }
+ok "an undeclared profile is empty arrays rather than a 404 or a null"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79  PATCH /v1/fleet/profile declares service area and specialties"
+
+status="$(curl -s -X PATCH -o "$WORKDIR/profile-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $fleet_provider_token" -H 'Content-Type: application/json' \
+  -d '{"specialties":["courier"]}' \
+  "http://localhost:$VERIFY_PORT/v1/fleet/profile")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/profile-nokey.json"; fail "a request with no Idempotency-Key returned $status, want 400"; }
+ok "and not without an Idempotency-Key — a retried phone must not declare twice"
+
+status="$(fleet_request PATCH "$fleet_customer_token" "verify-profile-cust-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["NSW"]}}' "$WORKDIR/profile-customer.json")"
+[[ "$status" == "403" ]] || { cat "$WORKDIR/profile-customer.json"; fail "a customer declared a service area: $status"; }
+[[ "$(json "$WORKDIR/profile-customer.json" '["error"]["code"]')" == "fleet_provider_only" ]] \
+  || { cat "$WORKDIR/profile-customer.json"; fail "expected code=fleet_provider_only"; }
+ok "a customer is refused with a code the app can act on — and both tokens claim 'customer'"
+
+# Everything below is written the way a person types it: a state spelled out, one in lower case,
+# a postcode with a space in it, a specialty in title case, and each list carrying a repeat.
+# Normalisation is what stops one region being recorded as two.
+declaration='{
+  "service_area": {"states": ["Victoria", "nsw", "VIC"], "postcodes": ["3 000", "0800", "3000"]},
+  "specialties": ["Refrigerated", "general_freight", "refrigerated"]
+}'
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-declare-$$" /v1/fleet/profile \
+  "$declaration" "$WORKDIR/profile.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile.json"; fail "PATCH /v1/fleet/profile returned $status, want 200"; }
+python3 - "$WORKDIR/profile.json" <<'PY' || fail "the declaration was not normalised, deduplicated and ordered"
+import json, sys
+body = json.load(open(sys.argv[1]))
+want = {
+    "service_area": {"states": ["NSW", "VIC"], "postcodes": ["0800", "3000"]},
+    "specialties": ["general_freight", "refrigerated"],
+}
+if body != want:
+    print("got", body, "want", want, file=sys.stderr)
+    sys.exit(1)
+PY
+ok "spelled-out states, mixed case and a spaced postcode become one ordered set each"
+
+# The rows, not the answer the endpoint gave about itself. Two grains, one per row, and never
+# both on one: a postcode is deliberately not validated against a state.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(scope || ':' || area, ',' order by scope, area)
+     from provider_service_areas where provider_id = '$fleet_provider_id';")"
+[[ "$stored" == "postcode:0800,postcode:3000,state:NSW,state:VIC" ]] \
+  || fail "the stored service area is '$stored'"
+ok "each entry is stored at one grain — a whole state, or one postcode, never both"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79  a named list is replaced, an omitted one is left alone, an empty one is cleared"
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-partial-$$" /v1/fleet/profile \
+  '{"specialties":["courier"]}' "$WORKDIR/profile-partial.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile-partial.json"; fail "a partial declaration returned $status"; }
+python3 - "$WORKDIR/profile-partial.json" <<'PY' || fail "naming only the specialties disturbed the service area"
+import json, sys
+body = json.load(open(sys.argv[1]))
+if body["service_area"] != {"states": ["NSW", "VIC"], "postcodes": ["0800", "3000"]}:
+    print("the service area changed:", body["service_area"], file=sys.stderr); sys.exit(1)
+if body["specialties"] != ["courier"]:
+    print("specialties =", body["specialties"], "want [courier] — a named list is replaced", file=sys.stderr)
+    sys.exit(1)
+PY
+ok "an omitted list is unchanged, and a named one is replaced rather than merged into"
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-clear-$$" /v1/fleet/profile \
+  '{"service_area":{"postcodes":[]}}' "$WORKDIR/profile-cleared.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile-cleared.json"; fail "clearing the postcodes returned $status"; }
+python3 - "$WORKDIR/profile-cleared.json" <<'PY' || fail "the empty list did not clear only the postcodes"
+import json, sys
+area = json.load(open(sys.argv[1]))["service_area"]
+if area != {"states": ["NSW", "VIC"], "postcodes": []}:
+    print("got", area, file=sys.stderr); sys.exit(1)
+PY
+ok "an empty list clears exactly that grain — the distinction a provider needs to withdraw"
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-noop-$$" /v1/fleet/profile \
+  '{}' "$WORKDIR/profile-noop.json")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/profile-noop.json"; fail "a declaration naming no list returned $status, want 400"; }
+ok "a declaration that changes nothing is refused rather than answered with the unchanged one"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79  a service area is a set of named regions, and a radius is not a field"
+
+# The decision SHIP-79 took rather than leaving to SHIP-81: a job's coordinate is best-effort and
+# its state and postcode are not, so eligibility is set membership. A client that believed
+# otherwise is told the field does not exist rather than having its declaration quietly ignored.
+for body in '{"service_area":{"radius_km":50}}' '{"service_area":{"latitude":-37.8,"longitude":144.9}}'; do
+  status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-radius-$RANDOM-$$" \
+    /v1/fleet/profile "$body" "$WORKDIR/profile-radius.json")"
+  [[ "$status" == "400" ]] || { cat "$WORKDIR/profile-radius.json"; fail "$body returned $status, want 400"; }
+done
+ok "neither a radius nor a coordinate is accepted; the unknown field is reported, not ignored"
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-invalid-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["NSW","Zealand"],"postcodes":["3000","12345"]},"specialties":["hovercraft"]}' \
+  "$WORKDIR/profile-invalid.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/profile-invalid.json"; fail "an invalid declaration returned $status, want 422"; }
+python3 - "$WORKDIR/profile-invalid.json" <<'PY' || fail "the refusal does not name each offending position"
+import json, sys
+details = json.load(open(sys.argv[1]))["error"]["details"]
+named = {d["field"] for d in details}
+want = {"service_area.states.1", "service_area.postcodes.1", "specialties.0"}
+if not want <= named:
+    print("named", named, "want at least", want, file=sys.stderr); sys.exit(1)
+if "service_area.states.0" in named:
+    print("a valid entry was reported:", named, file=sys.stderr); sys.exit(1)
+PY
+ok "every bad entry is named by its position, and the good ones are not"
+
+# Nothing a refused declaration carried reached the database. A declaration is replaced whole, so
+# a request that fails validation must leave the previous one exactly as it was.
+still="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(scope || ':' || area, ',' order by scope, area)
+     from provider_service_areas where provider_id = '$fleet_provider_id';")"
+[[ "$still" == "state:NSW,state:VIC" ]] || fail "the refused declaration reached the rows: '$still'"
+ok "a refused declaration changes nothing that was already declared"
+
+# The question SHIP-81 will ask, asked here in the shape it will ask it: set membership against a
+# job's state and postcode, one index lookup, and no coordinate anywhere.
+serves="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select exists (
+     select 1 from provider_service_areas
+      where provider_id = '$fleet_provider_id'
+        and ((scope = 'state' and area = 'VIC') or (scope = 'postcode' and area = '3121'))
+   ) || ' ' || exists (
+     select 1 from provider_service_areas
+      where provider_id = '$fleet_provider_id'
+        and ((scope = 'state' and area = 'QLD') or (scope = 'postcode' and area = '4000'))
+   );")"
+[[ "$serves" == "true false" ]] || fail "the membership query answered '$serves', want 'true false'"
+ok "the stored declaration answers eligibility by set membership — the query SHIP-81 inherits"

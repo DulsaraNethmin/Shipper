@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **268 checks across 11 sections**, and `make check` green. Since
+Verified by `make verify` — **281 checks across 11 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -270,6 +270,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
+| **SHIP-79** | M3 | `provider_service_areas` and `provider_specialties`, and `GET`/`PATCH /v1/fleet/profile` — a service area is a **set of named regions, not a radius**, so §9's `internal/geo` trigger does not fire at SHIP-81 — *see below* |
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -1969,6 +1970,110 @@ reason `jobs` refuses `?status=Draft`.
 Nothing shared was edited beyond the two lines `contracts/openapi.yaml` reserves per domain, the
 regenerated `routes_golden.txt` and `Docs/10-api-error-codes.md`, and this file. `Deps` needed no
 field: fleet builds from the clock and the pool alone.
+
+### SHIP-79 — a service area is a set of regions, and that is what keeps `internal/geo` unbuilt
+
+Migration `000301` creates `provider_service_areas` and `provider_specialties`, and
+`GET`/`PATCH /v1/fleet/profile` reads and replaces what a provider has declared: where they will
+carry freight, and what kind of freight they carry. `Docs/01` §4.2's "nominate service area and
+specialties", and the half of eligibility that belongs to a *provider* rather than to one vehicle.
+
+**The decision this ticket existed to take: a service area is a set of named regions — states and
+postcodes — and not a radius around a point.** §9 has named "the first ticket needing the distance
+between two coordinates in a domain other than `jobs`" as the trigger for writing `internal/geo`
+since SHIP-60, and named SHIP-81 as the likely one. **It is not.** SHIP-81 is now a set-membership
+query, this domain does no distance arithmetic, and `internal/geo` remains unwritten and
+unregistered. Three reasons, in the order they weighed:
+
+1. **A radius would make eligibility depend on a field the platform may not have.** A job's
+   coordinate is best-effort by design — SHIP-60 stores the address exactly as typed when a lookup
+   fails, and §3 above records that staging and production get *no geocoder at all* until one is
+   configured. A radius filter in that state matches nothing: a provider opens the app to an empty
+   feed with no error anywhere to explain it. The state and the postcode are typed by the customer
+   and validated on the way in, so they are always there.
+2. **It is how Australian road freight is quoted.** Providers price by postcode zone and by state
+   rather than by kilometres from a depot, and a straight-line radius is wrong about roads — 300 km
+   from Melbourne reaches Tasmania across Bass Strait.
+3. **Both documents already read it this way.** SHIP-60 gave a job address four parts rather than
+   one freeform line "because the suburb, the state and the postcode are values SHIP-79 and SHIP-81
+   will compare", and the geo decision itself recorded that "neither names a radius in kilometres".
+   This is that reading held to rather than quietly reversed.
+
+**What would reopen it is named rather than left to judgement**, in the same style: a ticket that
+genuinely needs a distance — "providers within 50 km of the pickup, ranked" is the shape. The answer
+then is still §9's, and the regions stay, because a provider has to be able to say "I do not cross
+the Nullarbor" in a form a straight line cannot express. **§9's own entry still says the trigger is
+"likely SHIP-81" and that is now known to be wrong**; correcting that sentence is a reconciliation
+edit rather than this ticket's, since a domain branch does not own §9.
+
+**An entry names one grain and never two**, and that follows directly from a decision §3 already
+records. `ck_provider_service_areas_scope_and_area` accepts either a whole state or one postcode,
+never a postcode qualified by a state — because SHIP-60 deliberately refused to validate a postcode
+against its state (the allocations have exceptions, 2600 is ACT inside the NSW range, and they move
+when Australia Post says so). A row carrying both could disagree with itself, and checking that it
+did not would be exactly the validation that decision refuses. One grain per row leaves nothing to
+be inconsistent about.
+
+**An empty declaration matches no job rather than every job.** Eligibility is opt-in, or the
+provider who has not finished onboarding would be the widest-reaching provider on the platform —
+and `Docs/04` §3 requires the area declared before verification passes. `fleet.Profile.Serves` is
+the reading SHIP-81 should use; a test in `internal/fleet` and a check in `make verify` both assert
+the empty case.
+
+**Three lists, and each of them has three states rather than two.** Omitted or `null` leaves a list
+exactly as it is; `[]` clears it; entries replace it whole. That is `VehicleFields`' distinction
+applied to a set, and the empty list is not decoration — without it a provider who withdrew from
+every single postcode and now covers whole states only could not say so. There is deliberately **no
+add-one or remove-one operation**: the screen renders the declaration as chips and sends the set
+back, and two operations over one collection is where a client and a server stop agreeing about
+what is in it.
+
+**What is replaced is the set, not the rows.** The store deletes only what has left the declaration
+and inserts only what is new, so an entry the provider has held since January keeps its `created_at`
+through a request that merely resends it. That matters because `Docs/04` §3 makes the service area
+something a verification decision is taken against, and "when did they take on Queensland" is the
+question support would ask.
+
+**The first advisory lock outside `cmd/worker`, and it is load-bearing rather than defensive.**
+Replacing a set is a delete and an insert that must be one decision, and a row lock cannot express
+it — what has to be serialised includes the case where the set is currently *empty*, so there are no
+rows for `FOR UPDATE` to hold. Without `pg_advisory_xact_lock`, two devices declaring at once in
+READ COMMITTED each fail to see the other's uncommitted insert, both survive, and the stored
+declaration becomes the union of two sets neither client asked for — a lost update with nothing to
+report afterwards. `TestTwoDevicesDeclaringAtOnceDoNotProduceTheUnion` was **watched failing with
+the lock removed** before it was believed. The lock class is `79`, following the convention
+`cmd/worker/outbox.go` set at `134`: the ticket's number, so two uses cannot share a key space by
+accident.
+
+**Twelve specialties, closed, and a declaration is never a permission.** Naming `dangerous_goods`
+claims a capability; what a provider is licensed and insured to carry is verification's business
+(`Docs/04` §3) and what may not be carried at all is X-9's. This is the capability vocabulary
+`000300` and `000404` were both careful to say `vehicle_type` is *not*: that answers what a vehicle
+is, this answers what its owner does. The pairing test `Docs/10` §3.4 requires reads the constraint
+out of `pg_constraint` in both directions.
+
+**The eight states are a second copy of a list `jobs` also holds**, and that is the boundary rule
+working rather than failing. Domains do not import each other, so `fleet` cannot reach
+`jobs.States`; eight strings that have not moved since 1975 are cheaper duplicated than registered
+in `internal/boundaries` — which is a shared file a domain branch must not edit anyway. Each copy is
+paired with its own `CHECK` by its own test, so neither can drift unnoticed.
+
+**Validation names the position, not just the list.** A detail's field is
+`service_area.postcodes.2`, because the client renders each entry as its own control and an error
+naming only the list leaves the provider to work out which of forty postcodes is meant. It is an
+extension of `httpx.FieldError`'s dotted path through an array index rather than a new convention.
+The offending value is deliberately not echoed back.
+
+**No new error code, and that is worth stating.** `fleet_provider_only` already exists and covers
+the only domain-specific refusal here; everything else is `validation_failed` with details or the
+middleware's own business. A domain code earns its place only where a client would otherwise have
+to parse a message. The read is deliberately *not* refused to a customer — their declaration is
+empty because they have never made one, and a 403 on a read that discloses nothing would make the
+client special-case a screen it never shows.
+
+Nothing shared was edited beyond the one line `contracts/openapi.yaml` reserves per path (plus a
+sentence on the `Fleet` tag, which is fleet's own block), the regenerated `routes_golden.txt`, and
+this file. `Deps` needed no field and `internal/boundaries` was not opened.
 
 ### What SHIP-80 built, and the ticket it turns out to have finished
 

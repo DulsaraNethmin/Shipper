@@ -122,6 +122,7 @@ SHIP-76
 
 # M3 — Bidding and award
 SHIP-78
+SHIP-79
 SHIP-80
 SHIP-91
 # M4 — Delivery execution

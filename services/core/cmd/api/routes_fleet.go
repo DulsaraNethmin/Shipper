@@ -32,8 +32,29 @@ import (
 // A `PATCH` carrying `{"active": false}` would be a client naming a state — and there is no
 // `DELETE`, because a vehicle is named by the bid that won a job and by the delivery that followed
 // it, so the row survives the provider's interest in it (Docs/05 §3.1, Docs/10 §3.3).
+//
+// # Why the declaration is one document rather than a collection
+//
+// SHIP-79 adds `/fleet/profile`, and it is a `GET` and a `PATCH` with no `{id}` beneath them. The
+// provider's service area and specialties are sets they edit as sets — the client renders chips and
+// sends the set back — so there is no `/fleet/profile/states/{state}` to `DELETE`. Two operations
+// over one collection is where a client and a server stop agreeing about what is in it.
 func init() {
 	register(
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/fleet/profile",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).Profile() },
+		},
+		Route{
+			Method:  http.MethodPatch,
+			Pattern: "/fleet/profile",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).Declare() },
+		},
 		Route{
 			Method:  http.MethodGet,
 			Pattern: "/fleet/vehicles",

@@ -27,6 +27,14 @@
 // than having it silently ignored, which is the failure worth preventing: a provider who believes
 // they took a truck off the road and did not will keep receiving work for it.
 //
+// # Two resources, and one of them is a set
+//
+// `/v1/fleet/vehicles` is a collection of things with identifiers. `/v1/fleet/profile` (SHIP-79) is
+// one document per provider holding three sets — states, postcodes, specialties — and it is edited
+// by sending a set back rather than by adding and removing entries one at a time. There is
+// therefore no `/v1/fleet/profile/states/{state}`: two operations over one collection is where a
+// client and a server stop agreeing about what is in it.
+//
 // The blank line below keeps this a file note rather than a second package comment.
 
 package fleet
@@ -420,6 +428,186 @@ func (h *Handler) List() http.Handler {
 		}
 
 		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(vehicles, encodeVehicleCursor(page.Next)))
+		return nil
+	})
+}
+
+// --- SHIP-79: the provider's declaration ------------------------------------------------------
+
+// profileRequest is the body of PATCH /v1/fleet/profile.
+//
+// Every list is a pointer, so absent, null and an explicit empty list are three distinct things —
+// the same distinction [vehicleRequest] draws, applied to a set:
+//
+//	omitted or null   leave that list exactly as it is
+//	an empty list     clear it
+//
+// A list that is supplied replaces its predecessor whole. There is no add-one or remove-one
+// operation, deliberately: the client renders the declaration as a set of chips and sends the set
+// back, and two operations over one collection is where a client and a server stop agreeing about
+// what is in it.
+//
+// `service_area` is nested so that the two grains read as one idea rather than as two unrelated
+// top-level lists — but the grains still move independently inside it, because a provider adding a
+// postcode should not have to resend every state.
+type profileRequest struct {
+	ServiceArea *serviceAreaRequest `json:"service_area"`
+	Specialties *[]string           `json:"specialties"`
+}
+
+// serviceAreaRequest is the two grains of a service area.
+//
+// **There is no radius and there is no coordinate**, and that is the decision SHIP-79 took rather
+// than left to SHIP-81. model.go carries the reasoning; the short version is that a job's
+// coordinate is best-effort and its state and postcode are not, so a radius would filter a feed on
+// a field the platform may not have.
+type serviceAreaRequest struct {
+	States    *[]string `json:"states"`
+	Postcodes *[]string `json:"postcodes"`
+}
+
+// fields turns the request into the domain's command.
+//
+// Values are carried across rather than checked here, for the reason [vehicleRequest.fields] gives:
+// whether a state or a specialty is *acceptable* is the domain's judgement, made once in
+// [ProfileFields.problems], so that the rule is the same for every caller rather than for whoever
+// arrived over HTTP.
+func (b profileRequest) fields() ProfileFields {
+	f := ProfileFields{}
+
+	if b.ServiceArea != nil {
+		f.States = b.ServiceArea.States
+		f.Postcodes = b.ServiceArea.Postcodes
+	}
+	if b.Specialties != nil {
+		specialties := make([]Specialty, 0, len(*b.Specialties))
+		for _, raw := range *b.Specialties {
+			specialties = append(specialties, Specialty(raw))
+		}
+		f.Specialties = &specialties
+	}
+	return f
+}
+
+// profileResponse is a provider's declaration as they see it.
+//
+// **Every list is always present and never null**, which is the opposite of the rule
+// [vehicleResponse] follows and is right for the opposite reason. An omitted capacity means "the
+// provider has not said"; an omitted list would mean the same thing as an empty one, and here that
+// distinction is exactly what the client is editing. A provider who has declared nothing gets three
+// empty arrays, which a client can render and iterate without a nil check.
+type profileResponse struct {
+	ServiceArea serviceAreaResponse `json:"service_area"`
+	Specialties []string            `json:"specialties"`
+}
+
+type serviceAreaResponse struct {
+	// States is every state or territory the provider serves in full, ascending.
+	States []string `json:"states"`
+
+	// Postcodes is every single postcode they serve, ascending, and it is not narrowed by States:
+	// the two are separate claims, and a postcode named inside a state already declared is
+	// harmless duplication rather than a contradiction.
+	Postcodes []string `json:"postcodes"`
+}
+
+// profileFrom splits the domain's flat set of areas into the two lists a client renders.
+//
+// The domain holds one list because that is what the table holds and what a membership test walks;
+// the wire holds two because the screen has two controls. Splitting here rather than in the store
+// keeps the shape of the API a decision of this file's.
+func profileFrom(p Profile) profileResponse {
+	out := profileResponse{
+		ServiceArea: serviceAreaResponse{States: []string{}, Postcodes: []string{}},
+		Specialties: []string{},
+	}
+
+	for _, area := range p.Areas {
+		switch area.Scope {
+		case ScopeState:
+			out.ServiceArea.States = append(out.ServiceArea.States, area.Area)
+		case ScopePostcode:
+			out.ServiceArea.Postcodes = append(out.ServiceArea.Postcodes, area.Area)
+		}
+	}
+	for _, specialty := range p.Specialties {
+		out.Specialties = append(out.Specialties, string(specialty))
+	}
+	return out
+}
+
+// Profile handles GET /v1/fleet/profile (SHIP-79).
+//
+// The calling provider's own declaration. **There is no parameter for whose**, and no route to
+// another provider's: what a competitor covers and specialises in is commercial information, and the
+// customer-facing view of a provider arrives with SHIP-96 as a shape of its own.
+//
+// It never answers 404. An undeclared profile is an empty one, so a client opening the screen for
+// the first time gets three empty arrays rather than an error it has to read as "not yet".
+func (h *Handler) Profile() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		profile, err := h.svc.Profile(r.Context(), pool, providerID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, profileFrom(profile))
+		return nil
+	})
+}
+
+// Declare handles PATCH /v1/fleet/profile (SHIP-79).
+//
+// PATCH rather than PUT, and the reason is the one [Handler.Update] gives sharpened by a second: a
+// provider changing their specialties should not have to resend four hundred postcodes, and a
+// client that has not been updated for a field added later would clear it by sending everything it
+// knows about. What each *named* list does is still a replacement — the three-state rule is in
+// [profileRequest].
+//
+// Only a provider account may declare one, refused with `fleet_provider_only` and read from
+// users.role rather than from the role claim in the token. The matching read is deliberately not
+// refused: see [Service.Profile].
+//
+// A transaction, because replacing a set is a delete and an insert that must be one decision, and
+// because the advisory lock that stops two devices interleaving only lasts as long as one.
+func (h *Handler) Declare() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		var req profileRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var declared Profile
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			declared, err = h.svc.Declare(ctx, runner, providerID, req.fields())
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, profileFrom(declared))
 		return nil
 	})
 }

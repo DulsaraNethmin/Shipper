@@ -10,6 +10,8 @@ GET    /v1/auth/sessions                        user         v1
 DELETE /v1/auth/sessions/{id}                   user         v1
 POST   /v1/auth/verify-email                    public       v1
 POST   /v1/auth/verify-phone                    public       v1
+GET    /v1/fleet/profile                        user         v1
+PATCH  /v1/fleet/profile                        user         v1
 GET    /v1/fleet/vehicles                       user         v1
 POST   /v1/fleet/vehicles                       user         v1
 GET    /v1/fleet/vehicles/{id}                  user         v1
