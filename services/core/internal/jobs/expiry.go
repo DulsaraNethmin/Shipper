@@ -241,7 +241,7 @@ type expiryWarned struct {
 
 // emitExpiryWarning writes the domain event, inside the caller's transaction.
 func (s *Service) emitExpiryWarning(ctx context.Context, r db.Runner, job Job, at time.Time) error {
-	event, err := events.New("job", job.ID, EventExpiryWarned, at, expiryWarned{
+	event, err := events.New(EventExpiryWarned, job.ID, at, expiryWarned{
 		JobID:      job.ID.String(),
 		CustomerID: job.CustomerID.String(),
 		ExpiresAt:  job.ExpiresAt.UTC(),

@@ -132,6 +132,7 @@ SHIP-110
 
 # M5 — Notifications
 SHIP-134
+SHIP-135
 
 # M6 — Admin
 SHIP-149

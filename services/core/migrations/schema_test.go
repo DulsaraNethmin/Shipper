@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -327,7 +328,10 @@ func TestOutboxAcceptsAnEvent(t *testing.T) {
 	jobID, _ := uuid.NewV7()
 	occurred := time.Now().UTC().Truncate(time.Millisecond)
 
-	event, err := events.New("job", jobID, "job.published", occurred, map[string]any{
+	// A registered event type, because since SHIP-135 there is no other kind: internal/events
+	// refuses to write one the catalogue does not know, which is what makes a row the publisher
+	// can never drain impossible to create.
+	event, err := events.New(jobs.EventStatusChanged, jobID, occurred, map[string]any{
 		"job_id": jobID.String(),
 	})
 	if err != nil {
@@ -349,8 +353,10 @@ func TestOutboxAcceptsAnEvent(t *testing.T) {
 		t.Fatalf("reading it back: %v", err)
 	}
 
-	if aggregateType != "job" || eventType != "job.published" {
-		t.Errorf("stored %s/%s, want job/job.published", aggregateType, eventType)
+	// The aggregate type is the catalogue's rather than the caller's — events.New takes no
+	// aggregate argument, so an event cannot be emitted onto a topic it does not belong to.
+	if aggregateType != "job" || eventType != jobs.EventStatusChanged {
+		t.Errorf("stored %s/%s, want job/%s", aggregateType, eventType, jobs.EventStatusChanged)
 	}
 	if published != nil {
 		t.Error("a freshly written event is already marked published")
@@ -366,9 +372,21 @@ func TestOutboxRefusesAnIncompleteEvent(t *testing.T) {
 	id, _ := uuid.NewV7()
 
 	cases := map[string]events.Event{
-		"no id":      {AggregateType: "job", AggregateID: id, Type: "job.published", Payload: []byte(`{}`)},
+		"no id":      {AggregateType: "job", AggregateID: id, Type: jobs.EventStatusChanged, Payload: []byte(`{}`)},
 		"no type":    {ID: id, AggregateType: "job", AggregateID: id, Payload: []byte(`{}`)},
-		"no payload": {ID: id, AggregateType: "job", AggregateID: id, Type: "job.published"},
+		"no payload": {ID: id, AggregateType: "job", AggregateID: id, Type: jobs.EventStatusChanged},
+
+		// SHIP-135's addition: an event type in no catalogue has no topic and no
+		// version, so a row carrying one is a row the publisher could never drain.
+		// Refused here, inside the caller's transaction, rather than left to block a
+		// batch — which is why the outbox needs no dead-letter path.
+		"a type nothing registered": {ID: id, AggregateType: "job", AggregateID: id,
+			Type: "job.invented_here", Payload: []byte(`{}`)},
+
+		// And an event on the wrong aggregate would publish to shipper.bid and be read
+		// by nobody.
+		"the wrong aggregate": {ID: id, AggregateType: "bid", AggregateID: id,
+			Type: jobs.EventStatusChanged, Payload: []byte(`{}`)},
 	}
 
 	for name, event := range cases {

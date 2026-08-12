@@ -181,7 +181,7 @@ type expiryExtended struct {
 
 // emitExpiryExtended writes the domain event, inside the caller's transaction.
 func (s *Service) emitExpiryExtended(ctx context.Context, r db.Runner, job Job, previous, at time.Time) error {
-	event, err := events.New("job", job.ID, EventExpiryExtended, at, expiryExtended{
+	event, err := events.New(EventExpiryExtended, job.ID, at, expiryExtended{
 		JobID:             job.ID.String(),
 		CustomerID:        job.CustomerID.String(),
 		PreviousExpiresAt: previous.UTC(),

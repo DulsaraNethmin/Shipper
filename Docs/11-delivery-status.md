@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **285 checks across 11 sections**, and `make check` green. Since
+Verified by `make verify` — **295 checks across 11 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -277,6 +277,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
+| **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -2414,6 +2415,134 @@ published, an unreachable broker leaves every row claimable and the next pass pu
 order, a crash between publishing and committing publishes the same event twice rather than
 losing it, and one aggregate belongs to one worker while a second worker is still handed the
 other.
+
+### SHIP-135 — the topic set, the catalogue, and why the outbox needs no dead-letter path
+
+Three points, and most of the value is in closing the two §9 items SHIP-134 opened and named this
+ticket for: **nothing created the Kafka topics**, and **the outbox had no dead-letter path**. Both
+are decided here, and it turns out they are one decision rather than two.
+
+**The topic set is three topics, one per aggregate — `shipper.job`, `shipper.bid`,
+`shipper.delivery` — and `topicFor` moved rather than changed.** §9 predicted it would be "the one
+line SHIP-135 changes", and what changed was its address: the mapping is now
+`internal/events.TopicFor`, beside the catalogue that decides the set, and `cmd/worker`'s
+`topicFor` delegates to it. The aggregate list is closed the way `internal/boundaries.Domains` and
+`migrations.Blocks` are closed. All three topics are created now even though only `job` has events,
+because a partition count cannot be reduced and deciding all three at once is cheaper than deciding
+each under whatever deadline first needs it.
+
+**`cmd/topics` creates them, applied like a migration, and local and deployed are the same step.**
+That was §9's genuinely open half. The compose stack was rejected because it would be a second,
+hand-maintained topic list that exists only locally — the drift the single implementation avoids,
+written down. A start-up step in `cmd/worker` was rejected for two reasons: it runs once per
+process rather than once per deployment, which in the harness alone is four worker starts, and it
+needs `Create` on the cluster in a process whose whole job is producing. **A schema is applied by a
+step somebody runs**, and this repository already has that shape in `cmd/migrate`. The topic list
+is derived from `events.Topics()` rather than typed, so it cannot drift from the catalogue;
+`make topics` runs it; it is idempotent, and re-running is the intended usage. It also **refuses**
+a topic whose partition count disagrees rather than correcting it — adding a partition rehashes
+every key and silently ends the per-aggregate ordering the publisher's advisory locks exist to
+keep, so that is a decision with a migration behind it, not a repair.
+
+**"Versioned schema" means a `Schema` per event type — aggregate, version, payload field set, and a
+payload bound — and the version travels in the message rather than in the topic name.** The obvious
+design is `shipper.job.v2`, and it is wrong here structurally rather than aesthetically: **ordering
+is promised per aggregate**, Kafka orders within one partition of one topic, so one topic per
+aggregate is what makes that promise keepable. A version in the topic name is therefore a version
+per *aggregate* — `job.expiry_warned` gaining a field would move `job.status_changed` too, and a
+job's events would split across two topics with no order between them. One topic per event type
+loses the ordering outright.
+
+**The version is written into the payload when the row is written, not looked up when it is
+published**, and that distinction is the whole point. The failure worth preventing is the one
+`internal/pagination`'s cursor prefix was built against (SHIP-66): not a rejected event but **a
+stale one accepted as meaning something else** after a deployment. A row written before a deploy
+and drained after it is entitled to the version it was written under; looking the version up at
+publish time would relabel it as the newer shape. It also makes a row self-describing —
+`select payload->>'schema_version'` answers "what shape is this" — and it needed no migration,
+which matters because `outbox` is in the shared block a domain branch may not touch. The publisher
+copies it into the envelope and into a `schema-version` Kafka header, so a consumer can refuse a
+version it was not built for without deserialising the body.
+
+**A domain declares its own events, and no domain track will ever edit `internal/events` to add
+one.** `internal/jobs/events.go` is one `init` calling `events.Register` for the three job events,
+with the payload struct itself as the schema — the field set is derived by reflection rather than
+retyped, so the catalogue cannot describe a shape the code does not have. SHIP-136 adds bidding's
+and delivery's from files exactly like it. `internal/events` still imports no domain: the catalogue
+is a table it holds, not a list it writes.
+
+**The mechanism that makes a forgotten version bump visible is `cmd/api/events_golden.txt`**, and
+it is there for the reason `routes_golden.txt` is: a domain registers from its own `init`, so no
+single source file lists them, and `cmd/api` is the one binary that links every domain. Each line
+is topic, type, version, bound and field set. **A line whose fields changed without its `v`
+changing is the defect** — a one-line diff in review, beside the change that caused it, rather than
+a consumer's logs a week later. Regenerating it is therefore the moment somebody is asked whether
+the version should go up, which is exactly when they can answer.
+
+**The dead-letter decision: there is no dead-letter path, because a permanently unpublishable row
+is now unwritable.** §9 offered three ways out and called bounding the payload the cheapest and
+probably right one. It is right, and the argument is stronger than "cheapest" once the class is
+enumerated. "Permanently unacceptable" can only mean three things: the event type is one nothing
+consumes, its aggregate has no topic, or the payload is over the broker's limit. All three are
+decided by the catalogue, and **`events.New` and `Outbox.Emit` check all three inside the
+transaction making the state change** — where a failure rolls the change back, tells the caller, and
+names the line that built the event. So the outbox's remaining failures are all transient (the
+broker is unreachable, or the topic set was never applied), and for those, failing the batch and
+leaving every row claimable is exactly right. **Rather than build a recovery path, the ticket made
+the failure unreachable.** Parking a row after N attempts was rejected on `000004`'s own terms —
+`published_at` is the publisher's only state — and publishing per event was rejected because it
+weakens the batch guarantee for every event to accommodate one that should never exist.
+
+The bound is 16 KiB per payload against a broker limit of 1,048,588 bytes, and it is not tuned:
+its job is to make an unacceptable payload unwritable, and any bound comfortably below the broker's
+does that. **The revisit trigger is named rather than left to judgement: the first event whose
+payload is legitimately unbounded — a document, a photograph, a manifest — must not travel in the
+outbox at all.** It goes to object storage and the event carries the key. If that is ever refused,
+the dead-letter question reopens with §9's other two answers still on the table.
+
+**Two smaller things fell out of it.** `events.New` no longer takes an aggregate type — the
+catalogue supplies it, so `job.status_changed` can no longer be emitted on the `bid` aggregate,
+which would have published to `shipper.bid` and been read by nobody with nothing anywhere
+reporting it. And **the budget-privacy invariant is now structural across every domain event there
+will ever be**: `cmd/api` refuses any registered field whose name mentions a budget, in bidding and
+delivery before they have written a line. `internal/jobs` already read its own events back out of
+the outbox and failed on one; this is the version that covers the domains that do not exist yet.
+
+**`make verify` went from 285 checks across 11 sections to 295**, with the ten new ones in
+`scripts/verify/80-notifications.sh` demonstrating the topic set against the real broker: all three
+topics with three partitions and stated retention, a second application that creates nothing, a
+topic staged by hand with one partition being reported and **left alone**, the version in the row,
+in the envelope and in the header, and the committed catalogue holding a schema for each of the
+three events and no budget field anywhere in it.
+
+**And it found a third instance of this harness's oldest lesson, one layer further out than the
+first two: `shipper.job` is shared by every git worktree on the machine.** The header check was
+first written as a count over the whole topic — every message of a registered type must carry
+`schema-version:1` — and it failed on a run where nothing was wrong. `COMPOSE_PROJECT_NAME` is
+pinned so that worktrees share one stack, deliberately, and the isolation that comes with that is
+per-worktree databases and ports. **Kafka has no equivalent**: there is one broker and one
+`shipper.job`, so a concurrent `make verify` in another worktree — running a build without this
+ticket in it — had its own unversioned events on the topic, and the count was right about what it
+saw. The check now fences on **the event ids this section created**, which is the recipe SHIP-47's
+rate-limit bucket produced and SHIP-134's comparison adopted, with one addition worth carrying
+forward: **on a topic the fence has to be an id rather than a timestamp**, because a concurrent run
+in another worktree is not ordered against this one. Anything a later section asserts about a Kafka
+topic has to identify its messages rather than count them.
+
+**`scripts/verify/50-jobs.sh` now applies the topic set before its first worker start, and claims
+no check for it.** That is the §9 finding acted on rather than restated: `cmd/worker` is one binary,
+every start runs every task, so that file's three starts also drain the outbox — and against a
+missing topic every one of those passes failed silently, because nothing in that section asserted
+on them. The topic application is a prerequisite there and an assertion in the notifications
+section, which keeps the check where the ticket is.
+
+**One configuration request, deliberately not taken.** The replication factor is the only genuinely
+environment-dependent number in the topic set: one is correct for a single-broker compose stack and
+wrong for a cluster, which wants three. `internal/config` is a shared surface a domain branch may
+not edit, so it is a flag on the command — `go run ./cmd/topics -replication 3` — defaulting to
+`events.DefaultReplicationFactor`. A deployment can pass it today with no configuration change.
+**Whoever next owns `internal/config` should fold it in as `KAFKA_REPLICATION_FACTOR`**, which is
+the same handling `GEOCODING_*` and the page sizes got.
 
 ### SHIP-15i — the wave-5 pre-step, and the two things it deliberately did not do
 

@@ -68,15 +68,24 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-# Three partitions rather than one, so the Hash balancer is doing something real: the key is the
-# aggregate, so one job's events share a partition and Kafka keeps their order within it. The
-# broker refuses to create topics on demand (deploy/docker-compose.yml), which is why this is
-# here at all — **SHIP-135 owns the topic set**, and until it lands a publish to a topic nobody
-# created fails the pass and leaves the rows claimable.
-"${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
-  --create --topic "$outbox_topic" --partitions 3 --replication-factor 1 >/dev/null 2>&1 \
-  || fail "could not create $outbox_topic"
-ok "topic $outbox_topic created empty (SHIP-135 owns the real topic set)"
+# Recreated by the command that owns the topic set rather than by kafka-topics.sh.
+#
+# That is a change from how this section was written. It used to create the topic itself, with
+# three partitions and a comment saying SHIP-135 would take it over; **SHIP-135 has**, so the topic
+# now comes back exactly as a deployment would make it. Three partitions still, and for the reason
+# that comment gave: the key is the aggregate, so one job's events must share a partition for Kafka
+# to keep their order within it.
+#
+# The command is idempotent and 50-jobs.sh has already run it once. The SHIP-135 section at the
+# foot of this file asserts the whole set, the partition count, and that a second run changes
+# nothing.
+pushd "$ROOT/services/core" >/dev/null
+go build -o "$WORKDIR/shipper-topics" ./cmd/topics
+popd >/dev/null
+KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
+  "$WORKDIR/shipper-topics" >"$WORKDIR/topics-recreate.log" 2>&1 \
+  || { cat "$WORKDIR/topics-recreate.log"; fail "could not recreate $outbox_topic"; }
+ok "topic $outbox_topic recreated empty by the command that owns the topic set (SHIP-135)"
 
 # The fence. Taken from the database's own clock, after the topic is empty and before anything
 # can publish into it — no worker is running at this point, SHIP-68's having been waited on — so
@@ -319,8 +328,210 @@ for line in open(sys.argv[1]):
   || fail "the first fixture came off the topic as [$consumed_payload], want job.published/1"
 ok "each message carries its event id, its type and the payload the domain wrote"
 
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-135  topics exist with a versioned schema for each domain event"
+
+# The half of SHIP-134 that ticket deliberately left open, and both of Docs/11 §9's questions
+# behind it: what creates the topics, and what the outbox does with an event that can never be
+# published.
+#
+# # What is demonstrated here and what is demonstrated by tests
+#
+# The catalogue itself — which events exist, what their payloads contain, what a version is, and
+# every refusal that keeps a permanently unpublishable row out of the outbox — is held by
+# internal/events/catalogue_test.go and by cmd/api/events_golden.txt. None of that needs a broker
+# and none of it is repeated here.
+#
+# What only a real cluster can show is the other half: that the topic set the catalogue implies is
+# actually on the broker with the partition count it asked for, that applying it twice is safe,
+# that a topic which drifted is reported rather than silently corrected, and that the version
+# reaches a consumer both in the envelope and in the payload. That is what this section does, and
+# it runs last in the file because it reads what the SHIP-134 section above put on the topic.
+#
+# # Fencing
+#
+# It asserts on shipper.job only through $WORKDIR/outbox-consumed.json, which the section above
+# produced from a topic it had just emptied. The one topic it manipulates is **shipper.delivery**,
+# which no code publishes to yet — deliberately, so that breaking a topic on purpose cannot cost
+# another section anything.
+
+topics_apply() {
+  KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
+    "$WORKDIR/shipper-topics" >"$1" 2>&1
+}
+
+topic_described() {
+  "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" \
+    --bootstrap-server localhost:9092 --describe --topic "$1" 2>/dev/null | tr -d '\r' | head -1
+}
+
+# --- the topic set exists ---------------------------------------------------------------------
+
+# The three aggregates of internal/events.Aggregates. Written out rather than read from the
+# binary, because a check that asked the code what to expect would agree with the code by
+# construction — the Go test holds the set, and this holds the cluster to it.
+retention_stated=1
+for topic in shipper.job shipper.bid shipper.delivery; do
+  described="$(topic_described "$topic")"
+  [[ "$described" == *"PartitionCount: 3"* ]] \
+    || fail "$topic is not on the broker with three partitions: ${described:-nothing at all}"
+  [[ "$described" == *"retention.ms=604800000"* ]] || retention_stated=0
+done
+ok "shipper.job, shipper.bid and shipper.delivery all exist, three partitions each"
+
+# Three is the number that cannot be taken back: partitions can be added and never removed, and
+# adding one rehashes every key onto a different partition, which silently ends the per-aggregate
+# ordering the section above just demonstrated.
+[[ "$retention_stated" == "1" ]] \
+  || fail "retention.ms is not stated on the topics, so the set is not reproducible on a broker whose default differs"
+ok "retention is stated on each topic rather than inherited, so the set is reproducible"
+
+# --- applying it again is safe ------------------------------------------------------------------
+
+# The property that lets a deployment run it every time, and lets 50-jobs.sh run it too.
+topics_apply "$WORKDIR/topics-again.log" \
+  || { cat "$WORKDIR/topics-again.log"; fail "a second application of the topic set failed"; }
+if grep -qE '^ +shipper\.[a-z]+ +created' "$WORKDIR/topics-again.log"; then
+  cat "$WORKDIR/topics-again.log"
+  fail "the second application created something, so it is not idempotent"
+fi
+[[ "$(grep -cE '^ +shipper\.[a-z]+ +exists$' "$WORKDIR/topics-again.log")" == "3" ]] \
+  || { cat "$WORKDIR/topics-again.log"; fail "the second application did not find all three topics"; }
+ok "applying the set again creates nothing and still exits zero — safe on every deploy"
+
+# --- a topic that drifted is refused, not corrected ---------------------------------------------
+
+# Staged on shipper.delivery, which nothing publishes to yet. This is the failure the command
+# exists to catch: somebody creates a topic by hand to unblock something, with the default one
+# partition, and every consumer's ordering guarantee quietly goes with it.
+"${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
+  --delete --topic shipper.delivery >/dev/null 2>&1 || true
+for _ in $(seq 1 50); do
+  "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
+    --list 2>/dev/null | tr -d '\r' | grep -qx shipper.delivery || break
+  sleep 0.2
+done
+"${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
+  --create --topic shipper.delivery --partitions 1 --replication-factor 1 >/dev/null 2>&1 \
+  || fail "could not stage a one-partition shipper.delivery"
+
+if topics_apply "$WORKDIR/topics-drifted.log"; then
+  cat "$WORKDIR/topics-drifted.log"
+  fail "the command accepted shipper.delivery with one partition"
+fi
+grep -q "partitions" "$WORKDIR/topics-drifted.log" \
+  || { cat "$WORKDIR/topics-drifted.log"; fail "it failed without saying the partition count was wrong"; }
+[[ "$(topic_described shipper.delivery)" == *"PartitionCount: 1"* ]] \
+  || fail "the refused run changed the topic anyway; adding a partition is a decision, not a repair"
+ok "a topic somebody created by hand with one partition is reported and left alone, never repaired"
+
+"${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
+  --delete --topic shipper.delivery >/dev/null 2>&1 || true
+for _ in $(seq 1 50); do
+  "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
+    --list 2>/dev/null | tr -d '\r' | grep -qx shipper.delivery || break
+  sleep 0.2
+done
+topics_apply "$WORKDIR/topics-restore.log" \
+  || { cat "$WORKDIR/topics-restore.log"; fail "the topic set could not be applied again"; }
+[[ "$(topic_described shipper.delivery)" == *"PartitionCount: 3"* ]] \
+  || fail "shipper.delivery did not come back with three partitions"
+ok "and once the wrong topic is gone the set applies cleanly again"
+
+# --- the version travels with the message -------------------------------------------------------
+
+# The cancellation the section above put through a real endpoint. It went through internal/events,
+# so its row carries the version its schema had **when the row was written** — which is the whole
+# reason the version is in the payload rather than looked up at publish time. A deployment that
+# changes a payload while rows are still unpublished would otherwise relabel them as the new shape.
+stored_version="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select payload->>'schema_version' from outbox where aggregate_id = '$emitted_job';")"
+[[ "$stored_version" == "1" ]] \
+  || fail "the stored payload reports schema version [$stored_version], want 1"
+ok "the outbox row records the version it was written under, readable with one select"
+
+wire_version="$(python3 -c '
+import json, sys
+for line in open(sys.argv[1]):
+    if not line.strip():
+        continue
+    e = json.loads(line)
+    if e["aggregate_id"] == sys.argv[2]:
+        print("%s/%s/%s" % (e["type"], e.get("schema_version"), e["payload"].get("schema_version")))
+        break
+' "$WORKDIR/outbox-consumed.json" "$emitted_job")"
+[[ "$wire_version" == "job.status_changed/1/1" ]] \
+  || fail "the message came off the topic as [$wire_version], want job.status_changed/1/1"
+ok "and it reaches a consumer in the envelope as well as inside the payload"
+
+# Repeated as a Kafka header so a consumer can refuse a version it was not built for without
+# deserialising the body at all — which is what makes checking it something anybody actually does.
+#
+# Asserted as two populations, and the split is the interesting part. The event a domain emitted
+# through internal/events carries the header; the three this file wrote with psql, to arrange a
+# transaction that rolls back, carry none. A hand-written row is published **with no version rather
+# than with the catalogue's current one**, because the catalogue's answer today is a claim about a
+# row that nothing knows to be true — which is the same reason the version is stamped when the row
+# is written rather than looked up when it is published.
+#
+# # Fenced by event id, and this is the third instance of that lesson in this harness
+#
+# The first version of this check counted messages by event type across the whole topic, and it
+# failed on a machine where another git worktree was running `make verify` at the same time. The
+# database and the ports are per worktree; **`COMPOSE_PROJECT_NAME` is pinned so the stack is not**,
+# so there is one broker and one `shipper.job` for every worktree on the machine. The other run's
+# events — from a build without this ticket in it — were on the topic and carried no version, and
+# the count was right about what it saw.
+#
+# So this reads only the ids it created. That is the recipe SHIP-47's rate-limit bucket produced
+# and the SHIP-134 comparison above adopted, one layer further out: **fence what you assert on**,
+# and note that on this topic the fence has to be an id rather than a timestamp, because a
+# concurrent run is not ordered against this one.
+emitted_event_id="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select id from outbox where aggregate_id = '$emitted_job';" | tr -d ' ')"
+
+headers="$("${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-consumer.sh" \
+  --bootstrap-server localhost:9092 --topic "$outbox_topic" --from-beginning \
+  --property print.headers=true --max-messages 200 --timeout-ms 8000 2>/dev/null | tr -d '\r' || true)"
+
+# `event-id:` appears only in the header portion, and the payload spells the field schema_version
+# with an underscore, so neither pattern can match inside a message body.
+grep -q "event-id:$emitted_event_id.*schema-version:1" <<<"$headers" \
+  || { printf '%s\n' "$headers"; fail "the event the endpoint emitted is not headed schema-version:1"; }
+
+for id in "${event_ids[@]}"; do
+  header_line="$(grep "event-id:$id" <<<"$headers" || true)"
+  [[ -n "$header_line" ]] || { printf '%s\n' "$headers"; fail "fixture $id is not on the topic"; }
+  [[ "$header_line" != *"schema-version"* ]] \
+    || fail "fixture $id was published claiming a schema version it was never written with"
+done
+ok "the version is a Kafka header on the event a domain emitted, and on none of the three written by hand"
+
+# --- there is a schema for each domain event, and it is committed ---------------------------------
+
+# cmd/api/events_golden.txt is the catalogue rendered: topic, type, version, payload bound and the
+# payload's field set, one line per event, derived from the payload structs by reflection. A
+# payload that changes shape moves a line; a line that moved without its `v` moving is the defect
+# the file exists to make visible in review.
+events_golden="$ROOT/services/core/cmd/api/events_golden.txt"
+for event in job.status_changed job.expiry_warned job.expiry_extended; do
+  grep -qE "^shipper\.job +$event +v[0-9]+ +[0-9]+ +[a-z_]+:" "$events_golden" \
+    || fail "$event has no schema recorded in cmd/api/events_golden.txt"
+done
+ok "each of the three domain events has a recorded schema: topic, version, bound and field set"
+
+# The budget-privacy invariant, applied to the catalogue rather than to one payload. An event is
+# the worst place for it to appear, because it travels past every point a response body could have
+# redacted it (Docs/01 §4.3).
+if grep -qi "budget" "$events_golden"; then
+  fail "an event in the catalogue declares a budget field"
+fi
+ok "and no event in the catalogue declares a budget field, in this domain or any later one"
+
 unset consumed consumed_ids consumed_sorted outbox_sorted ours_in_order emitted_type consumed_payload
 unset published worker_pid outbox_fence outbox_token emitted_job emitted_rows
 unset committed_job rolled_back_job rolled_back_rows outbox_topic
 unset event_ids
-unset -f outbox_request
+unset described retention_stated stored_version wire_version headers events_golden event topic
+unset emitted_event_id header_line id
+unset -f outbox_request topics_apply topic_described

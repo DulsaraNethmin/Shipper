@@ -676,8 +676,25 @@ ok "a job with no pickup date gets the fourteen-day backstop instead"
 # interval later, which is what lets this take seconds instead of five minutes.
 pushd "$ROOT/services/core" >/dev/null
 go build -o "$WORKDIR/shipper-worker" ./cmd/worker
+go build -o "$WORKDIR/shipper-topics" ./cmd/topics
 popd >/dev/null
 ok "the worker builds with the jobs domain's task registered"
+
+# The Kafka topic set, applied before anything in this file starts the worker.
+#
+# cmd/worker is one binary and every start runs *every* registered task, so the three starts below
+# also drain the outbox — and until SHIP-135 a publish to a topic nobody created failed that pass
+# and left the rows claimable. This section's own assertions never depended on it, which is exactly
+# why it went unnoticed for a wave; a run in which three worker starts silently fail every outbox
+# pass is not a run demonstrating a working system.
+#
+# **SHIP-135 owns the topic set and 80-notifications.sh asserts it.** This is a prerequisite rather
+# than a check, so it claims no ok(): the point here is only that the system under test is
+# provisioned the way a deployment provisions it. The command is idempotent, which is what makes it
+# safe to run here and again there.
+KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
+  "$WORKDIR/shipper-topics" >"$WORKDIR/topics-jobs.log" 2>&1 \
+  || { cat "$WORKDIR/topics-jobs.log"; fail "could not apply the Kafka topic set"; }
 
 SHIPPER_ENV=development \
 LOG_FORMAT=json \
