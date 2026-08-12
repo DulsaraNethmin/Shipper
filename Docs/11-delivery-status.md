@@ -1451,6 +1451,64 @@ SHIP-109. There is also no `CHECK` that the job has reached `Awarded`: a `CHECK`
 another table's column, so SHIP-106 enforces it where the assignment is made, exactly as `000400`
 does for the customer's role.
 
+### What SHIP-110 built, and why its two clocks are structural rather than conventional
+
+`milestones`, migration `000601`, and no endpoint either — demonstrated by
+`services/core/migrations/milestones_test.go`, on the same reasoning as SHIP-105 above.
+
+**`milestones` is deliberately not `job_status_history`, and conflating them is the mistake that
+table's header comment exists to prevent.** A history row is what the job's status *did*, and
+`000402`'s guard will not accept a status change no row describes. A milestone is what an actor
+*recorded*, and it may legitimately move nothing: `Docs/02` §3.1 requires a queued "Picked up"
+arriving after "In transit" to be absorbed rather than rejected (SHIP-112), and a "Delivered"
+recorded offline against an administrator's cancellation to be retained with its reason
+(SHIP-113). Neither is a transition, so neither could be a history row —
+`ck_job_status_history_moves` would refuse it outright, and the guard would have nothing to guard.
+A milestone that *does* move the job produces two rows in one transaction saying two different
+true things, and that pair is what makes an offline delivery reconstructable.
+
+**The dual timestamps are structural, which is the one thing to check if you review only part of
+this.** `000401` keeps its two clocks apart by convention — a `DEFAULT now()` and a guard that
+never names the column — and that holds while one function does the writing. Milestones are
+written from the driver portal, the mobile sync worker and the admin panel, so
+`milestones.server_recorded_at` is `NOT NULL` with **no default** and a `BEFORE INSERT` trigger
+that *refuses* an insert naming it and fills it from `now()` otherwise. Two columns are worth
+nothing if a caller can write one value to both: that record would say the platform received a
+milestone at the exact instant a device claims to have recorded it, which never happens and is
+precisely what somebody backdating a delivery would write. The table is append-only besides, so
+neither clock can overwrite the other afterwards either. A four-milestone offline batch synced in
+one transaction is tested end to end: four recorded times, one arrival.
+
+**An implausible actor time is recorded, not refused.** A device clock hours fast is evidence, and
+`Docs/02` §3.1 asks for the update to be absorbed rather than rejected — refusing it would discard
+work a driver actually did. There is no bound on `actor_recorded_at` and there should not be one.
+
+**There is deliberately no uniqueness on `(job_id, milestone)`,** and the absence is a decision
+with a test on it. A repeated *request* is stopped by the idempotency key (SHIP-15, SHIP-111),
+which is a different thing from a repeated *milestone*: a driver who reaches a pickup, finds
+nobody there and returns later records "En route to pickup" twice, and `Docs/02` §5 calls that
+failed attempt an ordinary outcome. A unique index would refuse it, and would also refuse the late
+arrival SHIP-112 exists to absorb.
+
+**The five milestones are a delivery vocabulary, not the twelve job statuses.** `Docs/02` §2 says
+so — "describing what a driver records, not constraining what the guard accepts" — and
+`internal/delivery` declares its own constants rather than importing `jobs.Statuses`, which
+domains may not do anyway. `ck_milestones_milestone` is paired with `delivery.Milestones` in both
+directions per `Docs/10` §3.4, and the test also asserts what the constraint must *not* permit:
+`'Completed'` is reached by seventy-two hours passing (`Docs/02` §6.1) and nobody records it. The
+actor list is narrower than `job_status_history`'s for the same reason — `Docs/02` §3 permits the
+awarded provider, their driver, an administrator with a reason, and the platform. **Not a
+customer**: confirming a delivery is a status transition, not recording one. `actor_id` carries no
+foreign key because it points at three different tables — a `users` row for a provider, a
+`driver_assignments` row for a driver, and neither for an administrator — which is the convention
+`000401` declared and this follows.
+
+**One note for the wave reconciliation:** both test files are new files in a directory other
+tracks also add files to, which is the established pattern (`jobs_test.go`,
+`device_sessions_test.go`) rather than an edit to a shared surface. `milestones_test.go` reuses
+`quotedLiteral` from `jobs_test.go`, since two package-level names cannot both be that and a
+second identically shaped regexp is how the two drift.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

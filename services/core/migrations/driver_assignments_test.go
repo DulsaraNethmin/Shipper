@@ -353,7 +353,7 @@ func TestDriverAssignmentTimestampsCarryTheirZone(t *testing.T) {
 // TestDeliveryMigrationsAreInTheDeliveryBlock names the numbers, because the block scheme is only
 // worth having if something checks that a migration landed inside its range.
 func TestDeliveryMigrationsAreInTheDeliveryBlock(t *testing.T) {
-	for _, version := range []int{600} {
+	for _, version := range []int{600, 601} {
 		block, ok := migrations.BlockContaining(version)
 		if !ok {
 			t.Errorf("version %d falls in no reserved block", version)
