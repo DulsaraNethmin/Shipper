@@ -279,9 +279,9 @@ func (d Dimensions) IsZero() bool { return d.LengthCm == 0 && d.WidthCm == 0 && 
 // Job is the job record: who owns it, what state it is in, and what the customer has said about
 // the delivery so far.
 //
-// It grows further through M2 — the goods category (SHIP-58), the budget (SHIP-67) and expiry
-// (SHIP-68) — and each of those arrives with the ticket that gives it meaning rather than as an
-// empty column waiting for one.
+// It grows further through M2 — the goods category (SHIP-58) and expiry (SHIP-68) — and each of
+// those arrives with the ticket that gives it meaning rather than as an empty column waiting for
+// one. The budget (SHIP-67) is here now.
 //
 // **Every field below Status is optional**, because a Draft is allowed to be incomplete: Docs/01
 // §4.1 lets a customer save a draft and come back to it, and SHIP-75 has a partly completed job
@@ -292,9 +292,15 @@ func (d Dimensions) IsZero() bool { return d.LengthCm == 0 && d.WidthCm == 0 && 
 // refuses the change regardless (000402), so a struct field that is written by mistake produces
 // a failed transaction rather than a silently moved job.
 //
-// There is no budget field here yet, and when SHIP-67 adds one it will not be carried into any
-// provider-facing shape. Docs/01 §4.3 keeps the customer's maximum private — not as an amount,
-// a band, or a "budget supplied" flag.
+// # BudgetCents is on this struct and must never reach a provider-facing shape
+//
+// Docs/01 §4.3 keeps the customer's maximum private — not as an amount, a band, or a "budget
+// supplied" flag. A [Job] is the domain's own record and carries it; what may not carry it is a
+// response, an event payload, or anything else that leaves the service towards a provider. That
+// is held by two things rather than by memory: SHIP-82's feed and SHIP-83's provider detail get
+// response types of their own rather than this one with fields hidden, and
+// TestOnlyTheOwnersResponseCarriesTheBudget reads this package's own source and refuses a
+// `budget` json tag anywhere but on the owning customer's response.
 type Job struct {
 	ID         uuid.UUID
 	CustomerID uuid.UUID
@@ -317,6 +323,15 @@ type Job struct {
 
 	PickupWindow  TimeWindow
 	DropoffWindow TimeWindow
+
+	// BudgetCents is the customer's maximum, in minor units (SHIP-67).
+	//
+	// Cents rather than a float, per Docs/10 §3.3: money is numeric(12,2) in PostgreSQL and
+	// int64 minor units in Go, never a float. AUD is implied; there is no currency in the MVP.
+	//
+	// Zero means not supplied, which is unambiguous because ck_jobs_budget refuses zero and
+	// everything below it — the same arrangement [Dimensions] relies on.
+	BudgetCents int64
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -354,6 +369,10 @@ type DraftFields struct {
 
 	PickupWindow  *TimeWindow
 	DropoffWindow *TimeWindow
+
+	// BudgetCents is the customer's maximum, in minor units (SHIP-67). A pointer to zero
+	// clears it, which is how a customer who set a budget removes it again.
+	BudgetCents *int64
 }
 
 // IsEmpty reports whether nothing at all was supplied.
@@ -366,5 +385,6 @@ func (f DraftFields) IsEmpty() bool {
 		f.GoodsDescription == nil &&
 		f.LengthCm == nil && f.WidthCm == nil && f.HeightCm == nil && f.WeightKg == nil &&
 		f.VehicleRequirement == nil && f.HandlingNotes == nil &&
-		f.PickupWindow == nil && f.DropoffWindow == nil
+		f.PickupWindow == nil && f.DropoffWindow == nil &&
+		f.BudgetCents == nil
 }

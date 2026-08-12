@@ -5,13 +5,17 @@
 // domains be built at once without touching a shared file. A domain importing internal/httpx is
 // sitting on infrastructure, not crossing a boundary, and the import lint permits it.
 //
-// # There is no budget field in any type below, and that is not because it has not been added yet
+// # The budget is on exactly one type below, and a test is what keeps it there
 //
 // Docs/01 §4.3 keeps the customer's maximum private from providers — not as an amount, not as a
-// band, not as a "budget supplied" flag. SHIP-67 adds the column and the serialisation test that
-// proves it cannot leak. Every endpoint here is owner-only, so a budget field would be safe on
-// them specifically; it is absent anyway, because the field arrives with the ticket that owns the
-// proof rather than with the first response that could carry it.
+// band, not as a "budget supplied" flag. Every endpoint in this file is owner-only, so
+// [jobResponse] may carry it and does (SHIP-67).
+//
+// What makes that safe as the file grows is not this paragraph. SHIP-82's provider feed and
+// SHIP-83's provider job detail get response types of their own rather than this one with fields
+// hidden, and TestOnlyTheOwnersResponseCarriesTheBudget parses this package's source and fails
+// when any struct but [jobResponse] declares a `budget` json tag. A provider shape written later
+// with the field copied across does not compile past the test suite.
 //
 // # Status appears in responses and in no request
 //
@@ -123,6 +127,17 @@ type draftRequest struct {
 
 	PickupWindow  *windowBody `json:"pickup_window"`
 	DropoffWindow *windowBody `json:"dropoff_window"`
+
+	// BudgetCents is the customer's maximum, in cents (SHIP-67).
+	//
+	// Minor units as a whole number rather than dollars as a decimal, for the reason
+	// Docs/10 §3.3 gives for the Go and PostgreSQL sides: money is never a float, and a JSON
+	// number written as 45.50 is one. The name says the unit, because a field called
+	// `budget` holding 150000 is a field somebody eventually reads as dollars.
+	//
+	// It is accepted here and returned only to the owner. No provider-facing shape carries
+	// it in any form (Docs/01 §4.3) — see the note at the top of this file.
+	BudgetCents *int64 `json:"budget_cents"`
 }
 
 // cancelRequest is the body of POST /v1/jobs/{id}/cancel.
@@ -154,6 +169,7 @@ func (b draftRequest) fields() (DraftFields, error) {
 		WeightKg:           b.WeightKg,
 		VehicleRequirement: b.VehicleRequirement,
 		HandlingNotes:      b.HandlingNotes,
+		BudgetCents:        b.BudgetCents,
 	}
 
 	if b.Pickup != nil {
@@ -250,9 +266,10 @@ type windowResponse struct {
 // never repurposed or removed.
 //
 // **This is the customer's view and there is no provider view of a job yet.** When one arrives
-// (SHIP-82's feed, SHIP-100's detail), it is a different type in this package rather than this one
+// (SHIP-82's feed, SHIP-83's detail), it is a different type in this package rather than this one
 // with fields hidden, because Docs/01 §4.3's budget rule is much easier to keep with two types
-// than with one and a redaction step somebody has to remember.
+// than with one and a redaction step somebody has to remember. This is the type that carries
+// `budget_cents`, and TestOnlyTheOwnersResponseCarriesTheBudget is what stops it being the second.
 type jobResponse struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
@@ -272,6 +289,12 @@ type jobResponse struct {
 
 	PickupWindow  *windowResponse `json:"pickup_window,omitempty"`
 	DropoffWindow *windowResponse `json:"dropoff_window,omitempty"`
+
+	// BudgetCents is the customer's own maximum, returned to the customer (SHIP-67).
+	//
+	// Omitted when it was not supplied, like everything else optional here, so a client can
+	// tell "no budget" from "a budget of nothing" without a second flag.
+	BudgetCents int64 `json:"budget_cents,omitempty"`
 
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
@@ -297,6 +320,8 @@ func jobFrom(j Job) jobResponse {
 
 		PickupWindow:  windowFrom(j.PickupWindow),
 		DropoffWindow: windowFrom(j.DropoffWindow),
+
+		BudgetCents: j.BudgetCents,
 
 		CreatedAt: timestamp(j.CreatedAt),
 		UpdatedAt: timestamp(j.UpdatedAt),

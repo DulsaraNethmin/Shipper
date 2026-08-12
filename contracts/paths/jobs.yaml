@@ -8,13 +8,18 @@
 # tolerate fields they do not recognise, which is a rule about client behaviour and not a licence
 # for the contract to describe less than the service returns.
 #
-# # There is no budget field anywhere in this document
+# # The budget is here, and it is here because every operation in this document is owner-only
 #
 # Docs/01 §4.3 keeps the customer's maximum private from providers — not as an amount, not as a
-# band, and not as a "budget supplied" indicator. Both operations here are owner-only, so the
-# field would be safe on them specifically; it arrives with SHIP-67, which is the ticket that
-# brings the serialisation test proving it cannot leak, rather than with the first response that
-# could have carried it.
+# band, and not as a "budget supplied" indicator. Every path below requires a credential and
+# answers only about the caller's own jobs, so `budget_cents` is safe on these specifically
+# (SHIP-67).
+#
+# **A provider-facing operation must not describe it.** SHIP-82's job feed and SHIP-83's provider
+# job detail get schemas of their own rather than a variant of `Job` with one field removed,
+# because a shape with a redaction step somebody has to remember is the arrangement this rule is
+# hardest to keep with. TestOnlyTheOwnersResponseCarriesTheBudget refuses the field on any Go type
+# but the owner's response; this document is the same statement in the other language.
 #
 # # Status is returned and is never accepted
 #
@@ -180,9 +185,8 @@ JobByID:
       reaches a provider through a shape of its own (SHIP-82, SHIP-83) rather than through this
       one.
 
-      This is the customer's view, so it carries everything the customer supplied. The
-      budget arrives with SHIP-67, which is the ticket that brings the test proving the field
-      cannot reach a provider.
+      This is the customer's view, so it carries everything the customer supplied — the budget
+      included (SHIP-67), which no provider-facing shape may repeat.
     parameters:
       - $ref: '#/JobID'
     responses:
@@ -538,6 +542,24 @@ JobDraft:
       $ref: '#/TimeWindow'
     dropoff_window:
       $ref: '#/TimeWindow'
+    budget_cents:
+      type: integer
+      minimum: 0
+      maximum: 100000000
+      description: |
+        The customer's own maximum, in **cents**, AUD. Optional; `0` clears it (SHIP-67).
+
+        Minor units as a whole number rather than dollars as a decimal, because money is never
+        a float in this platform (Docs/10 §3.3) and a JSON number written as `1500.50` is one.
+        The name carries the unit, because a field called `budget` holding `150000` is a field
+        somebody eventually reads as dollars.
+
+        **Never disclosed to a provider, in any form** — not as an amount, not as a band, and
+        not as a "budget supplied" indicator (Docs/01 §4.3). It is used on the customer's own
+        side, to compare the bids they receive. Providers judge a job by its detail: the
+        dimensions, the access constraints and the handling notes do more for bid accuracy than
+        a budget signal would.
+      example: 150000
 
 JobCancellation:
   type: object
@@ -630,10 +652,11 @@ Job:
     for most of its life and a response full of `""` and `0` says nothing about which fields the
     customer has actually filled in.
 
-    This is the customer's view. There is no provider view of a job yet; when one arrives it is
-    a separate schema rather than this one with fields hidden, because Docs/01 §4.3's budget
-    rule is much easier to keep with two shapes than with one and a redaction step somebody has
-    to remember.
+    This is the customer's view, and since SHIP-67 it is the one shape in this API that carries
+    `budget_cents`. There is no provider view of a job yet; when one arrives (SHIP-82, SHIP-83)
+    it is a separate schema rather than this one with a field hidden, because Docs/01 §4.3's
+    budget rule is much easier to keep with two shapes than with one and a redaction step
+    somebody has to remember.
   properties:
     id:
       type: string
@@ -670,6 +693,15 @@ Job:
       $ref: '#/TimeWindowResponse'
     dropoff_window:
       $ref: '#/TimeWindowResponse'
+    budget_cents:
+      type: integer
+      description: |
+        The customer's own maximum, in cents, AUD. Omitted when none was supplied (SHIP-67).
+
+        **This schema is the customer's view of their own job, and it is the only shape in this
+        API that carries the budget.** Docs/01 §4.3 keeps it private from providers in every
+        form; SHIP-82's feed and SHIP-83's provider job detail describe a job without it.
+      example: 150000
     created_at:
       type: string
       format: date-time
