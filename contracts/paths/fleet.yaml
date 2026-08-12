@@ -642,7 +642,66 @@ OpenJobs:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+OpenJobByID:
+  get:
+    operationId: getOpenJob
+    summary: Read one job this provider may bid on
+    tags: [Jobs]
+    description: |
+      One job out of `/v1/jobs/open`, in the same shape the feed gave it (SHIP-83).
+
+      **This is a member of that collection and not a second view of `GET /v1/jobs/{id}`.** That
+      operation is the *customer's* own job and is the one shape in this API that carries
+      `budget_cents`; this one has no field it could go in. `Docs/01` §4.3 keeps the customer's
+      maximum private from providers in every form, and two shapes are far easier to keep that rule
+      with than one shape and a redaction step somebody has to remember.
+
+      **A job this provider may not bid on answers `404`, byte-identically to a job that does not
+      exist.** Which jobs exist, and which of them a competitor is eligible for, is information
+      nobody published. The authorisation is the same predicate the feed runs, so a job served here
+      is a job the feed would have carried, and a job refused here is one a bid would be refused on.
+    parameters:
+      - $ref: '#/OpenJobID'
+    responses:
+      '200':
+        description: The job, as a provider deciding whether to bid sees it.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/OpenJob'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- parameters --------------------------------------------------------------------------------
+
+OpenJobID:
+  name: id
+  in: path
+  required: true
+  description: The job's identifier, as carried by an entry in `/v1/jobs/open`.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
 
 VehicleID:
   name: id
@@ -1050,7 +1109,7 @@ OpenJob:
   required: [id, status, created_at]
   additionalProperties: false
   description: |
-    A job as a provider deciding whether to bid on it sees it (SHIP-82).
+    A job as a provider deciding whether to bid on it sees it (SHIP-82, SHIP-83).
 
     **There is no budget field, and there is no form one could take here.** `Docs/01` §4.3 keeps the
     customer's maximum private from a provider — not as an amount, not as a band, not as a
@@ -1058,9 +1117,9 @@ OpenJob:
     started sending one would fail the contract test rather than quietly disclose it. The customer's
     own `Job` schema is the only shape in this API that carries `budget_cents`.
 
-    SHIP-83 adds `GET /v1/jobs/open/{id}` and it answers with this same schema, so a client parses
-    one type whatever it did to obtain the job — and, more to the point, so there is one shape to
-    keep the budget out of rather than two.
+    **One schema for the feed and for the single job**, so a client parses one type whatever it did
+    to obtain the job — and, more to the point, so there is one shape to keep the budget out of
+    rather than two.
 
     **The pickup and dropoff carry suburb, state and postcode, and not the street line or the
     coordinate.** No document takes a position on when a provider learns the exact door, so this

@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **292 checks across 11 sections**, and `make check` green. Since
+Verified by `make verify` — **297 checks across 11 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -274,6 +274,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-81** | M3 | The job eligibility filter — **one SQL predicate in `fleet`, reaching four tables across three domains**, chosen over ports because ports cannot page a set intersection. Two readers, one clause; no endpoint until SHIP-82 — *see below* |
 | **SHIP-82** | M3 | `GET /v1/jobs/open` — the provider's feed, keyset-paged. **Declared in `routes_fleet.go`, not `routes_jobs.go`**: routes follow the domain that answers them, not the first segment of the path. It also deletes SHIP-81's SQL mirror from `make verify` in favour of real HTTP checks — *see below* |
+| **SHIP-83** | M3 | `GET /v1/jobs/open/{id}` — one job as a provider sees it, and **the fourth budget proof §8 recorded as still owed**: the serialised response, obtained over HTTP, held to a *closed set of keys* so that a budget renamed `max_price` fails too. The street line and the coordinate are confirmed withheld — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -2369,13 +2370,15 @@ it. **It is deleted.** Every filter check now runs through the endpoint, so ther
 description of the rule instead of two, and a filter that stopped working fails the run instead of
 passing against a copy of itself.
 
-The replacement asks the endpoint on every check. **SHIP-83 grows it a second half**: that ticket's
-`GET /v1/jobs/open/{id}` answers the same question about the same job, one predicate serves both,
-and a provider shown a job in the feed and then refused it on the detail screen is the worst of both
-outcomes — so the helper asks both and requires them to agree.
+The replacement asks **both endpoints on every check and requires them to agree** — the feed
+carries the job, or `GET /v1/jobs/open/{id}` answers 200, and never one without the other. That is
+the same claim `TestTheThreeReadersOfTheFilterAgree` makes in Go, made again over HTTP, and it is
+worth making twice: a provider shown a job in the feed and then refused it on the detail screen is
+the worst of both outcomes.
 
-`make verify` went from 288 checks to **292**, a net gain of four after the deletion.
-`make verify-update` wrote the figure; it was not typed.
+`make verify` went from 288 checks to **292** at this ticket and to **297** once SHIP-83 added its
+section — a net gain of nine across the pair, after the deletion. `make verify-update` wrote both
+figures; neither was typed.
 
 #### Pagination, and the case a one-field cursor gets wrong
 
@@ -2404,6 +2407,115 @@ of the four is a failure of the request — they are the truthful answer to it �
 the provider to onboarding from an empty list and the profile it already holds. It is the reading
 `Service.Profile` already takes for a read that discloses nothing, and refusing here would make the
 client special-case a screen it can render anyway.
+
+### SHIP-83 — the fourth proof, and the two disclosure decisions confirmed
+
+`GET /v1/jobs/open/{id}` is one job out of the feed. The endpoint is small; the test is the ticket.
+
+#### The debt §8 recorded, paid
+
+§8 has said since SHIP-67 that the pairing could not be honoured in one wave, that SHIP-67 landed
+with the three strongest proofs available at the time, and that **"SHIP-83 remains reserved to this
+owner and adds the fourth: its provider response, serialised, asserted to carry no budget. That is
+the test the pairing was actually for, and it is the one thing that is still owed."**
+
+`TestTheProviderResponseCarriesNoBudgetInAnyForm` is that test. It does four things a struct-field
+check cannot, and each was chosen against a specific way the weaker version would have passed while
+the invariant was broken:
+
+1. **It obtains the response the way a provider obtains it** — an HTTP request through the real
+   handler, mounted on the pattern `cmd/api` serves, answered as bytes. A field can be absent from
+   a struct and present on the wire through an embedded type, a custom `MarshalJSON`, or a map, and
+   a struct check sees none of the three.
+2. **It works on the raw bytes, so a key that is present and null still fails.** Decoding into a Go
+   type turns `"budget_cents": null` into a zero value indistinguishable from a field never sent —
+   and a present-but-null key *is* the "budget supplied" flag `Docs/01` §4.3 forbids, because a
+   provider learns which jobs carry a budget from which responses carry the key.
+3. **It asserts a closed set of keys rather than searching for the word.** This is the one that
+   matters most. A search catches `budget_cents` and misses `max_price`; the allow-list is every
+   key this API promises a provider, so a field arriving under *any* name fails. The `OpenJob`
+   schema is `additionalProperties: false` for the same reason.
+4. **It checks the value, not only the name.** The fixture's budget is a number appearing nowhere
+   else in the job, and the body is searched for every rendering an encoder could produce, with
+   UUIDs stripped first — a UUID is hexadecimal, so a run of digits can occur inside one by chance,
+   rarely enough to pass review and often enough to fail one morning.
+
+It covers **three** responses, not one: the feed, the single job, and a second page reached by
+following a cursor, which is a different code path through the same handler and would be reached
+only by a provider who scrolled. And it **refuses to run against a job with no budget** — the first
+thing it does is read `jobs.budget` back out of the row, because a privacy test whose fixture has
+nothing to leak passes forever and proves nothing.
+
+**Both halves were verified by mutation.** A field `max_price float64` carrying 4321.99 was added to
+`openJobResponse`: SHIP-81's source-parsing guard **passed** — it searches for "budget" — and the new
+test failed on all three responses, naming the key and its JSON path. Renaming that field
+`budget_cents` made the source guard fail as well. **That is the gap the closed key set closes**, and
+it is the reason this is not simply SHIP-67's test moved.
+
+#### The guard already reached the new shapes, and did not need extending
+
+Run 2's `TestNoProviderFacingShapeCarriesTheBudget` parses **every non-test file in
+`internal/fleet`**, so `openJobResponse`, `regionResponse` and `windowResponse` came under it the
+moment they were written — confirmed by injecting `BudgetCents` and watching it fail with
+`openJobResponse.BudgetCents carries the customer's budget`. Nothing was added to it. What the new
+test adds is the axis that guard cannot have: it reads *source*, so it can only ever refuse a name.
+
+`make verify` makes the same closed-key-set assertion from outside Go against the running service,
+so neither can be quietly deleted alone.
+
+#### The street line: confirmed, and widened to the coordinate
+
+SHIP-81 chose suburb, state and postcode for the feed and asked SHIP-83 to confirm or reopen it
+explicitly. **Confirmed.** No document takes a position on when a provider learns the exact door, so
+this stays with the reversible direction — the argument `Docs/01` §4.3 makes about the budget,
+applied to an address. A provider prices on the locality, the distance and the state; the doorstep
+is needed by whoever drives to it, which is after an award. Disclosing later is easy and
+withdrawing later is not.
+
+**The widening is the part that would have been easy to miss: the coordinate is withheld too.**
+`jobs` geocodes the whole address, so a pickup coordinate *is* the street line written as two
+numbers. A shape that withheld `line` and sent `coordinate` would have kept the letter of the
+decision and broken it completely. `TestTheProviderJobCarriesNeitherTheStreetLineNorTheCoordinate`
+asserts both against a job that has both, and also asserts the locality *is* there — so it is a
+decision about grain rather than a response that forgot the address.
+
+**What reopens it is named**: the awarded provider needs the exact address, and that is a different
+shape at a different moment (SHIP-93 onwards), not a field added here.
+
+#### One shape for the feed and the detail view, which is itself a privacy decision
+
+Both endpoints answer with the same type, and a test asserts the detail response is byte-identical
+to the feed entry. That is the rule the vehicle endpoints already follow — a client parses one type
+whatever it did to obtain the resource — and here it does something further: **two shapes would be
+two places a budget field could be added and two responses a test would have to know to check.**
+One shape is one of each. A "detail" view carrying a field or two more is exactly where somebody
+would later put "just a little more".
+
+#### The third reader of the predicate, and why it is a read rather than a check-then-read
+
+The obvious implementation asks `Service.EligibleFor` and then reads the job. It was rejected: the
+read needs its own `WHERE`, and the only honest one is the predicate itself — so the choice is
+between naming eligibility twice and naming it once — and two statements can disagree, because the
+customer can cancel the job between the check and the read, leaving the detail view serving a job
+nobody may bid on. `Service.EligibleJobFor` runs one statement with the same column list and the
+same clause.
+
+`EligibleFor` is untouched and is still what SHIP-84 asks before it writes a bid; a caller deciding
+whether to permit something wants a boolean, not a row. SHIP-81's `TestEligibleForAgreesWithTheFeed`
+is now `TestTheThreeReadersOfTheFilterAgree` and holds all three to each other across every case.
+
+#### A job a provider may not bid on is a job that does not exist
+
+404, with a body byte-identical to a job that is not there, and a message that says nothing about
+eligibility — a refusal that explained itself would disclose what the status code is withholding.
+Nine cases in Go and two in `make verify`, including the owning customer, who is refused their own
+job here: `GET /v1/jobs/{id}` is where they read it, and that response is the one shape in this API
+that carries the budget.
+
+Shared surfaces: two `$ref` lines in `contracts/openapi.yaml`, two lines in `routes_golden.txt`
+(regenerated, not typed), and §3's check count (written by `make verify-update`). No
+`internal/boundaries` edit, no `Deps` field, no migration, no new error code — `not_found` already
+says the right thing — and `internal/fleet` still imports no domain.
 
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 
@@ -2984,11 +3096,13 @@ Kept here rather than deleted, because the shape recurs: this was described only
 
 **~~The SHIP-67 / SHIP-83 pairing cannot be honoured in one wave.~~ Settled at SHIP-67: built now, SHIP-83 reserved to the same owner.** The fact about the dependency graph has not changed — SHIP-83 depends on SHIP-82 → SHIP-81 → (SHIP-79, SHIP-80) → SHIP-78, and wave 4 delivers only SHIP-78 and SHIP-80, leaving three hops. What has changed is that the choice the pairing forced has been made rather than deferred again.
 
-**The decision, and the reasoning it was made on.** Deferring both would have left the column unbuilt for a rule it already satisfies, and SHIP-65's *Done when* incomplete for a third consecutive wave, in exchange for a test against an endpoint that does not exist. So SHIP-67 landed with the strongest proof available today, which turned out to be three tests rather than one — the source-parsing test that refuses a budget field on any shape but the owner's response, a wire test over every response a provider or a stranger can obtain, and a test on the stored event payload. §3 has the detail. **SHIP-83 remains reserved to this owner and adds the fourth**: its provider response, serialised, asserted to carry no budget. That is the test the pairing was actually for, and it is the one thing that is still owed.
+**The decision, and the reasoning it was made on.** Deferring both would have left the column unbuilt for a rule it already satisfies, and SHIP-65's *Done when* incomplete for a third consecutive wave, in exchange for a test against an endpoint that does not exist. So SHIP-67 landed with the strongest proof available today, which turned out to be three tests rather than one — the source-parsing test that refuses a budget field on any shape but the owner's response, a wire test over every response a provider or a stranger can obtain, and a test on the stored event payload. §3 has the detail. ~~**SHIP-83 remains reserved to this owner and adds the fourth**: its provider response, serialised, asserted to carry no budget. That is the test the pairing was actually for, and it is the one thing that is still owed.~~
+
+**~~Still owed.~~ Paid at SHIP-83 — see §3.** `TestTheProviderResponseCarriesNoBudgetInAnyForm` is the fourth proof: the provider's response obtained over HTTP through the real handler, asserted on the raw bytes across all three ways a provider can obtain a job. **It turned out to need to be stronger than the entry asked for.** "Asserted to carry no budget" reads as a search for the field, and a search catches `budget_cents` and misses `max_price` — so the test holds the response to a **closed set of keys** instead, checks the value with identifiers stripped out, and refuses to run at all against a fixture whose budget is NULL. Verified by mutation in both directions: a field named `max_price` passes the source-parsing guard and fails this one; renamed `budget_cents`, it fails both.
 
 **The `make verify` tripwire has been moved, and this is the entry recording it.** The check asserting that no `budget` key was present is gone; what replaced it asserts the owner reads their own budget back and that no provider-facing or stranger-facing response mentions it in any form. **The tripwire is now the source-parsing test rather than a verify line** — whoever writes SHIP-82 or SHIP-83 will meet it as a failing test the moment a provider shape acquires the field, which is earlier and louder than a shell assertion would have been.
 
-**Half of that prediction is now observed.** SHIP-82's new response types are non-test files in `internal/fleet`, so the source-parsing guard reached them with no change to it — confirmed by injecting a `budget_cents` field and watching it fail. SHIP-83 is what adds the serialised-response half.
+**That prediction held exactly, and SHIP-83 found the one thing it does not cover.** The source-parsing guard did fire first, and `internal/fleet`'s copy reached SHIP-82's and SHIP-83's new response types with no change to it — they are non-test files in the package it parses. What it cannot do is refuse a budget under a name that is not "budget", because it reads source and can only match a spelling. SHIP-83's serialised-response test is the axis it lacks, and `make verify` now makes the same closed-key-set assertion from outside Go, so neither can be quietly deleted alone.
 
 ## 9. Open recommendations nobody has decided
 

@@ -21,6 +21,7 @@ POST   /v1/fleet/vehicles/{id}/reactivate       user         v1
 GET    /v1/jobs                                 user         v1
 POST   /v1/jobs                                 user         v1
 GET    /v1/jobs/open                            user         v1
+GET    /v1/jobs/open/{id}                       user         v1
 GET    /v1/jobs/{id}                            user         v1
 PATCH  /v1/jobs/{id}                            user         v1
 POST   /v1/jobs/{id}/cancel                     user         v1

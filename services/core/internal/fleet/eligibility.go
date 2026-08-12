@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -378,6 +379,39 @@ func (s *Service) EligibleJobs(ctx context.Context, r db.Runner, providerID uuid
 	return page, nil
 }
 
+// EligibleJobFor is one job out of the feed, by identifier (SHIP-83).
+//
+// **The third reader of [eligible], and it authorises and reads in one statement rather than two.**
+// SHIP-83 could have asked [Service.EligibleFor] and then read the job, and that shape was rejected
+// for two reasons that both matter:
+//
+//   - **A second SELECT is a second definition of what a provider may see.** The read would need
+//     its own WHERE, and the only honest one is this predicate — so the choice is between naming it
+//     twice and naming it once. `doc.go` requires eligibility decided in one place.
+//   - **Two statements can disagree with each other.** Between the check and the read the customer
+//     can cancel the job, and the detail view would then serve a job nobody may bid on. One
+//     statement cannot straddle that.
+//
+// [Service.EligibleFor] is unchanged and is still what SHIP-84 asks before it writes a bid: a
+// caller deciding whether to permit something wants a boolean, not a row. What keeps the three
+// readers from drifting is TestTheThreeReadersOfTheFilterAgree, which holds all of them to each
+// other across every case in this file.
+//
+// **A job this provider may not bid on is [ErrJobNotOffered], and so is a job that does not
+// exist.** The two are one sentinel rather than two, because distinguishing them would need a
+// second query whose only purpose is to disclose which job identifiers exist — the reasoning
+// [ErrVehicleNotFound] and [ErrNotVehicleOwner] take on the wire, taken here in the domain as well
+// because there is nothing this domain could truthfully say about a job it may not read.
+func (s *Service) EligibleJobFor(ctx context.Context, r db.Runner, providerID, jobID uuid.UUID) (EligibleJob, error) {
+	if providerID == uuid.Nil {
+		return EligibleJob{}, fmt.Errorf("fleet: a job request names no provider: %w", ErrNotProvider)
+	}
+	if jobID == uuid.Nil {
+		return EligibleJob{}, ErrJobNotOffered
+	}
+	return s.store.eligibleJob(ctx, r, providerID, s.clock.Now(), jobID)
+}
+
 // EligibleFor answers the same question about one job (SHIP-81).
 //
 // The second reader of [eligible], and the reason that constant is a WHERE clause rather than a
@@ -519,6 +553,34 @@ func (postgresStore) eligibleJobs(ctx context.Context, r db.Runner, providerID u
 		return nil, fmt.Errorf("fleet: reading the jobs %s is eligible for: %w", providerID, err)
 	}
 	return out, nil
+}
+
+// eligibleJob reads one row of the feed by identifier (SHIP-83).
+//
+// The same column list and the same predicate the feed uses, with `j.id = $3` added — so the
+// detail view can show nothing the feed could not have shown, including the budget it does not
+// select. A separate column list here would be a second disclosure boundary, and the second one is
+// always the one nobody remembers to check.
+//
+// No rows is [ErrJobNotOffered] rather than an error about the database, because "no such job" and
+// "not yours to bid on" are the same answer and neither is a failure of the request.
+func (postgresStore) eligibleJob(ctx context.Context, r db.Runner, providerID uuid.UUID,
+	now time.Time, jobID uuid.UUID) (EligibleJob, error) {
+
+	const q = `
+		SELECT ` + eligibleJobColumns + `
+		FROM jobs j
+		WHERE j.id = $3
+		  AND ` + eligible
+
+	job, err := scanEligibleJob(r.QueryRow(ctx, q, providerID, now.UTC(), jobID))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return EligibleJob{}, ErrJobNotOffered
+	case err != nil:
+		return EligibleJob{}, fmt.Errorf("fleet: read job %s for provider %s: %w", jobID, providerID, err)
+	}
+	return job, nil
 }
 
 // jobIsEligible answers [eligible] for one job.

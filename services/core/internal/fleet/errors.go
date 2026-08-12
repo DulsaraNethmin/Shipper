@@ -52,6 +52,19 @@ var (
 	// ErrNothingToUpdate means an edit named no field at all.
 	ErrNothingToUpdate = errors.New("fleet: the request changes nothing")
 
+	// ErrJobNotOffered means the eligibility filter does not offer that job to that provider
+	// (SHIP-83).
+	//
+	// **It is deliberately one sentinel covering two cases** — no such job, and a job this
+	// provider may not bid on — where [ErrVehicleNotFound] and [ErrNotVehicleOwner] are two. The
+	// difference is that a vehicle's owner is a column this domain can read, so distinguishing
+	// them costs nothing and lets a test tell "the stranger was refused" from "the row vanished".
+	// A job is not this domain's row: separating the two would take a second query against `jobs`
+	// whose only product is the knowledge that some identifier exists, which is the disclosure the
+	// 404 exists to prevent. There is nothing this domain could truthfully say about a job it may
+	// not read, so it says the one thing that is true of both.
+	ErrJobNotOffered = errors.New("fleet: that job is not offered to this provider")
+
 	// ErrNotInTransaction means a method that reads, decides and writes was handed a connection
 	// pool rather than a transaction.
 	//

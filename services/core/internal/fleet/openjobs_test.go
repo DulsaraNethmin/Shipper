@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -18,7 +19,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
-// The provider's view of the marketplace at the wire: SHIP-82's feed.
+// The provider's view of the marketplace at the wire: SHIP-82's feed and SHIP-83's single job.
 //
 // These drive the handlers on a mux of their own, the way http_test.go does — what is being checked
 // is this domain's own half, and the middleware around it belongs to cmd/api. The mux mounts the
@@ -31,12 +32,14 @@ import (
 //     in the same database so that "only" has something to be wrong about.
 //     [TestPagingTheFeedReachesEveryJobExactlyOnce] is the second, and it pages over jobs that share
 //     a created_at to the millisecond — which is the case a one-field cursor gets wrong.
-//   - **The feed is the caller's own and cannot be widened by asking.**
-//     [TestAnotherProvidersFeedIsNotReachableByAsking]. Eligibility is the platform's decision, so
-//     there is no parameter for whose feed to read and nothing here to forget to filter.
-//
-// SHIP-83 adds the single job to this file, and with it the serialised-response budget test that
-// Docs/11 §8 records as the one proof the SHIP-67 pairing still owes.
+//   - **SHIP-83's *Done when*: "provider view omits budget entirely; verified by test."**
+//     [TestTheProviderResponseCarriesNoBudgetInAnyForm] is that test and it is the reason this file
+//     exists. Docs/11 §8 records it as the one proof still owed from the SHIP-67 pairing: not a
+//     struct-field check, but the response a provider actually receives, serialised, asserted to
+//     carry no budget in any form.
+//   - **A provider who is not eligible cannot reach the job another way.**
+//     [TestAJobThisProviderMayNotBidOnIsNotFound] drives the detail endpoint from every ineligible
+//     position and requires the answer to be byte-identical to a job that does not exist.
 
 // --- the world these tests run in ---------------------------------------------------------------
 
@@ -75,10 +78,10 @@ func newMarketplace(t *testing.T) marketplace {
 // richJob is a job with every field this endpoint can carry filled in, including the two it must
 // never disclose.
 //
-// **The budget and the street line are real values here on purpose**, even though nothing in this
-// file reads them yet. A fixture that left them NULL would let a response that leaked them pass
-// SHIP-83's checks, which is the failure mode Docs/11 §8 describes: a privacy test that asserts
-// nothing reads exactly like one that asserts everything.
+// **The budget and the street line are real values here on purpose.** A fixture that left them
+// NULL would let a response that leaked them pass every check below, which is the failure mode
+// Docs/11 §8 describes: a privacy test that asserts nothing reads exactly like one that asserts
+// everything.
 func richJob(budget float64) jobFields {
 	return jobFields{
 		PickupLine:       "5 Church Street",
@@ -418,6 +421,439 @@ func TestTheFeedRefusesAQueryItCannotHonour(t *testing.T) {
 	})
 }
 
+// --- SHIP-83: one job, and no budget ------------------------------------------------------------
+
+// TestTheProviderJobDetailIsTheJobTheFeedShowed is SHIP-83's endpoint, and the one-shape rule.
+//
+// A client that fetched a job from the feed and then fetched it again by identifier must get the
+// same object, byte for byte. Two shapes would be two places a field could be added — including the
+// one field that must never be added — and the reason this is asserted rather than assumed is that
+// a "detail" view is exactly where somebody would later put "just a little more".
+func TestTheProviderJobDetailIsTheJobTheFeedShowed(t *testing.T) {
+	m := newMarketplace(t)
+	job := m.publish(t, richJob(1500))
+
+	fromFeed := m.feed(t, "")
+	if len(fromFeed.Data) != 1 {
+		t.Fatalf("the feed carries %d jobs, want the one just published", len(fromFeed.Data))
+	}
+
+	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET the job = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	if got, want := canonical(t, rec.Body.Bytes()), canonical(t, fromFeed.Data[0]); got != want {
+		t.Errorf("the detail view and the feed entry are different shapes.\n  detail: %s\n  feed:   %s",
+			got, want)
+	}
+
+	// And it carries what a provider prices on. Docs/01 §4.3's answer to a provider who wants the
+	// budget is better job detail, so a shape that dropped the handling notes to be safe would be
+	// taking away the thing the rule offers in exchange.
+	var job1 struct {
+		ID                 string `json:"id"`
+		Status             string `json:"status"`
+		GoodsDescription   string `json:"goods_description"`
+		HandlingNotes      string `json:"handling_notes"`
+		VehicleRequirement string `json:"vehicle_requirement"`
+		ExpiresAt          string `json:"expires_at"`
+		Pickup             struct {
+			Suburb, State, Postcode string
+		} `json:"pickup"`
+		PickupWindow *struct {
+			Start, End string
+		} `json:"pickup_window"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &job1); err != nil {
+		t.Fatalf("the response is not JSON: %v", err)
+	}
+	switch {
+	case job1.ID != job.String():
+		t.Errorf("id = %q, want %s", job1.ID, job)
+	case job1.Status != "open":
+		t.Errorf("status = %q, want the wire form `open` (Docs/10 §4.7)", job1.Status)
+	case job1.Pickup.Suburb != "Richmond" || job1.Pickup.State != "VIC" || job1.Pickup.Postcode != "3121":
+		t.Errorf("pickup = %+v, want Richmond VIC 3121", job1.Pickup)
+	case job1.HandlingNotes == "" || job1.VehicleRequirement == "" || job1.GoodsDescription == "":
+		t.Error("the detail a provider prices on is missing; Docs/01 §4.3 offers it in exchange " +
+			"for the budget, so dropping it is not the safe direction")
+	case job1.PickupWindow == nil || job1.PickupWindow.Start == "":
+		t.Error("the pickup window is absent from a job that has one")
+	case job1.ExpiresAt == "":
+		t.Error("expires_at is absent; a provider cannot tell how long they have to price it")
+	}
+}
+
+// TestTheProviderResponseCarriesNoBudgetInAnyForm is SHIP-83's *Done when*, and the proof
+// `Docs/11` §8 records as the one thing the SHIP-67 pairing still owed.
+//
+// SHIP-67 landed three tests: one that parses `internal/jobs` for a budget field on a shape it
+// should not be on, one over the responses a provider could obtain *at that time*, and one on the
+// stored event payload. §8 states what was missing plainly — "SHIP-83 remains reserved to this
+// owner and adds the fourth: its provider response, serialised, asserted to carry no budget."
+//
+// # What this test does that a struct-field check cannot
+//
+//  1. **It obtains the response the way a provider obtains it** — an HTTP request, through the real
+//     handler, mounted on the pattern cmd/api serves, answered as bytes. A field can be absent from
+//     a struct and present on the wire (an embedded type, a custom MarshalJSON, a map) and a struct
+//     check would not see any of the three.
+//  2. **It works on the raw bytes, so a key that is present and null still fails.** Decoding into a
+//     Go type would turn `"budget_cents": null` into a zero value indistinguishable from a field
+//     that was never sent — and a present-but-null key is exactly the "budget supplied" signal
+//     Docs/01 §4.3 forbids, because a provider learns which jobs have a budget from which responses
+//     carry the key at all.
+//  3. **It asserts a closed set of keys rather than searching for the word "budget".** A search
+//     catches `budget_cents` and misses `max_price`, `ceiling`, or `customer_maximum`. The
+//     allow-list below is every key this API promises a provider, so a field that arrives under any
+//     name at all fails — which is the only form of this test that survives somebody deciding to be
+//     helpful.
+//  4. **It checks the value, not only the name.** The fixture's budget is a number that appears
+//     nowhere else in the job, and the whole serialised body is searched for it in every rendering
+//     a JSON encoder could produce. A band, a rounding, or an amount smuggled into free text fails
+//     here.
+//
+// # It refuses to run against a job with no budget
+//
+// The first thing it does is read `jobs.budget` back out of the row. A privacy test whose fixture
+// has nothing to leak passes forever and proves nothing, and that is the specific way this test
+// could rot without anybody noticing.
+func TestTheProviderResponseCarriesNoBudgetInAnyForm(t *testing.T) {
+	m := newMarketplace(t)
+
+	// A number that appears nowhere else in the job: not in a dimension, a postcode, a timestamp
+	// or an identifier. 4321.99 renders as 4321.99, 4321, and 432199 in cents — all three are
+	// searched for below.
+	const budget = 4321.99
+	job := m.publish(t, richJob(budget))
+
+	// The fixture, verified rather than assumed.
+	var stored *float64
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT budget FROM jobs WHERE id = $1`, job).Scan(&stored); err != nil {
+		t.Fatalf("reading the stored budget: %v", err)
+	}
+	if stored == nil || *stored != budget {
+		t.Fatalf("the job's budget is %v, want %v — this test asserts nothing against a job "+
+			"that has no budget to leak", stored, budget)
+	}
+
+	// Every way a provider can obtain a job from this service. A shape that is safe on one
+	// endpoint and not on the other is the failure two responses invite, and it is why both are
+	// here rather than only the one SHIP-83 adds.
+	responses := map[string][]byte{
+		"the feed, GET /v1/jobs/open":                nil,
+		"the job itself, GET /v1/jobs/open/{id}":     nil,
+		"the feed a second time, following a cursor": nil,
+	}
+
+	feed := m.get(t, "/v1/jobs/open")
+	if feed.Code != http.StatusOK {
+		t.Fatalf("the feed = %d, want 200 (%s)", feed.Code, feed.Body)
+	}
+	responses["the feed, GET /v1/jobs/open"] = feed.Body.Bytes()
+
+	detail := m.get(t, "/v1/jobs/open/"+job.String())
+	if detail.Code != http.StatusOK {
+		t.Fatalf("the job = %d, want 200 (%s)", detail.Code, detail.Body)
+	}
+	responses["the job itself, GET /v1/jobs/open/{id}"] = detail.Body.Bytes()
+
+	// A second page is a different code path through the same handler — the one that renders a
+	// cursor — and a leak there would be reached only by a provider who scrolled.
+	second := m.publish(t, richJob(budget))
+	exec(t, m.pool, `UPDATE jobs SET created_at = $2 WHERE id = $1`, second, testInstant.Add(time.Minute))
+	firstPage := m.feed(t, "limit=1")
+	if !firstPage.HasMore {
+		t.Fatalf("the fixture did not produce a second page")
+	}
+	paged := m.get(t, "/v1/jobs/open?limit=1&cursor="+url.QueryEscape(firstPage.NextCursor))
+	if paged.Code != http.StatusOK {
+		t.Fatalf("the second page = %d, want 200 (%s)", paged.Code, paged.Body)
+	}
+	responses["the feed a second time, following a cursor"] = paged.Body.Bytes()
+
+	for how, body := range responses {
+		t.Run(how, func(t *testing.T) {
+			// Not vacuous: the response has to be carrying the job before "it carries no
+			// budget" means anything at all.
+			if !strings.Contains(string(body), `"goods_description"`) {
+				t.Fatalf("this response carries no job, so it proves nothing: %s", body)
+			}
+
+			assertNoBudget(t, body)
+		})
+	}
+}
+
+// providerJobKeys is every key the provider's view of a job may carry.
+//
+// **A closed list, and the point of the exercise.** Docs/01 §4.3 forbids the customer's budget
+// reaching a provider "as an amount, a band, or a 'budget supplied' flag", and a deny-list of names
+// cannot express that: `max_price` is a budget and does not contain the word. This is the other
+// direction — anything not promised is refused — so a field added to the provider's shape has to be
+// added here too, which makes it a decision somebody records rather than one that arrives with a
+// schema change.
+//
+// It is the same list as the `OpenJob` schema in contracts/paths/fleet.yaml, which is
+// `additionalProperties: false` for the same reason.
+var providerJobKeys = map[string]bool{
+	"id":                  true,
+	"status":              true,
+	"pickup":              true,
+	"dropoff":             true,
+	"goods_description":   true,
+	"length_cm":           true,
+	"width_cm":            true,
+	"height_cm":           true,
+	"weight_kg":           true,
+	"vehicle_requirement": true,
+	"handling_notes":      true,
+	"pickup_window":       true,
+	"dropoff_window":      true,
+	"expires_at":          true,
+	"created_at":          true,
+
+	// The envelope Docs/10 §4.5 wraps a list in, and the two nested shapes' own keys. They are
+	// in one list rather than three because the walk below is recursive: what matters is that
+	// **no** key anywhere in the document is unaccounted for.
+	"data":        true,
+	"next_cursor": true,
+	"has_more":    true,
+	"suburb":      true,
+	"state":       true,
+	"postcode":    true,
+	"start":       true,
+	"end":         true,
+}
+
+// assertNoBudget is the whole of the check, applied to one serialised response.
+func assertNoBudget(t *testing.T, body []byte) {
+	t.Helper()
+
+	// 1. Every key in the document, at every depth, is one this API promised a provider.
+	var document any
+	if err := json.Unmarshal(body, &document); err != nil {
+		t.Fatalf("the response is not JSON: %v (%s)", err, body)
+	}
+	walkKeys(document, func(path, key string) {
+		if !providerJobKeys[key] {
+			t.Errorf("the provider's response carries %q (at %s).\n"+
+				"  Every key a provider may see is in providerJobKeys, and this is not one of "+
+				"them. If it is the customer's budget under another name, it is a defect: "+
+				"Docs/01 §4.3 forbids it as an amount, a band, or a \"budget supplied\" flag. "+
+				"If it is a genuinely new field, add it to that list and to the OpenJob schema "+
+				"deliberately.", key, path)
+		}
+	})
+
+	// 2. No key named for the budget in any spelling — including one present and null, which the
+	//    walk above catches by name and this catches in the bytes even if it is nested inside a
+	//    string.
+	if strings.Contains(strings.ToLower(string(body)), "budget") {
+		t.Errorf("the word \"budget\" appears in a provider's response: %s", body)
+	}
+
+	// 3. Not the value either, in any rendering a JSON encoder could produce. `4321.99` is the
+	//    stored number; `432199` is it in cents, which is the form the customer's own response
+	//    uses and therefore the likeliest way it would arrive here.
+	//
+	//    Identifiers are removed before the search. A UUID is hexadecimal, so a run of digits
+	//    can occur inside one by chance — rarely enough to pass in review and often enough to
+	//    fail in CI one morning, which is the worst kind of test.
+	searchable := identifier.ReplaceAllString(string(body), "<id>")
+	for _, rendering := range []string{"4321.99", "432199", "4321,99", "4,321.99"} {
+		if strings.Contains(searchable, rendering) {
+			t.Errorf("the customer's budget appears in a provider's response as %q: %s",
+				rendering, body)
+		}
+	}
+}
+
+// identifier matches a UUID as it appears in a JSON document.
+var identifier = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+
+// walkKeys visits every object key in a decoded JSON document, with the path that reached it.
+func walkKeys(node any, visit func(path, key string)) {
+	var walk func(node any, path string)
+	walk = func(node any, path string) {
+		switch value := node.(type) {
+		case map[string]any:
+			for key, child := range value {
+				visit(path, key)
+				walk(child, path+"."+key)
+			}
+		case []any:
+			for i, child := range value {
+				walk(child, fmt.Sprintf("%s[%d]", path, i))
+			}
+		}
+	}
+	walk(node, "$")
+}
+
+// TestTheProviderJobCarriesNeitherTheStreetLineNorTheCoordinate is the other disclosure decision
+// SHIP-81 left for this ticket, confirmed rather than inherited.
+//
+// **Confirmed: suburb, state and postcode, and not the street line.** No document takes a position
+// on when a provider learns the exact door, so this stays with the reversible direction — the
+// argument Docs/01 §4.3 makes about the budget, applied to an address. A provider prices on the
+// locality, the distance and the state; the doorstep is needed by whoever drives to it, which is
+// after an award. Disclosing later is easy and withdrawing later is not.
+//
+// **And the coordinate goes with it**, which is the half that would have been easy to leave open:
+// `jobs` geocodes the whole address, so the pickup coordinate *is* the street line as two numbers.
+// A shape that withheld `line` and sent `coordinate` would have kept the letter of the decision and
+// broken it completely. This asserts both against a job that has both.
+func TestTheProviderJobCarriesNeitherTheStreetLineNorTheCoordinate(t *testing.T) {
+	m := newMarketplace(t)
+	job := m.publish(t, richJob(1500))
+
+	// The fixture has to have an address and a coordinate, or this proves nothing.
+	var line string
+	var latitude *float64
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT pickup_line, pickup_latitude FROM jobs WHERE id = $1`, job).Scan(&line, &latitude); err != nil {
+		t.Fatalf("reading the stored address: %v", err)
+	}
+	if line == "" || latitude == nil {
+		t.Fatalf("the job has no street line or no coordinate (%q, %v), so this asserts nothing",
+			line, latitude)
+	}
+
+	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	body := rec.Body.String()
+	for what, disclosure := range map[string]string{
+		"the pickup street line":  line,
+		"the pickup latitude":     "-37.8197",
+		"the pickup longitude":    "144.9989",
+		"the dropoff street line": "1 Bourke Street",
+	} {
+		if strings.Contains(body, disclosure) {
+			t.Errorf("%s (%q) reached a provider who has not bid.\n"+
+				"  SHIP-83 confirmed SHIP-81's decision: a provider is given the locality and "+
+				"not the doorstep until they are the one driving to it. The awarded provider's "+
+				"view is a different shape at a different moment.", what, disclosure)
+		}
+	}
+
+	// And the locality is there, so this is a decision about grain rather than a response that
+	// forgot the address.
+	if !strings.Contains(body, "Richmond") || !strings.Contains(body, "3121") {
+		t.Errorf("the pickup locality is missing; a provider cannot price a job without it: %s", body)
+	}
+}
+
+// TestAJobThisProviderMayNotBidOnIsNotFound is the authorisation half of SHIP-83.
+//
+// Every way of being ineligible answers 404, and the body has to be byte-identical to the answer
+// for a job that does not exist. 403 would confirm the job is there, and which jobs exist — and
+// which of them a competitor may bid on — is information nobody published.
+func TestAJobThisProviderMayNotBidOnIsNotFound(t *testing.T) {
+	// Each case makes the provider ineligible somehow and answers with the job to then ask for —
+	// which is the published one for all but the draft, where the point is a job that was never
+	// offered at all.
+	cases := map[string]func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID{
+		"the job was cancelled": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			transition(t, m.pool, job, m.customer, "Open", "Cancelled")
+			return job
+		},
+		"the job was never published": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			// A second job, left as a draft. The status is not moved back by UPDATE, because
+			// 000402 refuses a status change that did not come through the guard — which is the
+			// invariant working rather than an inconvenience.
+			return draftJob(t, m.pool, m.customer, richJob(1500))
+		},
+		"the job's deadline has passed": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			setExpiry(t, m.pool, job, alreadyPast)
+			return job
+		},
+		"the provider does not serve where it is picked up": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			declare(t, m.pool, m.provider, ProfileFields{States: &[]string{"WA"}})
+			return job
+		},
+		"the provider's only vehicle is off the road": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			exec(t, m.pool, `UPDATE vehicles SET deactivated_at = now() WHERE provider_id = $1`, m.provider)
+			return job
+		},
+		"the provider is not verified": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			exec(t, m.pool, `UPDATE users SET email_verified_at = NULL WHERE id = $1`, m.provider)
+			return job
+		},
+		"the provider's account is suspended": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			exec(t, m.pool, `UPDATE users SET status = 'suspended' WHERE id = $1`, m.provider)
+			return job
+		},
+		"the truck cannot carry it": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			exec(t, m.pool, `UPDATE jobs SET weight_kg = 9000 WHERE id = $1`, job)
+			return job
+		},
+		"the caller published the job themselves": func(t *testing.T, m marketplace, job uuid.UUID) uuid.UUID {
+			// A customer reading their own job through the provider's route. `GET /v1/jobs/{id}`
+			// is where they read it, and that one carries their budget; this must not become a
+			// second way to the same row.
+			return job
+		},
+	}
+
+	for name, ineligible := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := newMarketplace(t)
+			job := m.publish(t, richJob(1500))
+
+			caller := m.provider
+			if name == "the caller published the job themselves" {
+				caller = m.customer
+			}
+
+			// It is reachable first, by the provider. Otherwise every case below would pass
+			// against an endpoint that answered 404 to everything.
+			if rec := m.get(t, "/v1/jobs/open/"+job.String()); rec.Code != http.StatusOK {
+				t.Fatalf("the job was already unreachable before the test broke anything: %d (%s)",
+					rec.Code, rec.Body)
+			}
+
+			asked := ineligible(t, m, job)
+
+			refused := as(t, m.router, caller, http.MethodGet, "/v1/jobs/open/"+asked.String(), "")
+			if refused.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 (%s)", refused.Code, refused.Body)
+			}
+
+			// The job that does not exist, asked for by the same caller in the same state.
+			absent := as(t, m.router, caller, http.MethodGet,
+				"/v1/jobs/open/00000000-0000-7000-8000-000000000010", "")
+			if absent.Code != http.StatusNotFound {
+				t.Fatalf("a job that does not exist = %d, want 404 (%s)", absent.Code, absent.Body)
+			}
+
+			refusedBody := decode[errorEnvelope](t, refused).Error
+			absentBody := decode[errorEnvelope](t, absent).Error
+			if refusedBody.Code != absentBody.Code || refusedBody.Message != absentBody.Message {
+				t.Errorf("a job this provider may not bid on answers %q/%q and a job that does "+
+					"not exist answers %q/%q. The two must be indistinguishable, or the refusal "+
+					"confirms the job exists.",
+					refusedBody.Code, refusedBody.Message, absentBody.Code, absentBody.Message)
+			}
+			if refusedBody.Code != "not_found" {
+				t.Errorf("error.code = %q, want not_found", refusedBody.Code)
+			}
+
+			// Nothing about eligibility, either: a message explaining *why* would disclose what
+			// the status code is withholding.
+			if strings.Contains(strings.ToLower(refusedBody.Message), "eligib") {
+				t.Errorf("the refusal explains itself (%q), which tells the caller the job is "+
+					"there", refusedBody.Message)
+			}
+		})
+	}
+}
+
 // TestAnotherProvidersFeedIsNotReachableByAsking is the rule Docs/07 §3 puts on the platform.
 //
 // There is no parameter for whose feed to read, so the only thing to check is that adding one
@@ -472,19 +908,37 @@ func TestTheBiddableStatusesReachTheWireInDocs02sNames(t *testing.T) {
 	job := m.publish(t, richJob(1500))
 	transition(t, m.pool, job, m.customer, "Open", "Negotiating")
 
+	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a Negotiating job = %d, want 200 — Docs/02 §1 keeps it open to eligible bids (%s)",
+			rec.Code, rec.Body)
+	}
 	var body struct {
 		Status string `json:"status"`
 	}
-	page := m.feed(t, "")
-	if len(page.Data) != 1 {
-		t.Fatalf("the feed carries %d jobs, want the Negotiating one — Docs/02 §1 keeps it open "+
-			"to eligible bids", len(page.Data))
-	}
-	if err := json.Unmarshal(page.Data[0], &body); err != nil {
-		t.Fatalf("the entry is not JSON: %v", err)
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the response is not JSON: %v", err)
 	}
 	if body.Status != "negotiating" {
 		t.Errorf("status = %q, want negotiating", body.Status)
+	}
+}
+
+// TestTheJobIDInThePathMustBeAnIdentifier keeps a malformed path out of the database.
+//
+// bad_request rather than not_found, which is httpx's own division: the path was addressed wrongly
+// rather than naming something absent. It also discloses nothing — the answer is the same whether
+// or not any job exists.
+func TestTheJobIDInThePathMustBeAnIdentifier(t *testing.T) {
+	m := newMarketplace(t)
+	m.publish(t, richJob(1500))
+
+	rec := m.get(t, "/v1/jobs/open/not-a-uuid")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if code := decode[errorEnvelope](t, rec).Error.Code; code != "bad_request" {
+		t.Errorf("error.code = %q, want bad_request", code)
 	}
 }
 

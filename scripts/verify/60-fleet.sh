@@ -691,31 +691,43 @@ SQL
 
 publish_job "$elig_job_id" Draft Open
 
-# eligible — 1 when the feed offers that one job to that one provider, 0 when it does not.
+# eligible — 1 when the marketplace offers that one job to that one provider, 0 when it does not.
+#
+# **Both endpoints are asked, and they have to agree.** `GET /v1/jobs/open/{id}` answers 200 or 404,
+# and the feed either carries the job or does not. One SQL predicate serves both, so a disagreement
+# is a defect rather than a difference of emphasis — a provider shown a job in the feed and then
+# refused it on the detail screen is the worst of both, and it is the failure sharing the clause
+# exists to prevent. Every filter check below therefore exercises the two endpoints at once.
 #
 # Scoped to the single job by id, so the jobs 50-jobs.sh leaves behind cannot make a broken filter
 # look like a working one.
-#
-# **SHIP-83 grows this a second half.** `GET /v1/jobs/open/{id}` answers the same question about the
-# same job, one predicate serves both endpoints, and a disagreement between them is a defect rather
-# than a difference of emphasis — so that ticket asks both here and requires them to agree.
 eligible() {
-  local status found
+  local detail feed status
+
+  detail="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$elig_job_id" "$WORKDIR/elig-detail.json")"
+  case "$detail" in
+    200) detail=1 ;;
+    404) detail=0 ;;
+    *) cat "$WORKDIR/elig-detail.json"; fail "GET /v1/jobs/open/$elig_job_id returned $detail, want 200 or 404" ;;
+  esac
+
   status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/elig-feed.json")"
   [[ "$status" == "200" ]] || { cat "$WORKDIR/elig-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
-
-  found="$(python3 - "$WORKDIR/elig-feed.json" "$elig_job_id" <<'FEED'
+  feed="$(python3 - "$WORKDIR/elig-feed.json" "$elig_job_id" <<'PY'
 import json, sys
 page = json.load(open(sys.argv[1]))
 found = any(job["id"] == sys.argv[2] for job in page["data"])
 if not found and page["has_more"]:
-    # Ambiguous rather than false: the job could be on a later page, and a check that read that
-    # as "excluded" would pass for the wrong reason on a busy database.
+    # Ambiguous rather than false: the job could be on a later page, and a check that read
+    # that as "excluded" would pass for the wrong reason on a busy database.
+    print("more", file=sys.stderr)
     sys.exit(1)
 print(1 if found else 0)
-FEED
+PY
 )" || fail "the feed did not fit in one page of 100; this check cannot tell absent from further down"
-  printf '%s' "$found"
+
+  [[ "$detail" == "$feed" ]] || fail "the feed says $feed and GET /v1/jobs/open/$elig_job_id says $detail — one predicate serves both"
+  printf '%s' "$detail"
 }
 
 status="$(curl -s -o "$WORKDIR/open-anon.json" -w '%{http_code}' \
@@ -925,3 +937,119 @@ status="$(fleet_get "$fleet_customer_token" /v1/jobs/open "$WORKDIR/open-custome
   || { cat "$WORKDIR/open-customer.json"; fail "a customer's feed is not an empty array"; }
 ok "a caller eligible for nothing gets an empty array, never null and never a 403"
 
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-83  GET /v1/jobs/open/{id} — one job, no budget, and no doorstep"
+
+status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-detail.json"; fail "GET /v1/jobs/open/$open_job_id returned $status, want 200"; }
+
+# One shape, whatever the client did to obtain it — the rule the vehicle endpoints already follow,
+# and here it is also the privacy decision: two shapes would be two places a budget field could be
+# added and two responses this section would have to know to check.
+python3 - "$WORKDIR/open-detail.json" "$WORKDIR/open-feed.json" "$open_job_id" <<'PY' || fail "the detail view and the feed entry are different shapes"
+import json, sys
+detail = json.load(open(sys.argv[1]))
+entry = next(job for job in json.load(open(sys.argv[2]))["data"] if job["id"] == sys.argv[3])
+if detail != entry:
+    print("detail:", detail, "\nfeed:  ", entry, file=sys.stderr)
+    sys.exit(1)
+PY
+ok "the job by identifier is the entry the feed carried, field for field"
+
+# **The invariant, checked where it can actually be broken: the bytes a provider receives.**
+#
+# Docs/11 §8 records what the SHIP-67 pairing still owed — "its provider response, serialised,
+# asserted to carry no budget". internal/fleet/openjobs_test.go is that test in Go, over a closed
+# set of keys so that a budget renamed `max_price` fails too. This is the same assertion made from
+# outside Go, against a running service, so that neither can be quietly deleted alone.
+stored_budget="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select budget from jobs where id = '$open_job_id';")"
+[[ -n "$stored_budget" ]] || fail "the job carries no budget, so these checks are asserting nothing"
+[[ "$stored_budget" == "1500.00" ]] || fail "the stored budget is '$stored_budget', want 1500.00"
+
+python3 - "$WORKDIR/open-detail.json" "$WORKDIR/open-feed.json" <<'PY' || fail "the customer's budget reached a provider"
+import json, re, sys
+
+# Every key a provider may see, at any depth: the envelope's three, the job's fifteen, and the two
+# nested shapes'. **A closed list, and that is the point** — a deny-list of names catches
+# `budget_cents` and misses `max_price`, while Docs/01 §4.3 forbids the budget "as an amount, a
+# band, or a 'budget supplied' flag" rather than forbidding a spelling.
+allowed = {
+    "data", "next_cursor", "has_more",
+    "id", "status", "pickup", "dropoff", "goods_description",
+    "length_cm", "width_cm", "height_cm", "weight_kg",
+    "vehicle_requirement", "handling_notes", "pickup_window", "dropoff_window",
+    "expires_at", "created_at",
+    "suburb", "state", "postcode", "start", "end",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+# Identifiers come out before the value search: a UUID is hexadecimal, so a run of digits can
+# occur inside one by chance — rarely enough to pass review and often enough to fail one morning.
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+for path in sys.argv[1:]:
+    raw = open(path).read()
+
+    unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+    if unexpected:
+        print(path, "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+        print("A budget under another name is still a budget (Docs/01 §4.3).", file=sys.stderr)
+        sys.exit(1)
+
+    if "budget" in raw.lower():
+        print(path, "mentions the budget:", raw, file=sys.stderr)
+        sys.exit(1)
+
+    searchable = identifier.sub("<id>", raw)
+    for rendering in ("1500.00", "150000"):
+        if rendering in searchable:
+            print(path, "carries the budget's value as", rendering, file=sys.stderr)
+            print(raw, file=sys.stderr)
+            sys.exit(1)
+PY
+ok "the customer's budget is on the job and in neither response — not the word, not the value, not a key under another name"
+
+# The other disclosure decision, confirmed by SHIP-83 rather than inherited: a provider who has not
+# bid gets the locality and not the doorstep. The coordinate goes with the street line, because the
+# platform geocodes the whole address — sending it would be sending the line as two numbers.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_latitude = -37.8197, pickup_longitude = 144.9989 where id = '$open_job_id';"
+status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-detail2.json")"
+[[ "$status" == "200" ]] || fail "re-reading the job returned $status"
+for disclosure in 'Church Street' 'Bourke Street' '37.8197' '144.9989' '"line"' '"coordinate"' '"latitude"'; do
+  grep -q "$disclosure" "$WORKDIR/open-detail2.json" \
+    && { cat "$WORKDIR/open-detail2.json"; fail "the provider's job carries '$disclosure' before they have bid"; }
+done
+grep -q 'Richmond' "$WORKDIR/open-detail2.json" || fail "the pickup locality is missing; a provider cannot price without it"
+grep -q '3121' "$WORKDIR/open-detail2.json" || fail "the pickup postcode is missing"
+ok "the pickup is suburb, state and postcode — never the street line, and never the coordinate that is the street line"
+
+# A job this provider may not bid on is indistinguishable from one that does not exist. 403 would
+# confirm the job is there, and which jobs a competitor may bid on is nobody else's business.
+status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$qld_job_id" "$WORKDIR/open-theirs.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/open-theirs.json"; fail "an ineligible job returned $status, want 404"; }
+status="$(fleet_get "$elig_provider_token" /v1/jobs/open/00000000-0000-7000-8000-000000000020 "$WORKDIR/open-nothing.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/open-nothing.json"; fail "a job that does not exist returned $status, want 404"; }
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/open-theirs.json" "$WORKDIR/open-nothing.json" \
+  || fail "a job outside the provider's eligibility answers differently from a job that does not exist"
+ok "an ineligible job answers exactly what a missing job answers — the refusal confirms nothing"
+
+# And the customer cannot read their own job here. GET /v1/jobs/{id} is where they read it, and
+# that response is the one shape in this API that carries the budget.
+status="$(fleet_get "$fleet_customer_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-owner.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/open-owner.json"; fail "the owning customer read their job through the provider's route: $status"; }
+ok "the provider's route is not a second way to a job the customer owns"

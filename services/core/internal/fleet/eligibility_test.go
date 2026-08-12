@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -40,8 +41,9 @@ import (
 //   - **The opt-in rule.** A provider who has declared nothing matches nothing
 //     ([TestAProviderWhoHasDeclaredNothingSeesNothing]). SHIP-79 settled it and this is where it
 //     is enforced.
-//   - **One definition of eligibility.** [TestEligibleForAgreesWithTheFeed] holds the single-job
-//     check to the feed across every case, which is the claim the shared predicate makes.
+//   - **One definition of eligibility.** [TestTheThreeReadersOfTheFilterAgree] holds the
+//     single-job check and SHIP-83's single-job *read* to the feed across every case, which is the
+//     claim the shared predicate makes.
 
 // publishInstant is when the test world's jobs become Open.
 //
@@ -431,14 +433,21 @@ func TestAJobIsNotOfferedToItsOwnCustomer(t *testing.T) {
 	}
 }
 
-// TestEligibleForAgreesWithTheFeed is the claim the shared predicate makes, tested rather than
+// TestTheThreeReadersOfTheFilterAgree is the claim the shared predicate makes, tested rather than
 // asserted.
 //
 // `doc.go` requires eligibility to be decided in one place — "the feed itself is filtered here and
-// a bid on an ineligible job is refused here" — and the two readers exist so SHIP-84 does not write
-// a second definition. If they could disagree, a provider could be shown a job and then refused a
-// bid on it, which is the worst of both.
-func TestEligibleForAgreesWithTheFeed(t *testing.T) {
+// a bid on an ineligible job is refused here" — and the readers exist so that SHIP-84 does not
+// write a second definition. If they could disagree, a provider could be shown a job and then
+// refused a bid on it, which is the worst of both.
+//
+// **There were two readers at SHIP-81 and there are three from SHIP-83**: the feed, the boolean
+// SHIP-84 asks before it writes a bid, and the single-job read the provider's detail view serves.
+// The third is the one most easily got wrong, because it is the only one that returns a *row* — a
+// detail endpoint that authorised with one query and read with another would have two definitions
+// inside one handler. This holds all three to each other across every case, so a clause added to
+// the predicate for one reader cannot quietly fail to reach the others.
+func TestTheThreeReadersOfTheFilterAgree(t *testing.T) {
 	service := newTestService()
 
 	cases := map[string]func(t *testing.T, w world){
@@ -469,6 +478,21 @@ func TestEligibleForAgreesWithTheFeed(t *testing.T) {
 				t.Errorf("EligibleFor says %t and the feed says %t. One predicate serves both, so "+
 					"they cannot disagree — a provider shown a job and then refused a bid on it is "+
 					"the defect this shares the clause to prevent.", permitted, w.sees(t))
+			}
+
+			// The third reader (SHIP-83). A row when the job is offered, ErrJobNotOffered when
+			// it is not, and nothing else: any other error means the detail endpoint would have
+			// answered 500 where the feed answered truthfully.
+			job, err := service.EligibleJobFor(t.Context(), w.pool, w.provider, w.job)
+			switch {
+			case err == nil && !permitted:
+				t.Errorf("EligibleJobFor returned job %s that EligibleFor and the feed both refuse", job.ID)
+			case errors.Is(err, ErrJobNotOffered) && permitted:
+				t.Error("EligibleJobFor refused a job the feed carries and EligibleFor permits")
+			case err != nil && !errors.Is(err, ErrJobNotOffered):
+				t.Fatalf("EligibleJobFor: %v", err)
+			case err == nil && job.ID != w.job:
+				t.Errorf("EligibleJobFor returned %s, want the job asked for, %s", job.ID, w.job)
 			}
 		})
 	}

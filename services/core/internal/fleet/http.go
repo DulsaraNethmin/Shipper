@@ -12,14 +12,14 @@
 // platform. A vehicle belonging to another provider answers 404, byte-identically to one that does
 // not exist.
 //
-// # One route here is not under /fleet, and that is deliberate
+// # Two routes here are not under /fleet, and that is deliberate
 //
-// `GET /v1/jobs/open` (SHIP-82) serves jobs, and it is served from this domain because this domain
-// decides which jobs a provider may bid on. Routes are declared rather than registered, so the file
-// a route is declared in follows the domain that answers it rather than the first segment of its
-// path. The rule that keeps it apart from `jobs`' own route is the one the budget invariant needs:
-// `/v1/jobs/{id}` is the customer's job and carries their budget, and nothing served from here has
-// a field it could go in.
+// `GET /v1/jobs/open` and `GET /v1/jobs/open/{id}` (SHIP-82, SHIP-83) serve jobs, and they are
+// served from this domain because this domain decides which jobs a provider may bid on. Routes are
+// declared rather than registered, so the file a route is declared in follows the domain that
+// answers it rather than the first segment of its path. The rule that keeps the two apart is the
+// one the budget invariant needs: `/v1/jobs/{id}` is the customer's job and carries their budget;
+// `/v1/jobs/open/{id}` is a provider's view of one and has no field it could go in.
 //
 // **This is not the customer's view of a vehicle.** Docs/01 §4.3 lets a customer compare "provider
 // profile, vehicle, and declared capability" when they read the bids on their job, and that shape
@@ -621,7 +621,7 @@ func (h *Handler) Declare() http.Handler {
 	})
 }
 
-// --- SHIP-82: the marketplace as a provider sees it -------------------------------------------
+// --- SHIP-82 and SHIP-83: the marketplace as a provider sees it -------------------------------
 
 // openJobResponse is a job a provider may bid on.
 //
@@ -629,17 +629,38 @@ func (h *Handler) Declare() http.Handler {
 //
 // Docs/01 §4.3 keeps the customer's maximum private from providers — "not as an amount, a band, or
 // a 'budget supplied' flag" — and CLAUDE.md calls a breach a defect rather than a style choice.
-// Docs/11 §8 records SHIP-83 as owing the one proof SHIP-67 could not write — the provider's
-// response, serialised, asserted to carry no budget — and **SHIP-83 answers it against this type**,
-// because this is the shape both of its endpoints put on the wire.
+// Docs/11 §8 records SHIP-83 as owing the one proof SHIP-67 could not write: the provider's
+// response, serialised, asserted to carry no budget.
+// [TestTheProviderResponseCarriesNoBudgetInAnyForm] is that test, and it does not look for the word
+// — it holds this shape to a **closed list of keys**, because a budget renamed `max_price` would
+// pass every check that searched for "budget".
 //
-// # The street line is not here either, and SHIP-83 confirms or reopens that
+// # One shape for the feed and for the detail view, and that is the privacy decision
 //
-// SHIP-81 took the decision for the feed because no document takes a position: a provider prices a
-// job on the locality, the distance and the state, and the doorstep is needed by whoever drives to
-// it, which is after an award. The coordinate is absent for the same reason rather than a different
-// one — `jobs` geocodes the whole address, so a pickup coordinate *is* the street line written as
-// two numbers.
+// [Handler.OpenJobs] and [Handler.OpenJob] answer with this same type, the arrangement
+// [vehicleResponse] already establishes for a vehicle: a client parses one type whatever it did to
+// obtain the job. Here it does something further. Two shapes would be two places a budget field
+// could be added and two responses a test would have to know to check; one shape is one of each. A
+// "detail" view carrying a field or two more would also make the feed a subset every client has to
+// special-case, and there is nothing about a job a provider deciding whether to bid needs that the
+// feed cannot carry — Docs/01 §4.3's own answer to a provider who wants the budget is "better job
+// detail — dimensions, access constraints, handling notes", all of which are here in full.
+//
+// # The street line is not here, and SHIP-83 confirms rather than inherits that
+//
+// SHIP-81 took the decision for the feed because no document takes a position, and SHIP-83's job
+// was to confirm or reopen it for the view of a single job. **Confirmed, and for the same reason
+// widened by one:** a provider prices a job on the locality, the distance and the state, and the
+// doorstep is needed by whoever drives to it, which is after an award. Disclosing later is easy and
+// withdrawing later is not.
+//
+// The widening is that **the coordinate is not here either**, and it is the part that would have
+// been easy to give away: `jobs` geocodes the whole address, so a pickup coordinate *is* the street
+// line written as two numbers. A shape that withheld `line` and sent `coordinate` would have kept
+// the letter of the decision and broken it entirely.
+//
+// **What reopens it is named**: the awarded provider needs the exact address, and that is a
+// different shape at a different moment (SHIP-93 onwards), not a field added here.
 //
 // Nor is there a customer. Docs/01 §4.3 lets a *customer* compare provider profiles once bids
 // arrive; nothing gives the reverse before an award.
@@ -797,6 +818,46 @@ func (h *Handler) OpenJobs() http.Handler {
 	})
 }
 
+// OpenJob handles GET /v1/jobs/open/{id} (SHIP-83).
+//
+// One job out of the feed, in the same shape the feed gave it. A member of the collection above
+// rather than a second view of `GET /v1/jobs/{id}`: that route is the *customer's* job, it carries
+// their budget, and one shape with a redaction step somebody has to remember is the arrangement a
+// privacy rule is hardest to keep with.
+//
+// **A job this provider may not bid on answers 404, byte-identically to a job that does not
+// exist.** The reasoning is the one a stranger's vehicle already gets, sharpened: which jobs exist
+// on the platform, and which of them a competitor is eligible for, is information nobody published.
+// The authorisation is the same predicate the feed runs — [Service.EligibleJobFor] — so a job this
+// endpoint serves is a job the feed would have carried, and a job it refuses is one SHIP-84 will
+// refuse a bid on.
+func (h *Handler) OpenJob() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		job, err := h.svc.EligibleJobFor(r.Context(), pool, providerID, jobID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, openJobFrom(job))
+		return nil
+	})
+}
+
 // eligibilityQueryFrom reads `?limit=` and `?cursor=`, which is every parameter this feed has.
 //
 // An unknown query parameter is passed over rather than refused, which is the opposite of what
@@ -864,6 +925,20 @@ func invalidJobCursor(cause error) error {
 	return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
 		"The cursor is not one this endpoint issued. Ask for the first page without one.").
 		WithCause(cause)
+}
+
+// jobIDFrom reads and parses the {id} path parameter of the provider's job detail.
+//
+// Separate from [vehicleIDFrom] only so that the message names the right thing: a client told "the
+// vehicle id in the path is not valid" while fetching a job has been sent looking in the wrong
+// place.
+func jobIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The job id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
 }
 
 // vehicleQueryFrom reads `?active=`, `?limit=` and `?cursor=`.
@@ -1027,6 +1102,14 @@ func apiError(err error) error {
 	case errors.Is(err, ErrVehicleNotFound), errors.Is(err, ErrNotVehicleOwner):
 		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
 			"No such vehicle.").WithCause(err)
+
+	case errors.Is(err, ErrJobNotOffered):
+		// 404 and not 403, and the message says nothing about eligibility. A provider refused
+		// with "you are not eligible for this job" has been told the job exists, which is what
+		// the indistinguishable answer is for. The client already has the feed to show what
+		// this provider may bid on.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such job.").WithCause(err)
 
 	case errors.Is(err, ErrNotProvider):
 		return httpx.NewError(http.StatusForbidden, CodeProviderOnly,
