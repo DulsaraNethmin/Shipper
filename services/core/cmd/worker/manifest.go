@@ -78,6 +78,27 @@ type Task struct {
 
 	// Run is the pass itself.
 	Run Work
+
+	// Close releases whatever the task owns, once, after its loop has stopped. Optional.
+	//
+	// Added at SHIP-15g for SHIP-134, and the gap it fills is worth stating because the
+	// original design deliberately did not have one. Deps carries the pool, the clock and
+	// configuration, on the reasoning that "a domain service is a pure function" of those —
+	// true of job expiry, bid expiry and the auto-complete, all of which only ever run
+	// queries. The outbox publisher is the first task that is not: it holds a Kafka producer,
+	// which is a connection with buffered messages behind it.
+	//
+	// Without this, that task had two options and both were bad. Building the producer inside
+	// every pass pays a connection and a metadata fetch each time round a loop that runs every
+	// few seconds. Building it once in the registration closure leaks it, and worse, drops
+	// whatever it had buffered at shutdown — which for an outbox publisher means events that
+	// the database believes were published.
+	//
+	// A hook on the task rather than a field on Deps, deliberately: Deps would need one field
+	// per integration, and every future task would carry a Kafka producer it never uses. This
+	// way the resource stays owned by the one task that wants it, and a track adds a file and
+	// still edits none.
+	Close func(context.Context) error
 }
 
 // defaultTaskTimeout bounds a pass that names no timeout of its own.
