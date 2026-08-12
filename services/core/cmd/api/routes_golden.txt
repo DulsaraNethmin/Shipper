@@ -22,4 +22,6 @@ GET    /v1/jobs/{id}                            user         v1
 PATCH  /v1/jobs/{id}                            user         v1
 POST   /v1/jobs/{id}/cancel                     user         v1
 POST   /v1/jobs/{id}/extend                     user         v1
+POST   /v1/jobs/{id}/driver                     user         v1
+POST   /v1/jobs/{id}/milestones                 user         v1
 GET    /v1/{$}                                  public       v1

@@ -131,7 +131,9 @@ SHIP-98
 
 # M4 — Delivery execution
 SHIP-105
+SHIP-106
 SHIP-110
+SHIP-111
 
 # M5 — Notifications
 SHIP-134
