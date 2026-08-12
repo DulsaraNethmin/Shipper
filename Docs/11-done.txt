@@ -5,17 +5,17 @@
 # *Done when* line in Docs/09 is demonstrable.
 #
 # Docs/11 §4 lists the partly-finished tickets, and they are NOT all absent from this list.
-# Since SHIP-134 landed, every ticket §4 names is here: SHIP-65 and SHIP-149 are here as well
-# as there, because each landed and is named by a commit subject, while one clause of its
-# *Done when* belongs to a ticket that does not exist yet. Do not "tidy" them out: `make
-# status` exits 1 when git shows a ticket this file does not declare, so removing one breaks
-# the build rather than making it more honest. Docs/11 §10 carries the full reasoning.
-# Of the two, only SHIP-134 is absent. SHIP-149 is here as well as there, because it landed
-# and is named by a commit subject, while one clause of its *Done when* belongs to a ticket
-# that does not exist yet. SHIP-65 was the other such entry until SHIP-67 closed it — which is
-# how this is meant to end. Do not "tidy" either out: `make status` exits 1
-# when git shows a ticket this file does not declare, so removing one breaks the build rather
-# than making it more honest. Docs/11 §10 carries the full reasoning.
+# Every ticket §4 names is here. SHIP-149 is its only live row, and it is here as well as there
+# because it landed and is named by a commit subject, while one clause of its *Done when* — the
+# Go write helper — belongs to work that does not exist yet. SHIP-65 was the other such entry
+# until SHIP-67 closed it, and SHIP-134 until its publisher landed, which is how this shape is
+# meant to end. Do not "tidy" any of them out: `make status` exits 1 when git shows a ticket this
+# file does not declare, so removing one breaks the build rather than making it more honest.
+# Docs/11 §10 carries the full reasoning.
+#
+# This paragraph was itself duplicated and self-contradictory until the wave-4 reconciliation —
+# a merge=union artefact, and the reason the attribute is confined to a file whose content lines
+# are independent tokens. Prose in a union-merged file is the one thing to keep short.
 #
 # Add a ticket in the same change that finishes it, in the same commit as the Docs/11 §3 entry
 # that says what it built.

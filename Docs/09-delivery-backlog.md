@@ -67,7 +67,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 33 tickets, 87 points
+**Size:** 34 tickets, 92 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
