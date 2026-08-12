@@ -126,9 +126,10 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **208 checks**, and `make check` green. Since SHIP-15e the checks
-live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
-its section by adding a file.
+Verified by `make verify` — **241 checks across 10 sections**, and `make check` green. Since
+SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
+runner; a ticket adds its section by adding a file. **The number is measured, never reconciled**:
+run `make verify` and write what it prints.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -213,6 +214,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-61** | M2 | `POST /v1/jobs` — the first authenticated state-changing endpoint in the service — *see below* |
 | **SHIP-62** | M2 | `PATCH /v1/jobs/{id}` — a partial edit of a draft, and a stranger's edit is indistinguishable from no job at all — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
+| **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -1404,6 +1406,79 @@ false of SHIP-134, which holds a Kafka producer with buffered messages behind it
 now optional and called after the task's loop stops, with a fresh context rather than the
 cancelled one, since a `Close` inherited from a cancelled context could never flush. A hook on the
 task rather than a field on `Deps`, so every future task does not carry a producer it never uses.
+
+### What SHIP-78 built, and the first test the migration guard ever got
+
+`internal/fleet` is open. Migration `000300` creates `vehicles`, and six routes under
+`/v1/fleet/vehicles` let a provider add, edit, deactivate, reactivate, read and list their own
+fleet. It is the third domain to hold code, and the first in M3.
+
+**The migration guard fired on the first `make migrate-up` and the message was actionable.** Fleet
+draws from block 300–399 and the development database was at `000404`, which is exactly the
+situation SHIP-15g predicted this ticket would hit — "days from happening rather than theoretical",
+and it happened on the first command. The refusal named the migration, its domain, and the one-line
+fix; `make migrate-down n=all && make migrate-up` applied it, and nothing else was needed. Recorded
+because SHIP-15g was built on a hand-made reproduction and this is the first real occurrence: the
+guard works and the message needed no interpretation.
+
+**Vehicles are deactivated, never deleted, and that is structural.** There is no `DELETE` route and
+no `active` field in any request type. `deactivated_at` is not among the columns an edit writes, so
+an ordinary `PATCH` cannot take a truck off the road by accident — the same discipline that keeps
+`status` out of jobs' `draftColumns`. The reason is not squeamishness about deletion: a vehicle is
+named by the bid that won a job (SHIP-89) and by the delivery that followed it (SHIP-105), so the
+row outlives the provider's interest in it, and `Docs/05` §3.1 requires that record retained.
+
+**The one-live-plate rule is a partial unique index, not application logic.**
+`uq_vehicles_provider_registration` covers only vehicles whose `deactivated_at` is `NULL`, which
+buys three things a `SELECT` before the `INSERT` could not: a second live row for one truck is
+refused even when two requests race; a retired plate can be given to a replacement vehicle, because
+a truck sold and a replacement carrying the same personalised plate is ordinary; and the collision
+that only *reactivation* can hit — the plate was taken while this vehicle was off the road —
+surfaces at exactly the moment it becomes real. That last case answers `409`
+`fleet_duplicate_registration` from a request that supplied no registration at all, which is the
+clearest evidence in the repository so far for `Docs/06` §4.1's "do not abstract PostgreSQL": a
+mocked repository would accept every one of them.
+
+Registration is normalised to upper case **with its spaces removed**, not merely collapsed. A plate
+is written both ways — `ABC 123` on the vehicle and `ABC123` on the paperwork — and keeping the
+space would let the index see two live vehicles where there is one, which is precisely the duplicate
+it exists to refuse.
+
+**`vehicle_type` is a closed list of eleven and it is not SHIP-79's capability vocabulary.** That
+distinction is worth holding on to, because `000404` promised the vocabulary
+`jobs.vehicle_requirement` will one day be validated against to the fleet domain and it would be
+easy to read this as it. It is not: SHIP-79's list is what a *provider* declares about the work they
+take, and this answers the narrower question of what a vehicle is — which cannot be deferred,
+because a fleet record that does not say what the vehicle is describes nothing. **Nothing in `jobs`
+is validated against these values and nothing in `fleet` reads that column.** The pairing test
+`Docs/10` §3.4 requires reads `ck_vehicles_type` out of `pg_constraint` and holds it to
+`fleet.VehicleTypes` in both directions.
+
+**Fleet emits no domain event and has no `ports.go`, and both are decisions rather than
+omissions.** It is the first domain that needs nothing of another domain and nothing of an adapter —
+verification is checked against the *provider* and belongs to `profiles`, and SHIP-81 is where fleet
+first has to ask another domain a question. Nor is anything waiting to hear that a provider bought a
+van: SHIP-81 reads this table directly rather than a projection, and SHIP-89's bid names a vehicle by
+id at the moment it is placed. An event today would have no consumer, and an event with no consumer
+is a shape somebody later has to either keep or break. **If SHIP-81 or SHIP-134 finds it wants one,
+adding it is additive** — the outbox writer and the `EventSink` shape are already established in
+`jobs`.
+
+**A retired vehicle can still be edited, and editing it does not bring it back.** Refusing the edit
+was the tempting alternative and it is wrong: a provider correcting the plate on a truck that is off
+the road for a month would otherwise create a second row for the same vehicle, which is the
+duplication deactivation exists to avoid. Returning to service is its own operation because it is
+the one that can collide.
+
+**The fleet list defaults to *every* vehicle rather than the active ones**, which is the less
+obvious of the two choices. A screen that silently hid retired vehicles would leave a provider
+unable to find the one they need to bring back; `?active=true` is one parameter away for the screen
+that wants only what can be offered. `?active=yes` is a `400` rather than an empty list, for the
+reason `jobs` refuses `?status=Draft`.
+
+Nothing shared was edited beyond the two lines `contracts/openapi.yaml` reserves per domain, the
+regenerated `routes_golden.txt` and `Docs/10-api-error-codes.md`, and this file. `Deps` needed no
+field: fleet builds from the clock and the pool alone.
 
 ## 4. Partly done — do not treat these as finished
 
