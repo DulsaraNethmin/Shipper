@@ -109,6 +109,7 @@ SHIP-67a
 
 # M3 — Bidding and award
 SHIP-78
+SHIP-80
 
 # M6 — Admin
 SHIP-149
