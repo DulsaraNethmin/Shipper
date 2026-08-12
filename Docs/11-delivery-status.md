@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **282 checks across 12 sections**, and `make check` green. Since
+Verified by `make verify` — **299 checks across 12 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -275,6 +275,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -2455,6 +2456,135 @@ Docs/01 §4.4's five recordable milestones, and whether the endpoint should writ
 question rather than this ticket's — `milestones` is SHIP-110's table and SHIP-111 owns what writes
 to it. The transition already emits `job.status_changed` through the outbox, so nothing downstream
 is deaf to the assignment meanwhile.
+
+### SHIP-111 — the milestone endpoint, and which mechanism actually makes a retry safe
+
+`POST /v1/jobs/{id}/milestones`. The awarded provider records that the driver has set off, collected
+the goods, or begun the journey; the milestone is written to SHIP-110's table and the job moves in
+the same transaction when `Docs/02` §2 has a row for it.
+
+**The interesting part is the second sentence of the *Done when*: "once per idempotency key".** That
+is not what SHIP-15's middleware gives you, and reading it as though it were is the mistake this
+ticket exists to not make.
+
+| Mechanism | What it guarantees | For how long |
+|---|---|---|
+| `httpx.Idempotent` (Redis) | the *response* is replayed and the handler never runs | while the entry lives — a TTL, an eviction, a failover |
+| `uq_milestones_idempotency` (000602) | the *row* cannot be written twice | permanently |
+
+A driver records a milestone in a pickup bay with no signal (`Docs/01` §4.4 names the conditions) and
+the phone syncs when it finds a tower, which may be the next day. That outlives any TTL worth
+setting, so the request runs a second time — and the only thing standing between it and a duplicate
+on the customer's timeline is the index. **Redis makes the retry cheap; the database makes it
+correct.** The handler is written as though the middleware were not there: it inserts with
+`ON CONFLICT (job_id, idempotency_key) DO NOTHING`, and when the insert declines it reads what that
+key recorded and answers with it.
+
+`ON CONFLICT` rather than catching a unique violation, and each word is load-bearing: a violation
+aborts the surrounding transaction, which still has a status transition to make, so catching it
+would mean unwinding to a savepoint to ask a question the conflict has already answered. `DO NOTHING`
+rather than `DO UPDATE` because the table is append-only and 000601's trigger would refuse the
+update — which is the right refusal, since a retry must return what was recorded rather than
+overwrite it with a second attempt's timestamp. The index is inferred by its columns and its
+predicate because a *partial* unique index has no constraint name to name.
+
+**The key is scoped per job.** It must not be able to refuse a different action — a client reusing
+one value across two jobs has made two requests that both deserve to succeed — and it must not be
+able to reach another caller's record, which `job_id` already prevents because only the awarded
+provider may write a milestone on a job. A subject column would be a second copy of that fact, and a
+wrong one the moment SHIP-108's driver records under the same key.
+
+**`make verify` tells the two mechanisms apart by deleting the cached response.** The same key sent
+three times: the first records, the second is replayed by the middleware — **as a `201`, byte for
+byte, because a replay is the stored response and not a new one** — and then `redis-cli del` removes
+the entry and the third request runs all the way to the table and is answered `200` from the row it
+already wrote. `Idempotency-Replayed: true` on the second and absent on the third is what makes the
+claim checkable rather than asserted. One milestone row and one transition at the end of all three.
+Seventeen checks were added to `scripts/verify/70-delivery.sh`, taking the run from 282 checks across
+12 sections to the figure at the top of this section.
+
+**The concurrent case is a test rather than a check.** Eight goroutines, one key, eight
+transactions, and the assertion is that exactly one believes it recorded anything. The middleware
+would refuse seven of them with `idempotency_request_in_progress` and never let them reach the
+service, which is exactly why the test bypasses it: two API instances, or a cache miss on both sides
+of a retry, is the same race with nothing in front of it. A check-then-write implementation passes
+that test approximately never.
+
+**Actor permissions are the other half, and the case worth writing down is the customer.** `Docs/02`
+§3 permits "the awarded provider, their assigned driver, or an administrator acting with an audit
+reason", and only the first can present a credential today — the driver's job-scoped token is
+SHIP-107 and SHIP-108, and admin sign-in is SHIP-147. So the customer who *owns* the job is refused,
+with the same `404` a stranger gets: they are shown milestones and they confirm the delivery at the
+end, and neither of those is recording one.
+
+**The `Jobs` port grew three named methods rather than one taking a status.** `MoveToEnRouteToPickup`,
+`MoveToPickedUp`, `MoveToInTransit` — the shape SHIP-106 argued for, held to when it stopped being
+one method. A port shaped "move this job to whatever I pass" would put the target status in
+`delivery`'s hands, and the four `jobs.Status` values now appear in `cmd/api` and nowhere else. The
+cost is four lines per move in the adapter; the property bought is that **the set of moves this
+domain can ask for is fixed at compile time**.
+
+`Delivered` has no method behind it, and that is the enforcement rather than an omission — see
+below. The translation of refusals into outcomes was also collapsed into one `move` helper in the
+adapter, because four copies of it could translate `jobs.ErrAlreadyInStatus` four ways and every one
+of them would still compile and still pass its own test.
+
+**`JobAlreadyDriverAssigned` was renamed to `JobAlreadyInStatus`.** With one move on the port the
+specific name was clearer; with four it would be wrong, because a driver re-recording
+`en_route_to_pickup` on a job already there is that outcome and has nothing to do with an
+assignment. One name for one concept, and the compiler found every use.
+
+**The two clocks are kept apart in both tables, and the transition carries the milestone's claim.**
+`recorded_at` is the actor's and is never corrected or bounded — 000601 says why, and a test sends a
+time ninety minutes in the past and asserts the column holds exactly that. `accepted_at` is the
+platform's, written by the trigger that refuses to be told what to say. The `job_status_history` row
+the move leaves carries the *same* actor claim, because a customer shown 06:40 by one and 08:10 by
+the other has been told the delivery happened twice. The service takes a `clock.Clock` for the case
+where the client sends nothing — an online recording, where there is one clock — which is what
+SHIP-106 predicted it would need and is the only reason a clock is there.
+
+**Two decisions this ticket was left, and both went to "no".**
+
+*Does assigning a driver write a `Driver assigned` milestone?* **No, and nothing writes that value
+to the table.** `Docs/01` §4.4 numbers it among the five a provider can record, so it stays in
+`delivery.Milestones` and in `ck_milestones_milestone`; the endpoint refuses it with a `422` pointing
+at `POST /v1/jobs/{id}/driver`. The reasoning is that a milestone row exists to hold a claim the
+platform cannot verify and may not be able to act on — that is why it carries the actor's clock and
+why it may move nothing. Assigning a driver is not that. It is made online through an authenticated
+session against a job that must be `Awarded`, so there is one clock and it cannot be "recorded but
+absorbed"; and the fact is already held twice, by `driver_assignments` and by the
+`Awarded → Driver assigned` history row. A third copy in an append-only table would outlive a
+replaced assignment and could only ever disagree. `Docs/02` §1 supports the split from the other
+side: `Driver assigned` is the one of the five whose primary actor is the provider alone, and the
+other four all read "Provider / Driver".
+
+*Does the endpoint accept `Delivered`?* **No, until proof exists.** CLAUDE.md's invariant is that
+delivered requires photo proof or a recorded exception and never neither, `Docs/01` §4.4 decides it,
+and neither can be captured until SHIP-114…SHIP-116. So every `delivered` is refused with
+`delivery_proof_required`, and there is no `MoveToDelivered` on the port — the refusal cannot be
+removed by editing one file. **SHIP-118 narrows this from "always" to "when the job has neither",
+which is the ticket it was already going to be**; the sentinel, the code and the message already say
+what that ticket needs to say.
+
+**What is left in place for SHIP-112, deliberately.** A late milestone — a queued `Picked up`
+arriving after `In transit` is recorded — is refused today with `delivery_milestone_not_permitted`
+and the transaction rolls back whole. `Docs/02` §3.1 says it must be *absorbed*, and that is
+SHIP-112's five points rather than this ticket's. What SHIP-111 owes it is a seam: the milestone row
+is written before the move is attempted and is already independent of whether the job moved, so
+**SHIP-112 changes one `case` of one `switch` — `JobNotAssignable` in `Service.RecordMilestone` —
+and nothing else**. There is no uniqueness on `(job_id, milestone)` to get in its way (000601 refused
+to add one for exactly this reason), the two clocks it needs are already stored, and the error code's
+own description tells clients to keep the update rather than discard it, so a client written against
+today's behaviour will not lose records when the answer changes. A test marks the boundary and says
+in its name that it is temporary.
+
+**A repeat that is not a retry is a second row.** A driver who reaches a pickup, finds nobody there,
+and sets off again records `en_route_to_pickup` twice under two keys: two milestones, one
+transition, which is `Docs/02` §5's failed attempt and the case 000601 has no uniqueness for.
+
+**The delivery block moved to `000602`** — one column, one check, one partial unique index. It is the
+first migration in this repository written to hold a guarantee that a piece of infrastructure was
+already believed to provide.
 
 ## 4. Partly done — do not treat these as finished
 

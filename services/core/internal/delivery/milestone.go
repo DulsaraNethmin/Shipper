@@ -1,5 +1,14 @@
 package delivery
 
+import (
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
+)
+
 // Milestone is one of the five things a provider or an assigned driver records on a delivery
 // (Docs/01 §4.4).
 //
@@ -62,6 +71,147 @@ func (m Milestone) Valid() bool {
 }
 
 func (m Milestone) String() string { return string(m) }
+
+// Wire is the milestone as a client names it: lower snake case, per Docs/10 §4.7.
+//
+// Derived rather than tabulated, which is the same call jobs.Status.Wire makes and for the same
+// reason: a five-entry table beside the five constants is a second list that can disagree with the
+// first, and a transformation cannot disagree with its input.
+//
+// **This is delivery's own mapping and not a copy of `jobs`'.** Four of the five strings happen to
+// match a job status, so the wire forms match too — `picked_up` here and `picked_up` there — and
+// they are still two vocabularies (see the type's own comment). SHIP-56a generates the *status*
+// list for three languages; it has no opinion about this one, which has five values, a different
+// membership, and a table of its own behind it.
+func (m Milestone) Wire() string {
+	return strings.ReplaceAll(strings.ToLower(string(m)), " ", "_")
+}
+
+// MilestoneFromWire is [Milestone.Wire] read backwards: the milestone a client named, or false.
+//
+// Case-sensitive on purpose. `Picked up` is the stored form and `picked_up` is the wire form, and a
+// client that sends the stored form has misread the contract rather than typed the wrong case — it
+// is told so, which is more useful than being quietly understood and then finding the two forms
+// used interchangeably by the next endpoint.
+func MilestoneFromWire(wire string) (Milestone, bool) {
+	for _, known := range Milestones {
+		if known.Wire() == wire {
+			return known, true
+		}
+	}
+	return "", false
+}
+
+// maxMilestoneReason bounds the note an actor may attach to a milestone.
+//
+// Generous but finite, on the same reasoning as maxDriverName: a bound against a runaway text
+// field rather than a judgement about what may be said. What goes here is Docs/02 §5's ordinary
+// exception — "customer unavailable at pickup", "the gate was locked and I am returning at four" —
+// and a driver typing it on a phone in a yard is not writing an incident report.
+const maxMilestoneReason = 500
+
+// Recording is what an actor says they did, as it arrives from a client.
+//
+// # RecordedAt is the actor's clock and is never corrected
+//
+// Docs/02 §3.1 requires the two clocks to be carried separately, and the migration that made them
+// two columns (000601) is explicit that this one is not bounded against now(): a device that has
+// been out of signal for a day, or is simply set wrong, still recorded something true about work
+// that was done, and "refusing an implausible time would discard the record".
+//
+// The zero value means "the actor did not say", which is the ordinary case for anything recorded
+// online: there is one clock, and [Service.RecordMilestone] fills this from it. That is the same
+// treatment jobs.Move.RecordedAt gets, deliberately — a milestone and the transition it causes are
+// one act, and they must not disagree about when the actor says it happened.
+//
+// # Key is the client's idempotency key, and it is a field rather than an argument
+//
+// It reaches the milestones row, so it is part of what is recorded rather than part of how the
+// request was made. The uniqueness it buys is the database's (000602), not this struct's.
+type Recording struct {
+	Milestone  Milestone
+	RecordedAt time.Time
+	Reason     string
+	Key        string
+}
+
+// normalise trims what the client sent into what the columns should hold.
+func (rec Recording) normalise() Recording {
+	rec.Reason = collapse(rec.Reason)
+	return rec
+}
+
+// problems reports what is wrong with a recording, in the error contract's shape.
+//
+// The milestone is checked here rather than left to ck_milestones_milestone for the reason
+// Docs/10 §4.6 gives: a client that sent a value the platform does not know should be told which
+// field was wrong and what is accepted, not handed a constraint name in a 500.
+//
+// **`driver_assigned` is refused, and it is refused here rather than being absent from the
+// enumeration.** Docs/01 §4.4 numbers five and the database accepts five; what this endpoint will
+// not do is write the fifth. See [Service.RecordMilestone].
+func (rec Recording) problems() validate.Errors {
+	var e validate.Errors
+
+	switch {
+	case rec.Milestone == "":
+		e.Add("milestone", validate.CodeRequired, "Say which milestone you are recording.")
+
+	case !rec.Milestone.Valid():
+		e.Add("milestone", validate.CodeInvalid,
+			"That is not a milestone. Use one of %s.", strings.Join(recordableWire(), ", "))
+
+	case rec.Milestone == MilestoneDriverAssigned:
+		e.Add("milestone", validate.CodeNotAllowed,
+			"A driver is put on a job through its own endpoint, not recorded as a milestone.")
+	}
+
+	if rec.Reason != "" {
+		e.Length("reason", rec.Reason, 1, maxMilestoneReason)
+	}
+
+	return e
+}
+
+// recordableWire is the wire form of every milestone this endpoint accepts.
+//
+// Derived from [Milestones] minus the one with an endpoint of its own, so the message a client is
+// refused with cannot list a value the handler would then reject — which is what a hand-written
+// string in the message above would eventually do.
+func recordableWire() []string {
+	wire := make([]string, 0, len(Milestones))
+	for _, m := range Milestones {
+		if m == MilestoneDriverAssigned {
+			continue
+		}
+		wire = append(wire, m.Wire())
+	}
+	return wire
+}
+
+// Record is one row of milestones — what somebody recorded, and when, on both clocks.
+//
+// It is evidence rather than state. The table is append-only (000601), so nothing here is ever
+// updated: a milestone that turned out to be wrong is another milestone and another row.
+//
+// ActorRecordedAt is what the actor claims and ServerRecordedAt is when it arrived. **Neither is
+// derived from the other**, and the pair is what makes an offline delivery reconstructable — which
+// is why the second is filled by a trigger that refuses to be told what to say.
+type Record struct {
+	ID    uuid.UUID
+	JobID uuid.UUID
+
+	Milestone Milestone
+
+	Actor   ActorType
+	ActorID uuid.UUID
+
+	Reason string
+	Key    string
+
+	ActorRecordedAt  time.Time
+	ServerRecordedAt time.Time
+}
 
 // ActorType is who recorded a milestone.
 //

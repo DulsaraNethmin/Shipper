@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -51,6 +52,21 @@ func init() {
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).AssignDriver() },
 		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/milestones",
+			Group:   GroupV1,
+
+			// RequireUser again, and the reason bears repeating because this is the route
+			// whose name most invites the other answer. A driver records milestones from a
+			// link-authenticated portal, and that portal's token is SHIP-107 and SHIP-108.
+			// RequireDriverToken is declarable with no middleware behind it: a route
+			// declaring it panics at startup rather than being served open, which is the
+			// right outcome and not one to work around. The caller here is the awarded
+			// provider, and the platform checks that against the accepted bid.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordMilestone() },
+		},
 	)
 }
 
@@ -67,7 +83,7 @@ func init() {
 // a transient condition the service is built to survive, and the handlers answer 503 for as long as
 // it lasts.
 func deliveryHandler(d Deps) *delivery.Handler {
-	svc := delivery.NewService(jobLifecycle{jobs: newJobService(d)}, acceptedBids{})
+	svc := delivery.NewService(jobLifecycle{jobs: newJobService(d)}, acceptedBids{}, d.Clock)
 
 	handler, err := delivery.NewHandler(svc, d.Pool, d.Logger)
 	if err != nil {
@@ -111,17 +127,89 @@ type jobLifecycle struct {
 //
 // RecordedAt is left zero, so jobs.Transition uses the platform's clock for both. That is correct
 // here and would not be for a milestone: this request is made online, by a provider looking at the
-// screen, so there is only one clock. SHIP-111 carries the actor's separately (Docs/02 §3.1).
+// screen, so there is only one clock. The three methods below carry the actor's separately.
 func (l jobLifecycle) MoveToDriverAssigned(
 	ctx context.Context,
 	r db.Runner,
 	jobID, providerID uuid.UUID,
 ) (delivery.JobMove, error) {
-	_, err := l.jobs.Transition(ctx, r, jobs.Move{
+	return l.move(ctx, r, jobs.Move{
 		JobID: jobID,
 		To:    jobs.StatusDriverAssigned,
 		Actor: jobs.User(jobs.ActorProvider, providerID),
 	})
+}
+
+// The three moves a recorded milestone can make (SHIP-111).
+//
+// One method per move rather than one taking a status, which delivery/ports.go argues at length and
+// this file is where the argument is cashed: **the four `jobs.Status` values below appear in cmd/api
+// and nowhere else.** `delivery` names milestones, this names statuses, and the mapping between the
+// two vocabularies lives in the composition root where both are visible.
+//
+// `Delivered` is deliberately absent. Docs/01 §4.4 makes photo proof or a recorded exception the
+// condition of recording one, neither can be captured until SHIP-114…SHIP-116, and a method here
+// would be a way to reach that status without either. The delivery domain refuses it in front of
+// this (delivery.ErrProofRequired); having no method behind it as well means the refusal cannot be
+// removed by editing one file.
+//
+// RecordedAt is the actor's clock, passed through to job_status_history's actor_recorded_at. The
+// transition and the milestone that caused it are one act, and the pair of rows they leave must
+// agree about when the actor says it happened (Docs/02 §3.1). Each table stamps its own arrival
+// time from the database's clock, so the two are never collapsed.
+
+func (l jobLifecycle) MoveToEnRouteToPickup(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+	recordedAt time.Time,
+) (delivery.JobMove, error) {
+	return l.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusEnRouteToPickup,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: recordedAt,
+	})
+}
+
+func (l jobLifecycle) MoveToPickedUp(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+	recordedAt time.Time,
+) (delivery.JobMove, error) {
+	return l.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusPickedUp,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: recordedAt,
+	})
+}
+
+func (l jobLifecycle) MoveToInTransit(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+	recordedAt time.Time,
+) (delivery.JobMove, error) {
+	return l.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusInTransit,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: recordedAt,
+	})
+}
+
+// move is the translation itself, in one place: what `jobs` treats as a refusal becomes a
+// delivery.JobMove with a nil error, and everything else stays an error because a failing database
+// is not an answer.
+//
+// Written once rather than four times because a fifth move must not be able to translate
+// jobs.ErrAlreadyInStatus differently from the four before it. That is exactly the drift that would
+// be invisible: every one of these methods would still compile, still pass its own test, and answer
+// a repeated milestone with a refusal on one path and an absorption on another.
+func (l jobLifecycle) move(ctx context.Context, r db.Runner, m jobs.Move) (delivery.JobMove, error) {
+	_, err := l.jobs.Transition(ctx, r, m)
 
 	switch {
 	case err == nil:
@@ -129,7 +217,7 @@ func (l jobLifecycle) MoveToDriverAssigned(
 	case errors.Is(err, jobs.ErrJobNotFound):
 		return delivery.JobNotFound, nil
 	case errors.Is(err, jobs.ErrAlreadyInStatus):
-		return delivery.JobAlreadyDriverAssigned, nil
+		return delivery.JobAlreadyInStatus, nil
 	case errors.Is(err, jobs.ErrTransitionNotPermitted):
 		return delivery.JobNotAssignable, nil
 	default:

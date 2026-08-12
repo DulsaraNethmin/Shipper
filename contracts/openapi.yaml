@@ -186,6 +186,8 @@ paths:
     $ref: './paths/jobs.yaml#/CancelJob'
   /v1/jobs/{id}/driver:
     $ref: './paths/delivery.yaml#/AssignDriver'
+  /v1/jobs/{id}/milestones:
+    $ref: './paths/delivery.yaml#/Milestones'
 
 components:
   schemas:

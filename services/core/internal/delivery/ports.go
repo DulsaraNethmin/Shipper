@@ -2,6 +2,7 @@ package delivery
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -80,12 +81,19 @@ const (
 	// JobNotFound means there is no such job.
 	JobNotFound
 
-	// JobAlreadyDriverAssigned means the job was already at 'Driver assigned'.
+	// JobAlreadyInStatus means the job was already where the move would have put it.
 	//
 	// Distinct from JobNotAssignable because the two want opposite handling, exactly as
 	// jobs.ErrAlreadyInStatus is distinct from jobs.ErrTransitionNotPermitted: a job that is
 	// already where the caller wanted it has not refused anything.
-	JobAlreadyDriverAssigned
+	//
+	// **SHIP-106 called this JobAlreadyDriverAssigned, and SHIP-111 renamed it.** With one move
+	// on the port the specific name was the clearer one; with four it would be actively wrong,
+	// because a driver re-recording 'En route to pickup' on a job that is already there — which
+	// Docs/02 §5 lists as an ordinary outcome, the failed pickup attempt — is this outcome and
+	// has nothing to do with an assignment. One name for one concept, and the compiler found
+	// every use.
+	JobAlreadyInStatus
 
 	// JobNotAssignable means Docs/02 §2 has no row from the job's status to 'Driver assigned'.
 	//
@@ -101,8 +109,8 @@ func (m JobMove) String() string {
 		return "moved"
 	case JobNotFound:
 		return "no such job"
-	case JobAlreadyDriverAssigned:
-		return "already driver assigned"
+	case JobAlreadyInStatus:
+		return "already in that status"
 	case JobNotAssignable:
 		return "not assignable"
 	default:
@@ -117,6 +125,20 @@ func (m JobMove) String() string {
 // target status, and the one thing CLAUDE.md says about job status is that nothing outside the
 // guard chooses it. The method names the one move SHIP-106 makes, and a domain that needs another
 // declares another.
+// # Four methods and not one taking a milestone, which is the same refusal a second time
+//
+// SHIP-111 records four things that move a job, and the obvious shape — one method taking the
+// milestone — is the shape this comment already refused. The target status would then be chosen by
+// whatever `delivery` passed, and the mapping from a milestone to a status would live in a
+// translation table that Docs/02 §2 never sees. Four methods cost four lines each in the adapter
+// and buy the property that **the set of moves this domain can ask for is fixed at compile time**:
+// a fifth requires editing this interface, which is a decision somebody records rather than a
+// string somebody passes.
+//
+// The methods take the actor's clock rather than reading one. A milestone recorded offline at
+// 06:40 and synced at 09:15 is one act, and the two rows it writes — a milestone and a
+// job_status_history transition — must agree about when the actor says it happened (Docs/02 §3.1).
+// Each table stamps its own arrival time; neither takes the other's word for the actor's.
 type Jobs interface {
 	// MoveToDriverAssigned runs the guarded transition on behalf of the provider, inside the
 	// caller's transaction. providerID is the actor recorded against it.
@@ -125,4 +147,23 @@ type Jobs interface {
 	// refusal. A refusal comes back as a [JobMove] with a nil error, because "Docs/02 does not
 	// permit this" is an answer rather than a fault.
 	MoveToDriverAssigned(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID) (JobMove, error)
+
+	// MoveToEnRouteToPickup is Docs/02 §2's `Awarded / Driver assigned → En route to pickup`.
+	//
+	// Two `from` statuses and one method, because the caller is not choosing between them:
+	// a provider driving the job themselves sets off from Awarded without nominating anybody,
+	// and the guard is what knows that both are permitted.
+	MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+
+	// MoveToPickedUp is `En route to pickup → Picked up`.
+	MoveToPickedUp(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+
+	// MoveToInTransit is `Picked up → In transit`.
+	//
+	// Docs/02 §2 permits this one as "an automatic presentation change" as well as an act, which
+	// is why milestone.go's ActorSystem exists. Nothing applies it automatically yet, and when
+	// something does it will be a task in cmd/worker rather than a request, so this method stays
+	// the actor's path and is not widened to carry an actor type it would only ever be given one
+	// value of.
+	MoveToInTransit(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
 }

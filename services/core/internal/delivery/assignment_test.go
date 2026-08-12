@@ -44,11 +44,42 @@ var testInstant = time.Date(2026, 8, 12, 3, 30, 0, 0, time.UTC)
 type testJobs struct{ svc *jobs.Service }
 
 func (j testJobs) MoveToDriverAssigned(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID) (JobMove, error) {
-	_, err := j.svc.Transition(ctx, r, jobs.Move{
+	return j.move(ctx, r, jobs.Move{
 		JobID: jobID,
 		To:    jobs.StatusDriverAssigned,
 		Actor: jobs.User(jobs.ActorProvider, providerID),
 	})
+}
+
+func (j testJobs) MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
+	return j.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusEnRouteToPickup,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: at,
+	})
+}
+
+func (j testJobs) MoveToPickedUp(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
+	return j.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusPickedUp,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: at,
+	})
+}
+
+func (j testJobs) MoveToInTransit(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
+	return j.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusInTransit,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: at,
+	})
+}
+
+func (j testJobs) move(ctx context.Context, r db.Runner, m jobs.Move) (JobMove, error) {
+	_, err := j.svc.Transition(ctx, r, m)
 
 	switch {
 	case err == nil:
@@ -56,7 +87,7 @@ func (j testJobs) MoveToDriverAssigned(ctx context.Context, r db.Runner, jobID, 
 	case errors.Is(err, jobs.ErrJobNotFound):
 		return JobNotFound, nil
 	case errors.Is(err, jobs.ErrAlreadyInStatus):
-		return JobAlreadyDriverAssigned, nil
+		return JobAlreadyInStatus, nil
 	case errors.Is(err, jobs.ErrTransitionNotPermitted):
 		return JobNotAssignable, nil
 	default:
@@ -81,7 +112,10 @@ func (testAwards) AwardedProvider(ctx context.Context, r db.Runner, jobID uuid.U
 	return providerID, true, nil
 }
 
-// staticJobs answers with one outcome, for the two cases no fixture can produce.
+// staticJobs answers with one outcome, for the cases no fixture can produce.
+//
+// Every move answers identically, which is what makes it useful: a test using it is asking what the
+// *service* does with an outcome, not which move produced it.
 type staticJobs struct {
 	move JobMove
 	err  error
@@ -91,8 +125,32 @@ func (s staticJobs) MoveToDriverAssigned(context.Context, db.Runner, uuid.UUID, 
 	return s.move, s.err
 }
 
+func (s staticJobs) MoveToEnRouteToPickup(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+	return s.move, s.err
+}
+
+func (s staticJobs) MoveToPickedUp(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+	return s.move, s.err
+}
+
+func (s staticJobs) MoveToInTransit(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+	return s.move, s.err
+}
+
+// testClock is the clock every service below is built with.
+//
+// Fixed rather than real, and it is doing work: [testInstant] is what a milestone recorded with no
+// actor-supplied time is stamped with, so a test can tell that value apart from the
+// server_recorded_at the database writes from its own clock. Two real clocks would agree to within a
+// millisecond and prove nothing.
+func testClock() *clock.Fixed { return clock.NewFixed(testInstant) }
+
 func newTestService() *Service {
-	return NewService(testJobs{svc: jobs.NewService(events.NewOutbox(), clock.NewFixed(testInstant), nil)}, testAwards{})
+	return NewService(
+		testJobs{svc: jobs.NewService(events.NewOutbox(), testClock(), nil)},
+		testAwards{},
+		testClock(),
+	)
 }
 
 // newAccount inserts a user with the role the test needs.
@@ -559,7 +617,7 @@ func TestAnUnrecognisedOutcomeIsAFailure(t *testing.T) {
 	provider := newAccount(t, pool, "unknown-p@example.com", "+61400000624", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	svc := NewService(staticJobs{move: JobMoveUnrecognised}, testAwards{})
+	svc := NewService(staticJobs{move: JobMoveUnrecognised}, testAwards{}, testClock())
 
 	_, _, err := assign(t, pool, svc, provider, jobID, Nomination{
 		DriverName:   "Sam Patel",
@@ -580,7 +638,7 @@ func TestAJobAlreadyDriverAssignedKeepsTheNewDriver(t *testing.T) {
 	provider := newAccount(t, pool, "already-p@example.com", "+61400000626", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	svc := NewService(staticJobs{move: JobAlreadyDriverAssigned}, testAwards{})
+	svc := NewService(staticJobs{move: JobAlreadyInStatus}, testAwards{}, testClock())
 
 	assignment, created, err := assign(t, pool, svc, provider, jobID, Nomination{
 		DriverName:   "Sam Patel",
@@ -596,17 +654,20 @@ func TestAJobAlreadyDriverAssignedKeepsTheNewDriver(t *testing.T) {
 
 // TestNewServiceRefusesAMissingCollaborator.
 //
-// Both ports are load-bearing rules rather than conveniences: without Awards nobody is checked, and
-// without Jobs the job never moves. A service that started without either would fail silently, in
-// production, at the first assignment.
+// All three are load-bearing rules rather than conveniences: without Awards nobody is checked,
+// without Jobs the job never moves, and without a clock a milestone recorded with no actor-supplied
+// time has nothing to be stamped from. A service that started without any of them would fail
+// silently, in production, at the first request.
 func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		jobs   Jobs
 		awards Awards
+		clk    clock.Clock
 	}{
-		{name: "no job lifecycle", jobs: nil, awards: testAwards{}},
-		{name: "no award lookup", jobs: staticJobs{move: JobMoved}, awards: nil},
+		{name: "no job lifecycle", jobs: nil, awards: testAwards{}, clk: testClock()},
+		{name: "no award lookup", jobs: staticJobs{move: JobMoved}, awards: nil, clk: testClock()},
+		{name: "no clock", jobs: staticJobs{move: JobMoved}, awards: testAwards{}, clk: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer func() {
@@ -614,7 +675,7 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 					t.Error("NewService returned a service that cannot work")
 				}
 			}()
-			NewService(tc.jobs, tc.awards)
+			NewService(tc.jobs, tc.awards, tc.clk)
 		})
 	}
 }

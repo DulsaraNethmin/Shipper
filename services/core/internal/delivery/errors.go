@@ -55,13 +55,65 @@ var (
 	// same driver is absorbed rather than refused — see [Service.AssignDriver].
 	ErrDriverAlreadyAssigned = errors.New("delivery: this job already has a driver")
 
-	// ErrNotInTransaction means AssignDriver was handed a connection pool rather than a
-	// transaction.
+	// ErrNotInTransaction means a service method that writes two tables was handed a connection
+	// pool rather than a transaction.
 	//
 	// Checked here rather than left to the database, even though the status guard would refuse
-	// the transition on its own (000402's setting is transaction-local): by then the assignment
-	// row would have committed alone, leaving a driver on a job that never moved.
-	ErrNotInTransaction = errors.New("delivery: an assignment must run inside a transaction")
+	// the transition on its own (000402's setting is transaction-local): by then the first row
+	// would have committed alone, leaving a driver on a job that never moved, or a milestone on a
+	// delivery whose status disagrees with it.
+	ErrNotInTransaction = errors.New("delivery: this must run inside a transaction")
+
+	// ErrNoIdempotencyKey means a milestone was offered with no key to record it against.
+	//
+	// SHIP-15's middleware refuses a state-changing request without one, so this is unreachable
+	// through the served route. It is checked anyway, because uq_milestones_idempotency is
+	// *partial*: a row with a NULL key falls outside the index, and the one thing SHIP-111
+	// promises — once per key — would be absent rather than broken. A guarantee that can be
+	// removed by omitting a header is one this domain should refuse to write without.
+	ErrNoIdempotencyKey = errors.New("delivery: a milestone must carry the key it was recorded under")
+
+	// ErrIdempotencyKeyReused means the key has already recorded a different milestone on this
+	// job.
+	//
+	// The database's version of the fingerprint check httpx.Idempotent makes in Redis, and it
+	// answers with the same code. Replaying the first milestone would tell a client that
+	// something it never sent had been recorded; recording the second under the same key would
+	// make "once per key" false.
+	ErrIdempotencyKeyReused = errors.New("delivery: that idempotency key already recorded a different milestone")
+
+	// ErrProofRequired means a delivery was recorded with nothing to show for it.
+	//
+	// CLAUDE.md states the invariant and Docs/01 §4.4 decides it: "a job cannot be recorded as
+	// Delivered without photo proof, except through the exception path". Neither the proof
+	// (SHIP-114, SHIP-115) nor the exception (SHIP-116) can be captured yet, so **every**
+	// 'Delivered' is refused here for now — which is the only answer that does not leave a job at
+	// Delivered with neither.
+	//
+	// **SHIP-118 is the ticket that narrows this**, from "always" to "when the job has neither
+	// proof nor a recorded exception". The sentinel, the code and the message already say what
+	// that ticket needs to say; what changes is the condition in front of them.
+	ErrProofRequired = errors.New("delivery: a delivery needs photo proof or a recorded exception")
+
+	// ErrMilestoneNotPermitted means Docs/02 §2 has no transition from where the job stands to
+	// where this milestone would put it.
+	//
+	// **This is the interim answer to a case Docs/02 §3.1 says must not be an error.** A queued
+	// update that arrives after a later one "must be absorbed, not rejected" — the row kept, the
+	// job left alone — and that absorption is SHIP-112, a five-point ticket of its own. Until it
+	// lands the milestone rolls back with its transaction and the client is told the job has
+	// moved on, which at least does not lose the driver's work silently: the device still holds
+	// it and shows it as pending (Docs/02 §3.1).
+	ErrMilestoneNotPermitted = errors.New("delivery: this milestone cannot be recorded from the job's current status")
+
+	// ErrMilestoneVanished means the unique index refused a duplicate and no row exists for the
+	// key that caused it.
+	//
+	// Nothing in the platform can produce this: `milestones` is append-only, has no DELETE path,
+	// and the row that caused the conflict is committed by the time the conflict is visible. It
+	// is here so that an impossible state becomes a 500 with a cause in the log rather than a
+	// reply that invents an answer.
+	ErrMilestoneVanished = errors.New("delivery: a milestone was refused as a duplicate of a row that is not there")
 
 	// ErrJobMoveUnrecognised means the [Jobs] port answered with a [JobMove] this domain has no
 	// case for.
@@ -78,10 +130,13 @@ var (
 // describes them and cmd/api's uniqueness test can see them. Named <domain>_<condition>, which is
 // what stops two domains meaning different things by one string.
 //
-// There are deliberately two. A malformed mobile number is `validation_failed` with details, a job
-// that is not the caller's is `not_found`, and a missing idempotency key is the middleware's
-// business. A domain code earns its place only where a client would otherwise have to parse a
-// message to know what to do — and these two lead to two different screens.
+// There are deliberately four, and the list is short for a reason. A malformed mobile number is
+// `validation_failed` with details, a job that is not the caller's is `not_found`, and a repeated
+// idempotency key is the protocol's own `idempotency_key_reused` rather than a delivery code — the
+// database enforces it here (000602) and the middleware enforces it in Redis, and a client that had
+// to tell the two apart would be branching on where the platform happened to catch it. A domain code
+// earns its place only where a client would otherwise parse a message to know what to do, and each
+// of these four leads to a different screen.
 var (
 	// CodeJobNotAssignable is returned when the job is in no status a driver can be assigned
 	// from.
@@ -101,4 +156,30 @@ var (
 	// app guessing which of the two states it is in.
 	CodeDriverAlreadyAssigned = httpx.RegisterCode("delivery_driver_already_assigned",
 		"This job already has a driver. Reload it to see who is carrying it.")
+
+	// CodeMilestoneNotPermitted is returned when the job has moved past the milestone being
+	// recorded, or has not reached the point where it makes sense.
+	//
+	// 409 rather than 422: the value is a perfectly good milestone and the request contradicts
+	// the state the job is in. It is a distinct code from delivery_job_not_assignable because the
+	// screens differ — the app reloads the delivery and shows what it can record *now*, which for
+	// a job already 'In transit' is not the same list.
+	//
+	// **The client that gets this must keep the update rather than discard it.** Docs/02 §3.1 has
+	// the platform absorbing it instead of refusing, and SHIP-112 is what makes that true; a
+	// client that deletes the driver's work on a 409 will lose real records on the day this
+	// answer stops being sent.
+	CodeMilestoneNotPermitted = httpx.RegisterCode("delivery_milestone_not_permitted",
+		"This milestone cannot be recorded from the job's current status. Reload the delivery to "+
+			"see what it is, and keep the update — a late one will be absorbed rather than refused "+
+			"once SHIP-112 lands.")
+
+	// CodeProofRequired is returned when a delivery is recorded with no proof and no exception.
+	//
+	// A code of its own because it leads somewhere specific: the camera, or the exception path
+	// beside it (Docs/01 §4.4). What a client must never do with it is offer "try again", which
+	// is what a generic conflict would suggest.
+	CodeProofRequired = httpx.RegisterCode("delivery_proof_required",
+		"A delivery is recorded with photo proof, or with a reason why there is none. Capturing "+
+			"either is not built yet, so 'delivered' cannot be recorded through this endpoint.")
 )

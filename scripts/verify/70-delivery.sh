@@ -250,3 +250,199 @@ ok "the transition guard refuses the move, and the endpoint says which of the tw
   "select count(*) from driver_assignments where job_id = '$delivery_draft_job';")" == "0" ]] \
   || fail "an assignment row survived a refused transition"
 ok "and the assignment rolled back with it — a driver on a job that never moved cannot happen"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-111  POST /v1/jobs/{id}/milestones records a milestone once per idempotency key"
+
+# # This section is where the two idempotency mechanisms are told apart
+#
+# Everything below runs against the built binary with SHIP-15's middleware in front of it, which
+# is the only place the difference between "Redis replayed the response" and "the database refused
+# the row" is observable. The middleware sets `Idempotency-Replayed: true` when it answers from
+# its own store; the checks read that header, and one of them deletes the Redis entry first so
+# that the request reaches the handler exactly as it would after a TTL expiry — a phone out of
+# signal for a day outlives any TTL worth setting, and that is the case the ticket exists for.
+#
+# Nothing here reads the outbox or Kafka, so no fence is needed. The transitions below do write
+# outbox rows, and a later section running cmd/worker will publish them, which is correct.
+
+milestone_job="$(delivery_awarded_job milestones)"
+milestone_key="verify-ms-$$"
+
+# milestone_request <token> <key> <body> <name> — one recording, keeping the response headers.
+#
+# The headers are the point: `Idempotency-Replayed` is how a check says *which* mechanism
+# answered, and asserting on the status alone could not tell the two apart.
+milestone_request() {
+  curl -s -X POST -o "$WORKDIR/ms-$4.json" -D "$WORKDIR/ms-$4.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$3" \
+    "http://localhost:$VERIFY_PORT/v1/jobs/$milestone_job/milestones"
+}
+
+# replayed_from_redis <name> — whether the middleware answered that request from its store.
+replayed_from_redis() {
+  grep -qi '^idempotency-replayed: true' "$WORKDIR/ms-$1.headers"
+}
+
+# forget_the_cached_response <key> — delete the middleware's entry, as a TTL expiry would.
+#
+# The key is namespaced by the authenticated subject (SHIP-44), which is what stops one client
+# reading another's stored response.
+forget_the_cached_response() {
+  redis-cli -u "$REDIS_URL" del "idem:v1:user:$delivery_provider_id:$1" >/dev/null
+}
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: $milestone_key-anon" -H 'Content-Type: application/json' \
+  -d '{"milestone":"en_route_to_pickup"}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$milestone_job/milestones")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/ms-anon.json"; fail "an unauthenticated recording returned $status, want 401"; }
+ok "it cannot be reached without a credential"
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H 'Content-Type: application/json' \
+  -d '{"milestone":"en_route_to_pickup"}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$milestone_job/milestones")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/ms-nokey.json"; fail "a recording with no Idempotency-Key returned $status, want 400"; }
+ok "and not without an Idempotency-Key — the key is what the row is recorded under, not just how the retry is absorbed"
+
+# --- who may record: Docs/02 §3 names three, and only one of them can present a credential ---
+
+status="$(milestone_request "$delivery_other_token" "$milestone_key-stranger" \
+  '{"milestone":"en_route_to_pickup"}' stranger)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/ms-stranger.json"; fail "another provider recorded a milestone: $status"; }
+ok "a provider who did not win the job gets the answer a missing job gets"
+
+status="$(milestone_request "$delivery_customer_token" "$milestone_key-customer" \
+  '{"milestone":"en_route_to_pickup"}' customer)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/ms-customer.json"; fail "the job's own customer recorded a milestone: $status"; }
+[[ "$(json "$WORKDIR/ms-customer.json" '["error"]["code"]')" == "not_found" ]] \
+  || { cat "$WORKDIR/ms-customer.json"; fail "expected code=not_found"; }
+ok "and so does the customer who owns the job — Docs/02 §3 permits the provider, their driver and an administrator, and a customer is none of them"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "0" ]] \
+  || fail "a caller with no right to record anything wrote a row"
+ok "neither refusal left a row behind"
+
+# --- the recording itself, with the actor's clock ninety minutes behind the platform's ---
+
+milestone_recorded_at="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select to_char((now() at time zone 'utc') - interval '90 minutes', 'YYYY-MM-DD\"T\"HH24:MI:SS') || 'Z';")"
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key" \
+  "{\"milestone\":\"en_route_to_pickup\",\"recorded_at\":\"$milestone_recorded_at\",\"reason\":\"  gate   locked \"}" first)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-first.json"; fail "recording a milestone returned $status, want 201"; }
+milestone_id="$(json "$WORKDIR/ms-first.json" '["id"]')"
+[[ "$milestone_id" =~ ^[0-9a-f-]{36}$ ]] || fail "the response carries no milestone id"
+[[ "$(json "$WORKDIR/ms-first.json" '["milestone"]')" == "en_route_to_pickup" ]] \
+  || fail "the milestone came back as $(json "$WORKDIR/ms-first.json" '["milestone"]'), want the lower snake case wire form"
+[[ "$(json "$WORKDIR/ms-first.json" '["recorded_by"]')" == "provider" ]] \
+  || fail "recorded_by is $(json "$WORKDIR/ms-first.json" '["recorded_by"]'), want provider"
+[[ "$(json "$WORKDIR/ms-first.json" '["reason"]')" == "gate locked" ]] \
+  || fail "the reason was not collapsed: $(json "$WORKDIR/ms-first.json" '["reason"]')"
+ok "the awarded provider records a milestone, and it comes back in the wire vocabulary"
+
+# The two clocks, read from the columns rather than from the response. The actor's is what was
+# sent, uncorrected; the platform's is the row's arrival.
+milestone_clocks="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (actor_recorded_at = '$milestone_recorded_at'::timestamptz) || ' ' || (server_recorded_at > actor_recorded_at)
+     from milestones where id = '$milestone_id';")"
+[[ "$milestone_clocks" == "true true" ]] \
+  || fail "the two clocks are '$milestone_clocks', want 'true true' — the actor's time was corrected or the two were collapsed"
+ok "the actor's clock is stored exactly as sent and the platform's is ninety minutes later — two columns, never one (Docs/02 §3.1)"
+
+milestone_history="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select h.from_status || '->' || h.to_status || ' ' || (h.actor_recorded_at = '$milestone_recorded_at'::timestamptz)
+     from job_status_history h
+    where h.job_id = '$milestone_job' and h.to_status = 'En route to pickup';")"
+[[ "$milestone_history" == "Awarded->En route to pickup true" ]] \
+  || fail "the recorded transition is '$milestone_history', want 'Awarded->En route to pickup true'"
+ok "the job moved through the guard, and the transition carries the same actor claim as the milestone"
+
+# --- the retry, twice, through each mechanism in turn ---
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key" \
+  "{\"milestone\":\"en_route_to_pickup\",\"recorded_at\":\"$milestone_recorded_at\",\"reason\":\"  gate   locked \"}" replay)"
+# **201, not 200, and the difference is the whole point of this pair of checks.** The middleware
+# replays the stored response *verbatim*, status included, so a retry it absorbs is
+# indistinguishable from the original — that is what makes it cheap. The check below it is the
+# same request answered by the handler, which knows it is a retry and says 200.
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-replay.json"; fail "the immediate retry returned $status, want the stored 201 replayed"; }
+replayed_from_redis replay || fail "the immediate retry was not replayed by the middleware, so the cheap path is not working"
+[[ "$(json "$WORKDIR/ms-replay.json" '["id"]')" == "$milestone_id" ]] \
+  || fail "the replay answered with a different milestone"
+ok "the same key immediately after replays the stored 201 from Redis, byte for byte — the handler is never reached"
+
+# The entry is deleted, which is what a TTL expiry, an eviction or a failover looks like from the
+# handler's side. **This is the check the ticket turns on**: the request now runs for a second
+# time, all the way to the table, and must still record nothing.
+forget_the_cached_response "$milestone_key"
+status="$(milestone_request "$delivery_provider_token" "$milestone_key" \
+  "{\"milestone\":\"en_route_to_pickup\",\"recorded_at\":\"$milestone_recorded_at\",\"reason\":\"  gate   locked \"}" expired)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/ms-expired.json"; fail "the retry after the cached response expired returned $status, want 200"; }
+! replayed_from_redis expired || fail "the entry was deleted and the middleware still replayed; this check is proving nothing"
+[[ "$(json "$WORKDIR/ms-expired.json" '["id"]')" == "$milestone_id" ]] \
+  || fail "the retry recorded a second milestone: $(json "$WORKDIR/ms-expired.json" '["id"]') is not $milestone_id"
+ok "with the cached response gone the request runs again, reaches the table, and is answered from the row it already wrote"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "1" ]] \
+  || fail "one key recorded more than one milestone"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$milestone_job' and to_status = 'En route to pickup';")" == "1" ]] \
+  || fail "the retry moved the job a second time"
+ok "one key, three requests, one milestone and one transition — which is Redis for the first retry and uq_milestones_idempotency for the second"
+
+# A key that recorded something else. The middleware refuses this on its fingerprint while its
+# entry lives, so the entry is deleted first and the *database* is what answers — with the same
+# code, deliberately: a client should not have to know which layer caught it.
+forget_the_cached_response "$milestone_key"
+status="$(milestone_request "$delivery_provider_token" "$milestone_key" '{"milestone":"picked_up"}' reused)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-reused.json"; fail "a key reused for another milestone returned $status, want 409"; }
+[[ "$(json "$WORKDIR/ms-reused.json" '["error"]["code"]')" == "idempotency_key_reused" ]] \
+  || { cat "$WORKDIR/ms-reused.json"; fail "expected code=idempotency_key_reused"; }
+ok "the same key against a different milestone is refused by the index, with the code the middleware would have used"
+
+# --- a repeat that is not a retry ---
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-again" \
+  '{"milestone":"en_route_to_pickup","reason":"nobody at the gate, returning at four"}' again)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-again.json"; fail "recording the same milestone under a new key returned $status, want 201"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "2" ]] \
+  || fail "a second recording under a new key was absorbed as a retry"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$milestone_job' and to_status = 'En route to pickup';")" == "1" ]] \
+  || fail "the second recording moved the job again"
+ok "a failed pickup attempt recorded again under a new key is a second row and no second transition (Docs/02 §5)"
+
+# --- the rest of the delivery, and the two milestones this endpoint will not record ---
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-pickup" '{"milestone":"picked_up"}' pickup)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-pickup.json"; fail "recording picked_up returned $status"; }
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-transit" '{"milestone":"in_transit"}' transit)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-transit.json"; fail "recording in_transit returned $status"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$milestone_job';")" == "In transit" ]] \
+  || fail "the job did not follow its milestones"
+ok "the delivery runs through its milestones, each one a named move on the port rather than a status the domain chose"
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-delivered" '{"milestone":"delivered"}' delivered)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-delivered.json"; fail "delivered returned $status, want 409"; }
+[[ "$(json "$WORKDIR/ms-delivered.json" '["error"]["code"]')" == "delivery_proof_required" ]] \
+  || { cat "$WORKDIR/ms-delivered.json"; fail "expected code=delivery_proof_required"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$milestone_job';")" == "In transit" ]] \
+  || fail "a job reached Delivered with neither proof nor a recorded exception"
+ok "delivered is refused while nothing can prove it — the invariant holds without SHIP-118, which narrows the refusal rather than adding it"
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-late" '{"milestone":"en_route_to_pickup"}' late)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-late.json"; fail "a milestone the job has moved past returned $status, want 409"; }
+[[ "$(json "$WORKDIR/ms-late.json" '["error"]["code"]')" == "delivery_milestone_not_permitted" ]] \
+  || { cat "$WORKDIR/ms-late.json"; fail "expected code=delivery_milestone_not_permitted"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "4" ]] \
+  || fail "the refused recording left a row behind; SHIP-112 keeps it deliberately, and until then the transaction must not"
+ok "a milestone the job has moved past is refused and rolls back whole — SHIP-112 is the ticket that absorbs it instead"
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-assigned" '{"milestone":"driver_assigned"}' assigned)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/ms-assigned.json"; fail "driver_assigned returned $status, want 422"; }
+[[ "$(json "$WORKDIR/ms-assigned.json" '["error"]["details"][0]["field"]')" == "milestone" ]] \
+  || { cat "$WORKDIR/ms-assigned.json"; fail "the refusal does not name the milestone field"; }
+ok "driver_assigned is refused here — it has an endpoint of its own, and nothing writes it to this table"

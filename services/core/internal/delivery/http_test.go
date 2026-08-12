@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -40,6 +41,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs/{id}/driver", handler.AssignDriver())
+	mux.Handle("POST /v1/jobs/{id}/milestones", handler.RecordMilestone())
 	return mux
 }
 
@@ -321,6 +323,282 @@ func TestNoDriverIsRecordedWhenTheJobCannotMove(t *testing.T) {
 	}
 	if rows != 0 {
 		t.Errorf("%d assignment rows survived a refused transition, want 0", rows)
+	}
+}
+
+// The wire contract of SHIP-111.
+//
+// **These run without the idempotency middleware in front of them**, which is deliberate and is the
+// case worth testing: the middleware belongs to cmd/api, it replays from Redis, and every retry it
+// absorbs is one this handler never sees. What is left when it cannot absorb one — the entry expired,
+// the cache was flushed, two instances — is the handler answering from the record, which is what the
+// 200 below is.
+
+// recordAs sends a milestone recording on behalf of an authenticated caller, under a named key.
+//
+// The key is an argument rather than generated, because the tests that matter are the ones where two
+// requests share one: passing it explicitly makes a shared key visible in the test rather than
+// implied by a helper.
+func recordAs(t *testing.T, h http.Handler, caller uuid.UUID, jobID uuid.UUID, key, body string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, milestonesPath(jobID), strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	req = req.WithContext(authctx.WithSubject(req.Context(), authctx.Subject{
+		UserID:    caller.String(),
+		Role:      authctx.RoleCustomer,
+		SessionID: uuid.Must(uuid.NewV7()).String(),
+	}))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// milestonesPath is the route as cmd/api serves it.
+func milestonesPath(jobID uuid.UUID) string { return "/v1/jobs/" + jobID.String() + "/milestones" }
+
+type milestoneBody struct {
+	ID         string `json:"id"`
+	JobID      string `json:"job_id"`
+	Milestone  string `json:"milestone"`
+	RecordedBy string `json:"recorded_by"`
+	Reason     string `json:"reason"`
+	RecordedAt string `json:"recorded_at"`
+	AcceptedAt string `json:"accepted_at"`
+}
+
+// TestTheMilestoneEndpointAnswersWithWhatItRecorded is SHIP-111 at the wire.
+func TestTheMilestoneEndpointAnswersWithWhatItRecorded(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	customer := newAccount(t, pool, "http-ms-c@example.com", "+61400000700", "customer")
+	provider := newAccount(t, pool, "http-ms-p@example.com", "+61400000701", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+
+	rec := recordAs(t, router, provider, jobID, theKey,
+		`{"milestone": "en_route_to_pickup", "recorded_at": "2026-08-12T02:00:00Z", "reason": "on the road"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (%s)", rec.Code, rec.Body)
+	}
+
+	body := decode[milestoneBody](t, rec)
+	switch {
+	case body.ID == "":
+		t.Error("the response carries no milestone id")
+	case body.JobID != jobID.String():
+		t.Errorf("job_id = %q, want %s", body.JobID, jobID)
+	case body.Milestone != "en_route_to_pickup":
+		t.Errorf("milestone = %q, want the lower snake case wire form (Docs/10 §4.7)", body.Milestone)
+	case body.RecordedBy != "provider":
+		t.Errorf("recorded_by = %q, want provider", body.RecordedBy)
+	case body.Reason != "on the road":
+		t.Errorf("reason = %q", body.Reason)
+	case body.RecordedAt != "2026-08-12T02:00:00.000Z":
+		t.Errorf("recorded_at = %q, want the time the client sent, uncorrected", body.RecordedAt)
+	case body.AcceptedAt == "" || body.AcceptedAt == body.RecordedAt:
+		t.Errorf("accepted_at = %q; it is the platform's clock and must not be the actor's", body.AcceptedAt)
+	}
+
+	// The job's status is not echoed, for the reason the assignment response gives — and here
+	// there is a second: a milestone may deliberately move nothing at all.
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("the response is not JSON: %v", err)
+	}
+	if _, present := raw["status"]; present {
+		t.Error("the response carries a job status, which is the jobs domain's to serialise")
+	}
+}
+
+// TestARetriedMilestoneAnswers200WithTheOriginal is the retry path at the wire.
+//
+// The same key twice, both reaching the handler. The second must answer with the first milestone and
+// must not have recorded another, which is the whole of the ticket seen from a client.
+func TestARetriedMilestoneAnswers200WithTheOriginal(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	customer := newAccount(t, pool, "http-retry-c@example.com", "+61400000702", "customer")
+	provider := newAccount(t, pool, "http-retry-p@example.com", "+61400000703", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+
+	body := `{"milestone": "en_route_to_pickup"}`
+
+	first := recordAs(t, router, provider, jobID, theKey, body)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("the first call = %d, want 201 (%s)", first.Code, first.Body)
+	}
+
+	second := recordAs(t, router, provider, jobID, theKey, body)
+	if second.Code != http.StatusOK {
+		t.Fatalf("the retry = %d, want 200 (%s)", second.Code, second.Body)
+	}
+	if decode[milestoneBody](t, second).ID != decode[milestoneBody](t, first).ID {
+		t.Error("the retry answered with a different milestone")
+	}
+	if n := milestoneCount(t, pool, jobID); n != 1 {
+		t.Errorf("%d milestone rows after one action retried once, want 1", n)
+	}
+}
+
+// TestTheMilestoneWireRefusals covers every failure a client can produce, and the code each carries.
+func TestTheMilestoneWireRefusals(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	customer := newAccount(t, pool, "http-msx-c@example.com", "+61400000704", "customer")
+	provider := newAccount(t, pool, "http-msx-p@example.com", "+61400000705", "provider")
+	stranger := newAccount(t, pool, "http-msx-x@example.com", "+61400000706", "provider")
+
+	awarded := awardedJob(t, pool, customer, provider)
+	inTransit := awardedJob(t, pool, customer, provider)
+	moveJob(t, pool, inTransit, jobs.User(jobs.ActorProvider, provider),
+		jobs.StatusEnRouteToPickup, jobs.StatusPickedUp, jobs.StatusInTransit)
+
+	// One key that has already recorded something, so the reuse refusal has something to collide
+	// with. It is spent on `awarded`, which the cases below then leave at En route to pickup.
+	if rec := recordAs(t, router, provider, awarded, "spent-"+theKey,
+		`{"milestone": "en_route_to_pickup"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("setting up the spent key: %d (%s)", rec.Code, rec.Body)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		caller uuid.UUID
+		job    uuid.UUID
+		key    string
+		body   string
+		status int
+		code   string
+		field  string
+	}{
+		{
+			name:   "another provider's job is not found",
+			caller: stranger, job: awarded, key: theKey + "-stranger",
+			body:   `{"milestone": "picked_up"}`,
+			status: http.StatusNotFound, code: "not_found",
+		},
+		{
+			name:   "the job's own customer is refused the same way",
+			caller: customer, job: awarded, key: theKey + "-customer",
+			body:   `{"milestone": "picked_up"}`,
+			status: http.StatusNotFound, code: "not_found",
+		},
+		{
+			name:   "a job that does not exist is the same answer",
+			caller: provider, job: uuid.Must(uuid.NewV7()), key: theKey + "-nojob",
+			body:   `{"milestone": "picked_up"}`,
+			status: http.StatusNotFound, code: "not_found",
+		},
+		{
+			name:   "no idempotency key at all",
+			caller: provider, job: awarded, key: "",
+			body:   `{"milestone": "picked_up"}`,
+			status: http.StatusBadRequest, code: "idempotency_key_required",
+		},
+		{
+			name:   "a key that recorded something else",
+			caller: provider, job: awarded, key: "spent-" + theKey,
+			body:   `{"milestone": "picked_up"}`,
+			status: http.StatusConflict, code: "idempotency_key_reused",
+		},
+		{
+			name:   "a milestone the job has moved past",
+			caller: provider, job: inTransit, key: theKey + "-late",
+			body:   `{"milestone": "en_route_to_pickup"}`,
+			status: http.StatusConflict, code: "delivery_milestone_not_permitted",
+		},
+		{
+			name:   "delivered, while nothing can prove it",
+			caller: provider, job: inTransit, key: theKey + "-delivered",
+			body:   `{"milestone": "delivered"}`,
+			status: http.StatusConflict, code: "delivery_proof_required",
+		},
+		{
+			name:   "the stored form is not the wire form",
+			caller: provider, job: awarded, key: theKey + "-stored",
+			body:   `{"milestone": "Picked up"}`,
+			status: 422, code: "validation_failed", field: "milestone",
+		},
+		{
+			name:   "a milestone nobody has heard of",
+			caller: provider, job: awarded, key: theKey + "-unknown",
+			body:   `{"milestone": "unloaded"}`,
+			status: 422, code: "validation_failed", field: "milestone",
+		},
+		{
+			name:   "no milestone at all",
+			caller: provider, job: awarded, key: theKey + "-none",
+			body:   `{}`,
+			status: 422, code: "validation_failed", field: "milestone",
+		},
+		{
+			name:   "driver assigned has an endpoint of its own",
+			caller: provider, job: awarded, key: theKey + "-assigned",
+			body:   `{"milestone": "driver_assigned"}`,
+			status: 422, code: "validation_failed", field: "milestone",
+		},
+		{
+			name:   "a recorded_at that is not a timestamp",
+			caller: provider, job: awarded, key: theKey + "-time",
+			body:   `{"milestone": "picked_up", "recorded_at": "yesterday"}`,
+			status: 422, code: "validation_failed", field: "recorded_at",
+		},
+		{
+			name:   "an unknown field is a client typo rather than something to ignore",
+			caller: provider, job: awarded, key: theKey + "-typo",
+			body:   `{"milestone": "picked_up", "photo": "x"}`,
+			status: http.StatusBadRequest, code: "bad_request",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := recordAs(t, router, tc.caller, tc.job, tc.key, tc.body)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tc.status, rec.Body)
+			}
+
+			envelope := decode[errorEnvelope](t, rec)
+			if envelope.Error.Code != tc.code {
+				t.Errorf("error.code = %q, want %q", envelope.Error.Code, tc.code)
+			}
+			if tc.field == "" {
+				return
+			}
+			for _, d := range envelope.Error.Details {
+				if d.Field == tc.field {
+					return
+				}
+			}
+			t.Errorf("no detail about %s: %s", tc.field, rec.Body)
+		})
+	}
+
+	// Nothing above should have written a row beyond the one that set the spent key up, and the
+	// two jobs should be where they were.
+	if n := milestoneCount(t, pool, awarded); n != 1 {
+		t.Errorf("%d milestones on the awarded job, want the 1 that set up the spent key", n)
+	}
+	if n := milestoneCount(t, pool, inTransit); n != 0 {
+		t.Errorf("%d milestones survived on the in-transit job, want 0", n)
+	}
+	if got := jobStatus(t, pool, inTransit); got != string(jobs.StatusInTransit) {
+		t.Errorf("the in-transit job is %q; a refused recording moved it", got)
+	}
+}
+
+// TestTheMilestoneEndpointAnswers503WithNoDatabase.
+func TestTheMilestoneEndpointAnswers503WithNoDatabase(t *testing.T) {
+	router := newTestRouter(t, nil)
+
+	rec := recordAs(t, router, uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), theKey,
+		`{"milestone": "picked_up"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
 	}
 }
 

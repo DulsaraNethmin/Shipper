@@ -114,6 +114,114 @@ func (postgresStore) liveAssignment(ctx context.Context, r db.Runner, jobID uuid
 	return a, true, nil
 }
 
+// milestoneColumns is every column of a milestone, in the order [scanMilestone] reads them.
+//
+// server_recorded_at is selected and never written. 000601's trigger raises on an INSERT that names
+// it, which is not a rule this file has to remember: there is no statement below that could.
+const milestoneColumns = `
+	id, job_id, milestone, actor_type, actor_id, reason, idempotency_key,
+	actor_recorded_at, server_recorded_at`
+
+// scanMilestone reads one row of [milestoneColumns].
+func scanMilestone(row pgx.Row) (Record, error) {
+	var (
+		rec     Record
+		actorID *uuid.UUID
+		reason  *string
+		key     *string
+	)
+
+	if err := row.Scan(
+		&rec.ID, &rec.JobID, &rec.Milestone, &rec.Actor, &actorID, &reason, &key,
+		&rec.ActorRecordedAt, &rec.ServerRecordedAt,
+	); err != nil {
+		return Record{}, err
+	}
+
+	// Three nullable columns, and each null means something the zero value says just as well:
+	// nobody (the platform acting alone), no reason given, and no request behind the row.
+	if actorID != nil {
+		rec.ActorID = *actorID
+	}
+	if reason != nil {
+		rec.Reason = *reason
+	}
+	if key != nil {
+		rec.Key = *key
+	}
+	return rec, nil
+}
+
+// insertMilestone records a milestone, or reports that this key already recorded one.
+//
+// # ON CONFLICT DO NOTHING, and every word of that is load-bearing
+//
+// **ON CONFLICT** rather than an insert whose unique violation is caught: a violation aborts the
+// surrounding transaction, and this insert runs inside one that still has a status transition to
+// make. Catching the error would mean unwinding to a savepoint to ask a question the conflict has
+// already answered.
+//
+// **DO NOTHING** rather than DO UPDATE: the table is append-only and 000601's trigger would refuse
+// the update. That is the correct refusal — a retry must return what was recorded, not overwrite it
+// with a second attempt's timestamp.
+//
+// **The index is inferred by its columns and its predicate**, because uq_milestones_idempotency is
+// a partial index and therefore has no constraint name to name. The WHERE clause here is not a
+// filter on rows; it is how PostgreSQL is told which index this statement expects.
+//
+// Under a concurrent duplicate the second statement waits on the first's speculative insertion,
+// then finds the committed row and returns none — which is why the caller's follow-up read is what
+// answers, rather than this returning a partially written row.
+//
+// recorded is false when the key had already recorded something on this job. The existing row is
+// not read here: what to do about it is [Service.RecordMilestone]'s decision.
+func (postgresStore) insertMilestone(ctx context.Context, r db.Runner, rec Record) (Record, bool, error) {
+	const q = `
+		INSERT INTO milestones
+			(id, job_id, milestone, actor_type, actor_id, reason, idempotency_key, actor_recorded_at)
+		VALUES ($1, $2, $3, $4, $5, nullif($6, ''), nullif($7, ''), $8)
+		ON CONFLICT (job_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+		RETURNING ` + milestoneColumns
+
+	created, err := scanMilestone(r.QueryRow(ctx, q,
+		rec.ID, rec.JobID, string(rec.Milestone), string(rec.Actor), rec.ActorID,
+		rec.Reason, rec.Key, rec.ActorRecordedAt))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Record{}, false, nil
+	case err != nil:
+		return Record{}, false, fmt.Errorf("delivery: recording %s on %s: %w",
+			rec.Milestone, rec.JobID, err)
+	}
+	return created, true, nil
+}
+
+// milestoneRecordedBy is what a key already recorded on a job, if anything.
+//
+// Read after [postgresStore.insertMilestone] declines, which is its only caller: at READ COMMITTED
+// each statement takes a fresh snapshot, so a row committed by the request that won a race is
+// visible to this one even though the transaction around it began earlier.
+func (postgresStore) milestoneRecordedBy(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+	key string,
+) (Record, bool, error) {
+	const q = `
+		SELECT ` + milestoneColumns + `
+		FROM milestones
+		WHERE job_id = $1 AND idempotency_key = $2`
+
+	rec, err := scanMilestone(r.QueryRow(ctx, q, jobID, key))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Record{}, false, nil
+	case err != nil:
+		return Record{}, false, fmt.Errorf("delivery: reading what %s recorded on %s: %w", key, jobID, err)
+	}
+	return rec, true, nil
+}
+
 // accountPhone is the caller's own verified mobile, for a self-assignment.
 //
 // Reading `users` from here is the sanctioned kind of cross-table read: the table is in the shared

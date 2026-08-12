@@ -71,3 +71,55 @@ func TestWhatIsNotAMilestone(t *testing.T) {
 		}
 	}
 }
+
+// TestMilestoneWireFormsAreStableAndDistinct pins the five strings a client sends and reads.
+//
+// [delivery.Milestone.Wire] is derived rather than tabulated, so it cannot disagree with the
+// constants — which is the drift worth preventing and not the risk this test covers. **These strings
+// are published.** A client already sending `en_route_to_pickup` cannot have it renamed underneath
+// it, and writing all five out is what makes a change to that function visible as a change to the
+// contract rather than as a passing refactor.
+func TestMilestoneWireFormsAreStableAndDistinct(t *testing.T) {
+	want := map[delivery.Milestone]string{
+		delivery.MilestoneDriverAssigned:  "driver_assigned",
+		delivery.MilestoneEnRouteToPickup: "en_route_to_pickup",
+		delivery.MilestonePickedUp:        "picked_up",
+		delivery.MilestoneInTransit:       "in_transit",
+		delivery.MilestoneDelivered:       "delivered",
+	}
+
+	if len(want) != len(delivery.Milestones) {
+		t.Fatalf("%d wire forms for %d milestones", len(want), len(delivery.Milestones))
+	}
+
+	seen := map[string]delivery.Milestone{}
+	for _, m := range delivery.Milestones {
+		got := m.Wire()
+		if got != want[m] {
+			t.Errorf("%q on the wire is %q, want %q", m, got, want[m])
+		}
+		if first, clash := seen[got]; clash {
+			t.Errorf("%q and %q are both %q on the wire", first, m, got)
+		}
+		seen[got] = m
+
+		back, known := delivery.MilestoneFromWire(got)
+		if !known || back != m {
+			t.Errorf("MilestoneFromWire(%q) = %q, %v; want %q back", got, back, known, m)
+		}
+	}
+}
+
+// TestTheStoredFormIsNotTheWireForm.
+//
+// The two spellings are close enough to be used interchangeably by accident, and reading one where
+// the other is meant is the mistake that produces a milestone the database refuses at insert time
+// rather than a refusal a client can act on.
+func TestTheStoredFormIsNotTheWireForm(t *testing.T) {
+	for _, notWire := range []string{"Picked up", "PICKED_UP", "picked up", "picked-up", ""} {
+		if m, known := delivery.MilestoneFromWire(notWire); known {
+			t.Errorf("MilestoneFromWire(%q) = %q; only the lower snake case form is the wire form "+
+				"(Docs/10 §4.7)", notWire, m)
+		}
+	}
+}

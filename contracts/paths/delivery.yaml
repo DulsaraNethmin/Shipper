@@ -248,3 +248,238 @@ IdempotencyKey:
     type: string
     maxLength: 255
   example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
+
+Milestones:
+  post:
+    operationId: recordMilestone
+    summary: Record a delivery milestone
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Records what happened on a delivery — that the driver has set off, collected the goods, or
+      begun the journey — and moves the job when the lifecycle has a transition for it (SHIP-111).
+
+      Only the provider whose bid the customer accepted may call it. The customer of the job may
+      not: they are shown milestones and confirm the delivery at the end, and neither of those is
+      recording one. A job awarded to somebody else, a job that does not exist, and a job that is
+      the caller's own to watch rather than to drive all answer `404` identically.
+
+      ## The milestone and the job's status are not the same thing
+
+      Four of the five milestone names match a job status and they are still two vocabularies. A
+      milestone is a claim that somebody did something; it is kept whether or not it moves the job,
+      and a delivery that runs to plan produces both. **The response does not echo the job's
+      status** — read the job if you need it.
+
+      `driver_assigned` is recorded by `POST /v1/jobs/{id}/driver` rather than here, and `delivered`
+      needs proof, which cannot be captured yet — see the responses below.
+
+      ## Two clocks, and you must send the first one when they differ
+
+      ```json
+      { "milestone": "picked_up" }
+      { "milestone": "picked_up", "recorded_at": "2026-08-12T06:40:11Z" }
+      ```
+
+      `recorded_at` is **when you acted**, not when you sent this. A device that records a milestone
+      in a yard with no signal and syncs an hour later must send the earlier time: it is what the
+      customer is shown, and the platform does not correct it or refuse it for being implausible.
+      Omitting it means "now", which is right only when you are online at the moment you record.
+
+      The response carries both — `recorded_at` as you sent it, and `accepted_at` as the platform's
+      own clock. They are what makes an offline delivery reconstructable afterwards, so a client
+      that renders only `accepted_at` is showing a sync time as though it were a delivery event.
+
+      ## Recording the same thing twice
+
+      Two different requests, and they are answered differently.
+
+      **A retry** reuses its `Idempotency-Key`. It answers `200` with the milestone the first
+      attempt recorded, and records nothing further — whether the retry arrives a second later or a
+      day later, because the guarantee is a unique index in the database rather than a cached
+      response. Retry as often as a dropped connection requires.
+
+      **A second recording** is a new action with a new key: a driver who reaches a pickup, finds
+      nobody there, and sets off again records `en_route_to_pickup` twice. Both are kept. The job
+      moves once, because after the first it is already there.
+
+      Reusing one key for two *different* milestones is refused with `idempotency_key_reused`. One
+      key per action.
+
+      ## A milestone the job has moved past
+
+      Refused for now with `delivery_milestone_not_permitted`. **Do not discard the update when you
+      get it** — hold it and show it as pending. Docs/02 §3.1 requires a late milestone to be
+      absorbed into the record rather than rejected, and the platform will do that shortly; a client
+      that deletes the driver's work on this answer will lose real records when it stops being sent.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/MilestoneRecording'
+    responses:
+      '201':
+        description: |
+          The milestone is recorded. The job has moved too, unless it was already where this
+          milestone would have put it.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Milestone'
+      '200':
+        description: |
+          This `Idempotency-Key` had already recorded this milestone. Nothing was written and the
+          original is returned — the same shape as `201`, so a client that does not care which
+          happened parses one type.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Milestone'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          One of four, and they lead to four different places:
+
+          | `error.code` | What happened |
+          |---|---|
+          | `delivery_milestone_not_permitted` | The job has moved past this milestone, or has not reached where it makes sense. Keep the update — see above |
+          | `delivery_proof_required` | `delivered` needs photo proof or a recorded exception, and capturing either is not built yet |
+          | `idempotency_key_reused` | This key already recorded a *different* milestone on this job. Generate a new one |
+          | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field, with the JSON path the client sent.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+MilestoneRecording:
+  type: object
+  additionalProperties: false
+  required: [milestone]
+  description: |
+    What you did, and when you did it. Unknown fields are refused, so a client typo fails loudly
+    rather than being silently ignored.
+  properties:
+    milestone:
+      type: string
+      enum: [en_route_to_pickup, picked_up, in_transit, delivered]
+      description: |
+        Which milestone. `driver_assigned` is deliberately absent: a driver is put on a job through
+        `POST /v1/jobs/{id}/driver`, which is a different act with a record of its own.
+
+        `delivered` is accepted by the schema and refused by the platform until proof can be
+        captured (SHIP-114 to SHIP-118). It is listed because it is a real milestone and the client
+        that will send it is being built against this document.
+      example: picked_up
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339, and **your** clock: the moment you acted, not the moment you sent this. Send it
+        whenever the two differ, which is every milestone recorded out of signal. Omit it and the
+        platform uses its own clock, which is correct only when you are online as you record.
+
+        It is not bounded against the present. A device with a wrong clock still recorded something
+        true about work that was done, and discarding the record would lose more than the wrong
+        timestamp costs.
+      example: '2026-08-12T06:40:11Z'
+    reason:
+      type: string
+      maxLength: 500
+      description: |
+        Optional. What a person should know about this milestone that the milestone itself does not
+        say — "nobody at the gate, returning at four". It is kept with the record and shown to
+        support.
+      example: nobody at the gate, returning at four
+
+Milestone:
+  type: object
+  additionalProperties: false
+  required: [id, job_id, milestone, recorded_by, recorded_at, accepted_at]
+  description: |
+    One recorded milestone.
+
+    **The job's status is not here.** A milestone may deliberately move nothing — a second
+    `en_route_to_pickup` after a failed pickup attempt is kept and moves the job nowhere — so a
+    client that read a status from this response would be reading something it does not say.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    milestone:
+      type: string
+      enum: [driver_assigned, en_route_to_pickup, picked_up, in_transit, delivered]
+      example: picked_up
+    recorded_by:
+      type: string
+      enum: [provider, driver, admin, system]
+      description: |
+        What kind of actor recorded it, not who they are. It is `provider` for everything recorded
+        through this endpoint today; the other three arrive with the driver portal, administrative
+        action, and the automatic `picked_up → in_transit` presentation change.
+      example: provider
+    reason:
+      type: string
+      description: Present only when one was given.
+      example: nobody at the gate, returning at four
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        When the actor says they acted, in UTC. **This is what a customer is shown.** It is what was
+        sent, uncorrected.
+      example: '2026-08-12T06:40:11.000Z'
+    accepted_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform received it, in UTC, on the platform's clock. This is what audit and
+        support reason about, and it is later than `recorded_at` by however long the device was out
+        of signal.
+      example: '2026-08-12T09:15:02.481Z'

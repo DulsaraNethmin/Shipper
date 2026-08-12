@@ -5,7 +5,7 @@
 // domains be built at once without touching a shared file. A domain importing internal/httpx is
 // sitting on infrastructure, not crossing a boundary, and the import lint permits it.
 //
-// # This endpoint is called by the provider, not by the driver
+// # These endpoints are called by the provider, not by the driver
 //
 // Worth stating first, because the domain's name invites the opposite assumption. The driver has no
 // account and no session — the portal is link-authenticated (Docs/07 §3) — and the job-scoped token
@@ -29,6 +29,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,6 +38,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
 // Handler serves this domain's routes.
@@ -199,6 +201,199 @@ func (h *Handler) AssignDriver() http.Handler {
 	})
 }
 
+// recordMilestoneRequest is the body of POST /v1/jobs/{id}/milestones.
+//
+//	{"milestone": "picked_up"}
+//	{"milestone": "en_route_to_pickup", "recorded_at": "2026-08-12T06:40:11Z",
+//	 "reason": "gate locked, returning at four"}
+//
+// **`recorded_at` is the actor's clock and the platform does not correct it.** A phone that has been
+// out of signal since dawn sends the time the driver acted, and 000601 stores it beside — never
+// instead of — the time the request arrived. It is deliberately not bounded against now(): refusing
+// an implausible time would discard the record, which is the opposite of what Docs/02 §3.1 asks for.
+//
+// Omitting it means "now", which is what an online client sends. There is no field for the
+// platform's clock and there cannot be — the trigger behind that column raises on an INSERT that
+// names it.
+type recordMilestoneRequest struct {
+	Milestone  string `json:"milestone"`
+	RecordedAt string `json:"recorded_at"`
+	Reason     string `json:"reason"`
+}
+
+// milestoneResponse is one recorded milestone.
+//
+// **Two timestamps, deliberately, named for what they mean rather than for their columns.**
+// `recorded_at` is when the actor says they acted and is what a customer is shown; `accepted_at` is
+// when the platform received it and is what support reasons about. A client that renders only the
+// first is right; a client that renders only the second is showing a sync time as though it were a
+// delivery event.
+//
+// The job's status is not echoed, for the reason [assignmentResponse] gives — it is the jobs
+// endpoints' vocabulary — and here there is a second reason: a milestone may deliberately move
+// nothing at all.
+type milestoneResponse struct {
+	ID    string `json:"id"`
+	JobID string `json:"job_id"`
+
+	Milestone string `json:"milestone"`
+
+	// RecordedBy is the kind of actor rather than who they are. It is `provider` for every row
+	// this endpoint writes today and stops being constant at SHIP-108, when a driver holding a
+	// job-scoped link can record one — which is when a client first needs to tell "you recorded
+	// this" from "your driver did".
+	RecordedBy string `json:"recorded_by"`
+
+	Reason string `json:"reason,omitempty"`
+
+	RecordedAt string `json:"recorded_at"`
+	AcceptedAt string `json:"accepted_at"`
+}
+
+func milestoneFrom(rec Record) milestoneResponse {
+	return milestoneResponse{
+		ID:    rec.ID.String(),
+		JobID: rec.JobID.String(),
+
+		Milestone:  rec.Milestone.Wire(),
+		RecordedBy: string(rec.Actor),
+		Reason:     rec.Reason,
+
+		RecordedAt: timestamp(rec.ActorRecordedAt),
+		AcceptedAt: timestamp(rec.ServerRecordedAt),
+	}
+}
+
+// RecordMilestone handles POST /v1/jobs/{id}/milestones (SHIP-111).
+//
+// A collection under the job, and plural: a delivery accumulates milestones and 000601 refuses none
+// of them for being a repeat. `POST /jobs/{id}/status` would have been the same request under the
+// wrong name — job status is not a settable field, and what a client records here is what somebody
+// did, from which a status move may or may not follow.
+//
+// 201 when a milestone was recorded, 200 when this idempotency key had already recorded it and
+// nothing was written. Both carry the same shape.
+//
+// # The 200 is the ticket, not a nicety
+//
+// SHIP-15's middleware replays the stored response for a repeated key and this handler is never
+// reached — while the entry lives. The path that matters is the one after it expires or is evicted:
+// the handler runs again, the unique index refuses the second row, and this answers with the
+// milestone the first attempt recorded. A driver's phone reconnecting after a day in a valley takes
+// that path, and it is the only reason "records a milestone once per idempotency key" is true of the
+// platform rather than of its cache.
+func (h *Handler) RecordMilestone() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req recordMilestoneRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		recording, err := recordingFrom(req, r.Header.Get(httpx.HeaderIdempotencyKey))
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var (
+			record   Record
+			recorded bool
+		)
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			record, recorded, err = h.svc.RecordMilestone(ctx, runner, providerID, jobID, recording)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		if !recorded {
+			// Logged because it is the signal that the middleware's entry had gone and the
+			// database caught the retry instead. That is the mechanism working, and it is
+			// otherwise invisible: the response is indistinguishable from an ordinary one.
+			httpx.LoggerFrom(r.Context()).Info("a milestone retry was answered from the record rather than recorded again",
+				slog.String("job_id", jobID.String()),
+				slog.String("milestone", record.Milestone.Wire()),
+				slog.String("milestone_id", record.ID.String()))
+
+			httpx.WriteJSON(w, http.StatusOK, milestoneFrom(record))
+			return nil
+		}
+
+		httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+		return nil
+	})
+}
+
+// recordingFrom turns the request body and the idempotency header into what the domain takes.
+//
+// Both failures it reports are failures to *read* the request rather than to validate it, which is
+// why they are here and not in [Recording.problems]: neither an unrecognised milestone nor a
+// timestamp that is not one leaves a value the domain could be given to judge.
+//
+// The wire form is translated in this direction only. `Picked up` sent verbatim is refused like any
+// other unknown string — a client that sent the stored form has misread the contract, and accepting
+// both spellings would make two forms interchangeable in one direction and not the other.
+//
+// The key is read from the header rather than from the body. It identifies the *request*, and a
+// client able to put a different value in each would have two answers to which one a milestone was
+// recorded under.
+func recordingFrom(req recordMilestoneRequest, key string) (Recording, error) {
+	var problems validate.Errors
+
+	var milestone Milestone
+	parsed, known := MilestoneFromWire(req.Milestone)
+	switch {
+	case req.Milestone == "":
+		// Left as the zero value so the domain's Required check reports it. A client that
+		// sent nothing should be told the field is required, not that "" is not a milestone.
+
+	case known:
+		milestone = parsed
+
+	default:
+		problems.Add("milestone", validate.CodeInvalid,
+			"That is not a milestone. Use one of %s.", strings.Join(recordableWire(), ", "))
+	}
+
+	var recordedAt time.Time
+	if req.RecordedAt != "" {
+		parsed, err := time.Parse(time.RFC3339, req.RecordedAt)
+		if err != nil {
+			problems.Add("recorded_at", validate.CodeInvalid,
+				"Send the time you recorded this as RFC 3339, like 2026-08-12T06:40:11Z.")
+		} else {
+			recordedAt = parsed
+		}
+	}
+
+	if err := problems.Err(); err != nil {
+		return Recording{}, err
+	}
+
+	return Recording{
+		Milestone:  milestone,
+		RecordedAt: recordedAt,
+		Reason:     req.Reason,
+		Key:        key,
+	}, nil
+}
+
 // jobIDFrom reads and parses the {id} path parameter.
 //
 // A path parameter of the wrong shape is bad_request rather than not_found, which is the httpx
@@ -289,6 +484,31 @@ func apiError(err error) error {
 	case errors.Is(err, ErrDriverAlreadyAssigned):
 		return httpx.NewError(http.StatusConflict, CodeDriverAlreadyAssigned,
 			"This job already has a driver.").WithCause(err)
+
+	case errors.Is(err, ErrNoIdempotencyKey):
+		// The middleware answers this before a handler runs, so reaching it means the route
+		// was served without the middleware. Answering with the middleware's own code keeps
+		// one thing for a client to branch on either way.
+		return httpx.NewError(http.StatusBadRequest, httpx.CodeIdempotencyKeyRequired,
+			"This request must carry an %s header. Generate one value per action and reuse it "+
+				"for every retry of that action.", httpx.HeaderIdempotencyKey).WithCause(err)
+
+	case errors.Is(err, ErrIdempotencyKeyReused):
+		// The same code the middleware uses on a fingerprint mismatch, and the same status.
+		// A client should not have to know whether Redis still held the key or the database
+		// caught it — the answer to both is "generate a new key for the new action".
+		return httpx.NewError(http.StatusConflict, httpx.CodeIdempotencyKeyReused,
+			"This %s has already recorded a different milestone on this job. Generate a new key "+
+				"for each action.", httpx.HeaderIdempotencyKey).WithCause(err)
+
+	case errors.Is(err, ErrProofRequired):
+		return httpx.NewError(http.StatusConflict, CodeProofRequired,
+			"A delivery cannot be recorded without proof, and capturing proof is not built yet.").
+			WithCause(err)
+
+	case errors.Is(err, ErrMilestoneNotPermitted):
+		return httpx.NewError(http.StatusConflict, CodeMilestoneNotPermitted,
+			"This milestone cannot be recorded from the job's current status.").WithCause(err)
 
 	default:
 		return err
