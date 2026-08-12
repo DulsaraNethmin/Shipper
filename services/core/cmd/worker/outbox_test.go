@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
@@ -102,7 +103,17 @@ func unpublished(t *testing.T, pool *pgxpool.Pool) int {
 	return n
 }
 
-func runPass(t *testing.T, pool *pgxpool.Pool, d outboxDrain) (int, error) {
+// drainPass runs one pass and hands back what it claimed *and* whether it failed.
+//
+// Named apart from tasks_jobs_test.go's runPass rather than sharing it, and the two are not the
+// same helper: that one calls t.Fatal on error, which is right for a task that is only ever
+// expected to succeed. Three of the tests below are about the pass failing — an unreachable
+// broker, a crash before the commit — so the error has to come back rather than end the test.
+//
+// The collision itself is the ordinary hazard of two tracks adding files to one package: git
+// merged them cleanly because the files differ, and `go vet` is what caught it. Same shape as
+// SHIP-110's quotedLiteral, and the same resolution — the incomer renames.
+func drainPass(t *testing.T, pool *pgxpool.Pool, d outboxDrain) (int, error) {
 	t.Helper()
 
 	claimed := 0
@@ -133,7 +144,7 @@ func TestAnEventCommittedWithItsTransactionIsPublished(t *testing.T) {
 	}
 
 	to := &recorder{}
-	claimed, err := runPass(t, pool, outboxDrain{to: to, batch: 10})
+	claimed, err := drainPass(t, pool, outboxDrain{to: to, batch: 10})
 	if err != nil {
 		t.Fatalf("the pass failed: %v", err)
 	}
@@ -174,7 +185,7 @@ func TestAnEventInARolledBackTransactionIsNeverPublished(t *testing.T) {
 	}
 
 	to := &recorder{}
-	claimed, err := runPass(t, pool, outboxDrain{to: to, batch: 10})
+	claimed, err := drainPass(t, pool, outboxDrain{to: to, batch: 10})
 	if err != nil {
 		t.Fatalf("the pass failed: %v", err)
 	}
@@ -207,7 +218,7 @@ func TestAnUnreachableBrokerLeavesEveryRowClaimable(t *testing.T) {
 	to := &recorder{}
 	to.fail(errors.New("dial tcp: connection refused"))
 
-	if _, err := runPass(t, pool, outboxDrain{to: to, batch: 10}); err == nil {
+	if _, err := drainPass(t, pool, outboxDrain{to: to, batch: 10}); err == nil {
 		t.Fatal("the pass reported success with an unreachable broker")
 	} else if !strings.Contains(err.Error(), "connection refused") {
 		t.Errorf("the error does not name the broker failure: %v", err)
@@ -217,7 +228,7 @@ func TestAnUnreachableBrokerLeavesEveryRowClaimable(t *testing.T) {
 	}
 
 	to.fail(nil)
-	claimed, err := runPass(t, pool, outboxDrain{to: to, batch: 10})
+	claimed, err := drainPass(t, pool, outboxDrain{to: to, batch: 10})
 	if err != nil {
 		t.Fatalf("the pass after the broker came back failed: %v", err)
 	}
@@ -271,7 +282,7 @@ func TestACrashBetweenPublishingAndCommittingRepublishes(t *testing.T) {
 		t.Fatalf("the event is marked published although the mark never committed")
 	}
 
-	claimed, err := runPass(t, pool, drain)
+	claimed, err := drainPass(t, pool, drain)
 	if err != nil {
 		t.Fatalf("the pass after the crash failed: %v", err)
 	}
@@ -363,10 +374,16 @@ func TestOneAggregateBelongsToOneWorker(t *testing.T) {
 // A task that is declared and never registered runs nothing, produces no compile error and no
 // test failure, and is the exact hazard cmd/worker/manifest.go's registry exists to prevent. The
 // only way to notice is to ask the manifest.
+//
+// Deps is filled out further than this task needs, because tasks() builds *every* registration
+// and a half-filled Deps fails in somebody else's closure — SHIP-68's job expiry panics without a
+// clock. That is the manifest working as intended rather than a nuisance: the registry is shared,
+// so a test that asks it a question has to satisfy every task in it.
 func TestTheOutboxPublisherIsRegistered(t *testing.T) {
 	built, err := tasks(Deps{
 		Config: &config.Config{},
 		Logger: slog.New(slog.DiscardHandler),
+		Clock:  clock.System{},
 	})
 	if err != nil {
 		t.Fatalf("building the registered tasks: %v", err)
@@ -390,17 +407,26 @@ func TestTheOutboxPublisherIsRegistered(t *testing.T) {
 
 // TestTheOutboxTaskShutsDownWithNoBrokerConfigured checks the two halves of the empty-brokers
 // path together: the task still exists, and it refuses rather than panics.
+//
+// The zero Deps case is not hypothetical tidiness. tasks() builds every registration, so another
+// track's test asking the manifest about *its* task runs this closure with whatever Deps that
+// test needed — and SHIP-68's did exactly that, with no Config, and this function took it down.
+// The registry is shared even though the files are not.
 func TestTheOutboxTaskShutsDownWithNoBrokerConfigured(t *testing.T) {
-	w, publish := newKafkaEventPublisher(Deps{
-		Config: &config.Config{},
-		Logger: slog.New(slog.DiscardHandler),
-	})
+	for name, deps := range map[string]Deps{
+		"no brokers": {Config: &config.Config{}, Logger: slog.New(slog.DiscardHandler)},
+		"nothing at all, as another track's manifest test supplies it": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w, publish := newKafkaEventPublisher(deps)
 
-	if err := publish.Publish(t.Context(), []events.Event{{}}); err == nil {
-		t.Error("publishing with no brokers configured reported success")
-	}
-	if err := closeWriter(t.Context(), w); err != nil {
-		t.Errorf("closing a producer that was never built: %v", err)
+			if err := publish.Publish(t.Context(), []events.Event{{}}); err == nil {
+				t.Error("publishing with no brokers configured reported success")
+			}
+			if err := closeWriter(t.Context(), w); err != nil {
+				t.Errorf("closing a producer that was never built: %v", err)
+			}
+		})
 	}
 }
 

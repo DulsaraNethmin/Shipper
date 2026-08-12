@@ -126,11 +126,13 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **218 checks across 10 sections**, and `make check` green. Since
+Verified by `make verify` — **235 checks across 10 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. The tenth section is SHIP-134's
-`scripts/verify/80-notifications.sh`, and the count is what the runner printed rather than what
-the arithmetic suggested.
+`scripts/verify/80-notifications.sh`; SHIP-67 and SHIP-68 added theirs to the jobs file. The
+count is what the runner printed on the merged tree rather than what the arithmetic suggested —
+and it was printed twice in a row, which for this section is part of the check rather than
+belt-and-braces (see SHIP-134 below).
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -1266,13 +1268,14 @@ the check it sets up.
 
 `GET /v1/jobs/{id}` returns a job in full to the customer who owns it, and 404 to everybody else.
 
-**Its *Done when* says "including budget", and the budget column does not exist.** It was
-deliberately not added. `Docs/11` §8 makes SHIP-67 single-owner with SHIP-83 precisely so the column
-and the serialisation test proving it cannot reach a provider land together, and SHIP-67 is not in
-this wave. A field that arrives before its proof is the one arrangement worse than a field that
-arrives late — so the endpoint is complete and the sentence is not. **Recorded here rather than
-resolved silently**, and §4 carries SHIP-65 until SHIP-67 closes it. `make verify` asserts the
-absence of a `budget` key, so the day it appears somebody has to come to that file and say so.
+**~~Its *Done when* says "including budget", and the budget column does not exist.~~ Closed at
+SHIP-67 — see below.** It was deliberately not added at SHIP-65: `Docs/11` §8 makes SHIP-67
+single-owner with SHIP-83 precisely so the column and the serialisation test proving it cannot
+reach a provider land together, and SHIP-67 was not in wave 3. A field that arrives before its
+proof is the one arrangement worse than a field that arrives late — so the endpoint was complete
+and the sentence was not. **Recorded rather than resolved silently**, and §4 carried SHIP-65 until
+SHIP-67 closed it. The `make verify` check asserting the *absence* of a `budget` key was the
+tripwire, and SHIP-67 moved it loudly rather than quietly.
 
 **`Docs/09` cannot be satisfied here as written, and that is worth a decision rather than a
 workaround.** SHIP-67 owns the budget column and **depends on SHIP-65**, so SHIP-65's *Done when*
@@ -1407,6 +1410,93 @@ false of SHIP-134, which holds a Kafka producer with buffered messages behind it
 now optional and called after the task's loop stops, with a fresh context rather than the
 cancelled one, since a `Close` inherited from a cancelled context could never flush. A hook on the
 task rather than a field on `Deps`, so every future task does not carry a producer it never uses.
+
+### SHIP-67 — the budget, and the pairing that could not be honoured
+
+`jobs.budget` is `numeric(12,2)` (000405), held in Go as `int64` cents and published as
+`budget_cents`. Minor units rather than a decimal, on Docs/10 §3.3's rule that money is never a
+float — a JSON number written `1500.50` is one, and the name carries the unit because a field
+called `budget` holding `150000` is a field somebody eventually reads as dollars. The conversion
+is two SQL expressions, one per direction, so nothing between the column and the wire rounds.
+**`internal/money` was deliberately not written**: it is registered for SHIP-74, wave 4's Track A
+is building `bids` in the same wave, and a shared package written by two tracks at once is the
+conflict the pre-seeded list exists to avoid.
+
+**The SHIP-83 pairing was broken deliberately, and this is the record §8 asked for.** §8 makes
+SHIP-67 single-owner with SHIP-83 so that budget privacy is proved against a *serialised provider
+response* rather than against struct fields, and it also records — as a verified fact rather than
+a scheduling preference — that SHIP-83 is three dependency hops away. **Decided: build SHIP-67
+now, and reserve SHIP-83 to the same owner when it becomes startable.** Deferring both would have
+left the column unbuilt for a rule it already satisfies, and SHIP-65's *Done when* incomplete for
+a third wave, in exchange for a test on an endpoint that does not exist.
+
+What replaces the pairing is three tests rather than one, and the first is stronger than what the
+pairing would have bought:
+
+- **`TestOnlyTheOwnersResponseCarriesTheBudget` parses the package's own source** and fails when
+  any struct outside a four-name allow-list declares a budget field, by Go name or by json tag.
+  Reflection could only check types somebody remembered to point it at, which is precisely the act
+  a future provider response would omit; the source is the complete list by construction. The
+  allow-list is checked in both directions, so an entry that has stopped constraining anything
+  fails too.
+- **`TestNoRefusalLeaksTheBudget`** drives the real handlers and searches every response a
+  provider or a second customer can obtain — reads, lists, edits, cancellations, malformed ids.
+  Error messages are the one part of a response nobody writes a schema for.
+- **`TestTheStatusChangedEventCarriesNoBudget`** reads the stored `outbox` payload. An event
+  travels past the last endpoint that could redact anything, to Kafka and every consumer behind it.
+
+**When SHIP-83 lands it adds the fourth**, and that is the test the pairing was actually for.
+
+**The `make verify` tripwire was moved loudly.** `50-jobs.sh` asserted that no `budget` key was
+present in a job response, and that assertion existed so that whoever added the column had to come
+to the file and say so. The replacement is stronger in both directions: the SHIP-65 section still
+refuses a budget on a job created without one — the omitempty rule that lets a client tell "no
+budget" from "a budget of nothing" — and a new SHIP-67 section asserts the owner reads their own
+back, that the column holds `1500.00` for `150000` cents, and that no response to a provider or to
+another customer mentions the word or the amount anywhere.
+
+### SHIP-68 — the deadline is the database's, the sweep is the worker's
+
+Docs/02 §6.3 — the earlier of fourteen days after publication or the pickup date passing — is now
+three pieces in three places, and the split is the ticket's main decision.
+
+**000406 sets `expires_at` in a trigger on the transition into Open, not in Go.** The alternative
+was to compute it inside `Service.Transition`, and it was rejected for the reason 000402 gives for
+the status guard itself: the property wanted is that *every* published job has a deadline, and
+publication is not one code path. SHIP-63 publishes, SHIP-93 returns an Awarded job to Open after
+a provider cancellation, an administrator may reopen one — three tickets on three branches, and a
+deadline computed in one Go function is a deadline three of them can forget. The symptom would be
+an Open job that never expires, which nothing reports. `updated_at` is the precedent: a derived
+timestamp belonging to a state change is set by the trigger attached to that change.
+
+**It is a default, not a lock.** The trigger fills `expires_at` only when it is `NULL`, so a
+caller writing its own value in the same statement keeps it, and a job that already has a deadline
+keeps that. Two consequences fall out and both are what Docs/02 §6.3 asks for: SHIP-70's extend
+endpoint is an ordinary `UPDATE`, and the clock does not restart every time a job cycles
+`Negotiating → Open` as bids expire — which would let a job with a slow trickle of bids live for
+ever, the exact stale listing §6.3 is about.
+
+**`cmd/worker` needed no seam and no shared edit**, exactly as SHIP-15g predicted: `tasks_jobs.go`
+is a new file with an `init` that calls `register`, and nothing else in the tree changed. No field
+was added to `Deps`. The claim query lives in `internal/jobs` because *which* jobs are due names
+this domain's table, status and column; the loop lives in `cmd/worker` because *how* work is
+claimed is the worker's, and `ClaimIDs` refuses a query without `FOR UPDATE SKIP LOCKED`.
+
+**The claim judges against the worker's clock rather than `now()`**, which is Docs/10 §6.3 being
+useful rather than ceremonial: a test advances a `clock.Fixed` by fifteen days and watches the
+backstop fire, instead of waiting or writing a deadline into the past to fake one. Two concurrent
+passes are tested against a real database and each job is expired exactly once — no lease table,
+no leader election, just `SKIP LOCKED` and one transaction per pass.
+
+**`expires_at` is returned to the owner.** SHIP-69 warns forty-eight hours ahead and SHIP-70
+extends, and neither is usable by a client that cannot see the deadline; it is omitted while the
+job is a Draft, because the clock starts at publication.
+
+**`make verify` runs the real worker binary**, not a stand-in: it publishes one job whose pickup
+window closed an hour ago and one with no window at all, checks the two deadlines the trigger
+computed, starts `cmd/worker`, waits for the first pass, and then asserts the stale job is
+`Cancelled` with an `Open->Cancelled` history row attributed to `system` with no account, an
+outbox event, and the live job untouched. The count went from 208 to **224**.
 
 ### What SHIP-105 built, and the two rules that follow from a driver having no account
 
@@ -1596,20 +1686,42 @@ would be cancelled before it began. `kafka.Writer.Close` takes no context, so th
 a deployment open until SIGKILL discards the buffer the hook exists to protect. **No field was
 added to `Deps`.**
 
-**`make verify` went from 208 checks across 9 sections to 218 across 10**, the new one being
+**`make verify` prints 235 checks across 10 sections on the merged tree**, the tenth being
 `scripts/verify/80-notifications.sh` — 80–89 is the notifications range. It is a real end-to-end
-run and not a restatement of the tests: it empties `shipper.job`, writes three events in a
+run and not a restatement of the tests: it empties `shipper.job`, registers its own customer and
+cancels a draft through the API so that a real endpoint emits one event, writes three more in a
 committed transaction and one in a rolled-back one, runs the actual worker binary against the
-actual broker, SIGTERMs it, and reads the messages back with Kafka's own console consumer. Two
-things it found that a test could not. First, **the topic also carries the jobs domain's own
-events** — SHIP-64's cancellations write `job.status_changed` inside the transaction that moves
-the job, so the mechanism is already carrying real domain events end to end, and the section
-asserts that the set on the topic equals the set the database says it published. Second, **the
-first version of that assertion compared the two as ordered lists and failed**: with three
-partitions the console consumer reads three independent streams and interleaves them, which is the
-shortest available demonstration that "ordering is per aggregate, not global" is a property of
-what was built rather than a sentence in a comment. The check is now a set comparison plus a
-per-aggregate order check over every aggregate on the topic.
+actual broker, SIGTERMs it, and reads the messages back with Kafka's own console consumer. The
+whole path is exercised — endpoint, transaction, outbox, worker, broker, consumer.
+
+**Three things that section found, none of which a test could have.** First, **the console
+consumer interleaves**: with three partitions it reads three independent streams, so the first
+version of the comparison, which matched ordered lists, failed. That is the shortest available
+demonstration that "ordering is per aggregate, not global" is a property of what was built rather
+than a sentence in a comment. The check is now a set comparison plus a per-aggregate order check
+over every aggregate on the topic — and a payload check that looked at "the first message" fell
+to the same assumption a run later, so it now looks its event up by id.
+
+Second, **cross-section state, for the second time in this harness's life.** The original
+comparison was against `select id from outbox where published_at is not null` — every job event
+the database had ever published — on the reasoning that the topic had just been recreated empty.
+SHIP-68 broke it on the merge: that section runs the real worker to demonstrate job expiry, and
+the worker runs *every* registered task, so it drains the outbox and marks job events published
+before this section wipes the topic. Those rows are legitimately published and legitimately
+absent from the fresh topic. **Nothing was lost and the product was right; the assertion was too
+broad.** It had also been silently intermittent: on a machine where `shipper.job` did not yet
+exist, SHIP-68's publisher passes failed against the missing topic, left every row claimable, and
+the broad query happened to agree. The fix is a fence — `published_at > $outbox_fence`, taken
+after the topic is recreated and before anything can publish — so the comparison covers exactly
+what this section's worker produced. **SHIP-47's rate-limit bucket was the first instance of the
+same shape**, and the recipe is the same both times: fence what you assert on, and own what you
+assert about. The section now registers its own customer rather than reading 50-jobs.sh's token,
+and its header says so for the next section that runs the worker or reads Kafka.
+
+Third, a consequence of the second worth stating on its own: **`cmd/worker` is one binary and
+every section that starts it starts every task.** SHIP-68's section is about job expiry and
+publishes the outbox as a side effect. That is correct behaviour and it will keep surprising
+people.
 
 The transactional half is `services/core/cmd/worker/outbox_test.go`, against a real PostgreSQL
 with the broker stood in for by a recorder: an event whose transaction rolled back is never
@@ -1622,9 +1734,13 @@ other.
 
 | Ticket | Exists | Missing |
 |---|---|---|
-| **SHIP-65** | The endpoint, the owner-only rule, the full customer view | The `budget` field its *Done when* names. The column is SHIP-67's, with the proof that it cannot leak |
 | **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
+
+**SHIP-65 has left this table.** Its *Done when* — "returns full job including budget" — was met
+but for the budget for two waves, and SHIP-67 closed it with the column and the proof together.
+§10's note that a ticket can be both done and partly done still stands; SHIP-149 is now its only
+live example.
 
 ## 5. Blocked — and only by work outside this repository
 
@@ -1815,7 +1931,11 @@ Kept here rather than deleted, because the shape recurs: this was described only
 
 **Also single-owner, for reasons in `Docs/10`:** SHIP-57 (the status guard), SHIP-67 with SHIP-83 (budget privacy — test the serialised response, not struct fields), both token verifiers, and the middleware ordering in `newRouter` — which is now load-bearing in a second way, since `ResolveSubject` sitting outside `Idempotent` is what makes the scope work at all.
 
-**The SHIP-67 / SHIP-83 pairing cannot be honoured in one wave, and that is a fact about the dependency graph rather than a scheduling preference.** Verified against `Docs/09`: SHIP-83 depends on SHIP-82 → SHIP-81 → (SHIP-79, SHIP-80) → SHIP-78. SHIP-67 is startable **now**; SHIP-83 is four tickets and three hops away. Any wave that starts SHIP-67 either breaks the pairing or defers a startable ticket for a chain that is not close to landing. **The ticket that takes SHIP-67 must therefore settle this explicitly** — build now and reserve SHIP-83 to the same owner later, or defer both — and record which, here and in §3. What the pairing was protecting is worth restating so the choice is made on it: the invariant must be proved against the **serialised provider response**, not against struct fields, and SHIP-67's own *Done when* is precisely that serialisation test. Note also that `make verify` currently **asserts no `budget` key is present**, so whichever ticket adds the column must change that assertion in the same commit — it is the invariant's tripwire and it should be moved loudly, never quietly.
+**~~The SHIP-67 / SHIP-83 pairing cannot be honoured in one wave.~~ Settled at SHIP-67: built now, SHIP-83 reserved to the same owner.** The fact about the dependency graph has not changed — SHIP-83 depends on SHIP-82 → SHIP-81 → (SHIP-79, SHIP-80) → SHIP-78, and wave 4 delivers only SHIP-78 and SHIP-80, leaving three hops. What has changed is that the choice the pairing forced has been made rather than deferred again.
+
+**The decision, and the reasoning it was made on.** Deferring both would have left the column unbuilt for a rule it already satisfies, and SHIP-65's *Done when* incomplete for a third consecutive wave, in exchange for a test against an endpoint that does not exist. So SHIP-67 landed with the strongest proof available today, which turned out to be three tests rather than one — the source-parsing test that refuses a budget field on any shape but the owner's response, a wire test over every response a provider or a stranger can obtain, and a test on the stored event payload. §3 has the detail. **SHIP-83 remains reserved to this owner and adds the fourth**: its provider response, serialised, asserted to carry no budget. That is the test the pairing was actually for, and it is the one thing that is still owed.
+
+**The `make verify` tripwire has been moved, and this is the entry recording it.** The check asserting that no `budget` key was present is gone; what replaced it asserts the owner reads their own budget back and that no provider-facing or stranger-facing response mentions it in any form. **The tripwire is now the source-parsing test rather than a verify line** — whoever writes SHIP-82 or SHIP-83 will meet it as a failing test the moment a provider shape acquires the field, which is earlier and louder than a shell assertion would have been.
 
 ## 9. Open recommendations nobody has decided
 
@@ -1907,16 +2027,16 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Since
-SHIP-134 landed, every ticket §4 names is in the list** — SHIP-65 and SHIP-149 are both in the
-list *and* partly done, and that is not a contradiction to be tidied away.
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is now in the list**, and SHIP-149 is the only row left in it — which is
+not a contradiction to be tidied away.
 
 **A ticket can be both**, and this is the shape: it landed, it is named by a commit subject, and one
-clause of its *Done when* belongs to a ticket that does not exist yet. SHIP-65 shipped the job
-detail endpoint and the owner-only rule; the `budget` field its sentence also names is SHIP-67's,
-together with the serialisation test proving it cannot leak — and adding the column before that
-proof would be exactly the wrong order. SHIP-149 shipped the append-only `audit_log` and its
-triggers; the Go write helper is still missing.
+clause of its *Done when* belongs to a ticket that does not exist yet. SHIP-149 shipped the
+append-only `audit_log` and its triggers; the Go write helper is still missing. SHIP-65 was the
+other example for two waves — the job detail endpoint and the owner-only rule shipped, the `budget`
+field its sentence also names did not, because adding the column before the proof it cannot leak
+would have been exactly the wrong order. **SHIP-67 closed it**, which is what this shape is supposed
+to end in.
 
 **Removing either from the list would make `make status` hard-fail**, not go quiet: a commit subject
 names each (`a47ba3a` for SHIP-65), and the script exits 1 when git shows a ticket the list does not

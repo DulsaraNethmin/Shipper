@@ -20,9 +20,39 @@
 # the events back off the topic with Kafka's own console consumer. Nothing here is a repeat of
 # a test: it is the wire, the acknowledgement and the shutdown flush.
 #
-# Events are inserted with psql because no endpoint emits one yet — SHIP-136 is what makes jobs,
-# bids and deliveries write to the outbox. That is also exactly what the contract says a domain
-# does: write the row inside the transaction making the change.
+# Three of the four events are inserted with psql, which is exactly what the contract says a
+# domain does — write the row inside the transaction making the change — and is the only way to
+# arrange a transaction that rolls back. The fourth is emitted by a real endpoint: this section
+# registers its own customer, creates a draft and cancels it, and SHIP-57's guard writes
+# job.status_changed inside the transaction that moves the job.
+#
+# # Everything here is scoped to this section, and that is the second time it has had to be
+#
+# **This section owns nothing that another section can see, and reads nothing another section
+# left behind.** That is a correction, not a principle stated up front. The first version
+# compared the topic against `select id from outbox where published_at is not null` — every job
+# event the database had ever published — on the reasoning that the topic had just been recreated
+# empty, so the two had to agree.
+#
+# **SHIP-68 broke it, and the direction of the breakage is worth reading.** That section runs the
+# real worker to demonstrate job expiry, and the worker runs *every* registered task, so it drains
+# the outbox and marks job events published before this section wipes the topic. Those rows are
+# legitimately published and legitimately absent from the fresh topic, so the equality could never
+# hold again. Nothing was lost, and the product was right — the assertion was too broad.
+#
+# It is also why it was intermittent before the merge: on a machine where `shipper.job` did not
+# yet exist, SHIP-68's publisher passes failed against the missing topic and left every row
+# claimable, so this section drained them itself and the broad query happened to agree.
+#
+# **This is the second time cross-section state has bitten this harness** — SHIP-47's rate-limit
+# bucket was the first, where one section's failed sign-ins spent an allowance another section
+# then found empty. The recipe both times is the same: **fence what you assert on**. Here the
+# fence is `published_at > $outbox_fence`, taken after the topic is recreated and before anything
+# can publish, so the comparison is over exactly what this section's worker produced.
+#
+# The next section to run the worker, or to read Kafka, has to do the same. Note in particular
+# that this section *deletes* `shipper.job`, which is safe today only because no other section
+# asserts on a topic it did not create.
 
 ticket "SHIP-134  domain events commit with their transaction and publish at least once"
 
@@ -47,6 +77,51 @@ done
   --create --topic "$outbox_topic" --partitions 3 --replication-factor 1 >/dev/null 2>&1 \
   || fail "could not create $outbox_topic"
 ok "topic $outbox_topic created empty (SHIP-135 owns the real topic set)"
+
+# The fence. Taken from the database's own clock, after the topic is empty and before anything
+# can publish into it — no worker is running at this point, SHIP-68's having been waited on — so
+# `published_at > $outbox_fence` names exactly the events this section's worker sends to the
+# topic it just created. See the header for what happened without it.
+outbox_fence="$("$PSQL" "$DATABASE_URL" -tAc "select clock_timestamp();")"
+
+# --- an event a real endpoint wrote ----------------------------------------------------------
+
+# Its own customer, its own job. Reusing 50-jobs.sh's token would make this section depend on
+# that one having run, which is the coupling the header is about.
+outbox_request() {
+  curl -s -X "$1" -o "$6" -w '%{http_code}' \
+    -H "$auth_header: Bearer $2" \
+    -H "Idempotency-Key: $3" \
+    -H 'Content-Type: application/json' \
+    -d "$5" "http://localhost:$VERIFY_PORT$4"
+}
+
+status="$(post_json "verify-outbox-cust-$$" /v1/auth/register \
+  "{\"email\":\"outbox-customer-$$@example.com\",\"phone\":\"04180$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/outbox-customer.json")"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/outbox-customer.json"; fail "could not register the outbox customer: $status"; }
+outbox_token="$(mint_token "$(json "$WORKDIR/outbox-customer.json" '["id"]')")"
+
+status="$(outbox_request POST "$outbox_token" "verify-outbox-draft-$$" /v1/jobs '{}' \
+  "$WORKDIR/outbox-draft.json")"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/outbox-draft.json"; fail "could not create a draft to cancel: $status"; }
+emitted_job="$(json "$WORKDIR/outbox-draft.json" '["id"]')"
+
+# A cancellation is a transition, so it goes through SHIP-57's guard, which emits the event
+# inside the same transaction. Nothing in this section writes that row.
+status="$(outbox_request POST "$outbox_token" "verify-outbox-cancel-$$" \
+  "/v1/jobs/$emitted_job/cancel" '{"reason": "Demonstrating the outbox end to end."}' \
+  "$WORKDIR/outbox-cancelled.json")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/outbox-cancelled.json"; fail "cancelling the draft returned $status, want 200"; }
+
+emitted_rows="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox where aggregate_id = '$emitted_job' and published_at is null;")"
+[[ "$emitted_rows" == "1" ]] \
+  || fail "cancelling the job left $emitted_rows unpublished outbox row(s), want 1"
+ok "a real endpoint's transition wrote its event to the outbox, unpublished, in its own transaction"
 
 committed_job="$(uuidgen | tr 'A-Z' 'a-z')"
 rolled_back_job="$(uuidgen | tr 'A-Z' 'a-z')"
@@ -101,11 +176,16 @@ worker_pid=$!
 
 # Poll rather than sleep a fixed span: the drain runs every two seconds and the first pass is
 # immediate, so this is usually one iteration.
+#
+# Four: the three fixtures and the cancellation the endpoint emitted. Counted on the two
+# aggregates this section owns rather than on the outbox as a whole, because what else is in
+# there is another section's business — the same fencing the comparison below needs.
 published=0
 for _ in $(seq 1 100); do
   published="$("$PSQL" "$DATABASE_URL" -tAc \
-    "select count(*) from outbox where aggregate_id = '$committed_job' and published_at is not null;")"
-  if [[ "$published" == "3" ]]; then break; fi
+    "select count(*) from outbox
+      where aggregate_id in ('$committed_job', '$emitted_job') and published_at is not null;")"
+  if [[ "$published" == "4" ]]; then break; fi
   sleep 0.2
 done
 
@@ -119,9 +199,9 @@ for _ in $(seq 1 50); do
 done
 wait "$worker_pid" 2>/dev/null || true
 
-[[ "$published" == "3" ]] \
-  || { cat "$WORKDIR/worker.log"; fail "$published of 3 events were marked published"; }
-ok "the worker drained the outbox and marked all three published"
+[[ "$published" == "4" ]] \
+  || { cat "$WORKDIR/worker.log"; fail "$published of 4 events were marked published"; }
+ok "the worker drained the outbox and marked all four published"
 
 grep -q '"task":"outbox-publisher"' "$WORKDIR/worker.log" \
   || { cat "$WORKDIR/worker.log"; fail "the outbox publisher did not register as a task"; }
@@ -144,10 +224,15 @@ import json, sys
 print(" ".join(json.loads(line)["id"] for line in open(sys.argv[1]) if line.strip()))
 ' "$WORKDIR/outbox-consumed.json")"
 
-# The topic was emptied before the worker started, so what is on it now is exactly what this
-# worker run published — which the database independently claims is every job event it marked.
-# Comparing the two catches an event marked published that never left, which is the one failure
-# the ordering of publish and mark exists to prevent.
+# What the topic holds against what the database says this worker run published — in both
+# directions, which is what makes it worth doing. A row marked published that never left is the
+# one failure the ordering of publish and mark exists to prevent; a message on the topic the
+# outbox does not claim would mean something published without recording it.
+#
+# **Fenced on `published_at > $outbox_fence`**, not on `published_at is not null`. The broad form
+# was this section's original defect: SHIP-68 runs the real worker, which drains the outbox before
+# this section wipes the topic, so rows legitimately published into a topic that no longer exists
+# would be counted as missing. The header carries the full account.
 #
 # **As sets, deliberately.** The topic has three partitions and the key is the aggregate, so the
 # consumer reads three independent streams and interleaves them however it likes. Asserting a
@@ -159,10 +244,10 @@ print(" ".join(json.loads(line)["id"] for line in open(sys.argv[1]) if line.stri
 # shellcheck disable=SC2086
 consumed_sorted="$(printf '%s\n' $consumed_ids | sort | tr '\n' ' ')"
 outbox_sorted="$("$PSQL" "$DATABASE_URL" -tAc \
-  "select id from outbox where aggregate_type = 'job' and published_at is not null order by id;" \
+  "select id from outbox where aggregate_type = 'job' and published_at > '$outbox_fence' order by id;" \
   | tr -d ' ' | sort | tr '\n' ' ')"
 [[ "$consumed_sorted" == "$outbox_sorted" ]] \
-  || fail "the topic holds [$consumed_sorted] and the outbox says it published [$outbox_sorted]"
+  || fail "the topic holds [$consumed_sorted] and the outbox says this run published [$outbox_sorted]"
 ok "every event the outbox marked published is on $outbox_topic, and nothing else is"
 
 # Per aggregate, though, the order is exact — and that is the promise. Checked over every
@@ -196,27 +281,46 @@ if grep -q "$rolled_back_job" "$WORKDIR/outbox-consumed.json"; then
 fi
 ok "the rolled-back transaction's event never reached the broker"
 
-# The rest of the list is the jobs domain's own events, emitted by the endpoints the earlier
-# sections exercised — SHIP-64's cancellations write job.status_changed inside the transaction
-# that moves the job. Nothing in this section put them there, which is the point: the mechanism
-# is already carrying real domain events end to end.
-domain_events="$(python3 -c '
+# The event no part of this section wrote: the cancellation went through SHIP-57's guard, the
+# guard emitted it, and it came off the topic with its aggregate and its type intact. That is the
+# whole path — endpoint, transaction, outbox, worker, broker — and it is the reason the section
+# creates its own job rather than counting on whatever earlier sections happened to leave
+# unpublished. Counting those was the first version, and it was one race away from asserting
+# nothing: SHIP-68's own expiry event is published by its own worker run about half the time.
+emitted_type="$(python3 -c '
 import json, sys
-ours = set(sys.argv[2:])
-print(sum(1 for line in open(sys.argv[1]) if line.strip() and json.loads(line)["id"] not in ours))
-' "$WORKDIR/outbox-consumed.json" "${event_ids[@]}")"
-(( domain_events > 0 )) \
-  || fail "no domain-written events reached the topic; only this section's fixtures did"
-ok "$domain_events event(s) written by the jobs domain's own endpoints published alongside them"
+for line in open(sys.argv[1]):
+    if not line.strip():
+        continue
+    e = json.loads(line)
+    if e["aggregate_id"] == sys.argv[2]:
+        print(e["type"])
+        break
+' "$WORKDIR/outbox-consumed.json" "$emitted_job")"
+[[ "$emitted_type" == "job.status_changed" ]] \
+  || fail "the cancelled job's event came off the topic as [$emitted_type], want job.status_changed"
+ok "the event a real endpoint emitted through the status guard published alongside them"
 
+# Looked up by id, not read off the first line. The first version read line one, which passed
+# only because the fixtures happened to be first that run: with three partitions the consumer
+# interleaves three streams, so "the first message" is not a thing this section gets to assume —
+# the same mistake as the ordered comparison above, in a smaller place. The second run found it.
 consumed_payload="$(python3 -c '
 import json, sys
-print(json.loads(open(sys.argv[1]).readline())["payload"]["sequence"])
-' "$WORKDIR/outbox-consumed.json")"
-[[ "$consumed_payload" == "1" ]] || fail "the payload did not survive the round trip"
+for line in open(sys.argv[1]):
+    if not line.strip():
+        continue
+    e = json.loads(line)
+    if e["id"] == sys.argv[2]:
+        print("%s/%s" % (e["type"], e["payload"]["sequence"]))
+        break
+' "$WORKDIR/outbox-consumed.json" "${event_ids[0]}")"
+[[ "$consumed_payload" == "job.published/1" ]] \
+  || fail "the first fixture came off the topic as [$consumed_payload], want job.published/1"
 ok "each message carries its event id, its type and the payload the domain wrote"
 
-unset consumed consumed_ids consumed_sorted outbox_sorted ours_in_order domain_events consumed_payload
-unset published worker_pid
+unset consumed consumed_ids consumed_sorted outbox_sorted ours_in_order emitted_type consumed_payload
+unset published worker_pid outbox_fence outbox_token emitted_job emitted_rows
 unset committed_job rolled_back_job rolled_back_rows outbox_topic
 unset event_ids
+unset -f outbox_request

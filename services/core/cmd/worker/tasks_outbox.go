@@ -91,10 +91,29 @@ func init() {
 //
 // It returns a writer even with no brokers configured, so that the failure is one legible error
 // per pass rather than a nil dereference. KAFKA_BROKERS defaults to localhost:29092 in
-// internal/config, so this is reachable only by setting it to nothing on purpose.
+// internal/config, so that is reachable only by setting it to nothing on purpose.
+//
+// # Why nil fields on Deps are tolerated here rather than assumed away
+//
+// main.go always supplies all of them, so the guards below look like belt and braces. They are
+// not: tasks() builds *every* registration, so any test asking the manifest a question about
+// another task runs this closure with whatever Deps that test happened to need. SHIP-68's
+// expiryTask passes a logger, a clock and a pool and no configuration, and the first version of
+// this function dereferenced d.Config and took that test down with it — in a file the jobs track
+// owns and this one may not edit. Docs/10 §9.2 already says the pool and the Redis client may be
+// nil and must not be treated as a promise; a registration closure should extend the same
+// courtesy to the rest of Deps.
 func newKafkaEventPublisher(d Deps) (*kafka.Writer, EventPublisher) {
-	brokers := d.Config.Kafka.Brokers
-	log := d.Logger.With(slog.String("task", outboxTaskName))
+	log := d.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	log = log.With(slog.String("task", outboxTaskName))
+
+	var brokers []string
+	if d.Config != nil {
+		brokers = d.Config.Kafka.Brokers
+	}
 
 	if len(brokers) == 0 {
 		log.Error("KAFKA_BROKERS is empty; the outbox cannot be drained and events will " +
