@@ -3,6 +3,7 @@ package httpx
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -218,6 +219,111 @@ func TestAnUntypedErrorBecomesAnOpaqueFiveHundred(t *testing.T) {
 	}
 	if got := decodeError(t, rec.Body.Bytes()); got.Code != CodeInternal {
 		t.Errorf("code = %q, want %q", got.Code, CodeInternal)
+	}
+}
+
+// The other half of the sentence above: the client is told nothing, so the *log* has to be
+// told everything, or the failure is invisible from both ends at once (SHIP-15i).
+//
+// This is not hypothetical. A sign-in answered 500 against a stale local database during
+// SHIP-55, and the only route to the cause was reading the handler.
+func TestAnUnmappedErrorReachesTheLogWithItsRequestID(t *testing.T) {
+	log, buf := jsonLogger()
+
+	// Bound by the Logger middleware (SHIP-14), not by the caller — which is the whole
+	// reason this logs through LoggerFrom rather than through a logger of its own.
+	log = log.With(slog.String("request_id", "req_7f31"))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/login?email=someone@example.com", nil)
+	req = req.WithContext(ContextWithLogger(req.Context(), log))
+
+	WriteError(httptest.NewRecorder(), req, errors.New(`pq: relation "device_sessions" does not exist`))
+
+	rec := recordWithMessage(t, buf, "unmapped error written as 500")
+
+	if got, _ := rec["error"].(string); !strings.Contains(got, "device_sessions") {
+		t.Errorf("error = %q, want the cause", got)
+	}
+	if got := rec["request_id"]; got != "req_7f31" {
+		t.Errorf("request_id = %v, want the one the middleware bound", got)
+	}
+	if got := rec["path"]; got != "/v1/auth/login" {
+		t.Errorf("path = %v", got)
+	}
+	if got := rec["method"]; got != http.MethodPost {
+		t.Errorf("method = %v", got)
+	}
+	if got := rec["level"]; got != "ERROR" {
+		t.Errorf("level = %v, want ERROR — a 500 is ours, not the caller's", got)
+	}
+
+	// The query string is left out for the same reason Logger leaves it out: it is the part
+	// of a URL most likely to carry a token or somebody's address.
+	if strings.Contains(buf.String(), "someone@example.com") {
+		t.Errorf("the query string reached the log:\n%s", buf.String())
+	}
+}
+
+// The response contract is published and its silence is deliberate. Logging the cause is an
+// observability change and must not become a disclosure one, so this holds the bytes.
+func TestLoggingTheCauseDoesNotChangeTheResponse(t *testing.T) {
+	const want = `{"error":{"code":"internal_error",` +
+		`"message":"Something went wrong at our end. Quote the request ID if you contact support."}}`
+
+	log, buf := jsonLogger()
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs", nil)
+	req = req.WithContext(ContextWithLogger(req.Context(), log))
+
+	unmapped := httptest.NewRecorder()
+	WriteError(unmapped, req, errors.New(`pq: column "budget_cents" does not exist`))
+
+	if got := unmapped.Body.String(); got != want {
+		t.Errorf("body = %q\nwant   %q", got, want)
+	}
+	if buf.Len() == 0 {
+		t.Error("the cause was not logged, so this test is holding the wrong branch unchanged")
+	}
+
+	// And byte-identical to the mapped path, which does not log at all: whether an error was
+	// considered is something only the log may reveal.
+	mapped := httptest.NewRecorder()
+	WriteError(mapped, req, StatusError(http.StatusInternalServerError))
+
+	if unmapped.Body.String() != mapped.Body.String() {
+		t.Errorf("an unmapped 500 no longer looks like a mapped one:\n  unmapped %s\n  mapped   %s",
+			unmapped.Body.String(), mapped.Body.String())
+	}
+	if unmapped.Header().Get("Content-Type") != mapped.Header().Get("Content-Type") {
+		t.Errorf("content type = %q, want %q",
+			unmapped.Header().Get("Content-Type"), mapped.Header().Get("Content-Type"))
+	}
+}
+
+// WriteError already guards its request ID with `if r != nil`, so the logging has to survive
+// the same call. A caller writing an error outside a request must not lose the cause as well
+// as the correlation — and must certainly not panic while reporting one failure with another.
+func TestWritingAnUnmappedErrorSurvivesANilRequest(t *testing.T) {
+	log, buf := jsonLogger()
+	previous := slog.Default()
+	slog.SetDefault(log)
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	rec := httptest.NewRecorder()
+	WriteError(rec, nil, errors.New("the outbox drain has no request"))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if got := decodeError(t, rec.Body.Bytes()); got.RequestID != "" {
+		t.Errorf("request_id = %q, want empty with no request", got.RequestID)
+	}
+
+	record := recordWithMessage(t, buf, "unmapped error written as 500")
+	if got, _ := record["error"].(string); got != "the outbox drain has no request" {
+		t.Errorf("error = %q, want the cause on slog.Default", got)
+	}
+	if _, ok := record["path"]; ok {
+		t.Error("a path was logged for a call with no request")
 	}
 }
 
