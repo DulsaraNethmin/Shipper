@@ -126,10 +126,18 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **257 checks across 10 sections**, and `make check` green. Since
+Verified by `make verify` — **268 checks across 11 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
-runner; a ticket adds its section by adding a file. **The number is measured, never reconciled**:
-run `make verify` and write what it prints.
+runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
+`scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
+SHIP-68 added theirs to the jobs file.
+
+**The number is measured, never reconciled**: run `make verify` and write what it prints. This
+line has now conflicted in four consecutive merges, and on three of them *no figure in the
+conflict was correct* — it is a hand-maintained scalar in prose, which is the one shape a merge
+cannot resolve, and it should be generated rather than typed. Run it twice: the second run is
+the one where `shipper.job` already exists and SHIP-68's worker publishes into it, which is the
+condition that broke SHIP-134's section at this merge (see below).
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -216,6 +224,9 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -1639,12 +1650,244 @@ Nothing shared was edited at all: no route file, no `contracts/openapi.yaml` ent
 already a registered domain and `000500` was already its reserved block. This file and
 `Docs/11-done.txt` are the whole of it.
 
+### What SHIP-105 built, and the two rules that follow from a driver having no account
+
+`driver_assignments`, migration `000600` — the first in the delivery block, and no endpoint.
+**Demonstrated by its own tests**, `services/core/migrations/driver_assignments_test.go`, rather
+than by `make verify`, which drives HTTP endpoints and this adds none. That is the treatment
+SHIP-56, SHIP-57 and SHIP-67a already had, and it is not the weaker one here: everything asserted
+is a constraint, an index or a trigger, and `Docs/06` §4.1 is right that "a mock happily accepts a
+write that the actual constraint would reject".
+
+**There is no foreign key to `users` anywhere in the table, because there is nothing to point
+at.** The driver portal is link-authenticated (`Docs/07` §3) and a driver holds a job-scoped token
+rather than a session. `000401` had already committed to the consequence —
+`job_status_history.actor_id` names an *assignment* when `actor_type` is `'driver'` — and this is
+the row that reference resolves to. Two rules follow from it, and both are worth reading before
+SHIP-106:
+
+- **An assignment's identity is immutable**, enforced by a trigger in the shape `000005` uses for
+  `users.role`. Editing `driver_name` is not an update; it silently re-attributes every milestone
+  and transition already recorded against that assignment to a different person. Replacing a
+  driver ends one assignment and creates another, and the ended row stays.
+- **At most one assignment is live per job**, `uq_driver_assignments_active`, a partial unique
+  index on `job_id WHERE unassigned_at IS NULL`. Two live assignments become two valid driver
+  links the moment SHIP-107 hangs a token off this row, which is how SHIP-108's "exactly one job,
+  and nothing else" quietly stops being true. `unassigned_at` is set once and cannot be cleared or
+  moved: reviving an assignment restores a driver, and their link, to a job they were taken off.
+
+`ck_driver_assignments_mobile` checks E.164 shape and nothing about allocation, mirroring
+identity's `validE164`. It is not tidiness — the mobile is the only channel the platform has to a
+person with no account, and a malformed one is a driver who never receives the link and a job that
+stalls with nobody knowing why. The name check is `driver_name ~ '\S'` rather than
+`btrim(driver_name) <> ''`, because `btrim`'s default character set is the space alone and the
+first version of it accepted a tab — which is exactly what a form field returns when somebody tabs
+through it. The test caught that, which is the argument for testing against a real database rather
+than reading the constraint and believing it.
+
+**What SHIP-106 has to decide, which this deliberately did not:** who made the assignment is not
+stored. It is an account for a provider and *not* an account for an administrator —
+`ck_users_role` refuses `'admin'`, because admin sign-in is a separate system (SHIP-147) — so
+recording it means the polymorphic `actor_type`/`actor_id` pair `audit_log` and
+`job_status_history` carry, and SHIP-106 is the ticket that knows whether an administrator may
+assign at all. Until then the `Awarded → Driver assigned` history row records who did it. The same
+narrowness, which is `000400`'s discipline, leaves the token columns to SHIP-107 and revocation to
+SHIP-109. There is also no `CHECK` that the job has reached `Awarded`: a `CHECK` cannot see
+another table's column, so SHIP-106 enforces it where the assignment is made, exactly as `000400`
+does for the customer's role.
+
+### What SHIP-110 built, and why its two clocks are structural rather than conventional
+
+`milestones`, migration `000601`, and no endpoint either — demonstrated by
+`services/core/migrations/milestones_test.go`, on the same reasoning as SHIP-105 above.
+
+**`milestones` is deliberately not `job_status_history`, and conflating them is the mistake that
+table's header comment exists to prevent.** A history row is what the job's status *did*, and
+`000402`'s guard will not accept a status change no row describes. A milestone is what an actor
+*recorded*, and it may legitimately move nothing: `Docs/02` §3.1 requires a queued "Picked up"
+arriving after "In transit" to be absorbed rather than rejected (SHIP-112), and a "Delivered"
+recorded offline against an administrator's cancellation to be retained with its reason
+(SHIP-113). Neither is a transition, so neither could be a history row —
+`ck_job_status_history_moves` would refuse it outright, and the guard would have nothing to guard.
+A milestone that *does* move the job produces two rows in one transaction saying two different
+true things, and that pair is what makes an offline delivery reconstructable.
+
+**The dual timestamps are structural, which is the one thing to check if you review only part of
+this.** `000401` keeps its two clocks apart by convention — a `DEFAULT now()` and a guard that
+never names the column — and that holds while one function does the writing. Milestones are
+written from the driver portal, the mobile sync worker and the admin panel, so
+`milestones.server_recorded_at` is `NOT NULL` with **no default** and a `BEFORE INSERT` trigger
+that *refuses* an insert naming it and fills it from `now()` otherwise. Two columns are worth
+nothing if a caller can write one value to both: that record would say the platform received a
+milestone at the exact instant a device claims to have recorded it, which never happens and is
+precisely what somebody backdating a delivery would write. The table is append-only besides, so
+neither clock can overwrite the other afterwards either. A four-milestone offline batch synced in
+one transaction is tested end to end: four recorded times, one arrival.
+
+**An implausible actor time is recorded, not refused.** A device clock hours fast is evidence, and
+`Docs/02` §3.1 asks for the update to be absorbed rather than rejected — refusing it would discard
+work a driver actually did. There is no bound on `actor_recorded_at` and there should not be one.
+
+**There is deliberately no uniqueness on `(job_id, milestone)`,** and the absence is a decision
+with a test on it. A repeated *request* is stopped by the idempotency key (SHIP-15, SHIP-111),
+which is a different thing from a repeated *milestone*: a driver who reaches a pickup, finds
+nobody there and returns later records "En route to pickup" twice, and `Docs/02` §5 calls that
+failed attempt an ordinary outcome. A unique index would refuse it, and would also refuse the late
+arrival SHIP-112 exists to absorb.
+
+**The five milestones are a delivery vocabulary, not the twelve job statuses.** `Docs/02` §2 says
+so — "describing what a driver records, not constraining what the guard accepts" — and
+`internal/delivery` declares its own constants rather than importing `jobs.Statuses`, which
+domains may not do anyway. `ck_milestones_milestone` is paired with `delivery.Milestones` in both
+directions per `Docs/10` §3.4, and the test also asserts what the constraint must *not* permit:
+`'Completed'` is reached by seventy-two hours passing (`Docs/02` §6.1) and nobody records it. The
+actor list is narrower than `job_status_history`'s for the same reason — `Docs/02` §3 permits the
+awarded provider, their driver, an administrator with a reason, and the platform. **Not a
+customer**: confirming a delivery is a status transition, not recording one. `actor_id` carries no
+foreign key because it points at three different tables — a `users` row for a provider, a
+`driver_assignments` row for a driver, and neither for an administrator — which is the convention
+`000401` declared and this follows.
+
+**One note for the wave reconciliation:** both test files are new files in a directory other
+tracks also add files to, which is the established pattern (`jobs_test.go`,
+`device_sessions_test.go`) rather than an edit to a shared surface. `milestones_test.go` reuses
+`quotedLiteral` from `jobs_test.go`, since two package-level names cannot both be that and a
+second identically shaped regexp is how the two drift.
+
+### What SHIP-134 built, the dependency it took, and the two designs it rejected
+
+The publisher. `outbox` and `internal/events` have existed since the foundation; §4 has carried
+"the publisher, that is M5 and stays there" since wave 1, and this closes it. No migration —
+`outbox` is `000004` and needed nothing.
+
+**A new dependency: `github.com/segmentio/kafka-go` v0.4.51.** There was no Kafka client in
+`go.mod`, and `go.mod` is a shared surface, so this was authorised deliberately rather than taken
+opportunistically (`Docs/10` §9.2). Three things decided it. **Pure Go**, which rules out the
+librdkafka bindings — cgo costs the static binary and complicates the Linux runner, and no
+document has chosen a vendor. **Synchronous produce as the default**, which is the whole shape an
+outbox needs: a call that returns after the broker has acknowledged, not a callback. And **one
+module for producing, consuming and admin**, so SHIP-135 and SHIP-137 are served by the same
+dependency rather than a second one. franz-go is faster and more actively maintained and would
+have been the choice if throughput were the constraint; it is not, for a task draining a few
+hundred rows every two seconds, and its produce path is a callback with a `ProduceSync` wrapper
+around it. `go mod tidy` pulled `klauspost/compress`, `pierrec/lz4/v4` and the `xdg-go` SCRAM
+chain with it. The client sits behind `EventPublisher`, one method declared in `outbox.go`, so
+replacing it is a change to one file.
+
+**The publisher lives in `cmd/worker`, not in `internal/events`.** Putting the reader beside the
+writer was the obvious first answer and it is the wrong one, for the transitivity reason that
+already produced the fourth boundary rule at SHIP-15c: **every domain imports `internal/events`**,
+because every domain emits. A Kafka client imported from there is linked into `cmd/api` and into
+every domain's test binary to serve one task in one binary none of them run. `internal/events/publish`
+would have avoided that and needed no edit to `internal/boundaries` either — a subpackage of
+registered infrastructure is classified by its first segment — and it was rejected for a smaller
+reason: the drain is a claim loop, claim loops live in `cmd/worker`, and `checkClaim` is the check
+that a claim query actually says `FOR UPDATE SKIP LOCKED`. Reaching it from another package means
+exporting it or writing the query without it, and the second is the mistake `claim.go` exists to
+catch. A platform adapter was never in the running: CLAUDE.md admits one only where a second
+implementation exists today, and there is one Kafka.
+
+**Publish, then mark, then commit — and it is the commit that carries the guarantee.** The row is
+marked only after the broker acknowledges, and the mark becomes durable only at commit, which
+leaves three outcomes and no fourth. The publish fails: the pass returns an error, `db.InTx` rolls
+back, `published_at` is still NULL, the advisory locks are released, and the next pass finds the
+same rows. That is the unreachable-broker case, and it is why the mark cannot come first. The
+publish succeeds and the commit does not: the events are on the broker and the rows still look
+unpublished, so they publish again — the at-least-once window `Docs/06` §4.0 names, and the reason
+every consumer deduplicates on the event id. Or both succeed. **There is no outcome in which a row
+is marked and never published**, and that asymmetry is the entire design: a duplicate is a solved
+consumer problem, a lost award notification is not.
+
+**The unit of division is the aggregate, not the row, and that is a correction to what SKIP LOCKED
+alone gives you.** `000004` promises ordering per aggregate. A claim that only said
+`WHERE published_at IS NULL ORDER BY occurred_at, id FOR UPDATE SKIP LOCKED LIMIT n` does not keep
+it once two workers run, which a rolling deployment guarantees: worker A takes the oldest hundred
+rows including job X's first two events, worker B skips A's locks and takes the next hundred
+including job X's third, and if B reaches the broker first — it will whenever A's batch is larger
+or its connection slower — job X's events arrive out of order and nothing reports it. A
+transaction-scoped advisory lock per aggregate closes it, because the lock is atomic: B is refused
+job X outright and moves to an aggregate nobody holds, so the work is still divided rather than
+duplicated. The row lock is kept as well, and not as ceremony — it is what releases a dead
+worker's claim.
+
+**Where the qual goes is not a style question, and this is the finding worth carrying forward.**
+The first version put `pg_try_advisory_xact_lock` in the claim's `WHERE`. It is shorter and it is
+wrong, because **how many rows a qual is evaluated against is the planner's decision, not the
+query's**. With the partial index driving an ordered index scan it runs on roughly `LIMIT` rows;
+on a small table PostgreSQL prefers a bitmap scan and a `Sort`, which evaluates the qual on the
+entire backlog before `LIMIT` applies — so one worker locks every aggregate in the outbox and a
+second worker gets nothing. Correct, and a throughput collapse that appears only above a certain
+table size. `TestOneAggregateBelongsToOneWorker` found it on five rows. The fix is two statements
+with a `MATERIALIZED` CTE: the `LIMIT` is fixed before any lock is attempted, so exactly the
+distinct aggregates among the oldest batch rows are tried and no others, whatever the planner
+does.
+
+**It creates no topics, deliberately.** SHIP-135 owns the topic set, and a topic conjured here
+would take whatever partition count seemed reasonable — partitions can be added but never removed,
+and adding one moves every key to a different partition, which silently ends the ordering promise
+above. The broker refuses auto-creation too (`deploy/docker-compose.yml`). Until SHIP-135, a
+publish to a topic nobody created fails the pass and leaves the rows claimable, which is the
+correct direction to fail. `topicFor` is one line and is where SHIP-135 will change it:
+`shipper.<aggregate_type>`.
+
+**`Task.Close` was added at SHIP-15g for exactly this and is now used.** The producer is built in
+the registration closure and released by `Close`, which the scheduler calls after the loop stops
+on a fresh context bounded by `shutdownTimeout` — a flush inherited from the cancelled context
+would be cancelled before it began. `kafka.Writer.Close` takes no context, so the wait is done in
+`closeWriter`: a close that outlives the window is reported rather than waited on, because holding
+a deployment open until SIGKILL discards the buffer the hook exists to protect. **No field was
+added to `Deps`.**
+
+**`make verify` prints 235 checks across 10 sections on the merged tree**, the tenth being
+`scripts/verify/80-notifications.sh` — 80–89 is the notifications range. It is a real end-to-end
+run and not a restatement of the tests: it empties `shipper.job`, registers its own customer and
+cancels a draft through the API so that a real endpoint emits one event, writes three more in a
+committed transaction and one in a rolled-back one, runs the actual worker binary against the
+actual broker, SIGTERMs it, and reads the messages back with Kafka's own console consumer. The
+whole path is exercised — endpoint, transaction, outbox, worker, broker, consumer.
+
+**Three things that section found, none of which a test could have.** First, **the console
+consumer interleaves**: with three partitions it reads three independent streams, so the first
+version of the comparison, which matched ordered lists, failed. That is the shortest available
+demonstration that "ordering is per aggregate, not global" is a property of what was built rather
+than a sentence in a comment. The check is now a set comparison plus a per-aggregate order check
+over every aggregate on the topic — and a payload check that looked at "the first message" fell
+to the same assumption a run later, so it now looks its event up by id.
+
+Second, **cross-section state, for the second time in this harness's life.** The original
+comparison was against `select id from outbox where published_at is not null` — every job event
+the database had ever published — on the reasoning that the topic had just been recreated empty.
+SHIP-68 broke it on the merge: that section runs the real worker to demonstrate job expiry, and
+the worker runs *every* registered task, so it drains the outbox and marks job events published
+before this section wipes the topic. Those rows are legitimately published and legitimately
+absent from the fresh topic. **Nothing was lost and the product was right; the assertion was too
+broad.** It had also been silently intermittent: on a machine where `shipper.job` did not yet
+exist, SHIP-68's publisher passes failed against the missing topic, left every row claimable, and
+the broad query happened to agree. The fix is a fence — `published_at > $outbox_fence`, taken
+after the topic is recreated and before anything can publish — so the comparison covers exactly
+what this section's worker produced. **SHIP-47's rate-limit bucket was the first instance of the
+same shape**, and the recipe is the same both times: fence what you assert on, and own what you
+assert about. The section now registers its own customer rather than reading 50-jobs.sh's token,
+and its header says so for the next section that runs the worker or reads Kafka.
+
+Third, a consequence of the second worth stating on its own: **`cmd/worker` is one binary and
+every section that starts it starts every task.** SHIP-68's section is about job expiry and
+publishes the outbox as a side effect. That is correct behaviour and it will keep surprising
+people.
+
+The transactional half is `services/core/cmd/worker/outbox_test.go`, against a real PostgreSQL
+with the broker stood in for by a recorder: an event whose transaction rolled back is never
+published, an unreachable broker leaves every row claimable and the next pass publishes them in
+order, a crash between publishing and committing publishes the same event twice rather than
+losing it, and one aggregate belongs to one worker while a second worker is still handed the
+other.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
 |---|---|---|
 | **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
-| **SHIP-134** | `outbox` table, `internal/events` writer | The publisher. That is M5 and stays there |
+| ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 
 **SHIP-65 has left this table.** Its *Done when* — "returns full job including budget" — was met
 but for the budget for two waves, and SHIP-67 closed it with the column and the proof together.
@@ -1917,6 +2160,18 @@ thirty days without ever refreshing.
 
 **`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 
+**The outbox has no dead-letter path, so one event the broker will never accept stops the
+aggregates in its batch.** SHIP-134 fails the whole pass when any event in it fails to publish,
+which is right for the case that actually happens — the broker is unreachable, and every row must
+stay claimable — but it means a permanently unacceptable event, one over the message-size limit
+say, blocks its batch until somebody looks. The pass logs the oldest event's type and id, so it is
+findable rather than mysterious. Three ways out and none of them is this ticket's: bound the
+payload where the domain writes it, which is the cheapest and probably the right one; park a row
+after N failed attempts, which needs a second state column and `000004` says `published_at` is the
+publisher's only state; or publish per event and mark per event, which trades the blockage for
+more duplicates. **Decide with SHIP-135**, which is where the schema and the size of a payload get
+settled anyway.
+
 ## 10. The done list, in a form a script can read
 
 **The list is `Docs/11-done.txt`**, one ticket per line. It is still authoritative and it is
@@ -1924,9 +2179,8 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Of the two
-tickets left in §4, only SHIP-134 is absent** — SHIP-149 is in the list *and* partly done, and that
-is not a contradiction to be tidied away.
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is now in the list**, and SHIP-149 is the only row left in it — which is
+not a contradiction to be tidied away.
 
 **A ticket can be both**, and this is the shape: it landed, it is named by a commit subject, and one
 clause of its *Done when* belongs to a ticket that does not exist yet. SHIP-149 shipped the
