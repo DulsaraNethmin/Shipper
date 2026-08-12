@@ -18,18 +18,20 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 69 | 183 |
+| **Done** | 70 | 188 |
 | Remaining | 135 | 448 |
-| **Total** | 204 | 631 |
+| **Total** | 205 | 636 |
 
 The totals grew by two tickets rather than shrinking: SHIP-15c and SHIP-23a were added to `Docs/09` during wave 2, both work the plan assumed and no ticket owned.
 
-They grew again by one in wave 3: **SHIP-15e** (M0, 5 points), the serial pre-step that split `scripts/verify-foundation.sh` into a harness plus one file per domain and moved the done list out of this file. Same pattern as its two predecessors — work the plan assumed and no ticket owned — which is now the third time, and is worth reading as the norm rather than the exception. Totals moved 203 → 204 tickets and 626 → 631 points.
+They grew again by one in wave 3: **SHIP-15e** (M0, 5 points), the serial pre-step that split `scripts/verify-foundation.sh` into a harness plus one file per domain and moved the done list out of this file. Totals moved 203 → 204 tickets and 626 → 631 points.
+
+And once more before wave 4: **SHIP-15g** (M0, 5 points), which took 205 tickets and 636 points. Same pattern a fourth time — a shared surface two different tracks had each parked work against, plus a defect neither could fix from a domain branch. **This is now the norm rather than the exception**, and the useful reading is that a wave costs one prep ticket: the pre-step is not overhead the process has failed to eliminate, it is the process. Budget for the next one rather than being surprised by it.
 
 | Milestone | Done | Points |
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
-| **M0** Foundation | 29 / 33 | 73 / 87 |
+| **M0** Foundation | 30 / 34 | 78 / 92 |
 | **M1** Identity | 26 / 28 | 71 / 78 |
 | **M2** Jobs | 11 / 26 | 33 / 78 |
 | **M3** Bidding and award | 0 / 27 | 0 / 95 |
@@ -38,7 +40,7 @@ They grew again by one in wave 3: **SHIP-15e** (M0, 5 points), the serial pre-st
 | **M6** Admin | 1 / 20 | 3 / 65 |
 | **M7** Hardening | 2 / 19 | 3 / 56 |
 
-**M0 has four tickets left and not one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. Every buildable M0 ticket is done, for the third time — **SHIP-15e** was the last one, and like SHIP-23a before it, it was a recommendation in §9 before it was a ticket.
+**M0 has four tickets left and not one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. Every buildable M0 ticket is done, for the fourth time — **SHIP-15g** was the last one, and like SHIP-23a and SHIP-15e before it, it was a recommendation in §9 and §3 before it was a ticket.
 
 **Wave 3 has landed in full.** Three lanes, seventeen tickets, forty-eight points, **no trim taken**, and exactly one conflict in the entire wave — one line of this file holding a number. §7 has the detail, including why the `contracts/openapi.yaml` collision the whole pre-step was designed around never materialised.
 
@@ -148,7 +150,7 @@ out of `CHECKS` deliberately — it needs a device, and the Flutter CI job is a 
 until SHIP-24…27 — so it is a check a person invokes when the storage or the session changes.
 The file's own header says which invocation demonstrates which claim.
 
-### M0 — Foundation (29 of 33)
+### M0 — Foundation (30 of 34)
 
 | Ticket | What |
 |---|---|
@@ -491,14 +493,17 @@ out half a credential: a refresh token the caller cannot exchange for anything. 
 issuer are built inside `identityHandler`, from configuration, with no field added to `Deps` —
 which is SHIP-15c's acceptance criterion holding for a second wave.
 
-**One thing the block scheme costs, found here and worth knowing before the next domain hits it.**
+**One thing the block scheme costs, found here — ~~and worth knowing before the next domain hits
+it~~. Closed at SHIP-15g, which now refuses rather than skipping; see §3.**
 `cmd/migrate` uses stock golang-migrate, which applies only migrations *above* the recorded
 version. A developer database that has jobs migrations applied sits at `000402`, so a new identity
 migration at `000103` is silently skipped by `make migrate-up` — it reports "no change" and the
 column never appears. Tests and CI are unaffected: `make test-db-template` drops and rebuilds from
 scratch, and CI runs `up → down all → up` against an empty database. The local fix is
-`make migrate-down n=all && make migrate-up`. This will bite every migration in `identity`,
-`profiles` and `fleet` from now on, because their blocks sit below `jobs`.
+`make migrate-down n=all && make migrate-up`, which is still the fix — the change is that the tool
+now says so instead of reporting success. It would otherwise have bitten every migration in
+`identity`, `profiles` and `fleet`, whose blocks sit below `jobs`, starting with SHIP-78 in the
+very next wave.
 
 ### What SHIP-40 built, and the design it rejected
 
@@ -1120,9 +1125,11 @@ shared-surface change SHIP-60 could not make from a domain branch. `cmd/api` the
 outside development and logs it once at startup. Falling back to the deterministic stub was the
 alternative and is worse: it writes coordinates that are stable, plausible, inside Australia and
 entirely fictional, and a fictional coordinate on a real job is much harder to notice than none.
-**This is a request rather than a finding — see §9's note on the mobile bundle identifier for the
-shape.** Whoever next owns `internal/config` adds the two variables and `newGeocoder` in
-`cmd/api/routes_jobs.go` builds the provider from them.
+~~**This is a request rather than a finding.** Whoever next owns `internal/config` adds the two
+variables and `newGeocoder` builds the provider from them.~~ **Granted at SHIP-15g — see §3.**
+`GEOCODING_BASE_URL` and `GEOCODING_API_KEY` exist, and `newGeocoder` builds
+`geocoding.NewProvider` from them. The nil path survives for the case where nothing is configured,
+and the refusal to fall back to the stub outside development is unchanged.
 
 ### What SHIP-61 built, and what it is the first of
 
@@ -1315,12 +1322,14 @@ a job at exactly the page boundary, which is the failure keyset pagination exist
 by another route. `ORDER BY created_at DESC, id DESC` matches `idx_jobs_customer`, so the list
 needed no index of its own.
 
-**The page sizes are constants in `internal/pagination`, and `Docs/10` §4.5 says they come from
-configuration.** They do not, because `internal/config` has no fields for them and adding two is a
-shared-surface change a domain branch cannot make — the same position SHIP-60 reached over
-`GEOCODING_*`. They are in `pagination` rather than in `jobs` because every list endpoint needs the
-same answer. **This is a request:** whoever next owns `internal/config` moves them, and no caller
-changes, because callers ask `pagination.Limit`.
+**~~The page sizes are constants in `internal/pagination`, and `Docs/10` §4.5 says they come from
+configuration.~~ Granted at SHIP-15g — see §3.** They were constants because `internal/config` had
+no fields for them and adding two is a shared-surface change a domain branch cannot make — the same
+position SHIP-60 reached over `GEOCODING_*`, which is what turned two requests into one prep
+ticket. `PAGINATION_DEFAULT_PAGE_SIZE` and `PAGINATION_MAX_PAGE_SIZE` now exist, and **no caller
+changed**, exactly as the request predicted: callers ask `pagination.Limit`, and `cmd/api` installs
+the bounds once before serving. They live in `pagination` rather than in `jobs` because every list
+endpoint needs the same answer.
 
 **A limit above the maximum is narrowed rather than refused, and a limit of `0` is refused.** The
 asymmetry is deliberate: a client asking for more than the platform will give is asking for a page,
@@ -1335,6 +1344,66 @@ customer with no jobs opens the app and never again in testing.
 and reading the list once and grouping it beats one request per group; widening the parameter later
 is additive. The filter takes the wire form and refuses the stored one — `?status=Draft` is a `400`,
 not an empty list, because an empty list would tell a client its filter worked.
+
+### SHIP-15g — the wave-4 pre-step, and one thing it found already built
+
+Three shared surfaces, closed serially before wave 4's tracks opened. The pattern is SHIP-15c's
+and SHIP-15e's: a wave costs one prep ticket, and §1 now says so rather than treating it as a
+surprise.
+
+**`internal/config` gained what two wave-3 lanes had each parked.** `GEOCODING_BASE_URL` and
+`GEOCODING_API_KEY` (SHIP-60's request) and `PAGINATION_DEFAULT_PAGE_SIZE` /
+`PAGINATION_MAX_PAGE_SIZE` (SHIP-66's, required by `Docs/10` §4.5). Both lanes had written a
+documented constant and filed a request, because `internal/config` is a shared file a domain
+branch must not edit — the rule working, but twice in one wave, which is what made it a ticket.
+
+`cmd/api/routes_jobs.go` now builds `geocoding.NewProvider` when a base URL is configured, so the
+nil-geocoder path is reached only when nothing is set. **Falling back to the stub outside
+development is still refused**, for the reason SHIP-60 gave: it writes coordinates that are
+stable, plausible, inside Australia and entirely fictional, and a staging environment full of
+those is worse than one with none, because it looks like it works. A key set without a base URL is
+now refused at load — the shape of a half-finished configuration whose only symptom would
+otherwise be silence.
+
+`internal/pagination` keeps `Limit(raw)`, exactly as SHIP-66 promised: the bounds are package
+state installed once by `cmd/api` before it serves, so no caller changed. `SetBounds` ignores
+values `internal/config` would have refused, because a zero default would make every page empty
+and read as a database with no rows.
+
+**The migration guard — the defect that would have bitten Track C in this very wave.** Stock
+golang-migrate applies only migrations numbered *above* the recorded version. Numbers here come
+from reserved per-domain blocks, not in time order, so a development database sitting at `000404`
+silently skips a new identity migration at `000105`: `make migrate-up` prints "no change" and the
+column never appears. **Fleet is block 300–399 and SHIP-78 is in this wave**, so this was days
+from happening rather than theoretical.
+
+Decided: **fail loudly, do not reorder.** Applying out of order would run a migration against a
+schema it was never written for and that no test covers — a migration is a program, not a patch,
+and discovering the mismatch halfway leaves a dirty schema. Refusing is smaller and matches what
+this repository already does: `migrate-create` refuses a missing `domain=` rather than guessing.
+
+Answering it at all needed a record, because `schema_migrations` holds one integer and cannot say
+whether `000105` ran before the file existed. `cmd/migrate` now keeps `schema_migrations_applied`
+beside it, created by the tool rather than by a migration, and a database that predates it is
+backfilled from its version on first run. **Demonstrated by hand, not believed**: a throwaway
+`000105` on a database at `000404` produced a refusal naming the migration, its domain, and the
+one-line fix; `make migrate-down n=all && make migrate-up` then applied it. The narrow gap worth
+naming is that a database *already* bitten before the guard existed is backfilled as healthy —
+nothing can distinguish that, and the same command fixes it.
+
+**`cmd/worker` did not need the registration seam this ticket was scoped to build.** SHIP-67a
+built it in wave 2: `Deps` is pre-seeded, `register` is called from an `init`, and a domain
+contributes `cmd/worker/tasks_<domain>.go` and edits nothing shared. SHIP-68 and SHIP-134 will be
+its first two clients and **will not collide**. Recorded because the wave-4 plan named this as the
+one thing making four tracks safe, and it was already true.
+
+What was genuinely missing is smaller and real: **a task that owns a resource had no way to
+release it.** `Deps` carries the pool, the clock and configuration on the reasoning that a task is
+a pure function of those — true of job expiry, bid expiry and auto-complete, all query-only, and
+false of SHIP-134, which holds a Kafka producer with buffered messages behind it. `Task.Close` is
+now optional and called after the task's loop stops, with a fresh context rather than the
+cancelled one, since a `Close` inherited from a cancelled context could never flush. A hook on the
+task rather than a field on `Deps`, so every future task does not carry a producer it never uses.
 
 ## 4. Partly done — do not treat these as finished
 
