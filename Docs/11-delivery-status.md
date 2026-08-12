@@ -1405,6 +1405,91 @@ now optional and called after the task's loop stops, with a fresh context rather
 cancelled one, since a `Close` inherited from a cancelled context could never flush. A hook on the
 task rather than a field on `Deps`, so every future task does not carry a producer it never uses.
 
+### What SHIP-50 built, and the two places it put things nobody expected
+
+**A `401` now triggers one refresh and one replay, and several at once still produce one
+refresh.** The second clause is the ticket. Three requests going out with the same token and all
+being refused is the ordinary shape of a phone coming back into signal — and a client that
+refreshed per request would present an already-rotated token, which SHIP-40 answers by revoking
+the **whole device session**. The client would be doing to itself exactly what that mechanism
+exists to catch somebody else doing. One in-flight future serialises them;
+`auth_interceptor_test.dart` holds the refresher open so all three failures land while the
+refresh is genuinely in flight, which is a different code path from three landing after one has
+finished.
+
+**The other half of "refresh once" is not a lock, and it is the half a lock does not cover.** A
+`401` that arrives *after* somebody else's refresh completed has nothing to queue behind. So the
+interceptor passes the session the token the failed request actually carried, and the session
+answers with the current one when they differ rather than refreshing again.
+
+**The replay reuses the original request's `Idempotency-Key`, and that is correct by construction
+rather than by remembering.** It re-sends the same `RequestOptions` object, so the header is
+already in it. A fresh key would turn one bid into two — `Docs/07` §4 has the key generated where
+the user acts and reused across every retry, and a refresh-and-replay is a retry by any reading:
+the platform saw the attempt, refused it for a credential reason, and is about to see it again.
+`ActionKey` needed no change; wave 3 had already written the rule down.
+
+**A refresh is sent through a second transport carrying no interceptor at all.** The credential is
+body-borne, so a bearer token on it would be the expired token sent to the endpoint that replaces
+it — and it would put the refresh inside the interceptor whose answer to a failure is to refresh.
+SHIP-42 closed that loop from the platform's side by answering `400` rather than `401`; this
+closes it from the client's, so neither side is the only thing holding it.
+
+**Signing out on a failed refresh is decided by `ActionKey.outcomeUnknown`, not by a status
+code.** `identity_refresh_token_invalid` means the platform saw the token and will not honour it:
+the session is over. A dropped connection, a `503` or a proxy's error page say nothing about
+whether the session is alive, and signing out on those would end a perfectly good session because
+the signal dropped — a driver in a tunnel. Reusing the predicate that already decides whether to
+keep the idempotency key means the retry rule and the sign-out rule cannot drift apart.
+
+**Two things landed where SHIP-49 said they would not.**
+
+- **The access token is a private field on `SessionController`, not a field on `SessionState`.**
+  `session_state.dart` had anticipated the opposite. `freezed` writes a `toString` over every
+  field, so a token in the state is a token in any log line or crash report that prints the
+  session — the thing `Docs/07` §3 forbids in the same sentence as preferences and documents, and
+  the reason the *refresh* token was kept out of the state in the first place. It is also not view
+  state: no widget renders it, so a field would rebuild every listener on each refresh. The role,
+  which is view state, stays in the state. The document was corrected rather than left.
+- **`POST /v1/auth/refresh` is in `core/auth`, not on `IdentityRepository`.** The wave brief
+  expected the repository. Refreshing is not a screen's action — nothing renders its result and
+  the only caller is the session — and putting it on the identity feature would mean `core/auth`
+  importing `features/identity`. That is the mobile shape of the edge `CLAUDE.md` calls the one
+  easiest to break by accident: every feature already imports `core/`, so one import the other way
+  welds all seven to identity. `core/api/auth_interceptor.dart` declares the two-member interface
+  it needs from the session and `apiClientProvider` supplies the closure, which is
+  `internal/httpx`'s rule written in Dart. Sign-in stayed on `IdentityRepository`, because signing
+  in *is* a screen's action.
+
+**The first refresh happens as soon as the keychain answers, and the shell is published before
+it.** Without that the role would arrive "whenever something happens to make a request", which in
+M1 is nothing at all — and SHIP-52's role-pending shell would be what every cold start showed for
+ever. Holding the splash for the round trip was the alternative and is worse: a cold start would
+be as slow as the signal, and offline as slow as the connect timeout. The visible consequence is
+that "signed in and not yet knowing as whom" is now the window before the refresh answers, plus
+the cold start that cannot reach the platform — `role_selection_screen_test.dart` reaches it by
+stubbing the refresher unreachable, which is the honest way to reach it.
+
+**`TokenPair` is hand-written rather than `freezed` + `json_serializable`, for the `toString`
+reason above.** It also reads only two of the contract's four fields: nothing schedules on
+`expires_in`, because this client refreshes when the platform says a token is not accepted and
+never on a clock, and `Docs/07` §4 is built on handsets whose clock is wrong after a spell out of
+signal.
+
+**`roleFromAccessToken` does not verify and must never start.** The signing key is the platform's
+(`internal/identity/token.go`), and a build carrying a verification key would not make the check
+mean anything. A device that edits its own token gets a different *shell* and exactly the same
+refusals. Three answers, and the difference between two of them matters: a known role, `unknown`
+for a role this build has not heard of (which the shell renders as "update the app"), and `null`
+for a token that said nothing readable — collapsing the last two would put an update prompt in
+front of somebody whose token had simply not arrived yet.
+
+**How it was demonstrated.** `make flutter-check` in the wave-4 worktree: 198 host tests, up from
+166. The interceptor tests run through the real `apiClientProvider` transport, the real
+`SessionController` and the real single-flight rule, with a stub only at the socket and the
+Keychain — an interceptor tested against a hand-made session would pass with the session wired to
+nothing, and "concurrent calls refresh once" is a claim about the two of them together.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

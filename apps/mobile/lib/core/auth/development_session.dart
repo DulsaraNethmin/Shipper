@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/auth/session_controller.dart';
+import 'package:shipper/core/auth/token_pair.dart';
 import 'package:shipper/core/auth/user_role.dart';
 
 /// Puts a placeholder token in the keychain so the signed-in shells can be reached (SHIP-49,
@@ -54,10 +56,7 @@ class DevelopmentSessionButton extends ConsumerWidget {
       // the same placeholder, and renaming it would break the cold-start test for no reason.
       key: role == null ? const Key('development-session') : Key('development-session-${role!.name}'),
       onPressed: () => unawaited(
-        ref.read(sessionProvider.notifier).signIn(
-              refreshToken: developmentPlaceholderToken,
-              role: role,
-            ),
+        ref.read(sessionProvider.notifier).signIn(developmentPlaceholderPair(role)),
       ),
       child: Text(label),
     );
@@ -66,3 +65,20 @@ class DevelopmentSessionButton extends ConsumerWidget {
 
 /// Recognisable in a keychain dump, and obviously not a real token.
 const developmentPlaceholderToken = 'development-placeholder-not-a-credential';
+
+/// A pair shaped like the platform's, carrying [role] where the platform would sign it.
+///
+/// The session reads the role from the access token's claim rather than from an argument
+/// (SHIP-50), so this has to produce something with a claim in it. The result is an **unsigned**
+/// JWT shape: three segments, a readable payload, and a signature segment that is not one. The
+/// platform refuses it on sight, which is the point — this is a fixture for reaching a shell by
+/// hand in a debug build, not a credential.
+TokenPair developmentPlaceholderPair(UserRole? role) {
+  final claims = role == null ? <String, Object?>{} : <String, Object?>{'role': role.wireName};
+  final payload = base64Url.encode(utf8.encode(jsonEncode(claims))).replaceAll('=', '');
+
+  return TokenPair(
+    accessToken: 'notaheader.$payload.notasignature',
+    refreshToken: developmentPlaceholderToken,
+  );
+}

@@ -14,6 +14,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
+import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/health/health_repository.dart';
@@ -21,6 +22,7 @@ import 'package:shipper/core/health/health_status.dart';
 import 'package:shipper/core/routing/app_router.dart';
 
 import '../auth/fake_token_store.dart';
+import '../auth/session_fixtures.dart';
 
 void main() {
   group('the guard, as a table', () {
@@ -228,6 +230,10 @@ Widget _scope(FakeTokenStore store, {required Widget child}) => ProviderScope(
         healthProvider.overrideWith(
           (ref) => const HealthStatus(status: 'ok', version: 'v0.0.0-test'),
         ),
+        // A restored session refreshes as soon as the keychain answers (SHIP-50). Without this
+        // every cold-start test here would open a socket to whatever is listening on the local
+        // API port — which is nothing on CI and, on a developer's machine, is the API.
+        sessionRefresherProvider.overrideWithValue(FakeSessionRefresher()),
       ],
       child: child,
     );

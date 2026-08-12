@@ -17,6 +17,14 @@ class FakeTokenStore implements TokenStore {
   /// actually cleared it rather than only that the state changed.
   String? refreshToken;
 
+  /// Every value ever written, in order.
+  ///
+  /// Two things need it. Rotation is a write per refresh (`Docs/07` §3), so "the new token was
+  /// stored" is a claim about a sequence rather than about a final value. And the role must
+  /// **not** be written beside the token — a store that only exposed its current contents could
+  /// not tell "one write, the token" from "two writes, one of them the role".
+  final written = <String>[];
+
   bool _unreadable = false;
 
   /// Whether [clear] was called, which is a different fact from the store being empty.
@@ -29,7 +37,10 @@ class FakeTokenStore implements TokenStore {
   }
 
   @override
-  Future<void> writeRefreshToken(String token) async => refreshToken = token;
+  Future<void> writeRefreshToken(String token) async {
+    written.add(token);
+    refreshToken = token;
+  }
 
   @override
   Future<void> clear() async {

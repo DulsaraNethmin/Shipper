@@ -1,30 +1,48 @@
-// SHIP-49 — the cold start, in isolation from the widgets that show it.
+// SHIP-49 and SHIP-50 — the cold start and the refresh, in isolation from the widgets that show
+// them.
 //
 // Everything the routing guard does follows from the three states this controller produces, so
 // these run against a ProviderContainer rather than a pumped app: a failure here is a failure
 // in the session, and a failure in app_router_test.dart is then unambiguously a failure in
 // routing.
+//
+// What runs end to end through the real transport — a 401, the replay, and several concurrent
+// failures producing one refresh — is core/api/auth_interceptor_test.dart. This file is about
+// what the session does on its own.
+
+import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shipper/core/auth/session_controller.dart';
+import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_store.dart';
+import 'package:shipper/core/auth/user_role.dart';
+import 'package:shipper/core/errors/api_failure.dart';
 
 import 'fake_token_store.dart';
+import 'session_fixtures.dart';
 
 void main() {
-  ProviderContainer containerWith(FakeTokenStore store) {
+  ({ProviderContainer container, FakeSessionRefresher refresher}) containerWith(
+    FakeTokenStore store, {
+    FakeSessionRefresher? refresher,
+  }) {
+    final refresh = refresher ?? FakeSessionRefresher();
     final container = ProviderContainer(
-      overrides: [tokenStoreProvider.overrideWithValue(store)],
+      overrides: [
+        tokenStoreProvider.overrideWithValue(store),
+        sessionRefresherProvider.overrideWithValue(refresh),
+      ],
     );
     addTearDown(container.dispose);
-    return container;
+    return (container: container, refresher: refresh);
   }
 
   group('cold start', () {
     test('begins restoring, before the keychain has answered', () {
-      final container = containerWith(FakeTokenStore());
+      final (:container, refresher: _) = containerWith(FakeTokenStore());
 
       // Read without awaiting: this is the first frame, and it is the state the splash screen
       // is shown for. A model with only signedIn and signedOut would have to guess here, and
@@ -33,7 +51,7 @@ void main() {
     });
 
     test('a stored refresh token routes the app signed in', () async {
-      final container = containerWith(FakeTokenStore(refreshToken: 'refresh-abc'));
+      final (:container, refresher: _) = containerWith(FakeTokenStore(refreshToken: 'refresh-1'));
 
       await container.read(sessionProvider.notifier).restored;
 
@@ -41,7 +59,7 @@ void main() {
     });
 
     test('an empty keychain routes the app signed out', () async {
-      final container = containerWith(FakeTokenStore());
+      final (:container, refresher: _) = containerWith(FakeTokenStore());
 
       await container.read(sessionProvider.notifier).restored;
 
@@ -49,7 +67,7 @@ void main() {
     });
 
     test('an empty string is not a session', () async {
-      final container = containerWith(FakeTokenStore(refreshToken: ''));
+      final (:container, refresher: _) = containerWith(FakeTokenStore(refreshToken: ''));
 
       await container.read(sessionProvider.notifier).restored;
 
@@ -60,7 +78,7 @@ void main() {
       // The safe direction, and the one the user can recover from. Signed in with unreadable
       // storage is an app whose every request fails and which offers no route back to a
       // sign-in screen.
-      final container = containerWith(FakeTokenStore.unreadable());
+      final (:container, refresher: _) = containerWith(FakeTokenStore.unreadable());
 
       await container.read(sessionProvider.notifier).restored;
 
@@ -68,35 +86,160 @@ void main() {
     });
   });
 
+  group('the first refresh, which is what a restored session is missing', () {
+    test('happens as soon as the keychain answers, and brings the role with it', () async {
+      // The keychain holds a refresh token and no role — the role is a claim in the access token
+      // the platform signs. Without this the shell would sit on "signed in, role not yet known"
+      // until something happened to make a request, which in M1 is nothing at all.
+      final refresher = FakeSessionRefresher()
+        ..pairs = [aTokenPair(role: UserRole.provider, refreshToken: 'refresh-2')];
+      final store = FakeTokenStore(refreshToken: 'refresh-1');
+      final (:container, refresher: _) = containerWith(store, refresher: refresher);
+
+      await container.read(sessionProvider.notifier).restored;
+
+      expect(refresher.presented, ['refresh-1']);
+      expect(container.read(sessionProvider), const SessionState.signedIn(role: UserRole.provider));
+    });
+
+    test('stores the rotated token, because the one presented is already dead', () async {
+      final store = FakeTokenStore(refreshToken: 'refresh-1');
+      final (:container, refresher: _) = containerWith(
+        store,
+        refresher: FakeSessionRefresher()..pairs = [aTokenPair(refreshToken: 'refresh-2')],
+      );
+
+      await container.read(sessionProvider.notifier).restored;
+
+      expect(store.refreshToken, 'refresh-2');
+    });
+
+    test('does not happen at all when the device is signed out', () async {
+      final (:container, :refresher) = containerWith(FakeTokenStore());
+
+      await container.read(sessionProvider.notifier).restored;
+
+      expect(refresher.calls, 0, reason: 'there is nothing to refresh with');
+    });
+
+    test('does not hold the splash: the shell is shown before the network answers', () async {
+      // Docs/07 §4 is built on connections that are sometimes not there. A cold start that
+      // waited for a round trip would be as slow as the signal, every time — and offline it
+      // would be as slow as the connect timeout.
+      final gate = Completer<void>();
+      final refresher = FakeSessionRefresher()..gate = gate;
+      final (:container, refresher: _) = containerWith(
+        FakeTokenStore(refreshToken: 'refresh-1'),
+        refresher: refresher,
+      );
+
+      // Reading is what builds the provider, which is what starts the cold start.
+      expect(container.read(sessionProvider), isA<SessionRestoring>());
+
+      for (var turn = 0; turn < 50 && refresher.calls == 0; turn++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      // The refresh is still in flight — the fake is holding it — and the app is already in the
+      // shell rather than on the splash.
+      expect(refresher.calls, 1);
+      expect(container.read(sessionProvider), isA<SessionSignedIn>());
+
+      gate.complete();
+      await container.read(sessionProvider.notifier).restored;
+    });
+
+    test('a refused refresh signs the device out', () async {
+      // identity_refresh_token_invalid: the platform saw the token and will not honour it. The
+      // session is over and the stored token is worth nothing.
+      final store = FakeTokenStore(refreshToken: 'refresh-1');
+      final (:container, refresher: _) = containerWith(
+        store,
+        refresher: FakeSessionRefresher()
+          ..failure = const ApiErrorResponse(
+            statusCode: 400,
+            code: 'identity_refresh_token_invalid',
+            message: 'Sign in again.',
+          ),
+      );
+
+      await container.read(sessionProvider.notifier).restored;
+
+      expect(container.read(sessionProvider), isA<SessionSignedOut>());
+      expect(store.refreshToken, isNull);
+    });
+
+    test('an unreachable platform does not', () async {
+      final store = FakeTokenStore(refreshToken: 'refresh-1');
+      final (:container, refresher: _) = containerWith(
+        store,
+        refresher: FakeSessionRefresher()..failure = const ApiUnreachable(),
+      );
+
+      await container.read(sessionProvider.notifier).restored;
+
+      expect(container.read(sessionProvider), isA<SessionSignedIn>());
+      expect(store.refreshToken, 'refresh-1');
+    });
+  });
+
   group('sign in and sign out', () {
     test('signing in stores the token before the state says it did', () async {
       final store = FakeTokenStore();
-      final container = containerWith(store);
+      final (:container, refresher: _) = containerWith(store);
       await container.read(sessionProvider.notifier).restored;
 
-      await container.read(sessionProvider.notifier).signIn(refreshToken: 'refresh-abc');
+      await container.read(sessionProvider.notifier).signIn(aTokenPair(refreshToken: 'refresh-1'));
 
       // The order is the assertion. A state that changed first would survive a crash as a
       // signed-in app with an empty keychain — signed out again on the next cold start, with
       // no explanation.
-      expect(store.refreshToken, 'refresh-abc');
+      expect(store.refreshToken, 'refresh-1');
       expect(container.read(sessionProvider), isA<SessionSignedIn>());
     });
 
-    test('signing out clears the store and the state', () async {
-      final store = FakeTokenStore(refreshToken: 'refresh-abc');
-      final container = containerWith(store);
+    test('signing in takes the role from the access token, not from the caller', () async {
+      // The platform fixes the role at registration and signs it into the token (SHIP-37,
+      // SHIP-45). Reading it here is reading the platform's answer rather than the client's
+      // belief about it — and there is no second copy to disagree with later.
+      final (:container, refresher: _) = containerWith(FakeTokenStore());
+      await container.read(sessionProvider.notifier).restored;
+
+      await container.read(sessionProvider.notifier).signIn(aTokenPair(role: UserRole.provider));
+
+      expect(container.read(sessionProvider), const SessionState.signedIn(role: UserRole.provider));
+    });
+
+    test('the role is not written to the keychain', () async {
+      // A stored role is a second copy that every later refresh would have to agree with, and
+      // the keychain is not where the platform's claims live.
+      final store = FakeTokenStore();
+      final (:container, refresher: _) = containerWith(store);
+      await container.read(sessionProvider.notifier).restored;
+
+      await container.read(sessionProvider.notifier).signIn(
+            aTokenPair(role: UserRole.provider, refreshToken: 'refresh-1'),
+          );
+
+      expect(store.refreshToken, 'refresh-1');
+      expect(store.written, ['refresh-1'], reason: 'one write, and it is the token');
+    });
+
+    test('signing out clears the store, the state and the access token', () async {
+      final store = FakeTokenStore(refreshToken: 'refresh-1');
+      final (:container, refresher: _) = containerWith(store);
       await container.read(sessionProvider.notifier).restored;
 
       await container.read(sessionProvider.notifier).signOut();
 
       expect(store.cleared, isTrue);
       expect(store.refreshToken, isNull);
+      expect(container.read(sessionProvider.notifier).accessToken, isNull);
       expect(container.read(sessionProvider), isA<SessionSignedOut>());
     });
 
     test('signing out ends the session even when clearing throws', () async {
-      final container = containerWith(_UnclearableStore());
+      final (:container, refresher: _) = containerWith(_UnclearableStore());
       await container.read(sessionProvider.notifier).restored;
 
       await container.read(sessionProvider.notifier).signOut();

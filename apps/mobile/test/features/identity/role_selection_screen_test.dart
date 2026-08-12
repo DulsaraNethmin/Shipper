@@ -14,10 +14,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/session_controller.dart';
+import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/auth/user_role.dart';
+import 'package:shipper/core/errors/api_failure.dart';
 
 import '../../core/auth/fake_token_store.dart';
+import '../../core/auth/session_fixtures.dart';
 import 'fake_identity_repository.dart';
 import 'signup_app.dart';
 
@@ -27,12 +30,20 @@ import 'signup_app.dart';
 ///
 /// `flutter test` runs in debug, so that affordance is present here; a release build tree-shakes
 /// it and its placeholder string away entirely.
+///
+/// **The refresher is stubbed unreachable, and that is what keeps the no-role case reachable at
+/// all.** SHIP-50 refreshes as soon as the keychain answers, and a successful refresh brings the
+/// role with it — so "signed in and not yet knowing as whom" is now the window before that
+/// answers, and the cold start that cannot reach the platform.
 Future<ProviderContainer> _signedIn(WidgetTester tester, {UserRole? role}) async {
   await tester.pumpWidget(
     ProviderScope(
       overrides: [
         tokenStoreProvider.overrideWithValue(
           role == null ? FakeTokenStore(refreshToken: 'refresh-abc') : FakeTokenStore(),
+        ),
+        sessionRefresherProvider.overrideWithValue(
+          FakeSessionRefresher()..failure = const ApiUnreachable(),
         ),
       ],
       child: const ShipperApp(),
@@ -159,10 +170,7 @@ void main() {
       // the copy says "update the app" rather than "something went wrong".
       final container = await _signedIn(tester);
 
-      await container.read(sessionProvider.notifier).signIn(
-            refreshToken: 'refresh-abc',
-            role: UserRole.unknown,
-          );
+      await container.read(sessionProvider.notifier).signIn(aTokenPair(role: UserRole.unknown));
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('shell-role-unrecognised')), findsOneWidget);
