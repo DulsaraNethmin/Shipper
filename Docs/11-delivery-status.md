@@ -1405,6 +1405,52 @@ now optional and called after the task's loop stops, with a fresh context rather
 cancelled one, since a `Close` inherited from a cancelled context could never flush. A hook on the
 task rather than a field on `Deps`, so every future task does not carry a producer it never uses.
 
+### What SHIP-105 built, and the two rules that follow from a driver having no account
+
+`driver_assignments`, migration `000600` — the first in the delivery block, and no endpoint.
+**Demonstrated by its own tests**, `services/core/migrations/driver_assignments_test.go`, rather
+than by `make verify`, which drives HTTP endpoints and this adds none. That is the treatment
+SHIP-56, SHIP-57 and SHIP-67a already had, and it is not the weaker one here: everything asserted
+is a constraint, an index or a trigger, and `Docs/06` §4.1 is right that "a mock happily accepts a
+write that the actual constraint would reject".
+
+**There is no foreign key to `users` anywhere in the table, because there is nothing to point
+at.** The driver portal is link-authenticated (`Docs/07` §3) and a driver holds a job-scoped token
+rather than a session. `000401` had already committed to the consequence —
+`job_status_history.actor_id` names an *assignment* when `actor_type` is `'driver'` — and this is
+the row that reference resolves to. Two rules follow from it, and both are worth reading before
+SHIP-106:
+
+- **An assignment's identity is immutable**, enforced by a trigger in the shape `000005` uses for
+  `users.role`. Editing `driver_name` is not an update; it silently re-attributes every milestone
+  and transition already recorded against that assignment to a different person. Replacing a
+  driver ends one assignment and creates another, and the ended row stays.
+- **At most one assignment is live per job**, `uq_driver_assignments_active`, a partial unique
+  index on `job_id WHERE unassigned_at IS NULL`. Two live assignments become two valid driver
+  links the moment SHIP-107 hangs a token off this row, which is how SHIP-108's "exactly one job,
+  and nothing else" quietly stops being true. `unassigned_at` is set once and cannot be cleared or
+  moved: reviving an assignment restores a driver, and their link, to a job they were taken off.
+
+`ck_driver_assignments_mobile` checks E.164 shape and nothing about allocation, mirroring
+identity's `validE164`. It is not tidiness — the mobile is the only channel the platform has to a
+person with no account, and a malformed one is a driver who never receives the link and a job that
+stalls with nobody knowing why. The name check is `driver_name ~ '\S'` rather than
+`btrim(driver_name) <> ''`, because `btrim`'s default character set is the space alone and the
+first version of it accepted a tab — which is exactly what a form field returns when somebody tabs
+through it. The test caught that, which is the argument for testing against a real database rather
+than reading the constraint and believing it.
+
+**What SHIP-106 has to decide, which this deliberately did not:** who made the assignment is not
+stored. It is an account for a provider and *not* an account for an administrator —
+`ck_users_role` refuses `'admin'`, because admin sign-in is a separate system (SHIP-147) — so
+recording it means the polymorphic `actor_type`/`actor_id` pair `audit_log` and
+`job_status_history` carry, and SHIP-106 is the ticket that knows whether an administrator may
+assign at all. Until then the `Awarded → Driver assigned` history row records who did it. The same
+narrowness, which is `000400`'s discipline, leaves the token columns to SHIP-107 and revocation to
+SHIP-109. There is also no `CHECK` that the job has reached `Awarded`: a `CHECK` cannot see
+another table's column, so SHIP-106 enforces it where the assignment is made, exactly as `000400`
+does for the customer's role.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
