@@ -202,6 +202,8 @@ Hand-written validators returning `[]httpx.FieldError`, in `internal/validate`. 
 
 `snake_case` JSON throughout, matching `built_at` and `request_id` in the endpoints that already exist. Enum values are lower snake case on the wire even where the stored form has spaces. A single resource is returned as a bare object; a collection is returned in the envelope above.
 
+**One exception, taken deliberately at SHIP-60: the Australian state is returned as its upper-case abbreviation** (`NSW`, `VIC`), because a client prints it rather than branching on it, and the lower snake case form would have every client upper-casing it back. Any case, and the spelled-out name, are accepted on input. This is narrow on purpose and does not loosen the rule for enums a client *does* branch on — job status in particular stays lower snake case on the wire, through `Status.Wire()`.
+
 ## 5. Identity and tokens
 
 | Element | Position |

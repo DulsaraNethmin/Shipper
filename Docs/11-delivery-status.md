@@ -10,7 +10,7 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-11, closing wave 2 — thirteen tickets across three tracks, plus the two-ticket serial pre-step that made them possible. This is the reconciliation pass the wave rules reserve: §1, §2, §6 and §7 are left alone by each track while it runs, precisely so that three agents do not do the same arithmetic three ways, and are corrected once when the wave lands.
+**Last updated:** 2026-08-12, closing wave 3 — seventeen tickets across three lanes, plus the serial pre-step (SHIP-15e) that made them possible. This is the reconciliation pass the wave rules reserve: §1, §2, §6 and §7 are left alone by each track while it runs, precisely so that three agents do not do the same arithmetic three ways, and are corrected once when the wave lands.
 
 ---
 
@@ -18,50 +18,69 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 51 | 130 |
-| Remaining | 152 | 496 |
-| **Total** | 203 | 626 |
+| **Done** | 69 | 183 |
+| Remaining | 135 | 448 |
+| **Total** | 204 | 631 |
 
 The totals grew by two tickets rather than shrinking: SHIP-15c and SHIP-23a were added to `Docs/09` during wave 2, both work the plan assumed and no ticket owned.
+
+They grew again by one in wave 3: **SHIP-15e** (M0, 5 points), the serial pre-step that split `scripts/verify-foundation.sh` into a harness plus one file per domain and moved the done list out of this file. Same pattern as its two predecessors — work the plan assumed and no ticket owned — which is now the third time, and is worth reading as the norm rather than the exception. Totals moved 203 → 204 tickets and 626 → 631 points.
 
 | Milestone | Done | Points |
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
-| **M0** Foundation | 28 / 32 | 68 / 82 |
-| **M1** Identity | 15 / 28 | 40 / 78 |
-| **M2** Jobs | 5 / 26 | 16 / 78 |
+| **M0** Foundation | 29 / 33 | 73 / 87 |
+| **M1** Identity | 26 / 28 | 71 / 78 |
+| **M2** Jobs | 11 / 26 | 33 / 78 |
 | **M3** Bidding and award | 0 / 27 | 0 / 95 |
 | **M4** Delivery | 0 / 29 | 0 / 101 |
 | **M5** Notifications | 0 / 13 | 0 / 45 |
 | **M6** Admin | 1 / 20 | 3 / 65 |
 | **M7** Hardening | 2 / 19 | 3 / 56 |
 
-**M0 has four tickets left and not one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. Every buildable M0 ticket is done, for the second time — SHIP-23a was the last one, and it was a recommendation in §9 before it was a ticket.
+**M0 has four tickets left and not one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3. Every buildable M0 ticket is done, for the third time — **SHIP-15e** was the last one, and like SHIP-23a before it, it was a recommendation in §9 before it was a ticket.
 
-**Wave 2 has landed in full.** Three tracks, thirteen tickets, thirty-seven points, and **no conflict in code between them** — everything the three collided in was this file. §7 has the detail.
+**Wave 3 has landed in full.** Three lanes, seventeen tickets, forty-eight points, **no trim taken**, and exactly one conflict in the entire wave — one line of this file holding a number. §7 has the detail, including why the `contracts/openapi.yaml` collision the whole pre-step was designed around never materialised.
 
-**A person can now register through the API and be recorded as verified.** Email token and phone OTP are issued on registration, both are legible in the development log on purpose, both are confirmed through their own endpoint, and the role is fixed at registration and immutable afterwards — enforced by a database trigger, not by application logic. That is wave 2's exit criterion for M1 and it is demonstrated by `make verify`, not asserted.
+**A person can now register, verify, sign in, and stay signed in — M1 is 26 of 28.** Email token and phone OTP are issued on registration, both are legible in the development log on purpose, both are confirmed through their own endpoint, and the role is fixed at registration and immutable afterwards — enforced by a database trigger, not by application logic. Wave 3 added the rest of the session: sign-in, sign-out, refresh-token rotation with reuse detection that invalidates the whole device session, an explicit sliding expiry on `device_sessions`, the device list and its revoke, and rate limiting that charges failed sign-ins only and fails **closed** when Redis is down. All of it is demonstrated by `make verify`, not asserted.
+
+**Only SHIP-50 and SHIP-55 remain in M1, and both are Flutter.** The platform half of identity is finished; what is left is the client's token-refresh interceptor and its login screen. M1's exit criterion — "a person can register, verify, choose a role, and stay signed in across app restarts" — is met server-side and awaits those two on the device.
 
 **The jobs table constrains all twelve statuses, and status is not a settable field.** A `BEFORE UPDATE` trigger refuses any change not described by a `job_status_history` row written in the same transaction, so the guard, the record and the transaction are one condition. `cmd/worker` claims due work under `FOR UPDATE SKIP LOCKED` and survives being run twice.
 
 **The published contract exists (SHIP-17a), and it is checked rather than believed.** `contracts/openapi.yaml` is assembled from per-domain fragments under `contracts/paths/`, and three tests in `cmd/api` hold it to the service: the manifest and the contract must agree in both directions, live handler responses must satisfy the published schemas, and the error contract must match the `Error` schema for failures that `net/http` writes rather than a handler. That closes `TestEveryRouteIsInTheContract`, the last of the three route-surface guards in `Docs/10` §4.1 to become enforceable.
 
-**The first domain logic exists, and it is in exactly one package.** `internal/identity` holds argon2id password storage and access-token issue; the other seven domains still contain `doc.go` and nothing else. Everything outside `identity` remains foundation and adapters.
+**Domain logic now lives in two packages, not one.** `internal/identity` holds argon2id password storage, access-token issue, refresh rotation and the session surface; `internal/jobs` holds the location value object, the store, the ports and the handlers for create, amend, cancel, detail and list. The other six domains still contain `doc.go` and nothing else.
 
-That distinction is worth keeping in mind rather than rounding away: `identity` now has code that other domains will want to call, and the rule that stops them calling it directly — one domain never imports another — has its first real opportunity to be broken from here on.
+That distinction is worth keeping in mind rather than rounding away: two domains now hold code the others will want to call, and the rule that stops them calling it directly — one domain never imports another — has had its first real opportunity to be broken and was not. Wave 3 is also the first evidence for the pre-seeded infrastructure list: `internal/ratelimit` (SHIP-47) and `internal/pagination` (SHIP-66) were both written **with no shared-file edit at all**, which is exactly what registering them in `internal/boundaries` ahead of the code was for. Only `money` remains unwritten.
 
-**All four deployables now exist and run.** The Flutter client builds and runs on both simulators, the two Next.js surfaces build and serve, and the Go service serves `/health` to the app. Nothing above the foundation is wired to a real endpoint yet — the app fetches `/health` and nothing else — but the shape `Docs/08` describes is on disk rather than in a document.
+**All four deployables now exist and run, and the app is wired to real product endpoints.** The Flutter client builds and runs on both simulators, the two Next.js surfaces build and serve, and the Go service serves both `/health` and `/v1`. Wave 3's SHIP-51…54 took the client past the foundation: registration, email verification and phone OTP are driven from the device against the live API, through a deep link the router holds across a cold-start keychain restore. The two Next.js surfaces are still foundation only.
 
 ## 2. Branch state
 
 | Branch | At | Holds |
 |---|---|---|
 | `main` | PR #19 | **Wave 1, released 11 August 2026.** Now well behind `develop` |
-| `develop` | wave 2 merged | Everything below. **Cut new branches from here** |
+| `develop` | wave 3 merged | Everything below. **Cut new branches from here** |
 
-**`develop` is roughly sixty commits ahead of `main` and is release-sized.** Wave 1 was released as PR #19; everything since — SHIP-17a, the wave-2 pre-step, and all three wave-2 tracks — is on `develop` only. The next `develop → main` pull request is the second release.
+**`develop` is 98 commits ahead of `main` and holds three waves.** Wave 1 was released as PR #19; everything since — SHIP-17a, the wave-2 pre-step and its three tracks, the wave-3 pre-step (SHIP-15e) and its three lanes — is on `develop` only. The next `develop → main` pull request is the second release, and it is now considerably larger than the first.
+
+That figure is `git rev-list --count main..develop`, and it is worth naming the command because the other two readings differ sharply: `--first-parent` gives 20 (one per merged branch, which is the useful review unit) and `--no-merges` gives 72. A previous estimate of "81" reproduced under none of them.
 
 **Run the revert check before cutting it.** `main`'s history contains a revert, which is the shape where a merge silently resurrects deletions, and the two commands for establishing that it is safe are below. This is not hypothetical here: PR #19 had exactly that shape.
+
+### The wave-3 branches, in merge order
+
+All four were merged locally with `--no-ff`, none through a pull request, so the record is the merge commit rather than a number.
+
+| Merge commit | Branch | Brought |
+|---|---|---|
+| `fee58cd` | `ship-15e-wave-3-prep` | SHIP-15e — the verify split and the done-list move, before the lanes opened |
+| `d79fa22` | `ship-51-54-registration-journey` | SHIP-51, 52, 53, 54 |
+| `3f72216` | `ship-60-66-job-drafts` | SHIP-60, 61, 62, 64, 65, 66 |
+| `db3027d` | `ship-39-47-sessions-and-login` | SHIP-39, 40, 41, 42, 43, 46, 47 |
+
+**One conflict across the whole wave**, and it was this file: the `make verify` check-count line. `develop` claimed 123, the identity lane claimed 170, and **the truth was 208** — `develop`'s own figure had already been stale by 20 before the merge, because a wave-2 track added checks without updating the line. Taking either side would have shipped a wrong number; it was resolved by re-running `make verify` on the merged tree and writing what it printed. That is the general rule for this line and it is cheap: the number is measured, never reconciled.
 
 ### The wave-2 branches, in merge order
 
@@ -73,9 +92,11 @@ That distinction is worth keeping in mind rather than rounding away: `identity` 
 | — | `ship-30-36-registration-and-verification` | SHIP-30, 31, 33, 34, 36, 45 |
 | — | `ship-48-49-client-session` | SHIP-48, 49, 23a |
 
-The last two were merged locally rather than through a pull request, which is why they have no number. **Both conflicted in this file and nowhere else**, and both resolutions were unions — see §7.
+The last two were merged locally rather than through a pull request, which is why they have no number. **Both conflicted in this file and nowhere else**, and both resolutions were unions — see §7a.
 
-An earlier version of this section chased the exact pull-request number and commit count, and was wrong within a day both times — a commit cannot record the number of the pull request that merges it. **This table is always slightly behind reality, and the fix is to correct it in the next update rather than to try to make it self-aware.** It now says "wave 2 merged" rather than a number, for that reason.
+An earlier version of this section chased the exact pull-request number and commit count, and was wrong within a day both times — a commit cannot record the number of the pull request that merges it. **This table is always slightly behind reality, and the fix is to correct it in the next update rather than to try to make it self-aware.** It says "wave 3 merged" rather than a number, for that reason.
+
+The commit count above is the same kind of figure and gets the same treatment: **recount it at each reconciliation, never carry it forward.** It has now been carried forward wrongly once — a handover brief recorded 81 when the true count was 98 — which is the cost of copying a number that a single merge invalidates.
 
 `main` still shows commits `develop` does not have. Those are the detour, not divergent work: wave 0 reached `main` by being merged (PR #6), reverted (PR #7), and reapplied (PR #9), and PR #19's own merge commit sits on `main` alone. The content is identical; only the shape of the history differs.
 
@@ -88,7 +109,7 @@ An earlier version of this section chased the exact pull-request number and comm
 | #13 | `ship-22-35-web-and-adapters` | SHIP-22, 23, 32, 35, 59a |
 | #14 | `ship-29-38-credentials-and-sessions` | SHIP-29, 37, 38, and the SHIP-149 verify fix |
 
-`ship-16-21-flutter-foundation` exists and is parked at PR #11's merge, holding nothing. It is the branch the Flutter track resumed on — see §7a.
+`ship-16-21-flutter-foundation` exists and is parked at PR #11's merge, holding nothing. It is the branch the Flutter track resumed on — see §7b.
 
 **A warning worth keeping.** Reverting a merge does not undo it: the commits stay ancestors forever, so re-merging the same branch brings nothing across and reports success. If a merge to `main` is ever reverted again, the fix is to revert *the revert*, not to merge again.
 
@@ -127,7 +148,7 @@ out of `CHECKS` deliberately — it needs a device, and the Flutter CI job is a 
 until SHIP-24…27 — so it is a check a person invokes when the storage or the session changes.
 The file's own header says which invocation demonstrates which claim.
 
-### M0 — Foundation (28 of 32)
+### M0 — Foundation (29 of 33)
 
 | Ticket | What |
 |---|---|
@@ -719,8 +740,10 @@ having enumerated both.
 **The response uses `Docs/10` §4.5's collection envelope with `next_cursor` always null**, and the
 `has_more` beside it is a bound on the response rather than an invitation to page. Every sign-in
 creates a session and nothing stops a client signing in a thousand times instead of refreshing, so
-the query is capped at a hundred rows. Keyset paging belongs to `internal/pagination`, which is
-registered in `internal/boundaries` and still unwritten; §9 carries it.
+the query is capped at a hundred rows. Keyset paging belongs to `internal/pagination`, which was
+unwritten when this was written and **which SHIP-66 wrote later in the same wave**. The remaining
+gap is smaller and sharper than the original note: the package exists and `GET /v1/auth/sessions`
+has simply not adopted it. §9 carries it as a follow-up, not as a missing dependency.
 
 ### What SHIP-47 built, and the two positions it takes
 
@@ -1343,33 +1366,69 @@ X-5 and X-6 need no third party at all — they are decisions somebody can make 
 
 ## 6. Ready to start now
 
-Strict build order says the next ticket is the lowest-numbered open one, which is **SHIP-39**. Twenty-seven tickets have every dependency met, so build order is now a preference rather than a constraint — the list below is computed from `Docs/09`'s dependency column against §10, not maintained by hand.
+Strict build order says the next ticket is the lowest-numbered open one, which is **SHIP-24** — and it is blocked on X-2, as are the other three M0 stragglers. The lowest-numbered ticket that can actually be started is **SHIP-50**. **Twenty-seven tickets have every dependency met: 22 code tickets worth 79 points, plus the five Track-X tickets worth 10.** Build order is a preference rather than a constraint at this point. The list below is computed from `Docs/09`'s dependency column against `Docs/11-done.txt`, not maintained by hand — and it is the **complete** startable set, because an earlier version of this table was a curated selection that read like a full list.
 
 | Ticket | Pts | Area |
 |---|---|---|
-| SHIP-39 | 5 | Refresh token rotation — `device_sessions` exists, and **it still needs an expiry column**; see §9 |
-| SHIP-46 | 3 | Session list and revoke — unblocked by SHIP-44, and the first protected routes in the service |
-| SHIP-51 | 3 | Flutter registration screen — the first client screen that calls a real endpoint |
-| SHIP-56a | 2 | Status codegen for Go, Dart and TypeScript — cut from wave 2 because it writes into three app trees |
-| SHIP-60 | 3 | Address and location value object — **decide the geocoding signature question in §9 first** |
-| SHIP-61, 64 | 5 | Create and cancel a job draft — the guard from SHIP-57 has its first callers |
-| SHIP-68 | 5 | Job expiry — the first real client of `cmd/worker` |
-| SHIP-78, 80 | 8 | `vehicles` and `bids` — the M3 foundation, both unblocked now |
-| SHIP-105, 110 | 5 | `driver_assignments`, `milestones` — M4 tables, no endpoints |
+| SHIP-50 | 5 | Flutter token refresh interceptor — the mobile analogue of `internal/identity`; every later mobile ticket calls through it |
+| SHIP-55 | 2 | Flutter login screen — closes M1, and **must settle biometric unlock**; see §9 |
+| SHIP-56a | 2 | Status codegen for Go, Dart and TypeScript — cut from waves 2 and 3 because it writes into four trees |
+| SHIP-67 | 3 | Budget stored and never serialised — **the invariant's tripwire**; see §8 on the broken SHIP-83 pairing |
+| SHIP-68 | 5 | Job expiry — the first real client of `cmd/worker`, and it needs `000404`'s date-window columns |
+| SHIP-71 | 3 | Flutter job creation, locations step |
+| SHIP-76 | 3 | Flutter customer job list — SHIP-66 unblocked it |
+| SHIP-78, 80 | 8 | `vehicles` and `bids` — the M3 foundation. **SHIP-80 makes the award transaction startable** |
+| SHIP-105, 110 | 5 | `driver_assignments`, `milestones` — M4 tables, no endpoints, **same migration block** |
 | SHIP-134 | 5 | The outbox publisher — §4 has been carrying its table since wave 1 |
-| SHIP-147 | 5 | Admin authentication, a separate system from user auth |
-| SHIP-174 | 3 | Datadog APM and log ingestion |
-| ~~SHIP-114~~ | 5 | **Dependencies met, still not buildable — see below** |
+| SHIP-163 | 3 | Dispute intake endpoint — dependencies met since SHIP-57, and **this file had never listed it** |
+| ~~SHIP-114~~ | 5 | **Dependencies met, not buildable** — no object storage in the local stack; see below |
+| ~~SHIP-124~~ | 5 | Buildable, but it is `core/queue` for offline delivery — M4 work, not M1 closure |
+| ~~SHIP-147~~ | 5 | Buildable, but it edits the `newRouter` middleware chain — **shared-platform work**, not a track slot |
+| ~~SHIP-168~~ | 3 | Buildable, but its store link does not exist until X-2/X-3 publish listings |
+| ~~SHIP-169~~ | 3 | Buildable, but it touches `users`, in the **shared migration block (1–99)** |
+| ~~SHIP-174~~ | 3 | **Not demonstrable** — no Datadog agent in compose, no `DD_*` config, no account |
+| ~~SHIP-178~~ | 3 | **Not demonstrable** — install base comes from App Store Connect and Play Console (X-2, X-3) |
+| ~~SHIP-182~~ | 5 | **Not demonstrable** — there is no production and no managed backup |
+| ~~SHIP-183~~ | 3 | A **decision ticket** — §9 parks the per-account-lockout question here; it also rewrites limits on every domain's routes |
 
 Plus **X-1, X-3, X-4, X-5 and X-6**, none of which is code and none of which has started. X-5 and X-6 need no third party at all.
 
+**Nine of the 22 are struck, which is the useful signal in this table.** Dependencies being met is not the same as a ticket being startable: four are not demonstrable with the tooling that exists, three are shared-platform work a domain branch must not do, one is a decision, and one is in the wrong milestone. The startable-and-sensible set is thirteen tickets, and wave 4 takes eleven of them.
+
 **SHIP-114 is neither ready nor blocked on a third party, which is a third category this file needed.** Its dependencies are met, but `internal/platform/storage/` is `doc.go` alone and `deploy/docker-compose.yml` has no MinIO or equivalent, so "receives a short-lived pre-signed URL and uploads directly" cannot be demonstrated. Wave 1 already paid once for counting a ticket whose acceptance criterion needed a tool nobody had installed. **It needs a lettered ticket adding object storage to the local stack first**, as shared-platform work.
 
-**The identity bottleneck has eased but not gone.** SHIP-39, 40, 41, 42, 43, 46, 47 and 50 still live in or against `internal/identity`, and `Docs/10` §9.1 gives one package directory to one agent at a time. What changed is that `jobs`, `fleet`, `bidding` and the client now have unblocked work of their own, so a wave-3 split no longer has to invent parallelism.
+**The identity bottleneck is gone.** Seven of the eight tickets that lived in `internal/identity` — SHIP-39, 40, 41, 42, 43, 46, 47 — landed in wave 3, and the eighth, **SHIP-50**, is Flutter: it is written *against* the package, not in it. `Docs/10` §9.1 still gives one package directory to one agent at a time, but for the first time since wave 1 that rule constrains nothing, because no queued ticket needs to open `internal/identity` at all. The next one that will is SHIP-183, which is a decision before it is a change.
 
 **Public routes still share the anonymous idempotency scope, and that remains safe.** `replayOrRefuse` fingerprints method, path and body, so reading another caller's stored response requires sending their exact request — which, on every route on `Docs/10` §4.1's allow-list, means already holding the secret material in their body. `make verify` checks the anonymous scope still works, because scoping idempotency into uselessness would be a subtler regression than leaving it shared.
 
-## 7. Wave 2 — what landed
+## 7. Wave 3 — what landed
+
+One ticket serially, then three lanes concurrently. **Seventeen tickets, forty-eight points, all delivered, no trim taken.**
+
+| Step | Tickets | Landed |
+|---|---|---|
+| **Pre-step** (serial, primary tree) | SHIP-15e | Merged at `fee58cd` before any lane started |
+| **Lane A** identity | SHIP-39, 40, 42 → SHIP-41, 43, 46, 47 | All seven, two sequential runs on one branch |
+| **Lane B** jobs | SHIP-60, 61, 62 → SHIP-64, 65, 66 | All six, two sequential runs on one branch |
+| **Lane C** flutter | SHIP-51, 52, 53, 54 | All four, one run |
+
+The exit criterion was: a person can sign in, stay signed in across a rotation, see and revoke their devices, and be throttled when they guess; a customer can create, amend, cancel, read and list a job draft through the guarded status function; and the client drives registration and verification against the live API. **All of it holds**, and `make verify` went from 105 checks to **208**.
+
+### One conflict in the entire wave, and it was a number
+
+The wave's whole pre-step was designed around an anticipated collision in `contracts/openapi.yaml`: two lanes each adding `$ref` lines to the sorted `paths:` block, with a documented take-both-sides-and-re-sort recipe waiting for it. **It never materialised.** Lane A's four `/v1/auth/*` entries and lane B's `/v1/jobs*` entries landed in different regions of the sorted block and merged cleanly, as did the `tags:` block and `Docs/10-api-error-codes.md`.
+
+The one conflict was this file's `make verify` check-count line — and it is worth recording *why* it was the only one, because the reason is not luck. Every other shared file in the wave either has a `merge=union` attribute (`Docs/11-done.txt`, `routes_golden.txt`), is generated (`Docs/10-api-error-codes.md`), or is sorted with a test holding it sorted (`contracts/openapi.yaml`). The check count is none of those: it is a hand-maintained scalar in prose, which is the one shape a merge cannot resolve. **Three different values met in it and none of the three was right** — `develop` said 123, lane A said 170, the truth was 208, and `develop`'s figure had already been stale by 20 before the merge began. Resolved by measurement, which is the only resolution that could have been correct.
+
+### The pre-seeded infrastructure list had its first real test
+
+`internal/ratelimit` (SHIP-47) and `internal/pagination` (SHIP-66) were both written in this wave, in different lanes, **with no shared-file edit between them.** Both names had been registered in `internal/boundaries` ahead of the code precisely so that whoever needed one first could write it without touching a file another lane held. That is the mechanism working as designed rather than as asserted, and it is the strongest argument yet for seeding a name before the package exists. Only `money` is left unwritten.
+
+### What the wave cost in scale
+
+Wave 1 delivered 32 points, wave 2 delivered 37, wave 3 delivered **48** — a 30% step up that the plan named as the wave's real risk, taken without invoking the trim order. Three lanes, five agent runs, one conflict.
+
+## 7a. Wave 2 — what landed
 
 Two tickets serially, then three tracks concurrently. Thirteen tickets, thirty-seven points, all delivered.
 
@@ -1405,7 +1464,7 @@ Two of SHIP-15c's mechanisms caught real mistakes within the wave: the protocol-
 - **The last merge always conflicts in this file.** Three tracks each append to §3 and §10. §10 in particular is a candidate for `merge=union` in `.gitattributes`, because a union there is always a superset and `make status` fails on a drop rather than passing quietly — unlike YAML, where a union is invalid. Recorded in §9.
 - **Agents deviate from a brief in both directions, and both need checking.** One track merged `develop` into its own branch after being told not to; its conflict resolution was nonetheless correct. Another corrected a paragraph in `Docs/07` that was outside its ownership, and was right to — the reasoning behind a decision had stopped being true. Neither was harmful; both were only visible because the diff was read against the stated ownership.
 
-## 7a. Wave 1 — what landed
+## 7b. Wave 1 — what landed
 
 Fourteen tickets across four branches. All three tracks completed, but not all at once: the Flutter track was blocked mid-wave, deferred, and finished after the block cleared.
 
@@ -1474,17 +1533,21 @@ Kept here rather than deleted, because the shape recurs: this was described only
 
 **Also single-owner, for reasons in `Docs/10`:** SHIP-57 (the status guard), SHIP-67 with SHIP-83 (budget privacy — test the serialised response, not struct fields), both token verifiers, and the middleware ordering in `newRouter` — which is now load-bearing in a second way, since `ResolveSubject` sitting outside `Idempotent` is what makes the scope work at all.
 
+**The SHIP-67 / SHIP-83 pairing cannot be honoured in one wave, and that is a fact about the dependency graph rather than a scheduling preference.** Verified against `Docs/09`: SHIP-83 depends on SHIP-82 → SHIP-81 → (SHIP-79, SHIP-80) → SHIP-78. SHIP-67 is startable **now**; SHIP-83 is four tickets and three hops away. Any wave that starts SHIP-67 either breaks the pairing or defers a startable ticket for a chain that is not close to landing. **The ticket that takes SHIP-67 must therefore settle this explicitly** — build now and reserve SHIP-83 to the same owner later, or defer both — and record which, here and in §3. What the pairing was protecting is worth restating so the choice is made on it: the invariant must be proved against the **serialised provider response**, not against struct fields, and SHIP-67's own *Done when* is precisely that serialisation test. Note also that `make verify` currently **asserts no `budget` key is present**, so whichever ticket adds the column must change that assertion in the same commit — it is the invariant's tripwire and it should be moved loudly, never quietly.
+
 ## 9. Open recommendations nobody has decided
 
 **~~Job status as a database guarantee.~~ Decided and built at SHIP-57 — see §3.** The trigger exists, and it asks for more than the recommendation did: not merely that a session variable is set, but that it names a `job_status_history` row written in the same transaction which describes this job making exactly this move. The weaker form would have been a flag any caller could set; this one cannot be satisfied without leaving the record, which is what makes SHIP-57a's *Done when* structural rather than remembered.
 
-**Whether an adapter's value types get a home.** Wave 1 surfaced a consequence of the consumer-declares-the-interface rule that nobody had hit before. A domain's `ports.go` must name the adapter's method signature and may not import the adapter, so no struct declared in an adapter can appear in one. Geocoding therefore ended up as:
+**~~Whether an adapter's value types get a home.~~ Decided at SHIP-60 — see §3.** **No neutral geo package; the geocoding port keeps its five-return signature.** §9's premise did not survive contact: it warned about deciding "before three domains adopt the wide signature", but the width is adopted **exactly once**, in `jobs/ports.go`, and converted to a `Location` in the next statement — no store method, handler, response type or test carries five return values. What a second domain would adopt is a *coordinate type*, and a wide signature does not force that type to be wide. **The revisit trigger is named rather than left to judgement: the first ticket needing the distance between two coordinates in a domain other than `jobs`, likely SHIP-81.** At that point `internal/geo` gets a `Point` and the haversine, the port narrows to `Lookup(ctx, address) (geo.Point, bool, error)`, and the change is confined to `ports.go`, two adapter methods and one conversion. The original reasoning is kept below because the revisit will need it.
+
+Wave 1 surfaced a consequence of the consumer-declares-the-interface rule that nobody had hit before. A domain's `ports.go` must name the adapter's method signature and may not import the adapter, so no struct declared in an adapter can appear in one. Geocoding therefore ended up as:
 
 ```go
 Lookup(ctx context.Context, address string) (lat, lng float64, formatted string, found bool, err error)
 ```
 
-and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, geocoding.ErrNotFound)` would also be an import. The reasoning is correct and the lint agrees. But a neutral infrastructure package holding a coordinate type — the same shape as the pre-seeded `pagination`, `ratelimit` and `money` — would let both sides name it with no dependency edge either way, and that option was unavailable only because `internal/boundaries` was a forbidden shared edit mid-wave. **Decide at SHIP-60, before three domains adopt the wide signature.**
+and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, geocoding.ErrNotFound)` would also be an import. The reasoning is correct and the lint agrees. But a neutral infrastructure package holding a coordinate type — the same shape as the pre-seeded `pagination`, `ratelimit` and `money` — would let both sides name it with no dependency edge either way, and that option was unavailable only because `internal/boundaries` was a forbidden shared edit mid-wave.
 
 **~~`httpx.RegisterCode` is documented but does not exist.~~ Decided and built at SHIP-15c.** The registry, the uniqueness tests in `cmd/api`, and the generated `Docs/10-api-error-codes.md` all exist; `Docs/10` §4.4 is now true and says so, including that it was not. The choice was between building the mechanism and amending the document to match reality, and building won because SHIP-30 and SHIP-57 both need it on separate tracks in the same wave.
 
@@ -1498,9 +1561,9 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **~~§10's done block should probably be `merge=union`, and §3 probably should not.~~ Decided and done at SHIP-15e — see §3.** Both halves were kept: the list is `merge=union` and §3 is not. Since a git attribute applies to a whole file, the list moved to `Docs/11-done.txt`, one ticket per line — which the recommendation had not noticed matters, because a union resolves line by line and the old block put several tickets on one line.
 
-**~~`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.~~ Decided and split at SHIP-15e — see §3.** It is a harness plus one file per milestone or domain in `scripts/verify/`, numbered in reserved ranges the way migrations are, and a track adds a file rather than editing one. The count is unchanged at 105, which is the evidence the move lost nothing.
+**~~`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.~~ Decided and split at SHIP-15e — see §3.** It is a harness plus one file per milestone or domain in `scripts/verify/`, numbered in reserved ranges the way migrations are, and a track adds a file rather than editing one. The count was unchanged at 105 across the split, which is the evidence the move lost nothing. **That 105 is a historical figure, not today's** — wave 3 took it to 208; §3 carries the current count.
 
-**`device_sessions` has no expiry column.** SHIP-38's *Done when* named refresh state, device label and last seen, and the implementation stopped exactly there — correctly, as a scope decision. But a refresh token has to expire, so **SHIP-39 either adds the column or explains where expiry lives instead.** Flagged here so it is a decision rather than a discovery.
+**~~`device_sessions` has no expiry column.~~ Decided and built at SHIP-39 — see §3.** An explicit `device_sessions.refresh_token_expires_at`, `NOT NULL` with no default, in migration `000103`. The window **slides** — rewritten on every rotation, 30 days — so inactivity ends a session and daily use never does. **A Redis TTL was rejected** (`Docs/10` §5: a control a cache flush undoes is not one), and so was deriving expiry from `last_seen_at + TTL`, because that is a *display* column which SHIP-46 writes from a device-list **read** — a derived lifetime would mean every future write silently extends a credential. **No absolute session cap, deliberately**: that is a policy control with a product consequence rather than a mechanism, and it is another column and another migration whenever it is wanted.
 
 **The mobile bundle identifier has no owner and stops being changeable.** `apps/mobile` currently uses a provisional `au.com.shipper` for both the iOS bundle id and the Android application id. **Once X-2 and X-3 publish a build, neither can be changed** — a new identifier is a new app listing, with a new install base. Confirm it before SHIP-25 or SHIP-27, not after. The staging and production hostnames baked into the API client (`api.staging.shipper.com.au`, `api.shipper.com.au`) are provisional in the same way, though those are only configuration; `SHIPPER_API_BASE_URL` overrides them meanwhile.
 
@@ -1531,14 +1594,15 @@ hold about one account at a time. That is the standard shape and it is worth rev
 inheriting: a per-account limit counting *distinct* addresses, or one a successful sign-in clears,
 both remove it. **Decide at SHIP-183**, with the rest of the surface.
 
-**The device list is bounded but not pageable.** `GET /v1/auth/sessions` returns the collection
-envelope with `next_cursor` always null and a hundred-row cap, because `internal/pagination` is
-registered in `internal/boundaries` and not yet written (SHIP-46). `has_more` therefore reports a
-truncation a caller cannot page past. It is unreachable for a person — a hundred *live* sessions
-means signing in a hundred times in thirty days without refreshing — and the alternative was
-writing the shared pagination package mid-wave. **Whoever writes `internal/pagination` should adopt
-it here**, and the first endpoint with a genuinely unbounded collection (SHIP-64's job list) is
-where the decision actually has to be made.
+**The device list is bounded but not pageable, and the package it was waiting for now exists.**
+`GET /v1/auth/sessions` returns the collection envelope with `next_cursor` always null and a
+hundred-row cap, so `has_more` reports a truncation a caller cannot page past. When SHIP-46 wrote
+it, `internal/pagination` was registered in `internal/boundaries` and unwritten, and writing the
+shared package mid-wave was the alternative it declined. **SHIP-66 wrote the package later in the
+same wave**, which retires the reason and leaves a smaller, sharper item: `GET /v1/auth/sessions`
+should adopt `internal/pagination`. That is a small follow-up ticket, **not a defect** — the bound
+is unreachable for a person, since a hundred *live* sessions means signing in a hundred times in
+thirty days without ever refreshing.
 
 **`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 
@@ -1549,8 +1613,20 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. The two in
-§4 are deliberately absent.
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Of the three
+tickets in §4, only SHIP-134 is absent** — SHIP-65 and SHIP-149 are both in the list *and* partly
+done, and that is not a contradiction to be tidied away.
+
+**A ticket can be both**, and this is the shape: it landed, it is named by a commit subject, and one
+clause of its *Done when* belongs to a ticket that does not exist yet. SHIP-65 shipped the job
+detail endpoint and the owner-only rule; the `budget` field its sentence also names is SHIP-67's,
+together with the serialisation test proving it cannot leak — and adding the column before that
+proof would be exactly the wrong order. SHIP-149 shipped the append-only `audit_log` and its
+triggers; the Go write helper is still missing.
+
+**Removing either from the list would make `make status` hard-fail**, not go quiet: a commit subject
+names each (`a47ba3a` for SHIP-65), and the script exits 1 when git shows a ticket the list does not
+declare. The list is the floor of what landed; §4 is where the nuance lives. Keep them in both.
 
 **It moved so that it could be `merge=union`, which this document must never be** (SHIP-15e).
 Every track in a wave appends to the list, so the last merge of a wave conflicted here every
