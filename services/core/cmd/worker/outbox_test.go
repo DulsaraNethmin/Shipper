@@ -17,6 +17,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -77,16 +78,22 @@ func (r *recorder) fail(err error) {
 // Deliberately internal/events rather than a hand-written INSERT: the two halves of the outbox
 // have to agree about the columns, and a test that wrote its own insert would keep agreeing
 // after they stopped.
-func emit(t *testing.T, r db.Runner, aggregateType string, aggregateID uuid.UUID, eventType string, occurredAt time.Time) uuid.UUID {
+//
+// The event type is a real one — jobs.EventStatusChanged — rather than an invented string, and
+// since SHIP-135 it has to be: internal/events refuses to write an event type that is in no
+// catalogue, which is what makes a permanently unpublishable row impossible and is why the
+// publisher still has no dead-letter path. Nothing below distinguishes events by their type; they
+// are told apart by their ids.
+func emit(t *testing.T, r db.Runner, aggregateID uuid.UUID, occurredAt time.Time) uuid.UUID {
 	t.Helper()
 
-	e, err := events.New(aggregateType, aggregateID, eventType, occurredAt,
+	e, err := events.New(jobs.EventStatusChanged, aggregateID, occurredAt,
 		map[string]string{"aggregate": aggregateID.String()})
 	if err != nil {
-		t.Fatalf("building %s: %v", eventType, err)
+		t.Fatalf("building an event: %v", err)
 	}
 	if err := events.NewOutbox().Emit(t.Context(), r, e); err != nil {
-		t.Fatalf("emitting %s: %v", eventType, err)
+		t.Fatalf("emitting: %v", err)
 	}
 	return e.ID
 }
@@ -136,8 +143,8 @@ func TestAnEventCommittedWithItsTransactionIsPublished(t *testing.T) {
 	var want []uuid.UUID
 	if err := db.InTx(t.Context(), pool, func(_ context.Context, r db.Runner) error {
 		want = append(want,
-			emit(t, r, "job", job, "job.published", time.Now().Add(-3*time.Minute)),
-			emit(t, r, "job", job, "job.awarded", time.Now().Add(-2*time.Minute)))
+			emit(t, r, job, time.Now().Add(-3*time.Minute)),
+			emit(t, r, job, time.Now().Add(-2*time.Minute)))
 		return nil
 	}); err != nil {
 		t.Fatalf("committing the state change: %v", err)
@@ -160,12 +167,20 @@ func TestAnEventCommittedWithItsTransactionIsPublished(t *testing.T) {
 
 	// The payload survives the round trip. It is jsonb in the table and json.RawMessage
 	// either side of it, and a scan that lost it would still have published two events.
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(to.all()[0].Payload, &body); err != nil {
 		t.Fatalf("the published payload is not the JSON that was written: %v", err)
 	}
 	if body["aggregate"] != job.String() {
 		t.Errorf("payload = %v, want the aggregate %s", body, job)
+	}
+
+	// And so does its schema version (SHIP-135), which internal/events wrote into the payload
+	// when the row was created rather than the publisher looking it up now. That is the whole
+	// distinction: a row written before a deployment and drained after one is entitled to the
+	// version it was written under, not to whatever the catalogue says at publish time.
+	if v := events.SchemaVersionOf(to.all()[0].Payload); v != 1 {
+		t.Errorf("the published payload reports schema version %d, want 1", v)
 	}
 }
 
@@ -178,7 +193,7 @@ func TestAnEventInARolledBackTransactionIsNeverPublished(t *testing.T) {
 
 	boom := errors.New("the state change failed after the event was written")
 	if err := db.InTx(t.Context(), pool, func(_ context.Context, r db.Runner) error {
-		emit(t, r, "job", job, "job.awarded", time.Now())
+		emit(t, r, job, time.Now())
 		return boom
 	}); !errors.Is(err, boom) {
 		t.Fatalf("the transaction did not roll back: %v", err)
@@ -207,7 +222,7 @@ func TestAnUnreachableBrokerLeavesEveryRowClaimable(t *testing.T) {
 	var want []uuid.UUID
 	if err := db.InTx(t.Context(), pool, func(_ context.Context, r db.Runner) error {
 		for i := range 3 {
-			want = append(want, emit(t, r, "job", job, "job.published",
+			want = append(want, emit(t, r, job,
 				time.Now().Add(-time.Duration(3-i)*time.Minute)))
 		}
 		return nil
@@ -253,7 +268,7 @@ func TestACrashBetweenPublishingAndCommittingRepublishes(t *testing.T) {
 
 	var id uuid.UUID
 	if err := db.InTx(t.Context(), pool, func(_ context.Context, r db.Runner) error {
-		id = emit(t, r, "job", job, "job.awarded", time.Now())
+		id = emit(t, r, job, time.Now())
 		return nil
 	}); err != nil {
 		t.Fatalf("committing the state change: %v", err)
@@ -316,11 +331,11 @@ func TestOneAggregateBelongsToOneWorker(t *testing.T) {
 
 	if err := db.InTx(t.Context(), pool, func(_ context.Context, r db.Runner) error {
 		for i := range 3 {
-			emit(t, r, "job", held, "job.published",
+			emit(t, r, held,
 				time.Now().Add(-time.Duration(10-i)*time.Minute))
 		}
 		for i := range 2 {
-			emit(t, r, "job", free, "job.published",
+			emit(t, r, free,
 				time.Now().Add(-time.Duration(5-i)*time.Minute))
 		}
 		return nil

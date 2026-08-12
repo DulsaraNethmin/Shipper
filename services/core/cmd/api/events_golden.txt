@@ -1,0 +1,3 @@
+shipper.job        job.expiry_extended    v1   16384  customer_id:string expires_at:time.Time extended_at:time.Time job_id:string previous_expires_at:time.Time
+shipper.job        job.expiry_warned      v1   16384  customer_id:string expires_at:time.Time job_id:string warned_at:time.Time
+shipper.job        job.status_changed     v1   16384  actor_id:string actor_recorded_at:time.Time actor_type:string from:string job_id:string reason:string server_recorded_at:time.Time to:string

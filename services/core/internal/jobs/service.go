@@ -197,7 +197,7 @@ func (s *Service) emit(ctx context.Context, r db.Runner, c StatusChange) error {
 		payload.ActorID = c.Actor.ID.String()
 	}
 
-	event, err := events.New("job", c.JobID, EventStatusChanged, c.ServerRecordedAt, payload)
+	event, err := events.New(EventStatusChanged, c.JobID, c.ServerRecordedAt, payload)
 	if err != nil {
 		return err
 	}

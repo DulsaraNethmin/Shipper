@@ -342,7 +342,22 @@ type Job struct {
 	// A job that has left Open keeps the value it had. Nothing reads it outside [ExpiryClaim],
 	// which filters on status, and if the job returns to Open — Docs/02 §6.2 — the original
 	// deadline is the one Docs/02 §6.3 asks for.
+	//
+	// It is moved by exactly one thing a customer can reach: [Service.Extend] (SHIP-70).
 	ExpiresAt time.Time
+
+	// ExpiryWarnedAt is when the owner was told this job was about to expire (SHIP-69).
+	//
+	// Zero means "not warned against the deadline it has now" — which covers a job that has
+	// never been warned and a job whose deadline has moved since, because 000407's trigger
+	// clears the column whenever [ExpiresAt] changes. That is what makes the warning fire once
+	// per deadline rather than once per job.
+	//
+	// **Internal machinery, and not on any response.** A client that wants to show "expires in
+	// two days" has [ExpiresAt] and a clock; whether the platform has already sent a push about
+	// it is the platform's business, and putting it on the wire would invite a client to decide
+	// whether to warn — which is the notification domain's decision, not the app's.
+	ExpiryWarnedAt time.Time
 
 	CreatedAt time.Time
 	UpdatedAt time.Time

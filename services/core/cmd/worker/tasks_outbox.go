@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -139,11 +140,11 @@ func newKafkaEventPublisher(d Deps) (*kafka.Writer, EventPublisher) {
 		// pass would mark the row on the strength of it.
 		RequiredAcks: kafka.RequireAll,
 
-		// SHIP-135 owns the topic set. A topic conjured here would take whatever
-		// partition count the broker defaults to, and partitions cannot be reduced —
-		// see the header of outbox.go. The broker refuses auto-creation as well
-		// (deploy/docker-compose.yml), so this is belt and braces on a decision that
-		// matters.
+		// The topic set is cmd/topics', applied like a migration. A topic conjured
+		// here would take whatever partition count the broker defaults to, and
+		// partitions cannot be reduced — see the header of outbox.go. The broker
+		// refuses auto-creation as well (deploy/docker-compose.yml), so this is belt
+		// and braces on a decision that matters.
 		AllowAutoTopicCreation: false,
 
 		// The whole claimed batch arrives in one WriteMessages call, so the writer
@@ -198,29 +199,35 @@ func closeWriter(ctx context.Context, w *kafka.Writer) error {
 
 // topicFor is where an event's aggregate type becomes a topic name.
 //
-// One topic per aggregate type — shipper.job, shipper.bid, shipper.delivery — rather than one
-// topic for everything, so that a consumer can subscribe to what it cares about and retention
-// can differ per aggregate. It costs nothing today and cannot be undone cheaply later, because
-// moving an event to a different topic means every consumer reads two of them for a while.
+// **This is the line Docs/11 §9 said SHIP-135 would change**, and what changed is where it lives:
+// the mapping is now in internal/events beside the catalogue that decides the topic set, and
+// cmd/topics creates exactly what events.Topics() lists. The rule is unchanged — one topic per
+// aggregate type, shipper.job, shipper.bid, shipper.delivery — and internal/events/catalogue.go
+// carries the reasoning for it together with the reason a topic name does not carry a version.
 //
-// **SHIP-135 owns the topic set and the schema**, and this function is the single place it will
-// change. Nothing creates these topics yet: until SHIP-135 does, a pass against a broker that
-// does not have them fails and the rows stay claimable, which is the correct direction to fail.
-func topicFor(aggregateType string) string { return "shipper." + aggregateType }
+// The delegation stays rather than the call site being rewritten, because the interesting fact
+// about this function from here is that the producer does not get to decide topics.
+func topicFor(aggregateType string) string { return events.TopicFor(aggregateType) }
 
 // envelope is the wire form of an event.
 //
 // Self-describing rather than the bare payload, because the identifier a consumer deduplicates
 // on has to survive being read by something that does not also read the headers — and because a
-// message on a topic somebody is debugging should say what it is. The same four identifiers are
+// message on a topic somebody is debugging should say what it is. The same identifiers are
 // repeated as Kafka headers so a consumer can filter without deserialising the body at all.
 //
-// **The versioned schema is SHIP-135's**, not this struct's. This is the minimum an event needs
-// to be publishable and deduplicable; that ticket decides how it is versioned and where the
-// definition lives.
+// **SchemaVersion is SHIP-135's, and it is read out of the stored payload rather than looked up in
+// the catalogue.** The distinction matters exactly once, and that once is the case the versioning
+// exists for: a row written before a deployment and drained after one carries the version it was
+// written under, while the catalogue by then holds a different answer. Looking it up here would
+// relabel that row as the newer shape — a stale event accepted as meaning something else, which is
+// the failure internal/pagination's cursor prefix was built against and this is built against too.
+// Zero, omitted from both the envelope and the headers, means the row was written by hand or
+// predates its schema; that is a true statement and a better one than a guess.
 type envelope struct {
 	ID            uuid.UUID       `json:"id"`
 	Type          string          `json:"type"`
+	SchemaVersion int             `json:"schema_version,omitempty"`
 	AggregateType string          `json:"aggregate_type"`
 	AggregateID   uuid.UUID       `json:"aggregate_id"`
 	OccurredAt    time.Time       `json:"occurred_at"`
@@ -239,9 +246,12 @@ type kafkaEventPublisher struct{ w *kafka.Writer }
 func (p kafkaEventPublisher) Publish(ctx context.Context, batch []events.Event) error {
 	messages := make([]kafka.Message, len(batch))
 	for i, e := range batch {
+		version := events.SchemaVersionOf(e.Payload)
+
 		body, err := json.Marshal(envelope{
 			ID:            e.ID,
 			Type:          e.Type,
+			SchemaVersion: version,
 			AggregateType: e.AggregateType,
 			AggregateID:   e.AggregateID,
 			OccurredAt:    e.OccurredAt,
@@ -251,16 +261,25 @@ func (p kafkaEventPublisher) Publish(ctx context.Context, batch []events.Event) 
 			return fmt.Errorf("marshalling %s (%s): %w", e.Type, e.ID, err)
 		}
 
+		headers := []kafka.Header{
+			{Key: "event-id", Value: []byte(e.ID.String())},
+			{Key: "event-type", Value: []byte(e.Type)},
+			{Key: "aggregate-type", Value: []byte(e.AggregateType)},
+			{Key: "aggregate-id", Value: []byte(e.AggregateID.String())},
+		}
+		if version > 0 {
+			// A consumer routes on this without deserialising the body, which is what
+			// makes "refuse a version I was not built for" a cheap thing to do rather
+			// than a thing everybody skips.
+			headers = append(headers,
+				kafka.Header{Key: "schema-version", Value: []byte(strconv.Itoa(version))})
+		}
+
 		messages[i] = kafka.Message{
-			Topic: topicFor(e.AggregateType),
-			Key:   []byte(e.AggregateID.String()),
-			Value: body,
-			Headers: []kafka.Header{
-				{Key: "event-id", Value: []byte(e.ID.String())},
-				{Key: "event-type", Value: []byte(e.Type)},
-				{Key: "aggregate-type", Value: []byte(e.AggregateType)},
-				{Key: "aggregate-id", Value: []byte(e.AggregateID.String())},
-			},
+			Topic:   topicFor(e.AggregateType),
+			Key:     []byte(e.AggregateID.String()),
+			Value:   body,
+			Headers: headers,
 		}
 	}
 

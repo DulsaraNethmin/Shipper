@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -49,6 +50,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("GET /v1/jobs/{id}", handler.Detail())
 	mux.Handle("PATCH /v1/jobs/{id}", handler.Update())
 	mux.Handle("POST /v1/jobs/{id}/cancel", handler.Cancel())
+	mux.Handle("POST /v1/jobs/{id}/extend", handler.Extend())
 	return mux
 }
 
@@ -379,6 +381,133 @@ func TestCancellingSomebodyElsesJobIsIndistinguishableFromItNotExisting(t *testi
 
 	if got := statusOf(t, pool, uuid.MustParse(created.ID)); got != StatusDraft {
 		t.Errorf("the job is %s after a refused cancellation", got)
+	}
+}
+
+// TestExtendEndpointAnswersWithTheExtendedJob is SHIP-70's *Done when* at the wire: one call, an
+// empty body, and the job comes back with a deadline further away than it had.
+func TestExtendEndpointAnswersWithTheExtendedJob(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	customer := newCustomer(t, pool, "http-extend@example.com", "+61400000640")
+	job := expiringJob(t, pool, customer, 24*time.Hour, time.Time{})
+
+	rec := as(t, router, customer, http.MethodPost, "/v1/jobs/"+job.String()+"/extend", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	body := decode[jobResponse](t, rec)
+	if body.Status != "open" {
+		t.Errorf("status = %q, want open — an extension moves no job", body.Status)
+	}
+	if want := timestamp(testInstant.Add(ExtensionPeriod)); body.ExpiresAt != want {
+		t.Errorf("expires_at = %q, want %q", body.ExpiresAt, want)
+	}
+
+	// The same shape every other job endpoint answers with, so a client parses one type whatever
+	// it did to obtain the job.
+	detail := as(t, router, customer, http.MethodGet, "/v1/jobs/"+job.String(), "")
+	if detail.Body.String() != rec.Body.String() {
+		t.Errorf("the extension and the read answer with different shapes:\n %s\n %s",
+			rec.Body, detail.Body)
+	}
+}
+
+// TestExtendRefusesToBeToldHowLong is the request type having no fields, demonstrated rather than
+// asserted.
+//
+// Docs/02 §6.3 asks for an extension "in one action" and the platform computes the deadline. A
+// client that sent a period and had it silently ignored would believe it bought thirty days and
+// have no way to tell from a successful response — so the unknown field is reported.
+func TestExtendRefusesToBeToldHowLong(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	customer := newCustomer(t, pool, "http-extend-days@example.com", "+61400000641")
+	job := expiringJob(t, pool, customer, 24*time.Hour, time.Time{})
+
+	rec := as(t, router, customer, http.MethodPost, "/v1/jobs/"+job.String()+"/extend",
+		`{"days": 30}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "days") {
+		t.Errorf("the refusal does not name the field: %s", rec.Body)
+	}
+
+	// An empty body is refused too, on the rule SHIP-64 set: httpx.DecodeJSON needs one, and a
+	// second endpoint excepted from that would be a second answer to what a request looks like.
+	empty := as(t, router, customer, http.MethodPost, "/v1/jobs/"+job.String()+"/extend", "")
+	if empty.Code != http.StatusBadRequest {
+		t.Errorf("an empty body = %d, want 400 (%s)", empty.Code, empty.Body)
+	}
+
+	if at := deadlineOf(t, pool, job); at == nil || !at.Equal(testInstant.Add(24*time.Hour)) {
+		t.Errorf("a refused request moved the deadline to %v", at)
+	}
+}
+
+// TestExtendingAJobThatCannotBeIsAConflict covers both refusals under one code.
+//
+// 409 rather than 403: the caller is permitted and the request contradicts the state the job is in.
+// The client's action is the same for both — reload and offer what is actually available — which is
+// why they share `jobs_not_extendable` and differ only in the sentence.
+func TestExtendingAJobThatCannotBeIsAConflict(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	customer := newCustomer(t, pool, "http-extend-conflict@example.com", "+61400000642")
+
+	draft := decode[jobResponse](t, as(t, router, customer, http.MethodPost, "/v1/jobs", `{}`))
+
+	pickupEnd := testInstant.Add(30 * time.Hour).Truncate(time.Millisecond)
+	bound := expiringJob(t, pool, customer, 30*time.Hour, pickupEnd)
+
+	for name, id := range map[string]string{
+		"a draft":                     draft.ID,
+		"a job bounded by its pickup": bound.String(),
+	} {
+		rec := as(t, router, customer, http.MethodPost, "/v1/jobs/"+id+"/extend", `{}`)
+		if rec.Code != http.StatusConflict {
+			t.Errorf("%s = %d, want 409 (%s)", name, rec.Code, rec.Body)
+			continue
+		}
+		if code := decode[errorEnvelope](t, rec).Error.Code; code != "jobs_not_extendable" {
+			t.Errorf("%s: code = %q, want jobs_not_extendable", name, code)
+		}
+	}
+}
+
+// TestExtendingSomebodyElsesJobIsIndistinguishableFromItNotExisting applies SHIP-62's disclosure
+// rule to the third endpoint that names a job.
+//
+// Repeated per endpoint rather than trusted per domain, for the reason the cancellation version
+// gives: a job is discoverable through whichever route forgets it.
+func TestExtendingSomebodyElsesJobIsIndistinguishableFromItNotExisting(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	owner := newCustomer(t, pool, "http-extend-owner@example.com", "+61400000643")
+	stranger := newCustomer(t, pool, "http-extend-stranger@example.com", "+61400000644")
+
+	job := expiringJob(t, pool, owner, 24*time.Hour, time.Time{})
+
+	theirs := as(t, router, stranger, http.MethodPost, "/v1/jobs/"+job.String()+"/extend", `{}`)
+	nothing := as(t, router, stranger, http.MethodPost,
+		"/v1/jobs/"+uuid.Must(uuid.NewV7()).String()+"/extend", `{}`)
+
+	if theirs.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 — 403 would confirm the job exists (%s)", theirs.Code, theirs.Body)
+	}
+	if theirs.Body.String() != nothing.Body.String() {
+		t.Errorf("a stranger can tell somebody else's job from no job at all:\n %s\n %s",
+			theirs.Body, nothing.Body)
+	}
+
+	if at := deadlineOf(t, pool, job); at == nil || !at.Equal(testInstant.Add(24*time.Hour)) {
+		t.Errorf("the stranger's refused extension moved the deadline to %v", at)
 	}
 }
 

@@ -67,6 +67,17 @@ func init() {
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Cancel() },
 		},
+		Route{
+			// Also a verb under the resource, but for a different reason from cancel's.
+			// The deadline is an ordinary column, so a PATCH would work — and would be
+			// wrong, because the new deadline is the platform's to compute (Docs/02 §6.3).
+			// A client that could write the field could keep a listing alive for a decade.
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/extend",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return jobsHandler(d).Extend() },
+		},
 	)
 }
 

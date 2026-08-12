@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **268 checks across 11 sections**, and `make check` green. Since
+Verified by `make verify` — **295 checks across 11 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -267,6 +267,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-67** | M2 | `jobs.budget` — minor units, and three tests rather than one proving it cannot reach a provider — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-68** | M2 | Job expiry — the deadline is a trigger's, the sweep is the worker's, and `make verify` runs the real binary — *see below* |
+| **SHIP-69** | M2 | The expiry warning forty-eight hours ahead — a second task over the same column, and the job is warned once per *deadline* rather than once per job — *see below* |
+| **SHIP-70** | M2 | `POST /v1/jobs/{id}/extend` — an empty body, because the platform computes the deadline. **Not a status transition**, and the pickup date still bounds it — *see below* |
 | **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-77** | M2 | Flutter customer job detail — the timeline is derived from the current status, because the transition history the database records is served by no endpoint; and sign-out finally tells the platform — *see below* |
@@ -277,6 +279,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
+| **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -1768,6 +1771,111 @@ computed, starts `cmd/worker`, waits for the first pass, and then asserts the st
 `Cancelled` with an `Open->Cancelled` history row attributed to `system` with no account, an
 outbox event, and the live job untouched. The count went from 208 to **224**.
 
+### SHIP-69 — warned once per *deadline*, which is a trigger's job rather than a caller's
+
+Docs/02 §6.3's other sentence — "the customer is warned 48 hours before expiry" — is
+`job.expiry_warned`, emitted by a second task in `cmd/worker` over the column SHIP-68 built. The
+claim, the event and the pass are each the same shape as the expiry sweep's, deliberately: two tasks
+that claimed work differently would be two things to reason about when a pass misbehaves at three in
+the morning.
+
+**The warning needed somewhere to record that it had happened, and the tempting place was wrong.**
+The sweep runs every five minutes and a job sits inside the window for two days, so without a mark
+the customer's phone buzzes about five hundred times for one job. The obvious answer — ask the
+outbox whether a `job.expiry_warned` event exists for the aggregate — is the wrong table. The outbox
+is a hand-off rather than a record: rows are marked published and are prunable the moment they are
+(`000004` says so), so the question is answered correctly today and wrongly after the first
+clean-up. It is also a read of the events seam by a domain that is only supposed to write through
+it. `000407` adds `jobs.expiry_warned_at` instead.
+
+**"Once per deadline" is a trigger, and that is the decision worth reading.** A mark alone gives
+"once per job", which would mean a customer who extends is never warned again — SHIP-70 silently
+switching SHIP-69 off for exactly the jobs that had used it, with the symptom being a notification
+that never arrives. So `000407` clears `expiry_warned_at` whenever `expires_at` changes, on the same
+argument `000406` makes for setting the deadline in the first place: moving a deadline is not one
+code path. SHIP-70's endpoint is the first, an administrator adjusting a listing is a plausible
+second, a republished job is a third, and a line in the extend handler is a line the other two can
+forget. Attached to the change rather than to the caller, as `updated_at` and `expires_at` already
+are.
+
+**The claim is bounded at both ends, and the lower bound is the interesting one.** `expires_at > $1`
+excludes a job whose deadline has already passed, because both sweeps live in one binary and run on
+the same interval — so without it, a job that outlived its deadline between two passes gets "expires
+in two days" and "has expired" in the same minute, which costs a customer's trust in every later
+notification. The forty-eight hours itself is one constant in Go (`jobs.ExpiryWarning`) and the
+claim takes the horizon as a parameter, so a test moves the window instead of waiting.
+
+**A warning is not a transition and nothing here pretends otherwise.** The job is `Open` before and
+`Open` after; `Service.Transition` is not called, no `job_status_history` row is written, and
+`000402`'s guard returns early because the statement does not name `status`. Reusing the status event
+would have meant emitting `Open → Open`, which Docs/02 §2 has no row for — and would have put a move
+that never happened into a customer's timeline. Both the domain test and `make verify` assert the
+history row count is unchanged, because that is the failure a plausible implementation produces.
+
+**The two tasks are separate for their failure modes, not for tidiness.** One task claiming and
+doing both would mean a failure in either half rolls back the other, so an outbox that cannot be
+written would stop jobs expiring — the wrong trade, since a job left Open past its pickup date
+misleads providers while a warning that arrives late merely arrives late.
+
+**One thing this file's next reader has to know about the worker.** `cmd/worker` is one binary, so
+every verify section that starts it now runs a warning sweep too. `scripts/verify/50-jobs.sh` leaves
+**no job inside the forty-eight-hour window** — each is either already marked warned or has a
+deadline days away — so a later section's worker start claims nothing, and there is a check at the
+end of that file asserting exactly this. A future check that leaves an `Open` job an hour from its
+deadline will be told so there rather than by a puzzling failure three sections later. The count
+went from 268 to **275**.
+
+### SHIP-70 — an extension is an ordinary `UPDATE`, and the pickup date still bounds it
+
+`POST /v1/jobs/{id}/extend`, with `{}` as the whole request. Docs/02 §6.3's "can extend in one
+action" is one call and no fields.
+
+**It is not a status transition, and that was the ticket's first question.** The answer is no, and
+`000406` had already reached it from the other side: its trigger fills `expires_at` only when the
+column is NULL precisely so that "SHIP-70's extend endpoint is an ordinary `UPDATE`". A job is
+`Open` before an extension and `Open` after, Docs/02 §2 has no row describing it, and `Open → Open`
+is a move the guard refuses on purpose. So none of SHIP-57's machinery is involved. That is not a
+loophole — `000402`'s own comment says "every other update to a job — its category, its addresses,
+its budget — passes straight through", and a deadline is one of those.
+
+**The client does not say how long.** A period in the body would be a client choosing how long the
+platform's own listing rule applies to it, which is the same shape as naming a status. The new
+deadline is `LEAST(now + 14 days, pickup_window_end)` — `000406`'s rule applied again from the moment
+the customer acted. Counted from *now* rather than added to the deadline the job has, so acting
+early gains no more than acting late; and `extendRequest` has no fields at all, so
+`httpx.DecodeJSON` refuses `{"days": 30}` rather than ignoring it. A client that believed it had
+bought thirty days and received fourteen would have no way to tell from a successful response.
+
+**The pickup date still wins, and the refusal is the interesting half.** Docs/02 §6.3 makes the
+pickup date the operative rule — "a job whose pickup window has gone is dead regardless of how
+recently it was posted" — so an extension that ignored it would put a listing in front of providers
+advertising a collection date that had passed, which wastes a bid rather than a glance. A job whose
+deadline already *is* its pickup date therefore answers `409 jobs_not_extendable` rather than `200`
+with nothing changed, and the message names which of the customer's two dates is ending the job.
+Two sentinels share that one code — `ErrJobNotExtendable` (not `Open`) and `ErrExpiryBoundByPickup`
+— on the same reasoning that has `ErrNotJobOwner` and `ErrJobNotFound` sharing `not_found`: the
+client's action is identical and only the sentence differs.
+
+**Two things this deliberately does not do, and both are findings rather than omissions.** There is
+**no cap on the number of extensions**: every job with a pickup window is bounded by it, and a job
+without one is the distant-date case the backstop exists for, where the customer's continued
+interest is the only signal there is. A cap is a counter column and a policy decision. And **no
+endpoint moves the pickup window of an `Open` job** — `PATCH` is Draft-only (`jobs_not_a_draft`), so
+the customer told "your pickup date is what is ending this job" has no way to act on that today.
+Neither is in SHIP-70's *Done when*; both belong to whoever owns SHIP-63's publish/republish path.
+
+**It emits `job.expiry_extended` although the *Done when* does not ask for one**, and the reason is
+SHIP-69. A consumer that has already told the customer "this job expires in two days" has no other
+way to learn that it no longer does, and `000407` re-arms the warning — so a second
+`job.expiry_warned` would otherwise arrive later with nothing to explain why the first was void. The
+payload carries both deadlines for exactly that reason. It is also the only record that an extension
+happened at all: `job_status_history` is deliberately not the place for it.
+
+**`make verify` covers both tickets against the real worker and the real endpoint**, and the
+fixture worth naming is `age_job` — a plain `UPDATE` bringing a deadline to a day away, because no
+check can wait thirteen days, and it is the same statement the endpoint itself makes rather than a
+way around anything. The count went from 275 to **285**.
+
 ### SHIP-71 — the locations step, and the validation it deliberately does not do
 
 `/jobs/new` is the first screen to hang off the signed-in shell. It takes the two addresses in
@@ -2440,6 +2548,134 @@ published, an unreachable broker leaves every row claimable and the next pass pu
 order, a crash between publishing and committing publishes the same event twice rather than
 losing it, and one aggregate belongs to one worker while a second worker is still handed the
 other.
+
+### SHIP-135 — the topic set, the catalogue, and why the outbox needs no dead-letter path
+
+Three points, and most of the value is in closing the two §9 items SHIP-134 opened and named this
+ticket for: **nothing created the Kafka topics**, and **the outbox had no dead-letter path**. Both
+are decided here, and it turns out they are one decision rather than two.
+
+**The topic set is three topics, one per aggregate — `shipper.job`, `shipper.bid`,
+`shipper.delivery` — and `topicFor` moved rather than changed.** §9 predicted it would be "the one
+line SHIP-135 changes", and what changed was its address: the mapping is now
+`internal/events.TopicFor`, beside the catalogue that decides the set, and `cmd/worker`'s
+`topicFor` delegates to it. The aggregate list is closed the way `internal/boundaries.Domains` and
+`migrations.Blocks` are closed. All three topics are created now even though only `job` has events,
+because a partition count cannot be reduced and deciding all three at once is cheaper than deciding
+each under whatever deadline first needs it.
+
+**`cmd/topics` creates them, applied like a migration, and local and deployed are the same step.**
+That was §9's genuinely open half. The compose stack was rejected because it would be a second,
+hand-maintained topic list that exists only locally — the drift the single implementation avoids,
+written down. A start-up step in `cmd/worker` was rejected for two reasons: it runs once per
+process rather than once per deployment, which in the harness alone is four worker starts, and it
+needs `Create` on the cluster in a process whose whole job is producing. **A schema is applied by a
+step somebody runs**, and this repository already has that shape in `cmd/migrate`. The topic list
+is derived from `events.Topics()` rather than typed, so it cannot drift from the catalogue;
+`make topics` runs it; it is idempotent, and re-running is the intended usage. It also **refuses**
+a topic whose partition count disagrees rather than correcting it — adding a partition rehashes
+every key and silently ends the per-aggregate ordering the publisher's advisory locks exist to
+keep, so that is a decision with a migration behind it, not a repair.
+
+**"Versioned schema" means a `Schema` per event type — aggregate, version, payload field set, and a
+payload bound — and the version travels in the message rather than in the topic name.** The obvious
+design is `shipper.job.v2`, and it is wrong here structurally rather than aesthetically: **ordering
+is promised per aggregate**, Kafka orders within one partition of one topic, so one topic per
+aggregate is what makes that promise keepable. A version in the topic name is therefore a version
+per *aggregate* — `job.expiry_warned` gaining a field would move `job.status_changed` too, and a
+job's events would split across two topics with no order between them. One topic per event type
+loses the ordering outright.
+
+**The version is written into the payload when the row is written, not looked up when it is
+published**, and that distinction is the whole point. The failure worth preventing is the one
+`internal/pagination`'s cursor prefix was built against (SHIP-66): not a rejected event but **a
+stale one accepted as meaning something else** after a deployment. A row written before a deploy
+and drained after it is entitled to the version it was written under; looking the version up at
+publish time would relabel it as the newer shape. It also makes a row self-describing —
+`select payload->>'schema_version'` answers "what shape is this" — and it needed no migration,
+which matters because `outbox` is in the shared block a domain branch may not touch. The publisher
+copies it into the envelope and into a `schema-version` Kafka header, so a consumer can refuse a
+version it was not built for without deserialising the body.
+
+**A domain declares its own events, and no domain track will ever edit `internal/events` to add
+one.** `internal/jobs/events.go` is one `init` calling `events.Register` for the three job events,
+with the payload struct itself as the schema — the field set is derived by reflection rather than
+retyped, so the catalogue cannot describe a shape the code does not have. SHIP-136 adds bidding's
+and delivery's from files exactly like it. `internal/events` still imports no domain: the catalogue
+is a table it holds, not a list it writes.
+
+**The mechanism that makes a forgotten version bump visible is `cmd/api/events_golden.txt`**, and
+it is there for the reason `routes_golden.txt` is: a domain registers from its own `init`, so no
+single source file lists them, and `cmd/api` is the one binary that links every domain. Each line
+is topic, type, version, bound and field set. **A line whose fields changed without its `v`
+changing is the defect** — a one-line diff in review, beside the change that caused it, rather than
+a consumer's logs a week later. Regenerating it is therefore the moment somebody is asked whether
+the version should go up, which is exactly when they can answer.
+
+**The dead-letter decision: there is no dead-letter path, because a permanently unpublishable row
+is now unwritable.** §9 offered three ways out and called bounding the payload the cheapest and
+probably right one. It is right, and the argument is stronger than "cheapest" once the class is
+enumerated. "Permanently unacceptable" can only mean three things: the event type is one nothing
+consumes, its aggregate has no topic, or the payload is over the broker's limit. All three are
+decided by the catalogue, and **`events.New` and `Outbox.Emit` check all three inside the
+transaction making the state change** — where a failure rolls the change back, tells the caller, and
+names the line that built the event. So the outbox's remaining failures are all transient (the
+broker is unreachable, or the topic set was never applied), and for those, failing the batch and
+leaving every row claimable is exactly right. **Rather than build a recovery path, the ticket made
+the failure unreachable.** Parking a row after N attempts was rejected on `000004`'s own terms —
+`published_at` is the publisher's only state — and publishing per event was rejected because it
+weakens the batch guarantee for every event to accommodate one that should never exist.
+
+The bound is 16 KiB per payload against a broker limit of 1,048,588 bytes, and it is not tuned:
+its job is to make an unacceptable payload unwritable, and any bound comfortably below the broker's
+does that. **The revisit trigger is named rather than left to judgement: the first event whose
+payload is legitimately unbounded — a document, a photograph, a manifest — must not travel in the
+outbox at all.** It goes to object storage and the event carries the key. If that is ever refused,
+the dead-letter question reopens with §9's other two answers still on the table.
+
+**Two smaller things fell out of it.** `events.New` no longer takes an aggregate type — the
+catalogue supplies it, so `job.status_changed` can no longer be emitted on the `bid` aggregate,
+which would have published to `shipper.bid` and been read by nobody with nothing anywhere
+reporting it. And **the budget-privacy invariant is now structural across every domain event there
+will ever be**: `cmd/api` refuses any registered field whose name mentions a budget, in bidding and
+delivery before they have written a line. `internal/jobs` already read its own events back out of
+the outbox and failed on one; this is the version that covers the domains that do not exist yet.
+
+**`make verify` went from 285 checks across 11 sections to 295**, with the ten new ones in
+`scripts/verify/80-notifications.sh` demonstrating the topic set against the real broker: all three
+topics with three partitions and stated retention, a second application that creates nothing, a
+topic staged by hand with one partition being reported and **left alone**, the version in the row,
+in the envelope and in the header, and the committed catalogue holding a schema for each of the
+three events and no budget field anywhere in it.
+
+**And it found a third instance of this harness's oldest lesson, one layer further out than the
+first two: `shipper.job` is shared by every git worktree on the machine.** The header check was
+first written as a count over the whole topic — every message of a registered type must carry
+`schema-version:1` — and it failed on a run where nothing was wrong. `COMPOSE_PROJECT_NAME` is
+pinned so that worktrees share one stack, deliberately, and the isolation that comes with that is
+per-worktree databases and ports. **Kafka has no equivalent**: there is one broker and one
+`shipper.job`, so a concurrent `make verify` in another worktree — running a build without this
+ticket in it — had its own unversioned events on the topic, and the count was right about what it
+saw. The check now fences on **the event ids this section created**, which is the recipe SHIP-47's
+rate-limit bucket produced and SHIP-134's comparison adopted, with one addition worth carrying
+forward: **on a topic the fence has to be an id rather than a timestamp**, because a concurrent run
+in another worktree is not ordered against this one. Anything a later section asserts about a Kafka
+topic has to identify its messages rather than count them.
+
+**`scripts/verify/50-jobs.sh` now applies the topic set before its first worker start, and claims
+no check for it.** That is the §9 finding acted on rather than restated: `cmd/worker` is one binary,
+every start runs every task, so that file's three starts also drain the outbox — and against a
+missing topic every one of those passes failed silently, because nothing in that section asserted
+on them. The topic application is a prerequisite there and an assertion in the notifications
+section, which keeps the check where the ticket is.
+
+**One configuration request, deliberately not taken.** The replication factor is the only genuinely
+environment-dependent number in the topic set: one is correct for a single-broker compose stack and
+wrong for a cluster, which wants three. `internal/config` is a shared surface a domain branch may
+not edit, so it is a flag on the command — `go run ./cmd/topics -replication 3` — defaulting to
+`events.DefaultReplicationFactor`. A deployment can pass it today with no configuration change.
+**Whoever next owns `internal/config` should fold it in as `KAFKA_REPLICATION_FACTOR`**, which is
+the same handling `GEOCODING_*` and the page sizes got.
 
 ### SHIP-15i — the wave-5 pre-step, and the two things it deliberately did not do
 

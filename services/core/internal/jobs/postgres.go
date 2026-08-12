@@ -43,8 +43,8 @@ type postgresStore struct{}
 // column cannot hold — ck_jobs_length_cm refuses a dimension that is not positive — so 0 and NULL
 // cannot be confused in either direction.
 //
-// The coordinates, the four window ends and expires_at are the exceptions, for opposite reasons.
-// (0, 0) is a real point in the Gulf of Guinea, so a coalesced coordinate would be
+// The coordinates, the four window ends, expires_at and expiry_warned_at are the exceptions, for
+// opposite reasons. (0, 0) is a real point in the Gulf of Guinea, so a coalesced coordinate would be
 // indistinguishable from a resolved one; and PostgreSQL's NULL has no representation in
 // time.Time at all.
 //
@@ -70,7 +70,7 @@ const jobColumns = `
 	pickup_window_start, pickup_window_end,
 	dropoff_window_start, dropoff_window_end,
 	COALESCE((budget * 100)::bigint, 0),
-	expires_at,
+	expires_at, expiry_warned_at,
 	created_at, updated_at`
 
 // scanJob reads one row of [jobColumns].
@@ -88,7 +88,7 @@ func scanJob(row pgx.Row) (Job, error) {
 		pickupStart, pickupEnd   *time.Time
 		dropoffStart, dropoffEnd *time.Time
 
-		expiresAt *time.Time
+		expiresAt, expiryWarnedAt *time.Time
 	)
 
 	if err := row.Scan(
@@ -104,7 +104,7 @@ func scanJob(row pgx.Row) (Job, error) {
 		&pickupStart, &pickupEnd,
 		&dropoffStart, &dropoffEnd,
 		&j.BudgetCents,
-		&expiresAt,
+		&expiresAt, &expiryWarnedAt,
 		&j.CreatedAt, &j.UpdatedAt,
 	); err != nil {
 		return Job{}, err
@@ -112,6 +112,9 @@ func scanJob(row pgx.Row) (Job, error) {
 
 	if expiresAt != nil {
 		j.ExpiresAt = *expiresAt
+	}
+	if expiryWarnedAt != nil {
+		j.ExpiryWarnedAt = *expiryWarnedAt
 	}
 
 	// ck_jobs_pickup_coordinate_is_a_pair means one of these being present implies the other,
@@ -442,6 +445,67 @@ func (postgresStore) jobsFor(ctx context.Context, r db.Runner, customerID uuid.U
 		return nil, fmt.Errorf("jobs: reading the jobs of %s: %w", customerID, err)
 	}
 	return out, nil
+}
+
+// markExpiryWarned records that this job's owner has been told about the deadline it has now
+// (SHIP-69).
+//
+// # The predicate is on the write rather than in a read before it
+//
+// A read-then-write would be two statements with a window between them, and the window is where a
+// job gets warned twice. Here the conditions are part of the UPDATE, so PostgreSQL evaluates them
+// against the row it is about to change — which makes "warned at most once per deadline" a property
+// of the statement rather than of the order two statements happen to run in.
+//
+// The caller has already claimed and locked the row, so no rows updated cannot happen today. It is
+// reported rather than assumed away because the caller that could hit it is the one that has not
+// been written yet: a path that warns a job it chose some other way should be told the job was not
+// eligible, not left believing it sent a warning.
+//
+// **The status write is untouched.** This statement does not name `status`, so 000402's guard
+// returns early and no job_status_history row is needed — a warning is not a transition, and
+// nothing here should make it look like one.
+func (postgresStore) markExpiryWarned(ctx context.Context, r db.Runner, id uuid.UUID, at time.Time) (Job, error) {
+	const q = `
+		UPDATE jobs SET expiry_warned_at = $2
+		WHERE id = $1 AND status = 'Open' AND expiry_warned_at IS NULL
+		RETURNING ` + jobColumns
+
+	j, err := scanJob(r.QueryRow(ctx, q, id, at.UTC()))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Job{}, fmt.Errorf("jobs: %s is not an Open job awaiting a warning: %w",
+			id, ErrExpiryWarningNotDue)
+	case err != nil:
+		return Job{}, fmt.Errorf("jobs: warn %s of expiry: %w", id, err)
+	}
+	return j, nil
+}
+
+// setDeadline moves a job's expiry (SHIP-70).
+//
+// One column, and no `status` anywhere in the statement — which is the whole reason an extension is
+// an ordinary UPDATE rather than a transition. 000402's guard returns early for an update that
+// leaves the status alone, and 000406's trigger fills `expires_at` only when it is NULL, so a value
+// written here is a value that stays written. 000406 said so before this existed.
+//
+// 000407's trigger fires on the way through and clears `expiry_warned_at`, so the job is warned
+// again forty-eight hours before its new deadline. That is deliberately not done here: a deadline
+// can be moved by more than one caller and only the trigger sees all of them.
+//
+// The caller holds the row under FOR UPDATE, so no rows is the same impossible-but-reported case
+// [postgresStore.updateDraft] describes.
+func (postgresStore) setDeadline(ctx context.Context, r db.Runner, id uuid.UUID, at time.Time) (Job, error) {
+	const q = `UPDATE jobs SET expires_at = $2 WHERE id = $1 RETURNING ` + jobColumns
+
+	j, err := scanJob(r.QueryRow(ctx, q, id, at.UTC()))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Job{}, fmt.Errorf("jobs: %s vanished mid-extension: %w", id, ErrJobNotFound)
+	case err != nil:
+		return Job{}, fmt.Errorf("jobs: extend %s: %w", id, err)
+	}
+	return j, nil
 }
 
 // recordTransition writes the history row and returns the platform's clock reading.

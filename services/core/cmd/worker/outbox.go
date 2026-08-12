@@ -38,11 +38,13 @@ import (
 //
 // # What this is not
 //
-// It does not create topics. SHIP-135 owns the topic set, and a topic created here with
-// whatever partition count seemed reasonable would be worse than no topic at all: partitions can
-// be added later but never removed, and adding one moves every key to a different partition,
-// which silently ends the per-aggregate ordering promised below. Until SHIP-135, a publish to a
-// missing topic fails the pass and the rows stay claimable — see the failure note on run.
+// It does not create topics. **SHIP-135 owns the topic set and applies it from cmd/topics**, the
+// way a migration is applied, and a topic created here with whatever partition count seemed
+// reasonable would be worse than no topic at all: partitions can be added later but never removed,
+// and adding one moves every key to a different partition, which silently ends the per-aggregate
+// ordering promised below. A publish to a topic nobody applied fails the pass and the rows stay
+// claimable — see the failure note on run — which is the correct direction to fail, and now says
+// the deployment step was skipped rather than that a row is stuck.
 
 // EventPublisher is what a pass needs from a message broker.
 //
@@ -170,9 +172,19 @@ const markPublished = `
 // from a pass that failed, and the scheduler would log "claimed n" through a broker outage.
 // Louder and slightly wasteful beats quiet and slightly efficient.
 //
-// The cost is head-of-line blocking: one event the broker will never accept — over the message
-// size limit, say — stops the aggregates in its batch until somebody looks. Recorded in Docs/11
-// §9 rather than solved here, because the fix is a dead-letter path and that is not this ticket.
+// The cost would be head-of-line blocking: one event the broker will never accept — over the
+// message size limit, say — stopping the aggregates in its batch until somebody looked. SHIP-134
+// recorded that in Docs/11 §9 rather than solving it, because the obvious fix is a dead-letter
+// path.
+//
+// **SHIP-135 closed it from the other end and there is no dead-letter path.** Every condition that
+// can permanently reject an event — an unregistered type, an aggregate with no topic, a payload
+// over the broker's limit — is now checked by internal/events when the row is written, inside the
+// transaction making the state change, where a failure rolls the change back and names the line
+// that caused it. So a row that reaches this table is one the broker will accept, and every
+// failure left here is transient: the broker is unreachable, or the topic set was never applied.
+// Failing the whole batch and leaving every row claimable is exactly right for both.
+// internal/events/catalogue.go carries the argument and the trigger that would reopen it.
 func (d outboxDrain) run(ctx context.Context, r db.Runner) (int, error) {
 	if err := checkClaim(claimUnpublished); err != nil {
 		return 0, err

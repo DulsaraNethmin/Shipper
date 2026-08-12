@@ -85,6 +85,36 @@ var (
 	// ErrNothingToUpdate means a PATCH named no field at all.
 	ErrNothingToUpdate = errors.New("jobs: the request changes nothing")
 
+	// ErrExpiryWarningNotDue means a warning was attempted on a job that is not an Open job
+	// awaiting one (SHIP-69).
+	//
+	// Unreachable from the sweep, which claims exactly the eligible rows and holds their locks.
+	// It exists for the caller that does not exist yet: a path that picks a job some other way
+	// should be told the job was not eligible rather than believing a warning was sent, because
+	// the mark and the event are what make the warning happen once and a caller that skipped
+	// both has silently done nothing.
+	ErrExpiryWarningNotDue = errors.New("jobs: that job is not awaiting an expiry warning")
+
+	// ErrJobNotExtendable means the job is in a status whose deadline does not end it.
+	//
+	// Only an Open job expires — [ExpiryClaim] filters on it, and Docs/02 §2's one "job expires
+	// unclaimed" row is `Open → Cancelled`. Extending anything else would move a column nothing
+	// reads and tell the customer their job was safe when it was never at risk.
+	ErrJobNotExtendable = errors.New("jobs: only an Open job can have its expiry extended")
+
+	// ErrExpiryBoundByPickup means the job is ending because its pickup date is passing, so
+	// there is no time an extension could add.
+	//
+	// Docs/02 §6.3 calls the pickup date the operative rule and the fourteen days a backstop: "a
+	// job whose pickup window has gone is dead regardless of how recently it was posted."
+	// Extending past it would put a listing in front of providers advertising a collection date
+	// that has been and gone, which is worse than letting the job expire.
+	//
+	// Distinct from ErrJobNotExtendable in Go and one code on the wire, for the reason
+	// ErrNotJobOwner and ErrJobNotFound share `not_found`: the client's action is the same —
+	// reload and show what is actually available — and only the sentence differs.
+	ErrExpiryBoundByPickup = errors.New("jobs: the pickup date is what ends this job, not the listing period")
+
 	// ErrJobNotCancellable means Docs/02 §2 has no `→ Cancelled` row for the status the job
 	// is in.
 	//
@@ -133,4 +163,16 @@ var (
 	CodeNotCancellable = httpx.RegisterCode("jobs_not_cancellable",
 		"The job can no longer be cancelled. Once a provider has been awarded the work, ending "+
 			"the job is a support matter rather than a state change. Reload it to see its current status.")
+
+	// CodeNotExtendable is returned when an extension cannot add time to a job (SHIP-70).
+	//
+	// 409 rather than 403, on the same reasoning as the two above: the caller is permitted and
+	// the request contradicts the state the job is in. Two conditions share it — the job is not
+	// Open, or its pickup date rather than its listing period is what ends it — because the
+	// client's response to both is to reload and offer what is actually available. The message
+	// says which; the code says what to do.
+	CodeNotExtendable = httpx.RegisterCode("jobs_not_extendable",
+		"The job's expiry cannot be extended. Either it is not being offered to providers any "+
+			"more, or its pickup date is what is ending it — and no amount of extra listing "+
+			"time keeps a job alive past the date its goods were to be collected.")
 )
