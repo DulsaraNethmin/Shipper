@@ -119,11 +119,14 @@ SHIP-67a
 SHIP-68
 SHIP-71
 SHIP-76
+SHIP-77
 
 # M3 — Bidding and award
 SHIP-78
 SHIP-80
 SHIP-91
+SHIP-98
+
 # M4 — Delivery execution
 SHIP-105
 SHIP-110

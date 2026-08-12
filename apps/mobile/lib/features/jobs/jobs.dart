@@ -5,9 +5,14 @@
 /// - `job.dart` — the `Job` schema from `contracts/paths/jobs.yaml`, and `AddressInput`, which is
 ///   an address on its way *to* the platform.
 /// - `job_status.dart` — the twelve states of `Docs/02` §1, in their wire form.
-/// - `jobs_repository.dart` — the three endpoints a customer screen calls.
+/// - `jobs_repository.dart` — the five endpoints a customer screen calls.
 /// - `job_locations_screen.dart` and its controller — the first step of publishing (SHIP-71).
 /// - `customer_job_list.dart` and its controller — the customer's own jobs (SHIP-76).
+/// - `job_detail_screen.dart` and its controller — one delivery in full (SHIP-77).
+/// - `job_timeline.dart` — where a job has reached, derived from its status because the
+///   per-transition history is recorded in the database and served by no endpoint.
+/// - `job_actions.dart` — what the platform would permit on a job right now, which the app uses
+///   to decide what is worth offering and never to decide anything else.
 ///
 /// ## Three rules this package is held to
 ///

@@ -15,6 +15,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/session_controller.dart';
+import 'package:shipper/core/auth/session_ender.dart';
 import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_store.dart';
@@ -85,6 +86,33 @@ void main() {
       // first request it makes, because the platform decides.
       expect(redirectFor(const SessionState.signedOut(), Routes.newJob), Routes.signIn);
       expect(redirectFor(const SessionState.restoring(), Routes.newJob), Routes.starting);
+    });
+
+    test('a job detail path is reachable while signed in, id and all', () {
+      // SHIP-77 is the first route whose path carries an identifier, so it is the first that a
+      // set of fixed strings cannot answer. Forgetting it produces SHIP-71's symptom exactly: a
+      // card that appears to do nothing when it is tapped.
+      const path = '/jobs/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0';
+
+      expect(redirectFor(const SessionState.signedIn(), path), isNull);
+      expect(redirectFor(const SessionState.signedOut(), path), Routes.signIn);
+      expect(redirectFor(const SessionState.restoring(), path), Routes.starting);
+    });
+
+    test('the wizard is still the wizard, not a job whose id is the word new', () {
+      // go_router takes the first route that matches, which is why `/jobs/new` is declared
+      // before `/jobs/:id`. The guard has to agree with that ordering, or the two disagree
+      // about what `/jobs/new` is and only one of them draws a screen.
+      expect(Routes.newJob, '/jobs/new');
+      expect(Routes.jobDetailFor('abc'), '/jobs/abc');
+      expect(redirectFor(const SessionState.signedIn(), Routes.newJob), isNull);
+    });
+
+    test('the pattern matches one segment and not a path below it', () {
+      // A guard matching `/jobs/{id}/anything` would wave through routes nobody has declared,
+      // and whichever screen eventually claims one would inherit a decision made before it
+      // existed.
+      expect(redirectFor(const SessionState.signedIn(), '/jobs/0198f2c1/bids'), Routes.home);
     });
 
     test('the connectivity screen is reachable from either shell, and during the restore', () {
@@ -267,6 +295,9 @@ Widget _scope(FakeTokenStore store, {required Widget child}) => ProviderScope(
         // the customer half — which reads that customer's jobs as soon as it is drawn (SHIP-76).
         // Without this it would open a socket to whatever is listening on the local API port.
         jobsRepositoryProvider.overrideWithValue(FakeJobsRepository()),
+        // Two tests here tap sign-out, which now tells the platform the device session is over.
+        // Same hazard as the three above, and the same override.
+        sessionEnderProvider.overrideWithValue(FakeSessionEnder()),
       ],
       child: child,
     );

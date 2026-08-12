@@ -81,6 +81,35 @@ class ApiClient {
     return _write('PATCH', path, idempotencyKey: idempotencyKey, body: body);
   }
 
+  /// A write the platform answers with `204 No Content`.
+  ///
+  /// `POST /v1/auth/logout` is the only one today and is why this exists: it answers `204` with
+  /// an empty body, which [postJson] would raise as [ApiMalformedResponse] — a *success* reported
+  /// as a broken response. Nothing branches on that today, because the one caller is
+  /// fire-and-forget, and that is exactly the kind of wrongness that stays harmless until
+  /// something does.
+  ///
+  /// [headers] is for the one call that has to carry a credential this transport will not supply.
+  /// See `session_ender.dart`, which explains why the sign-out request must not travel through
+  /// the interceptor that reads the session's token.
+  Future<void> postNoContent(
+    String path, {
+    required String idempotencyKey,
+    Map<String, Object?> headers = const <String, Object?>{},
+    Object? body,
+  }) async {
+    await _guarded(
+      () => _dio.request<Object?>(
+        path,
+        data: body,
+        options: Options(
+          method: 'POST',
+          headers: {ApiHeaders.idempotencyKey: idempotencyKey, ...headers},
+        ),
+      ),
+    );
+  }
+
   Future<Map<String, dynamic>> _write(
     String method,
     String path, {
@@ -100,15 +129,20 @@ class ApiClient {
   }
 
   Future<Map<String, dynamic>> _json(Future<Response<Object?>> Function() send) async {
+    final response = await _guarded(send);
+    final data = response.data;
+
+    if (data is Map<String, dynamic>) return data;
+
+    // A 204, an HTML error page from a proxy, or a JSON array where an object was expected.
+    // All of them mean the same thing to a caller: this is not the response it can use.
+    throw ApiMalformedResponse(statusCode: response.statusCode ?? 0);
+  }
+
+  /// Sends, mapping a transport failure onto [ApiFailure].
+  Future<Response<Object?>> _guarded(Future<Response<Object?>> Function() send) async {
     try {
-      final response = await send();
-      final data = response.data;
-
-      if (data is Map<String, dynamic>) return data;
-
-      // A 204, an HTML error page from a proxy, or a JSON array where an object was expected.
-      // All of them mean the same thing to a caller: this is not the response it can use.
-      throw ApiMalformedResponse(statusCode: response.statusCode ?? 0);
+      return await send();
     } on DioException catch (e) {
       // The idempotency guard rejects with the call site's own error. Surfacing that as a
       // network problem would hide a programming mistake behind a plausible excuse, and the

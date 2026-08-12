@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:shipper/core/auth/session_ender.dart';
 import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/token_pair.dart';
 import 'package:shipper/core/auth/user_role.dart';
@@ -90,5 +91,33 @@ class FakeSessionRefresher implements SessionRefresher {
     if (thrown != null) throw thrown;
 
     return pairs[attempt < pairs.length ? attempt : pairs.length - 1];
+  }
+}
+
+/// A [SessionEnder] that records what it was asked, and can refuse.
+///
+/// It records the **access token each call carried**, which is what makes the rule assertable:
+/// the sign-out request is authenticated with the token the session is in the act of discarding,
+/// and a client that sent nothing would silently leave the platform session alive for thirty
+/// days — which is the defect this exists to stop coming back.
+class FakeSessionEnder implements SessionEnder {
+  /// Every access token presented, in order. Its length is the number of sign-outs reported.
+  final presented = <String>[];
+
+  /// Every idempotency key sent, in order.
+  final keys = <String>[];
+
+  /// Thrown instead of answering. A sign-out must survive it.
+  Object? failure;
+
+  int get calls => presented.length;
+
+  @override
+  Future<void> end({required String accessToken, required String idempotencyKey}) async {
+    presented.add(accessToken);
+    keys.add(idempotencyKey);
+
+    final thrown = failure;
+    if (thrown != null) throw thrown;
   }
 }

@@ -89,12 +89,7 @@ class SignedInShell extends ConsumerWidget {
         key: const Key('shell-signed-in'),
         child: switch (role) {
           UserRole.customer => const CustomerJobList(),
-          UserRole.provider => const _Half(
-              shellKey: Key('shell-provider'),
-              title: 'Work you can bid on',
-              body: 'Finding jobs, bidding and recording milestones arrive with the '
-                  'bidding and delivery screens in M3 and M4.',
-            ),
+          UserRole.provider => const _ProviderHalf(),
           UserRole.unknown => const _Half(
               shellKey: Key('shell-role-unrecognised'),
               title: 'This version cannot show your account',
@@ -115,12 +110,72 @@ class SignedInShell extends ConsumerWidget {
   }
 }
 
+/// The provider half of the shell (SHIP-98).
+///
+/// It is still mostly a placeholder, and deliberately so: the job feed is SHIP-99, bidding is
+/// SHIP-100, and the delivery screens are M4. What it stopped being at SHIP-98 is *entirely* a
+/// placeholder — the fleet is a real provider surface, and this is the only way into it.
+///
+/// **The entry point is drawn for a provider and for nobody else**, which is `Docs/07` §1's
+/// requirement that the two halves stay genuinely separate. That is a presentation decision and not
+/// a control: `ProviderOnly` explains why the fleet screens answer for themselves as well, because
+/// a route is reachable by a deep link with no button involved.
+class _ProviderHalf extends StatelessWidget {
+  const _ProviderHalf();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          key: const Key('shell-provider'),
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              'Work you can bid on',
+              style: theme.textTheme.headlineSmall,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Finding jobs, bidding and recording milestones arrive with the bidding and '
+              'delivery screens in M3 and M4.',
+              style: theme.textTheme.bodySmall,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 32),
+            Text(
+              // Says why the fleet matters here rather than treating it as a settings page. What a
+              // provider can carry is what decides the work they can bid on, and the platform
+              // checks it when the bid is placed.
+              'What you can carry decides which jobs you can bid on.',
+              style: theme.textTheme.bodyMedium,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              key: const Key('manage-vehicles'),
+              // `push` rather than `go`, so the back gesture returns to the shell rather than
+              // rebuilding it.
+              onPressed: () => context.push(Routes.fleet),
+              icon: const Icon(Icons.local_shipping_outlined),
+              label: const Text('Your vehicles'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// A half of the marketplace that has no screen yet.
 ///
-/// The customer half stopped being one of these at SHIP-76 and is now `CustomerJobList`. What is
-/// left is the provider half, which fills at M3, and the two role cases that are not a half of
-/// anything: an account type this build does not know, and a restored session whose role has not
-/// arrived yet.
+/// The customer half stopped being one of these at SHIP-76 and is now `CustomerJobList`, and the
+/// provider half at SHIP-98. What is left is the two role cases that are not a half of anything: an
+/// account type this build does not know, and a restored session whose role has not arrived yet.
 class _Half extends StatelessWidget {
   const _Half({required this.shellKey, required this.title, required this.body});
 

@@ -7,12 +7,16 @@ import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
+import 'package:shipper/features/fleet/add_vehicle_screen.dart';
+import 'package:shipper/features/fleet/fleet_screen.dart';
+import 'package:shipper/features/fleet/vehicle_screen.dart';
 import 'package:shipper/features/identity/email_verification_screen.dart';
 import 'package:shipper/features/identity/phone_verification_screen.dart';
 import 'package:shipper/features/identity/registration_complete_screen.dart';
 import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/role_selection_screen.dart';
 import 'package:shipper/features/identity/sign_in_screen.dart';
+import 'package:shipper/features/jobs/job_detail_screen.dart';
 import 'package:shipper/features/jobs/job_locations_screen.dart';
 
 /// Route paths, named once.
@@ -75,6 +79,44 @@ abstract final class Routes {
   /// already exists is SHIP-75, and gets a route that names one.
   static const newJob = '/jobs/new';
 
+  /// One delivery in full, to the customer who owns it (SHIP-77).
+  ///
+  /// **The id is in the path rather than in a constructor argument**, and that is what makes the
+  /// screen deep-linkable: `Docs/07` §5 requires every notification to open the exact job it
+  /// concerns, so SHIP-145 delivers a payload to this path and nothing about the screen changes.
+  ///
+  /// Declared **after** [newJob] in the router, which is what keeps `/jobs/new` meaning the
+  /// wizard: go_router takes the first route that matches, and `new` would otherwise be read as
+  /// an identifier.
+  static const jobDetail = '/jobs/:id';
+
+  /// [jobDetail] for one job.
+  static String jobDetailFor(String jobId) => '/jobs/$jobId';
+
+  /// The provider's own fleet (SHIP-98).
+  ///
+  /// `/fleet/vehicles` rather than `/fleet`, because the fleet is not the only thing that domain
+  /// holds: SHIP-79's service area and specialties are a provider *profile*, served from
+  /// `/v1/fleet/profile`. Naming the collection now is what stops that arriving as a second meaning
+  /// for one path.
+  static const fleet = '/fleet/vehicles';
+
+  /// Adding a vehicle (SHIP-98).
+  ///
+  /// Declared **before** [vehicleDetail] in the router, for the reason [newJob] is declared before
+  /// [jobDetail]: go_router takes the first route that matches, and `new` would otherwise be read
+  /// as a vehicle's identifier.
+  static const newVehicle = '/fleet/vehicles/new';
+
+  /// One vehicle, to the provider who owns it (SHIP-98).
+  ///
+  /// The id is in the path rather than in a constructor argument, which is what makes the screen
+  /// deep-linkable — the same decision, and the same reason, as [jobDetail].
+  static const vehicleDetail = '/fleet/vehicles/:id';
+
+  /// [vehicleDetail] for one vehicle.
+  static String vehicleDetailFor(String vehicleId) => '/fleet/vehicles/$vehicleId';
+
   /// The connectivity check (SHIP-19).
   ///
   /// Reachable from **both** shells on purpose. It is the only screen that demonstrates build
@@ -115,10 +157,47 @@ const _signedOutLocations = <String>{
 ///
 /// **Adding a location here grants no permission.** What the account may actually do is decided
 /// server-side on every request; this decides only where the app is willing to draw.
+///
+/// **It is deliberately blind to the role**, and that is worth saying because SHIP-98 added the
+/// first surface only one half of the marketplace has any use for. Two reasons, and the second is
+/// the one that would have produced a bug: a guard that decided who may be where would be an
+/// authorisation control living on the device, which `Docs/07` §3 forbids; and the role is `null`
+/// for the first round trip of a restored cold start (SHIP-50), so a role-aware redirect would
+/// bounce a provider off their own fleet every time they opened the app from a notification. The
+/// role decides what a screen *draws* — `ProviderOnly` — not where the router is willing to go.
 const _signedInLocations = <String>{
   Routes.home,
   Routes.newJob,
+  Routes.fleet,
+  Routes.newVehicle,
 };
+
+/// Locations a signed-in user may be at whose path carries an identifier (SHIP-77).
+///
+/// A second collection rather than a cleverer first one, because a set of fixed strings is the
+/// readable form and most routes are one. This is for the routes that cannot be: `/jobs/{id}`
+/// names a job, so there is no constant to put in the set above.
+///
+/// **It matches shape and nothing else, and that is deliberate.** It does not check that the id
+/// is a UUID, or that the job exists, or that the caller owns it. `Docs/07` §3 puts all three on
+/// the platform — `GET /v1/jobs/{id}` answers `404` for a stranger's job byte-identically to one
+/// that does not exist — and a client-side pattern that looked authoritative is exactly how a
+/// guard stops being navigation and starts being a control nobody audited.
+final _signedInPatterns = <RegExp>[
+  // `/jobs/new` is matched by the set above first, so the wizard is never read as a job id.
+  RegExp(r'^/jobs/[^/]+$'),
+
+  // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
+  // route reachable only through an identifier looks, from the outside, like a card that does
+  // nothing when it is tapped.
+  RegExp(r'^/fleet/vehicles/[^/]+$'),
+];
+
+/// Whether a signed-in user may be at [location].
+bool _signedInMayBeAt(String location) {
+  return _signedInLocations.contains(location) ||
+      _signedInPatterns.any((pattern) => pattern.hasMatch(location));
+}
 
 /// Where the session says this location should be, or `null` to leave it alone.
 ///
@@ -142,7 +221,7 @@ String? redirectFor(SessionState session, String location) {
     SessionRestoring() => location == Routes.starting ? null : Routes.starting,
     SessionSignedOut() =>
       _signedOutLocations.contains(location) ? null : Routes.signIn,
-    SessionSignedIn() => _signedInLocations.contains(location) ? null : Routes.home,
+    SessionSignedIn() => _signedInMayBeAt(location) ? null : Routes.home,
   };
 }
 
@@ -266,6 +345,31 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.newJob,
         builder: (context, state) => const JobLocationsScreen(),
+      ),
+      // After `newJob`, deliberately. go_router takes the first route that matches, so declaring
+      // `/jobs/:id` first would make `/jobs/new` a job whose id is the word "new".
+      GoRoute(
+        path: Routes.jobDetail,
+        builder: (context, state) => JobDetailScreen(
+          jobId: state.pathParameters['id'] ?? '',
+        ),
+      ),
+      GoRoute(
+        path: Routes.fleet,
+        builder: (context, state) => const FleetScreen(),
+      ),
+      // Before `vehicleDetail`, deliberately, exactly as `newJob` precedes `jobDetail`: go_router
+      // takes the first route that matches, so `/fleet/vehicles/:id` declared first would make
+      // `/fleet/vehicles/new` a vehicle whose id is the word "new".
+      GoRoute(
+        path: Routes.newVehicle,
+        builder: (context, state) => const AddVehicleScreen(),
+      ),
+      GoRoute(
+        path: Routes.vehicleDetail,
+        builder: (context, state) => VehicleScreen(
+          vehicleId: state.pathParameters['id'] ?? '',
+        ),
       ),
       GoRoute(
         path: Routes.health,

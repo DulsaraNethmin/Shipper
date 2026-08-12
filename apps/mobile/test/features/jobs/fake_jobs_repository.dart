@@ -90,6 +90,13 @@ class FakeJobsRepository implements JobsRepository {
   /// What the list answers with.
   ApiPage<Job> page = const ApiPage<Job>(data: <Job>[]);
 
+  /// What `GET /v1/jobs/{id}` answers with (SHIP-77).
+  ///
+  /// A function of the id, because the detail screen is reached with one and a fake that ignored
+  /// it would let a screen showing the wrong job pass. It answers the **same shape** the list
+  /// does, which is the contract: one `Job` schema for create, edit, read and list alike.
+  Job Function(String jobId) detail = (jobId) => aJob(id: jobId);
+
   /// Set to make the next call of that action throw instead of answering.
   final failures = <String, Object>{};
 
@@ -157,6 +164,45 @@ class FakeJobsRepository implements JobsRepository {
         idempotencyKey: null,
       ),
       () => page,
+    );
+  }
+
+  @override
+  Future<Job> job({required String jobId}) {
+    return _record(
+      (
+        action: 'read',
+        jobId: jobId,
+        fields: const <String, Object?>{},
+        cursor: null,
+        idempotencyKey: null,
+      ),
+      () => detail(jobId),
+    );
+  }
+
+  @override
+  Future<Job> cancel({
+    required String jobId,
+    String reason = '',
+    required String idempotencyKey,
+  }) {
+    return _record(
+      (
+        action: 'cancel',
+        jobId: jobId,
+        fields: <String, Object?>{if (reason.isNotEmpty) 'reason': reason},
+        cursor: null,
+        idempotencyKey: idempotencyKey,
+      ),
+      () {
+        // What the platform does: the transition is applied and the job comes back as it now is.
+        // The answer is recorded against `detail` too, so a re-read after the cancellation —
+        // which is what a `409` makes the screen do — agrees with what the cancellation returned.
+        final ended = detail(jobId).copyWith(status: JobStatus.cancelled);
+        detail = (_) => ended;
+        return ended;
+      },
     );
   }
 }

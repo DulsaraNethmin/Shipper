@@ -2,8 +2,10 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import 'package:shipper/core/errors/api_failure.dart';
+import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/jobs/customer_jobs_controller.dart';
 import 'package:shipper/features/jobs/job.dart';
 import 'package:shipper/shared/design_system/failure_banner.dart';
@@ -155,31 +157,38 @@ class _JobCard extends StatelessWidget {
     return Card(
       key: Key('job-${job.id}'),
       margin: EdgeInsets.zero,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _leg(theme, Icons.trip_origin, job.pickup, 'Pickup address not added yet'),
-            const SizedBox(height: 4),
-            _leg(theme, Icons.place_outlined, job.dropoff, 'Drop-off address not added yet'),
-            if (job.goodsDescription case final goods? when goods.isNotEmpty) ...[
+      // Tapping through to the job in full (SHIP-77). `push` rather than `go`, so the back
+      // gesture returns to the list where it was rather than rebuilding the shell — which would
+      // re-read the list and lose the customer's scroll position.
+      child: InkWell(
+        onTap: () => context.push(Routes.jobDetailFor(job.id)),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _leg(theme, Icons.trip_origin, job.pickup, 'Pickup address not added yet'),
+              const SizedBox(height: 4),
+              _leg(theme, Icons.place_outlined, job.dropoff, 'Drop-off address not added yet'),
+              if (job.goodsDescription case final goods? when goods.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(goods, style: theme.textTheme.bodyMedium),
+              ],
               const SizedBox(height: 8),
-              Text(goods, style: theme.textTheme.bodyMedium),
+              Text(
+                [
+                  // `null` is no budget, which is a different thing from a budget of nothing —
+                  // the platform omits the field rather than sending zero for exactly this
+                  // reason.
+                  if (budget != null) 'Budget ${audFromCents(budget)}',
+                  if (created != null) 'Created $created',
+                  if (expires != null) 'Expires $expires',
+                ].join('  ·  '),
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
             ],
-            const SizedBox(height: 8),
-            Text(
-              [
-                // `null` is no budget, which is a different thing from a budget of nothing —
-                // the platform omits the field rather than sending zero for exactly this reason.
-                if (budget != null) 'Budget ${audFromCents(budget)}',
-                if (created != null) 'Created $created',
-                if (expires != null) 'Expires $expires',
-              ].join('  ·  '),
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-            ),
-          ],
+          ),
         ),
       ),
     );

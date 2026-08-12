@@ -1,4 +1,4 @@
-/// Field-level checks for the signup forms (SHIP-51, SHIP-53, SHIP-54).
+/// Field-level checks for the forms (SHIP-51, SHIP-53, SHIP-54, SHIP-98).
 ///
 /// **Every rule here is a convenience and none of them is a control.** `Docs/07` §2 is explicit:
 /// the app may pre-validate, and the platform decides. `internal/identity/service.go` runs the
@@ -120,6 +120,35 @@ abstract final class Validators {
     final input = value?.trim() ?? '';
     if (input.isEmpty) return 'Enter the six-digit code.';
     return _sixDigits.hasMatch(input) ? null : 'The code is six digits.';
+  }
+
+  /// A measurement the form has to be able to *parse*, and nothing more (SHIP-98).
+  ///
+  /// Empty is accepted, because every measurement on the fleet form is optional — a provider
+  /// standing in a truck yard has the plate to hand and may not know the load height, and the
+  /// platform treats an empty value as "not stated".
+  ///
+  /// **This checks a shape, not a rule, and the distinction is what keeps it inside the split above.**
+  /// The form has to turn what was typed into a JSON number, so "12 tonnes" is a mistake it can see
+  /// without asking. What it deliberately does not check is any *bound* — the maximum weight and the
+  /// maximum dimension are limits `internal/fleet/service.go` holds and `Docs/06` §5.3 keeps
+  /// server-side, and a copy compiled in here could not be corrected without a store release. A
+  /// value past the platform's bound comes back as `out_of_range` with the real number in it, under
+  /// the input that caused it.
+  static String? decimal(String? value) {
+    final input = value?.trim() ?? '';
+    if (input.isEmpty) return null;
+    return double.tryParse(input) == null ? 'Enter a number.' : null;
+  }
+
+  /// A measurement that has to be whole, in the same spirit as [decimal] (SHIP-98).
+  ///
+  /// The three load dimensions are integers in the contract, so `320.5` is a value this form cannot
+  /// send rather than a value the platform would refuse. Again a shape and not a bound.
+  static String? wholeNumber(String? value) {
+    final input = value?.trim() ?? '';
+    if (input.isEmpty) return null;
+    return int.tryParse(input) == null ? 'Enter a whole number.' : null;
   }
 
   /// The token from a verification email (SHIP-53).

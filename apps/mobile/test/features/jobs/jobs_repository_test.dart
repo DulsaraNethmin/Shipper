@@ -218,4 +218,86 @@ void main() {
       expect(page.hasMore, isFalse);
     });
   });
+
+  group('reading one job', () {
+    test('GETs /v1/jobs/{id} with no idempotency key', () async {
+      // A single resource is a bare object rather than a one-item page — the envelope is how a
+      // client tells the two apart without knowing the endpoint (`Docs/10` §4.5).
+      final stub = _repoReturning(<String, Object?>{
+        ..._draft,
+        'status': 'open',
+        'budget_cents': 150000,
+      });
+
+      final job = await stub.repo.job(jobId: '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0');
+
+      final sent = stub.adapter.requests.single;
+      expect(sent.method, 'GET');
+      expect(sent.path, '/v1/jobs/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0');
+      expect(sent.headers.containsKey(ApiHeaders.idempotencyKey), isFalse);
+      expect(job.status, JobStatus.open);
+      // The one shape in this API that carries the budget, read here by the customer who owns
+      // the job (SHIP-67, `Docs/01` §4.3).
+      expect(job.budgetCents, 150000);
+    });
+  });
+
+  group('cancelling', () {
+    test('POSTs the verb under the resource, and sends no status', () async {
+      // Job status is never a settable field (`Docs/02` §2, `CLAUDE.md`). A client naming the
+      // status it wants would be a client deciding a transition, and `{"status": "cancelled"}`
+      // is refused as an unknown field rather than quietly obeyed.
+      final stub = _repoReturning(<String, Object?>{..._draft, 'status': 'cancelled'});
+
+      final job = await stub.repo.cancel(
+        jobId: '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0',
+        idempotencyKey: 'key-3',
+      );
+
+      final sent = stub.adapter.requests.single;
+      expect(sent.method, 'POST');
+      expect(sent.path, '/v1/jobs/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0/cancel');
+      expect(sent.headers[ApiHeaders.idempotencyKey], 'key-3');
+      expect(_sentBody(sent).containsKey('status'), isFalse);
+      expect(job.status, JobStatus.cancelled);
+    });
+
+    test('an empty body is a complete request', () async {
+      // The contract says so: every field of `JobCancellation` is optional, and the API takes a
+      // JSON body on every state-changing request — one endpoint excepted from that would be a
+      // second answer to what a request looks like.
+      final stub = _repoReturning(<String, Object?>{..._draft, 'status': 'cancelled'});
+
+      await stub.repo.cancel(jobId: 'j', idempotencyKey: 'key-4');
+
+      expect(_sentBody(stub.adapter.requests.single), isEmpty);
+    });
+
+    test('a reason travels under the key the contract names', () async {
+      // The platform refuses unknown fields on this body, so a key name is part of the contract
+      // in a way a response's is not.
+      final stub = _repoReturning(<String, Object?>{..._draft, 'status': 'cancelled'});
+
+      await stub.repo.cancel(
+        jobId: 'j',
+        reason: 'Found a cheaper option elsewhere.',
+        idempotencyKey: 'key-5',
+      );
+
+      expect(
+        _sentBody(stub.adapter.requests.single),
+        <String, Object?>{'reason': 'Found a cheaper option elsewhere.'},
+      );
+    });
+
+    test('a cancellation with no idempotency key is refused before it is sent', () async {
+      final stub = _repoReturning(_draft);
+
+      await expectLater(
+        stub.repo.cancel(jobId: 'j', idempotencyKey: ''),
+        throwsA(isA<StateError>()),
+      );
+      expect(stub.adapter.requests, isEmpty);
+    });
+  });
 }

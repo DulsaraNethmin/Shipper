@@ -4,7 +4,7 @@ import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/api/page.dart';
 import 'package:shipper/features/jobs/job.dart';
 
-/// The job endpoints a customer screen calls (SHIP-71, SHIP-76).
+/// The job endpoints a customer screen calls (SHIP-71, SHIP-76, SHIP-77).
 ///
 /// Every one of them is authenticated and every one is about **the caller's own jobs**. There is
 /// no parameter anywhere for whose jobs to read or whose job to create: the owner is whoever the
@@ -69,6 +69,39 @@ abstract interface class JobsRepository {
   /// No idempotency key: a read changes nothing, and the middleware lets read-only methods
   /// through untouched.
   Future<ApiPage<Job>> jobs({String? cursor});
+
+  /// `GET /v1/jobs/{id}` (SHIP-65) — one job, in full, to the customer who owns it.
+  ///
+  /// **The same shape the list returns**, deliberately: the contract answers create, edit, read
+  /// and list with one `Job` schema so a client parses one type whatever it did to obtain the
+  /// job. A "detail" shape carrying a field or two more would make every other response a subset
+  /// every screen has to special-case.
+  ///
+  /// A job belonging to somebody else answers `404`, byte-identically to a job that does not
+  /// exist. That is the platform's decision and this client neither softens nor explains it.
+  Future<Job> job({required String jobId});
+
+  /// `POST /v1/jobs/{id}/cancel` (SHIP-64) — ends a job the caller owns, before it is awarded.
+  ///
+  /// **A verb under the resource, because status is never a settable field** (`Docs/02` §2,
+  /// `CLAUDE.md`). The client names an intent; the platform decides what the status becomes, and
+  /// answers with the job as it now is.
+  ///
+  /// `Docs/02` §2 permits `draft → cancelled` and `open`/`negotiating → cancelled` and nothing
+  /// else from a customer, so once a bid has been awarded the answer is `jobs_not_cancellable`
+  /// and a `409` — a refusal a screen renders rather than one it pre-empts.
+  ///
+  /// Cancelling a job that is already cancelled answers `200`, records nothing further, and is
+  /// not an error: that is a phone which lost its connection, restarted, and generated a fresh
+  /// key for the same intent.
+  ///
+  /// [reason] is optional and omitted when empty. `Docs/01` §3 requires a reason only of an
+  /// administrator; a customer abandoning their own draft owes nobody an explanation.
+  Future<Job> cancel({
+    required String jobId,
+    String reason,
+    required String idempotencyKey,
+  });
 }
 
 /// The real one, over [ApiClient].
@@ -116,6 +149,26 @@ final class ApiJobsRepository implements JobsRepository {
       Job.fromJson,
     );
   }
+
+  @override
+  Future<Job> job({required String jobId}) async {
+    return Job.fromJson(await _client.getJson('$_base/$jobId'));
+  }
+
+  @override
+  Future<Job> cancel({
+    required String jobId,
+    String reason = '',
+    required String idempotencyKey,
+  }) async {
+    return Job.fromJson(
+      await _client.postJson(
+        '$_base/$jobId/cancel',
+        idempotencyKey: idempotencyKey,
+        body: cancellationBody(reason: reason),
+      ),
+    );
+  }
 }
 
 /// The body of the locations step (SHIP-71).
@@ -137,6 +190,20 @@ Map<String, Object?> locationsBody({
     'pickup': pickup.toJson(),
     'dropoff': dropoff.toJson(),
   };
+}
+
+/// The body of a cancellation (SHIP-77).
+///
+/// **An empty object is a complete request**, which is what the contract says and why this is a
+/// function rather than a literal at the call site: `{}` reads like an oversight and is not one.
+/// The API takes a JSON body on every state-changing request, and one endpoint excepted from that
+/// would be a second answer to what a request looks like.
+///
+/// An empty [reason] is **omitted rather than sent as `""`**. The platform records the reason
+/// against the transition in the job's history for support to read, and an empty string there is
+/// a reason somebody gave rather than one nobody was asked for.
+Map<String, Object?> cancellationBody({String reason = ''}) {
+  return <String, Object?>{if (reason.isNotEmpty) 'reason': reason};
 }
 
 /// The application's jobs repository.
