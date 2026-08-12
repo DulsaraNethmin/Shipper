@@ -16,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -128,14 +129,109 @@ func up(args []string) error {
 	}
 	defer closeMigrate(m)
 
+	l, closeLedger, err := openLedger()
+	if err != nil {
+		return err
+	}
+	defer closeLedger()
+
+	ctx := context.Background()
+	if err := guard(ctx, m, l); err != nil {
+		return err
+	}
+
 	if len(args) > 0 {
 		n, err := strconv.Atoi(args[0])
 		if err != nil || n <= 0 {
 			return fmt.Errorf("up: %q is not a positive number of steps", args[0])
 		}
-		return report(m, m.Steps(n))
+		if err := report(m, m.Steps(n)); err != nil {
+			return err
+		}
+	} else if err := report(m, m.Up()); err != nil {
+		return err
 	}
-	return report(m, m.Up())
+
+	return reconcile(ctx, m, l)
+}
+
+// guard refuses to run when a migration would be passed over. See ledger.go.
+func guard(ctx context.Context, m *migrate.Migrate, l *ledger) error {
+	if err := l.ensure(ctx); err != nil {
+		return err
+	}
+
+	current, err := currentVersion(m)
+	if err != nil {
+		return err
+	}
+	if current == 0 {
+		// Nothing applied, so nothing can be skipped. Also the state every test and every
+		// CI run starts from, which is why neither has ever seen this failure.
+		return nil
+	}
+
+	versions, err := embeddedVersions()
+	if err != nil {
+		return err
+	}
+
+	applied, err := l.applied(ctx)
+	if err != nil {
+		return err
+	}
+
+	// A database that predates the ledger has a version and no records. Seed it rather than
+	// reporting its entire history as skipped.
+	if len(applied) == 0 {
+		seed := backfill(versions, current)
+		if err := l.record(ctx, seed); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if missing := skipped(versions, current, applied); len(missing) > 0 {
+		return errSkipped(missing)
+	}
+	return nil
+}
+
+// reconcile brings the ledger into line with the schema after migrations have run.
+//
+// Called after both up and down, because the ledger has to follow the schema in both directions:
+// a version reversed and not forgotten would be reported as applied by the next run, which would
+// hide exactly the failure the guard exists to catch.
+func reconcile(ctx context.Context, m *migrate.Migrate, l *ledger) error {
+	current, err := currentVersion(m)
+	if err != nil {
+		return err
+	}
+
+	versions, err := embeddedVersions()
+	if err != nil {
+		return err
+	}
+
+	if err := l.forget(ctx, current); err != nil {
+		return err
+	}
+	return l.record(ctx, backfill(versions, current))
+}
+
+// currentVersion reads the recorded version, treating "none applied" as zero.
+//
+// A dirty schema is deliberately not refused here: `migrate version` reports it, and a guard that
+// also refused it would give two different messages for one condition.
+func currentVersion(m *migrate.Migrate) (int, error) {
+	v, _, err := m.Version()
+	if errors.Is(err, migrate.ErrNilVersion) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return int(v), nil
 }
 
 func down(args []string) error {
@@ -145,22 +241,37 @@ func down(args []string) error {
 	}
 	defer closeMigrate(m)
 
+	l, closeLedger, err := openLedger()
+	if err != nil {
+		return err
+	}
+	defer closeLedger()
+
+	ctx := context.Background()
+	if err := l.ensure(ctx); err != nil {
+		return err
+	}
+
 	// golang-migrate's Down() reverses everything. That is a reasonable library default
 	// and a poor command-line one, so an unqualified `down` here steps back exactly one
 	// migration and dropping the whole schema has to be asked for by name.
-	if len(args) == 0 {
-		return report(m, m.Steps(-1))
+	switch {
+	case len(args) == 0:
+		err = report(m, m.Steps(-1))
+	case strings.EqualFold(args[0], "all"):
+		err = report(m, m.Down())
+	default:
+		n, convErr := strconv.Atoi(args[0])
+		if convErr != nil || n <= 0 {
+			return fmt.Errorf("down: %q is not a positive number of steps, nor \"all\"", args[0])
+		}
+		err = report(m, m.Steps(-n))
+	}
+	if err != nil {
+		return err
 	}
 
-	if strings.EqualFold(args[0], "all") {
-		return report(m, m.Down())
-	}
-
-	n, err := strconv.Atoi(args[0])
-	if err != nil || n <= 0 {
-		return fmt.Errorf("down: %q is not a positive number of steps, nor \"all\"", args[0])
-	}
-	return report(m, m.Steps(-n))
+	return reconcile(ctx, m, l)
 }
 
 func version() error {

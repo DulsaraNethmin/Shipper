@@ -39,18 +39,56 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
-// The page sizes of Docs/10 §4.5.
+// The page sizes of Docs/10 §4.5, as fallbacks.
 //
-// **That section says both come from configuration, and neither does yet.** internal/config has no
-// fields for them, and adding two is a shared-surface change SHIP-66 could not make from a domain
-// branch — the same position SHIP-60 reached over GEOCODING_*, recorded the same way in Docs/11 §3.
-// They are here rather than in a domain because every list endpoint needs the same answer, and two
-// domains with two defaults is exactly the divergence this package exists to prevent. Whoever next
-// owns internal/config moves them; no caller changes, because callers ask [Limit].
+// These were the whole answer at SHIP-66, with a comment recording that §4.5 requires them to come
+// from configuration and that a domain branch could not add the fields. SHIP-15g added them, so
+// these two are now the defaults [Bounds] carries when nothing has been installed — which is the
+// state every unit test and every non-HTTP caller runs in, and which must therefore stay usable.
+//
+// They remain here rather than in a domain because every list endpoint needs the same answer, and
+// two domains with two defaults is exactly the divergence this package exists to prevent.
 const (
 	DefaultLimit = 20
 	MaxLimit     = 100
 )
+
+// bounds is what [Limit] applies. It is package state, set once by cmd/api at startup.
+//
+// # Why a package variable rather than a parameter
+//
+// SHIP-66 promised that moving these to configuration would change no caller, because callers ask
+// [Limit]. Threading a bounds argument through every list handler would break that promise for no
+// gain: there is one process, one configuration, and no endpoint that wants a different ceiling
+// from its neighbour. The alternative — a Bounds value passed from each domain's service — would
+// have every domain carrying a field it never varies.
+//
+// It is written once, before the server accepts a request, and only read afterwards. That is the
+// same discipline slog.SetDefault and http.DefaultServeMux rely on, and it is why there is no
+// mutex here: a lock would suggest a concurrency this value does not have.
+var bounds = Bounds{Default: DefaultLimit, Max: MaxLimit}
+
+// Bounds is the configured page sizing.
+type Bounds struct {
+	// Default applies when a request names no ?limit=.
+	Default int
+
+	// Max is the ceiling a larger ?limit= is narrowed to.
+	Max int
+}
+
+// SetBounds installs the configured page sizes. cmd/api calls it once, before serving.
+//
+// Values that are not positive, or a default above the maximum, are ignored rather than applied:
+// internal/config already refuses both at load, so reaching here with one means a caller other
+// than cmd/api built a Bounds by hand. Ignoring it keeps the fallbacks, which are known-good;
+// applying it would let a zero default make every page empty.
+func SetBounds(b Bounds) {
+	if b.Default < 1 || b.Max < 1 || b.Default > b.Max {
+		return
+	}
+	bounds = b
+}
 
 // cursorVersion prefixes every encoded cursor.
 //
@@ -132,7 +170,7 @@ func invalidCursor(cause error) error {
 		WithCause(cause)
 }
 
-// Limit reads a `?limit=` parameter, applying [DefaultLimit] and [MaxLimit].
+// Limit reads a `?limit=` parameter, applying the bounds [SetBounds] installed.
 //
 // The two failures are treated differently on purpose:
 //
@@ -146,7 +184,7 @@ func invalidCursor(cause error) error {
 // ordinary one.
 func Limit(raw string) (int, error) {
 	if strings.TrimSpace(raw) == "" {
-		return DefaultLimit, nil
+		return bounds.Default, nil
 	}
 
 	n, err := strconv.Atoi(raw)
@@ -154,8 +192,8 @@ func Limit(raw string) (int, error) {
 		return 0, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
 			"The limit must be a whole number of at least 1.").WithCause(err)
 	}
-	if n > MaxLimit {
-		return MaxLimit, nil
+	if n > bounds.Max {
+		return bounds.Max, nil
 	}
 	return n, nil
 }

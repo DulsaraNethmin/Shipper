@@ -88,7 +88,38 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 	wg.Wait()
+	s.closeAll()
 	return nil
+}
+
+// shutdownTimeout bounds how long a task's Close may take.
+//
+// Generous enough for a Kafka producer to flush what it has buffered, short enough that a wedged
+// Close cannot hold a deployment open until the container runtime sends SIGKILL — which would
+// discard the buffer this exists to protect.
+const shutdownTimeout = 10 * time.Second
+
+// closeAll releases what the tasks own, after every loop has stopped.
+//
+// Deliberately after wg.Wait rather than beside it: closing a producer while a pass is still
+// writing to it would turn an ordinary shutdown into an error in the last pass.
+//
+// The context is fresh rather than derived from the cancelled one the scheduler ran under. A
+// Close inherited from it would be cancelled before it began, which is the bug that makes a
+// graceful shutdown quietly not flush anything.
+func (s *Scheduler) closeAll() {
+	for _, t := range s.tasks {
+		if t.Close == nil {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		if err := t.Close(ctx); err != nil {
+			s.log.Error("a scheduled task did not shut down cleanly",
+				slog.String("task", t.Name), slog.String("error", err.Error()))
+		}
+		cancel()
+	}
 }
 
 func (s *Scheduler) loop(ctx context.Context, t Task) {

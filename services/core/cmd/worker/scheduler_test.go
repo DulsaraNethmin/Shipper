@@ -454,3 +454,64 @@ func TestNewSchedulerNeedsWhatItCannotWorkWithout(t *testing.T) {
 		t.Error("a scheduler was built with no logger")
 	}
 }
+
+// SHIP-15g added Task.Close for SHIP-134's Kafka producer, the first task that owns something
+// other than a query.
+
+func TestSchedulerClosesWhatTasksOwn(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	var closed int
+	var closeCtxLive bool
+	task := Task{
+		Name:  "owns-a-resource",
+		Every: time.Hour,
+		Run:   func(context.Context, db.Runner) (int, error) { return 0, nil },
+		Close: func(ctx context.Context) error {
+			closed++
+			// A Close handed the cancelled run context could never flush anything,
+			// which is the bug that makes a graceful shutdown silently lossy.
+			closeCtxLive = ctx.Err() == nil
+			return nil
+		},
+	}
+
+	s, err := NewScheduler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), []Task{task})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if closed != 1 {
+		t.Errorf("Close called %d times, want exactly 1", closed)
+	}
+	if !closeCtxLive {
+		t.Error("Close was handed an already-cancelled context; it could not have flushed anything")
+	}
+}
+
+// A task without a Close is the ordinary case — the three query-only tasks in the backlog — and
+// must not crash the shutdown.
+func TestSchedulerShutsDownTasksThatOwnNothing(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	s, err := NewScheduler(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), []Task{{
+		Name:  "owns-nothing",
+		Every: time.Hour,
+		Run:   func(context.Context, db.Runner) (int, error) { return 0, nil },
+	}})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}

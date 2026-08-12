@@ -58,7 +58,58 @@ type Config struct {
 	Identity    Identity
 	Email       Email
 	SMS         SMS
+	Geocoding   Geocoding
+	Pagination  Pagination
 	App         App
+}
+
+// Geocoding configures the address-lookup adapter (SHIP-35), first consumed by SHIP-60's
+// location value object.
+//
+// Added at SHIP-15g rather than at SHIP-60, and the delay is the point: internal/config is a
+// shared surface a domain branch must not edit, so the jobs lane wrote a documented constant and
+// filed a request instead. The same wall was hit twice in one wave — see [Pagination] — which is
+// what turned two parked requests into a prep ticket.
+//
+// # Why a missing base URL is not an error
+//
+// Empty means no provider is configured, and cmd/api then builds the console stub in development
+// and nil outside it. Nil is a supported state, not a degraded one: jobs.NewService documents it
+// as "addresses are stored unresolved", and every path copes because Docs/01 §4.4's SHIP-59a
+// requires a failed lookup not to fail the job.
+//
+// Falling back to the stub in staging was considered and rejected. The stub returns stable,
+// plausible, entirely fictional coordinates, and a staging environment quietly full of those is
+// worse than one with no coordinates at all — the first looks like it works.
+// The field names match [Email] and [SMS] deliberately: all three are the same shape of
+// adapter — a base URL, a credential, and an implementation chosen from Env — and naming the
+// third one differently would invite the reader to look for a difference that is not there.
+type Geocoding struct {
+	// ProviderBaseURL is the provider's HTTP endpoint. Empty disables lookup entirely.
+	ProviderBaseURL string
+
+	// ProviderAPIKey authenticates to it. Empty is allowed even when the base URL is set,
+	// because a local or self-hosted geocoder may need no credential.
+	ProviderAPIKey string
+}
+
+// Pagination carries the page sizes Docs/10 §4.5 requires to be configurable.
+//
+// They lived as constants in internal/pagination from SHIP-66, with a comment saying that section
+// requires configuration and that a domain branch could not provide it. This is that move. No
+// caller changes: callers ask pagination.Limit, which now reads what cmd/api installed at startup.
+//
+// # Why these are bounded rather than merely positive
+//
+// A maximum page size is a bound on the work one request can ask the database for, so a
+// misconfigured value is a denial-of-service switch rather than a preference. The ceiling is
+// enforced here, at load, where it fails on startup rather than on the first large request.
+type Pagination struct {
+	// DefaultPageSize applies when a request names no ?limit=.
+	DefaultPageSize int
+
+	// MaxPageSize is the ceiling a larger ?limit= is narrowed to, never an error.
+	MaxPageSize int
 }
 
 // Email configures the transactional email adapter (SHIP-32), first consumed by the
@@ -332,6 +383,17 @@ func Load() (*Config, error) {
 			ProviderBaseURL: l.str("SMS_PROVIDER_BASE_URL", ""),
 			ProviderAPIKey:  l.str("SMS_PROVIDER_API_KEY", ""),
 			Sender:          l.str("SMS_SENDER", "Shipper"),
+		},
+		Geocoding: Geocoding{
+			ProviderBaseURL: l.str("GEOCODING_BASE_URL", ""),
+			ProviderAPIKey:  l.str("GEOCODING_API_KEY", ""),
+		},
+		Pagination: Pagination{
+			// The bounds are the range the pagination package will run, not taste. One
+			// row per page is legal and useless; the ceiling stops a configuration
+			// mistake becoming an unbounded query.
+			DefaultPageSize: l.boundedInt("PAGINATION_DEFAULT_PAGE_SIZE", 20, 1, 500),
+			MaxPageSize:     l.boundedInt("PAGINATION_MAX_PAGE_SIZE", 100, 1, 500),
 		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
@@ -637,6 +699,23 @@ func (l *loader) validate(cfg *Config) {
 	if cfg.Identity.AccessTokenTTL > time.Hour {
 		l.errf("IDENTITY_ACCESS_TOKEN_TTL (%s) is longer than an hour; an issued access token "+
 			"cannot be revoked before it expires", cfg.Identity.AccessTokenTTL)
+	}
+
+	// A default larger than the ceiling would mean a request that named no ?limit= got a
+	// bigger page than one that asked for the maximum, which is the sort of inversion that is
+	// obvious in a sentence and invisible in two environment variables.
+	if cfg.Pagination.DefaultPageSize > cfg.Pagination.MaxPageSize {
+		l.errf("PAGINATION_DEFAULT_PAGE_SIZE (%d) cannot exceed PAGINATION_MAX_PAGE_SIZE (%d)",
+			cfg.Pagination.DefaultPageSize, cfg.Pagination.MaxPageSize)
+	}
+
+	// A credential with nowhere to go is the shape of a half-finished configuration, and the
+	// symptom is silence: cmd/api builds no geocoder, addresses are stored unresolved, and the
+	// key sitting in the environment suggests the opposite. The reverse — a base URL with no
+	// key — is legitimate and not checked, because a self-hosted geocoder needs no credential.
+	if cfg.Geocoding.ProviderAPIKey != "" && cfg.Geocoding.ProviderBaseURL == "" {
+		l.errf("GEOCODING_API_KEY is set but GEOCODING_BASE_URL is not; " +
+			"no geocoder is built, so addresses would be stored unresolved")
 	}
 
 	// Everything below this point is a deployment-safety rule. Development is exempt by
