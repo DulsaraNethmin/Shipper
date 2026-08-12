@@ -618,3 +618,427 @@ func TestAFleetListIsTheProvidersOwn(t *testing.T) {
 		}
 	})
 }
+
+// --- SHIP-79: the provider's declaration -------------------------------------------------------
+
+// declared runs one declaration inside a transaction, which is what Declare requires.
+func declared(t *testing.T, pool *pgxpool.Pool, provider uuid.UUID, f ProfileFields) (Profile, error) {
+	t.Helper()
+
+	var profile Profile
+	err := inTx(t, pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		profile, err = newTestService().Declare(ctx, r, provider, f)
+		return err
+	})
+	return profile, err
+}
+
+// states, postcodes and specialties read as the wire does: the two lists of a service area, split.
+func states(p Profile) []string    { return areasAt(p, ScopeState) }
+func postcodes(p Profile) []string { return areasAt(p, ScopePostcode) }
+
+func areasAt(p Profile, scope AreaScope) []string {
+	var out []string
+	for _, area := range p.Areas {
+		if area.Scope == scope {
+			out = append(out, area.Area)
+		}
+	}
+	return out
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestAProviderDeclaresAServiceAreaAndSpecialties is SHIP-79's acceptance criterion: declared,
+// stored, and read back.
+//
+// Everything supplied here is in a form a person would type rather than the form that is stored,
+// because normalising is what stops one region being recorded as two — the same argument the
+// registration plate makes, applied to a set.
+func TestAProviderDeclaresAServiceAreaAndSpecialties(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare@example.com", "+61400000350")
+
+	profile, err := declared(t, pool, provider, ProfileFields{
+		States:      ptr([]string{"Victoria", " nsw ", "VIC"}),
+		Postcodes:   ptr([]string{"3 000", "0800", "3000"}),
+		Specialties: ptr([]Specialty{" Refrigerated ", SpecialtyGeneralFreight, "refrigerated"}),
+	})
+	if err != nil {
+		t.Fatalf("Declare() = %v", err)
+	}
+
+	// States first and each group ascending, whatever order they were sent in.
+	if got := states(profile); !sameStrings(got, []string{"NSW", "VIC"}) {
+		t.Errorf("states = %v, want [NSW VIC] — spelled out, mixed case and duplicated on the way in", got)
+	}
+	if got := postcodes(profile); !sameStrings(got, []string{"0800", "3000"}) {
+		t.Errorf("postcodes = %v, want [0800 3000] — the space removed and the repeat collapsed", got)
+	}
+
+	// Specialties come back in the platform's own order rather than the order they were sent, so
+	// two providers holding the same specialties present them identically.
+	if len(profile.Specialties) != 2 ||
+		profile.Specialties[0] != SpecialtyGeneralFreight ||
+		profile.Specialties[1] != SpecialtyRefrigerated {
+		t.Errorf("specialties = %v, want [general_freight refrigerated]", profile.Specialties)
+	}
+
+	// The rows, not the answer the service gave about itself.
+	var rows int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM provider_service_areas WHERE provider_id = $1`, provider).Scan(&rows); err != nil {
+		t.Fatalf("counting the stored areas: %v", err)
+	}
+	if rows != 4 {
+		t.Errorf("%d stored areas, want 4 — two states and two postcodes", rows)
+	}
+}
+
+// TestAnUndeclaredProfileIsEmptyRatherThanMissing.
+//
+// There is no parent row, so "I have not nominated a service area yet" has the same shape as any
+// other answer. A client opening the screen for the first time gets empty lists rather than an
+// error it has to read as "not yet".
+func TestAnUndeclaredProfileIsEmptyRatherThanMissing(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-empty@example.com", "+61400000351")
+
+	profile, err := newTestService().Profile(t.Context(), pool, provider)
+	if err != nil {
+		t.Fatalf("Profile() = %v", err)
+	}
+	if len(profile.Areas) != 0 || len(profile.Specialties) != 0 {
+		t.Errorf("an undeclared profile is %+v, want empty", profile)
+	}
+	if profile.ProviderID != provider {
+		t.Errorf("provider = %s, want %s", profile.ProviderID, provider)
+	}
+
+	// And it matches nothing. Eligibility is opt-in: the alternative would make the provider who
+	// has not finished onboarding the widest-reaching provider on the platform.
+	if profile.Serves("NSW", "2000") {
+		t.Error("an undeclared provider serves New South Wales; an empty declaration must match nothing")
+	}
+}
+
+// TestAnUnnamedListIsLeftAloneAndAnEmptyOneClearsIt is the three-state rule, which is the whole of
+// how a partial declaration works.
+func TestAnUnnamedListIsLeftAloneAndAnEmptyOneClearsIt(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-partial@example.com", "+61400000352")
+
+	if _, err := declared(t, pool, provider, ProfileFields{
+		States:      ptr([]string{"NSW"}),
+		Postcodes:   ptr([]string{"3000"}),
+		Specialties: ptr([]Specialty{SpecialtyLivestock}),
+	}); err != nil {
+		t.Fatalf("the first declaration: %v", err)
+	}
+
+	// Naming only the specialties leaves both halves of the service area exactly as they were.
+	profile, err := declared(t, pool, provider, ProfileFields{
+		Specialties: ptr([]Specialty{SpecialtyCourier}),
+	})
+	if err != nil {
+		t.Fatalf("the second declaration: %v", err)
+	}
+	if !sameStrings(states(profile), []string{"NSW"}) || !sameStrings(postcodes(profile), []string{"3000"}) {
+		t.Errorf("naming only the specialties changed the service area: %+v", profile.Areas)
+	}
+	if len(profile.Specialties) != 1 || profile.Specialties[0] != SpecialtyCourier {
+		t.Errorf("specialties = %v, want [courier] — a named list is replaced, not merged", profile.Specialties)
+	}
+
+	// The empty list is the other half, and without it a provider who withdrew from every single
+	// postcode could not say so.
+	profile, err = declared(t, pool, provider, ProfileFields{Postcodes: ptr([]string{})})
+	if err != nil {
+		t.Fatalf("clearing the postcodes: %v", err)
+	}
+	if len(postcodes(profile)) != 0 {
+		t.Errorf("postcodes = %v, want none — an empty list clears", postcodes(profile))
+	}
+	if !sameStrings(states(profile), []string{"NSW"}) {
+		t.Errorf("clearing the postcodes disturbed the states: %v", states(profile))
+	}
+}
+
+// TestARedeclaredEntryKeepsTheDateItWasFirstDeclared.
+//
+// The store amends the set rather than rewriting it, so an entry that survives a change is the same
+// entry. It matters because created_at is the only record of when a provider took on a region, and
+// Docs/04 §3 makes the service area something a verification decision is made against.
+func TestARedeclaredEntryKeepsTheDateItWasFirstDeclared(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-stable@example.com", "+61400000353")
+
+	if _, err := declared(t, pool, provider, ProfileFields{States: ptr([]string{"NSW"})}); err != nil {
+		t.Fatalf("the first declaration: %v", err)
+	}
+
+	first := declaredAt(t, pool, provider, "NSW")
+
+	if _, err := declared(t, pool, provider, ProfileFields{States: ptr([]string{"NSW", "VIC"})}); err != nil {
+		t.Fatalf("the second declaration: %v", err)
+	}
+
+	if again := declaredAt(t, pool, provider, "NSW"); !again.Equal(first) {
+		t.Errorf("NSW was rewritten: first declared %s, now %s", first, again)
+	}
+}
+
+func declaredAt(t *testing.T, pool *pgxpool.Pool, provider uuid.UUID, area string) time.Time {
+	t.Helper()
+
+	var at time.Time
+	err := pool.QueryRow(t.Context(),
+		`SELECT created_at FROM provider_service_areas WHERE provider_id = $1 AND area = $2`,
+		provider, area).Scan(&at)
+	if err != nil {
+		t.Fatalf("reading created_at for %s: %v", area, err)
+	}
+	return at
+}
+
+// TestOnlyAProviderDeclaresAServiceArea, read from users.role rather than from a token's claim.
+//
+// The read is deliberately not refused: a customer's declaration is empty because they have never
+// made one, and answering 403 to a read that discloses nothing would make the client special-case a
+// screen it never shows.
+func TestOnlyAProviderDeclaresAServiceArea(t *testing.T) {
+	pool := pgtest.DB(t)
+	customer := newAccount(t, pool, "declare-customer@example.com", "+61400000354", "customer")
+
+	_, err := declared(t, pool, customer, ProfileFields{States: ptr([]string{"NSW"})})
+	if !errors.Is(err, ErrNotProvider) {
+		t.Errorf("Declare() by a customer = %v, want ErrNotProvider", err)
+	}
+
+	profile, err := newTestService().Profile(t.Context(), pool, customer)
+	if err != nil {
+		t.Errorf("Profile() for a customer = %v, want an empty profile", err)
+	}
+	if len(profile.Areas) != 0 {
+		t.Errorf("a customer has a service area: %+v", profile.Areas)
+	}
+}
+
+// TestADeclarationThatNamesNoListIsRefused, for the reason an edit to a vehicle that changes
+// nothing is: answering with the unchanged declaration would tell a client its edit was applied.
+func TestADeclarationThatNamesNoListIsRefused(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-nothing@example.com", "+61400000355")
+
+	if _, err := declared(t, pool, provider, ProfileFields{}); !errors.Is(err, ErrNothingToUpdate) {
+		t.Errorf("Declare() with no list = %v, want ErrNothingToUpdate", err)
+	}
+}
+
+// TestADeclarationOutsideATransactionIsRefused.
+//
+// Replacing a set is a delete and an insert that must be one decision, and lockProfile's advisory
+// lock is released the moment the statement returns when there is no transaction to hold it.
+func TestADeclarationOutsideATransactionIsRefused(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-notx@example.com", "+61400000356")
+
+	_, err := newTestService().Declare(t.Context(), pool, provider,
+		ProfileFields{States: ptr([]string{"NSW"})})
+	if !errors.Is(err, ErrNotInTransaction) {
+		t.Errorf("Declare() on the pool = %v, want ErrNotInTransaction", err)
+	}
+}
+
+// TestEveryBadEntryIsReportedByPosition is Docs/10 §4.6 applied to a set.
+//
+// The position is what makes the answer usable: the client renders each entry as its own control,
+// and an error naming only the list leaves the provider to work out which of forty postcodes is the
+// one it means.
+func TestEveryBadEntryIsReportedByPosition(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-invalid@example.com", "+61400000357")
+
+	_, err := declared(t, pool, provider, ProfileFields{
+		States:      ptr([]string{"NSW", "Zealand"}),
+		Postcodes:   ptr([]string{"3000", "3A00", "800"}),
+		Specialties: ptr([]Specialty{SpecialtyOversized, "hovercraft"}),
+	})
+
+	var apiErr *httpx.Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Declare() = %v, want a validation failure", err)
+	}
+	if apiErr.Status != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", apiErr.Status)
+	}
+
+	named := map[string]bool{}
+	for _, detail := range apiErr.Details {
+		named[detail.Field] = true
+	}
+	for _, want := range []string{
+		"service_area.states.1",
+		"service_area.postcodes.1",
+		"service_area.postcodes.2",
+		"specialties.1",
+	} {
+		if !named[want] {
+			t.Errorf("no detail names %s; got %v", want, named)
+		}
+	}
+	if named["service_area.states.0"] || named["specialties.0"] {
+		t.Errorf("a valid entry was reported: %v", named)
+	}
+
+	// Nothing was written. A declaration is replaced whole, so a request that fails validation
+	// must leave the previous one exactly as it was — including when there was none.
+	profile, err := newTestService().Profile(t.Context(), pool, provider)
+	if err != nil {
+		t.Fatalf("Profile() = %v", err)
+	}
+	if len(profile.Areas) != 0 || len(profile.Specialties) != 0 {
+		t.Errorf("a refused declaration reached the database: %+v", profile)
+	}
+}
+
+// TestALongerListThanThereAreStatesIsOneErrorRatherThanThousands.
+//
+// The count is checked before the entries are, so a client with a runaway list gets one message it
+// can act on instead of a response body of field errors.
+func TestALongerListThanThereAreStatesIsOneErrorRatherThanThousands(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-toomany@example.com", "+61400000358")
+
+	tooMany := make([]string, 0, len(ServiceAreaStates)+1)
+	for i := range len(ServiceAreaStates) + 1 {
+		tooMany = append(tooMany, string(rune('a'+i)))
+	}
+
+	_, err := declared(t, pool, provider, ProfileFields{States: ptr(tooMany)})
+
+	var apiErr *httpx.Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Declare() = %v, want a validation failure", err)
+	}
+	if len(apiErr.Details) != 1 || apiErr.Details[0].Field != "service_area.states" {
+		t.Errorf("details = %+v, want one error naming the list itself", apiErr.Details)
+	}
+}
+
+// TestServiceAreaMembershipIsASetQuery is the "queryable" half of SHIP-79's Done when, and it is
+// the shape SHIP-81 will filter with.
+//
+// It is a test rather than an exported query method because SHIP-81 owns the eligibility filter and
+// this ticket adds none. What it demonstrates is that the decision holds: a job's state and postcode
+// answer the question with set membership and no distance arithmetic anywhere.
+func TestServiceAreaMembershipIsASetQuery(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-serves@example.com", "+61400000359")
+
+	profile, err := declared(t, pool, provider, ProfileFields{
+		States:    ptr([]string{"TAS"}),
+		Postcodes: ptr([]string{"3000"}),
+	})
+	if err != nil {
+		t.Fatalf("Declare() = %v", err)
+	}
+
+	for _, c := range []struct {
+		state, postcode string
+		want            bool
+		why             string
+	}{
+		{"TAS", "7000", true, "a whole state covers a postcode inside it"},
+		{"VIC", "3000", true, "a single postcode is covered without the state being"},
+		{"VIC", "3121", false, "a postcode in a state the provider does not serve"},
+		{"NSW", "2000", false, "neither grain matches"},
+	} {
+		if got := profile.Serves(c.state, c.postcode); got != c.want {
+			t.Errorf("Serves(%q, %q) = %v, want %v — %s", c.state, c.postcode, got, c.want, c.why)
+		}
+	}
+
+	// The same question asked of the database, which is where SHIP-81 will ask it: one index
+	// lookup per provider, and no coordinate involved.
+	var serves bool
+	err = pool.QueryRow(t.Context(), `
+		SELECT EXISTS (
+			SELECT 1 FROM provider_service_areas
+			WHERE provider_id = $1
+			  AND ((scope = 'state' AND area = $2) OR (scope = 'postcode' AND area = $3))
+		)`, provider, "VIC", "3000").Scan(&serves)
+	if err != nil {
+		t.Fatalf("the membership query: %v", err)
+	}
+	if !serves {
+		t.Error("the membership query does not find a postcode the provider declared")
+	}
+}
+
+// TestTwoDevicesDeclaringAtOnceDoNotProduceTheUnion is what the advisory lock exists for.
+//
+// In READ COMMITTED and without it, each transaction's DELETE cannot see the other's uncommitted
+// INSERT, so both survive and the declaration becomes a set neither client asked for — a lost
+// update with nothing to report afterwards. This fails with [postgresStore.lockProfile] removed.
+func TestTwoDevicesDeclaringAtOnceDoNotProduceTheUnion(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "declare-race@example.com", "+61400000360")
+
+	first, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("opening the first transaction: %v", err)
+	}
+	defer first.Rollback(t.Context())
+
+	if _, err := newTestService().Declare(t.Context(), first, provider,
+		ProfileFields{States: ptr([]string{"NSW"})}); err != nil {
+		t.Fatalf("the first declaration: %v", err)
+	}
+
+	second := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		second <- func() error {
+			return db.InTx(context.Background(), pool, func(ctx context.Context, r db.Runner) error {
+				_, err := newTestService().Declare(ctx, r, provider,
+					ProfileFields{States: ptr([]string{"VIC"})})
+				return err
+			})
+		}()
+	}()
+
+	// Long enough for the second transaction to reach the lock and block on it. If it has not,
+	// this test passes for the wrong reason rather than failing for a wrong one — which is the
+	// safe direction for a timing-dependent check to be wrong in.
+	<-started
+	time.Sleep(200 * time.Millisecond)
+
+	if err := first.Commit(t.Context()); err != nil {
+		t.Fatalf("committing the first declaration: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("the second declaration: %v", err)
+	}
+
+	profile, err := newTestService().Profile(t.Context(), pool, provider)
+	if err != nil {
+		t.Fatalf("Profile() = %v", err)
+	}
+	if !sameStrings(states(profile), []string{"VIC"}) {
+		t.Errorf("states = %v, want [VIC] — the later declaration replaces the earlier, and the "+
+			"union of the two is what an unlocked read-modify-write produces", states(profile))
+	}
+}

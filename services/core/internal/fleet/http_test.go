@@ -42,12 +42,21 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("GET /v1/fleet/profile", handler.Profile())
+	mux.Handle("PATCH /v1/fleet/profile", handler.Declare())
 	mux.Handle("GET /v1/fleet/vehicles", handler.List())
 	mux.Handle("POST /v1/fleet/vehicles", handler.Add())
 	mux.Handle("GET /v1/fleet/vehicles/{id}", handler.Detail())
 	mux.Handle("PATCH /v1/fleet/vehicles/{id}", handler.Update())
 	mux.Handle("POST /v1/fleet/vehicles/{id}/deactivate", handler.Deactivate())
 	mux.Handle("POST /v1/fleet/vehicles/{id}/reactivate", handler.Reactivate())
+
+	// SHIP-82 and SHIP-83, which are not under /fleet: this domain serves them because this
+	// domain decides which jobs a provider may bid on. See the note at the top of
+	// cmd/api/routes_fleet.go, and note that the patterns here have to match that file exactly —
+	// a route mounted here and nowhere else is an endpoint that exists only in the tests.
+	mux.Handle("GET /v1/jobs/open", handler.OpenJobs())
+	mux.Handle("GET /v1/jobs/open/{id}", handler.OpenJob())
 	return mux
 }
 
@@ -434,4 +443,196 @@ func TestTheListIsTheEnvelopeAndTheFilterIsRefusedWhenItIsNonsense(t *testing.T)
 			t.Errorf("?limit=5000 = %d, want it narrowed to the maximum", rec.Code)
 		}
 	})
+}
+
+// --- SHIP-79: the provider's declaration -------------------------------------------------------
+
+// TestTheProfileEndpointAnswersEmptyListsBeforeAnythingIsDeclared.
+//
+// Never a 404, and never `null`. An undeclared profile is an empty one, so a client opening the
+// screen for the first time renders three empty pickers rather than an error it has to read as
+// "not yet" — and a client iterating a null list breaks the first time a new provider signs in and
+// never again in testing.
+func TestTheProfileEndpointAnswersEmptyListsBeforeAnythingIsDeclared(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	provider := newProvider(t, pool, "http-profile-empty@example.com", "+61400000370")
+
+	rec := as(t, router, provider, http.MethodGet, "/v1/fleet/profile", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	const want = `{"service_area":{"states":[],"postcodes":[]},"specialties":[]}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Errorf("body = %s, want %s", got, want)
+	}
+}
+
+// TestTheProfileEndpointDeclaresAndReadsBack is SHIP-79's acceptance criterion at the wire.
+func TestTheProfileEndpointDeclaresAndReadsBack(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	provider := newProvider(t, pool, "http-profile@example.com", "+61400000371")
+
+	rec := as(t, router, provider, http.MethodPatch, "/v1/fleet/profile", `{
+		"service_area": {"states": ["Victoria", "nsw"], "postcodes": ["3 000", "0800"]},
+		"specialties": ["Refrigerated", "general_freight"]
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	declaredBody := decode[profileResponse](t, rec)
+	if !sameStrings(declaredBody.ServiceArea.States, []string{"NSW", "VIC"}) {
+		t.Errorf("states = %v, want [NSW VIC] — spelled out and lower case on the way in",
+			declaredBody.ServiceArea.States)
+	}
+	if !sameStrings(declaredBody.ServiceArea.Postcodes, []string{"0800", "3000"}) {
+		t.Errorf("postcodes = %v, want [0800 3000]", declaredBody.ServiceArea.Postcodes)
+	}
+	if !sameStrings(declaredBody.Specialties, []string{"general_freight", "refrigerated"}) {
+		t.Errorf("specialties = %v, want [general_freight refrigerated] in the platform's order",
+			declaredBody.Specialties)
+	}
+
+	// The read answers with the same shape the write did, so a client parses one type whatever it
+	// did to obtain the declaration.
+	read := as(t, router, provider, http.MethodGet, "/v1/fleet/profile", "")
+	if read.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200 (%s)", read.Code, read.Body)
+	}
+	if read.Body.String() != rec.Body.String() {
+		t.Errorf("the read and the write answer differently:\n  read  %s\n  write %s",
+			read.Body.String(), rec.Body.String())
+	}
+}
+
+// TestAnOmittedListIsUnchangedAndAnEmptyOneClears, over the wire, where the difference between
+// `null` and `[]` is a difference in the bytes rather than in a Go pointer.
+func TestAnOmittedListIsUnchangedAndAnEmptyOneClears(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	provider := newProvider(t, pool, "http-profile-partial@example.com", "+61400000372")
+
+	rec := as(t, router, provider, http.MethodPatch, "/v1/fleet/profile",
+		`{"service_area":{"states":["NSW"],"postcodes":["3000"]},"specialties":["livestock"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the first declaration: %d (%s)", rec.Code, rec.Body)
+	}
+
+	// Naming only the specialties leaves the service area exactly as it was.
+	rec = as(t, router, provider, http.MethodPatch, "/v1/fleet/profile", `{"specialties":["courier"]}`)
+	body := decode[profileResponse](t, rec)
+	if !sameStrings(body.ServiceArea.States, []string{"NSW"}) ||
+		!sameStrings(body.ServiceArea.Postcodes, []string{"3000"}) {
+		t.Errorf("the service area changed when only the specialties were named: %+v", body.ServiceArea)
+	}
+
+	// An explicit null is the same as saying nothing, which is what a client that serialises its
+	// whole model with unset fields will send.
+	rec = as(t, router, provider, http.MethodPatch, "/v1/fleet/profile",
+		`{"service_area":{"states":null,"postcodes":["3121"]}}`)
+	body = decode[profileResponse](t, rec)
+	if !sameStrings(body.ServiceArea.States, []string{"NSW"}) {
+		t.Errorf("a null list cleared something: states = %v", body.ServiceArea.States)
+	}
+	if !sameStrings(body.ServiceArea.Postcodes, []string{"3121"}) {
+		t.Errorf("postcodes = %v, want [3121] — a named list is replaced whole", body.ServiceArea.Postcodes)
+	}
+
+	// The empty list is the other half of the distinction.
+	rec = as(t, router, provider, http.MethodPatch, "/v1/fleet/profile",
+		`{"service_area":{"postcodes":[]}}`)
+	body = decode[profileResponse](t, rec)
+	if len(body.ServiceArea.Postcodes) != 0 {
+		t.Errorf("postcodes = %v, want none — an empty list clears", body.ServiceArea.Postcodes)
+	}
+	if !sameStrings(body.ServiceArea.States, []string{"NSW"}) {
+		t.Errorf("clearing the postcodes disturbed the states: %v", body.ServiceArea.States)
+	}
+}
+
+// TestADeclarationNamingNoListIsRefused, and an unknown field with it.
+//
+// httpx.DecodeJSON refuses unknown fields, so a client sending `service_areas` or `radius_km` is
+// told the field does not exist rather than having its declaration silently ignored.
+func TestADeclarationNamingNoListIsRefusedOverTheWire(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	provider := newProvider(t, pool, "http-profile-empty-body@example.com", "+61400000373")
+
+	for _, body := range []string{
+		`{}`,
+		`{"service_area":{}}`,
+	} {
+		rec := as(t, router, provider, http.MethodPatch, "/v1/fleet/profile", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s returned %d, want 400 (%s)", body, rec.Code, rec.Body)
+		}
+	}
+
+	// A radius is not a field, and a client that believed it was should be told so rather than
+	// have a declaration accepted that means something else entirely.
+	for _, body := range []string{
+		`{"service_area":{"radius_km":50}}`,
+		`{"service_areas":{"states":["NSW"]}}`,
+	} {
+		rec := as(t, router, provider, http.MethodPatch, "/v1/fleet/profile", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s returned %d, want 400 (%s)", body, rec.Code, rec.Body)
+		}
+	}
+}
+
+// TestABadEntryIsNamedByItsPositionOverTheWire.
+func TestABadEntryIsNamedByItsPositionOverTheWire(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	provider := newProvider(t, pool, "http-profile-invalid@example.com", "+61400000374")
+
+	rec := as(t, router, provider, http.MethodPatch, "/v1/fleet/profile", `{
+		"service_area": {"states": ["NSW", "Zealand"], "postcodes": ["3000", "12345"]},
+		"specialties": ["hovercraft"]
+	}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body)
+	}
+
+	envelope := decode[errorEnvelope](t, rec)
+	if envelope.Error.Code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", envelope.Error.Code)
+	}
+
+	named := map[string]bool{}
+	for _, detail := range envelope.Error.Details {
+		named[detail.Field] = true
+	}
+	for _, want := range []string{"service_area.states.1", "service_area.postcodes.1", "specialties.0"} {
+		if !named[want] {
+			t.Errorf("no detail names %s; got %v", want, named)
+		}
+	}
+}
+
+// TestOnlyAProviderMayDeclare, and the read is deliberately not refused.
+func TestOnlyAProviderMayDeclare(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+	customer := newAccount(t, pool, "http-profile-customer@example.com", "+61400000375", "customer")
+
+	rec := as(t, router, customer, http.MethodPatch, "/v1/fleet/profile",
+		`{"service_area":{"states":["NSW"]}}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (%s)", rec.Code, rec.Body)
+	}
+	if code := decode[errorEnvelope](t, rec).Error.Code; code != string(CodeProviderOnly) {
+		t.Errorf("code = %q, want %s", code, CodeProviderOnly)
+	}
+
+	// The read discloses nothing, so refusing it would only make the client special-case a screen
+	// it never shows.
+	if read := as(t, router, customer, http.MethodGet, "/v1/fleet/profile", ""); read.Code != http.StatusOK {
+		t.Errorf("GET by a customer = %d, want 200 (%s)", read.Code, read.Body)
+	}
 }

@@ -462,3 +462,594 @@ status="$(fleet_get "$(mint_token "$(json "$WORKDIR/fleet-fresh.json" '["id"]')"
 [[ "$(tr -d ' \n' < "$WORKDIR/fleet-list-empty.json")" == '{"data":[],"has_more":false}' ]] \
   || { cat "$WORKDIR/fleet-list-empty.json"; fail "an empty fleet is not an empty array"; }
 ok "a provider with no fleet gets an empty array, never null"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79  GET /v1/fleet/profile — a declaration nobody has made is empty, never missing"
+
+status="$(curl -s -o "$WORKDIR/profile-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/fleet/profile")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/profile-anon.json"; fail "an unauthenticated GET returned $status, want 401"; }
+ok "it cannot be reached without a credential"
+
+# The provider registered at the top of this file has declared nothing yet, which is the state
+# every provider is in when they first open the screen.
+status="$(fleet_get "$fleet_provider_token" /v1/fleet/profile "$WORKDIR/profile-empty.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile-empty.json"; fail "GET /v1/fleet/profile returned $status, want 200"; }
+[[ "$(tr -d ' \n' < "$WORKDIR/profile-empty.json")" == '{"service_area":{"states":[],"postcodes":[]},"specialties":[]}' ]] \
+  || { cat "$WORKDIR/profile-empty.json"; fail "an undeclared profile is not three empty arrays"; }
+ok "an undeclared profile is empty arrays rather than a 404 or a null"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79  PATCH /v1/fleet/profile declares service area and specialties"
+
+status="$(curl -s -X PATCH -o "$WORKDIR/profile-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $fleet_provider_token" -H 'Content-Type: application/json' \
+  -d '{"specialties":["courier"]}' \
+  "http://localhost:$VERIFY_PORT/v1/fleet/profile")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/profile-nokey.json"; fail "a request with no Idempotency-Key returned $status, want 400"; }
+ok "and not without an Idempotency-Key — a retried phone must not declare twice"
+
+status="$(fleet_request PATCH "$fleet_customer_token" "verify-profile-cust-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["NSW"]}}' "$WORKDIR/profile-customer.json")"
+[[ "$status" == "403" ]] || { cat "$WORKDIR/profile-customer.json"; fail "a customer declared a service area: $status"; }
+[[ "$(json "$WORKDIR/profile-customer.json" '["error"]["code"]')" == "fleet_provider_only" ]] \
+  || { cat "$WORKDIR/profile-customer.json"; fail "expected code=fleet_provider_only"; }
+ok "a customer is refused with a code the app can act on — and both tokens claim 'customer'"
+
+# Everything below is written the way a person types it: a state spelled out, one in lower case,
+# a postcode with a space in it, a specialty in title case, and each list carrying a repeat.
+# Normalisation is what stops one region being recorded as two.
+declaration='{
+  "service_area": {"states": ["Victoria", "nsw", "VIC"], "postcodes": ["3 000", "0800", "3000"]},
+  "specialties": ["Refrigerated", "general_freight", "refrigerated"]
+}'
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-declare-$$" /v1/fleet/profile \
+  "$declaration" "$WORKDIR/profile.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile.json"; fail "PATCH /v1/fleet/profile returned $status, want 200"; }
+python3 - "$WORKDIR/profile.json" <<'PY' || fail "the declaration was not normalised, deduplicated and ordered"
+import json, sys
+body = json.load(open(sys.argv[1]))
+want = {
+    "service_area": {"states": ["NSW", "VIC"], "postcodes": ["0800", "3000"]},
+    "specialties": ["general_freight", "refrigerated"],
+}
+if body != want:
+    print("got", body, "want", want, file=sys.stderr)
+    sys.exit(1)
+PY
+ok "spelled-out states, mixed case and a spaced postcode become one ordered set each"
+
+# The rows, not the answer the endpoint gave about itself. Two grains, one per row, and never
+# both on one: a postcode is deliberately not validated against a state.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(scope || ':' || area, ',' order by scope, area)
+     from provider_service_areas where provider_id = '$fleet_provider_id';")"
+[[ "$stored" == "postcode:0800,postcode:3000,state:NSW,state:VIC" ]] \
+  || fail "the stored service area is '$stored'"
+ok "each entry is stored at one grain — a whole state, or one postcode, never both"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79  a named list is replaced, an omitted one is left alone, an empty one is cleared"
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-partial-$$" /v1/fleet/profile \
+  '{"specialties":["courier"]}' "$WORKDIR/profile-partial.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile-partial.json"; fail "a partial declaration returned $status"; }
+python3 - "$WORKDIR/profile-partial.json" <<'PY' || fail "naming only the specialties disturbed the service area"
+import json, sys
+body = json.load(open(sys.argv[1]))
+if body["service_area"] != {"states": ["NSW", "VIC"], "postcodes": ["0800", "3000"]}:
+    print("the service area changed:", body["service_area"], file=sys.stderr); sys.exit(1)
+if body["specialties"] != ["courier"]:
+    print("specialties =", body["specialties"], "want [courier] — a named list is replaced", file=sys.stderr)
+    sys.exit(1)
+PY
+ok "an omitted list is unchanged, and a named one is replaced rather than merged into"
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-clear-$$" /v1/fleet/profile \
+  '{"service_area":{"postcodes":[]}}' "$WORKDIR/profile-cleared.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile-cleared.json"; fail "clearing the postcodes returned $status"; }
+python3 - "$WORKDIR/profile-cleared.json" <<'PY' || fail "the empty list did not clear only the postcodes"
+import json, sys
+area = json.load(open(sys.argv[1]))["service_area"]
+if area != {"states": ["NSW", "VIC"], "postcodes": []}:
+    print("got", area, file=sys.stderr); sys.exit(1)
+PY
+ok "an empty list clears exactly that grain — the distinction a provider needs to withdraw"
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-noop-$$" /v1/fleet/profile \
+  '{}' "$WORKDIR/profile-noop.json")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/profile-noop.json"; fail "a declaration naming no list returned $status, want 400"; }
+ok "a declaration that changes nothing is refused rather than answered with the unchanged one"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79  a service area is a set of named regions, and a radius is not a field"
+
+# The decision SHIP-79 took rather than leaving to SHIP-81: a job's coordinate is best-effort and
+# its state and postcode are not, so eligibility is set membership. A client that believed
+# otherwise is told the field does not exist rather than having its declaration quietly ignored.
+for body in '{"service_area":{"radius_km":50}}' '{"service_area":{"latitude":-37.8,"longitude":144.9}}'; do
+  status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-radius-$RANDOM-$$" \
+    /v1/fleet/profile "$body" "$WORKDIR/profile-radius.json")"
+  [[ "$status" == "400" ]] || { cat "$WORKDIR/profile-radius.json"; fail "$body returned $status, want 400"; }
+done
+ok "neither a radius nor a coordinate is accepted; the unknown field is reported, not ignored"
+
+status="$(fleet_request PATCH "$fleet_provider_token" "verify-profile-invalid-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["NSW","Zealand"],"postcodes":["3000","12345"]},"specialties":["hovercraft"]}' \
+  "$WORKDIR/profile-invalid.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/profile-invalid.json"; fail "an invalid declaration returned $status, want 422"; }
+python3 - "$WORKDIR/profile-invalid.json" <<'PY' || fail "the refusal does not name each offending position"
+import json, sys
+details = json.load(open(sys.argv[1]))["error"]["details"]
+named = {d["field"] for d in details}
+want = {"service_area.states.1", "service_area.postcodes.1", "specialties.0"}
+if not want <= named:
+    print("named", named, "want at least", want, file=sys.stderr); sys.exit(1)
+if "service_area.states.0" in named:
+    print("a valid entry was reported:", named, file=sys.stderr); sys.exit(1)
+PY
+ok "every bad entry is named by its position, and the good ones are not"
+
+# Nothing a refused declaration carried reached the database. A declaration is replaced whole, so
+# a request that fails validation must leave the previous one exactly as it was.
+still="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(scope || ':' || area, ',' order by scope, area)
+     from provider_service_areas where provider_id = '$fleet_provider_id';")"
+[[ "$still" == "state:NSW,state:VIC" ]] || fail "the refused declaration reached the rows: '$still'"
+ok "a refused declaration changes nothing that was already declared"
+
+# The question SHIP-81 will ask, asked here in the shape it will ask it: set membership against a
+# job's state and postcode, one index lookup, and no coordinate anywhere.
+serves="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select exists (
+     select 1 from provider_service_areas
+      where provider_id = '$fleet_provider_id'
+        and ((scope = 'state' and area = 'VIC') or (scope = 'postcode' and area = '3121'))
+   ) || ' ' || exists (
+     select 1 from provider_service_areas
+      where provider_id = '$fleet_provider_id'
+        and ((scope = 'state' and area = 'QLD') or (scope = 'postcode' and area = '4000'))
+   );")"
+[[ "$serves" == "true false" ]] || fail "the membership query answered '$serves', want 'true false'"
+ok "the stored declaration answers eligibility by set membership — the query SHIP-81 inherits"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-81  the eligibility filter, through SHIP-82's GET /v1/jobs/open — four filters, each shown to exclude"
+
+# **SHIP-81's SQL mirror is gone, and this is what replaced it.**
+#
+# SHIP-81 had no endpoint, so it demonstrated the four filters by running a hand-written copy of
+# internal/fleet/eligibility.go's predicate against the real schema — clearly marked as a mirror,
+# and with its own section header saying SHIP-82 would delete it. This is that deletion. Every
+# check below now goes through the real endpoint, so there is one description of the rule rather
+# than two, and a filter that stopped working would fail here instead of passing against a copy of
+# itself.
+#
+# What the mirror bought — evidence from outside Go, against rows the real API created — is bought
+# better this way: the request is the one a provider's phone makes.
+#
+# A provider of its own, deliberately. The sections above leave several vehicles in various states
+# on $fleet_provider_id, and "no vehicle in service" cannot be demonstrated against a fleet whose
+# contents this check does not control.
+
+status="$(post_json "verify-elig-prov-$$" /v1/auth/register \
+  "{\"email\":\"fleet-eligible-$$@example.com\",\"phone\":\"04144$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/elig-provider.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/elig-provider.json"; fail "could not register the eligibility provider: $status"; }
+elig_provider_id="$(json "$WORKDIR/elig-provider.json" '["id"]')"
+elig_provider_token="$(mint_token "$elig_provider_id")"
+
+fleet_customer_id="$(json "$WORKDIR/fleet-customer.json" '["id"]')"
+
+# Docs/04 §3's automated baseline, applied directly. Driving the real verification endpoints would
+# need the token out of the console email and the OTP out of the log, which 40-identity.sh already
+# demonstrates; repeating it here would be testing identity rather than eligibility.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set email_verified_at = now(), phone_verified_at = now() where id = '$elig_provider_id';"
+
+status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-profile-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["VIC"]}}' "$WORKDIR/elig-profile.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/elig-profile.json"; fail "declaring VIC returned $status"; }
+
+status="$(fleet_request POST "$elig_provider_token" "verify-elig-vehicle-$$" /v1/fleet/vehicles \
+  '{"registration":"ELG111","vehicle_type":"box_truck","max_weight_kg":1200,"load_length_cm":300,"load_width_cm":160,"load_height_cm":180}' \
+  "$WORKDIR/elig-vehicle.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/elig-vehicle.json"; fail "adding the eligibility vehicle returned $status"; }
+elig_vehicle_id="$(json "$WORKDIR/elig-vehicle.json" '["id"]')"
+
+# The job carries a budget, deliberately, and it is the number SHIP-83's checks below search for.
+# A job with no budget would make every one of those assertions vacuous — a privacy check whose
+# fixture has nothing to leak passes forever and proves nothing.
+status="$(fleet_request POST "$fleet_customer_token" "verify-elig-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":150000}' \
+  "$WORKDIR/elig-job.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/elig-job.json"; fail "creating the eligibility job returned $status"; }
+elig_job_id="$(json "$WORKDIR/elig-job.json" '["id"]')"
+
+# publish_job <job> <from> <to> — a status transition made the only way 000402 permits one: a
+# job_status_history row written in the same transaction and named by shipper.job_status_transition.
+# SHIP-63's publish endpoint does not exist yet, so the guard is satisfied directly rather than
+# bypassed.
+publish_job() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<SQL
+DO \$do\$
+DECLARE entry uuid := gen_random_uuid();
+BEGIN
+  INSERT INTO job_status_history
+      (id, job_id, from_status, to_status, actor_type, actor_id, actor_recorded_at)
+  VALUES (entry, '$1', '$2', '$3', 'customer', '$fleet_customer_id', now());
+  PERFORM set_config('shipper.job_status_transition', entry::text, true);
+  UPDATE jobs SET status = '$3' WHERE id = '$1';
+END
+\$do\$;
+SQL
+}
+
+publish_job "$elig_job_id" Draft Open
+
+# eligible — 1 when the marketplace offers that one job to that one provider, 0 when it does not.
+#
+# **Both endpoints are asked, and they have to agree.** `GET /v1/jobs/open/{id}` answers 200 or 404,
+# and the feed either carries the job or does not. One SQL predicate serves both, so a disagreement
+# is a defect rather than a difference of emphasis — a provider shown a job in the feed and then
+# refused it on the detail screen is the worst of both, and it is the failure sharing the clause
+# exists to prevent. Every filter check below therefore exercises the two endpoints at once.
+#
+# Scoped to the single job by id, so the jobs 50-jobs.sh leaves behind cannot make a broken filter
+# look like a working one.
+eligible() {
+  local detail feed status
+
+  detail="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$elig_job_id" "$WORKDIR/elig-detail.json")"
+  case "$detail" in
+    200) detail=1 ;;
+    404) detail=0 ;;
+    *) cat "$WORKDIR/elig-detail.json"; fail "GET /v1/jobs/open/$elig_job_id returned $detail, want 200 or 404" ;;
+  esac
+
+  status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/elig-feed.json")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/elig-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
+  feed="$(python3 - "$WORKDIR/elig-feed.json" "$elig_job_id" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+found = any(job["id"] == sys.argv[2] for job in page["data"])
+if not found and page["has_more"]:
+    # Ambiguous rather than false: the job could be on a later page, and a check that read
+    # that as "excluded" would pass for the wrong reason on a busy database.
+    print("more", file=sys.stderr)
+    sys.exit(1)
+print(1 if found else 0)
+PY
+)" || fail "the feed did not fit in one page of 100; this check cannot tell absent from further down"
+
+  [[ "$detail" == "$feed" ]] || fail "the feed says $feed and GET /v1/jobs/open/$elig_job_id says $detail — one predicate serves both"
+  printf '%s' "$detail"
+}
+
+status="$(curl -s -o "$WORKDIR/open-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/open")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/open-anon.json"; fail "an unauthenticated feed read returned $status, want 401"; }
+ok "the feed cannot be reached without a credential — a provider sees it because the platform filtered it"
+
+[[ "$(eligible)" == "1" ]] || fail "the job every filter should accept is not eligible"
+ok "a verified provider serving VIC, with a truck that fits, is offered an Open Richmond job"
+
+# SHIP-68 gives an Open job a deadline as it is published, and the filter reads it rather than
+# trusting the status alone: the sweep runs on a ticker, so a job whose deadline has passed still
+# says 'Open' until the worker reaches it.
+deadline="$("$PSQL" "$DATABASE_URL" -tAc "select expires_at is not null from jobs where id = '$elig_job_id';")"
+[[ "$deadline" == "t" ]] || fail "the published job carries no deadline"
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set expires_at = now() - interval '1 hour' where id = '$elig_job_id';"
+[[ "$(eligible)" == "0" ]] || fail "a job past its deadline was still offered"
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set expires_at = now() + interval '14 days' where id = '$elig_job_id';"
+ok "job status — a deadline that has passed excludes it before the sweep has reached it"
+
+# Docs/04 §3's baseline, one channel at a time, then account standing. Restricted is excluded as
+# well as suspended: §4 makes it "limited access pending clarification", and §1 says a provider does
+# not bid until baseline checks are complete.
+for column in email_verified_at phone_verified_at; do
+  "$PSQL" "$DATABASE_URL" -q -c "update users set $column = null where id = '$elig_provider_id';"
+  [[ "$(eligible)" == "0" ]] || fail "a provider with no $column was still offered work"
+  "$PSQL" "$DATABASE_URL" -q -c "update users set $column = now() where id = '$elig_provider_id';"
+done
+for standing in restricted suspended; do
+  "$PSQL" "$DATABASE_URL" -q -c "update users set status = '$standing' where id = '$elig_provider_id';"
+  [[ "$(eligible)" == "0" ]] || fail "a $standing account was still offered work"
+  "$PSQL" "$DATABASE_URL" -q -c "update users set status = 'active' where id = '$elig_provider_id';"
+done
+ok "verification state — an unverified, restricted or suspended provider is offered nothing"
+
+# Through the API rather than by writing rows, because withdrawing from a region is something a
+# provider actually does — and because an empty declaration matching nothing is SHIP-79's rule,
+# which this is the enforcement of.
+status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-nsw-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["NSW"]}}' "$WORKDIR/elig-nsw.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/elig-nsw.json"; fail "redeclaring returned $status"; }
+[[ "$(eligible)" == "0" ]] || fail "a provider who withdrew from VIC was still offered a VIC job"
+
+status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-none-$$" /v1/fleet/profile \
+  '{"service_area":{"states":[],"postcodes":[]}}' "$WORKDIR/elig-none.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/elig-none.json"; fail "clearing the declaration returned $status"; }
+[[ "$(eligible)" == "0" ]] || fail "a provider who has declared nothing was offered a job — eligibility is opt-in"
+ok "service area — withdrawing excludes, and an empty declaration matches nothing, not everything"
+
+status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-vic-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["VIC"]}}' "$WORKDIR/elig-vic.json")"
+[[ "$status" == "200" ]] || fail "restoring the declaration returned $status"
+
+# Deactivation is what a provider does when a truck comes off the road, and Docs/01 §4.2's third
+# verb. It must stop new work reaching them without touching work already under way.
+status="$(fleet_request POST "$elig_provider_token" "verify-elig-off-$$" \
+  "/v1/fleet/vehicles/$elig_vehicle_id/deactivate" '' "$WORKDIR/elig-off.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/elig-off.json"; fail "deactivating returned $status"; }
+[[ "$(eligible)" == "0" ]] || fail "a provider whose only vehicle is off the road was still offered work"
+
+status="$(fleet_request POST "$elig_provider_token" "verify-elig-on-$$" \
+  "/v1/fleet/vehicles/$elig_vehicle_id/reactivate" '' "$WORKDIR/elig-on.json")"
+[[ "$status" == "200" ]] || fail "reactivating returned $status"
+
+# And a known mismatch excludes, while a missing measurement does not: 000300 lets a provider add a
+# truck with a plate and nothing else, and 000404 lets a customer publish without measuring.
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set weight_kg = 9000 where id = '$elig_job_id';"
+[[ "$(eligible)" == "0" ]] || fail "a nine-tonne load was offered to a 1200 kg truck"
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set weight_kg = null where id = '$elig_job_id';"
+[[ "$(eligible)" == "1" ]] || fail "a job that states no weight was excluded; a missing measurement is not a mismatch"
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set weight_kg = 80 where id = '$elig_job_id';"
+ok "vehicle capability — deactivation and a known mismatch exclude; an unstated measurement does not"
+
+# Docs/02 §1: "'Negotiating' is a useful presentation status. Technically, the job remains
+# available for eligible bids unless the customer closes it or awards a bid." Nothing can reach
+# Negotiating until SHIP-90, which is exactly why this is asserted now.
+publish_job "$elig_job_id" Open Negotiating
+[[ "$(eligible)" == "1" ]] || fail "a Negotiating job was closed to new bids, which Docs/02 §1 does not do"
+publish_job "$elig_job_id" Negotiating Cancelled
+[[ "$(eligible)" == "0" ]] || fail "a cancelled job was still offered"
+ok "job status — Negotiating stays biddable and Cancelled does not, exactly as Docs/02 §1 reads"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-82  GET /v1/jobs/open — the envelope, only eligible jobs, and paging"
+
+# **A fresh job, because the one above is Cancelled and stays that way.** Docs/02 §1 makes
+# Cancelled terminal, and moving it back would demonstrate a transition the platform does not
+# offer — the database's guard only checks that a history row describes the move, so writing an
+# illegal one here would be this script inventing a lifecycle rather than exercising one.
+status="$(fleet_request POST "$fleet_customer_token" "verify-open-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "vehicle_requirement":"Ute with a tailgate lifter","handling_notes":"Second-floor walk-up, no lift.",
+    "budget_cents":150000}' \
+  "$WORKDIR/open-job.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/open-job.json"; fail "creating the open-feed job returned $status"; }
+open_job_id="$(json "$WORKDIR/open-job.json" '["id"]')"
+publish_job "$open_job_id" Draft Open
+
+# A job the provider is not eligible for, alongside one they are. "Only eligible jobs" needs
+# something in the database to be wrong about; a feed filtered by an empty table proves nothing.
+status="$(fleet_request POST "$fleet_customer_token" "verify-open-qld-$$" /v1/jobs \
+  '{"pickup":{"line":"1 Queen Street","suburb":"Brisbane","state":"QLD","postcode":"4000"},
+    "dropoff":{"line":"2 Adelaide Street","suburb":"Brisbane","state":"QLD","postcode":"4000"},
+    "goods_description":"Pallet of tiles","weight_kg":300,
+    "budget_cents":90000}' \
+  "$WORKDIR/open-qld.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/open-qld.json"; fail "creating the out-of-area job returned $status"; }
+qld_job_id="$(json "$WORKDIR/open-qld.json" '["id"]')"
+publish_job "$qld_job_id" Draft Open
+
+status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/open-feed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
+python3 - "$WORKDIR/open-feed.json" "$open_job_id" "$qld_job_id" <<'PY' || fail "the feed is not Docs/10 §4.5's envelope, or it carries a job outside the provider's service area"
+import json, sys
+page = json.load(open(sys.argv[1]))
+if set(page) - {"data", "next_cursor", "has_more"}:
+    print("unexpected keys:", set(page), file=sys.stderr); sys.exit(1)
+if not isinstance(page["data"], list) or "has_more" not in page:
+    print("wrong shape:", page, file=sys.stderr); sys.exit(1)
+ids = [job["id"] for job in page["data"]]
+if sys.argv[2] not in ids:
+    print("the eligible job is missing:", ids, file=sys.stderr); sys.exit(1)
+if sys.argv[3] in ids:
+    print("a Queensland job reached a provider who serves Victoria only", file=sys.stderr); sys.exit(1)
+created = [job["created_at"] for job in page["data"]]
+if created != sorted(created, reverse=True):
+    print("not newest first:", created, file=sys.stderr); sys.exit(1)
+PY
+ok "the envelope is data/next_cursor/has_more, newest first, and a job outside the service area is not in it"
+
+# A second eligible job, so paging has a boundary to cross. Same pickup, so the same declaration
+# and the same truck accept it.
+status="$(fleet_request POST "$fleet_customer_token" "verify-open-second-$$" /v1/jobs \
+  '{"pickup":{"line":"7 Swan Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"3 Collins Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Dining table","weight_kg":60,
+    "budget_cents":120000}' \
+  "$WORKDIR/open-second.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/open-second.json"; fail "creating the second eligible job returned $status"; }
+second_job_id="$(json "$WORKDIR/open-second.json" '["id"]')"
+publish_job "$second_job_id" Draft Open
+
+# Paging followed the way a client follows it: take next_cursor, send it back, stop at
+# has_more=false. The page size is 1 so the boundary is crossed once per job.
+python3 - "$elig_provider_token" "$VERIFY_PORT" "$auth_header" "$open_job_id" "$second_job_id" <<'PY' || fail "paging the feed did not reach every eligible job exactly once"
+import json, sys, urllib.parse, urllib.request
+
+token, port, header = sys.argv[1], sys.argv[2], sys.argv[3]
+must_appear = set(sys.argv[4:])
+base = f"http://localhost:{port}/v1/jobs/open"
+
+def get(url):
+    request = urllib.request.Request(url, headers={header: f"Bearer {token}"})
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)
+
+whole = get(f"{base}?limit=100")
+if whole["has_more"]:
+    print("more than 100 eligible jobs; this check assumes there are not", file=sys.stderr)
+    sys.exit(1)
+expected = [job["id"] for job in whole["data"]]
+
+seen, url, pages = [], f"{base}?limit=1", 0
+while True:
+    pages += 1
+    if pages > len(expected) + 2:
+        print("paging did not terminate; the cursor is not advancing", file=sys.stderr)
+        sys.exit(1)
+    page = get(url)
+    seen.extend(job["id"] for job in page["data"])
+    if not page["has_more"]:
+        if page.get("next_cursor"):
+            print("the last page carries a cursor", file=sys.stderr)
+            sys.exit(1)
+        break
+    if len(page["data"]) != 1:
+        print("a page before the last holds", len(page["data"]), "jobs, want the limit of 1", file=sys.stderr)
+        sys.exit(1)
+    url = f"{base}?limit=1&cursor={urllib.parse.quote(page['next_cursor'])}"
+
+# A repeat and a skip are both invisible to a set comparison, so the length is checked too.
+if len(seen) != len(expected) or sorted(seen) != sorted(expected):
+    print("paged over", seen, "want", expected, file=sys.stderr)
+    sys.exit(1)
+if not must_appear <= set(seen):
+    print("the jobs this section published are not all in the feed:", must_appear - set(seen), file=sys.stderr)
+    sys.exit(1)
+print(f"    {len(expected)} eligible jobs over {pages} pages of one")
+PY
+ok "paging one job at a time reaches every eligible job exactly once, and terminates"
+
+status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?cursor=not-a-cursor' "$WORKDIR/open-badcursor.json")"
+[[ "$status" == "400" ]] || fail "a mangled cursor returned $status, want 400"
+status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=0' "$WORKDIR/open-badlimit.json")"
+[[ "$status" == "400" ]] || fail "?limit=0 returned $status, want 400"
+status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=5000' "$WORKDIR/open-biglimit.json")"
+[[ "$status" == "200" ]] || fail "?limit=5000 returned $status, want it narrowed to the maximum"
+ok "a mangled cursor and a bad limit are refused; an over-large limit is narrowed"
+
+# A customer reaching the provider's feed gets an empty page rather than a 403. Being eligible for
+# nothing is the truthful answer to the question, and the client renders that from an empty list.
+status="$(fleet_get "$fleet_customer_token" /v1/jobs/open "$WORKDIR/open-customer.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-customer.json"; fail "a customer reading the feed returned $status, want 200"; }
+[[ "$(tr -d ' \n' < "$WORKDIR/open-customer.json")" == '{"data":[],"has_more":false}' ]] \
+  || { cat "$WORKDIR/open-customer.json"; fail "a customer's feed is not an empty array"; }
+ok "a caller eligible for nothing gets an empty array, never null and never a 403"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-83  GET /v1/jobs/open/{id} — one job, no budget, and no doorstep"
+
+status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-detail.json"; fail "GET /v1/jobs/open/$open_job_id returned $status, want 200"; }
+
+# One shape, whatever the client did to obtain it — the rule the vehicle endpoints already follow,
+# and here it is also the privacy decision: two shapes would be two places a budget field could be
+# added and two responses this section would have to know to check.
+python3 - "$WORKDIR/open-detail.json" "$WORKDIR/open-feed.json" "$open_job_id" <<'PY' || fail "the detail view and the feed entry are different shapes"
+import json, sys
+detail = json.load(open(sys.argv[1]))
+entry = next(job for job in json.load(open(sys.argv[2]))["data"] if job["id"] == sys.argv[3])
+if detail != entry:
+    print("detail:", detail, "\nfeed:  ", entry, file=sys.stderr)
+    sys.exit(1)
+PY
+ok "the job by identifier is the entry the feed carried, field for field"
+
+# **The invariant, checked where it can actually be broken: the bytes a provider receives.**
+#
+# Docs/11 §8 records what the SHIP-67 pairing still owed — "its provider response, serialised,
+# asserted to carry no budget". internal/fleet/openjobs_test.go is that test in Go, over a closed
+# set of keys so that a budget renamed `max_price` fails too. This is the same assertion made from
+# outside Go, against a running service, so that neither can be quietly deleted alone.
+stored_budget="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select budget from jobs where id = '$open_job_id';")"
+[[ -n "$stored_budget" ]] || fail "the job carries no budget, so these checks are asserting nothing"
+[[ "$stored_budget" == "1500.00" ]] || fail "the stored budget is '$stored_budget', want 1500.00"
+
+python3 - "$WORKDIR/open-detail.json" "$WORKDIR/open-feed.json" <<'PY' || fail "the customer's budget reached a provider"
+import json, re, sys
+
+# Every key a provider may see, at any depth: the envelope's three, the job's fifteen, and the two
+# nested shapes'. **A closed list, and that is the point** — a deny-list of names catches
+# `budget_cents` and misses `max_price`, while Docs/01 §4.3 forbids the budget "as an amount, a
+# band, or a 'budget supplied' flag" rather than forbidding a spelling.
+allowed = {
+    "data", "next_cursor", "has_more",
+    "id", "status", "pickup", "dropoff", "goods_description",
+    "length_cm", "width_cm", "height_cm", "weight_kg",
+    "vehicle_requirement", "handling_notes", "pickup_window", "dropoff_window",
+    "expires_at", "created_at",
+    "suburb", "state", "postcode", "start", "end",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+# Identifiers come out before the value search: a UUID is hexadecimal, so a run of digits can
+# occur inside one by chance — rarely enough to pass review and often enough to fail one morning.
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+for path in sys.argv[1:]:
+    raw = open(path).read()
+
+    unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+    if unexpected:
+        print(path, "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+        print("A budget under another name is still a budget (Docs/01 §4.3).", file=sys.stderr)
+        sys.exit(1)
+
+    if "budget" in raw.lower():
+        print(path, "mentions the budget:", raw, file=sys.stderr)
+        sys.exit(1)
+
+    searchable = identifier.sub("<id>", raw)
+    for rendering in ("1500.00", "150000"):
+        if rendering in searchable:
+            print(path, "carries the budget's value as", rendering, file=sys.stderr)
+            print(raw, file=sys.stderr)
+            sys.exit(1)
+PY
+ok "the customer's budget is on the job and in neither response — not the word, not the value, not a key under another name"
+
+# The other disclosure decision, confirmed by SHIP-83 rather than inherited: a provider who has not
+# bid gets the locality and not the doorstep. The coordinate goes with the street line, because the
+# platform geocodes the whole address — sending it would be sending the line as two numbers.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_latitude = -37.8197, pickup_longitude = 144.9989 where id = '$open_job_id';"
+status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-detail2.json")"
+[[ "$status" == "200" ]] || fail "re-reading the job returned $status"
+for disclosure in 'Church Street' 'Bourke Street' '37.8197' '144.9989' '"line"' '"coordinate"' '"latitude"'; do
+  grep -q "$disclosure" "$WORKDIR/open-detail2.json" \
+    && { cat "$WORKDIR/open-detail2.json"; fail "the provider's job carries '$disclosure' before they have bid"; }
+done
+grep -q 'Richmond' "$WORKDIR/open-detail2.json" || fail "the pickup locality is missing; a provider cannot price without it"
+grep -q '3121' "$WORKDIR/open-detail2.json" || fail "the pickup postcode is missing"
+ok "the pickup is suburb, state and postcode — never the street line, and never the coordinate that is the street line"
+
+# A job this provider may not bid on is indistinguishable from one that does not exist. 403 would
+# confirm the job is there, and which jobs a competitor may bid on is nobody else's business.
+status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$qld_job_id" "$WORKDIR/open-theirs.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/open-theirs.json"; fail "an ineligible job returned $status, want 404"; }
+status="$(fleet_get "$elig_provider_token" /v1/jobs/open/00000000-0000-7000-8000-000000000020 "$WORKDIR/open-nothing.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/open-nothing.json"; fail "a job that does not exist returned $status, want 404"; }
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/open-theirs.json" "$WORKDIR/open-nothing.json" \
+  || fail "a job outside the provider's eligibility answers differently from a job that does not exist"
+ok "an ineligible job answers exactly what a missing job answers — the refusal confirms nothing"
+
+# And the customer cannot read their own job here. GET /v1/jobs/{id} is where they read it, and
+# that response is the one shape in this API that carries the budget.
+status="$(fleet_get "$fleet_customer_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-owner.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/open-owner.json"; fail "the owning customer read their job through the provider's route: $status"; }
+ok "the provider's route is not a second way to a job the customer owns"

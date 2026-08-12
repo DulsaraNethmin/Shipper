@@ -273,7 +273,11 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-77** | M2 | Flutter customer job detail — the timeline is derived from the current status, because the transition history the database records is served by no endpoint; and sign-out finally tells the platform — *see below* |
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
+| **SHIP-79** | M3 | `provider_service_areas` and `provider_specialties`, and `GET`/`PATCH /v1/fleet/profile` — a service area is a **set of named regions, not a radius**, so §9's `internal/geo` trigger does not fire at SHIP-81 — *see below* |
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-81** | M3 | The job eligibility filter — **one SQL predicate in `fleet`, reaching four tables across three domains**, chosen over ports because ports cannot page a set intersection. Two readers, one clause; no endpoint until SHIP-82 — *see below* |
+| **SHIP-82** | M3 | `GET /v1/jobs/open` — the provider's feed, keyset-paged. **Declared in `routes_fleet.go`, not `routes_jobs.go`**: routes follow the domain that answers them, not the first segment of the path. It also deletes SHIP-81's SQL mirror from `make verify` in favour of real HTTP checks — *see below* |
+| **SHIP-83** | M3 | `GET /v1/jobs/open/{id}` — one job as a provider sees it, and **the fourth budget proof §8 recorded as still owed**: the serialised response, obtained over HTTP, held to a *closed set of keys* so that a budget renamed `max_price` fails too. The street line and the coordinate are confirmed withheld — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -2213,6 +2217,110 @@ Nothing shared was edited beyond the two lines `contracts/openapi.yaml` reserves
 regenerated `routes_golden.txt` and `Docs/10-api-error-codes.md`, and this file. `Deps` needed no
 field: fleet builds from the clock and the pool alone.
 
+### SHIP-79 — a service area is a set of regions, and that is what keeps `internal/geo` unbuilt
+
+Migration `000301` creates `provider_service_areas` and `provider_specialties`, and
+`GET`/`PATCH /v1/fleet/profile` reads and replaces what a provider has declared: where they will
+carry freight, and what kind of freight they carry. `Docs/01` §4.2's "nominate service area and
+specialties", and the half of eligibility that belongs to a *provider* rather than to one vehicle.
+
+**The decision this ticket existed to take: a service area is a set of named regions — states and
+postcodes — and not a radius around a point.** §9 has named "the first ticket needing the distance
+between two coordinates in a domain other than `jobs`" as the trigger for writing `internal/geo`
+since SHIP-60, and named SHIP-81 as the likely one. **It is not.** SHIP-81 is now a set-membership
+query, this domain does no distance arithmetic, and `internal/geo` remains unwritten and
+unregistered. Three reasons, in the order they weighed:
+
+1. **A radius would make eligibility depend on a field the platform may not have.** A job's
+   coordinate is best-effort by design — SHIP-60 stores the address exactly as typed when a lookup
+   fails, and §3 above records that staging and production get *no geocoder at all* until one is
+   configured. A radius filter in that state matches nothing: a provider opens the app to an empty
+   feed with no error anywhere to explain it. The state and the postcode are typed by the customer
+   and validated on the way in, so they are always there.
+2. **It is how Australian road freight is quoted.** Providers price by postcode zone and by state
+   rather than by kilometres from a depot, and a straight-line radius is wrong about roads — 300 km
+   from Melbourne reaches Tasmania across Bass Strait.
+3. **Both documents already read it this way.** SHIP-60 gave a job address four parts rather than
+   one freeform line "because the suburb, the state and the postcode are values SHIP-79 and SHIP-81
+   will compare", and the geo decision itself recorded that "neither names a radius in kilometres".
+   This is that reading held to rather than quietly reversed.
+
+**What would reopen it is named rather than left to judgement**, in the same style: a ticket that
+genuinely needs a distance — "providers within 50 km of the pickup, ranked" is the shape. The answer
+then is still §9's, and the regions stay, because a provider has to be able to say "I do not cross
+the Nullarbor" in a form a straight line cannot express. **§9's own entry still says the trigger is
+"likely SHIP-81" and that is now known to be wrong**; correcting that sentence is a reconciliation
+edit rather than this ticket's, since a domain branch does not own §9.
+
+**An entry names one grain and never two**, and that follows directly from a decision §3 already
+records. `ck_provider_service_areas_scope_and_area` accepts either a whole state or one postcode,
+never a postcode qualified by a state — because SHIP-60 deliberately refused to validate a postcode
+against its state (the allocations have exceptions, 2600 is ACT inside the NSW range, and they move
+when Australia Post says so). A row carrying both could disagree with itself, and checking that it
+did not would be exactly the validation that decision refuses. One grain per row leaves nothing to
+be inconsistent about.
+
+**An empty declaration matches no job rather than every job.** Eligibility is opt-in, or the
+provider who has not finished onboarding would be the widest-reaching provider on the platform —
+and `Docs/04` §3 requires the area declared before verification passes. `fleet.Profile.Serves` is
+the reading SHIP-81 should use; a test in `internal/fleet` and a check in `make verify` both assert
+the empty case.
+
+**Three lists, and each of them has three states rather than two.** Omitted or `null` leaves a list
+exactly as it is; `[]` clears it; entries replace it whole. That is `VehicleFields`' distinction
+applied to a set, and the empty list is not decoration — without it a provider who withdrew from
+every single postcode and now covers whole states only could not say so. There is deliberately **no
+add-one or remove-one operation**: the screen renders the declaration as chips and sends the set
+back, and two operations over one collection is where a client and a server stop agreeing about
+what is in it.
+
+**What is replaced is the set, not the rows.** The store deletes only what has left the declaration
+and inserts only what is new, so an entry the provider has held since January keeps its `created_at`
+through a request that merely resends it. That matters because `Docs/04` §3 makes the service area
+something a verification decision is taken against, and "when did they take on Queensland" is the
+question support would ask.
+
+**The first advisory lock outside `cmd/worker`, and it is load-bearing rather than defensive.**
+Replacing a set is a delete and an insert that must be one decision, and a row lock cannot express
+it — what has to be serialised includes the case where the set is currently *empty*, so there are no
+rows for `FOR UPDATE` to hold. Without `pg_advisory_xact_lock`, two devices declaring at once in
+READ COMMITTED each fail to see the other's uncommitted insert, both survive, and the stored
+declaration becomes the union of two sets neither client asked for — a lost update with nothing to
+report afterwards. `TestTwoDevicesDeclaringAtOnceDoNotProduceTheUnion` was **watched failing with
+the lock removed** before it was believed. The lock class is `79`, following the convention
+`cmd/worker/outbox.go` set at `134`: the ticket's number, so two uses cannot share a key space by
+accident.
+
+**Twelve specialties, closed, and a declaration is never a permission.** Naming `dangerous_goods`
+claims a capability; what a provider is licensed and insured to carry is verification's business
+(`Docs/04` §3) and what may not be carried at all is X-9's. This is the capability vocabulary
+`000300` and `000404` were both careful to say `vehicle_type` is *not*: that answers what a vehicle
+is, this answers what its owner does. The pairing test `Docs/10` §3.4 requires reads the constraint
+out of `pg_constraint` in both directions.
+
+**The eight states are a second copy of a list `jobs` also holds**, and that is the boundary rule
+working rather than failing. Domains do not import each other, so `fleet` cannot reach
+`jobs.States`; eight strings that have not moved since 1975 are cheaper duplicated than registered
+in `internal/boundaries` — which is a shared file a domain branch must not edit anyway. Each copy is
+paired with its own `CHECK` by its own test, so neither can drift unnoticed.
+
+**Validation names the position, not just the list.** A detail's field is
+`service_area.postcodes.2`, because the client renders each entry as its own control and an error
+naming only the list leaves the provider to work out which of forty postcodes is meant. It is an
+extension of `httpx.FieldError`'s dotted path through an array index rather than a new convention.
+The offending value is deliberately not echoed back.
+
+**No new error code, and that is worth stating.** `fleet_provider_only` already exists and covers
+the only domain-specific refusal here; everything else is `validation_failed` with details or the
+middleware's own business. A domain code earns its place only where a client would otherwise have
+to parse a message. The read is deliberately *not* refused to a customer — their declaration is
+empty because they have never made one, and a 403 on a read that discloses nothing would make the
+client special-case a screen it never shows.
+
+Nothing shared was edited beyond the one line `contracts/openapi.yaml` reserves per path (plus a
+sentence on the `Fleet` tag, which is fleet's own block), the regenerated `routes_golden.txt`, and
+this file. `Deps` needed no field and `internal/boundaries` was not opened.
+
 ### What SHIP-80 built, and the ticket it turns out to have finished
 
 `internal/bidding` is open. Migration `000500` creates `bids`, and it adds no route, no handler and
@@ -2285,6 +2393,372 @@ Nothing shared was edited at all: no route file, no `contracts/openapi.yaml` ent
 `routes_golden.txt`, no `scripts/verify/` file, no `internal/boundaries` change — `bidding` was
 already a registered domain and `000500` was already its reserved block. This file and
 `Docs/11-done.txt` are the whole of it.
+
+### SHIP-81 — the first query needing three domains' data, and the shape it settles for the rest
+
+`internal/fleet/eligibility.go` answers `Docs/01` §4.3's first line — "Filter jobs by provider
+service area, vehicle capability, verification state, and job status" — as **one SQL predicate**.
+There is no endpoint; SHIP-82 puts `GET /v1/jobs/open` in front of it. Migration `000302` adds the
+one index the filter needs that did not already exist.
+
+#### The decision: one SQL statement in `fleet`, not ports and composition in Go
+
+The four filters read four tables owned by three domains — `provider_service_areas` and `vehicles`
+here, `users` in the shared block, and `jobs` in a domain `fleet` may not import. Two shapes were
+honestly available, and the reasoning is repeated at the top of `eligibility.go` because the next
+such ticket will copy it.
+
+1. **Ports cannot page a set intersection, and an unpageable feed is not a feed.** To return twenty
+   eligible jobs, something must know which open jobs are eligible *before* taking twenty. A port
+   handing `jobs` back to `fleet` puts the filter in Go, so the page boundary falls on the
+   *unfiltered* set: a provider serving one postcode would read every open job on the platform to
+   fill one screen, and "the next twenty eligible" would have no answer at all. SHIP-82's *Done
+   when* says "paginated", so this is not a performance preference — it is whether the next ticket
+   can be built.
+2. **The only port shape that *can* page puts `fleet`'s policy inside `jobs`.** That shape is one
+   where `jobs` runs the filter — "open jobs in these regions fitting one of these boxes" — which
+   is the eligibility rule itself, written in the domain that does not own it. `fleet/doc.go` has
+   said since SHIP-78 that eligibility is decided here, and `Docs/07` §3 requires it decided
+   server-side in exactly one place.
+3. **The Go boundary is about imports and is not being crossed.** `eligibility.go` imports no
+   domain; `make lint-imports` and SHIP-11's test are satisfied. CLAUDE.md's *other* rule points
+   the same way: **do not abstract PostgreSQL**, and a repository interface introduced only to keep
+   another domain's table names out of a file would be exactly that abstraction, bought with an
+   N+1.
+
+**What is given up is real and is not answered by a promise to be careful.** A `SELECT` naming
+`jobs` is a coupling with no compiler behind it. Three things stand in for one:
+
+- **Every query runs against the real schema in `make check`** — the tests are integration tests by
+  construction, so a renamed column is a red build rather than an empty feed.
+- **The reach is confined to one file, enforced by a test.**
+  `TestOnlyTheEligibilityFilterReadsTheJobsTable` parses the package and fails if any other
+  non-test file names the `jobs` table. "Which parts of `fleet` reach into `jobs`" is answerable by
+  reading one file.
+- **The two job statuses the SQL hard-codes are paired with `ck_jobs_status`** read out of
+  `pg_constraint`, in both directions — `Docs/10` §3.4's discipline applied across a domain
+  boundary for the first time.
+
+**What would change the answer is named**: a fifth domain's table joining the predicate, or a
+filter needing something no SQL expression can express. The shape to move to then is a materialised
+eligibility projection fed by domain events — a real design with a real cost, not worth paying for
+four tables. **A database view was considered and rejected**: it would have given one definition
+readable from Go *and* psql, but PostgreSQL refuses to drop or retype a column a view reads, so a
+`fleet` migration creating one would block the jobs track's next migration through a file they
+cannot see.
+
+#### The cost that has no clean answer: the SELECT crosses the boundary and the index cannot
+
+The feed reads `WHERE status IN ('Open','Negotiating') AND (expires_at IS NULL OR expires_at > $2)
+ORDER BY created_at DESC, id DESC`, and nothing in `jobs` indexes that — `idx_jobs_open_expiry` is
+partial on `'Open'` alone and ordered by `expires_at`. The index wanted is roughly
+`(created_at DESC, id DESC) WHERE status IN ('Open','Negotiating')`, and **it is in block 400–499,
+which a fleet migration may not draw from.** So the feed currently plans as a sequential scan on
+`jobs` under a `LIMIT` — correct, and cheap while open jobs number in the hundreds.
+
+This is the one asymmetry worth carrying forward: reading across a domain boundary in SQL works,
+and *indexing* across one does not. It is a request to the jobs track when volume warrants it, not
+something this branch could have fixed.
+
+**`000302` therefore adds the index that *is* fleet's**: `idx_vehicles_capability`, partial on
+vehicles in service and covering the four capacity columns, so the capability check — the one
+clause that runs once per candidate job — is an index-only scan.
+
+**The job-first index on `provider_service_areas` was NOT created, and `000301`'s expectation that
+SHIP-81 would need it is wrong.** The filter is *provider*-first in both forms: the feed asks
+"which open jobs may this provider see" and SHIP-84 asks "may this provider see this job", and both
+bind `provider_id` first, which `uq_provider_service_areas` already leads on. The job-first
+direction — "which providers serve this postcode" — is the **notification fan-out**, and it is
+still M5's. Creating it here would be write amplification for a query nobody makes.
+
+#### Two readers, one predicate
+
+`eligible` is a `WHERE` clause and nothing else. `Service.EligibleJobs` wraps it in a page (SHIP-82
+serves that) and `Service.EligibleFor` wraps it in `EXISTS` for one job, which is what SHIP-84 needs
+before accepting a bid — `fleet/doc.go` requires both. `TestEligibleForAgreesWithTheFeed` holds them
+to each other across every case, because a provider shown a job and then refused a bid on it is the
+worst of both.
+
+#### `Docs/02` §1 was read, and it says **two** statuses are biddable, not one
+
+The obvious reading of "only Open jobs are eligible" is wrong. `Docs/02` §1 defines Negotiating as
+"one or more active bids or counter-offers exist; **job remains open to eligible bids**", and adds:
+"'Negotiating' is a useful presentation status. Technically, the job remains available for eligible
+bids unless the customer closes it or awards a bid."
+
+**Nothing can reach Negotiating until SHIP-90**, which is exactly why this had to be got right now:
+a filter accepting only `'Open'` would pass every test written today and surface months later as
+jobs vanishing from every provider's feed the instant somebody bid on them — which reads as a
+bidding bug, not as one line in a predicate. `TestANegotiatingJobIsStillBiddable` and a `make
+verify` check both assert it.
+
+**The deadline is part of the status filter rather than a fifth filter.** SHIP-68's sweep runs on a
+ticker, so between `expires_at` passing and the worker reaching it the row still says `'Open'`. A
+feed trusting the column alone offers work nobody may bid on, and the provider finds out by being
+refused after pricing it.
+
+**`j.customer_id <> $1` is `000500`'s clause, handed here by name** — "it is a comparison across two
+tables and belongs with SHIP-81's eligibility filter". It is unreachable today (`users.role` is
+immutable, and `jobs` refuses a non-customer) and costs one line to be right if either changes.
+
+#### Verification state is deliberately incomplete, and the ticket that completes it is named
+
+`Docs/04` §4's five outcomes — Pending, Verified, Restricted, Rejected, Suspended — **do not exist
+yet**: `000002` says they "live with profiles", `internal/profiles` is empty, and block 200–299 is
+unused. The filter checks the part of `Docs/04` §3's baseline that does exist, which is its
+automated row: email and phone verified, on a provider account with `status = 'active'`.
+
+`'restricted'` is excluded as well as `'suspended'` — §4 makes Restricted "limited access pending
+clarification" and §1 says a provider does not bid until baseline checks are complete, so the
+conservative direction is also the reversible one.
+
+**The seam is the thing to remember: SHIP-152…154 add their clause to *this* predicate.** If that
+work adds a second eligibility check elsewhere, the platform will have two answers to who may bid.
+
+#### Opt-in is one rule, not four coincidences
+
+SHIP-79 settled it for the service area — an empty declaration matches nothing, or the provider who
+has not finished onboarding becomes the widest-reaching provider on the platform. `EXISTS` gives the
+same answer for the other three by construction: no account row, no declared region, no vehicle in
+service, no jobs. `TestAProviderWhoHasDeclaredNothingSeesNothing` checks all four halves separately,
+because a `NOT EXISTS` in the wrong place would pass three of them.
+
+**Its mirror image matters as much: a number that is missing never excludes.** `000300` lets a
+provider add a truck with a plate and nothing else; `000404` lets a customer publish without
+measuring. A comparison is made only where both sides supplied a number, so the filter excludes only
+on a *known* mismatch — treating "not stated" as "does not fit" would empty the feed of every job
+whose customer left a field blank, which is most of them. **Dimensions are compared axis to axis and
+rotation is not modelled**, because modelling it means guessing how goods will be packed, which is
+the provider's decision at the tailgate. What would reopen that is providers reporting jobs they
+could have taken and never saw.
+
+#### Two disclosure decisions this ticket had to take, because no document had
+
+`EligibleJob` is the first provider-facing shape anywhere outside `internal/jobs`, and that put two
+questions on this branch that nobody had answered.
+
+- **The budget guard is package-scoped, and this is the first thing it cannot see.** SHIP-67's
+  source-parsing test parses `internal/jobs`; its own header says it is waiting for "SHIP-82's feed
+  and SHIP-83's provider detail". SHIP-81 arrives before either.
+  `TestNoProviderFacingShapeCarriesTheBudget` is `fleet`'s copy, and it makes a **stronger**
+  statement than the original can: the allow-list is empty and must stay empty, because every shape
+  in this domain is read by a provider. It also checks the SQL — `jobs.budget` sits three lines from
+  `weight_kg`, so the `SELECT` list is the real disclosure boundary, which is why the query names
+  columns rather than selecting the row. A `make verify` check asserts the same thing from outside
+  Go.
+- **The provider's feed carries suburb, state and postcode — not the street line.** No document
+  takes a position on when a provider learns the exact door, so this takes the reversible direction,
+  which is the argument `Docs/01` §4.3 makes about the budget applied to an address: a provider
+  prices on the locality, and the doorstep is needed by whoever drives to it, after the award.
+  Disclosing later is easy; withdrawing later is not. **SHIP-83 confirms or reopens it**, and should
+  do so explicitly rather than inheriting it silently. The feed carries no customer identity either.
+
+#### How it is demonstrated
+
+`make verify` gained seven checks in `scripts/verify/60-fleet.sh` — a dedicated provider, a real job
+created through `POST /v1/jobs` and published through `000402`'s guard, then each filter broken in
+turn. **Those checks run a mirror of the predicate rather than the predicate itself**, which is
+stated in the section's own header: `internal/fleet/eligibility_test.go` is authoritative, and
+SHIP-82 replaces the mirror with the endpoint. What the mirror buys meanwhile is evidence from
+outside Go that the four filters are answerable from the real schema against rows the real API
+created.
+
+The Go tests are where the *Done when* is met: twelve subtests in
+`TestEachFilterExcludesSomething`, one per way a filter can exclude, each starting from a world every
+filter accepts and breaking exactly one thing. **The predicate was replaced with `TRUE` and the
+suite watched failing** — sixteen subtests, so none of them is decorative.
+
+Shared surfaces: none. No route, no `contracts/openapi.yaml` entry, no `routes_golden.txt` change,
+no `internal/boundaries` edit, no `Deps` field, and — as SHIP-79 predicted — **no `internal/geo`**.
+This file, `Docs/11-done.txt`, `scripts/verify/60-fleet.sh`, and fleet's own package and migration
+block are the whole of it. `internal/bidding` was untouched: it owns none of the four tables, and
+SHIP-91…95's award transaction is a single-owner branch that a feed query has no business sitting
+in front of.
+
+### SHIP-82 — the feed, and the route that is not in its own domain's file
+
+`GET /v1/jobs/open` puts SHIP-81's predicate in front of a provider, keyset-paged in the envelope
+`Docs/10` §4.5 gives every list. Two handlers, two contract operations, no migration and no new
+error code: the ticket is the endpoint the previous one was built for.
+
+#### The decision: a route is declared where its answer is decided, not where its path points
+
+The route is `/v1/jobs/open` and it is declared in **`cmd/api/routes_fleet.go`**, which looks wrong
+for a second and is the only arrangement that holds. Three things pointed the same way:
+
+1. **`fleet` decides eligibility, so `fleet` serves the endpoint.** The alternative is a
+   `fleet.Handler` constructed inside `routes_jobs.go`, which makes one domain's route file depend
+   on another domain's package — a shared-file edit in the exact place `Docs/10` §4.1 built the
+   manifest to avoid.
+2. **Routes are declared, not registered, and the file name is not part of the URL.** The manifest
+   sorts by path, `routes_golden.txt` records the served surface whatever file each line came from,
+   and `TestEveryRouteIsInTheContract` checks the contract in both directions. Nothing in the
+   mechanism cares which file an `init` sat in; the *tracks* care a great deal.
+3. **The path is still right, because the resource is a job.** `/v1/jobs/open` is the collection of
+   jobs offered to the calling provider and `/v1/jobs/open/{id}` is one member of it. net/http
+   prefers the more specific pattern, so it coexists with `jobs`' own `/v1/jobs/{id}` with neither
+   file knowing the other exists.
+
+**This wave proves the arrangement rather than asserting it**: track B held `routes_jobs.go` for
+the whole of it, and this branch added two routes to the served surface without touching that file
+or any other track's. The contract fragment follows the same rule — the operations live in
+`contracts/paths/fleet.yaml` and are tagged `Jobs`, because the fragment follows the *serving
+domain* and the tag follows the *resource a client is asking about*.
+
+#### What replaced SHIP-81's mirror, and why the count went up rather than down
+
+SHIP-81 demonstrated the four filters in `make verify` with a hand-written copy of the SQL
+predicate, marked as a mirror in its own section header, with the note that SHIP-82 would delete
+it. **It is deleted.** Every filter check now runs through the endpoint, so there is one
+description of the rule instead of two, and a filter that stopped working fails the run instead of
+passing against a copy of itself.
+
+The replacement asks **both endpoints on every check and requires them to agree** — the feed
+carries the job, or `GET /v1/jobs/open/{id}` answers 200, and never one without the other. That is
+the same claim `TestTheThreeReadersOfTheFilterAgree` makes in Go, made again over HTTP, and it is
+worth making twice: a provider shown a job in the feed and then refused it on the detail screen is
+the worst of both outcomes.
+
+`make verify` went from 288 checks to **292** at this ticket and to **297** once SHIP-83 added its
+section — a net gain of nine across the pair, after the deletion. `make verify-update` wrote both
+figures; neither was typed.
+
+#### Pagination, and the case a one-field cursor gets wrong
+
+The cursor is `internal/pagination`'s encoding — no second one was invented — over SHIP-81's
+`JobCursor`, which is a `created_at` **and** an `id`. The reason is the tie: a customer publishing
+several jobs in one sitting writes rows the database timestamps identically, and a keyset ordered
+on time alone either repeats those rows forever or drops them, depending on whether the comparison
+is `<` or `<=`.
+
+**`TestPagingTheFeedReachesEveryJobExactlyOnce` is written against exactly that.** Seven jobs, three
+of which share a `created_at` to the microsecond, paged at every size from one to eight — because a
+page size that happens not to land between the tied rows hides the defect completely. The check is
+a *multiset*: the number of entries seen is compared as well as the set of identifiers, so a job
+returned on two consecutive pages fails a test that a set comparison would pass.
+
+It was verified by mutation rather than by inspection. Replacing the row comparison
+`(j.created_at, j.id) < ($3, $4)` with `j.created_at < $3` makes the suite fail at four page sizes,
+reporting **five of seven jobs at a page size of one** — two silently gone. `make verify` pages the
+live feed one job at a time and asserts the same property against the running service.
+
+#### A provider eligible for nothing gets an empty page, not a refusal
+
+An unverified provider, one who has declared no service area, one with no vehicle in service, and a
+customer who followed a link meant for the other role all get `{"data":[],"has_more":false}`. None
+of the four is a failure of the request — they are the truthful answer to it — and the client sends
+the provider to onboarding from an empty list and the profile it already holds. It is the reading
+`Service.Profile` already takes for a read that discloses nothing, and refusing here would make the
+client special-case a screen it can render anyway.
+
+### SHIP-83 — the fourth proof, and the two disclosure decisions confirmed
+
+`GET /v1/jobs/open/{id}` is one job out of the feed. The endpoint is small; the test is the ticket.
+
+#### The debt §8 recorded, paid
+
+§8 has said since SHIP-67 that the pairing could not be honoured in one wave, that SHIP-67 landed
+with the three strongest proofs available at the time, and that **"SHIP-83 remains reserved to this
+owner and adds the fourth: its provider response, serialised, asserted to carry no budget. That is
+the test the pairing was actually for, and it is the one thing that is still owed."**
+
+`TestTheProviderResponseCarriesNoBudgetInAnyForm` is that test. It does four things a struct-field
+check cannot, and each was chosen against a specific way the weaker version would have passed while
+the invariant was broken:
+
+1. **It obtains the response the way a provider obtains it** — an HTTP request through the real
+   handler, mounted on the pattern `cmd/api` serves, answered as bytes. A field can be absent from
+   a struct and present on the wire through an embedded type, a custom `MarshalJSON`, or a map, and
+   a struct check sees none of the three.
+2. **It works on the raw bytes, so a key that is present and null still fails.** Decoding into a Go
+   type turns `"budget_cents": null` into a zero value indistinguishable from a field never sent —
+   and a present-but-null key *is* the "budget supplied" flag `Docs/01` §4.3 forbids, because a
+   provider learns which jobs carry a budget from which responses carry the key.
+3. **It asserts a closed set of keys rather than searching for the word.** This is the one that
+   matters most. A search catches `budget_cents` and misses `max_price`; the allow-list is every
+   key this API promises a provider, so a field arriving under *any* name fails. The `OpenJob`
+   schema is `additionalProperties: false` for the same reason.
+4. **It checks the value, not only the name.** The fixture's budget is a number appearing nowhere
+   else in the job, and the body is searched for every rendering an encoder could produce, with
+   UUIDs stripped first — a UUID is hexadecimal, so a run of digits can occur inside one by chance,
+   rarely enough to pass review and often enough to fail one morning.
+
+It covers **three** responses, not one: the feed, the single job, and a second page reached by
+following a cursor, which is a different code path through the same handler and would be reached
+only by a provider who scrolled. And it **refuses to run against a job with no budget** — the first
+thing it does is read `jobs.budget` back out of the row, because a privacy test whose fixture has
+nothing to leak passes forever and proves nothing.
+
+**Both halves were verified by mutation.** A field `max_price float64` carrying 4321.99 was added to
+`openJobResponse`: SHIP-81's source-parsing guard **passed** — it searches for "budget" — and the new
+test failed on all three responses, naming the key and its JSON path. Renaming that field
+`budget_cents` made the source guard fail as well. **That is the gap the closed key set closes**, and
+it is the reason this is not simply SHIP-67's test moved.
+
+#### The guard already reached the new shapes, and did not need extending
+
+Run 2's `TestNoProviderFacingShapeCarriesTheBudget` parses **every non-test file in
+`internal/fleet`**, so `openJobResponse`, `regionResponse` and `windowResponse` came under it the
+moment they were written — confirmed by injecting `BudgetCents` and watching it fail with
+`openJobResponse.BudgetCents carries the customer's budget`. Nothing was added to it. What the new
+test adds is the axis that guard cannot have: it reads *source*, so it can only ever refuse a name.
+
+`make verify` makes the same closed-key-set assertion from outside Go against the running service,
+so neither can be quietly deleted alone.
+
+#### The street line: confirmed, and widened to the coordinate
+
+SHIP-81 chose suburb, state and postcode for the feed and asked SHIP-83 to confirm or reopen it
+explicitly. **Confirmed.** No document takes a position on when a provider learns the exact door, so
+this stays with the reversible direction — the argument `Docs/01` §4.3 makes about the budget,
+applied to an address. A provider prices on the locality, the distance and the state; the doorstep
+is needed by whoever drives to it, which is after an award. Disclosing later is easy and
+withdrawing later is not.
+
+**The widening is the part that would have been easy to miss: the coordinate is withheld too.**
+`jobs` geocodes the whole address, so a pickup coordinate *is* the street line written as two
+numbers. A shape that withheld `line` and sent `coordinate` would have kept the letter of the
+decision and broken it completely. `TestTheProviderJobCarriesNeitherTheStreetLineNorTheCoordinate`
+asserts both against a job that has both, and also asserts the locality *is* there — so it is a
+decision about grain rather than a response that forgot the address.
+
+**What reopens it is named**: the awarded provider needs the exact address, and that is a different
+shape at a different moment (SHIP-93 onwards), not a field added here.
+
+#### One shape for the feed and the detail view, which is itself a privacy decision
+
+Both endpoints answer with the same type, and a test asserts the detail response is byte-identical
+to the feed entry. That is the rule the vehicle endpoints already follow — a client parses one type
+whatever it did to obtain the resource — and here it does something further: **two shapes would be
+two places a budget field could be added and two responses a test would have to know to check.**
+One shape is one of each. A "detail" view carrying a field or two more is exactly where somebody
+would later put "just a little more".
+
+#### The third reader of the predicate, and why it is a read rather than a check-then-read
+
+The obvious implementation asks `Service.EligibleFor` and then reads the job. It was rejected: the
+read needs its own `WHERE`, and the only honest one is the predicate itself — so the choice is
+between naming eligibility twice and naming it once — and two statements can disagree, because the
+customer can cancel the job between the check and the read, leaving the detail view serving a job
+nobody may bid on. `Service.EligibleJobFor` runs one statement with the same column list and the
+same clause.
+
+`EligibleFor` is untouched and is still what SHIP-84 asks before it writes a bid; a caller deciding
+whether to permit something wants a boolean, not a row. SHIP-81's `TestEligibleForAgreesWithTheFeed`
+is now `TestTheThreeReadersOfTheFilterAgree` and holds all three to each other across every case.
+
+#### A job a provider may not bid on is a job that does not exist
+
+404, with a body byte-identical to a job that is not there, and a message that says nothing about
+eligibility — a refusal that explained itself would disclose what the status code is withholding.
+Nine cases in Go and two in `make verify`, including the owning customer, who is refused their own
+job here: `GET /v1/jobs/{id}` is where they read it, and that response is the one shape in this API
+that carries the budget.
+
+Shared surfaces: two `$ref` lines in `contracts/openapi.yaml`, two lines in `routes_golden.txt`
+(regenerated, not typed), and §3's check count (written by `make verify-update`). No
+`internal/boundaries` edit, no `Deps` field, no migration, no new error code — `not_found` already
+says the right thing — and `internal/fleet` still imports no domain.
 
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 
@@ -3297,9 +3771,13 @@ Kept here rather than deleted, because the shape recurs: this was described only
 
 **~~The SHIP-67 / SHIP-83 pairing cannot be honoured in one wave.~~ Settled at SHIP-67: built now, SHIP-83 reserved to the same owner.** The fact about the dependency graph has not changed — SHIP-83 depends on SHIP-82 → SHIP-81 → (SHIP-79, SHIP-80) → SHIP-78, and wave 4 delivers only SHIP-78 and SHIP-80, leaving three hops. What has changed is that the choice the pairing forced has been made rather than deferred again.
 
-**The decision, and the reasoning it was made on.** Deferring both would have left the column unbuilt for a rule it already satisfies, and SHIP-65's *Done when* incomplete for a third consecutive wave, in exchange for a test against an endpoint that does not exist. So SHIP-67 landed with the strongest proof available today, which turned out to be three tests rather than one — the source-parsing test that refuses a budget field on any shape but the owner's response, a wire test over every response a provider or a stranger can obtain, and a test on the stored event payload. §3 has the detail. **SHIP-83 remains reserved to this owner and adds the fourth**: its provider response, serialised, asserted to carry no budget. That is the test the pairing was actually for, and it is the one thing that is still owed.
+**The decision, and the reasoning it was made on.** Deferring both would have left the column unbuilt for a rule it already satisfies, and SHIP-65's *Done when* incomplete for a third consecutive wave, in exchange for a test against an endpoint that does not exist. So SHIP-67 landed with the strongest proof available today, which turned out to be three tests rather than one — the source-parsing test that refuses a budget field on any shape but the owner's response, a wire test over every response a provider or a stranger can obtain, and a test on the stored event payload. §3 has the detail. ~~**SHIP-83 remains reserved to this owner and adds the fourth**: its provider response, serialised, asserted to carry no budget. That is the test the pairing was actually for, and it is the one thing that is still owed.~~
+
+**~~Still owed.~~ Paid at SHIP-83 — see §3.** `TestTheProviderResponseCarriesNoBudgetInAnyForm` is the fourth proof: the provider's response obtained over HTTP through the real handler, asserted on the raw bytes across all three ways a provider can obtain a job. **It turned out to need to be stronger than the entry asked for.** "Asserted to carry no budget" reads as a search for the field, and a search catches `budget_cents` and misses `max_price` — so the test holds the response to a **closed set of keys** instead, checks the value with identifiers stripped out, and refuses to run at all against a fixture whose budget is NULL. Verified by mutation in both directions: a field named `max_price` passes the source-parsing guard and fails this one; renamed `budget_cents`, it fails both.
 
 **The `make verify` tripwire has been moved, and this is the entry recording it.** The check asserting that no `budget` key was present is gone; what replaced it asserts the owner reads their own budget back and that no provider-facing or stranger-facing response mentions it in any form. **The tripwire is now the source-parsing test rather than a verify line** — whoever writes SHIP-82 or SHIP-83 will meet it as a failing test the moment a provider shape acquires the field, which is earlier and louder than a shell assertion would have been.
+
+**That prediction held exactly, and SHIP-83 found the one thing it does not cover.** The source-parsing guard did fire first, and `internal/fleet`'s copy reached SHIP-82's and SHIP-83's new response types with no change to it — they are non-test files in the package it parses. What it cannot do is refuse a budget under a name that is not "budget", because it reads source and can only match a spelling. SHIP-83's serialised-response test is the axis it lacks, and `make verify` now makes the same closed-key-set assertion from outside Go, so neither can be quietly deleted alone.
 
 ## 9. Open recommendations nobody has decided
 

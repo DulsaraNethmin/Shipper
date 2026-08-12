@@ -32,8 +32,45 @@ import (
 // A `PATCH` carrying `{"active": false}` would be a client naming a state — and there is no
 // `DELETE`, because a vehicle is named by the bid that won a job and by the delivery that followed
 // it, so the row survives the provider's interest in it (Docs/05 §3.1, Docs/10 §3.3).
+//
+// # Why the declaration is one document rather than a collection
+//
+// SHIP-79 adds `/fleet/profile`, and it is a `GET` and a `PATCH` with no `{id}` beneath them. The
+// provider's service area and specialties are sets they edit as sets — the client renders chips and
+// sends the set back — so there is no `/fleet/profile/states/{state}` to `DELETE`. Two operations
+// over one collection is where a client and a server stop agreeing about what is in it.
+//
+// # Why two of these routes are not under /fleet
+//
+// SHIP-82 and SHIP-83 add `GET /v1/jobs/open` and `GET /v1/jobs/open/{id}`, and they are declared
+// here rather than in routes_jobs.go. Routes are **declared, not registered**, so the file follows
+// the domain that answers the request rather than the first segment of the path: `fleet` owns the
+// eligibility filter, so `fleet` owns the endpoints that serve it. Declaring them in the jobs file
+// would have put a `fleet.Handler` in a file the jobs track edits every wave, which is the shared
+// surface this whole arrangement exists to avoid.
+//
+// The path is the client's view and it is right: the resource is a job. `/v1/jobs/open` is the
+// collection of jobs offered to the calling provider and `/v1/jobs/open/{id}` is one member of it.
+// net/http prefers the more specific pattern, so this coexists with `/v1/jobs/{id}` without either
+// file knowing about the other — and the two are deliberately different resources rather than one
+// endpoint returning two shapes: `/v1/jobs/{id}` is the customer's own job and carries the budget
+// that `Docs/01` §4.3 forbids a provider ever seeing.
 func init() {
 	register(
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/fleet/profile",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).Profile() },
+		},
+		Route{
+			Method:  http.MethodPatch,
+			Pattern: "/fleet/profile",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).Declare() },
+		},
 		Route{
 			Method:  http.MethodGet,
 			Pattern: "/fleet/vehicles",
@@ -75,6 +112,20 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Reactivate() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs/open",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).OpenJobs() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs/open/{id}",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).OpenJob() },
 		},
 	)
 }

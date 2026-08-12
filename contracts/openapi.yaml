@@ -100,6 +100,10 @@ tags:
 
       Vehicles are deactivated, never deleted: one is named by the bid that won a job and by the
       delivery that followed it.
+
+      It also holds what a provider declares about the work they take — the service area and
+      specialties an eligibility filter reads. A service area is a set of named regions, states and
+      postcodes, rather than a radius around a point.
   - name: Jobs
     description: |
       The job lifecycle — drafting, publishing, tracking and closing a delivery job. Every
@@ -170,6 +174,8 @@ paths:
     $ref: './paths/identity.yaml#/VerifyEmail'
   /v1/auth/verify-phone:
     $ref: './paths/identity.yaml#/VerifyPhone'
+  /v1/fleet/profile:
+    $ref: './paths/fleet.yaml#/Profile'
   /v1/fleet/vehicles:
     $ref: './paths/fleet.yaml#/Vehicles'
   /v1/fleet/vehicles/{id}:
@@ -180,6 +186,10 @@ paths:
     $ref: './paths/fleet.yaml#/ReactivateVehicle'
   /v1/jobs:
     $ref: './paths/jobs.yaml#/Jobs'
+  /v1/jobs/open:
+    $ref: './paths/fleet.yaml#/OpenJobs'
+  /v1/jobs/open/{id}:
+    $ref: './paths/fleet.yaml#/OpenJobByID'
   /v1/jobs/{id}:
     $ref: './paths/jobs.yaml#/JobByID'
   /v1/jobs/{id}/cancel:

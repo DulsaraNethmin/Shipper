@@ -332,6 +332,217 @@ func (postgresStore) clearDeactivatedAt(ctx context.Context, r db.Runner, id uui
 	return v, nil
 }
 
+// --- SHIP-79: the provider's declaration ------------------------------------------------------
+
+// profileLockClass is the advisory-lock class this domain takes, and it is the ticket's number.
+//
+// cmd/worker/outbox.go established the convention at 134 so that a second use of advisory locks
+// could not silently share a key space with the first. This is that second use, and 79 keeps them
+// apart by construction rather than by anyone remembering.
+const profileLockClass = 79
+
+// lockProfile serialises the whole of one provider's declaration for the rest of the transaction.
+//
+// **A row lock cannot express this, which is why it is an advisory one.** What has to be serialised
+// is a *set* — including the case where the set is currently empty, so there are no rows to lock and
+// FOR UPDATE has nothing to hold. Two providers declaring at once take different keys and neither
+// waits; the same provider from two devices takes one, and the second sees what the first committed.
+//
+// Without it, READ COMMITTED loses the update rather than reporting a conflict: each transaction's
+// DELETE cannot see the other's uncommitted INSERT, so both survive and the declaration becomes the
+// union of two sets that neither client asked for. That is the defect this exists to prevent, and
+// it is invisible afterwards.
+//
+// Blocking rather than pg_try_advisory_xact_lock: the outbox skips an aggregate another worker
+// holds because there is more work to do meanwhile, and here there is nothing else to do — the
+// caller asked for their declaration to be replaced and waiting a few milliseconds is the answer.
+func (postgresStore) lockProfile(ctx context.Context, r db.Runner, providerID uuid.UUID) error {
+	const q = `SELECT pg_advisory_xact_lock($1, hashtext($2::text))`
+
+	if _, err := r.Exec(ctx, q, profileLockClass, providerID); err != nil {
+		return fmt.Errorf("fleet: locking the declaration of %s: %w", providerID, err)
+	}
+	return nil
+}
+
+// replaceAreas makes one scope of a provider's service area exactly the supplied set.
+//
+// Two statements rather than a DELETE of everything followed by an INSERT of everything, and the
+// difference is visible in the data: an entry the provider has held since January survives a
+// request that merely resends it, keeping its created_at. Re-declaring an unchanged set writes
+// nothing at all.
+//
+// The other scope is untouched. Adding a postcode does not disturb a state, which is what lets the
+// two lists in [ProfileFields] move independently.
+//
+// ON CONFLICT DO NOTHING rather than an existence check: the caller has already deduplicated within
+// the request, and the unique index is what settles the case the caller cannot see — the same row
+// arriving from two directions. The advisory lock makes that unreachable today; the clause is what
+// keeps this correct if it ever is not.
+func (postgresStore) replaceAreas(ctx context.Context, r db.Runner, providerID uuid.UUID,
+	scope AreaScope, areas []string) error {
+
+	// An empty set deletes every row of the scope: `area = ANY('{}')` is false for every row, and
+	// NOT false is true. That is the "clear it" half of ProfileFields' three states, and it must
+	// not be special-cased into "leave it alone" — which is the whole distinction.
+	const removed = `
+		DELETE FROM provider_service_areas
+		WHERE provider_id = $1 AND scope = $2 AND NOT (area = ANY($3::text[]))`
+
+	if _, err := r.Exec(ctx, removed, providerID, string(scope), areas); err != nil {
+		return fmt.Errorf("fleet: withdrawing %s areas from %s: %w", scope, providerID, err)
+	}
+
+	if len(areas) == 0 {
+		return nil
+	}
+
+	ids, err := identifiers(len(areas))
+	if err != nil {
+		return err
+	}
+
+	const added = `
+		INSERT INTO provider_service_areas (id, provider_id, scope, area)
+		SELECT entry.id, $2, $3, entry.area
+		FROM unnest($1::uuid[], $4::text[]) AS entry(id, area)
+		ON CONFLICT (provider_id, scope, area) DO NOTHING`
+
+	if _, err := r.Exec(ctx, added, ids, providerID, string(scope), areas); err != nil {
+		return fmt.Errorf("fleet: declaring %s areas for %s: %w", scope, providerID, err)
+	}
+	return nil
+}
+
+// replaceSpecialties makes a provider's specialties exactly the supplied set.
+//
+// The counterpart of [postgresStore.replaceAreas] and the same shape, written out rather than
+// generalised over the two tables: they differ in their columns, their constraint and their
+// conflict target, and a version parameterised on all three would be a query builder — which
+// Docs/10 §3.1 rejects for the reason the fixed statements in this file already give.
+func (postgresStore) replaceSpecialties(ctx context.Context, r db.Runner, providerID uuid.UUID,
+	specialties []Specialty) error {
+
+	wanted := make([]string, 0, len(specialties))
+	for _, specialty := range specialties {
+		wanted = append(wanted, string(specialty))
+	}
+
+	const removed = `
+		DELETE FROM provider_specialties
+		WHERE provider_id = $1 AND NOT (specialty = ANY($2::text[]))`
+
+	if _, err := r.Exec(ctx, removed, providerID, wanted); err != nil {
+		return fmt.Errorf("fleet: withdrawing specialties from %s: %w", providerID, err)
+	}
+
+	if len(wanted) == 0 {
+		return nil
+	}
+
+	ids, err := identifiers(len(wanted))
+	if err != nil {
+		return err
+	}
+
+	const added = `
+		INSERT INTO provider_specialties (id, provider_id, specialty)
+		SELECT entry.id, $2, entry.specialty
+		FROM unnest($1::uuid[], $3::text[]) AS entry(id, specialty)
+		ON CONFLICT (provider_id, specialty) DO NOTHING`
+
+	if _, err := r.Exec(ctx, added, ids, providerID, wanted); err != nil {
+		return fmt.Errorf("fleet: declaring specialties for %s: %w", providerID, err)
+	}
+	return nil
+}
+
+// profile reads one provider's whole declaration.
+//
+// Two statements rather than a join or a UNION. They are two sets with nothing in common but the
+// provider, and joining them would multiply eight states by twelve specialties into ninety-six rows
+// to be deduplicated back in Go.
+//
+// A provider who has declared nothing reads as an empty profile rather than as a missing one, which
+// is why neither query treats no rows as an error.
+func (postgresStore) profile(ctx context.Context, r db.Runner, providerID uuid.UUID) (Profile, error) {
+	profile := Profile{ProviderID: providerID}
+
+	// States before postcodes, then ascending within each. Written as an ordering on the
+	// predicate rather than `ORDER BY scope DESC`, which sorts states first only by the accident
+	// that 's' follows 'p'.
+	const areas = `
+		SELECT scope, area
+		FROM provider_service_areas
+		WHERE provider_id = $1
+		ORDER BY (scope = 'state') DESC, area`
+
+	rows, err := r.Query(ctx, areas, providerID)
+	if err != nil {
+		return Profile{}, fmt.Errorf("fleet: read the service area of %s: %w", providerID, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var area ServiceArea
+		if err := rows.Scan(&area.Scope, &area.Area); err != nil {
+			return Profile{}, fmt.Errorf("fleet: scanning the service area of %s: %w", providerID, err)
+		}
+		profile.Areas = append(profile.Areas, area)
+	}
+	if err := rows.Err(); err != nil {
+		return Profile{}, fmt.Errorf("fleet: reading the service area of %s: %w", providerID, err)
+	}
+
+	// Unordered in SQL and sorted in Go, because the order that matters is Specialties' own —
+	// general freight first, dangerous goods last — and neither the alphabet nor the insertion
+	// order is that. A value the constraint accepts and Specialties does not know would sort to
+	// the front; the pairing test in migrations is what makes that unreachable.
+	const kinds = `SELECT specialty FROM provider_specialties WHERE provider_id = $1`
+
+	specialtyRows, err := r.Query(ctx, kinds, providerID)
+	if err != nil {
+		return Profile{}, fmt.Errorf("fleet: read the specialties of %s: %w", providerID, err)
+	}
+	defer specialtyRows.Close()
+
+	held := map[Specialty]bool{}
+	for specialtyRows.Next() {
+		var specialty Specialty
+		if err := specialtyRows.Scan(&specialty); err != nil {
+			return Profile{}, fmt.Errorf("fleet: scanning the specialties of %s: %w", providerID, err)
+		}
+		held[specialty] = true
+	}
+	if err := specialtyRows.Err(); err != nil {
+		return Profile{}, fmt.Errorf("fleet: reading the specialties of %s: %w", providerID, err)
+	}
+
+	for _, specialty := range Specialties {
+		if held[specialty] {
+			profile.Specialties = append(profile.Specialties, specialty)
+		}
+	}
+	return profile, nil
+}
+
+// identifiers generates n UUIDv7s, in the application rather than in PostgreSQL.
+//
+// Docs/10 §3.3's rule, and the reason it is a rule holds here too: the ordering a v7 carries is the
+// order the provider named their regions in, which a gen_random_uuid() default would replace with
+// noise.
+func identifiers(n int) ([]uuid.UUID, error) {
+	ids := make([]uuid.UUID, 0, n)
+	for range n {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return nil, fmt.Errorf("fleet: generating an identifier: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // duplicate turns the index's refusal into the domain's own error.
 //
 // Named by constraint rather than by SQLSTATE alone, so that a unique violation from some future

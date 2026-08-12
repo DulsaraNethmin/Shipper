@@ -12,6 +12,15 @@
 // platform. A vehicle belonging to another provider answers 404, byte-identically to one that does
 // not exist.
 //
+// # Two routes here are not under /fleet, and that is deliberate
+//
+// `GET /v1/jobs/open` and `GET /v1/jobs/open/{id}` (SHIP-82, SHIP-83) serve jobs, and they are
+// served from this domain because this domain decides which jobs a provider may bid on. Routes are
+// declared rather than registered, so the file a route is declared in follows the domain that
+// answers it rather than the first segment of its path. The rule that keeps the two apart is the
+// one the budget invariant needs: `/v1/jobs/{id}` is the customer's job and carries their budget;
+// `/v1/jobs/open/{id}` is a provider's view of one and has no field it could go in.
+//
 // **This is not the customer's view of a vehicle.** Docs/01 §4.3 lets a customer compare "provider
 // profile, vehicle, and declared capability" when they read the bids on their job, and that shape
 // arrives with SHIP-96 as a schema of its own rather than as this one reached by another route —
@@ -26,6 +35,14 @@
 // unknown fields — so a client that sends `"active": false` is told the field does not exist rather
 // than having it silently ignored, which is the failure worth preventing: a provider who believes
 // they took a truck off the road and did not will keep receiving work for it.
+//
+// # Two resources, and one of them is a set
+//
+// `/v1/fleet/vehicles` is a collection of things with identifiers. `/v1/fleet/profile` (SHIP-79) is
+// one document per provider holding three sets — states, postcodes, specialties — and it is edited
+// by sending a set back rather than by adding and removing entries one at a time. There is
+// therefore no `/v1/fleet/profile/states/{state}`: two operations over one collection is where a
+// client and a server stop agreeing about what is in it.
 //
 // The blank line below keeps this a file note rather than a second package comment.
 
@@ -424,6 +441,506 @@ func (h *Handler) List() http.Handler {
 	})
 }
 
+// --- SHIP-79: the provider's declaration ------------------------------------------------------
+
+// profileRequest is the body of PATCH /v1/fleet/profile.
+//
+// Every list is a pointer, so absent, null and an explicit empty list are three distinct things —
+// the same distinction [vehicleRequest] draws, applied to a set:
+//
+//	omitted or null   leave that list exactly as it is
+//	an empty list     clear it
+//
+// A list that is supplied replaces its predecessor whole. There is no add-one or remove-one
+// operation, deliberately: the client renders the declaration as a set of chips and sends the set
+// back, and two operations over one collection is where a client and a server stop agreeing about
+// what is in it.
+//
+// `service_area` is nested so that the two grains read as one idea rather than as two unrelated
+// top-level lists — but the grains still move independently inside it, because a provider adding a
+// postcode should not have to resend every state.
+type profileRequest struct {
+	ServiceArea *serviceAreaRequest `json:"service_area"`
+	Specialties *[]string           `json:"specialties"`
+}
+
+// serviceAreaRequest is the two grains of a service area.
+//
+// **There is no radius and there is no coordinate**, and that is the decision SHIP-79 took rather
+// than left to SHIP-81. model.go carries the reasoning; the short version is that a job's
+// coordinate is best-effort and its state and postcode are not, so a radius would filter a feed on
+// a field the platform may not have.
+type serviceAreaRequest struct {
+	States    *[]string `json:"states"`
+	Postcodes *[]string `json:"postcodes"`
+}
+
+// fields turns the request into the domain's command.
+//
+// Values are carried across rather than checked here, for the reason [vehicleRequest.fields] gives:
+// whether a state or a specialty is *acceptable* is the domain's judgement, made once in
+// [ProfileFields.problems], so that the rule is the same for every caller rather than for whoever
+// arrived over HTTP.
+func (b profileRequest) fields() ProfileFields {
+	f := ProfileFields{}
+
+	if b.ServiceArea != nil {
+		f.States = b.ServiceArea.States
+		f.Postcodes = b.ServiceArea.Postcodes
+	}
+	if b.Specialties != nil {
+		specialties := make([]Specialty, 0, len(*b.Specialties))
+		for _, raw := range *b.Specialties {
+			specialties = append(specialties, Specialty(raw))
+		}
+		f.Specialties = &specialties
+	}
+	return f
+}
+
+// profileResponse is a provider's declaration as they see it.
+//
+// **Every list is always present and never null**, which is the opposite of the rule
+// [vehicleResponse] follows and is right for the opposite reason. An omitted capacity means "the
+// provider has not said"; an omitted list would mean the same thing as an empty one, and here that
+// distinction is exactly what the client is editing. A provider who has declared nothing gets three
+// empty arrays, which a client can render and iterate without a nil check.
+type profileResponse struct {
+	ServiceArea serviceAreaResponse `json:"service_area"`
+	Specialties []string            `json:"specialties"`
+}
+
+type serviceAreaResponse struct {
+	// States is every state or territory the provider serves in full, ascending.
+	States []string `json:"states"`
+
+	// Postcodes is every single postcode they serve, ascending, and it is not narrowed by States:
+	// the two are separate claims, and a postcode named inside a state already declared is
+	// harmless duplication rather than a contradiction.
+	Postcodes []string `json:"postcodes"`
+}
+
+// profileFrom splits the domain's flat set of areas into the two lists a client renders.
+//
+// The domain holds one list because that is what the table holds and what a membership test walks;
+// the wire holds two because the screen has two controls. Splitting here rather than in the store
+// keeps the shape of the API a decision of this file's.
+func profileFrom(p Profile) profileResponse {
+	out := profileResponse{
+		ServiceArea: serviceAreaResponse{States: []string{}, Postcodes: []string{}},
+		Specialties: []string{},
+	}
+
+	for _, area := range p.Areas {
+		switch area.Scope {
+		case ScopeState:
+			out.ServiceArea.States = append(out.ServiceArea.States, area.Area)
+		case ScopePostcode:
+			out.ServiceArea.Postcodes = append(out.ServiceArea.Postcodes, area.Area)
+		}
+	}
+	for _, specialty := range p.Specialties {
+		out.Specialties = append(out.Specialties, string(specialty))
+	}
+	return out
+}
+
+// Profile handles GET /v1/fleet/profile (SHIP-79).
+//
+// The calling provider's own declaration. **There is no parameter for whose**, and no route to
+// another provider's: what a competitor covers and specialises in is commercial information, and the
+// customer-facing view of a provider arrives with SHIP-96 as a shape of its own.
+//
+// It never answers 404. An undeclared profile is an empty one, so a client opening the screen for
+// the first time gets three empty arrays rather than an error it has to read as "not yet".
+func (h *Handler) Profile() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		profile, err := h.svc.Profile(r.Context(), pool, providerID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, profileFrom(profile))
+		return nil
+	})
+}
+
+// Declare handles PATCH /v1/fleet/profile (SHIP-79).
+//
+// PATCH rather than PUT, and the reason is the one [Handler.Update] gives sharpened by a second: a
+// provider changing their specialties should not have to resend four hundred postcodes, and a
+// client that has not been updated for a field added later would clear it by sending everything it
+// knows about. What each *named* list does is still a replacement — the three-state rule is in
+// [profileRequest].
+//
+// Only a provider account may declare one, refused with `fleet_provider_only` and read from
+// users.role rather than from the role claim in the token. The matching read is deliberately not
+// refused: see [Service.Profile].
+//
+// A transaction, because replacing a set is a delete and an insert that must be one decision, and
+// because the advisory lock that stops two devices interleaving only lasts as long as one.
+func (h *Handler) Declare() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		var req profileRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var declared Profile
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			declared, err = h.svc.Declare(ctx, runner, providerID, req.fields())
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, profileFrom(declared))
+		return nil
+	})
+}
+
+// --- SHIP-82 and SHIP-83: the marketplace as a provider sees it -------------------------------
+
+// openJobResponse is a job a provider may bid on.
+//
+// # There is no budget field, in any form, and this is the shape that had to prove it
+//
+// Docs/01 §4.3 keeps the customer's maximum private from providers — "not as an amount, a band, or
+// a 'budget supplied' flag" — and CLAUDE.md calls a breach a defect rather than a style choice.
+// Docs/11 §8 records SHIP-83 as owing the one proof SHIP-67 could not write: the provider's
+// response, serialised, asserted to carry no budget.
+// [TestTheProviderResponseCarriesNoBudgetInAnyForm] is that test, and it does not look for the word
+// — it holds this shape to a **closed list of keys**, because a budget renamed `max_price` would
+// pass every check that searched for "budget".
+//
+// # One shape for the feed and for the detail view, and that is the privacy decision
+//
+// [Handler.OpenJobs] and [Handler.OpenJob] answer with this same type, the arrangement
+// [vehicleResponse] already establishes for a vehicle: a client parses one type whatever it did to
+// obtain the job. Here it does something further. Two shapes would be two places a budget field
+// could be added and two responses a test would have to know to check; one shape is one of each. A
+// "detail" view carrying a field or two more would also make the feed a subset every client has to
+// special-case, and there is nothing about a job a provider deciding whether to bid needs that the
+// feed cannot carry — Docs/01 §4.3's own answer to a provider who wants the budget is "better job
+// detail — dimensions, access constraints, handling notes", all of which are here in full.
+//
+// # The street line is not here, and SHIP-83 confirms rather than inherits that
+//
+// SHIP-81 took the decision for the feed because no document takes a position, and SHIP-83's job
+// was to confirm or reopen it for the view of a single job. **Confirmed, and for the same reason
+// widened by one:** a provider prices a job on the locality, the distance and the state, and the
+// doorstep is needed by whoever drives to it, which is after an award. Disclosing later is easy and
+// withdrawing later is not.
+//
+// The widening is that **the coordinate is not here either**, and it is the part that would have
+// been easy to give away: `jobs` geocodes the whole address, so a pickup coordinate *is* the street
+// line written as two numbers. A shape that withheld `line` and sent `coordinate` would have kept
+// the letter of the decision and broken it entirely.
+//
+// **What reopens it is named**: the awarded provider needs the exact address, and that is a
+// different shape at a different moment (SHIP-93 onwards), not a field added here.
+//
+// Nor is there a customer. Docs/01 §4.3 lets a *customer* compare provider profiles once bids
+// arrive; nothing gives the reverse before an award.
+type openJobResponse struct {
+	ID string `json:"id"`
+
+	// Status is `open` or `negotiating` and can be nothing else. A job already being negotiated is
+	// one a provider is bidding against company, which is worth their knowing before they price it.
+	Status string `json:"status"`
+
+	// Pickup is present for every job this endpoint can return: the eligibility filter matches a
+	// declared region against the pickup state or postcode, so a job with neither cannot be here.
+	// Dropoff can be absent, because 000403 lets a customer publish before they have both ends.
+	Pickup  *regionResponse `json:"pickup,omitempty"`
+	Dropoff *regionResponse `json:"dropoff,omitempty"`
+
+	GoodsDescription string  `json:"goods_description,omitempty"`
+	LengthCm         int     `json:"length_cm,omitempty"`
+	WidthCm          int     `json:"width_cm,omitempty"`
+	HeightCm         int     `json:"height_cm,omitempty"`
+	WeightKg         float64 `json:"weight_kg,omitempty"`
+
+	VehicleRequirement string `json:"vehicle_requirement,omitempty"`
+	HandlingNotes      string `json:"handling_notes,omitempty"`
+
+	PickupWindow  *windowResponse `json:"pickup_window,omitempty"`
+	DropoffWindow *windowResponse `json:"dropoff_window,omitempty"`
+
+	// ExpiresAt is when the job stops being offered (SHIP-68), so a provider deciding whether to
+	// price it today knows it will still be there tomorrow.
+	ExpiresAt string `json:"expires_at,omitempty"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+// regionResponse is one end of a job, at the grain a provider is given it.
+//
+// Three parts and no fourth. See [openJobResponse] for why the street line and the coordinate are
+// both absent, and [Region] for the decision SHIP-81 took first.
+type regionResponse struct {
+	Suburb   string `json:"suburb,omitempty"`
+	State    string `json:"state,omitempty"`
+	Postcode string `json:"postcode,omitempty"`
+}
+
+// windowResponse is a period a job's pickup or delivery has to happen in, with either end omitted
+// when the customer only cared about the other one.
+type windowResponse struct {
+	Start string `json:"start,omitempty"`
+	End   string `json:"end,omitempty"`
+}
+
+func openJobFrom(j EligibleJob) openJobResponse {
+	return openJobResponse{
+		ID:     j.ID.String(),
+		Status: wireStatus(j.Status),
+
+		Pickup:  regionFrom(j.Pickup),
+		Dropoff: regionFrom(j.Dropoff),
+
+		GoodsDescription: j.GoodsDescription,
+		LengthCm:         j.LengthCm,
+		WidthCm:          j.WidthCm,
+		HeightCm:         j.HeightCm,
+		WeightKg:         j.WeightKg,
+
+		VehicleRequirement: j.VehicleRequirement,
+		HandlingNotes:      j.HandlingNotes,
+
+		PickupWindow:  windowFrom(j.PickupWindow),
+		DropoffWindow: windowFrom(j.DropoffWindow),
+
+		ExpiresAt: timestamp(j.ExpiresAt),
+		CreatedAt: timestamp(j.CreatedAt),
+	}
+}
+
+// regionFrom omits an end of the job the customer has not filled in, rather than sending `{}`.
+func regionFrom(r Region) *regionResponse {
+	if r == (Region{}) {
+		return nil
+	}
+	return &regionResponse{Suburb: r.Suburb, State: r.State, Postcode: r.Postcode}
+}
+
+// windowFrom does the same for a window nobody stated.
+func windowFrom(w Window) *windowResponse {
+	if w.Start.IsZero() && w.End.IsZero() {
+		return nil
+	}
+	return &windowResponse{Start: timestamp(w.Start), End: timestamp(w.End)}
+}
+
+// wireStatus turns a stored job status into the form Docs/10 §4.7 puts on the wire — lower snake
+// case, so `Driver assigned` becomes `driver_assigned`.
+//
+// **A second copy of a rule `jobs` also holds**, for the reason [biddableStatuses] is a second copy
+// of two strings: domains do not import each other. It is the general transformation rather than a
+// two-entry lookup, so that it stays correct if this endpoint ever carries a third status, and
+// TestTheBiddableStatusesReachTheWireInDocs02sNames holds its output for the two statuses that can
+// reach here to the names Docs/02 §1 and the published contract both use.
+func wireStatus(stored string) string {
+	return strings.ToLower(strings.ReplaceAll(stored, " ", "_"))
+}
+
+// OpenJobs handles GET /v1/jobs/open (SHIP-82).
+//
+// The marketplace as this provider may bid on it: every open job the platform's eligibility filter
+// offers them, newest first, keyset-paged (Docs/10 §4.5).
+//
+// **There is no parameter that widens it and none that narrows it.** Not a state, not a vehicle,
+// not a goods type. Eligibility is the platform's decision (Docs/07 §3 — the app may hide, the
+// platform decides), and a filter parameter here would be a second place for that answer to be
+// argued with; a provider narrowing their own feed further is SHIP-99's client-side business.
+//
+// **A caller who is eligible for nothing gets an empty page, not a refusal**, and that includes an
+// unverified provider, one who has declared no service area, one with no vehicle in service, and a
+// customer who followed a link meant for the other role. None of the four is a failure of the
+// request — they are the truthful answer to it — and the read discloses nothing, so refusing it
+// would make the client special-case a screen it can render from an empty list and the profile it
+// already holds. That is the reading [Service.Profile] takes for the same reason.
+//
+// The route lives in cmd/api/routes_fleet.go rather than routes_jobs.go, because routes are
+// declared rather than registered and the declaring file is the one whose domain decides the
+// answer. `fleet` owns eligibility; `jobs` owns the customer's view of a job.
+func (h *Handler) OpenJobs() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		query, err := eligibilityQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		page, err := h.svc.EligibleJobs(r.Context(), pool, providerID, query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		jobs := make([]openJobResponse, 0, len(page.Jobs))
+		for _, job := range page.Jobs {
+			jobs = append(jobs, openJobFrom(job))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(jobs, encodeJobCursor(page.Next)))
+		return nil
+	})
+}
+
+// OpenJob handles GET /v1/jobs/open/{id} (SHIP-83).
+//
+// One job out of the feed, in the same shape the feed gave it. A member of the collection above
+// rather than a second view of `GET /v1/jobs/{id}`: that route is the *customer's* job, it carries
+// their budget, and one shape with a redaction step somebody has to remember is the arrangement a
+// privacy rule is hardest to keep with.
+//
+// **A job this provider may not bid on answers 404, byte-identically to a job that does not
+// exist.** The reasoning is the one a stranger's vehicle already gets, sharpened: which jobs exist
+// on the platform, and which of them a competitor is eligible for, is information nobody published.
+// The authorisation is the same predicate the feed runs — [Service.EligibleJobFor] — so a job this
+// endpoint serves is a job the feed would have carried, and a job it refuses is one SHIP-84 will
+// refuse a bid on.
+func (h *Handler) OpenJob() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		job, err := h.svc.EligibleJobFor(r.Context(), pool, providerID, jobID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, openJobFrom(job))
+		return nil
+	})
+}
+
+// eligibilityQueryFrom reads `?limit=` and `?cursor=`, which is every parameter this feed has.
+//
+// An unknown query parameter is passed over rather than refused, which is the opposite of what
+// httpx.DecodeJSON does to an unknown *body* field. Docs/07 §6's strictness is about bodies: a URL
+// picks up parameters from link trackers and proxies that no client typed, and refusing those would
+// break a request nobody composed. What matters is the other direction — neither parameter this
+// endpoint does read can widen the filter, and there are only two of them.
+func eligibilityQueryFrom(r *http.Request) (EligibilityQuery, error) {
+	values := r.URL.Query()
+
+	var query EligibilityQuery
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return EligibilityQuery{}, err
+	}
+	query.Limit = limit
+
+	if query.After, err = decodeJobCursor(values.Get("cursor")); err != nil {
+		return EligibilityQuery{}, err
+	}
+	return query, nil
+}
+
+// jobCursorFields is how many parts a job cursor has: the created_at it is positioned at, and the
+// id that breaks ties on it. Two, for the reason [JobCursor] gives — a customer publishing several
+// jobs in one sitting writes rows in the same millisecond, and a cursor that could not break that
+// tie would repeat or drop a job at exactly the page boundary.
+const jobCursorFields = 2
+
+// encodeJobCursor renders a position for a client to hand back, in the encoding
+// `internal/pagination` owns. The zero cursor is the empty string, which is also what "no cursor"
+// looks like on the way in.
+func encodeJobCursor(c JobCursor) string {
+	if c.IsZero() {
+		return ""
+	}
+	return pagination.Cursor{
+		c.CreatedAt.UTC().Format(time.RFC3339Nano),
+		c.ID.String(),
+	}.Encode()
+}
+
+// decodeJobCursor reads one back. See [decodeVehicleCursor] for why the shape is checked by
+// `pagination` and the meaning here, and why the timestamp is nanosecond rather than the
+// millisecond precision responses render.
+func decodeJobCursor(raw string) (JobCursor, error) {
+	fields, err := pagination.Decode(raw, jobCursorFields)
+	if err != nil || fields == nil {
+		return JobCursor{}, err
+	}
+
+	at, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		return JobCursor{}, invalidJobCursor(err)
+	}
+	id, err := uuid.Parse(fields[1])
+	if err != nil {
+		return JobCursor{}, invalidJobCursor(err)
+	}
+	return JobCursor{CreatedAt: at, ID: id}, nil
+}
+
+func invalidJobCursor(cause error) error {
+	return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+		"The cursor is not one this endpoint issued. Ask for the first page without one.").
+		WithCause(cause)
+}
+
+// jobIDFrom reads and parses the {id} path parameter of the provider's job detail.
+//
+// Separate from [vehicleIDFrom] only so that the message names the right thing: a client told "the
+// vehicle id in the path is not valid" while fetching a job has been sent looking in the wrong
+// place.
+func jobIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The job id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
+}
+
 // vehicleQueryFrom reads `?active=`, `?limit=` and `?cursor=`.
 //
 // Every failure it returns is already in the error contract, and they are bad_request rather than
@@ -585,6 +1102,14 @@ func apiError(err error) error {
 	case errors.Is(err, ErrVehicleNotFound), errors.Is(err, ErrNotVehicleOwner):
 		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
 			"No such vehicle.").WithCause(err)
+
+	case errors.Is(err, ErrJobNotOffered):
+		// 404 and not 403, and the message says nothing about eligibility. A provider refused
+		// with "you are not eligible for this job" has been told the job exists, which is what
+		// the indistinguishable answer is for. The client already has the feed to show what
+		// this provider may bid on.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such job.").WithCause(err)
 
 	case errors.Is(err, ErrNotProvider):
 		return httpx.NewError(http.StatusForbidden, CodeProviderOnly,

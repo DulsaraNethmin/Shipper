@@ -51,6 +51,19 @@ const (
 	// marketplace will accept is describing a slipped decimal point rather than a truck.
 	maxCapacityWeightKg    = 100_000
 	maxCapacityDimensionCm = 3000
+
+	// A postcode is four digits. Not a length bound but the whole format, because unlike a
+	// registration plate this one is fixed: Australia Post allocates four digits and has since
+	// 1967.
+	postcodeDigits = 4
+
+	// A service area of more than a thousand postcodes is describing a state.
+	//
+	// Australia has roughly 2,600 allocated postcodes and greater Sydney about 600, so this is
+	// generous for any real declaration — it is a bound against a client with a runaway list
+	// rather than a judgement about how much of the country a provider may cover. The provider who
+	// genuinely serves everywhere says so in eight state entries instead.
+	maxPostcodes = 1000
 )
 
 // Service holds this domain's rules.
@@ -269,6 +282,258 @@ func (s *Service) Vehicles(ctx context.Context, r db.Runner, providerID uuid.UUI
 		page.HasMore = true
 	}
 	return page, nil
+}
+
+// Profile is what the provider has declared about the work they take (SHIP-79).
+//
+// **An undeclared profile is an empty one rather than a missing one**, so this never reports "no
+// such thing": there is no parent row in the schema, and "I have not nominated a service area yet"
+// is a truthful answer with the same shape as any other.
+//
+// No provider-account check, deliberately, and the same reading [Service.Vehicles] takes. A
+// customer's declaration is empty because they have never made one, and answering 403 to a read
+// that discloses nothing would make the client special-case a screen it never shows.
+//
+// No transaction: two SELECTs against one provider's rows, neither of which the other can
+// invalidate in a way that matters — a declaration is replaced under an advisory lock, so the worst
+// a concurrent write can do is put this read on one side of it or the other.
+func (s *Service) Profile(ctx context.Context, r db.Runner, providerID uuid.UUID) (Profile, error) {
+	if providerID == uuid.Nil {
+		return Profile{}, fmt.Errorf("fleet: a profile names no provider: %w", ErrNotProvider)
+	}
+	return s.store.profile(ctx, r, providerID)
+}
+
+// Declare replaces the parts of the provider's declaration the caller named (SHIP-79).
+//
+// **The owner is whoever the token says is calling**, as everywhere else in this domain: there is
+// no field for naming a provider, because that would be an authorisation decision made from client
+// input (Docs/07 §3).
+//
+// Each of the three lists moves independently. One that was not named is left exactly as it is; one
+// that was is replaced whole, including by the empty list, which is how a provider withdraws from a
+// region. See [ProfileFields] for why replacement rather than add-one and remove-one.
+//
+// **What is replaced is the set, not the rows.** The store removes only what is no longer in the
+// declaration and inserts only what is new, so an entry the provider has held since January keeps
+// its created_at through a request that merely resends it.
+//
+// r must be a transaction, and for a sharper reason than [Service.Update]'s. Replacing a set is a
+// delete and an insert that must be one decision: two requests arriving together in READ COMMITTED
+// would each fail to see the other's uncommitted rows, and the declaration that resulted would be
+// the union of two sets rather than either of them. [postgresStore.lockProfile] is what serialises
+// them, and an advisory lock only lasts as long as the transaction that took it.
+func (s *Service) Declare(ctx context.Context, r db.Runner, providerID uuid.UUID, f ProfileFields) (Profile, error) {
+	if _, inTx := r.(pgx.Tx); !inTx {
+		return Profile{}, fmt.Errorf("fleet: declaring for %s: %w", providerID, ErrNotInTransaction)
+	}
+	if providerID == uuid.Nil {
+		return Profile{}, fmt.Errorf("fleet: a declaration names no provider: %w", ErrNotProvider)
+	}
+	if f.IsEmpty() {
+		return Profile{}, fmt.Errorf("fleet: declaring for %s: %w", providerID, ErrNothingToUpdate)
+	}
+
+	fields := f.normalise()
+	problems := fields.problems()
+	if err := problems.Err(); err != nil {
+		return Profile{}, err
+	}
+
+	provider, err := s.store.isProvider(ctx, r, providerID)
+	if err != nil {
+		return Profile{}, err
+	}
+	if !provider {
+		return Profile{}, fmt.Errorf("fleet: %s: %w", providerID, ErrNotProvider)
+	}
+
+	if err := s.store.lockProfile(ctx, r, providerID); err != nil {
+		return Profile{}, err
+	}
+
+	if fields.States != nil {
+		if err := s.store.replaceAreas(ctx, r, providerID, ScopeState, *fields.States); err != nil {
+			return Profile{}, err
+		}
+	}
+	if fields.Postcodes != nil {
+		if err := s.store.replaceAreas(ctx, r, providerID, ScopePostcode, *fields.Postcodes); err != nil {
+			return Profile{}, err
+		}
+	}
+	if fields.Specialties != nil {
+		if err := s.store.replaceSpecialties(ctx, r, providerID, *fields.Specialties); err != nil {
+			return Profile{}, err
+		}
+	}
+
+	return s.store.profile(ctx, r, providerID)
+}
+
+// normalise tidies and deduplicates every supplied list, returning a copy.
+//
+// Done before validation for the reason [VehicleFields.normalise] is: what is validated is then
+// exactly what will be stored, rather than a raw form that passes a check and a tidy form that
+// fails a constraint.
+//
+// **Deduplication is part of normalising rather than a refusal.** A declaration is a set, so
+// `["NSW", "nsw"]` names New South Wales once and saying so twice is not a mistake worth reporting
+// — the client rendered a chip twice, and refusing the request would leave the provider unable to
+// see which. The unique index makes the same guarantee against two requests racing; this makes it
+// against one request contradicting itself.
+//
+// An entry that cannot be recognised is left as it arrived rather than dropped, so that
+// [ProfileFields.problems] can report which position was wrong instead of silently declaring a
+// smaller set than the provider asked for.
+func (f ProfileFields) normalise() ProfileFields {
+	out := f
+
+	if f.States != nil {
+		out.States = tidied(*f.States, normaliseState)
+	}
+	if f.Postcodes != nil {
+		out.Postcodes = tidied(*f.Postcodes, func(raw string) string {
+			// Every space removed rather than collapsed, the same treatment a registration
+			// gets and for the same reason: "3 000" and "3000" are one postcode.
+			return strings.Join(strings.Fields(raw), "")
+		})
+	}
+	if f.Specialties != nil {
+		out.Specialties = tidied(*f.Specialties, Specialty.normalise)
+	}
+
+	return out
+}
+
+// tidied applies a normaliser to every entry and removes the repeats, preserving the order the
+// caller sent — which is what makes the positions in a field error still point at the right chip.
+func tidied[T comparable](raw []T, normalise func(T) T) *[]T {
+	out := make([]T, 0, len(raw))
+	seen := make(map[T]bool, len(raw))
+
+	for _, entry := range raw {
+		tidy := normalise(entry)
+		if seen[tidy] {
+			continue
+		}
+		seen[tidy] = true
+		out = append(out, tidy)
+	}
+	return &out
+}
+
+// normaliseState resolves any form of an Australian state to its abbreviation.
+//
+// Unrecognised input comes back collapsed rather than empty, so the validator reports a state it
+// does not know rather than a state that is missing — two different things to say to a provider.
+func normaliseState(raw string) string {
+	tidy := collapse(raw)
+	if tidy == "" {
+		return ""
+	}
+
+	if upper := strings.ToUpper(tidy); validState(upper) {
+		return upper
+	}
+	if abbreviation, known := longStateNames[strings.ToLower(tidy)]; known {
+		return abbreviation
+	}
+	return tidy
+}
+
+func validState(abbreviation string) bool {
+	for _, known := range ServiceAreaStates {
+		if abbreviation == known {
+			return true
+		}
+	}
+	return false
+}
+
+// problems reports everything wrong with a declaration at once (Docs/10 §4.6).
+//
+// **The field paths carry the position**, `service_area.states.2` rather than `service_area.states`,
+// because the client renders each entry as its own control and an error naming only the list leaves
+// the provider to work out which of forty postcodes is the wrong one. It is an extension of the
+// dotted path httpx.FieldError describes rather than a new convention: the same walk into the JSON
+// the client sent, through an array index.
+//
+// The offending value is deliberately not echoed into the message. It came from the client, which
+// still has it, and a message that repeated it would put unbounded caller-supplied text into a
+// response body for no benefit.
+func (f ProfileFields) problems() validate.Errors {
+	var e validate.Errors
+
+	if f.States != nil {
+		states := *f.States
+		// Checked before the entries are, so a runaway list produces one error rather than
+		// thousands. There are eight; after deduplication a longer list cannot be anything else.
+		if len(states) > len(ServiceAreaStates) {
+			e.Add("service_area.states", validate.CodeTooLong,
+				"There are only %d states and territories.", len(ServiceAreaStates))
+		} else {
+			for i, state := range states {
+				if !validState(state) {
+					e.Add(fmt.Sprintf("service_area.states.%d", i), validate.CodeNotAllowed,
+						"Choose an Australian state or territory.")
+				}
+			}
+		}
+	}
+
+	if f.Postcodes != nil {
+		postcodes := *f.Postcodes
+		if len(postcodes) > maxPostcodes {
+			e.Add("service_area.postcodes", validate.CodeTooLong,
+				"Name at most %d postcodes. A wider area than that is a state.", maxPostcodes)
+		} else {
+			for i, postcode := range postcodes {
+				if !isPostcode(postcode) {
+					e.Add(fmt.Sprintf("service_area.postcodes.%d", i), validate.CodeInvalid,
+						"Enter a %d-digit Australian postcode.", postcodeDigits)
+				}
+			}
+		}
+	}
+
+	if f.Specialties != nil {
+		specialties := *f.Specialties
+		if len(specialties) > len(Specialties) {
+			e.Add("specialties", validate.CodeTooLong,
+				"There are only %d specialties.", len(Specialties))
+		} else {
+			for i, specialty := range specialties {
+				if !specialty.Valid() {
+					// The twelve are not listed in the message, for the reason the vehicle
+					// type's refusal does not list the eleven: the contract publishes them, and
+					// a message that enumerated them is another copy to keep in step.
+					e.Add(fmt.Sprintf("specialties.%d", i), validate.CodeNotAllowed,
+						"This is not a kind of work this platform carries.")
+				}
+			}
+		}
+	}
+
+	return e
+}
+
+// isPostcode reports whether value is four digits and nothing else.
+//
+// **Not checked against the state it might belong to**, and that is the same refusal Docs/11 §3
+// records for SHIP-60: the allocations have exceptions — 2600 is ACT inside the NSW range — and
+// they move when Australia Post says so. Here there is not even a state to check it against, since
+// an entry names one grain and never two.
+func isPostcode(value string) bool {
+	if len(value) != postcodeDigits {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // owned reads a vehicle and refuses one belonging to another provider.
