@@ -14,13 +14,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
+import 'package:shipper/core/auth/session_controller.dart';
+import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/health/health_repository.dart';
 import 'package:shipper/core/health/health_status.dart';
 import 'package:shipper/core/routing/app_router.dart';
+import 'package:shipper/features/jobs/jobs_repository.dart';
 
+import '../../features/jobs/fake_jobs_repository.dart';
 import '../auth/fake_token_store.dart';
+import '../auth/session_fixtures.dart';
 
 void main() {
   group('the guard, as a table', () {
@@ -66,6 +71,20 @@ void main() {
       expect(redirectFor(signedIn, Routes.home), isNull);
       expect(redirectFor(signedIn, Routes.signIn), Routes.home);
       expect(redirectFor(signedIn, Routes.starting), Routes.home);
+    });
+
+    test('the job wizard is reachable while signed in and from nowhere else', () {
+      // SHIP-71 is the first screen to hang off the signed-in shell, and until it landed the
+      // guard sent a signed-in user home from *every* location but the shell. The symptom of
+      // forgetting a location here is a button that appears to do nothing, which points nowhere
+      // near this function.
+      expect(redirectFor(const SessionState.signedIn(), Routes.newJob), isNull);
+
+      // It is behind the session for the same reason the shell is, and for no stronger one:
+      // this is navigation, not authorisation. Reaching it any other way still fails on the
+      // first request it makes, because the platform decides.
+      expect(redirectFor(const SessionState.signedOut(), Routes.newJob), Routes.signIn);
+      expect(redirectFor(const SessionState.restoring(), Routes.newJob), Routes.starting);
     });
 
     test('the connectivity screen is reachable from either shell, and during the restore', () {
@@ -171,19 +190,31 @@ void main() {
       expect(find.byKey(const Key('shell-signed-out')), findsOneWidget);
     });
 
-    testWidgets('storing a session moves the app to the signed-in shell', (tester) async {
-      // The debug-only affordance on the signed-out screen. It is what makes the cold-start
-      // criterion demonstrable on a simulator in a wave with no authentication endpoint —
-      // flutter test runs in debug, so it is present here.
+    testWidgets('starting a session moves the app to the signed-in shell', (tester) async {
+      // The session, not a screen, is what moves the app: nothing here navigates. SHIP-55's
+      // sign-in screen is one caller of this and SHIP-50's refresh is another, and neither
+      // should have to know where a signed-in user goes.
       final store = FakeTokenStore();
-      await tester.pumpWidget(_app(store));
+      late final ProviderContainer container;
+
+      await tester.pumpWidget(
+        _scope(
+          store,
+          child: Builder(
+            builder: (context) {
+              container = ProviderScope.containerOf(context, listen: false);
+              return const ShipperApp();
+            },
+          ),
+        ),
+      );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byKey(const Key('development-session')));
+      await container.read(sessionProvider.notifier).signIn(aTokenPair(refreshToken: 'refresh-1'));
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('shell-signed-in')), findsOneWidget);
-      expect(store.refreshToken, isNotNull);
+      expect(store.refreshToken, 'refresh-1');
     });
 
     testWidgets('the router survives a session change rather than being rebuilt',
@@ -228,6 +259,14 @@ Widget _scope(FakeTokenStore store, {required Widget child}) => ProviderScope(
         healthProvider.overrideWith(
           (ref) => const HealthStatus(status: 'ok', version: 'v0.0.0-test'),
         ),
+        // A restored session refreshes as soon as the keychain answers (SHIP-50). Without this
+        // every cold-start test here would open a socket to whatever is listening on the local
+        // API port — which is nothing on CI and, on a developer's machine, is the API.
+        sessionRefresherProvider.overrideWithValue(FakeSessionRefresher()),
+        // The refresher above answers with a customer token, so a restored cold start lands in
+        // the customer half — which reads that customer's jobs as soon as it is drawn (SHIP-76).
+        // Without this it would open a socket to whatever is listening on the local API port.
+        jobsRepositoryProvider.overrideWithValue(FakeJobsRepository()),
       ],
       child: child,
     );

@@ -12,7 +12,8 @@ import 'package:shipper/features/identity/phone_verification_screen.dart';
 import 'package:shipper/features/identity/registration_complete_screen.dart';
 import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/role_selection_screen.dart';
-import 'package:shipper/features/identity/signed_out_screen.dart';
+import 'package:shipper/features/identity/sign_in_screen.dart';
+import 'package:shipper/features/jobs/job_locations_screen.dart';
 
 /// Route paths, named once.
 ///
@@ -24,7 +25,13 @@ abstract final class Routes {
   /// Where a cold start lands while the keychain is being read.
   static const starting = '/';
 
-  /// The signed-out shell. Registration hangs off it from SHIP-51; sign-in is SHIP-55.
+  /// The signed-out shell, which **is** the sign-in screen from SHIP-55. Registration hangs off
+  /// it (SHIP-51).
+  ///
+  /// It takes an optional `?email=` so the end of the signup journey can arrive with the address
+  /// it just registered. Same mechanism as [verifyEmail]'s token, and for the same reason: a
+  /// query parameter survives a redirect through the guard, where a constructor argument does
+  /// not.
   static const signIn = '/sign-in';
 
   /// The first step of signup: which half of the marketplace this account is (SHIP-52).
@@ -53,12 +60,20 @@ abstract final class Routes {
 
   /// Where the signup journey ends (SHIP-51).
   ///
-  /// A stub, and honestly so: the real ending signs the new account in, which needs
-  /// `POST /v1/auth/login` — SHIP-41, consumed by SHIP-55. Neither exists yet.
+  /// It hands over to [signIn] carrying the address just registered. The account is deliberately
+  /// **not** signed in automatically: `POST /v1/auth/register` returns no token, and the only way
+  /// to a session is a password this app does not keep after the form that took it.
   static const registered = '/register/done';
 
   /// The signed-in shell. Role-aware from SHIP-52.
   static const home = '/home';
+
+  /// The first step of publishing a delivery: the two addresses (SHIP-71).
+  ///
+  /// `/jobs/new` rather than `/jobs/{id}/locations`, because the draft does not exist until this
+  /// step saves it — the id arrives in the response and not in the route. Resuming a draft that
+  /// already exists is SHIP-75, and gets a route that names one.
+  static const newJob = '/jobs/new';
 
   /// The connectivity check (SHIP-19).
   ///
@@ -90,6 +105,21 @@ const _signedOutLocations = <String>{
   Routes.registered,
 };
 
+/// Locations a signed-in user may be at (SHIP-71).
+///
+/// It exists for the same reason [_signedOutLocations] does. SHIP-49's guard sent a signed-in
+/// user to the home shell from *every* other location, which was right while the shell was the
+/// only thing to reach; the first screen that hangs off it would otherwise be redirected away
+/// the instant it was opened, and the symptom — a button that appears to do nothing — points
+/// nowhere near the guard.
+///
+/// **Adding a location here grants no permission.** What the account may actually do is decided
+/// server-side on every request; this decides only where the app is willing to draw.
+const _signedInLocations = <String>{
+  Routes.home,
+  Routes.newJob,
+};
+
 /// Where the session says this location should be, or `null` to leave it alone.
 ///
 /// A pure function of the session and the location, separated from [routerProvider] so it can
@@ -112,7 +142,7 @@ String? redirectFor(SessionState session, String location) {
     SessionRestoring() => location == Routes.starting ? null : Routes.starting,
     SessionSignedOut() =>
       _signedOutLocations.contains(location) ? null : Routes.signIn,
-    SessionSignedIn() => location == Routes.home ? null : Routes.home,
+    SessionSignedIn() => _signedInLocations.contains(location) ? null : Routes.home,
   };
 }
 
@@ -199,7 +229,9 @@ final routerProvider = Provider<GoRouter>((ref) {
       ),
       GoRoute(
         path: Routes.signIn,
-        builder: (context, state) => const SignedOutScreen(),
+        builder: (context, state) => SignInScreen(
+          prefilledEmail: state.uri.queryParameters['email'],
+        ),
       ),
       GoRoute(
         path: Routes.chooseRole,
@@ -230,6 +262,10 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.home,
         builder: (context, state) => const SignedInShell(),
+      ),
+      GoRoute(
+        path: Routes.newJob,
+        builder: (context, state) => const JobLocationsScreen(),
       ),
       GoRoute(
         path: Routes.health,

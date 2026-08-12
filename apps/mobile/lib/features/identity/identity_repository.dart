@@ -1,15 +1,22 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/api/api_client.dart';
+import 'package:shipper/core/auth/token_pair.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/features/identity/account.dart';
 
-/// The five identity endpoints the signup journey calls (SHIP-51…54).
+/// The identity endpoints a screen calls: the five in the signup journey (SHIP-51…54) and the
+/// sign-in that ends it (SHIP-55).
 ///
 /// Every one of them is public and every one is state-changing, which is a combination the
 /// platform allows only here: each is how a caller obtains their own credentials, and an
 /// endpoint that takes a token sent to an address cannot require the session that proving the
 /// address leads to (`contracts/paths/identity.yaml`).
+///
+/// **`POST /v1/auth/refresh` is deliberately not here.** It is the only call in the domain that
+/// no screen makes — the session makes it, on its own behalf, and nothing renders its result. It
+/// lives in `core/auth/session_refresher.dart` so that `core/` never has to import a feature;
+/// see the note there.
 ///
 /// An interface with one real implementation, following `TokenStore` rather than
 /// `HealthRepository`. The reason is the same one: a widget test has to be able to hand a screen
@@ -74,6 +81,30 @@ abstract interface class IdentityRepository {
   Future<Account> verifyPhone({
     required String phone,
     required String code,
+    required String idempotencyKey,
+  });
+
+  /// `POST /v1/auth/login` (SHIP-41), which is where a session begins.
+  ///
+  /// One code — `identity_credentials_invalid` — for a wrong password and for an address with no
+  /// account, and the platform spends the same password-hashing work on both so the response time
+  /// does not disclose what the status code withholds. A screen must therefore not try to be more
+  /// specific than the platform: "check your email address and password" is the whole of what is
+  /// known.
+  ///
+  /// **It answers `400`, not `401`.** That is the domain's rule — a credential in the request body
+  /// is refused with `400`, one in the bearer header with `401` — and it is what keeps SHIP-50's
+  /// interceptor out of a loop.
+  ///
+  /// [deviceLabel] is display text for `GET /v1/auth/sessions`; see `core/device/device_label.dart`.
+  ///
+  /// **Each sign-in creates a device session**, so retrying under the same idempotency key is not
+  /// merely allowed but important: the platform replays its stored answer instead of starting a
+  /// second session that would sit in the device list for thirty days.
+  Future<TokenPair> login({
+    required String email,
+    required String password,
+    required String deviceLabel,
     required String idempotencyKey,
   });
 }
@@ -166,6 +197,22 @@ final class ApiIdentityRepository implements IdentityRepository {
     );
   }
 
+  @override
+  Future<TokenPair> login({
+    required String email,
+    required String password,
+    required String deviceLabel,
+    required String idempotencyKey,
+  }) async {
+    return TokenPair.fromJson(
+      await _client.postJson(
+        '$_base/login',
+        idempotencyKey: idempotencyKey,
+        body: loginBody(email: email, password: password, deviceLabel: deviceLabel),
+      ),
+    );
+  }
+
   /// How long before asking again, from the platform's answer.
   ///
   /// Falls back to a minute — the platform's own cooldown — when the field is missing or is not
@@ -211,6 +258,23 @@ Map<String, Object?> phoneBody(String phone) => <String, Object?>{'phone': phone
 /// `POST /v1/auth/verify-phone`.
 Map<String, Object?> verifyPhoneBody({required String phone, required String code}) {
   return <String, Object?>{'phone': phone, 'code': code};
+}
+
+/// `POST /v1/auth/login`.
+///
+/// All three fields are required by the contract. `device_label` in particular has no default on
+/// the platform's side, deliberately — four rows reading "Unknown device" cannot be acted on at
+/// SHIP-46.
+Map<String, Object?> loginBody({
+  required String email,
+  required String password,
+  required String deviceLabel,
+}) {
+  return <String, Object?>{
+    'email': email,
+    'password': password,
+    'device_label': deviceLabel,
+  };
 }
 
 /// The application's identity repository.

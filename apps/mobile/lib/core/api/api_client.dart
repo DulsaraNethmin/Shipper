@@ -2,7 +2,9 @@ import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/api/api_environment.dart';
+import 'package:shipper/core/api/auth_interceptor.dart';
 import 'package:shipper/core/api/idempotency_interceptor.dart';
+import 'package:shipper/core/auth/session_controller.dart';
 import 'package:shipper/core/errors/api_failure.dart';
 
 /// The one HTTP client, over `dio` (`Docs/10` §8.3).
@@ -21,9 +23,16 @@ class ApiClient {
   ApiClient(this._dio);
 
   /// Builds a client for [environment], or for the environment this build was compiled with.
-  factory ApiClient.forEnvironment([ApiEnvironment? environment]) {
+  ///
+  /// [session] is what makes it an *authenticated* client — omit it and nothing attaches a
+  /// bearer token and nothing reacts to a `401`. That is the right shape for the refresh call
+  /// itself, and for a test that is about something else.
+  factory ApiClient.forEnvironment([
+    ApiEnvironment? environment,
+    SessionTokens Function()? session,
+  ]) {
     final env = environment ?? ApiEnvironment.current;
-    return ApiClient(buildDio(baseUrl: env.baseUrl()));
+    return ApiClient(buildDio(baseUrl: env.baseUrl(), session: session));
   }
 
   final Dio _dio;
@@ -54,11 +63,38 @@ class ApiClient {
     required String idempotencyKey,
     Object? body,
   }) {
+    return _write('POST', path, idempotencyKey: idempotencyKey, body: body);
+  }
+
+  /// A partial edit.
+  ///
+  /// Identical to [postJson] in everything that matters — it is state-changing, so it carries an
+  /// idempotency key and is refused without one (SHIP-15). It exists as its own method because
+  /// the platform distinguishes the two: `PATCH /v1/jobs/{id}` touches only the fields present,
+  /// which is what lets one step of a wizard save its own without sending back the fields it
+  /// cannot see. A client that reached for `POST` there would create a second job.
+  Future<Map<String, dynamic>> patchJson(
+    String path, {
+    required String idempotencyKey,
+    Object? body,
+  }) {
+    return _write('PATCH', path, idempotencyKey: idempotencyKey, body: body);
+  }
+
+  Future<Map<String, dynamic>> _write(
+    String method,
+    String path, {
+    required String idempotencyKey,
+    Object? body,
+  }) {
     return _json(
-      () => _dio.post<Object?>(
+      () => _dio.request<Object?>(
         path,
         data: body,
-        options: Options(headers: {ApiHeaders.idempotencyKey: idempotencyKey}),
+        options: Options(
+          method: method,
+          headers: {ApiHeaders.idempotencyKey: idempotencyKey},
+        ),
       ),
     );
   }
@@ -122,8 +158,17 @@ class ApiClient {
 /// Separate from [ApiClient] so a test can build one against `DioAdapter` without reproducing
 /// the timeouts and interceptors — a test that configures its own transport is testing its own
 /// transport.
-Dio buildDio({required String baseUrl}) {
-  final dio = Dio(
+///
+/// [session] installs the bearer token and the refresh-on-`401` behaviour (SHIP-50). It is
+/// optional because two transports in this application deliberately do without it: the one the
+/// refresh call itself travels on, and the ones tests build for something else entirely.
+Dio buildDio({required String baseUrl, SessionTokens Function()? session}) {
+  // `late` so the replay closure can name the transport it is being installed into. A replay
+  // that bypassed the interceptor chain would skip the idempotency guard, and would send the
+  // *previous* token because nothing would re-run `onRequest`.
+  late final Dio dio;
+
+  dio = Dio(
     BaseOptions(
       baseUrl: baseUrl,
       // Chosen for a phone on mobile data rather than for a data centre. Long enough that a
@@ -138,6 +183,13 @@ Dio buildDio({required String baseUrl}) {
   );
 
   dio.interceptors.add(const IdempotencyInterceptor());
+
+  if (session != null) {
+    dio.interceptors.add(
+      AuthInterceptor(session: session, replay: (options) => dio.fetch<Object?>(options)),
+    );
+  }
+
   return dio;
 }
 
@@ -149,6 +201,26 @@ Dio buildDio({required String baseUrl}) {
 final apiEnvironmentProvider = Provider<ApiEnvironment>((ref) => ApiEnvironment.current);
 
 /// The application's client.
+///
+/// The session is read through a closure rather than watched, and that is what keeps the two
+/// providers from depending on each other's construction: the session needs a client to refresh
+/// with, and the client needs the session to authenticate with. Nothing is read until a request
+/// is actually made, by which point both exist.
 final apiClientProvider = Provider<ApiClient>((ref) {
+  return ApiClient.forEnvironment(
+    ref.watch(apiEnvironmentProvider),
+    () => ref.read(sessionProvider.notifier),
+  );
+});
+
+/// A second client, carrying no credential and reacting to no `401` (SHIP-50).
+///
+/// One call needs it and no screen should ever reach for it: `POST /v1/auth/refresh`. That
+/// endpoint takes its credential in the request body, so a bearer token on it would be the
+/// expired token being sent to the endpoint that replaces it — and sending it through
+/// [apiClientProvider] would put the refresh inside the interceptor whose answer to a failure is
+/// to refresh. The contract closes that loop from its own side by answering `400` rather than
+/// `401`; this closes it from the client's, so neither side is the only thing holding it.
+final unauthenticatedApiClientProvider = Provider<ApiClient>((ref) {
   return ApiClient.forEnvironment(ref.watch(apiEnvironmentProvider));
 });

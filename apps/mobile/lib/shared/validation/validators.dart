@@ -100,6 +100,16 @@ abstract final class Validators {
     return null;
   }
 
+  /// A password being **presented** rather than chosen (SHIP-55).
+  ///
+  /// Presence only, and the difference from [password] is deliberate rather than an oversight.
+  /// The ten-character minimum is a rule about what somebody may choose; applying it at sign-in
+  /// would refuse an account whose password predates the current floor — locally, so the person
+  /// could not even reach the platform that would have accepted them. `contracts/paths/identity
+  /// .yaml` states the same rule from the other side: sign-in checks the password for presence.
+  static String? presentedPassword(String? value) =>
+      (value ?? '').isEmpty ? 'Enter your password.' : null;
+
   /// The six-digit code from a verification SMS (SHIP-54).
   ///
   /// A shape rather than a rule: whether *this* code is the live one is the platform's to say,

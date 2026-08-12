@@ -210,10 +210,12 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-44** | M1 | Authentication middleware — the auth class is now enforced, and idempotency keys are scoped by caller — *see below* |
 | **SHIP-48** | M1 | Flutter secure storage — the refresh token in the Keychain and the Keystore, and nowhere a swap would be possible — *see below* |
 | **SHIP-49** | M1 | Flutter session and routing guard — three states, and a cold start that never guesses — *see below* |
+| **SHIP-50** | M1 | Flutter token refresh — one refresh per 401 however many requests hit it at once, and the replay carries the original idempotency key — *see below* |
 | **SHIP-51** | M1 | Flutter registration screen — the first client screen to call a product endpoint, and one idempotency key per action — *see below* |
 | **SHIP-52** | M1 | Flutter role selection — chosen first because the platform fixes it, and the session's role selects the shell — *see below* |
 | **SHIP-53** | M1 | Flutter email verification — typed or deep-linked, and the app's first deep link scheme — *see below* |
 | **SHIP-54** | M1 | Flutter phone verification — a code on opening, and a resend the platform's interval throttles — *see below* |
+| **SHIP-55** | M1 | Flutter sign-in — closes M1, deletes the development session stand-in, and settles biometric unlock as out of the MVP — *see below* |
 | **SHIP-56** | M2 | `jobs` — the twelve statuses of `Docs/02` §1 as a `CHECK`, held to the Go constants by test |
 | **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
@@ -222,6 +224,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-61** | M2 | `POST /v1/jobs` — the first authenticated state-changing endpoint in the service — *see below* |
 | **SHIP-62** | M2 | `PATCH /v1/jobs/{id}` — a partial edit of a draft, and a stranger's edit is indistinguishable from no job at all — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
+| **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
+| **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -1420,6 +1424,214 @@ now optional and called after the task's loop stops, with a fresh context rather
 cancelled one, since a `Close` inherited from a cancelled context could never flush. A hook on the
 task rather than a field on `Deps`, so every future task does not carry a producer it never uses.
 
+### What SHIP-50 built, and the two places it put things nobody expected
+
+**A `401` now triggers one refresh and one replay, and several at once still produce one
+refresh.** The second clause is the ticket. Three requests going out with the same token and all
+being refused is the ordinary shape of a phone coming back into signal — and a client that
+refreshed per request would present an already-rotated token, which SHIP-40 answers by revoking
+the **whole device session**. The client would be doing to itself exactly what that mechanism
+exists to catch somebody else doing. One in-flight future serialises them;
+`auth_interceptor_test.dart` holds the refresher open so all three failures land while the
+refresh is genuinely in flight, which is a different code path from three landing after one has
+finished.
+
+**The other half of "refresh once" is not a lock, and it is the half a lock does not cover.** A
+`401` that arrives *after* somebody else's refresh completed has nothing to queue behind. So the
+interceptor passes the session the token the failed request actually carried, and the session
+answers with the current one when they differ rather than refreshing again.
+
+**The replay reuses the original request's `Idempotency-Key`, and that is correct by construction
+rather than by remembering.** It re-sends the same `RequestOptions` object, so the header is
+already in it. A fresh key would turn one bid into two — `Docs/07` §4 has the key generated where
+the user acts and reused across every retry, and a refresh-and-replay is a retry by any reading:
+the platform saw the attempt, refused it for a credential reason, and is about to see it again.
+`ActionKey` needed no change; wave 3 had already written the rule down.
+
+**A refresh is sent through a second transport carrying no interceptor at all.** The credential is
+body-borne, so a bearer token on it would be the expired token sent to the endpoint that replaces
+it — and it would put the refresh inside the interceptor whose answer to a failure is to refresh.
+SHIP-42 closed that loop from the platform's side by answering `400` rather than `401`; this
+closes it from the client's, so neither side is the only thing holding it.
+
+**Signing out on a failed refresh is decided by `ActionKey.outcomeUnknown`, not by a status
+code.** `identity_refresh_token_invalid` means the platform saw the token and will not honour it:
+the session is over. A dropped connection, a `503` or a proxy's error page say nothing about
+whether the session is alive, and signing out on those would end a perfectly good session because
+the signal dropped — a driver in a tunnel. Reusing the predicate that already decides whether to
+keep the idempotency key means the retry rule and the sign-out rule cannot drift apart.
+
+**Two things landed where SHIP-49 said they would not.**
+
+- **The access token is a private field on `SessionController`, not a field on `SessionState`.**
+  `session_state.dart` had anticipated the opposite. `freezed` writes a `toString` over every
+  field, so a token in the state is a token in any log line or crash report that prints the
+  session — the thing `Docs/07` §3 forbids in the same sentence as preferences and documents, and
+  the reason the *refresh* token was kept out of the state in the first place. It is also not view
+  state: no widget renders it, so a field would rebuild every listener on each refresh. The role,
+  which is view state, stays in the state. The document was corrected rather than left.
+- **`POST /v1/auth/refresh` is in `core/auth`, not on `IdentityRepository`.** The wave brief
+  expected the repository. Refreshing is not a screen's action — nothing renders its result and
+  the only caller is the session — and putting it on the identity feature would mean `core/auth`
+  importing `features/identity`. That is the mobile shape of the edge `CLAUDE.md` calls the one
+  easiest to break by accident: every feature already imports `core/`, so one import the other way
+  welds all seven to identity. `core/api/auth_interceptor.dart` declares the two-member interface
+  it needs from the session and `apiClientProvider` supplies the closure, which is
+  `internal/httpx`'s rule written in Dart. Sign-in stayed on `IdentityRepository`, because signing
+  in *is* a screen's action.
+
+**The first refresh happens as soon as the keychain answers, and the shell is published before
+it.** Without that the role would arrive "whenever something happens to make a request", which in
+M1 is nothing at all — and SHIP-52's role-pending shell would be what every cold start showed for
+ever. Holding the splash for the round trip was the alternative and is worse: a cold start would
+be as slow as the signal, and offline as slow as the connect timeout. The visible consequence is
+that "signed in and not yet knowing as whom" is now the window before the refresh answers, plus
+the cold start that cannot reach the platform — `role_selection_screen_test.dart` reaches it by
+stubbing the refresher unreachable, which is the honest way to reach it.
+
+**`TokenPair` is hand-written rather than `freezed` + `json_serializable`, for the `toString`
+reason above.** It also reads only two of the contract's four fields: nothing schedules on
+`expires_in`, because this client refreshes when the platform says a token is not accepted and
+never on a clock, and `Docs/07` §4 is built on handsets whose clock is wrong after a spell out of
+signal.
+
+**`roleFromAccessToken` does not verify and must never start.** The signing key is the platform's
+(`internal/identity/token.go`), and a build carrying a verification key would not make the check
+mean anything. A device that edits its own token gets a different *shell* and exactly the same
+refusals. Three answers, and the difference between two of them matters: a known role, `unknown`
+for a role this build has not heard of (which the shell renders as "update the app"), and `null`
+for a token that said nothing readable — collapsing the last two would put an update prompt in
+front of somebody whose token had simply not arrived yet.
+
+**How it was demonstrated.** `make flutter-check` in the wave-4 worktree: 198 host tests, up from
+166. The interceptor tests run through the real `apiClientProvider` transport, the real
+`SessionController` and the real single-flight rule, with a stub only at the socket and the
+Keychain — an interceptor tested against a hand-made session would pass with the session wired to
+nothing, and "concurrent calls refresh once" is a claim about the two of them together.
+
+### What SHIP-55 built, and the decision it was told to settle
+
+**The signed-out shell and the sign-in screen are one screen, not two.** SHIP-49 built the first as
+a placeholder holding a disabled button, because `POST /v1/auth/login` did not exist. It does
+(SHIP-41), and a landing screen whose only purpose is a button leading to a form is a tap somebody
+makes every time they are signed out. `/sign-in` is unchanged, so every redirect, guard entry and
+deep link still resolves to it, and `shell-signed-out` is still the key that says the app is
+showing the signed-out surface.
+
+**Nothing on the screen navigates on success, deliberately.** The session changing is what moves
+the app, through the router's guard — and the role that decides *which* shell comes from the
+access token the platform just signed. A screen that also pushed a route would be a second
+mechanism deciding where a signed-in user goes, and the two would disagree the first time somebody
+signed in from anywhere else.
+
+**Sign-in validates the password for presence only, and that is a real difference from
+registration.** `Validators.password` carries the ten-character minimum somebody must *choose*.
+Applying it to a password being *presented* would refuse an account whose password predates the
+current floor — locally, so the person could not even reach the platform that would have accepted
+them. The contract states the same rule from its side.
+
+**`identity_credentials_invalid` goes in the banner and never under the password field.** One code
+for a wrong password and for an address with no account is what stops an unauthenticated endpoint
+being an account-existence oracle; a client that put the message under one field would undo that
+by saying which one was recognised.
+
+**Retrying after a dropped connection reuses the key, and here that is not a nicety.** Each
+sign-in creates a device session, because there is no device identifier to match on — so a
+retried sign-in is exactly how somebody ends up with a device list they cannot make sense of and a
+second session live for thirty days. `ActionKey` retains the key when the outcome is unknown, so
+the platform replays its stored pair. A wrong password retires it, because the platform saw that
+attempt and a replayed refusal is not what the person asked for.
+
+**`device_label` is derived, not asked for.** The contract observes that a sign-in screen is the
+only moment a label could be collected, which reads as an argument for a third field; it is not
+taken, because a person signing in on their own phone should not be asked to name it and whatever
+they typed would be worse for the one job the field has. It is `iOS 17.0` / `Android 14`, parsed
+loosely from `Platform.operatingSystemVersion` — a model name needs `device_info_plus`, which is a
+package decision with two native integrations and a store-privacy consequence, and §9 carries it.
+
+**It lives in `core/device/` rather than `core/auth/`, and a test made that choice.**
+`token_store_is_not_preferences_test.dart` forbids `dart:io` anywhere under `core/auth/` — the
+application documents directory is the third location `Docs/07` §3 rules out — and its own note
+says the rule will acquire no exceptions. Reading `Platform` is enough to trip it. The rule was
+honoured rather than waived, which is what a rule written that way is for.
+
+**Two honest stand-ins were deleted, which is the other half of the ticket.**
+`DevelopmentSessionButton`, its placeholder token and the `kDebugMode` preview button at the end of
+signup are gone. SHIP-52's *Done when* — "role is chosen during signup and drives the post-login
+shell" — is now demonstrable as one flow rather than as two separate facts with a debug button
+between them: choose provider, register, verify both channels, sign in, land in the provider half.
+
+**The end of signup carries the address forward and not the password.** It could have kept the
+password from the form in memory and signed in automatically; a plaintext password in the provider
+tree is one crash report away from somewhere it must never be, and `Docs/07` §3 draws that line for
+tokens, which are the lesser secret. One field to type instead of two.
+
+#### Biometric unlock: **out of the MVP**, and here is what would change the answer
+
+`Docs/07` §9 said this closes "at SHIP-48 onwards" and `Docs/11` §9 moved it to SHIP-55 on the
+grounds that an optional local unlock is a gate on a sign-in screen and there was no sign-in
+screen. There is one now, so the excuse has expired and the decision is taken: **not in the MVP.**
+
+The reasoning, in the order it actually weighed:
+
+- **It is a convenience over the stored token and never a substitute for it** (`Docs/07` §3, which
+  fixed its position long before this). The token is already behind `first_unlock_this_device` on
+  iOS and a Keystore-wrapped key on Android — the device passcode gates it. What biometric unlock
+  adds is a second gate in front of an app on an **already unlocked** handset. That is a real gain
+  and a modest one, and it is not what a marketplace pilot holding no payment details is exposed
+  on.
+- **The cost is asymmetric across the two platforms, which was measured rather than assumed.**
+  iOS is nearly free: `IOSOptions.accessControlFlags` takes `biometryAny`, `biometryCurrentSet` or
+  `userPresence` on the store SHIP-48 already built. **Android is not: `AndroidOptions.biometric()`
+  requires API 28**, and this app's floor is API 24 — chosen in `Docs/07` §9 precisely because a
+  token store that is only *sometimes* hardware-backed is not the guarantee the document makes.
+  Enabling it would mean either raising the floor by four API levels or shipping two sets of
+  storage options, and "only sometimes biometric" is the same shape of half-guarantee that
+  argument rejected.
+- **An optional control needs somewhere to turn it off, and there is no settings surface.** Not in
+  the app and not in `Docs/09` before SHIP-173. Shipping it as non-optional contradicts §3's own
+  wording.
+- **`biometryCurrentSet` invalidates the entry when the enrolled biometrics change**, and
+  `resetOnError` is `true`, so adding a fingerprint would quietly sign somebody out. That is a
+  support event caused by a convenience feature.
+- **Deferring costs nothing structurally.** Nothing in the session design moves either way, and
+  adopting it later is a change to two constants in the one folder allowed to hold the token —
+  which is exactly the property SHIP-48 built for.
+
+**What would change the answer**, named so this is a decision and not a shrug:
+
+1. **The Android floor rising to API 28 for another reason.** SHIP-24 and SHIP-26 touch the Android
+   build configuration and already carry the `flutter_secure_storage` 11 / `compileSdk` question
+   (§9). If the floor moves there, the Android half of this becomes free and it should be
+   reconsidered in the same change.
+2. **A settings surface existing.** SHIP-173's in-app account screen is the first, and it is where
+   an opt-in would live.
+3. **The pilot holding something that makes an unlocked handset a real exposure** — payment details
+   (the MVP holds none, `CLAUDE.md`), or a customer address history on a shared device.
+
+Until one of those, this stays out. **`Docs/07` §9's table row and its closing paragraph still
+describe it as open and pointing at SHIP-48**; this branch owns `apps/mobile/**` and `Docs/11`
+only, so correcting those two lines belongs to whoever reconciles the documents next.
+
+**How it was demonstrated.** `make flutter-check` in the wave-4 worktree: 219 host tests, up from
+198 — the sign-in screen driven through the real router, guard, session and shell, with the socket
+and the Keychain the only substitutions. Then on an iPhone 17 simulator against this worktree's API
+on 8092, through `apps/mobile/integration_test/sign_in_test.dart`: an account registered by `curl`,
+signed in **from the form**, landing in the provider half — with the role having travelled out of a
+token the platform signed and through nothing that was told what it was. Its second test relaunches
+over the same real Keychain, which is where SHIP-50's first refresh is demonstrated for real: the
+service log shows `POST /v1/auth/refresh 200` and the stored token is not the one that was
+presented, so the rotation happened.
+
+**One thing worth knowing for anybody running the API in a worktree.** Sign-in answered `500` until
+the local `shipper_b` database was rebuilt. `make migrate-up` had reported "no change" against a
+schema whose `device_sessions` was missing `refresh_token_expires_at` and `revoked_at`: the
+recorded version was `404`, from the jobs block, so the identity block's `000103` and `000104` sat
+*below* it and were never applied. That is the condition SHIP-15g's note already describes — a
+database bitten before the guard existed is backfilled as healthy — and the fix is the one it
+gives: `make migrate-down n=all && make migrate-up`. No repository change; the guard is already
+there for new databases.
+
 ### SHIP-67 — the budget, and the pairing that could not be honoured
 
 `jobs.budget` is `numeric(12,2)` (000405), held in Go as `int64` cents and published as
@@ -1506,6 +1718,137 @@ window closed an hour ago and one with no window at all, checks the two deadline
 computed, starts `cmd/worker`, waits for the first pass, and then asserts the stale job is
 `Cancelled` with an `Open->Cancelled` history row attributed to `system` with no account, an
 outbox event, and the live job untouched. The count went from 208 to **224**.
+
+### SHIP-71 — the locations step, and the validation it deliberately does not do
+
+`/jobs/new` is the first screen to hang off the signed-in shell. It takes the two addresses in
+their four parts each, saves them, and shows back what the platform made of them.
+
+**Nothing on the screen validates an address, and that is the decision rather than an omission.**
+No postcode pattern, no length, no picker holding the eight states. `validators.dart` already
+describes the one duplication this client knowingly carries — the password minimum — and the
+argument that makes it safe is that it can only fail in the harmless direction. None of these
+fields has that property, and one of them is worse than merely unsafe: a client-side "all four
+parts are required" rule would refuse the empty address `Docs/01` §4.1 explicitly allows, because
+a draft may be saved half-finished and returned to. So the platform decides, its
+`validation_failed` details arrive under dotted paths, and the form renders each one beside the
+input the path names. A test drives `pickup.postcode` and `dropoff.state` through the real screen
+and checks they land under the right two of the eight inputs.
+
+**The state is a text field, not a picker.** `Docs/10` §4.7's exception says a client prints the
+state rather than branching on it, and input is accepted in any case and as the spelled-out name.
+A picker would be a second copy of the platform's list compiled into a build that has no
+over-the-air update path, for no behaviour that depends on it. What is typed is what is sent —
+`new south wales` goes out as `new south wales`, and the platform normalises.
+
+**"We could not match this to a place on the map" is drawn as information, not as a failure.**
+SHIP-59a requires that a failed lookup does not fail the job, and the platform honours it by
+storing the address as typed with no coordinate. The client's half is the other end of that: no
+error colour, no warning, and the way on stays enabled. A screen that made a customer resolve a
+rural address before continuing would be blocking on something they cannot change.
+
+**Saving twice edits the draft rather than making a second one.** The first save is `POST
+/v1/jobs`; every save after it is `PATCH /v1/jobs/{id}` against the id the first returned. Without
+that, every corrected postcode leaves an abandoned draft behind — and the customer finds it in
+their job list, where nothing can explain it. That is what `ApiClient.patchJson` was added for,
+and the idempotency interceptor already covered `PATCH`.
+
+**The idempotency key follows `ActionKey`'s rule, and both directions are tested through the
+screen.** A dropped connection keeps the key, because the platform may have created the draft and
+the answer may have been lost. A `422` retires it, because the platform saw the request and
+refused it, and the customer is about to correct something — replaying that refusal is not what
+they asked for.
+
+**The guard needed widening and this is worth knowing before the next screen.** `redirectFor` sent
+a signed-in user to `/home` from *every* other location, which was right while the shell was the
+only thing to reach. `/jobs/new` is the first that is not, so there is now a `_signedInLocations`
+set beside `_signedOutLocations`. **It grants no permission** — reaching the step any other way
+still fails server-side on the first request it makes.
+
+**Three pieces landed outside the jobs feature**, each because a second consumer is certain rather
+than speculative: `core/api/page.dart` for the list envelope `Docs/10` §4.5 gives every collection,
+`shared/formatting/dates.dart` for day-first dates, and `shared/formatting/money.dart` for cents as
+AUD. `intl` was deliberately not added: the MVP ships one locale, and what the package would buy is
+locale negotiation that would render month-first on a handset set to `en-US`.
+
+**How it was demonstrated.** `make flutter-check` in the wave-4 worktree: 264 host tests, up from
+219. The step is driven through the real router, guard, session and shell — signed in as a
+customer, opened from the shell's own button, filled in, saved, refused, corrected, saved again —
+with the socket and the Keychain the only substitutions. **What was not demonstrated live: the
+unresolved-address path against the running API.** `geocoding.UseStub` resolves every address in
+development and `NewStub()` is constructed with no unknown list, so a local API cannot answer with
+a missing coordinate. The path is covered by the screen tests and by the platform's own
+`location_test.go`; a live demonstration needs either a staging deployment with no geocoder
+configured or a stub built with an unknown address, and neither belongs in a Flutter ticket.
+
+### SHIP-76 — the customer's jobs, and the budget widget that is private on purpose
+
+The `shell-customer` placeholder is now the customer's own jobs, grouped by status, with
+pull-to-refresh. The key is unchanged, so every routing and sign-in test still asserts the same
+fact.
+
+**The list is read once and grouped on the device.** `?status=` takes one value, so a screen
+showing every status a customer has would need twelve requests to draw itself — twelve round trips
+on mobile data, and twelve chances for a partial failure to produce a screen missing a group with
+no error to explain it. The contract recommends the opposite and this follows it. The grouping is
+a pure function tested as one, and the order comes from `JobStatus.values` rather than from a list
+written beside it, so a status added in `Docs/02` §1's order is grouped in that order with nothing
+else to edit.
+
+**The group headings carry no counts, and that is honesty rather than an omission.** The list is
+paged and the page size is server configuration, so a group holds the jobs that have been read
+rather than every job in that status. A number would be right on the first page and quietly wrong
+on every screen with more. What the screen says instead, when there is more, is "Showing your most
+recent jobs" above a button that asks for the next page — the further pages are the customer's
+decision rather than an unbounded read to draw one screen.
+
+**A customer with no jobs sees an empty state, and it is not the failure state.** "You have no
+jobs" and "we could not find out" are different things to be told and only one of them has a
+retry. A refresh that fails leaves the list on screen with a banner over it, because somebody who
+pulled to refresh in a tunnel should still be looking at their jobs.
+
+**`_JobCard` is private and must stay private.** It draws `budget_cents`, which is legitimate
+because every job on this screen belongs to the person looking at it — and `Docs/01` §4.3 is
+hardest to keep with a shared card taking a budget and a flag saying whether to show it, where the
+flag is one careless call site away from wrong and nothing fails.
+`budget_stays_on_the_customer_side_test.dart` scans `lib/` with comments stripped and fails when
+the budget is named outside a four-file allow list. **It is the client's half of the platform's
+`TestOnlyTheOwnersResponseCarriesTheBudget`, and it is not a duplicate of it**: the Go test stops
+the field reaching a provider's device, and this stops a widget that renders it being reused on a
+provider screen. SHIP-82 writes its own card, as the platform writes its own response type.
+
+**The provider half is asserted to read nothing.** A provider sees no job list and no publish
+button, and the fake repository records no call. The platform would refuse a provider creating a
+job (`jobs_customer_only`), and that is a different thing from the app not offering it.
+
+**`customerJobsProvider` is auto-disposed, and that is what clears one account's jobs before the
+next signs in.** `Docs/07` §3 requires cached job data to go with the token at sign-out; sign-out
+unmounts the shell, which drops the last listener. Kept alive it would hold the previous account's
+jobs in memory for whoever signed in next on the same handset. A token refresh does *not* dispose
+it — the shell rebuilds and the list widget stays mounted — while leaving for the job wizard and
+coming back does, which is how a draft just saved appears without anybody pulling.
+
+**One thing SHIP-71 got wrong and this fixed: `core/api/page.dart` exported `Page`.**
+`package:flutter/material` exports `Page`, the navigator's route descriptor, so the name is
+ambiguous in every file that draws a widget — which is every screen that would consume it. It is
+`ApiPage` now, matching `ApiClient`, `ApiFailure` and `ApiHeaders` in the same folder. The
+collision was invisible until a widget file imported it.
+
+**How it was demonstrated.** `make flutter-check` in the wave-4 worktree: **292 host tests**, up
+from 219 before this branch. Then against this worktree's API on 8092, by `curl`, because the wire
+is where a client is actually wrong: a fresh customer's list is `{"data":[],"has_more":false}`
+(the empty state's whole premise); a draft created with `"state":"new south wales"` comes back
+`"NSW"` with a coordinate and a `formatted`; a half-filled address answers `422` with
+`pickup.state` and `pickup.postcode` — the exact keys the form looks up — while an entirely empty
+`dropoff` produces no error at all; `PATCH` edits the same id rather than making a second job;
+`?status=Draft` is `400` where `?status=draft` is `200`; and `?limit=1` returns `has_more: true`
+with a cursor that fetches the second page and then reports `has_more: false`.
+
+**Not demonstrated live: the screens themselves on a simulator.** Everything above is the contract
+this client was written against, checked by hand; what has not been done in this branch is
+installing the build on a device and driving the two screens against that API, which is what
+SHIP-55's report did for sign-in. The widget tests drive the real router, guard, session and shell,
+so what a simulator would add is the platform channel and the renderer.
 
 ### What SHIP-78 built, and the first test the migration guard ever got
 
@@ -2111,13 +2454,19 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **`flutter_secure_storage` is held at 10.x because version 11 needs `compileSdk = 37`.** The client compiles against 36 today, and Android Gradle Plugin 9.0.1 names 36 as its own maximum recommended — so taking 11 means moving the SDK and probably the Gradle plugin together. There is no urgency: 10.3.1 uses the same Keystore-wrapped ciphers and the same API 23 requirement. **Decide it with SHIP-24 and SHIP-26**, which are the tickets that touch the Android build configuration anyway.
 
-**Biometric unlock is still open, and SHIP-48 is where `Docs/07` §9 said it would close.** It did not, and the reason is that the thing it would sit in front of does not exist yet: an optional local unlock is a gate on a sign-in screen, and the first sign-in screen is SHIP-55. Nothing in the session design moves either way — `Docs/07` §3 already fixes its position as a convenience over the stored token and never a substitute for it — so the cost of leaving it is another wave of nothing happening. `flutter_secure_storage` offers it as an option on the store this ticket built (`AndroidOptions.biometric`, and iOS access-control flags), which means adopting it later is a change to two constants rather than a change to the design. **Decide at SHIP-55.**
+**~~Biometric unlock is still open.~~ Decided at SHIP-55 — see §3. Out of the MVP, with three named triggers that would reopen it.** The short version: it is a convenience over a token the device passcode already gates, `AndroidOptions.biometric()` needs API 28 against this app's floor of 24, and an optional control needs a settings surface that does not exist before SHIP-173. The reopening triggers are the Android floor moving at SHIP-24/26, a settings screen existing, or the pilot holding something that makes an unlocked handset a real exposure. **`Docs/07` §9 still describes it as open in two places — a table row and its closing paragraph — and needs one line each.**
 
 **~~§10's done block should probably be `merge=union`, and §3 probably should not.~~ Decided and done at SHIP-15e — see §3.** Both halves were kept: the list is `merge=union` and §3 is not. Since a git attribute applies to a whole file, the list moved to `Docs/11-done.txt`, one ticket per line — which the recommendation had not noticed matters, because a union resolves line by line and the old block put several tickets on one line.
 
 **~~`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.~~ Decided and split at SHIP-15e — see §3.** It is a harness plus one file per milestone or domain in `scripts/verify/`, numbered in reserved ranges the way migrations are, and a track adds a file rather than editing one. The count was unchanged at 105 across the split, which is the evidence the move lost nothing. **That 105 is a historical figure, not today's** — wave 3 took it to 208; §3 carries the current count.
 
 **~~`device_sessions` has no expiry column.~~ Decided and built at SHIP-39 — see §3.** An explicit `device_sessions.refresh_token_expires_at`, `NOT NULL` with no default, in migration `000103`. The window **slides** — rewritten on every rotation, 30 days — so inactivity ends a session and daily use never does. **A Redis TTL was rejected** (`Docs/10` §5: a control a cache flush undoes is not one), and so was deriving expiry from `last_seen_at + TTL`, because that is a *display* column which SHIP-46 writes from a device-list **read** — a derived lifetime would mean every future write silently extends a credential. **No absolute session cap, deliberately**: that is a policy control with a product consequence rather than a mechanism, and it is another column and another migration whenever it is wanted.
+
+**Signing out on the device does not end the session on the platform, and SHIP-50 is what makes fixing it possible.** `SessionController.signOut` clears the Keychain and the in-memory access token; `POST /v1/auth/logout` (SHIP-43) is never called, so the refresh token it just discarded stays valid server-side for up to thirty days and the device keeps a row in `GET /v1/auth/sessions`. It was out of scope for SHIP-50 and SHIP-55 — neither *Done when* mentions it, and until SHIP-50 the client had no access token to authenticate the call with. It is now a handful of lines: a fire-and-forget call before the local clear, which must not block or fail the sign-out (`Docs/07` §3 is explicit that the device catching up is what this is). **No ticket owns it.** SHIP-143 is the nearest — "de-registers on sign-out" — and would be a reasonable home, or a small follow-up of its own.
+
+**`httpx.WriteError` discards the cause of an unmapped error.** An `error` that is not an `*httpx.Error` becomes `StatusError(500)` and the original is not logged anywhere, so the service records `status 500` and nothing about why. Found while demonstrating SHIP-55: sign-in answered `500` against a stale local database and the only route to the cause was reading the handler. A one-line `LoggerFrom(r.Context()).Error(...)` on the fallback branch would have named it immediately. **Not a defect in behaviour** — the response contract is correct and deliberately says nothing — but it is an observability gap in the one path where the platform has no idea what went wrong either. Whoever next touches `internal/httpx` should take it.
+
+**`device_label` is a platform name and a version rather than a model name.** `core/device/device_label.dart` sends `iOS 17.0` or `Android 14`, which is what `dart:io` can answer. "iPhone 15 Pro" needs `device_info_plus` — a package decision with two native integrations and a store data-safety consequence, deliberately not taken inside a two-point ticket. The field is display text for the device list (SHIP-46) and two handsets may legitimately share a label, so nothing is broken; it is simply less useful than it could be. One function changes when somebody adds the package.
 
 **The mobile bundle identifier has no owner and stops being changeable.** `apps/mobile` currently uses a provisional `au.com.shipper` for both the iOS bundle id and the Android application id. **Once X-2 and X-3 publish a build, neither can be changed** — a new identifier is a new app listing, with a new install base. Confirm it before SHIP-25 or SHIP-27, not after. The staging and production hostnames baked into the API client (`api.staging.shipper.com.au`, `api.shipper.com.au`) are provisional in the same way, though those are only configuration; `SHIPPER_API_BASE_URL` overrides them meanwhile.
 

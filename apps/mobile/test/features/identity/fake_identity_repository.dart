@@ -1,8 +1,11 @@
 import 'dart:async';
 
+import 'package:shipper/core/auth/token_pair.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/features/identity/account.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
+
+import '../../core/auth/session_fixtures.dart';
 
 /// An account the platform could have returned.
 ///
@@ -44,6 +47,10 @@ class FakeIdentityRepository implements IdentityRepository {
 
   /// The account every successful call answers with. Replace to change what a screen renders.
   Account account = anAccount();
+
+  /// What a successful sign-in answers with. Its access token carries the role the shell reads,
+  /// so replacing this is how a test signs somebody in as a provider.
+  TokenPair tokens = aTokenPair();
 
   /// What the platform says to wait before asking again.
   Duration retryAfter = const Duration(seconds: 60);
@@ -141,6 +148,21 @@ class FakeIdentityRepository implements IdentityRepository {
       verifyPhoneBody(phone: phone, code: code),
       idempotencyKey,
       () => account = account.copyWith(phoneVerified: true),
+    );
+  }
+
+  @override
+  Future<TokenPair> login({
+    required String email,
+    required String password,
+    required String deviceLabel,
+    required String idempotencyKey,
+  }) {
+    return _record(
+      'login',
+      loginBody(email: email, password: password, deviceLabel: deviceLabel),
+      idempotencyKey,
+      () => tokens,
     );
   }
 }
