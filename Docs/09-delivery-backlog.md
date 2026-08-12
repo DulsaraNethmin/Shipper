@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**204 tickets, 631 points.**
+**205 tickets, 636 points.**
 
 ## How to read this
 
@@ -35,7 +35,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 33 | 87 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 34 | 92 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 26 | 78 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 27 | 95 |
@@ -90,6 +90,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-15b | Spelling check scoped for client code | 2 | The Australian English check passes over Flutter and Next.js source while still failing on user-facing copy inside them | SHIP-15a |
 | SHIP-15c | Wave-2 shared surfaces: dependencies, isolation, error codes | 5 | Deps carries the pool and the Redis client, a second worktree's tests cannot drop this one's template, infrastructure importing a domain fails the lint, and httpx.RegisterCode backs a generated code list | SHIP-15a, SHIP-17a |
 | SHIP-15e | Wave-3 shared surfaces: the verify script, the handler helpers, the done list | 5 | A domain adds a verify section by adding a file and editing none; httpx.H and httpx.DecodeJSON exist and internal/identity uses them; the done list is merge=union; make web-check type-checks after the build | SHIP-15c, SHIP-44 |
+| SHIP-15g | Wave-4 shared surfaces: geocoding and pagination configuration, the out-of-order migration guard, a shutdown hook for scheduled tasks | 5 | Two tracks can start a wave without either needing an internal/config edit; a migration numbered below the current version can no longer be skipped silently; a scheduled task that owns a resource can release it | SHIP-15e |
 | SHIP-16 | Flutter project scaffold for iOS and Android | 2 | App builds and runs on both simulators | SHIP-1 |
 | SHIP-17 | Flutter feature-folder structure and state management choice | 3 | Structure matches Docs 07 §2 and the state approach is documented | SHIP-16 |
 | SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |
