@@ -1490,6 +1490,129 @@ front of somebody whose token had simply not arrived yet.
 Keychain — an interceptor tested against a hand-made session would pass with the session wired to
 nothing, and "concurrent calls refresh once" is a claim about the two of them together.
 
+### What SHIP-55 built, and the decision it was told to settle
+
+**The signed-out shell and the sign-in screen are one screen, not two.** SHIP-49 built the first as
+a placeholder holding a disabled button, because `POST /v1/auth/login` did not exist. It does
+(SHIP-41), and a landing screen whose only purpose is a button leading to a form is a tap somebody
+makes every time they are signed out. `/sign-in` is unchanged, so every redirect, guard entry and
+deep link still resolves to it, and `shell-signed-out` is still the key that says the app is
+showing the signed-out surface.
+
+**Nothing on the screen navigates on success, deliberately.** The session changing is what moves
+the app, through the router's guard — and the role that decides *which* shell comes from the
+access token the platform just signed. A screen that also pushed a route would be a second
+mechanism deciding where a signed-in user goes, and the two would disagree the first time somebody
+signed in from anywhere else.
+
+**Sign-in validates the password for presence only, and that is a real difference from
+registration.** `Validators.password` carries the ten-character minimum somebody must *choose*.
+Applying it to a password being *presented* would refuse an account whose password predates the
+current floor — locally, so the person could not even reach the platform that would have accepted
+them. The contract states the same rule from its side.
+
+**`identity_credentials_invalid` goes in the banner and never under the password field.** One code
+for a wrong password and for an address with no account is what stops an unauthenticated endpoint
+being an account-existence oracle; a client that put the message under one field would undo that
+by saying which one was recognised.
+
+**Retrying after a dropped connection reuses the key, and here that is not a nicety.** Each
+sign-in creates a device session, because there is no device identifier to match on — so a
+retried sign-in is exactly how somebody ends up with a device list they cannot make sense of and a
+second session live for thirty days. `ActionKey` retains the key when the outcome is unknown, so
+the platform replays its stored pair. A wrong password retires it, because the platform saw that
+attempt and a replayed refusal is not what the person asked for.
+
+**`device_label` is derived, not asked for.** The contract observes that a sign-in screen is the
+only moment a label could be collected, which reads as an argument for a third field; it is not
+taken, because a person signing in on their own phone should not be asked to name it and whatever
+they typed would be worse for the one job the field has. It is `iOS 17.0` / `Android 14`, parsed
+loosely from `Platform.operatingSystemVersion` — a model name needs `device_info_plus`, which is a
+package decision with two native integrations and a store-privacy consequence, and §9 carries it.
+
+**It lives in `core/device/` rather than `core/auth/`, and a test made that choice.**
+`token_store_is_not_preferences_test.dart` forbids `dart:io` anywhere under `core/auth/` — the
+application documents directory is the third location `Docs/07` §3 rules out — and its own note
+says the rule will acquire no exceptions. Reading `Platform` is enough to trip it. The rule was
+honoured rather than waived, which is what a rule written that way is for.
+
+**Two honest stand-ins were deleted, which is the other half of the ticket.**
+`DevelopmentSessionButton`, its placeholder token and the `kDebugMode` preview button at the end of
+signup are gone. SHIP-52's *Done when* — "role is chosen during signup and drives the post-login
+shell" — is now demonstrable as one flow rather than as two separate facts with a debug button
+between them: choose provider, register, verify both channels, sign in, land in the provider half.
+
+**The end of signup carries the address forward and not the password.** It could have kept the
+password from the form in memory and signed in automatically; a plaintext password in the provider
+tree is one crash report away from somewhere it must never be, and `Docs/07` §3 draws that line for
+tokens, which are the lesser secret. One field to type instead of two.
+
+#### Biometric unlock: **out of the MVP**, and here is what would change the answer
+
+`Docs/07` §9 said this closes "at SHIP-48 onwards" and `Docs/11` §9 moved it to SHIP-55 on the
+grounds that an optional local unlock is a gate on a sign-in screen and there was no sign-in
+screen. There is one now, so the excuse has expired and the decision is taken: **not in the MVP.**
+
+The reasoning, in the order it actually weighed:
+
+- **It is a convenience over the stored token and never a substitute for it** (`Docs/07` §3, which
+  fixed its position long before this). The token is already behind `first_unlock_this_device` on
+  iOS and a Keystore-wrapped key on Android — the device passcode gates it. What biometric unlock
+  adds is a second gate in front of an app on an **already unlocked** handset. That is a real gain
+  and a modest one, and it is not what a marketplace pilot holding no payment details is exposed
+  on.
+- **The cost is asymmetric across the two platforms, which was measured rather than assumed.**
+  iOS is nearly free: `IOSOptions.accessControlFlags` takes `biometryAny`, `biometryCurrentSet` or
+  `userPresence` on the store SHIP-48 already built. **Android is not: `AndroidOptions.biometric()`
+  requires API 28**, and this app's floor is API 24 — chosen in `Docs/07` §9 precisely because a
+  token store that is only *sometimes* hardware-backed is not the guarantee the document makes.
+  Enabling it would mean either raising the floor by four API levels or shipping two sets of
+  storage options, and "only sometimes biometric" is the same shape of half-guarantee that
+  argument rejected.
+- **An optional control needs somewhere to turn it off, and there is no settings surface.** Not in
+  the app and not in `Docs/09` before SHIP-173. Shipping it as non-optional contradicts §3's own
+  wording.
+- **`biometryCurrentSet` invalidates the entry when the enrolled biometrics change**, and
+  `resetOnError` is `true`, so adding a fingerprint would quietly sign somebody out. That is a
+  support event caused by a convenience feature.
+- **Deferring costs nothing structurally.** Nothing in the session design moves either way, and
+  adopting it later is a change to two constants in the one folder allowed to hold the token —
+  which is exactly the property SHIP-48 built for.
+
+**What would change the answer**, named so this is a decision and not a shrug:
+
+1. **The Android floor rising to API 28 for another reason.** SHIP-24 and SHIP-26 touch the Android
+   build configuration and already carry the `flutter_secure_storage` 11 / `compileSdk` question
+   (§9). If the floor moves there, the Android half of this becomes free and it should be
+   reconsidered in the same change.
+2. **A settings surface existing.** SHIP-173's in-app account screen is the first, and it is where
+   an opt-in would live.
+3. **The pilot holding something that makes an unlocked handset a real exposure** — payment details
+   (the MVP holds none, `CLAUDE.md`), or a customer address history on a shared device.
+
+Until one of those, this stays out. **`Docs/07` §9's table row and its closing paragraph still
+describe it as open and pointing at SHIP-48**; this branch owns `apps/mobile/**` and `Docs/11`
+only, so correcting those two lines belongs to whoever reconciles the documents next.
+
+**How it was demonstrated.** `make flutter-check` in the wave-4 worktree: 219 host tests, up from
+198 — the sign-in screen driven through the real router, guard, session and shell, with the socket
+and the Keychain the only substitutions. Then on an iPhone 17 simulator against this worktree's API
+on 8092, through `apps/mobile/integration_test/sign_in_test.dart`: an account registered by `curl`,
+signed in **from the form**, landing in the provider half — with the role having travelled out of a
+token the platform signed and through nothing that was told what it was. Its second test relaunches
+over the same real Keychain, which is where SHIP-50's first refresh is demonstrated for real: the
+service log shows `POST /v1/auth/refresh 200` and the stored token is not the one that was
+presented, so the rotation happened.
+
+**One thing worth knowing for anybody running the API in a worktree.** Sign-in answered `500` until
+the local `shipper_b` database was rebuilt. `make migrate-up` had reported "no change" against a
+schema whose `device_sessions` was missing `refresh_token_expires_at` and `revoked_at`: the
+recorded version was `404`, from the jobs block, so the identity block's `000103` and `000104` sat
+*below* it and were never applied. That is the condition SHIP-15g's note already describes — a
+database bitten before the guard existed is backfilled as healthy — and the fix is the one it
+gives: `make migrate-down n=all && make migrate-up`. No repository change; the guard is already
+there for new databases.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -1711,13 +1834,19 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **`flutter_secure_storage` is held at 10.x because version 11 needs `compileSdk = 37`.** The client compiles against 36 today, and Android Gradle Plugin 9.0.1 names 36 as its own maximum recommended — so taking 11 means moving the SDK and probably the Gradle plugin together. There is no urgency: 10.3.1 uses the same Keystore-wrapped ciphers and the same API 23 requirement. **Decide it with SHIP-24 and SHIP-26**, which are the tickets that touch the Android build configuration anyway.
 
-**Biometric unlock is still open, and SHIP-48 is where `Docs/07` §9 said it would close.** It did not, and the reason is that the thing it would sit in front of does not exist yet: an optional local unlock is a gate on a sign-in screen, and the first sign-in screen is SHIP-55. Nothing in the session design moves either way — `Docs/07` §3 already fixes its position as a convenience over the stored token and never a substitute for it — so the cost of leaving it is another wave of nothing happening. `flutter_secure_storage` offers it as an option on the store this ticket built (`AndroidOptions.biometric`, and iOS access-control flags), which means adopting it later is a change to two constants rather than a change to the design. **Decide at SHIP-55.**
+**~~Biometric unlock is still open.~~ Decided at SHIP-55 — see §3. Out of the MVP, with three named triggers that would reopen it.** The short version: it is a convenience over a token the device passcode already gates, `AndroidOptions.biometric()` needs API 28 against this app's floor of 24, and an optional control needs a settings surface that does not exist before SHIP-173. The reopening triggers are the Android floor moving at SHIP-24/26, a settings screen existing, or the pilot holding something that makes an unlocked handset a real exposure. **`Docs/07` §9 still describes it as open in two places — a table row and its closing paragraph — and needs one line each.**
 
 **~~§10's done block should probably be `merge=union`, and §3 probably should not.~~ Decided and done at SHIP-15e — see §3.** Both halves were kept: the list is `merge=union` and §3 is not. Since a git attribute applies to a whole file, the list moved to `Docs/11-done.txt`, one ticket per line — which the recommendation had not noticed matters, because a union resolves line by line and the old block put several tickets on one line.
 
 **~~`scripts/verify-foundation.sh` is the sixth shared surface, and it has no include mechanism.~~ Decided and split at SHIP-15e — see §3.** It is a harness plus one file per milestone or domain in `scripts/verify/`, numbered in reserved ranges the way migrations are, and a track adds a file rather than editing one. The count was unchanged at 105 across the split, which is the evidence the move lost nothing. **That 105 is a historical figure, not today's** — wave 3 took it to 208; §3 carries the current count.
 
 **~~`device_sessions` has no expiry column.~~ Decided and built at SHIP-39 — see §3.** An explicit `device_sessions.refresh_token_expires_at`, `NOT NULL` with no default, in migration `000103`. The window **slides** — rewritten on every rotation, 30 days — so inactivity ends a session and daily use never does. **A Redis TTL was rejected** (`Docs/10` §5: a control a cache flush undoes is not one), and so was deriving expiry from `last_seen_at + TTL`, because that is a *display* column which SHIP-46 writes from a device-list **read** — a derived lifetime would mean every future write silently extends a credential. **No absolute session cap, deliberately**: that is a policy control with a product consequence rather than a mechanism, and it is another column and another migration whenever it is wanted.
+
+**Signing out on the device does not end the session on the platform, and SHIP-50 is what makes fixing it possible.** `SessionController.signOut` clears the Keychain and the in-memory access token; `POST /v1/auth/logout` (SHIP-43) is never called, so the refresh token it just discarded stays valid server-side for up to thirty days and the device keeps a row in `GET /v1/auth/sessions`. It was out of scope for SHIP-50 and SHIP-55 — neither *Done when* mentions it, and until SHIP-50 the client had no access token to authenticate the call with. It is now a handful of lines: a fire-and-forget call before the local clear, which must not block or fail the sign-out (`Docs/07` §3 is explicit that the device catching up is what this is). **No ticket owns it.** SHIP-143 is the nearest — "de-registers on sign-out" — and would be a reasonable home, or a small follow-up of its own.
+
+**`httpx.WriteError` discards the cause of an unmapped error.** An `error` that is not an `*httpx.Error` becomes `StatusError(500)` and the original is not logged anywhere, so the service records `status 500` and nothing about why. Found while demonstrating SHIP-55: sign-in answered `500` against a stale local database and the only route to the cause was reading the handler. A one-line `LoggerFrom(r.Context()).Error(...)` on the fallback branch would have named it immediately. **Not a defect in behaviour** — the response contract is correct and deliberately says nothing — but it is an observability gap in the one path where the platform has no idea what went wrong either. Whoever next touches `internal/httpx` should take it.
+
+**`device_label` is a platform name and a version rather than a model name.** `core/device/device_label.dart` sends `iOS 17.0` or `Android 14`, which is what `dart:io` can answer. "iPhone 15 Pro" needs `device_info_plus` — a package decision with two native integrations and a store data-safety consequence, deliberately not taken inside a two-point ticket. The field is display text for the device list (SHIP-46) and two handsets may legitimately share a label, so nothing is broken; it is simply less useful than it could be. One function changes when somebody adds the package.
 
 **The mobile bundle identifier has no owner and stops being changeable.** `apps/mobile` currently uses a provisional `au.com.shipper` for both the iOS bundle id and the Android application id. **Once X-2 and X-3 publish a build, neither can be changed** — a new identifier is a new app listing, with a new install base. Confirm it before SHIP-25 or SHIP-27, not after. The staging and production hostnames baked into the API client (`api.staging.shipper.com.au`, `api.shipper.com.au`) are provisional in the same way, though those are only configuration; `SHIPPER_API_BASE_URL` overrides them meanwhile.
 

@@ -24,36 +24,35 @@ import '../../core/auth/session_fixtures.dart';
 import 'fake_identity_repository.dart';
 import 'signup_app.dart';
 
-/// Boots the app into a signed-in shell, which without a sign-in endpoint means one of two
-/// things: a cold start with a token in the keychain and no role, or the debug-only affordance
-/// that stores a placeholder and claims one.
+/// Boots the app into a signed-in shell, one of the two ways a device reaches one.
 ///
-/// `flutter test` runs in debug, so that affordance is present here; a release build tree-shakes
-/// it and its placeholder string away entirely.
+/// With a [role]: through the sign-in form, against a platform whose access token carries that
+/// role — which is the whole of "drives the post-login shell", finally end to end rather than as
+/// two separate facts.
 ///
-/// **The refresher is stubbed unreachable, and that is what keeps the no-role case reachable at
-/// all.** SHIP-50 refreshes as soon as the keychain answers, and a successful refresh brings the
-/// role with it — so "signed in and not yet knowing as whom" is now the window before that
-/// answers, and the cold start that cannot reach the platform.
+/// Without one: a cold start with a token in the keychain, where the app knows it is signed in
+/// and not yet as whom. **The refresher is stubbed unreachable, and that is what keeps this case
+/// reachable at all** — SHIP-50 refreshes as soon as the keychain answers and a successful
+/// refresh brings the role with it, so the no-role state is now the window before that answers,
+/// plus the cold start that cannot reach the platform.
 Future<ProviderContainer> _signedIn(WidgetTester tester, {UserRole? role}) async {
-  await tester.pumpWidget(
-    ProviderScope(
-      overrides: [
-        tokenStoreProvider.overrideWithValue(
-          role == null ? FakeTokenStore(refreshToken: 'refresh-abc') : FakeTokenStore(),
-        ),
-        sessionRefresherProvider.overrideWithValue(
-          FakeSessionRefresher()..failure = const ApiUnreachable(),
-        ),
-      ],
-      child: const ShipperApp(),
-    ),
-  );
-  await tester.pumpAndSettle();
-
-  if (role != null) {
-    await tester.tap(find.byKey(Key('development-session-${role.name}')));
+  if (role == null) {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          tokenStoreProvider.overrideWithValue(FakeTokenStore(refreshToken: 'refresh-abc')),
+          sessionRefresherProvider.overrideWithValue(
+            FakeSessionRefresher()..failure = const ApiUnreachable(),
+          ),
+        ],
+        child: const ShipperApp(),
+      ),
+    );
     await tester.pumpAndSettle();
+  } else {
+    await tester.pumpWidget(signupApp(FakeIdentityRepository()..tokens = aTokenPair(role: role)));
+    await tester.pumpAndSettle();
+    await signInThrough(tester);
   }
 
   return ProviderScope.containerOf(tester.element(find.byType(MaterialApp)), listen: false);
@@ -177,17 +176,23 @@ void main() {
     });
   });
 
-  testWidgets('the end of signup can preview the shell the chosen role selects', (tester) async {
-    // The debug-only bridge across the gap SHIP-55 closes. It is what makes "chosen at signup"
-    // and "drives the shell" one demonstrable flow on a device rather than two separate facts.
-    final identity = FakeIdentityRepository();
+  testWidgets('signing up as a provider and signing in lands in the provider half',
+      (tester) async {
+    // SHIP-52's *Done when* as one flow, which until SHIP-55 it could not be: the role is chosen
+    // on the first screen of signup, sent to registration, signed into the access token by the
+    // platform, and read back out of it to select the shell. Every step is the application's own
+    // — only the socket and the Keychain are substituted.
+    final identity = FakeIdentityRepository()..tokens = aTokenPair(role: UserRole.provider);
     await registerThrough(tester, identity, role: UserRole.provider);
     await verifyEmailThrough(tester);
     await verifyPhoneThrough(tester);
 
-    await tester.tap(find.byKey(const Key('development-session-provider')));
+    await tester.tap(find.byKey(const Key('registered-done')));
     await tester.pumpAndSettle();
 
+    await signInThrough(tester);
+
     expect(find.byKey(const Key('shell-provider')), findsOneWidget);
+    expect(find.byKey(const Key('shell-customer')), findsNothing);
   });
 }

@@ -14,6 +14,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/api/idempotency_interceptor.dart';
 import 'package:shipper/core/auth/user_role.dart';
+import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 
 class _StubAdapter implements HttpClientAdapter {
@@ -62,6 +63,14 @@ const _account = <String, Object?>{
   'email_verified': false,
   'phone_verified': false,
   'created_at': '2026-08-11T04:11:52.418Z',
+};
+
+/// The `TokenPair` example from the contract, verbatim.
+const _tokenPair = <String, Object?>{
+  'access_token': 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIwMTkxZjNjMiJ9.signature',
+  'expires_in': 900,
+  'refresh_token': 'hV8pQ2mXk4tZ7nR1bY6wJ3sL0aD5cF9gE2iU8oT4xM7',
+  'refresh_token_expires_in': 2592000,
 };
 
 Map<String, Object?> _sentBody(RequestOptions options) {
@@ -205,6 +214,73 @@ void main() {
       expect(sent.path, '/v1/auth/verify-phone');
       expect(_sentBody(sent), {'phone': '+61412345678', 'code': '408213'});
       expect(account.phoneVerified, isTrue);
+    });
+  });
+
+  group('login', () {
+    test('posts the contract body, including the device label', () async {
+      // device_label has no default on the platform's side, deliberately: four rows reading
+      // "Unknown device" cannot be acted on at SHIP-46. The platform refuses unknown fields, so
+      // `deviceLabel` reaching the wire as anything but `device_label` is a 400 from a build
+      // already on a phone.
+      final (:repo, :adapter) = _repoReturning(_tokenPair);
+
+      await repo.login(
+        email: 'alice@example.com',
+        password: 'correct-horse-battery-staple',
+        deviceLabel: "Nethmin's iPhone",
+        idempotencyKey: 'key-7',
+      );
+
+      final sent = adapter.requests.single;
+      expect(sent.method, 'POST');
+      expect(sent.path, '/v1/auth/login');
+      expect(sent.headers[ApiHeaders.idempotencyKey], 'key-7');
+      expect(_sentBody(sent), {
+        'email': 'alice@example.com',
+        'password': 'correct-horse-battery-staple',
+        'device_label': "Nethmin's iPhone",
+      });
+    });
+
+    test('decodes the pair', () async {
+      final (:repo, adapter: _) = _repoReturning(_tokenPair);
+
+      final pair = await repo.login(
+        email: 'alice@example.com',
+        password: 'correct-horse-battery-staple',
+        deviceLabel: 'iOS 17.0',
+        idempotencyKey: 'key-7',
+      );
+
+      expect(pair.accessToken, _tokenPair['access_token']);
+      expect(pair.refreshToken, _tokenPair['refresh_token']);
+    });
+
+    test('a wrong password is a 400, not a 401', () async {
+      // The domain's rule: a credential in the request body is refused with 400, one in the
+      // bearer header with 401. It is what keeps SHIP-50's interceptor out of a loop — a 401
+      // here would send it to refresh and replay a sign-in.
+      final (:repo, adapter: _) = _repoReturning({
+        'error': {
+          'code': 'identity_credentials_invalid',
+          'message': 'Check your email address and password.',
+        },
+      }, status: 400);
+
+      await expectLater(
+        repo.login(
+          email: 'alice@example.com',
+          password: 'wrong',
+          deviceLabel: 'iOS 17.0',
+          idempotencyKey: 'key-7',
+        ),
+        throwsA(
+          isA<ApiErrorResponse>()
+              .having((e) => e.statusCode, 'statusCode', 400)
+              .having((e) => e.code, 'code', 'identity_credentials_invalid'),
+        ),
+      );
     });
   });
 

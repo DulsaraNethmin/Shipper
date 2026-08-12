@@ -14,6 +14,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
+import 'package:shipper/core/auth/session_controller.dart';
 import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_store.dart';
@@ -173,19 +174,31 @@ void main() {
       expect(find.byKey(const Key('shell-signed-out')), findsOneWidget);
     });
 
-    testWidgets('storing a session moves the app to the signed-in shell', (tester) async {
-      // The debug-only affordance on the signed-out screen. It is what makes the cold-start
-      // criterion demonstrable on a simulator in a wave with no authentication endpoint —
-      // flutter test runs in debug, so it is present here.
+    testWidgets('starting a session moves the app to the signed-in shell', (tester) async {
+      // The session, not a screen, is what moves the app: nothing here navigates. SHIP-55's
+      // sign-in screen is one caller of this and SHIP-50's refresh is another, and neither
+      // should have to know where a signed-in user goes.
       final store = FakeTokenStore();
-      await tester.pumpWidget(_app(store));
+      late final ProviderContainer container;
+
+      await tester.pumpWidget(
+        _scope(
+          store,
+          child: Builder(
+            builder: (context) {
+              container = ProviderScope.containerOf(context, listen: false);
+              return const ShipperApp();
+            },
+          ),
+        ),
+      );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byKey(const Key('development-session')));
+      await container.read(sessionProvider.notifier).signIn(aTokenPair(refreshToken: 'refresh-1'));
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('shell-signed-in')), findsOneWidget);
-      expect(store.refreshToken, isNotNull);
+      expect(store.refreshToken, 'refresh-1');
     });
 
     testWidgets('the router survives a session change rather than being rebuilt',

@@ -20,10 +20,14 @@
 /// - `session_refresher.dart` — `POST /v1/auth/refresh`. The session's own call, not a
 ///   screen's, which is why it is not on `IdentityRepository` (SHIP-50).
 /// - `access_token.dart` — the `role` claim, read for presentation and never for authorisation.
-/// - `device_label.dart` — what a sign-in calls this handset in the device list (SHIP-55).
 ///
 /// **Nothing here decides what an account may do.** Signed in means this device holds a
 /// refresh token, which is a navigation fact; the platform decides the rest, on every request.
+///
+/// **Nothing in this folder may import `dart:io`**, and `token_store_is_not_preferences_test.dart`
+/// enforces it: the application documents directory is the third location `Docs/07` §3 rules
+/// out, and the shortest route there is a token written to a cache "just while it syncs". That
+/// is why the device label a sign-in sends lives in `core/device/` — it reads `Platform`.
 ///
 /// The interceptor that reacts to a `401` is `core/api/auth_interceptor.dart`, because it is a
 /// `dio` interceptor. It takes the two-member interface it needs from the session rather than

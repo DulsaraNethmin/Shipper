@@ -41,11 +41,11 @@ void main() {
       await tester.pumpWidget(signupApp(identity));
       await tester.pumpAndSettle();
 
-      // Sign-in is disabled rather than absent: Docs/07 §3 lets the app hide or disable, and
-      // there is no POST /v1/auth/login to call until SHIP-41.
+      // Sign-in is a working form from SHIP-55 — the signed-out shell and the sign-in screen
+      // are one screen, and registration is the other way out of it.
       expect(
         tester.widget<FilledButton>(find.byKey(const Key('sign-in'))).onPressed,
-        isNull,
+        isNotNull,
       );
 
       await tester.tap(find.byKey(const Key('create-account')));

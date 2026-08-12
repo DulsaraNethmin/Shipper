@@ -12,7 +12,7 @@ import 'package:shipper/features/identity/phone_verification_screen.dart';
 import 'package:shipper/features/identity/registration_complete_screen.dart';
 import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/role_selection_screen.dart';
-import 'package:shipper/features/identity/signed_out_screen.dart';
+import 'package:shipper/features/identity/sign_in_screen.dart';
 
 /// Route paths, named once.
 ///
@@ -24,7 +24,13 @@ abstract final class Routes {
   /// Where a cold start lands while the keychain is being read.
   static const starting = '/';
 
-  /// The signed-out shell. Registration hangs off it from SHIP-51; sign-in is SHIP-55.
+  /// The signed-out shell, which **is** the sign-in screen from SHIP-55. Registration hangs off
+  /// it (SHIP-51).
+  ///
+  /// It takes an optional `?email=` so the end of the signup journey can arrive with the address
+  /// it just registered. Same mechanism as [verifyEmail]'s token, and for the same reason: a
+  /// query parameter survives a redirect through the guard, where a constructor argument does
+  /// not.
   static const signIn = '/sign-in';
 
   /// The first step of signup: which half of the marketplace this account is (SHIP-52).
@@ -53,8 +59,9 @@ abstract final class Routes {
 
   /// Where the signup journey ends (SHIP-51).
   ///
-  /// A stub, and honestly so: the real ending signs the new account in, which needs
-  /// `POST /v1/auth/login` — SHIP-41, consumed by SHIP-55. Neither exists yet.
+  /// It hands over to [signIn] carrying the address just registered. The account is deliberately
+  /// **not** signed in automatically: `POST /v1/auth/register` returns no token, and the only way
+  /// to a session is a password this app does not keep after the form that took it.
   static const registered = '/register/done';
 
   /// The signed-in shell. Role-aware from SHIP-52.
@@ -199,7 +206,9 @@ final routerProvider = Provider<GoRouter>((ref) {
       ),
       GoRoute(
         path: Routes.signIn,
-        builder: (context, state) => const SignedOutScreen(),
+        builder: (context, state) => SignInScreen(
+          prefilledEmail: state.uri.queryParameters['email'],
+        ),
       ),
       GoRoute(
         path: Routes.chooseRole,

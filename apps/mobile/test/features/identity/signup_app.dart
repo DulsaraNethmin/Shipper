@@ -2,11 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
+import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/auth/user_role.dart';
+import 'package:shipper/core/device/device_label.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 
 import '../../core/auth/fake_token_store.dart';
+import '../../core/auth/session_fixtures.dart';
 import 'fake_identity_repository.dart';
 
 /// The real app, with the two things a widget test cannot have.
@@ -24,10 +27,20 @@ Widget signupApp(FakeIdentityRepository identity, {FakeTokenStore? store}) {
     overrides: [
       tokenStoreProvider.overrideWithValue(store ?? FakeTokenStore()),
       identityRepositoryProvider.overrideWithValue(identity),
+      // A restored session refreshes as soon as the keychain answers (SHIP-50). None of these
+      // tests starts with a stored token, so nothing refreshes — but a test that later does
+      // would otherwise open a socket to whatever is listening on the local API port.
+      sessionRefresherProvider.overrideWithValue(FakeSessionRefresher()),
+      // Pinned, because a login body is asserted against it and the real one is whatever the
+      // host machine happens to be running.
+      deviceLabelProvider.overrideWithValue(testDeviceLabel),
     ],
     child: const ShipperApp(),
   );
 }
+
+/// The device label every widget test signs in with.
+const testDeviceLabel = 'iOS 17.0';
 
 /// Boots the app and walks it from the signed-out shell to the role screen, which is where
 /// signup starts (SHIP-52).
@@ -93,6 +106,23 @@ Future<void> verifyEmailThrough(
   await tester.pumpAndSettle();
 
   await tester.tap(find.byKey(const Key('verify-email-continue')));
+  await tester.pumpAndSettle();
+}
+
+/// Signs in through the form on the signed-out screen (SHIP-55).
+///
+/// The values default to ones both this device's validators and the platform accept. What the
+/// sign-in actually answers with is [FakeIdentityRepository.tokens].
+Future<void> signInThrough(
+  WidgetTester tester, {
+  String email = 'alice@example.com',
+  String password = 'correct-horse-battery-staple',
+}) async {
+  await tester.enterText(find.byKey(const Key('sign-in-email')), email);
+  await tester.enterText(find.byKey(const Key('sign-in-password')), password);
+  await tester.pump();
+
+  await tester.tap(find.byKey(const Key('sign-in')));
   await tester.pumpAndSettle();
 }
 

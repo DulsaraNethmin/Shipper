@@ -2,18 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import 'package:shipper/core/auth/development_session.dart';
 import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/identity/signup_controller.dart';
 
-/// Where the signup journey ends (SHIP-51).
+/// Where the signup journey ends (SHIP-51), and hands over to sign-in (SHIP-55).
 ///
-/// **This screen is a deliberate stub, and the stub is the honest part.** The journey's real
-/// ending is the app signing the new account in and landing it in the shell its role selects —
-/// and that needs `POST /v1/auth/login`, which is SHIP-41, consumed by SHIP-55. Neither exists,
-/// and `Docs/11` §7 forbids a screen depending on an endpoint from its own wave. So rather than
-/// invent a sign-in path that would have to be deleted, this says plainly what was created, what
-/// is verified, and what is not yet possible.
+/// **The new account is not signed in automatically, and that is the platform's design rather
+/// than a gap.** `POST /v1/auth/register` returns an account and no token — registering is not
+/// signing in — so the only route to a session is `POST /v1/auth/login` with the password. This
+/// screen could have kept that password in memory from the form and used it, and deliberately
+/// does not: a plaintext password living in the provider tree is one crash report away from being
+/// somewhere it must never be (`Docs/07` §3 draws that line for tokens, and a password is worse).
+/// It carries the *address* forward instead, so the person types one field rather than two.
 ///
 /// It reads the account rather than a local flag, so what it reports is the platform's answer to
 /// the last verification call and not the client's belief about it.
@@ -58,38 +58,32 @@ class RegistrationCompleteScreen extends ConsumerWidget {
             ),
             const SizedBox(height: 24),
             Text(
-              // Not a placeholder for a screen somebody forgot: there is no sign-in endpoint on
-              // the platform yet. Saying so beats a button that fails, and beats a screen that
-              // implies the account cannot be used.
-              'Signing in from the app arrives in a later build. Everything above is recorded '
-              'on the platform, and this account is the one you will sign in to.',
+              'Signing in is the last step. Your account is created and everything above is '
+              'recorded on the platform.',
               key: const Key('registered-next'),
               style: theme.textTheme.bodySmall,
             ),
             const SizedBox(height: 24),
-            // Debug builds only, and tree-shaken out of anything else — see
-            // core/auth/development_session.dart for why it exists and what it is not.
-            //
-            // It is here because SHIP-52's *Done when* is "role is chosen during signup and
-            // drives the post-login shell", and this is the only point in the app where both
-            // halves of that sentence meet: the role a person just chose, and the shell it
-            // selects. Without a sign-in endpoint the link between them is otherwise only
-            // demonstrable as two separate things. SHIP-55 replaces this with the real sign-in.
-            DevelopmentSessionButton(
-              label: 'Preview the ${signup.role.label.toLowerCase()} shell',
-              role: signup.role,
-            ),
-            const SizedBox(height: 8),
             FilledButton(
               key: const Key('registered-done'),
               onPressed: () {
+                // The address is read before the reset, and carried in the route rather than left
+                // in state for the next screen to find. The sign-in screen belongs to no journey
+                // and must work identically on a fresh install.
+                final email = signup.email;
+
                 // The journey is over, so its state goes with it. Leaving an account and a
                 // handful of idempotency keys behind would mean a second signup on this device
                 // started half-way through the first one.
                 ref.read(signupProvider.notifier).reset();
-                context.go(Routes.signIn);
+
+                context.go(
+                  email == null
+                      ? Routes.signIn
+                      : Uri(path: Routes.signIn, queryParameters: {'email': email}).toString(),
+                );
               },
-              child: const Text('Back to start'),
+              child: const Text('Sign in'),
             ),
           ],
         ),
