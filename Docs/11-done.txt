@@ -2,8 +2,14 @@
 #
 # Authoritative. `make status` reads it, counts it against the backlog in Docs/09, and
 # cross-checks it against what commit subjects claim. A ticket belongs here only when its
-# *Done when* line in Docs/09 is demonstrable — the two partly-finished tickets in Docs/11 §4
-# are deliberately absent.
+# *Done when* line in Docs/09 is demonstrable.
+#
+# Docs/11 §4 lists the partly-finished tickets, and they are NOT all absent from this list.
+# Of the three, only SHIP-134 is absent. SHIP-65 and SHIP-149 are here as well as there,
+# because each landed and is named by a commit subject, while one clause of its *Done when*
+# belongs to a ticket that does not exist yet. Do not "tidy" them out: `make status` exits 1
+# when git shows a ticket this file does not declare, so removing one breaks the build rather
+# than making it more honest. Docs/11 §10 carries the full reasoning.
 #
 # Add a ticket in the same change that finishes it, in the same commit as the Docs/11 §3 entry
 # that says what it built.

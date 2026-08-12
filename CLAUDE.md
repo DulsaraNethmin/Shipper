@@ -288,16 +288,20 @@ mk/                   per-track make targets, glob-included by the root Makefile
 .github/workflows/    go.yml (SHIP-20); Flutter and the store pipelines follow
 ```
 
-The eight domain packages hold documentation and nothing else: no domain logic has been
-written. Their boundaries are enforced from now rather than from when they fill up, because
-`Docs/08` is right that they are almost impossible to reintroduce later.
+Two of the eight domain packages now hold logic — `identity` (passwords, tokens, sessions,
+rate limiting) and `jobs` (locations, the store, the handlers) — and the other six hold
+documentation and nothing else. Their boundaries were enforced from before they filled up,
+because `Docs/08` is right that they are almost impossible to reintroduce later, and the
+first two domains to fill have not needed to cross one.
 
 Adding a package directly under `internal/` fails the lint until it is classified as a
 domain or as infrastructure in `internal/boundaries/boundaries.go`. That is deliberate —
 it makes a ninth domain a decision someone recorded rather than something that happened.
 
-The infrastructure list is **seeded ahead of the code**: `pagination`, `ratelimit` and `money`
-are registered but not yet written. Whoever first needs one writes the package and edits
+The infrastructure list is **seeded ahead of the code**, and the mechanism has now been
+demonstrated rather than asserted: `ratelimit` (SHIP-47) and `pagination` (SHIP-66) were
+written in the same wave, in different lanes, **with no shared-file edit between them**. Only
+`money` remains registered and unwritten. Whoever first needs one writes the package and edits
 nothing shared. A domain that needs internal structure uses a sub-package — `internal/jobs/expiry`
 is attributed to `jobs`, may import it, and needs no registration.
 

@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**203 tickets, 626 points.**
+**204 tickets, 631 points.**
 
 ## How to read this
 
@@ -24,6 +24,10 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 
 **Depends on** lists real blockers only, not merely earlier tickets. Where a ticket has no dependency it can genuinely be pulled forward if you want a change of pace.
 
+**Dependencies point backwards, with exactly two exceptions — do not write a parser that assumes otherwise.** `SHIP-15c` depends on `SHIP-17a` and `SHIP-15e` depends on `SHIP-44`, both because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Both targets are long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
+
+**The two totals above are maintained by hand and the rows are the truth.** `scripts/delivery-status.sh` parses the rows, so `make status` is unaffected by a stale header — which is precisely why one drifted unnoticed after SHIP-15e was added. If the two disagree, correct the header.
+
 **A letter suffix means a ticket added after the first draft.** `SHIP-57a` sorts immediately after `SHIP-57` and before `SHIP-58`, so build order is preserved without renumbering two hundred rows. Each one exists because work the plan assumed turned out to belong to no ticket — a table nobody created, an adapter nobody owned, a process four scheduled tasks all needed.
 
 ## Milestones
@@ -31,7 +35,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 32 | 82 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 33 | 87 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 26 | 78 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 27 | 95 |
