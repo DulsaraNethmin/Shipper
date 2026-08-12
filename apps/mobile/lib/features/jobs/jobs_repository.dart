@@ -68,7 +68,7 @@ abstract interface class JobsRepository {
   ///
   /// No idempotency key: a read changes nothing, and the middleware lets read-only methods
   /// through untouched.
-  Future<Page<Job>> jobs({String? cursor});
+  Future<ApiPage<Job>> jobs({String? cursor});
 }
 
 /// The real one, over [ApiClient].
@@ -107,8 +107,8 @@ final class ApiJobsRepository implements JobsRepository {
   }
 
   @override
-  Future<Page<Job>> jobs({String? cursor}) async {
-    return Page.fromJson(
+  Future<ApiPage<Job>> jobs({String? cursor}) async {
+    return ApiPage.fromJson(
       await _client.getJson(
         _base,
         query: <String, dynamic>{if (cursor != null && cursor.isNotEmpty) 'cursor': cursor},

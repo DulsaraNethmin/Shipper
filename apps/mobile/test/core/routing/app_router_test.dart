@@ -21,7 +21,9 @@ import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/health/health_repository.dart';
 import 'package:shipper/core/health/health_status.dart';
 import 'package:shipper/core/routing/app_router.dart';
+import 'package:shipper/features/jobs/jobs_repository.dart';
 
+import '../../features/jobs/fake_jobs_repository.dart';
 import '../auth/fake_token_store.dart';
 import '../auth/session_fixtures.dart';
 
@@ -261,6 +263,10 @@ Widget _scope(FakeTokenStore store, {required Widget child}) => ProviderScope(
         // every cold-start test here would open a socket to whatever is listening on the local
         // API port — which is nothing on CI and, on a developer's machine, is the API.
         sessionRefresherProvider.overrideWithValue(FakeSessionRefresher()),
+        // The refresher above answers with a customer token, so a restored cold start lands in
+        // the customer half — which reads that customer's jobs as soon as it is drawn (SHIP-76).
+        // Without this it would open a socket to whatever is listening on the local API port.
+        jobsRepositoryProvider.overrideWithValue(FakeJobsRepository()),
       ],
       child: child,
     );

@@ -1763,6 +1763,75 @@ a missing coordinate. The path is covered by the screen tests and by the platfor
 `location_test.go`; a live demonstration needs either a staging deployment with no geocoder
 configured or a stub built with an unknown address, and neither belongs in a Flutter ticket.
 
+### SHIP-76 — the customer's jobs, and the budget widget that is private on purpose
+
+The `shell-customer` placeholder is now the customer's own jobs, grouped by status, with
+pull-to-refresh. The key is unchanged, so every routing and sign-in test still asserts the same
+fact.
+
+**The list is read once and grouped on the device.** `?status=` takes one value, so a screen
+showing every status a customer has would need twelve requests to draw itself — twelve round trips
+on mobile data, and twelve chances for a partial failure to produce a screen missing a group with
+no error to explain it. The contract recommends the opposite and this follows it. The grouping is
+a pure function tested as one, and the order comes from `JobStatus.values` rather than from a list
+written beside it, so a status added in `Docs/02` §1's order is grouped in that order with nothing
+else to edit.
+
+**The group headings carry no counts, and that is honesty rather than an omission.** The list is
+paged and the page size is server configuration, so a group holds the jobs that have been read
+rather than every job in that status. A number would be right on the first page and quietly wrong
+on every screen with more. What the screen says instead, when there is more, is "Showing your most
+recent jobs" above a button that asks for the next page — the further pages are the customer's
+decision rather than an unbounded read to draw one screen.
+
+**A customer with no jobs sees an empty state, and it is not the failure state.** "You have no
+jobs" and "we could not find out" are different things to be told and only one of them has a
+retry. A refresh that fails leaves the list on screen with a banner over it, because somebody who
+pulled to refresh in a tunnel should still be looking at their jobs.
+
+**`_JobCard` is private and must stay private.** It draws `budget_cents`, which is legitimate
+because every job on this screen belongs to the person looking at it — and `Docs/01` §4.3 is
+hardest to keep with a shared card taking a budget and a flag saying whether to show it, where the
+flag is one careless call site away from wrong and nothing fails.
+`budget_stays_on_the_customer_side_test.dart` scans `lib/` with comments stripped and fails when
+the budget is named outside a four-file allow list. **It is the client's half of the platform's
+`TestOnlyTheOwnersResponseCarriesTheBudget`, and it is not a duplicate of it**: the Go test stops
+the field reaching a provider's device, and this stops a widget that renders it being reused on a
+provider screen. SHIP-82 writes its own card, as the platform writes its own response type.
+
+**The provider half is asserted to read nothing.** A provider sees no job list and no publish
+button, and the fake repository records no call. The platform would refuse a provider creating a
+job (`jobs_customer_only`), and that is a different thing from the app not offering it.
+
+**`customerJobsProvider` is auto-disposed, and that is what clears one account's jobs before the
+next signs in.** `Docs/07` §3 requires cached job data to go with the token at sign-out; sign-out
+unmounts the shell, which drops the last listener. Kept alive it would hold the previous account's
+jobs in memory for whoever signed in next on the same handset. A token refresh does *not* dispose
+it — the shell rebuilds and the list widget stays mounted — while leaving for the job wizard and
+coming back does, which is how a draft just saved appears without anybody pulling.
+
+**One thing SHIP-71 got wrong and this fixed: `core/api/page.dart` exported `Page`.**
+`package:flutter/material` exports `Page`, the navigator's route descriptor, so the name is
+ambiguous in every file that draws a widget — which is every screen that would consume it. It is
+`ApiPage` now, matching `ApiClient`, `ApiFailure` and `ApiHeaders` in the same folder. The
+collision was invisible until a widget file imported it.
+
+**How it was demonstrated.** `make flutter-check` in the wave-4 worktree: **292 host tests**, up
+from 219 before this branch. Then against this worktree's API on 8092, by `curl`, because the wire
+is where a client is actually wrong: a fresh customer's list is `{"data":[],"has_more":false}`
+(the empty state's whole premise); a draft created with `"state":"new south wales"` comes back
+`"NSW"` with a coordinate and a `formatted`; a half-filled address answers `422` with
+`pickup.state` and `pickup.postcode` — the exact keys the form looks up — while an entirely empty
+`dropoff` produces no error at all; `PATCH` edits the same id rather than making a second job;
+`?status=Draft` is `400` where `?status=draft` is `200`; and `?limit=1` returns `has_more: true`
+with a cursor that fetches the second page and then reports `has_more: false`.
+
+**Not demonstrated live: the screens themselves on a simulator.** Everything above is the contract
+this client was written against, checked by hand; what has not been done in this branch is
+installing the build on a device and driving the two screens against that API, which is what
+SHIP-55's report did for sign-in. The widget tests drive the real router, guard, session and shell,
+so what a simulator would add is the platform channel and the renderer.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

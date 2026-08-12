@@ -8,6 +8,11 @@
 /// property of the API and not of jobs — bids, notifications and the provider feed all return it.
 /// The Go service made the same call at SHIP-66 and put it in `internal/pagination`.
 ///
+/// **`ApiPage` rather than `Page`, because Flutter already has one.** `package:flutter/material`
+/// exports `Page`, the navigator's route descriptor, so a bare `Page` is ambiguous in every file
+/// that draws a widget — which is every screen that would consume this. The prefix matches
+/// `ApiClient`, `ApiFailure` and `ApiHeaders` in the same folder.
+///
 /// ## The cursor is opaque and this class is what keeps it that way
 ///
 /// [nextCursor] is a token the endpoint issued. Nothing in the client may read it, compose one,
@@ -21,8 +26,8 @@
 /// fact. It is not: no cursor is also what the *first* request looks like, so a client that
 /// inferred the end of the list from an absent cursor would decide it had reached the end before
 /// it started.
-class Page<T> {
-  const Page({required this.data, this.nextCursor, this.hasMore = false});
+class ApiPage<T> {
+  const ApiPage({required this.data, this.nextCursor, this.hasMore = false});
 
   /// The items, in the order the platform returned them.
   ///
@@ -49,7 +54,7 @@ class Page<T> {
   /// [item] is allowed to throw. A row missing its `id` is the contract being broken rather than
   /// a field being added, and a caller that quietly dropped it would show a customer a list with
   /// a job silently missing from it.
-  static Page<T> fromJson<T>(
+  static ApiPage<T> fromJson<T>(
     Map<String, dynamic> json,
     T Function(Map<String, dynamic>) item,
   ) {
@@ -57,7 +62,7 @@ class Page<T> {
     final Object? cursor = json['next_cursor'];
     final Object? more = json['has_more'];
 
-    return Page<T>(
+    return ApiPage<T>(
       data: rows is List
           ? rows.whereType<Map<String, dynamic>>().map(item).toList(growable: false)
           : const [],

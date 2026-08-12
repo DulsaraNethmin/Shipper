@@ -133,8 +133,9 @@ void main() {
 
     testWidgets('a second tap while the first is in flight does not make a second draft',
         (tester) async {
+      final gate = Completer<void>();
       final jobs = await openLocations(tester);
-      jobs.gates['create'] = Completer<void>();
+      jobs.gates['create'] = gate;
 
       await fillAddresses(tester);
       await tester.tap(find.byKey(const Key('job-locations-submit')));
@@ -145,7 +146,9 @@ void main() {
       await tester.tap(find.byKey(const Key('job-locations-submit')));
       await tester.pump();
 
-      jobs.gates.remove('create');
+      gate.complete();
+      await tester.pumpAndSettle();
+
       expect(jobs.callsTo('create'), hasLength(1));
     });
   });

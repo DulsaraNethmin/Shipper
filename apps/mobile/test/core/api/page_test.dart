@@ -13,7 +13,7 @@ Map<String, dynamic> _itself(Map<String, dynamic> row) => row;
 
 void main() {
   test('an empty page is an empty list, not a null one', () {
-    final page = Page.fromJson(
+    final page = ApiPage.fromJson(
       <String, dynamic>{'data': <Object?>[], 'has_more': false},
       _itself,
     );
@@ -32,14 +32,14 @@ void main() {
       <String, dynamic>{'data': null},
       <String, dynamic>{'data': 'nope'},
     ]) {
-      expect(Page.fromJson(body, _itself).data, isEmpty, reason: '$body');
+      expect(ApiPage.fromJson(body, _itself).data, isEmpty, reason: '$body');
     }
   });
 
   test('the cursor is carried through untouched, and an empty one is no cursor', () {
     const token = 'MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTE';
 
-    final page = Page.fromJson(
+    final page = ApiPage.fromJson(
       <String, dynamic>{
         'data': <Object?>[
           <String, dynamic>{'id': 'a'},
@@ -56,7 +56,7 @@ void main() {
 
     // The empty string is what "no cursor" looks like on the way in as well, so the two have to
     // arrive as the same thing — otherwise a client asks for the page after nowhere.
-    final last = Page.fromJson(
+    final last = ApiPage.fromJson(
       <String, dynamic>{'data': <Object?>[], 'next_cursor': '', 'has_more': false},
       _itself,
     );
@@ -66,7 +66,7 @@ void main() {
   test('has_more is read rather than inferred from the cursor', () {
     // Absent `has_more` is false, and that is deliberately the safe direction: a client that
     // guessed "more" from a missing cursor would ask for the page after the end forever.
-    final page = Page.fromJson(
+    final page = ApiPage.fromJson(
       <String, dynamic>{
         'data': <Object?>[
           <String, dynamic>{'id': 'a'},

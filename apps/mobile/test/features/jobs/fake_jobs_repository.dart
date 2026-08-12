@@ -88,7 +88,7 @@ class FakeJobsRepository implements JobsRepository {
   Job Function(Map<String, Object?> fields) draft = (_) => aJob();
 
   /// What the list answers with.
-  Page<Job> page = const Page<Job>(data: <Job>[]);
+  ApiPage<Job> page = const ApiPage<Job>(data: <Job>[]);
 
   /// Set to make the next call of that action throw instead of answering.
   final failures = <String, Object>{};
@@ -147,7 +147,7 @@ class FakeJobsRepository implements JobsRepository {
   }
 
   @override
-  Future<Page<Job>> jobs({String? cursor}) {
+  Future<ApiPage<Job>> jobs({String? cursor}) {
     return _record(
       (
         action: 'list',
