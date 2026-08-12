@@ -22,6 +22,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/logging"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
 )
 
 // newRedisClient builds the Redis client from the configured URL.
@@ -56,6 +57,15 @@ func run() error {
 
 	log := logging.New(os.Stdout, cfg.Log.Level, cfg.Log.Format)
 	slog.SetDefault(log)
+
+	// Docs/10 §4.5 requires the page sizes to be configurable, and SHIP-66 left them as
+	// constants because a domain branch could not add the fields. Installed here, in the
+	// composition root, before anything can serve a request — which is the only window in
+	// which package state like this is safe to write.
+	pagination.SetBounds(pagination.Bounds{
+		Default: cfg.Pagination.DefaultPageSize,
+		Max:     cfg.Pagination.MaxPageSize,
+	})
 
 	info := buildinfo.Get()
 	log.Info("starting shipper core",

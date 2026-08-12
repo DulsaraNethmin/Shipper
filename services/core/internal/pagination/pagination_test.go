@@ -175,3 +175,42 @@ func TestACursorFieldCannotCarryTheSeparator(t *testing.T) {
 	}()
 	_ = Cursor{"a" + cursorSeparator + "b"}.Encode()
 }
+
+// The page sizes moved from constants to configuration at SHIP-15g. These cover the move itself:
+// that Limit reads what was installed, and that a bad Bounds cannot make every page empty.
+
+func TestLimitUsesTheInstalledBounds(t *testing.T) {
+	t.Cleanup(func() { SetBounds(Bounds{Default: DefaultLimit, Max: MaxLimit}) })
+	SetBounds(Bounds{Default: 5, Max: 50})
+
+	got, err := Limit("")
+	if err != nil || got != 5 {
+		t.Errorf("Limit(\"\") = %d, %v; want the configured default 5", got, err)
+	}
+
+	got, err = Limit("999")
+	if err != nil || got != 50 {
+		t.Errorf("Limit(\"999\") = %d, %v; want narrowing to the configured maximum 50", got, err)
+	}
+}
+
+// internal/config refuses all of these at load, so reaching SetBounds with one means a caller
+// built a Bounds by hand. Keeping the known-good fallbacks beats applying a zero default, which
+// would make every page empty and look like a database with no rows.
+func TestSetBoundsIgnoresValuesConfigWouldHaveRefused(t *testing.T) {
+	t.Cleanup(func() { SetBounds(Bounds{Default: DefaultLimit, Max: MaxLimit}) })
+
+	for name, b := range map[string]Bounds{
+		"zero default":         {Default: 0, Max: 100},
+		"zero maximum":         {Default: 20, Max: 0},
+		"default over ceiling": {Default: 200, Max: 100},
+	} {
+		SetBounds(Bounds{Default: DefaultLimit, Max: MaxLimit})
+		SetBounds(b)
+
+		got, err := Limit("")
+		if err != nil || got != DefaultLimit {
+			t.Errorf("%s: Limit(\"\") = %d, %v; want the fallback %d", name, got, err, DefaultLimit)
+		}
+	}
+}

@@ -97,36 +97,48 @@ func jobsHandler(d Deps) *jobs.Handler {
 // in its own ports.go and imports nothing from internal/platform, and the adapter knows nothing
 // about jobs. Go satisfies the interface structurally, and the two meet here (Docs/06 §4.1).
 //
-// # Why staging and production get no geocoder at all
+// # Development uses the stub; everything else uses what is configured
 //
-// Because there is nothing to give them. No document names a maps vendor, and there is no
-// GEOCODING_* configuration for one — geocoding.Provider takes its base URL and credential as its
-// own Options, and internal/config has no fields to fill them from. Adding them is a shared-surface
-// change (internal/config and deploy/.env.example, held to each other by a test), which SHIP-60
-// could not make from a domain branch.
+// SHIP-15g added GEOCODING_BASE_URL and GEOCODING_API_KEY, which SHIP-60 needed and could not add
+// from a domain branch. So this now builds the real provider when one is configured, and the
+// unconfigured case is the only one that still ends in nil.
 //
-// Of the three ways to leave it, this is the least bad:
+// Falling back to geocoding.Stub outside development remains refused, and the reason has not
+// changed: the stub writes coordinates that are stable, plausible, inside Australia, and entirely
+// fictional, and a fictional coordinate on a real job is far harder to notice than a missing one.
 //
-//   - falling back to geocoding.Stub outside development would write coordinates that are stable,
-//     plausible, inside Australia, and entirely fictional. A fictional coordinate on a real job is
-//     much harder to notice than a missing one;
-//   - panicking would make the API unbootable in staging the moment this file merged, which is a
-//     regression in a deployment that works today, over a feature it does not yet have;
-//   - a nil geocoder stores the address exactly as the customer typed it, with no coordinate.
-//     Every path through the domain already copes with that, because SHIP-59a requires an
-//     unrecognised address not to fail the job.
+// A nil geocoder stores the address exactly as the customer typed it, with no coordinate. Every
+// path through the domain copes, because SHIP-59a requires an unrecognised address not to fail the
+// job — which is also why a provider that fails to build is a warning rather than a panic: an
+// unbootable API in staging would be a regression in a deployment that works today, over a feature
+// it does not yet have.
 //
-// The warning is deliberately at startup rather than per request: it is a fact about the
+// The log line is deliberately at startup rather than per request: it is a fact about the
 // deployment, and one line in the boot log is findable where one line per created job is noise.
 func newGeocoder(d Deps) jobs.Geocoder {
 	if geocoding.UseStub(d.Config.Env) {
 		return geocoding.NewStub()
 	}
 
-	d.Logger.Warn("no geocoding provider is configured; job addresses will be stored unresolved",
-		"env", string(d.Config.Env),
-		"needs", "GEOCODING_BASE_URL and GEOCODING_API_KEY in internal/config (Docs/11 §9)")
-	return nil
+	if d.Config.Geocoding.ProviderBaseURL == "" {
+		d.Logger.Warn("no geocoding provider is configured; job addresses will be stored unresolved",
+			"env", string(d.Config.Env),
+			"needs", "GEOCODING_BASE_URL in deploy/.env")
+		return nil
+	}
+
+	provider, err := geocoding.NewProvider(geocoding.Options{
+		BaseURL: d.Config.Geocoding.ProviderBaseURL,
+		APIKey:  d.Config.Geocoding.ProviderAPIKey,
+	})
+	if err != nil {
+		d.Logger.Warn("the geocoding provider could not be built; job addresses will be stored unresolved",
+			"env", string(d.Config.Env), "error", err.Error())
+		return nil
+	}
+
+	d.Logger.Info("geocoding provider configured", "base_url", d.Config.Geocoding.ProviderBaseURL)
+	return provider
 }
 
 // Compile-time proof that the two implementations of the port satisfy it, which is the only place

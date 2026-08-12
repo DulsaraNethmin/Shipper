@@ -19,6 +19,8 @@ var allKeys = []string{
 	"KAFKA_BROKERS",
 	"IDENTITY_ARGON2_MEMORY_KIB", "IDENTITY_ARGON2_ITERATIONS", "IDENTITY_ARGON2_PARALLELISM",
 	"IDENTITY_ACCESS_TOKEN_TTL", "IDENTITY_ACCESS_TOKEN_KEYS", "IDENTITY_ACCESS_TOKEN_ACTIVE_KID",
+	"GEOCODING_BASE_URL", "GEOCODING_API_KEY",
+	"PAGINATION_DEFAULT_PAGE_SIZE", "PAGINATION_MAX_PAGE_SIZE",
 }
 
 // deploymentSigningKeys is a keyset a staging or production configuration can legitimately be
@@ -434,5 +436,89 @@ func TestLogValueOmitsCredentials(t *testing.T) {
 	// nothing anybody can sign with.
 	if !strings.Contains(rendered, "2026-08") {
 		t.Errorf("LogValue() rendered %q, want the active key identifier retained", rendered)
+	}
+}
+
+// SHIP-15g moved two parked requests into configuration: GEOCODING_* (SHIP-60) and the page sizes
+// (SHIP-66). Both lanes had written a documented constant instead, because internal/config is a
+// shared file a domain branch must not edit.
+
+func TestGeocodingAndPaginationDefaults(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GEOCODING_BASE_URL", "")
+	t.Setenv("GEOCODING_API_KEY", "")
+	t.Setenv("PAGINATION_DEFAULT_PAGE_SIZE", "")
+	t.Setenv("PAGINATION_MAX_PAGE_SIZE", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Empty is the supported "no provider" state, not a missing setting: cmd/api builds the
+	// stub in development and nothing outside it, and addresses are stored unresolved.
+	if cfg.Geocoding.ProviderBaseURL != "" || cfg.Geocoding.ProviderAPIKey != "" {
+		t.Errorf("geocoding defaults = %+v, want both empty", cfg.Geocoding)
+	}
+	if cfg.Pagination.DefaultPageSize != 20 || cfg.Pagination.MaxPageSize != 100 {
+		t.Errorf("pagination defaults = %+v, want 20 and 100 (Docs/10 §4.5)", cfg.Pagination)
+	}
+}
+
+func TestGeocodingAndPaginationAreReadFromTheEnvironment(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GEOCODING_BASE_URL", "https://geo.internal/v1")
+	t.Setenv("GEOCODING_API_KEY", "a-key")
+	t.Setenv("PAGINATION_DEFAULT_PAGE_SIZE", "25")
+	t.Setenv("PAGINATION_MAX_PAGE_SIZE", "250")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Geocoding.ProviderBaseURL != "https://geo.internal/v1" || cfg.Geocoding.ProviderAPIKey != "a-key" {
+		t.Errorf("geocoding = %+v", cfg.Geocoding)
+	}
+	if cfg.Pagination.DefaultPageSize != 25 || cfg.Pagination.MaxPageSize != 250 {
+		t.Errorf("pagination = %+v", cfg.Pagination)
+	}
+}
+
+// A default above the ceiling would give a request that asked for nothing a bigger page than one
+// that asked for the maximum — obvious in a sentence, invisible in two variables.
+func TestPaginationRefusesADefaultAboveTheMaximum(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PAGINATION_DEFAULT_PAGE_SIZE", "200")
+	t.Setenv("PAGINATION_MAX_PAGE_SIZE", "100")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted a default page size above the maximum")
+	} else if !strings.Contains(err.Error(), "PAGINATION_DEFAULT_PAGE_SIZE") {
+		t.Errorf("the error does not name the variable: %v", err)
+	}
+}
+
+// A key with no base URL builds no geocoder at all, so the only symptom would be addresses
+// silently stored unresolved while a credential sits in the environment suggesting otherwise.
+func TestGeocodingRefusesAKeyWithoutABaseURL(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GEOCODING_API_KEY", "a-key")
+	t.Setenv("GEOCODING_BASE_URL", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted GEOCODING_API_KEY with no GEOCODING_BASE_URL")
+	} else if !strings.Contains(err.Error(), "GEOCODING_BASE_URL") {
+		t.Errorf("the error does not name the missing variable: %v", err)
+	}
+}
+
+// The reverse is legitimate: a local or self-hosted geocoder needs no credential.
+func TestGeocodingAcceptsABaseURLWithoutAKey(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GEOCODING_BASE_URL", "http://localhost:8088")
+	t.Setenv("GEOCODING_API_KEY", "")
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load refused a base URL with no key: %v", err)
 	}
 }
