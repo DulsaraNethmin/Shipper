@@ -13,6 +13,7 @@ import 'package:shipper/features/identity/registration_complete_screen.dart';
 import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/role_selection_screen.dart';
 import 'package:shipper/features/identity/sign_in_screen.dart';
+import 'package:shipper/features/jobs/job_detail_screen.dart';
 import 'package:shipper/features/jobs/job_locations_screen.dart';
 
 /// Route paths, named once.
@@ -75,6 +76,20 @@ abstract final class Routes {
   /// already exists is SHIP-75, and gets a route that names one.
   static const newJob = '/jobs/new';
 
+  /// One delivery in full, to the customer who owns it (SHIP-77).
+  ///
+  /// **The id is in the path rather than in a constructor argument**, and that is what makes the
+  /// screen deep-linkable: `Docs/07` §5 requires every notification to open the exact job it
+  /// concerns, so SHIP-145 delivers a payload to this path and nothing about the screen changes.
+  ///
+  /// Declared **after** [newJob] in the router, which is what keeps `/jobs/new` meaning the
+  /// wizard: go_router takes the first route that matches, and `new` would otherwise be read as
+  /// an identifier.
+  static const jobDetail = '/jobs/:id';
+
+  /// [jobDetail] for one job.
+  static String jobDetailFor(String jobId) => '/jobs/$jobId';
+
   /// The connectivity check (SHIP-19).
   ///
   /// Reachable from **both** shells on purpose. It is the only screen that demonstrates build
@@ -120,6 +135,28 @@ const _signedInLocations = <String>{
   Routes.newJob,
 };
 
+/// Locations a signed-in user may be at whose path carries an identifier (SHIP-77).
+///
+/// A second collection rather than a cleverer first one, because a set of fixed strings is the
+/// readable form and most routes are one. This is for the routes that cannot be: `/jobs/{id}`
+/// names a job, so there is no constant to put in the set above.
+///
+/// **It matches shape and nothing else, and that is deliberate.** It does not check that the id
+/// is a UUID, or that the job exists, or that the caller owns it. `Docs/07` §3 puts all three on
+/// the platform — `GET /v1/jobs/{id}` answers `404` for a stranger's job byte-identically to one
+/// that does not exist — and a client-side pattern that looked authoritative is exactly how a
+/// guard stops being navigation and starts being a control nobody audited.
+final _signedInPatterns = <RegExp>[
+  // `/jobs/new` is matched by the set above first, so the wizard is never read as a job id.
+  RegExp(r'^/jobs/[^/]+$'),
+];
+
+/// Whether a signed-in user may be at [location].
+bool _signedInMayBeAt(String location) {
+  return _signedInLocations.contains(location) ||
+      _signedInPatterns.any((pattern) => pattern.hasMatch(location));
+}
+
 /// Where the session says this location should be, or `null` to leave it alone.
 ///
 /// A pure function of the session and the location, separated from [routerProvider] so it can
@@ -142,7 +179,7 @@ String? redirectFor(SessionState session, String location) {
     SessionRestoring() => location == Routes.starting ? null : Routes.starting,
     SessionSignedOut() =>
       _signedOutLocations.contains(location) ? null : Routes.signIn,
-    SessionSignedIn() => _signedInLocations.contains(location) ? null : Routes.home,
+    SessionSignedIn() => _signedInMayBeAt(location) ? null : Routes.home,
   };
 }
 
@@ -266,6 +303,14 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.newJob,
         builder: (context, state) => const JobLocationsScreen(),
+      ),
+      // After `newJob`, deliberately. go_router takes the first route that matches, so declaring
+      // `/jobs/:id` first would make `/jobs/new` a job whose id is the word "new".
+      GoRoute(
+        path: Routes.jobDetail,
+        builder: (context, state) => JobDetailScreen(
+          jobId: state.pathParameters['id'] ?? '',
+        ),
       ),
       GoRoute(
         path: Routes.health,

@@ -88,6 +88,33 @@ void main() {
       expect(redirectFor(const SessionState.restoring(), Routes.newJob), Routes.starting);
     });
 
+    test('a job detail path is reachable while signed in, id and all', () {
+      // SHIP-77 is the first route whose path carries an identifier, so it is the first that a
+      // set of fixed strings cannot answer. Forgetting it produces SHIP-71's symptom exactly: a
+      // card that appears to do nothing when it is tapped.
+      const path = '/jobs/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0';
+
+      expect(redirectFor(const SessionState.signedIn(), path), isNull);
+      expect(redirectFor(const SessionState.signedOut(), path), Routes.signIn);
+      expect(redirectFor(const SessionState.restoring(), path), Routes.starting);
+    });
+
+    test('the wizard is still the wizard, not a job whose id is the word new', () {
+      // go_router takes the first route that matches, which is why `/jobs/new` is declared
+      // before `/jobs/:id`. The guard has to agree with that ordering, or the two disagree
+      // about what `/jobs/new` is and only one of them draws a screen.
+      expect(Routes.newJob, '/jobs/new');
+      expect(Routes.jobDetailFor('abc'), '/jobs/abc');
+      expect(redirectFor(const SessionState.signedIn(), Routes.newJob), isNull);
+    });
+
+    test('the pattern matches one segment and not a path below it', () {
+      // A guard matching `/jobs/{id}/anything` would wave through routes nobody has declared,
+      // and whichever screen eventually claims one would inherit a decision made before it
+      // existed.
+      expect(redirectFor(const SessionState.signedIn(), '/jobs/0198f2c1/bids'), Routes.home);
+    });
+
     test('the connectivity screen is reachable from either shell, and during the restore', () {
       // SHIP-19's demonstration. Putting it behind the session would have made "the app can
       // reach the API" unanswerable on a fresh install, which is exactly when it is asked.

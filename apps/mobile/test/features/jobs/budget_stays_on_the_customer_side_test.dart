@@ -34,6 +34,14 @@ const _allowed = <String, String>{
   // The customer's own list. Every job on it belongs to the person looking at it, and the widget
   // that draws the amount is private to this file.
   'lib/features/jobs/customer_job_list.dart': 'the customer’s own jobs, and _JobCard is private',
+
+  // One of the customer's own jobs, in full (SHIP-77). `GET /v1/jobs/{id}` is owner-only and
+  // answers `404` to everybody else byte-identically to a job that does not exist, so every job
+  // this screen can reach belongs to the person looking at it — which is the question this list
+  // exists to ask, and it needs no "when" in the answer. SHIP-83's provider job detail is a
+  // separate screen reading a separate type, exactly as the platform writes a second response
+  // shape rather than redacting this one.
+  'lib/features/jobs/job_detail_screen.dart': 'the owner’s own job, in full',
 };
 
 /// What a reference to the budget looks like in Dart or on the wire.

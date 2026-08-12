@@ -269,6 +269,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-68** | M2 | Job expiry — the deadline is a trigger's, the sweep is the worker's, and `make verify` runs the real binary — *see below* |
 | **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
+| **SHIP-77** | M2 | Flutter customer job detail — the timeline is derived from the current status, because the transition history the database records is served by no endpoint; and sign-out finally tells the platform — *see below* |
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
@@ -1896,6 +1897,137 @@ this client was written against, checked by hand; what has not been done in this
 installing the build on a device and driving the two screens against that API, which is what
 SHIP-55's report did for sign-in. The widget tests drive the real router, guard, session and shell,
 so what a simulator would add is the platform channel and the renderer.
+
+### SHIP-77 — the timeline the endpoint does not serve, and the sign-out that finally reaches the platform
+
+Tapping a job in SHIP-76's list opens it in full: both addresses, the goods, the timing, the
+customer's own budget, a status timeline, and the actions the platform would permit. The route is
+`/jobs/{id}` and the screen re-reads the job from it rather than being handed one across, which is
+two things at once — a list page fetched ten minutes ago cannot show a stale status, and SHIP-145's
+notification payload reaches the same screen with nothing but an id.
+
+**The ticket's *Done when* says "status timeline", and the endpoint serves no history.** This was
+worth finding out on the wire rather than assuming, and the wire is unambiguous: `GET /v1/jobs/{id}`
+answers the `Job` schema, which is `additionalProperties: false` and carries one `status`,
+`created_at` and `updated_at`. There is no `history` array and no per-transition timestamp anywhere
+in it. `job_status_history` exists and is exactly what a timeline wants — SHIP-57a gave it the
+actor, the reason and both clocks, append-only — and `Service.History` reads it in Go, but **nothing
+exposes it over HTTP**. A read against this worktree's API on 8092 confirmed the response field for
+field.
+
+So the timeline is **derived from the current status**, and the design is mostly a list of things it
+refuses to claim:
+
+- **It says where the job is**, which the response establishes.
+- **It never says when an earlier step happened**, which the response does not. A step behind the
+  current one carries no date, because the only candidates would be invented — `updated_at`
+  repeated, or steps spaced evenly.
+- **A step behind the current one is not ticked as done.** `Docs/02` §2 permits skips:
+  `Awarded → En route to pickup` is a permitted move, so a job may pass `Driver assigned` without a
+  driver ever being nominated, and `Open → Awarded` skips `Negotiating` whenever the first bid is
+  the accepted one. "Past this point" is true of a skipped step; "this happened" is not.
+- **A cancelled or disputed job shows two steps, not ten.** The client knows two things about it —
+  every job is created as `draft`, and this is where it is now — and eight greyed steps it may
+  never have reached would be a screen filling silence with shape.
+
+The one date it does show without qualification is the first step's, because the contract states
+that a job is created as `draft`, so `created_at` *is* when it entered that step. The current step
+carries `updated_at`, labelled "Last updated" rather than presented as a transition time.
+
+**The screen says all of this out loud**, in one line under the timeline, because a timeline with no
+dates and no explanation reads as a screen that failed to load them. When an endpoint serves the
+history, `jobTimeline` takes it and the steps gain their real times; nothing else about the screen
+changes, which is why the derivation is a pure function rather than logic inside a widget.
+
+**"Available actions" is one action, because one endpoint exists.** `routes_golden.txt` serves three
+customer job routes: read, edit-a-draft, and cancel. Editing belongs to the wizard (SHIP-72…75), and
+**resuming an existing draft is SHIP-75 specifically, so this screen must not offer it** — the only
+path into the wizard today creates a *new* draft, and a customer who tapped it from an existing one
+would end up with two. So the action is cancel, confirmed first, and every status that offers
+nothing says why instead of going quiet: "no actions available" reads as a fault in the app, where
+"a provider has been awarded this delivery, and ending it now is a support matter" sends somebody to
+support.
+
+**The app hides; the platform decides, and the 409 path is where that is actually demonstrated.**
+`actionsFor` offers Cancel for `draft`, `open` and `negotiating` because `Docs/02` §2 permits nothing
+else towards `cancelled` from a customer — but it is a decision about what is worth showing, not a
+permission check, and the request goes out regardless of what the client believes. When the platform
+answers `409 jobs_not_cancellable` the screen renders the refusal **and re-reads the job**, which is
+`Docs/02` §3.1's rule that on conflict the server wins and the app reconciles. The reload
+deliberately **keeps the refusal on screen**: a first version cleared it, and the result was a
+customer looking at a job that had silently changed under them with no account of why their tap did
+nothing.
+
+**`/jobs/{id}` is the first route in this client whose path carries an identifier**, so the
+signed-in guard needed something a set of fixed strings could not give it. It has a pattern
+alongside the set, matching one segment and nothing below it, and matching shape and nothing else —
+it does not check that the id is a UUID, that the job exists, or that the caller owns it. All three
+are the platform's (`Docs/07` §3), and a client-side pattern that looked authoritative is how a
+guard stops being navigation and starts being a control nobody audited. `/jobs/new` stays the wizard
+because it is declared first and go_router takes the first match, and a test asserts that ordering
+rather than trusting it.
+
+**The budget is drawn on a second screen now, and the allow list grew by one entry.**
+`GET /v1/jobs/{id}` is owner-only and answers `404` to everybody else byte-identically to a job that
+does not exist, so every job this screen can reach belongs to the person looking at it — which is
+the question `budget_stays_on_the_customer_side_test.dart` asks, and the answer needs no "when" in
+it. SHIP-83's provider job detail remains a separate screen reading a separate type.
+
+**Housekeeping: sign-out now calls `POST /v1/auth/logout`, and §9's entry is closed.** The other
+item §9 named — the `kDebugMode` development-session button — was already gone; SHIP-55 deleted it,
+and §3's own row for SHIP-55 says so.
+
+The logout gap was real and easy to demonstrate: before this, `signOut` cleared the Keychain and the
+in-memory token and told nobody, so the discarded refresh token stayed valid server-side for up to
+thirty days and the handset kept a row in `GET /v1/auth/sessions`. It is fire-and-forget, dispatched
+and not awaited, and its failures are swallowed — `Docs/07` §3 has the device catching up rather
+than asking permission, and a sign-out that failed because a train went into a tunnel would be a
+defect rather than a safeguard.
+
+**§9 called it "a handful of lines", and it is not, for two reasons neither obvious nor optional.**
+
+*The request must not travel through `AuthInterceptor`.* The interceptor reads the session's access
+token at **request** time, and `signOut` clears it at **call** time — so a fire-and-forget logout
+dispatched through the ordinary client races the clear and usually loses, going out with no
+credential and answering `401`. Worse, the interceptor's answer to a `401` is to refresh and replay,
+which on the way out means minting a fresh session in order to end one, and calling `signOut` from
+inside `signOut` when that refresh fails. So `SessionEnder` takes the access token as an argument
+and sets the header itself, over the transport that carries no session — the token being thrown
+away, spent on the request that makes throwing it away mean something.
+
+*The endpoint answers `204`.* `ApiClient.postJson` raises `ApiMalformedResponse` for an empty body,
+so a successful sign-out would have been reported as a broken response. Harmless while the only
+caller ignores the result, and wrong the moment one does not, so `postNoContent` exists.
+
+`SessionEnder` lives in `core/auth` beside `SessionRefresher` and for the same reason: signing out on
+the platform is not a screen's action, and putting it on `IdentityRepository` would make `core/`
+import a feature. Two paths pass `notifyingPlatform: false` — a device with no stored token has no
+session for the platform to end, and a refused refresh is the platform having already said the
+session is over, where telling it back would spend a request from a possibly signal-less device on a
+credential it has just refused.
+
+**What is still not closed:** an access token that expired before somebody tapped Sign out cannot
+authenticate the call, and refreshing first would be a client minting a credential in order to
+destroy one. Fifteen minutes is the window. `DELETE /v1/auth/sessions/{id}` (SHIP-46) remains how a
+session that outlived its device is ended.
+
+**How it was demonstrated.** `make flutter-check` in this worktree: **353 host tests**, up from 292
+before this branch, analyzer clean, and the environment test green for all three flavours. Then
+against this worktree's API on 8092 by `curl`, because the wire is where a client is actually wrong:
+`GET /v1/jobs/{id}` returns the owner's job with `budget_cents` and **no history field of any kind**;
+`POST /v1/jobs/{id}/cancel` with `{}` answers `200` with `status: cancelled` and a moved
+`updated_at`; the same cancellation under a **fresh** key answers `200` again and records nothing
+further; a job that is not the caller's answers `404 not_found`; `{"status": "open"}` on the
+cancellation is refused `400 bad_request` with *unknown field "status"*, which is the never-a-settable-field
+invariant holding from the client's side too; an address typed `"new south wales"` comes back `NSW`;
+and `POST /v1/auth/logout` answers `204` with zero bytes after which the device's refresh token is
+`identity_refresh_token_invalid`, which is the whole of what the sign-out change buys.
+
+**Not demonstrated live: the `409` refusal, and the screens on a simulator.** A `409` needs an
+awarded job, and no endpoint awards one until SHIP-92 — so that path is held by the widget test
+alone. And as with SHIP-76, nothing here was driven on a device; the widget tests drive the real
+router, guard, session, shell and list, so what a simulator would add is the platform channel and
+the renderer.
 
 ### What SHIP-78 built, and the first test the migration guard ever got
 
