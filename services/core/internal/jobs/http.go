@@ -153,6 +153,21 @@ type cancelRequest struct {
 	Reason string `json:"reason"`
 }
 
+// extendRequest is the body of POST /v1/jobs/{id}/extend, and it has no fields at all (SHIP-70).
+//
+// **The client does not say how long.** Docs/02 §6.3 asks for an extension "in one action", and a
+// period in the body would be a client choosing how long the platform's own listing rule applies to
+// it — the same shape as a client naming a status, and refused for the same reason. The platform
+// decides, and [ExtensionPeriod] is where.
+//
+// A body is still required, on exactly the reasoning [cancelRequest] gives: httpx.DecodeJSON
+// refuses an empty body, and a second endpoint excepted from that would be a second answer to what
+// a request looks like. `{}` is the whole request. Because the decoder refuses unknown fields, a
+// client that sends `{"days": 30}` is told the field does not exist rather than having it ignored —
+// which matters more here than usual, since a client that believes it bought thirty days and got
+// fourteen has no way to tell from a successful response until the job disappears.
+type extendRequest struct{}
+
 // fields turns the request into the domain's command, reporting anything it could not parse.
 //
 // Only parsing failures are reported here. Whether a value is *acceptable* is the domain's
@@ -688,6 +703,63 @@ func (h *Handler) Cancel() http.Handler {
 	})
 }
 
+// Extend handles POST /v1/jobs/{id}/extend (SHIP-70).
+//
+// Docs/02 §6.3's "can extend in one action", and it is one call with an empty body: the platform
+// decides the new deadline, so there is nothing for a client to send and nothing for it to get
+// wrong. See [extendRequest] and [Service.Extend].
+//
+// A verb under the resource rather than a `PATCH` writing `expires_at`, for a reason that is worth
+// separating from the one behind [Handler.Cancel]. Cancel is a verb because status is not settable;
+// the deadline *is* an ordinary column, so a PATCH would work — and would be wrong anyway, because
+// the value is the platform's to compute. A client that could write the field could keep a listing
+// alive for a decade.
+//
+// State-changing, so it carries an Idempotency-Key like every other mutating route (SHIP-15). The
+// middleware absorbs a retry that reuses its key. A retry with a *fresh* key is not absorbed here,
+// and that is deliberate rather than an oversight: unlike a cancellation, an extension is not
+// idempotent by nature — asking twice is asking for two extensions, and the second is a request the
+// customer is entitled to make. What bounds it is the pickup window, not the endpoint.
+//
+// A job belonging to somebody else answers 404, byte-identically to a job that does not exist.
+// See [apiError].
+func (h *Handler) Extend() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		customerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req extendRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var extended Job
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			extended, err = h.svc.Extend(ctx, runner, customerID, jobID)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, jobFrom(extended))
+		return nil
+	})
+}
+
 // jobIDFrom reads and parses the {id} path parameter.
 //
 // A path parameter of the wrong shape is bad_request rather than not_found, which is the httpx
@@ -781,6 +853,19 @@ func apiError(err error) error {
 	case errors.Is(err, ErrJobNotCancellable):
 		return httpx.NewError(http.StatusConflict, CodeNotCancellable,
 			"This job can no longer be cancelled. Reload it to see its current status.").WithCause(err)
+
+	// Two sentinels, one code, two messages. The client's action is the same for both — reload
+	// and offer what is actually available — so a second code would be one more branch for no
+	// decision; the sentence differs because the customer's next move does.
+	case errors.Is(err, ErrJobNotExtendable):
+		return httpx.NewError(http.StatusConflict, CodeNotExtendable,
+			"This job is not being offered to providers, so there is no expiry to extend. "+
+				"Reload it to see its current status.").WithCause(err)
+
+	case errors.Is(err, ErrExpiryBoundByPickup):
+		return httpx.NewError(http.StatusConflict, CodeNotExtendable,
+			"This job is ending because its pickup date is passing, not because the listing "+
+				"has aged. More listing time would not keep it open.").WithCause(err)
 
 	case errors.Is(err, ErrNothingToUpdate):
 		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,

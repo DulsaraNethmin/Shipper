@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,7 +12,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -516,6 +519,65 @@ func TestWarnOfExpiryRefusesAJobThatIsNotOpen(t *testing.T) {
 	}
 	if len(sink.emitted) != 0 {
 		t.Errorf("the refused warning emitted %d events", len(sink.emitted))
+	}
+}
+
+// TestTheExpiryEventsCarryNoBudget covers the two payloads SHIP-69 and SHIP-70 added.
+//
+// The companion of TestTheStatusChangedEventCarriesNoBudget in budget_test.go, which explains why
+// an event is the copy of a job that most needs checking: it reaches Kafka and whatever is behind
+// it (SHIP-134), well past the last endpoint that could have redacted anything. Two new event types
+// are two new opportunities to serialise a job wholesale, and the source-parsing test cannot see a
+// leak that arrives by embedding a whole [Job] in a payload.
+//
+// Read out of the outbox rather than from a recording sink, because what a consumer sees is the
+// stored jsonb.
+func TestTheExpiryEventsCarryNoBudget(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := NewService(events.NewOutbox(), clock.NewFixed(testInstant), nil)
+
+	customer := newCustomer(t, pool, "expiry-budget@example.com", "+61400000699")
+
+	created, err := newDraftService(t, &fakeGeocoder{}).CreateDraft(t.Context(), pool, customer,
+		DraftFields{BudgetCents: money(150_000)})
+	if err != nil {
+		t.Fatalf("creating the job: %v", err)
+	}
+	publish(t, pool, created.ID, customer)
+	setDeadline(t, pool, created.ID, testInstant.Add(24*time.Hour))
+
+	if _, err := warn(t, pool, service, created.ID); err != nil {
+		t.Fatalf("warning the job: %v", err)
+	}
+	if _, err := extend(t, pool, service, customer, created.ID); err != nil {
+		t.Fatalf("extending the job: %v", err)
+	}
+
+	rows, err := pool.Query(t.Context(),
+		`SELECT event_type, payload::text FROM outbox WHERE aggregate_id = $1`, created.ID)
+	if err != nil {
+		t.Fatalf("reading the events back: %v", err)
+	}
+	defer rows.Close()
+
+	// The publication went through `publish`, which writes to a recording sink rather than the
+	// outbox, so exactly the two events this ticket added are in the table.
+	seen := map[string]bool{}
+	for rows.Next() {
+		var eventType, payload string
+		if err := rows.Scan(&eventType, &payload); err != nil {
+			t.Fatalf("scanning an event: %v", err)
+		}
+		seen[eventType] = true
+		if mentionsBudget(payload) || strings.Contains(payload, "150000") {
+			t.Errorf("%s carries the customer's budget, which travels to every consumer there "+
+				"will ever be (Docs/01 §4.3):\n%s", eventType, payload)
+		}
+	}
+	for _, want := range []string{EventExpiryWarned, EventExpiryExtended} {
+		if !seen[want] {
+			t.Errorf("no %s event reached the outbox, so this test proves nothing about it", want)
+		}
 	}
 }
 

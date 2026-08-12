@@ -482,6 +482,32 @@ func (postgresStore) markExpiryWarned(ctx context.Context, r db.Runner, id uuid.
 	return j, nil
 }
 
+// setDeadline moves a job's expiry (SHIP-70).
+//
+// One column, and no `status` anywhere in the statement — which is the whole reason an extension is
+// an ordinary UPDATE rather than a transition. 000402's guard returns early for an update that
+// leaves the status alone, and 000406's trigger fills `expires_at` only when it is NULL, so a value
+// written here is a value that stays written. 000406 said so before this existed.
+//
+// 000407's trigger fires on the way through and clears `expiry_warned_at`, so the job is warned
+// again forty-eight hours before its new deadline. That is deliberately not done here: a deadline
+// can be moved by more than one caller and only the trigger sees all of them.
+//
+// The caller holds the row under FOR UPDATE, so no rows is the same impossible-but-reported case
+// [postgresStore.updateDraft] describes.
+func (postgresStore) setDeadline(ctx context.Context, r db.Runner, id uuid.UUID, at time.Time) (Job, error) {
+	const q = `UPDATE jobs SET expires_at = $2 WHERE id = $1 RETURNING ` + jobColumns
+
+	j, err := scanJob(r.QueryRow(ctx, q, id, at.UTC()))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Job{}, fmt.Errorf("jobs: %s vanished mid-extension: %w", id, ErrJobNotFound)
+	case err != nil:
+		return Job{}, fmt.Errorf("jobs: extend %s: %w", id, err)
+	}
+	return j, nil
+}
+
 // recordTransition writes the history row and returns the platform's clock reading.
 //
 // server_recorded_at is not supplied. It defaults from now(), which is transaction start time,

@@ -862,8 +862,137 @@ run_worker "$WORKDIR/worker-warning-again.log"
   || { cat "$WORKDIR/worker-warning-again.log"; fail "a second pass warned the same job again"; }
 ok "a second pass warns nobody again — one notification per deadline, not one per interval"
 
-# Nothing this file leaves behind is inside the warning window, which is what makes every later
-# section's worker start claim none of it. See the header above.
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-70  a customer extends an expiring job in one call"
+
+# age_job <job-id> — bring a job's deadline to a day from now, as if it had been listed for
+# thirteen.
+#
+# A plain UPDATE, which is exactly the statement the extend endpoint itself makes: 000402's guard
+# passes any update that does not name `status`, and 000406's trigger only ever fills a NULL. So the
+# fixture is honest rather than a way around anything — and it is the only way to reach the state
+# this ticket is about, since no test can wait thirteen days.
+age_job() {
+  "$PSQL" "$DATABASE_URL" -q -c \
+    "update jobs set expires_at = now() + interval '24 hours' where id = '$1';" >/dev/null
+}
+
+# A distant pickup date, so the fourteen days is what ends this job — Docs/02 §6.3's backstop case,
+# and the one an extension is actually for.
+aged_job="$(expiring_job extend-aged "$warn_distant")"
+age_job "$aged_job"
+extend_before="$("$PSQL" "$DATABASE_URL" -tAc "select expires_at from jobs where id = '$aged_job';")"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-extend-$$" \
+  "/v1/jobs/$aged_job/extend" '{}' "$WORKDIR/jobs-extended.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-extended.json"; fail "extending returned $status, want 200"; }
+[[ "$(json "$WORKDIR/jobs-extended.json" '["status"]')" == "open" ]] \
+  || fail "the extended job reads as $(json "$WORKDIR/jobs-extended.json" '["status"]'), want open"
+ok "one call with an empty body extends the job, and it is still open"
+
+# The column, not the answer the endpoint gave about itself — and fourteen days from *now* rather
+# than fourteen added to what it had, which is what stops repeated taps compounding.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at > '$extend_before'
+      and expires_at between now() + interval '13 days' and now() + interval '15 days'
+     from jobs where id = '$aged_job';")" == "t" ]] \
+  || fail "the deadline is $("$PSQL" "$DATABASE_URL" -tAc "select expires_at from jobs where id = '$aged_job';"), want fourteen days from now"
+ok "the stored deadline moved to fourteen days from the moment the customer acted"
+
+# Not a transition. The job has exactly one history row — its publication — and still does.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$aged_job';")" == "1" ]] \
+  || fail "the extension recorded a transition; job status is not what an extension changes"
+ok "no transition was recorded — Docs/02 §2 has no move for it, and none was invented"
+
+# Docs/02 §6.3's operative rule surviving the escape hatch: an extension never carries a job past
+# the date its goods were to be collected.
+capped_job="$(expiring_job extend-capped "$warn_later")"
+age_job "$capped_job"
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-extend-capped-do-$$" \
+  "/v1/jobs/$capped_job/extend" '{}' "$WORKDIR/jobs-extend-capped.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-extend-capped.json"; fail "extending returned $status, want 200"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at = pickup_window_end from jobs where id = '$capped_job';")" == "t" ]] \
+  || fail "the extension went past the pickup window's end"
+ok "and stops at the pickup window's end when that is the earlier of the two (Docs/02 §6.3)"
+
+# The domain event, which is the only record that an extension happened and what it moved.
+extend_event="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(string_agg(payload::text, ' '), '') from outbox
+    where aggregate_id = '$aged_job' and event_type = 'job.expiry_extended';")"
+[[ "$extend_event" == *previous_expires_at* ]] \
+  || fail "the extension emitted no job.expiry_extended naming the deadline it moved from: $extend_event"
+case "$extend_event" in
+  *budget*) fail "the extension event carries a budget: $extend_event" ;;
+esac
+ok "it emits job.expiry_extended carrying both deadlines, and no budget"
+
+# The interlock between the two tickets: a customer who extends must be warned again against the
+# deadline they now have. 000407's trigger is what makes that true wherever a deadline moves.
+rearm_job="$(expiring_job extend-rearm "$warn_distant")"
+age_job "$rearm_job"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set expiry_warned_at = now() where id = '$rearm_job';" >/dev/null
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-extend-rearm-do-$$" \
+  "/v1/jobs/$rearm_job/extend" '{}' "$WORKDIR/jobs-extend-rearm.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-extend-rearm.json"; fail "extending the warned job returned $status"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expiry_warned_at is null from jobs where id = '$rearm_job';")" == "t" ]] \
+  || fail "the extended job is still marked warned, so it would never be warned again"
+ok "extending clears the warning mark, so SHIP-69 fires again against the new deadline"
+
+# The client cannot choose the period. A field this endpoint does not accept is reported rather than
+# ignored, because a client that believed it had bought thirty days and received fourteen could not
+# tell from a successful response.
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-extend-days-$$" \
+  "/v1/jobs/$aged_job/extend" '{"days": 30}' "$WORKDIR/jobs-extend-days.json")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/jobs-extend-days.json"; fail "naming a period returned $status, want 400"; }
+grep -q 'days' "$WORKDIR/jobs-extend-days.json" || fail "the refusal does not name the field"
+ok "a client naming its own period is refused; the platform decides how long"
+
+# A job already bounded by its pickup date gains nothing from more listing time, and is told which
+# of its two dates is ending it rather than answered 200 with nothing changed.
+bound_job="$(expiring_job extend-bound "$warn_later")"
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-extend-bound-do-$$" \
+  "/v1/jobs/$bound_job/extend" '{}' "$WORKDIR/jobs-extend-bound.json")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/jobs-extend-bound.json"; fail "extending a pickup-bound job returned $status, want 409"; }
+[[ "$(json "$WORKDIR/jobs-extend-bound.json" '["error"]["code"]')" == "jobs_not_extendable" ]] \
+  || { cat "$WORKDIR/jobs-extend-bound.json"; fail "expected code=jobs_not_extendable"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at = pickup_window_end from jobs where id = '$bound_job';")" == "t" ]] \
+  || fail "the refused extension moved the deadline anyway"
+ok "a job its pickup date is ending is refused, under a code the app can act on"
+
+# And so is a draft, which has no deadline to extend at all.
+draft_to_extend="$(new_draft extend-draft)"
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-extend-draft-do-$$" \
+  "/v1/jobs/$draft_to_extend/extend" '{}' "$WORKDIR/jobs-extend-draft.json")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/jobs-extend-draft.json"; fail "extending a draft returned $status, want 409"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at is null from jobs where id = '$draft_to_extend';")" == "t" ]] \
+  || fail "the refused extension gave a draft a deadline"
+ok "a draft is refused too — only an Open job has an expiry to extend"
+
+# A stranger's extension is a 404, byte-identical to a job that does not exist. Per endpoint rather
+# than per domain: a job is discoverable through whichever route forgets it.
+status="$(job_request POST "$jobs_other_token" "verify-jobs-extend-stranger-$$" \
+  "/v1/jobs/$aged_job/extend" '{}' "$WORKDIR/jobs-extend-stranger.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/jobs-extend-stranger.json"; fail "a stranger's extension returned $status, want 404"; }
+status="$(job_request POST "$jobs_other_token" "verify-jobs-extend-nothing-$$" \
+  "/v1/jobs/00000000-0000-7000-8000-000000000003/extend" '{}' "$WORKDIR/jobs-extend-nothing.json")"
+[[ "$status" == "404" ]] || fail "extending a job that does not exist returned $status, want 404"
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/jobs-extend-stranger.json" "$WORKDIR/jobs-extend-nothing.json" \
+  || fail "somebody else's job answers differently from no job at all"
+ok "a stranger cannot extend, and cannot tell the job apart from one that never existed"
+
+# Nothing this section leaves behind is inside the warning window, which is what makes the next
+# section's worker run — and every later one — claim none of it. See the SHIP-69 header.
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
   "select count(*) from jobs
     where status = 'Open' and expiry_warned_at is null
@@ -872,5 +1001,5 @@ ok "a second pass warns nobody again — one notification per deadline, not one 
 ok "and no job is left inside the warning window for a later section's worker to pick up"
 
 unset warn_soon warn_later warn_distant warned_job unwarned_job warned_events warned_payload
-unset warned_state
-unset -f expiring_job run_worker
+unset warned_state extend_before extend_event aged_job capped_job rearm_job bound_job draft_to_extend
+unset -f expiring_job run_worker age_job

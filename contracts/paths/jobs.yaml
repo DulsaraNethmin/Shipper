@@ -410,6 +410,106 @@ CancelJob:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+ExtendJob:
+  post:
+    operationId: extendJob
+    summary: Extend an expiring job
+    tags: [Jobs]
+    description: |
+      Gives a job that is about to stop being offered more time on the market (SHIP-70).
+
+      Docs/02 §6.3 warns the customer forty-eight hours before a job expires and lets them
+      "extend in one action". This is that action, and it is a single call with an empty body.
+
+      ## The client does not say how long
+
+      `JobExtension` has no fields, and that is deliberate rather than unfinished. The new
+      deadline is the platform's to compute, on the same rule that set the original one: **the
+      earlier of fourteen days from now and the job's pickup window ending.** A client that could
+      name its own deadline could keep a listing alive for a decade, which is the stale-listing
+      problem Docs/02 §6.3 exists to prevent, arriving by another route.
+
+      A field this endpoint does not accept is reported rather than ignored, so a client that
+      sends `{"days": 30}` is told. A client that believed it had bought thirty days and silently
+      received fourteen would have no way to tell from a successful response.
+
+      ## Extending is not a status change
+
+      The job is `open` before and `open` after. Nothing is written to its status history, and
+      Docs/02 §2 has no transition for it; only `expires_at` moves. The warning is re-armed with
+      it, so the customer is told again forty-eight hours before the new deadline (SHIP-69).
+
+      ## When it cannot be extended
+
+      Two conditions answer `409` with `jobs_not_extendable`, and they share a code because the
+      client's response to both is the same — reload and offer what is actually available:
+
+      - the job is not `open`, so no deadline is ending it;
+      - the job's **pickup date** is what ends it rather than the listing period. Docs/02 §6.3
+        makes the pickup date the operative rule: "a job whose pickup window has gone is dead
+        regardless of how recently it was posted", and extra listing time in front of providers
+        advertising a collection date that has passed is worse than letting the job expire.
+
+      There is no limit on how many times a job may be extended. Every job with a pickup window
+      is bounded by it; a job without one is the distant-date case the fourteen-day backstop
+      exists for.
+
+      **A job belonging to another customer answers `404`, not `403`** — see the note on
+      editing a draft.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      description: |
+        Required, and empty: send `{}`. The API takes a JSON body on every state-changing
+        request, and one endpoint excepted from that is a second answer to what a request looks
+        like.
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobExtension'
+    responses:
+      '200':
+        description: |
+          The job is extended, and is returned in full with its new `expires_at`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          The job is not being offered, or its pickup date rather than its listing period is
+          what ends it (`jobs_not_extendable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- parameters --------------------------------------------------------------------------------
 
 JobID:
@@ -576,6 +676,18 @@ JobCancellation:
         explanation, so this is never required of them; Docs/01 §3 requires one only of an
         administrator changing a commercial record.
       example: Found a cheaper option elsewhere.
+
+JobExtension:
+  type: object
+  additionalProperties: false
+  description: |
+    Nothing. `{}` is the whole request.
+
+    An extension takes no period, because the new deadline is the platform's to compute — see the
+    operation's description. The empty object is still required: `additionalProperties: false`
+    means a client that sends a period is told the field does not exist rather than having it
+    quietly ignored, which is the failure worth reporting here.
+  properties: {}
 
 Address:
   type: object

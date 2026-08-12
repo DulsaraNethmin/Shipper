@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **275 checks across 11 sections**, and `make check` green. Since
+Verified by `make verify` — **285 checks across 11 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -268,6 +268,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-68** | M2 | Job expiry — the deadline is a trigger's, the sweep is the worker's, and `make verify` runs the real binary — *see below* |
 | **SHIP-69** | M2 | The expiry warning forty-eight hours ahead — a second task over the same column, and the job is warned once per *deadline* rather than once per job — *see below* |
+| **SHIP-70** | M2 | `POST /v1/jobs/{id}/extend` — an empty body, because the platform computes the deadline. **Not a status transition**, and the pickup date still bounds it — *see below* |
 | **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
@@ -1820,6 +1821,57 @@ deadline days away — so a later section's worker start claims nothing, and the
 end of that file asserting exactly this. A future check that leaves an `Open` job an hour from its
 deadline will be told so there rather than by a puzzling failure three sections later. The count
 went from 268 to **275**.
+
+### SHIP-70 — an extension is an ordinary `UPDATE`, and the pickup date still bounds it
+
+`POST /v1/jobs/{id}/extend`, with `{}` as the whole request. Docs/02 §6.3's "can extend in one
+action" is one call and no fields.
+
+**It is not a status transition, and that was the ticket's first question.** The answer is no, and
+`000406` had already reached it from the other side: its trigger fills `expires_at` only when the
+column is NULL precisely so that "SHIP-70's extend endpoint is an ordinary `UPDATE`". A job is
+`Open` before an extension and `Open` after, Docs/02 §2 has no row describing it, and `Open → Open`
+is a move the guard refuses on purpose. So none of SHIP-57's machinery is involved. That is not a
+loophole — `000402`'s own comment says "every other update to a job — its category, its addresses,
+its budget — passes straight through", and a deadline is one of those.
+
+**The client does not say how long.** A period in the body would be a client choosing how long the
+platform's own listing rule applies to it, which is the same shape as naming a status. The new
+deadline is `LEAST(now + 14 days, pickup_window_end)` — `000406`'s rule applied again from the moment
+the customer acted. Counted from *now* rather than added to the deadline the job has, so acting
+early gains no more than acting late; and `extendRequest` has no fields at all, so
+`httpx.DecodeJSON` refuses `{"days": 30}` rather than ignoring it. A client that believed it had
+bought thirty days and received fourteen would have no way to tell from a successful response.
+
+**The pickup date still wins, and the refusal is the interesting half.** Docs/02 §6.3 makes the
+pickup date the operative rule — "a job whose pickup window has gone is dead regardless of how
+recently it was posted" — so an extension that ignored it would put a listing in front of providers
+advertising a collection date that had passed, which wastes a bid rather than a glance. A job whose
+deadline already *is* its pickup date therefore answers `409 jobs_not_extendable` rather than `200`
+with nothing changed, and the message names which of the customer's two dates is ending the job.
+Two sentinels share that one code — `ErrJobNotExtendable` (not `Open`) and `ErrExpiryBoundByPickup`
+— on the same reasoning that has `ErrNotJobOwner` and `ErrJobNotFound` sharing `not_found`: the
+client's action is identical and only the sentence differs.
+
+**Two things this deliberately does not do, and both are findings rather than omissions.** There is
+**no cap on the number of extensions**: every job with a pickup window is bounded by it, and a job
+without one is the distant-date case the backstop exists for, where the customer's continued
+interest is the only signal there is. A cap is a counter column and a policy decision. And **no
+endpoint moves the pickup window of an `Open` job** — `PATCH` is Draft-only (`jobs_not_a_draft`), so
+the customer told "your pickup date is what is ending this job" has no way to act on that today.
+Neither is in SHIP-70's *Done when*; both belong to whoever owns SHIP-63's publish/republish path.
+
+**It emits `job.expiry_extended` although the *Done when* does not ask for one**, and the reason is
+SHIP-69. A consumer that has already told the customer "this job expires in two days" has no other
+way to learn that it no longer does, and `000407` re-arms the warning — so a second
+`job.expiry_warned` would otherwise arrive later with nothing to explain why the first was void. The
+payload carries both deadlines for exactly that reason. It is also the only record that an extension
+happened at all: `job_status_history` is deliberately not the place for it.
+
+**`make verify` covers both tickets against the real worker and the real endpoint**, and the
+fixture worth naming is `age_job` — a plain `UPDATE` bringing a deadline to a day away, because no
+check can wait thirteen days, and it is the same statement the endpoint itself makes rather than a
+way around anything. The count went from 275 to **285**.
 
 ### SHIP-71 — the locations step, and the validation it deliberately does not do
 

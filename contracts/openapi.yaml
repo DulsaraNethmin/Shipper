@@ -176,6 +176,8 @@ paths:
     $ref: './paths/jobs.yaml#/JobByID'
   /v1/jobs/{id}/cancel:
     $ref: './paths/jobs.yaml#/CancelJob'
+  /v1/jobs/{id}/extend:
+    $ref: './paths/jobs.yaml#/ExtendJob'
 
 components:
   schemas:
