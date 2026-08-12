@@ -613,3 +613,202 @@ serves="$("$PSQL" "$DATABASE_URL" -tAc \
    );")"
 [[ "$serves" == "true false" ]] || fail "the membership query answered '$serves', want 'true false'"
 ok "the stored declaration answers eligibility by set membership — the query SHIP-81 inherits"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-81  the eligibility filter — four filters, each shown to exclude something"
+
+# SHIP-81 adds no endpoint. SHIP-82 puts `GET /v1/jobs/open` in front of the query and this
+# section becomes HTTP checks then; until it does, the demonstration is the predicate run against
+# real rows, from outside Go.
+#
+# # The SQL below is a MIRROR of internal/fleet/eligibility.go's `eligible`, and that is a cost
+#
+# internal/fleet/eligibility_test.go is authoritative: it exercises the real predicate through the
+# real domain service, and it is what `make check` runs. What this adds is a different kind of
+# evidence — that the four filters are answerable from the real schema, against rows created
+# through the real API, with nothing Go-shaped in the path. A copy that drifts would be a check
+# quietly asserting the wrong thing, so it is written once, next to the section it serves, and
+# SHIP-82 deletes it in favour of the endpoint.
+#
+# A provider of its own, deliberately. The sections above leave several vehicles in various states
+# on $fleet_provider_id, and "no vehicle in service" cannot be demonstrated against a fleet whose
+# contents this check does not control.
+
+status="$(post_json "verify-elig-prov-$$" /v1/auth/register \
+  "{\"email\":\"fleet-eligible-$$@example.com\",\"phone\":\"04144$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/elig-provider.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/elig-provider.json"; fail "could not register the eligibility provider: $status"; }
+elig_provider_id="$(json "$WORKDIR/elig-provider.json" '["id"]')"
+elig_provider_token="$(mint_token "$elig_provider_id")"
+
+fleet_customer_id="$(json "$WORKDIR/fleet-customer.json" '["id"]')"
+
+# Docs/04 §3's automated baseline, applied directly. Driving the real verification endpoints would
+# need the token out of the console email and the OTP out of the log, which 40-identity.sh already
+# demonstrates; repeating it here would be testing identity rather than eligibility.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set email_verified_at = now(), phone_verified_at = now() where id = '$elig_provider_id';"
+
+status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-profile-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["VIC"]}}' "$WORKDIR/elig-profile.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/elig-profile.json"; fail "declaring VIC returned $status"; }
+
+status="$(fleet_request POST "$elig_provider_token" "verify-elig-vehicle-$$" /v1/fleet/vehicles \
+  '{"registration":"ELG111","vehicle_type":"box_truck","max_weight_kg":1200,"load_length_cm":300,"load_width_cm":160,"load_height_cm":180}' \
+  "$WORKDIR/elig-vehicle.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/elig-vehicle.json"; fail "adding the eligibility vehicle returned $status"; }
+elig_vehicle_id="$(json "$WORKDIR/elig-vehicle.json" '["id"]')"
+
+# The job carries a budget, deliberately. It is what the last check in this section reads: the
+# feed's column list must not name it, and a job with no budget at all would make that assertion
+# vacuous.
+status="$(fleet_request POST "$fleet_customer_token" "verify-elig-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":150000}' \
+  "$WORKDIR/elig-job.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/elig-job.json"; fail "creating the eligibility job returned $status"; }
+elig_job_id="$(json "$WORKDIR/elig-job.json" '["id"]')"
+
+# publish_job <job> <from> <to> — a status transition made the only way 000402 permits one: a
+# job_status_history row written in the same transaction and named by shipper.job_status_transition.
+# SHIP-63's publish endpoint does not exist yet, so the guard is satisfied directly rather than
+# bypassed.
+publish_job() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<SQL
+DO \$do\$
+DECLARE entry uuid := gen_random_uuid();
+BEGIN
+  INSERT INTO job_status_history
+      (id, job_id, from_status, to_status, actor_type, actor_id, actor_recorded_at)
+  VALUES (entry, '$1', '$2', '$3', 'customer', '$fleet_customer_id', now());
+  PERFORM set_config('shipper.job_status_transition', entry::text, true);
+  UPDATE jobs SET status = '$3' WHERE id = '$1';
+END
+\$do\$;
+SQL
+}
+
+publish_job "$elig_job_id" Draft Open
+
+# eligible — 1 when the provider may bid on that one job, 0 when any filter excludes it.
+#
+# Scoped to the single job by id, so the jobs 50-jobs.sh leaves behind cannot make a broken filter
+# look like a working one.
+eligible() {
+  "$PSQL" "$DATABASE_URL" -tAc "
+    select count(*) from jobs j
+     where j.id = '$elig_job_id'
+       and j.status in ('Open', 'Negotiating')
+       and (j.expires_at is null or j.expires_at > now())
+       and j.customer_id <> '$elig_provider_id'
+       and exists (select 1 from users u
+                    where u.id = '$elig_provider_id' and u.role = 'provider'
+                      and u.status = 'active'
+                      and u.email_verified_at is not null
+                      and u.phone_verified_at is not null)
+       and exists (select 1 from provider_service_areas a
+                    where a.provider_id = '$elig_provider_id'
+                      and ((a.scope = 'state'    and a.area = j.pickup_state)
+                        or (a.scope = 'postcode' and a.area = j.pickup_postcode)))
+       and exists (select 1 from vehicles v
+                    where v.provider_id = '$elig_provider_id' and v.deactivated_at is null
+                      and (j.weight_kg is null or v.max_weight_kg  is null or v.max_weight_kg  >= j.weight_kg)
+                      and (j.length_cm is null or v.load_length_cm is null or v.load_length_cm >= j.length_cm)
+                      and (j.width_cm  is null or v.load_width_cm  is null or v.load_width_cm  >= j.width_cm)
+                      and (j.height_cm is null or v.load_height_cm is null or v.load_height_cm >= j.height_cm));"
+}
+
+[[ "$(eligible)" == "1" ]] || fail "the job every filter should accept is not eligible"
+ok "a verified provider serving VIC, with a truck that fits, is offered an Open Richmond job"
+
+# SHIP-68 gives an Open job a deadline as it is published, and the filter reads it rather than
+# trusting the status alone: the sweep runs on a ticker, so a job whose deadline has passed still
+# says 'Open' until the worker reaches it.
+deadline="$("$PSQL" "$DATABASE_URL" -tAc "select expires_at is not null from jobs where id = '$elig_job_id';")"
+[[ "$deadline" == "t" ]] || fail "the published job carries no deadline"
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set expires_at = now() - interval '1 hour' where id = '$elig_job_id';"
+[[ "$(eligible)" == "0" ]] || fail "a job past its deadline was still offered"
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set expires_at = now() + interval '14 days' where id = '$elig_job_id';"
+ok "job status — a deadline that has passed excludes it before the sweep has reached it"
+
+# Docs/04 §3's baseline, one channel at a time, then account standing. Restricted is excluded as
+# well as suspended: §4 makes it "limited access pending clarification", and §1 says a provider does
+# not bid until baseline checks are complete.
+for column in email_verified_at phone_verified_at; do
+  "$PSQL" "$DATABASE_URL" -q -c "update users set $column = null where id = '$elig_provider_id';"
+  [[ "$(eligible)" == "0" ]] || fail "a provider with no $column was still offered work"
+  "$PSQL" "$DATABASE_URL" -q -c "update users set $column = now() where id = '$elig_provider_id';"
+done
+for standing in restricted suspended; do
+  "$PSQL" "$DATABASE_URL" -q -c "update users set status = '$standing' where id = '$elig_provider_id';"
+  [[ "$(eligible)" == "0" ]] || fail "a $standing account was still offered work"
+  "$PSQL" "$DATABASE_URL" -q -c "update users set status = 'active' where id = '$elig_provider_id';"
+done
+ok "verification state — an unverified, restricted or suspended provider is offered nothing"
+
+# Through the API rather than by writing rows, because withdrawing from a region is something a
+# provider actually does — and because an empty declaration matching nothing is SHIP-79's rule,
+# which this is the enforcement of.
+status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-nsw-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["NSW"]}}' "$WORKDIR/elig-nsw.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/elig-nsw.json"; fail "redeclaring returned $status"; }
+[[ "$(eligible)" == "0" ]] || fail "a provider who withdrew from VIC was still offered a VIC job"
+
+status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-none-$$" /v1/fleet/profile \
+  '{"service_area":{"states":[],"postcodes":[]}}' "$WORKDIR/elig-none.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/elig-none.json"; fail "clearing the declaration returned $status"; }
+[[ "$(eligible)" == "0" ]] || fail "a provider who has declared nothing was offered a job — eligibility is opt-in"
+ok "service area — withdrawing excludes, and an empty declaration matches nothing, not everything"
+
+status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-vic-$$" /v1/fleet/profile \
+  '{"service_area":{"states":["VIC"]}}' "$WORKDIR/elig-vic.json")"
+[[ "$status" == "200" ]] || fail "restoring the declaration returned $status"
+
+# Deactivation is what a provider does when a truck comes off the road, and Docs/01 §4.2's third
+# verb. It must stop new work reaching them without touching work already under way.
+status="$(fleet_request POST "$elig_provider_token" "verify-elig-off-$$" \
+  "/v1/fleet/vehicles/$elig_vehicle_id/deactivate" '' "$WORKDIR/elig-off.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/elig-off.json"; fail "deactivating returned $status"; }
+[[ "$(eligible)" == "0" ]] || fail "a provider whose only vehicle is off the road was still offered work"
+
+status="$(fleet_request POST "$elig_provider_token" "verify-elig-on-$$" \
+  "/v1/fleet/vehicles/$elig_vehicle_id/reactivate" '' "$WORKDIR/elig-on.json")"
+[[ "$status" == "200" ]] || fail "reactivating returned $status"
+
+# And a known mismatch excludes, while a missing measurement does not: 000300 lets a provider add a
+# truck with a plate and nothing else, and 000404 lets a customer publish without measuring.
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set weight_kg = 9000 where id = '$elig_job_id';"
+[[ "$(eligible)" == "0" ]] || fail "a nine-tonne load was offered to a 1200 kg truck"
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set weight_kg = null where id = '$elig_job_id';"
+[[ "$(eligible)" == "1" ]] || fail "a job that states no weight was excluded; a missing measurement is not a mismatch"
+"$PSQL" "$DATABASE_URL" -q -c "update jobs set weight_kg = 80 where id = '$elig_job_id';"
+ok "vehicle capability — deactivation and a known mismatch exclude; an unstated measurement does not"
+
+# Docs/02 §1: "'Negotiating' is a useful presentation status. Technically, the job remains
+# available for eligible bids unless the customer closes it or awards a bid." Nothing can reach
+# Negotiating until SHIP-90, which is exactly why this is asserted now.
+publish_job "$elig_job_id" Open Negotiating
+[[ "$(eligible)" == "1" ]] || fail "a Negotiating job was closed to new bids, which Docs/02 §1 does not do"
+publish_job "$elig_job_id" Negotiating Cancelled
+[[ "$(eligible)" == "0" ]] || fail "a cancelled job was still offered"
+ok "job status — Negotiating stays biddable and Cancelled does not, exactly as Docs/02 §1 reads"
+
+# The invariant this feed exists under, checked where it can actually be broken.
+#
+# The provider's feed is the first thing in the service that reads `jobs` from outside the jobs
+# domain, and it reads it column by column — so the SELECT list *is* the disclosure boundary, and
+# `budget` sits three lines from `weight_kg` in the same table. SHIP-67's source-parsing guard
+# parses internal/jobs and cannot see this; internal/fleet has its own copy, and this is the same
+# assertion made from outside Go so that neither can be quietly deleted alone.
+stored_budget="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select budget is not null from jobs where id = '$elig_job_id';")"
+[[ "$stored_budget" == "t" ]] || fail "the job carries no budget, so this check is asserting nothing"
+
+selected="$(sed -n '/^const eligibleJobColumns/,/`$/p' services/core/internal/fleet/eligibility.go)"
+[[ -n "$selected" ]] || fail "eligibleJobColumns is gone; the provider feed's column list is what this reads"
+if grep -qi 'budget' <<<"$selected"; then
+  fail "the provider feed's column list names the budget, which Docs/01 §4.3 forbids in every form"
+fi
+ok "the customer's budget is stored on the job and named nowhere in the provider feed's column list"
