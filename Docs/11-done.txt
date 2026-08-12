@@ -5,9 +5,10 @@
 # *Done when* line in Docs/09 is demonstrable.
 #
 # Docs/11 §4 lists the partly-finished tickets, and they are NOT all absent from this list.
-# Of the three, only SHIP-134 is absent. SHIP-65 and SHIP-149 are here as well as there,
-# because each landed and is named by a commit subject, while one clause of its *Done when*
-# belongs to a ticket that does not exist yet. Do not "tidy" them out: `make status` exits 1
+# Of the two, only SHIP-134 is absent. SHIP-149 is here as well as there, because it landed
+# and is named by a commit subject, while one clause of its *Done when* belongs to a ticket
+# that does not exist yet. SHIP-65 was the other such entry until SHIP-67 closed it — which is
+# how this is meant to end. Do not "tidy" either out: `make status` exits 1
 # when git shows a ticket this file does not declare, so removing one breaks the build rather
 # than making it more honest. Docs/11 §10 carries the full reasoning.
 #
@@ -105,7 +106,9 @@ SHIP-62
 SHIP-64
 SHIP-65
 SHIP-66
+SHIP-67
 SHIP-67a
+SHIP-68
 
 # M6 — Admin
 SHIP-149
