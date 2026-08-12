@@ -745,3 +745,132 @@ status="$(job_get "$jobs_customer_token" "/v1/jobs/$live_job" "$WORKDIR/jobs-liv
 [[ -n "$(json "$WORKDIR/jobs-live-detail.json" '["expires_at"]')" ]] \
   || { cat "$WORKDIR/jobs-live-detail.json"; fail "an Open job does not tell its owner when it expires"; }
 ok "the owner sees the expiry through the API — a cancelled job, and a deadline on the live one"
+
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-69  a domain event fires forty-eight hours before a job would expire"
+
+# Docs/02 §6.3: "The customer is warned 48 hours before expiry and can extend in one action."
+# Demonstrated against the real worker binary, like SHIP-68 above, because the half worth showing is
+# the one that only exists as a running process.
+#
+# # This section reads the outbox, so everything it asserts on is fenced by job id
+#
+# cmd/worker is one binary and starts every registered task, so each run below also drains the
+# outbox as a side effect — which is what broke SHIP-134's section when SHIP-68's met it at the
+# wave-4 merge (scripts/verify/80-notifications.sh carries the full account). The recipe is the same
+# one that fixed it: **assert only on rows this section can name.** Every query here is keyed on a
+# job created here, so nothing another section left behind can satisfy it and nothing this section
+# publishes can be mistaken for another section's.
+#
+# # And the traffic goes the other way too, which is new with this ticket
+#
+# SHIP-69 adds a second task to that same binary, so **every other section that starts the worker
+# now also runs a warning sweep**. That is safe by construction rather than by luck: this section
+# and the SHIP-70 one below leave no job inside the forty-eight-hour window — each is either
+# already marked warned, or has a deadline days away — so a later worker start claims nothing here.
+# A future check that leaves an Open job an hour from its deadline has to know that.
+
+# Two jobs inside the forty-eight-hour window and one outside it. Their deadlines come from 000406's
+# trigger on publication rather than from an UPDATE, so the window is measured against a deadline
+# the platform computed.
+warn_soon="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+warn_later="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+warn_distant="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+# expiring_job <name> <pickup-window-end> — a published job whose pickup window closes then.
+expiring_job() {
+  local out="$WORKDIR/jobs-$1.json" id
+  [[ "$(job_request POST "$jobs_customer_token" "verify-jobs-$1-$$" /v1/jobs \
+        "{\"goods_description\": \"Pallet for $1\", \"pickup_window\": {\"end\": \"$2\"}}" "$out")" == "201" ]] \
+    || { cat "$out"; fail "could not create the job for $1"; }
+  id="$(json "$out" '["id"]')"
+  move_job "$id" Draft Open || fail "could not publish the job for $1"
+  printf '%s' "$id"
+}
+
+# run_worker <logfile> — start the real worker, let its first passes run, and stop it cleanly.
+#
+# The scheduler runs every task once at start-up rather than one interval later, so a start is a
+# pass. Stopping before asserting anything means a failed assertion cannot leave a worker running.
+run_worker() {
+  local log="$1" pid
+  SHIPPER_ENV=development \
+  LOG_FORMAT=json \
+  LOG_LEVEL=debug \
+  DATABASE_URL="$DATABASE_URL" \
+  REDIS_URL="$REDIS_URL" \
+    "$WORKDIR/shipper-worker" >"$log" 2>&1 &
+  pid=$!
+  sleep 2
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+  wait "$pid" 2>/dev/null || true
+}
+
+warned_job="$(expiring_job warn-soon "$warn_soon")"
+unwarned_job="$(expiring_job warn-later "$warn_later")"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select bool_and(expiry_warned_at is null) from jobs where id in ('$warned_job', '$unwarned_job');")" == "t" ]] \
+  || fail "a freshly published job is already marked warned"
+ok "a job is published unwarned — the mark exists so the warning happens once, not once a pass"
+
+run_worker "$WORKDIR/worker-warning.log"
+
+warned_events="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox where aggregate_id = '$warned_job' and event_type = 'job.expiry_warned';")"
+[[ "$warned_events" == "1" ]] \
+  || { cat "$WORKDIR/worker-warning.log"; fail "the job a day from its deadline has $warned_events job.expiry_warned events, want 1"; }
+ok "one pass emits job.expiry_warned for the job inside the forty-eight-hour window"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox where aggregate_id = '$unwarned_job' and event_type = 'job.expiry_warned';")" == "0" ]] \
+  || fail "a job six days from its deadline was warned; the warning would be an announcement"
+ok "and leaves alone the one whose deadline is six days away"
+
+# The payload as a consumer reads it out of the outbox: the customer to reach, and both instants.
+# And no budget, in any form — an event travels past the last endpoint that could redact anything
+# (Docs/01 §4.3).
+warned_payload="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select payload::text from outbox where aggregate_id = '$warned_job' and event_type = 'job.expiry_warned';")"
+[[ "$warned_payload" == *"$jobs_customer_id"* ]] \
+  || fail "the warning names no customer to reach: $warned_payload"
+[[ "$warned_payload" == *expires_at* && "$warned_payload" == *warned_at* ]] \
+  || fail "the warning does not carry both instants: $warned_payload"
+case "$warned_payload" in
+  *budget*) fail "the warning event carries a budget: $warned_payload" ;;
+esac
+ok "the payload names the customer and the deadline, and carries no budget"
+
+# Through no transition at all. A job_status_history row would mean the warning had been routed
+# through the status guard — an `Open -> Open` move Docs/02 §2 has no row for, appearing in a
+# customer's timeline.
+warned_state="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (j.expiry_warned_at is not null) || ' ' || count(h.id)
+     from jobs j left join job_status_history h on h.job_id = j.id
+    where j.id = '$warned_job' group by j.status, j.expiry_warned_at;")"
+[[ "$warned_state" == "Open true 1" ]] \
+  || fail "the warned job is '$warned_state', want 'Open true 1' — Open, marked, and moved by nothing"
+ok "the job is still Open, is marked warned, and no transition was recorded for it"
+
+# A second pass, which is what the ticker would do five minutes later.
+run_worker "$WORKDIR/worker-warning-again.log"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox where aggregate_id = '$warned_job' and event_type = 'job.expiry_warned';")" == "1" ]] \
+  || { cat "$WORKDIR/worker-warning-again.log"; fail "a second pass warned the same job again"; }
+ok "a second pass warns nobody again — one notification per deadline, not one per interval"
+
+# Nothing this file leaves behind is inside the warning window, which is what makes every later
+# section's worker start claim none of it. See the header above.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from jobs
+    where status = 'Open' and expiry_warned_at is null
+      and expires_at > now() and expires_at <= now() + interval '48 hours';")" == "0" ]] \
+  || fail "this file leaves an Open job inside the warning window; a later section that starts the worker would warn it"
+ok "and no job is left inside the warning window for a later section's worker to pick up"
+
+unset warn_soon warn_later warn_distant warned_job unwarned_job warned_events warned_payload
+unset warned_state
+unset -f expiring_job run_worker

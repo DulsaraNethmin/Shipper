@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **268 checks across 11 sections**, and `make check` green. Since
+Verified by `make verify` — **275 checks across 11 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -267,6 +267,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-67** | M2 | `jobs.budget` — minor units, and three tests rather than one proving it cannot reach a provider — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
 | **SHIP-68** | M2 | Job expiry — the deadline is a trigger's, the sweep is the worker's, and `make verify` runs the real binary — *see below* |
+| **SHIP-69** | M2 | The expiry warning forty-eight hours ahead — a second task over the same column, and the job is warned once per *deadline* rather than once per job — *see below* |
 | **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
@@ -1765,6 +1766,60 @@ window closed an hour ago and one with no window at all, checks the two deadline
 computed, starts `cmd/worker`, waits for the first pass, and then asserts the stale job is
 `Cancelled` with an `Open->Cancelled` history row attributed to `system` with no account, an
 outbox event, and the live job untouched. The count went from 208 to **224**.
+
+### SHIP-69 — warned once per *deadline*, which is a trigger's job rather than a caller's
+
+Docs/02 §6.3's other sentence — "the customer is warned 48 hours before expiry" — is
+`job.expiry_warned`, emitted by a second task in `cmd/worker` over the column SHIP-68 built. The
+claim, the event and the pass are each the same shape as the expiry sweep's, deliberately: two tasks
+that claimed work differently would be two things to reason about when a pass misbehaves at three in
+the morning.
+
+**The warning needed somewhere to record that it had happened, and the tempting place was wrong.**
+The sweep runs every five minutes and a job sits inside the window for two days, so without a mark
+the customer's phone buzzes about five hundred times for one job. The obvious answer — ask the
+outbox whether a `job.expiry_warned` event exists for the aggregate — is the wrong table. The outbox
+is a hand-off rather than a record: rows are marked published and are prunable the moment they are
+(`000004` says so), so the question is answered correctly today and wrongly after the first
+clean-up. It is also a read of the events seam by a domain that is only supposed to write through
+it. `000407` adds `jobs.expiry_warned_at` instead.
+
+**"Once per deadline" is a trigger, and that is the decision worth reading.** A mark alone gives
+"once per job", which would mean a customer who extends is never warned again — SHIP-70 silently
+switching SHIP-69 off for exactly the jobs that had used it, with the symptom being a notification
+that never arrives. So `000407` clears `expiry_warned_at` whenever `expires_at` changes, on the same
+argument `000406` makes for setting the deadline in the first place: moving a deadline is not one
+code path. SHIP-70's endpoint is the first, an administrator adjusting a listing is a plausible
+second, a republished job is a third, and a line in the extend handler is a line the other two can
+forget. Attached to the change rather than to the caller, as `updated_at` and `expires_at` already
+are.
+
+**The claim is bounded at both ends, and the lower bound is the interesting one.** `expires_at > $1`
+excludes a job whose deadline has already passed, because both sweeps live in one binary and run on
+the same interval — so without it, a job that outlived its deadline between two passes gets "expires
+in two days" and "has expired" in the same minute, which costs a customer's trust in every later
+notification. The forty-eight hours itself is one constant in Go (`jobs.ExpiryWarning`) and the
+claim takes the horizon as a parameter, so a test moves the window instead of waiting.
+
+**A warning is not a transition and nothing here pretends otherwise.** The job is `Open` before and
+`Open` after; `Service.Transition` is not called, no `job_status_history` row is written, and
+`000402`'s guard returns early because the statement does not name `status`. Reusing the status event
+would have meant emitting `Open → Open`, which Docs/02 §2 has no row for — and would have put a move
+that never happened into a customer's timeline. Both the domain test and `make verify` assert the
+history row count is unchanged, because that is the failure a plausible implementation produces.
+
+**The two tasks are separate for their failure modes, not for tidiness.** One task claiming and
+doing both would mean a failure in either half rolls back the other, so an outbox that cannot be
+written would stop jobs expiring — the wrong trade, since a job left Open past its pickup date
+misleads providers while a warning that arrives late merely arrives late.
+
+**One thing this file's next reader has to know about the worker.** `cmd/worker` is one binary, so
+every verify section that starts it now runs a warning sweep too. `scripts/verify/50-jobs.sh` leaves
+**no job inside the forty-eight-hour window** — each is either already marked warned or has a
+deadline days away — so a later section's worker start claims nothing, and there is a check at the
+end of that file asserting exactly this. A future check that leaves an `Open` job an hour from its
+deadline will be told so there rather than by a puzzling failure three sections later. The count
+went from 268 to **275**.
 
 ### SHIP-71 — the locations step, and the validation it deliberately does not do
 

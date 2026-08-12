@@ -30,12 +30,24 @@ import (
 // claim judges against clock.Now(), so advancing a clock.Fixed is the whole of "time passed".
 
 // expiryTask builds the registered task exactly as main would, over the given clock.
-//
-// Through tasks() rather than by calling expireJobs directly, deliberately. The registration in
-// init is the thing a merge can drop, and a test that reached past it would keep passing after the
-// task had stopped being registered — which is the failure manifest.go describes: no error, no test
-// failure, and a task that silently never runs.
 func expiryTask(t *testing.T, pool *pgxpool.Pool, at clock.Clock) Task {
+	t.Helper()
+	return registeredTask(t, pool, at, "job-expiry")
+}
+
+// warningTask is SHIP-69's, built the same way.
+func warningTask(t *testing.T, pool *pgxpool.Pool, at clock.Clock) Task {
+	t.Helper()
+	return registeredTask(t, pool, at, "job-expiry-warning")
+}
+
+// registeredTask finds one task by name in what the manifest built.
+//
+// Through tasks() rather than by calling expireJobs or warnOfExpiry directly, deliberately. The
+// registration in init is the thing a merge can drop, and a test that reached past it would keep
+// passing after the task had stopped being registered — which is the failure manifest.go describes:
+// no error, no test failure, and a task that silently never runs.
+func registeredTask(t *testing.T, pool *pgxpool.Pool, at clock.Clock, name string) Task {
 	t.Helper()
 
 	built, err := tasks(Deps{
@@ -48,11 +60,11 @@ func expiryTask(t *testing.T, pool *pgxpool.Pool, at clock.Clock) Task {
 	}
 
 	for _, task := range built {
-		if task.Name == "job-expiry" {
+		if task.Name == name {
 			return task
 		}
 	}
-	t.Fatal("no task is called job-expiry; the jobs domain's registration is not in the manifest")
+	t.Fatalf("no task is called %s; the jobs domain's registration is not in the manifest", name)
 	return Task{}
 }
 
@@ -72,22 +84,32 @@ func runPass(t *testing.T, pool *pgxpool.Pool, task Task) int {
 	return claimed
 }
 
-// TestTheJobExpiryTaskIsDeclaredSensibly is the declaration rather than the work.
-func TestTheJobExpiryTaskIsDeclaredSensibly(t *testing.T) {
+// TestTheJobTasksAreDeclaredSensibly is the declaration rather than the work.
+//
+// Both of the jobs domain's tasks, because SHIP-69 registered the second one and a task that is
+// declared badly fails at startup in a way no other test would reach.
+func TestTheJobTasksAreDeclaredSensibly(t *testing.T) {
 	pool := pgtest.DB(t)
-	task := expiryTask(t, pool, clock.System{})
 
-	switch {
-	case task.Every <= 0:
-		t.Error("the task has no interval, so it would never run twice")
-	case task.timeout() >= task.Every:
-		// A pass that may outlive its own interval is a task whose passes overlap in one
-		// process, which the scheduler's one-goroutine-per-task design does not expect.
-		t.Errorf("the timeout %s is not shorter than the interval %s", task.timeout(), task.Every)
-	case task.Close != nil:
-		// Job expiry owns nothing: it runs queries inside the caller's transaction. A Close
-		// here would mean a resource somebody added without saying why (SHIP-15g).
-		t.Error("the task declares a Close, but it owns no long-lived resource")
+	for _, task := range []Task{
+		expiryTask(t, pool, clock.System{}),
+		warningTask(t, pool, clock.System{}),
+	} {
+		switch {
+		case task.Every <= 0:
+			t.Errorf("%s has no interval, so it would never run twice", task.Name)
+		case task.timeout() >= task.Every:
+			// A pass that may outlive its own interval is a task whose passes overlap in
+			// one process, which the scheduler's one-goroutine-per-task design does not
+			// expect.
+			t.Errorf("%s: the timeout %s is not shorter than the interval %s",
+				task.Name, task.timeout(), task.Every)
+		case task.Close != nil:
+			// Neither owns anything: both run queries inside the caller's transaction. A
+			// Close here would mean a resource somebody added without saying why
+			// (SHIP-15g).
+			t.Errorf("%s declares a Close, but it owns no long-lived resource", task.Name)
+		}
 	}
 }
 
@@ -274,7 +296,205 @@ func TestAFailedPassLeavesEveryClaimedJobOpen(t *testing.T) {
 	}
 }
 
+// --- SHIP-69: the warning pass ------------------------------------------------------------------
+
+// TestAPassWarnsEachJobOnceForTheDeadlineItHas is SHIP-69's *Done when* as a running task: a
+// domain event fires forty-eight hours before a job would expire, and only then.
+//
+// Three properties in one pass, because each is a distinct silent failure:
+//
+//   - the job inside the window is warned, and the event is in the outbox with the change;
+//   - the job five days out is not, so the warning is a warning rather than an announcement;
+//   - a second pass warns nobody, so a five-minute sweep does not send five hundred notifications
+//     about one job over the two days it spends inside the window.
+func TestAPassWarnsEachJobOnceForTheDeadlineItHas(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := jobs.NewService(events.NewOutbox(), clock.System{}, nil)
+
+	customer := newJobCustomer(t, pool, "worker-warning@example.com", "+61400000694")
+
+	// Its pickup window closes in a day, so 000406 set the deadline to that instant and the job
+	// is inside the warning window now. Nothing was written into expires_at by hand.
+	soon := publishedJob(t, pool, service, customer, &jobs.TimeWindow{
+		End: time.Now().UTC().Add(24 * time.Hour),
+	})
+	distant := publishedJob(t, pool, service, customer, &jobs.TimeWindow{
+		End: time.Now().UTC().Add(5 * 24 * time.Hour),
+	})
+	draft := draftJob(t, pool, service, customer)
+
+	if claimed := runPass(t, pool, warningTask(t, pool, clock.System{})); claimed != 1 {
+		t.Errorf("the pass claimed %d jobs, want the one inside the window", claimed)
+	}
+
+	if warnings(t, pool, soon) != 1 {
+		t.Errorf("the job a day from its deadline got %d warnings, want one", warnings(t, pool, soon))
+	}
+	if warnings(t, pool, distant) != 0 {
+		t.Error("a job five days from its deadline was warned")
+	}
+	if warnings(t, pool, draft) != 0 {
+		t.Error("a draft was warned; the clock starts at publication")
+	}
+
+	// Still Open, and no transition recorded. A warning is not a status change, and putting one
+	// in a customer's timeline would be a move Docs/02 §2 has no row for.
+	if got := statusOf(t, pool, soon); got != jobs.StatusOpen {
+		t.Errorf("the warned job is %s, want Open", got)
+	}
+	var moves int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM job_status_history WHERE job_id = $1`, soon).Scan(&moves); err != nil {
+		t.Fatalf("counting the transitions: %v", err)
+	}
+	if moves != 1 {
+		t.Errorf("the warned job has %d recorded transitions, want only its publication", moves)
+	}
+
+	if claimed := runPass(t, pool, warningTask(t, pool, clock.System{})); claimed != 0 {
+		t.Errorf("a second pass claimed %d jobs; the warning would repeat every interval", claimed)
+	}
+	if warnings(t, pool, soon) != 1 {
+		t.Errorf("the job was warned %d times over two passes", warnings(t, pool, soon))
+	}
+}
+
+// TestAPassWarnsAgainOnceTheDeadlineHasMoved is "once per deadline" rather than "once per job",
+// through the running task — which is where it would actually fail.
+//
+// The job is warned, its deadline moves, and it must be warned again forty-eight hours before the
+// one it now has. 000407's trigger is what makes that true and this is the pass that would have
+// silently stopped finding the job without it. SHIP-70's extend endpoint is the caller that makes
+// this matter, and internal/jobs tests that path; here the deadline is moved with a plain UPDATE,
+// because the rule belongs to any caller that moves one rather than to that endpoint.
+func TestAPassWarnsAgainOnceTheDeadlineHasMoved(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := jobs.NewService(events.NewOutbox(), clock.System{}, nil)
+
+	customer := newJobCustomer(t, pool, "worker-rewarn@example.com", "+61400000695")
+	job := publishedJob(t, pool, service, customer, nil)
+
+	// Thirteen days in, the fourteen-day backstop is a day away: inside the window.
+	almost := clock.NewFixed(time.Now().UTC().Add(13 * 24 * time.Hour))
+	if claimed := runPass(t, pool, warningTask(t, pool, almost)); claimed != 1 {
+		t.Fatalf("a pass thirteen days in claimed %d jobs, want the one approaching its backstop", claimed)
+	}
+
+	// The deadline moves out by another fortnight. 000402's guard passes an update that does not
+	// name `status` and 000406's trigger only ever fills a NULL, so this is the same statement
+	// any deadline mover makes.
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE jobs SET expires_at = now() + interval '27 days' WHERE id = $1`, job); err != nil {
+		t.Fatalf("moving the deadline: %v", err)
+	}
+
+	// Immediately afterwards there is nothing to warn about — the new deadline is a fortnight
+	// out — which is the half that would pass even if the trigger cleared nothing.
+	if claimed := runPass(t, pool, warningTask(t, pool, almost)); claimed != 0 {
+		t.Errorf("a pass straight after the deadline moved claimed %d jobs, want none", claimed)
+	}
+
+	// And a day before the new deadline, it is found again.
+	approaching := clock.NewFixed(time.Now().UTC().Add(26 * 24 * time.Hour))
+	if claimed := runPass(t, pool, warningTask(t, pool, approaching)); claimed != 1 {
+		t.Fatalf("a pass approaching the new deadline claimed %d jobs, want one — moving a "+
+			"deadline would otherwise switch the warning off for good", claimed)
+	}
+	if got := warnings(t, pool, job); got != 2 {
+		t.Errorf("the job has %d warnings, want one per deadline it has had", got)
+	}
+}
+
+// TestAJobPastItsDeadlineIsExpiredRatherThanWarned is the lower bound on the warning window, and
+// the reason it exists.
+//
+// Both sweeps live in one binary and run on the same interval, so a job that outlived its deadline
+// between two passes is seen by both. Without the bound the customer receives "your job expires in
+// two days" and "your job has expired" within the same minute, which costs their trust in every
+// later notification.
+func TestAJobPastItsDeadlineIsExpiredRatherThanWarned(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := jobs.NewService(events.NewOutbox(), clock.System{}, nil)
+
+	customer := newJobCustomer(t, pool, "worker-overdue@example.com", "+61400000696")
+	job := publishedJob(t, pool, service, customer, &jobs.TimeWindow{
+		End: time.Now().UTC().Add(-time.Hour),
+	})
+
+	if claimed := runPass(t, pool, warningTask(t, pool, clock.System{})); claimed != 0 {
+		t.Errorf("the warning pass claimed %d overdue jobs, want none", claimed)
+	}
+	if got := warnings(t, pool, job); got != 0 {
+		t.Errorf("an overdue job got %d warnings", got)
+	}
+
+	if claimed := runPass(t, pool, expiryTask(t, pool, clock.System{})); claimed != 1 {
+		t.Errorf("the expiry pass claimed %d jobs, want the overdue one", claimed)
+	}
+	if got := statusOf(t, pool, job); got != jobs.StatusCancelled {
+		t.Errorf("the overdue job is %s, want Cancelled", got)
+	}
+}
+
+// TestTwoWorkersWarnEachJobExactlyOnce is the property a rolling deployment depends on, for the
+// second task.
+//
+// Same shape as the expiry version and the same reason: two workers are the normal state during a
+// deployment, nothing coordinates them, and the failure is quiet in both directions — a duplicated
+// claim is two notifications for one job, and a missing SKIP LOCKED is two workers doing the work
+// of one, slowly.
+func TestTwoWorkersWarnEachJobExactlyOnce(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := jobs.NewService(events.NewOutbox(), clock.System{}, nil)
+
+	customer := newJobCustomer(t, pool, "worker-warn-concurrent@example.com", "+61400000697")
+
+	const due = 6
+	soon := time.Now().UTC().Add(24 * time.Hour)
+	jobIDs := make([]uuid.UUID, 0, due)
+	for range due {
+		jobIDs = append(jobIDs, publishedJob(t, pool, service, customer, &jobs.TimeWindow{End: soon}))
+	}
+
+	var wg sync.WaitGroup
+	claimed := make([]int, 2)
+	for worker := range claimed {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			claimed[n] = runPass(t, pool, warningTask(t, pool, clock.System{}))
+		}(worker)
+	}
+	wg.Wait()
+
+	if total := claimed[0] + claimed[1]; total != due {
+		t.Errorf("two workers claimed %d jobs between them (%v), want %d", total, claimed, due)
+	}
+	for _, id := range jobIDs {
+		if got := warnings(t, pool, id); got != 1 {
+			t.Errorf("job %s has %d warnings, want exactly one", id, got)
+		}
+	}
+}
+
 // --- fixtures ----------------------------------------------------------------------------------
+
+// warnings counts the expiry-warning events a job has in the outbox.
+//
+// Counted in the outbox rather than from the column, because the column says the platform decided
+// to warn and the event is what a customer would actually receive. A mark with no event is the
+// failure worth catching.
+func warnings(t *testing.T, pool *pgxpool.Pool, job uuid.UUID) int {
+	t.Helper()
+
+	var n int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM outbox WHERE aggregate_id = $1 AND event_type = $2`,
+		job, jobs.EventExpiryWarned).Scan(&n); err != nil {
+		t.Fatalf("counting the warnings for %s: %v", job, err)
+	}
+	return n
+}
 
 func newJobCustomer(t *testing.T, pool *pgxpool.Pool, email, phone string) uuid.UUID {
 	t.Helper()

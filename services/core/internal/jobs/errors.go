@@ -85,6 +85,16 @@ var (
 	// ErrNothingToUpdate means a PATCH named no field at all.
 	ErrNothingToUpdate = errors.New("jobs: the request changes nothing")
 
+	// ErrExpiryWarningNotDue means a warning was attempted on a job that is not an Open job
+	// awaiting one (SHIP-69).
+	//
+	// Unreachable from the sweep, which claims exactly the eligible rows and holds their locks.
+	// It exists for the caller that does not exist yet: a path that picks a job some other way
+	// should be told the job was not eligible rather than believing a warning was sent, because
+	// the mark and the event are what make the warning happen once and a caller that skipped
+	// both has silently done nothing.
+	ErrExpiryWarningNotDue = errors.New("jobs: that job is not awaiting an expiry warning")
+
 	// ErrJobNotCancellable means Docs/02 §2 has no `→ Cancelled` row for the status the job
 	// is in.
 	//

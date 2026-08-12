@@ -10,7 +10,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 )
 
-// The jobs domain's scheduled work (SHIP-68, and SHIP-69 when it lands).
+// The jobs domain's scheduled work (SHIP-68, SHIP-69).
 //
 // This file exists so that adding a task adds a file and edits none, exactly as
 // cmd/api/routes_jobs.go does for routes. manifest.go says why: four tasks in the backlog belong
@@ -19,7 +19,18 @@ import (
 // notices it is gone.
 //
 // Nothing was added to Deps to make this work, which is the test manifest.go set for itself: a
-// domain service is a pure function of the pool, the clock and configuration.
+// domain service is a pure function of the pool, the clock and configuration. SHIP-69 added a
+// second task to the same file and still added nothing, which is the first time that claim has been
+// tested by anything but its author.
+//
+// # Two tasks over one column, and why they are two
+//
+// Both sweeps read jobs.expires_at, and a single pass could warn and expire in one claim. They are
+// separate because their failure modes are: expiry is a transition that must not be skipped, and a
+// warning is a notification that must not be repeated. One task means a failure in either half
+// rolls back both, so an outbox that cannot be written stops jobs expiring — which is the wrong
+// trade, since a job that stays Open past its pickup date misleads providers while a warning that
+// arrives late merely arrives late.
 
 func init() {
 	register(func(d Deps) Task {
@@ -36,9 +47,20 @@ func init() {
 			Run:     expireJobs(d, service),
 		}
 	})
+
+	register(func(d Deps) Task {
+		service := jobs.NewService(events.NewOutbox(), d.Clock, nil)
+
+		return Task{
+			Name:    "job-expiry-warning",
+			Every:   jobExpiryInterval,
+			Timeout: jobExpiryTimeout,
+			Run:     warnOfExpiry(d, service),
+		}
+	})
 }
 
-// jobExpiryInterval is how often the sweep runs.
+// jobExpiryInterval is how often each sweep runs.
 //
 // Docs/02 §6.3 measures expiry in days, so the precision this needs is coarse; five minutes is
 // chosen against the other end instead — the longest a job should keep taking bids after its
@@ -50,6 +72,11 @@ func init() {
 // domain branch does not edit (Docs/10 §9.2), and nothing here changes under operational pressure
 // in the way a validation limit does: the deadline itself is per job and already stored, so
 // tuning this changes only how promptly a decision that has already been made is acted on.
+//
+// SHIP-69's warning sweep shares it rather than declaring a second one. Both read the same column
+// and the warning's precision requirement is coarser still — forty-eight hours, measured to the
+// nearest five minutes — so a separate constant would be a second number that could only ever
+// disagree with this one by accident.
 const jobExpiryInterval = 5 * time.Minute
 
 // jobExpiryTimeout bounds one pass.
@@ -103,6 +130,46 @@ func expireJobs(d Deps, service *jobs.Service) Work {
 			d.Logger.Debug("job expired",
 				slog.String("job_id", id.String()),
 				slog.Time("judged_at", d.Clock.Now()))
+		}
+		return len(due), nil
+	}
+}
+
+// warnOfExpiry is one pass of SHIP-69: claim the Open jobs coming up on their deadline that have
+// not been told, and tell each of them.
+//
+// The same shape as [expireJobs] — claim inside the caller's transaction, act on what was claimed,
+// return the count — and it is the same shape on purpose. Two tasks that claim work differently
+// would be two things to reason about when a pass misbehaves at three in the morning.
+//
+// # The horizon is computed here and the forty-eight hours is not
+//
+// jobs.ExpiryWarning is the domain's constant and this adds it to the worker's clock, so the claim
+// receives two instants and contains no interval of its own. That is the same division as the
+// expiry sweep's: the domain says what the rule is, the worker says when it is being asked. A test
+// moves a clock.Fixed and the window moves with it.
+func warnOfExpiry(d Deps, service *jobs.Service) Work {
+	return func(ctx context.Context, r db.Runner) (int, error) {
+		now := d.Clock.Now()
+
+		due, err := ClaimIDs(ctx, r, jobs.ExpiryWarningClaim,
+			now, now.Add(jobs.ExpiryWarning), jobs.ExpiryBatch)
+		if err != nil {
+			return 0, err
+		}
+
+		for _, id := range due {
+			if _, err := service.WarnOfExpiry(ctx, r, id); err != nil {
+				// Returned rather than logged and skipped, exactly as the expiry sweep
+				// does. The transaction rolls back, every claimed job keeps its NULL
+				// mark, and the next pass finds them again — so a partial failure costs
+				// a five-minute delay rather than a warning nobody ever receives.
+				return 0, err
+			}
+
+			d.Logger.Debug("job expiry warning emitted",
+				slog.String("job_id", id.String()),
+				slog.Time("judged_at", now))
 		}
 		return len(due), nil
 	}

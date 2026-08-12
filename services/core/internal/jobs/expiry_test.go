@@ -2,6 +2,8 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -14,6 +16,9 @@ import (
 )
 
 // SHIP-68 — the deadline half. The sweep that acts on it is cmd/worker's, and is tested there.
+//
+// SHIP-69's warning is here too, and both of its halves are: the claim's predicate and what one
+// warning does. The pass that drives them is cmd/worker's, like the expiry sweep's.
 //
 // Docs/02 §6.3: an Open job leaves Open at the earlier of fourteen days after publication or its
 // pickup date passing. These tests are against a real PostgreSQL because most of the rule is a
@@ -308,7 +313,288 @@ func TestExpireRefusesAJobThatIsNotOpen(t *testing.T) {
 	}
 }
 
+// --- SHIP-69: the warning, forty-eight hours ahead ----------------------------------------------
+
+// TestTheWarningClaimTakesOnlyJobsInsideTheWindow holds [ExpiryWarningClaim] to its predicate.
+//
+// Each row it must not take is a distinct defect, and two of them are the ones a looser query would
+// get wrong quietly:
+//
+//   - a job whose deadline has already passed belongs to the *expiry* sweep. Warning it would send
+//     "expires in two days" minutes before "has expired", from the same binary;
+//   - a job already warned must not be warned again. Without that, a five-minute sweep sends five
+//     hundred notifications about one job over the two days it is inside the window.
+func TestTheWarningClaimTakesOnlyJobsInsideTheWindow(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newCustomer(t, pool, "warning-claim@example.com", "+61400000694")
+	now := time.Now().UTC()
+
+	open := func(deadline time.Time) uuid.UUID {
+		job := newDraft(t, pool, customer)
+		publish(t, pool, job, customer)
+		setDeadline(t, pool, job, deadline)
+		return job
+	}
+
+	// Two inside the window, at different distances, so "most urgent first" is a total order
+	// rather than an accident of insertion.
+	urgent := open(now.Add(time.Hour))
+	soon := open(now.Add(36 * time.Hour))
+
+	distant := open(now.Add(5 * 24 * time.Hour))
+	overdue := open(now.Add(-time.Hour))
+
+	warned := open(now.Add(12 * time.Hour))
+	markWarned(t, pool, warned, now.Add(-time.Minute))
+
+	draft := newDraft(t, pool, customer)
+
+	awarded := open(now.Add(12 * time.Hour))
+	move(t, pool, awarded, StatusAwarded, User(ActorCustomer, customer))
+
+	claimed := claimWarnings(t, pool, now)
+	if len(claimed) != 2 || claimed[0] != urgent || claimed[1] != soon {
+		t.Errorf("the claim took %v, want the two inside the window, most urgent first: [%s %s].\n"+
+			"distant=%s overdue=%s already-warned=%s draft=%s awarded=%s",
+			claimed, urgent, soon, distant, overdue, warned, draft, awarded)
+	}
+}
+
+// TestWarnOfExpiryMarksTheJobAndEmitsTheEventTogether is SHIP-69's *Done when*: a domain event
+// fires forty-eight hours before a job would expire.
+//
+// Both halves are asserted because either alone is a silent failure. An event with no mark warns
+// the customer again every five minutes; a mark with no event marks the job as told about something
+// nobody told them.
+//
+// **And it is not a transition.** The job is Open before and Open after, and job_status_history
+// gains nothing — checked here rather than assumed, because reusing the status machinery would have
+// been the easy way to write this and would have put an `Open -> Open` row in a customer's timeline.
+func TestWarnOfExpiryMarksTheJobAndEmitsTheEventTogether(t *testing.T) {
+	pool := pgtest.DB(t)
+	sink := &recordingSink{}
+	service := newTestService(sink)
+
+	customer := newCustomer(t, pool, "warning-emit@example.com", "+61400000695")
+	job := newDraft(t, pool, customer)
+	publish(t, pool, job, customer)
+
+	deadline := testInstant.Add(30 * time.Hour)
+	setDeadline(t, pool, job, deadline)
+
+	before := len(historyOf(t, pool, job))
+
+	warned, err := warn(t, pool, service, job)
+	if err != nil {
+		t.Fatalf("warning the job: %v", err)
+	}
+
+	if warned.Status != StatusOpen {
+		t.Errorf("the warned job is %s, want Open — a warning is not a transition", warned.Status)
+	}
+	if statusOf(t, pool, job) != StatusOpen {
+		t.Error("the row moved")
+	}
+	if after := len(historyOf(t, pool, job)); after != before {
+		t.Errorf("the warning wrote %d history rows; a warning moves no job", after-before)
+	}
+
+	at := warnedAt(t, pool, job)
+	if at == nil {
+		t.Fatal("the job is not marked warned, so the next pass would warn it again")
+	}
+	if !at.Equal(testInstant) {
+		t.Errorf("marked warned at %s, want the service clock's %s", at, testInstant)
+	}
+
+	if len(sink.emitted) != 1 || sink.emitted[0].Type != EventExpiryWarned {
+		t.Fatalf("emitted %d events (%v), want one %s", len(sink.emitted), sink.emitted, EventExpiryWarned)
+	}
+
+	var payload expiryWarned
+	if err := json.Unmarshal(sink.emitted[0].Payload, &payload); err != nil {
+		t.Fatalf("the payload is not the shape this domain wrote: %v", err)
+	}
+	switch {
+	case payload.JobID != job.String():
+		t.Errorf("the event names job %s, want %s", payload.JobID, job)
+	case payload.CustomerID != customer.String():
+		// The consumer's whole job is to reach the customer; an event that made it read the
+		// job back to find out who owns it would be a round trip per notification.
+		t.Errorf("the event names customer %s, want %s", payload.CustomerID, customer)
+	case !payload.ExpiresAt.Equal(deadline):
+		t.Errorf("the event warns about %s, want the job's deadline %s", payload.ExpiresAt, deadline)
+	case !payload.WarnedAt.Equal(testInstant):
+		t.Errorf("the event was warned at %s, want %s", payload.WarnedAt, testInstant)
+	}
+}
+
+// TestAJobIsWarnedOncePerDeadlineAndAgainWhenItMoves is the whole of 000407, and the second half is
+// the one that would rot unnoticed.
+//
+// Once per deadline: a second warning against the same deadline is refused and the claim stops
+// selecting the job. Again when it moves: the trigger clears the mark on any change to expires_at,
+// so a customer who extends is warned again — without which SHIP-70 would silently switch off
+// SHIP-69 for exactly the jobs that used it.
+func TestAJobIsWarnedOncePerDeadlineAndAgainWhenItMoves(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := newTestService(&recordingSink{})
+
+	customer := newCustomer(t, pool, "warning-once@example.com", "+61400000696")
+	job := newDraft(t, pool, customer)
+	publish(t, pool, job, customer)
+
+	now := time.Now().UTC()
+	setDeadline(t, pool, job, now.Add(24*time.Hour))
+
+	if claimed := claimWarnings(t, pool, now); len(claimed) != 1 {
+		t.Fatalf("the claim took %d jobs before any warning, want 1", len(claimed))
+	}
+	if _, err := warn(t, pool, service, job); err != nil {
+		t.Fatalf("the first warning: %v", err)
+	}
+
+	if claimed := claimWarnings(t, pool, now); len(claimed) != 0 {
+		t.Errorf("the claim took %v after the warning; a five-minute sweep would send one "+
+			"notification per pass for two days", claimed)
+	}
+	if _, err := warn(t, pool, service, job); !errors.Is(err, ErrExpiryWarningNotDue) {
+		t.Errorf("warning twice = %v, want ErrExpiryWarningNotDue", err)
+	}
+
+	// The deadline moves — which is what SHIP-70 does, and what an administrator adjusting a
+	// listing would do — and the mark goes with it.
+	setDeadline(t, pool, job, now.Add(20*24*time.Hour))
+	if at := warnedAt(t, pool, job); at != nil {
+		t.Errorf("the job is still marked warned at %s after its deadline moved; it would never "+
+			"be warned again (Docs/02 §6.3)", at)
+	}
+
+	later := now.Add(19 * 24 * time.Hour)
+	if claimed := claimWarnings(t, pool, later); len(claimed) != 1 || claimed[0] != job {
+		t.Errorf("the claim took %v approaching the new deadline, want [%s]", claimed, job)
+	}
+}
+
+// TestWarnOfExpiryRefusesToRunOutsideATransaction keeps the mark and the event atomic.
+//
+// Outside a transaction the mark would commit on its own and the event might not follow, which is
+// a job recorded as warned about something nobody was told.
+func TestWarnOfExpiryRefusesToRunOutsideATransaction(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := newTestService(&recordingSink{})
+
+	customer := newCustomer(t, pool, "warning-notx@example.com", "+61400000697")
+	job := newDraft(t, pool, customer)
+	publish(t, pool, job, customer)
+
+	if _, err := service.WarnOfExpiry(t.Context(), pool, job); !errors.Is(err, ErrNotInTransaction) {
+		t.Errorf("warning through the pool = %v, want ErrNotInTransaction", err)
+	}
+	if at := warnedAt(t, pool, job); at != nil {
+		t.Error("the refused warning marked the job anyway")
+	}
+}
+
+// TestWarnOfExpiryRefusesAJobThatIsNotOpen is the predicate on the write rather than in a read
+// before it.
+//
+// Unreachable from the sweep, which claims only Open rows and holds their locks. It is the answer
+// given to a caller that has not been written yet, and the alternative — succeeding quietly — would
+// mark a Draft as warned and emit a notification about a job nobody can see.
+func TestWarnOfExpiryRefusesAJobThatIsNotOpen(t *testing.T) {
+	pool := pgtest.DB(t)
+	sink := &recordingSink{}
+	service := newTestService(sink)
+
+	customer := newCustomer(t, pool, "warning-draft@example.com", "+61400000698")
+	job := newDraft(t, pool, customer)
+
+	if _, err := warn(t, pool, service, job); !errors.Is(err, ErrExpiryWarningNotDue) {
+		t.Errorf("warning a draft = %v, want ErrExpiryWarningNotDue", err)
+	}
+	if len(sink.emitted) != 0 {
+		t.Errorf("the refused warning emitted %d events", len(sink.emitted))
+	}
+}
+
 // --- fixtures ----------------------------------------------------------------------------------
+
+// warn runs a warning in a transaction, which is what Service.WarnOfExpiry requires.
+func warn(t *testing.T, pool *pgxpool.Pool, svc *Service, job uuid.UUID) (Job, error) {
+	t.Helper()
+
+	var warned Job
+	err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		warned, err = svc.WarnOfExpiry(ctx, r, job)
+		return err
+	})
+	return warned, err
+}
+
+// claimWarnings runs [ExpiryWarningClaim] the way cmd/worker does, and returns what it took.
+//
+// The horizon is computed here exactly as warnOfExpiry computes it, so a test that disagreed with
+// the worker about where the window ends would be testing something the worker never asks.
+func claimWarnings(t *testing.T, pool *pgxpool.Pool, at time.Time) []uuid.UUID {
+	t.Helper()
+
+	var claimed []uuid.UUID
+	if err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
+		rows, err := r.Query(ctx, ExpiryWarningClaim, at, at.Add(ExpiryWarning), ExpiryBatch)
+		if err != nil {
+			return err
+		}
+		claimed, err = pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+		return err
+	}); err != nil {
+		t.Fatalf("running the warning claim: %v", err)
+	}
+	return claimed
+}
+
+// warnedAt reads a job's expiry_warned_at straight out of the table, bypassing the domain.
+func warnedAt(t *testing.T, pool *pgxpool.Pool, job uuid.UUID) *time.Time {
+	t.Helper()
+
+	var at *time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT expiry_warned_at FROM jobs WHERE id = $1`, job).Scan(&at); err != nil {
+		t.Fatalf("reading the warning mark of %s: %v", job, err)
+	}
+	return at
+}
+
+// markWarned puts a job's expiry_warned_at where a test needs it, without emitting anything.
+func markWarned(t *testing.T, pool *pgxpool.Pool, job uuid.UUID, at time.Time) {
+	t.Helper()
+
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE jobs SET expiry_warned_at = $2 WHERE id = $1`, job, at); err != nil {
+		t.Fatalf("marking %s warned: %v", job, err)
+	}
+}
+
+// historyOf is every recorded transition for a job, read straight out of the table.
+func historyOf(t *testing.T, pool *pgxpool.Pool, job uuid.UUID) []string {
+	t.Helper()
+
+	rows, err := pool.Query(t.Context(),
+		`SELECT from_status || '->' || to_status FROM job_status_history
+		  WHERE job_id = $1 ORDER BY server_recorded_at, id`, job)
+	if err != nil {
+		t.Fatalf("reading the history of %s: %v", job, err)
+	}
+	defer rows.Close()
+
+	moves, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("scanning the history of %s: %v", job, err)
+	}
+	return moves
+}
 
 // setDeadline puts a job's expires_at where a test needs it.
 //
