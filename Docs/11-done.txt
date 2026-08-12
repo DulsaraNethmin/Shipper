@@ -125,6 +125,7 @@ SHIP-78
 SHIP-79
 SHIP-80
 SHIP-81
+SHIP-82
 SHIP-91
 # M4 — Delivery execution
 SHIP-105

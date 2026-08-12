@@ -50,6 +50,12 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("PATCH /v1/fleet/vehicles/{id}", handler.Update())
 	mux.Handle("POST /v1/fleet/vehicles/{id}/deactivate", handler.Deactivate())
 	mux.Handle("POST /v1/fleet/vehicles/{id}/reactivate", handler.Reactivate())
+
+	// SHIP-82, which is not under /fleet: this domain serves it because this domain decides
+	// which jobs a provider may bid on. See the note at the top of cmd/api/routes_fleet.go, and
+	// note that the pattern here has to match that file exactly — a route mounted here and
+	// nowhere else is an endpoint that exists only in the tests.
+	mux.Handle("GET /v1/jobs/open", handler.OpenJobs())
 	return mux
 }
 

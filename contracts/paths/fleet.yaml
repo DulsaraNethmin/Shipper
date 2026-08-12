@@ -579,6 +579,69 @@ Profile:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+OpenJobs:
+  get:
+    operationId: listOpenJobs
+    summary: List the jobs this provider may bid on
+    tags: [Jobs]
+    description: |
+      The marketplace as the calling provider may bid on it, newest first (SHIP-82).
+
+      A job appears here only when all four of `Docs/01` §4.3's filters accept it: the provider's
+      declared service area covers where it is picked up, a vehicle they have in service can carry
+      it, their account has met the verification baseline, and the job is still open to bids.
+
+      **There is no parameter that widens this and none that narrows it** — no state, no vehicle,
+      no goods type. Eligibility is the platform's decision, not a filter a client composes
+      (`Docs/07` §3), and a provider narrowing their own feed further is the client's business.
+
+      **A provider who is eligible for nothing gets an empty page rather than an error.** That
+      covers an unverified account, one that has declared no service area, one with no vehicle in
+      service, and a customer who followed a link meant for the other role. None of the four is a
+      failure of the request; they are the truthful answer to it, and the client can send the
+      provider to onboarding from an empty list and the profile it already holds.
+
+      **`Negotiating` jobs are here as well as `Open` ones.** `Docs/02` §1: a job with bids on it
+      "remains open to eligible bids unless the customer closes it or awards a bid". The status is
+      carried so a provider knows they are bidding against company.
+
+      ## Paging
+
+      Keyset, not offset (`Docs/10` §4.5). Pass `cursor` back exactly as it was received. The
+      ordering is stable across pages even when several jobs were published in the same
+      millisecond, so following the cursor to the end reaches every job exactly once.
+    parameters:
+      - $ref: '#/Limit'
+      - $ref: '#/CursorParameter'
+    responses:
+      '200':
+        description: |
+          One page of jobs this provider may bid on. `data` is an empty array when there are none —
+          never `null`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/OpenJobPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- parameters --------------------------------------------------------------------------------
 
 VehicleID:
@@ -608,9 +671,10 @@ Limit:
   in: query
   required: false
   description: |
-    How many vehicles to return. Absent is 20; anything above 100 is narrowed to 100 rather than
-    refused, so raising the maximum later cannot break a client. A value that is not a whole number
-    of at least 1 is refused, because that is a client defect rather than a request.
+    How many entries to return — vehicles or jobs, depending on the operation. Absent is 20;
+    anything above 100 is narrowed to 100 rather than refused, so raising the maximum later cannot
+    break a client. A value that is not a whole number of at least 1 is refused, because that is a
+    client defect rather than a request.
   schema:
     type: integer
     minimum: 1
@@ -980,3 +1044,171 @@ VehicleType:
     - prime_mover
     - trailer
   example: van
+
+OpenJob:
+  type: object
+  required: [id, status, created_at]
+  additionalProperties: false
+  description: |
+    A job as a provider deciding whether to bid on it sees it (SHIP-82).
+
+    **There is no budget field, and there is no form one could take here.** `Docs/01` §4.3 keeps the
+    customer's maximum private from a provider — not as an amount, not as a band, not as a
+    "budget supplied" flag — and this schema is `additionalProperties: false`, so a service that
+    started sending one would fail the contract test rather than quietly disclose it. The customer's
+    own `Job` schema is the only shape in this API that carries `budget_cents`.
+
+    SHIP-83 adds `GET /v1/jobs/open/{id}` and it answers with this same schema, so a client parses
+    one type whatever it did to obtain the job — and, more to the point, so there is one shape to
+    keep the budget out of rather than two.
+
+    **The pickup and dropoff carry suburb, state and postcode, and not the street line or the
+    coordinate.** No document takes a position on when a provider learns the exact door, so this
+    takes the reversible direction: a provider prices on the locality and the distance, and the
+    doorstep is needed by whoever drives to it, after the award. The coordinate is withheld for the
+    same reason and not a different one — the platform geocodes the whole address, so sending it
+    would be sending the street line as two numbers.
+
+    Everything optional is **omitted rather than sent empty**, because a customer publishes without
+    measuring the sofa more often than not, and a response full of `""` and `0` says nothing about
+    which fields they actually filled in.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    status:
+      $ref: '#/BiddableJobStatus'
+    pickup:
+      $ref: '#/JobRegion'
+    dropoff:
+      $ref: '#/JobRegion'
+    goods_description:
+      type: string
+      example: Two-seater sofa, wrapped, no legs attached
+    length_cm:
+      type: integer
+      example: 190
+    width_cm:
+      type: integer
+      example: 90
+    height_cm:
+      type: integer
+      example: 85
+    weight_kg:
+      type: number
+      example: 45.5
+    vehicle_requirement:
+      type: string
+      description: |
+        What the customer believes the job needs, in their own words. Free text, and deliberately
+        not matched against any vocabulary: matching "ute with a tailgate lifter" against an
+        enumeration would hide jobs on a spelling.
+      example: Ute with a tailgate lifter
+    handling_notes:
+      type: string
+      description: |
+        Access constraints and anything else the customer thought a carrier should know. Carried in
+        full rather than summarised — `Docs/01` §4.3 names this among the detail that makes a bid
+        accurate, and it is the platform's answer to a provider who would rather have the budget.
+      example: Second-floor walk-up, no lift.
+    pickup_window:
+      $ref: '#/JobTimeWindow'
+    dropoff_window:
+      $ref: '#/JobTimeWindow'
+    expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the job stops being offered (SHIP-68). A provider deciding whether to price it today
+        can see whether it will still be there tomorrow.
+      example: '2026-08-25T03:30:00.000Z'
+    created_at:
+      type: string
+      format: date-time
+      description: When the customer created the job. The feed is ordered by this, newest first.
+      example: '2026-08-11T03:30:00.000Z'
+
+OpenJobPage:
+  type: object
+  required: [data, has_more]
+  additionalProperties: false
+  description: |
+    One page of a collection, in the envelope `Docs/10` §4.5 gives every list in this API.
+  properties:
+    data:
+      type: array
+      description: |
+        The jobs this provider may bid on, newest first. An **empty array** when there are none —
+        never `null`, and never an error: a provider who has declared no service area or has no
+        vehicle in service is eligible for nothing, which is an answer rather than a failure.
+      items:
+        $ref: '#/OpenJob'
+    next_cursor:
+      type: string
+      description: Pass as `cursor` to fetch the next page. Absent on the last page.
+      example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
+    has_more:
+      type: boolean
+      description: |
+        Whether asking again with `next_cursor` would return anything. Always present, and carried
+        rather than inferred from the cursor's absence — which is also what the first request looks
+        like.
+      example: false
+
+JobRegion:
+  type: object
+  additionalProperties: false
+  description: |
+    Where one end of a job is, at the grain a provider is given it before they bid.
+
+    **Three parts and no fourth.** There is no street line and no coordinate here; see `OpenJob`
+    for the decision and what would reopen it. A part the customer has not supplied is omitted, so
+    a job published with only a state and a postcode does not claim a blank suburb.
+
+    Distinct from the provider's own `ServiceArea`, which is a region they have *declared*. This is
+    a place a job is at.
+  properties:
+    suburb:
+      type: string
+      example: Richmond
+    state:
+      $ref: '#/StateOrTerritory'
+    postcode:
+      type: string
+      pattern: '^[0-9]{4}$'
+      example: '3121'
+
+JobTimeWindow:
+  type: object
+  additionalProperties: false
+  description: |
+    A period the pickup or the delivery has to happen in, with either end omitted when the customer
+    only cared about the other one. The whole window is omitted when they stated neither.
+  properties:
+    start:
+      type: string
+      format: date-time
+      example: '2026-08-14T09:00:00.000Z'
+    end:
+      type: string
+      format: date-time
+      example: '2026-08-15T17:00:00.000Z'
+
+BiddableJobStatus:
+  type: string
+  description: |
+    The status of a job that is open to bids, in the wire form `Docs/10` §4.7 requires and
+    `Docs/02` §1 names.
+
+    **Two values, not one.** `Docs/02` §1 defines Negotiating as a job that has bids or
+    counter-offers on it and "remains open to eligible bids unless the customer closes it or awards
+    a bid" — so it is still biddable, and it is carried rather than hidden because a provider
+    bidding against company is in a different position from one bidding alone.
+
+    This is a subset of the twelve statuses in the `Job` schema, and it is a subset by construction:
+    nothing else can satisfy the eligibility filter, so no other value can appear here.
+  enum:
+    - open
+    - negotiating
+  example: open

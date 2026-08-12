@@ -39,6 +39,22 @@ import (
 // provider's service area and specialties are sets they edit as sets — the client renders chips and
 // sends the set back — so there is no `/fleet/profile/states/{state}` to `DELETE`. Two operations
 // over one collection is where a client and a server stop agreeing about what is in it.
+//
+// # Why one of these routes is not under /fleet
+//
+// SHIP-82 adds `GET /v1/jobs/open`, and it is declared here rather than in routes_jobs.go. Routes
+// are **declared, not registered**, so the file follows the domain that answers the request rather
+// than the first segment of the path: `fleet` owns the eligibility filter, so `fleet` owns the
+// endpoint that serves it. Declaring it in the jobs file would have put a `fleet.Handler` in a file
+// the jobs track edits every wave, which is the shared surface this whole arrangement exists to
+// avoid.
+//
+// The path is the client's view and it is right: the resource is a job, and `/v1/jobs/open` is the
+// collection of jobs offered to the calling provider. net/http prefers the more specific pattern,
+// so this coexists with `/v1/jobs/{id}` without either file knowing about the other — and the two
+// are deliberately different resources rather than one endpoint returning two shapes:
+// `/v1/jobs/{id}` is the customer's own job and carries the budget that `Docs/01` §4.3 forbids a
+// provider ever seeing.
 func init() {
 	register(
 		Route{
@@ -96,6 +112,13 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Reactivate() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs/open",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).OpenJobs() },
 		},
 	)
 }

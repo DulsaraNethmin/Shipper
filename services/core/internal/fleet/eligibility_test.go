@@ -717,6 +717,11 @@ func TestNoProviderFacingShapeCarriesTheBudget(t *testing.T) {
 
 // jobFields is the part of a job these tests set. A subset on purpose: everything absent from it
 // is a column the filter must tolerate being NULL.
+//
+// The second group is what SHIP-82 and SHIP-83 put on the wire rather than what SHIP-81 filters on.
+// A job carrying only the first group is enough to test eligibility and not enough to tell whether
+// the response carries what a provider needs to price the work — or whether it carries what they
+// must never be given.
 type jobFields struct {
 	PickupSuburb     string
 	PickupState      string
@@ -726,6 +731,33 @@ type jobFields struct {
 	LengthCm         int
 	WidthCm          int
 	HeightCm         int
+
+	PickupLine      string
+	DropoffLine     string
+	DropoffSuburb   string
+	DropoffState    string
+	DropoffPostcode string
+
+	VehicleRequirement string
+	HandlingNotes      string
+
+	PickupWindowStart  time.Time
+	PickupWindowEnd    time.Time
+	DropoffWindowStart time.Time
+	DropoffWindowEnd   time.Time
+
+	// Budget is the customer's own maximum, in AUD, exactly as `jobs.budget` stores it (SHIP-67).
+	//
+	// **It is here so that the tests asserting a provider never sees it are asserting something.**
+	// A fixture with no budget would let every such check pass against a response that leaked one,
+	// which is why [TestTheProviderResponseCarriesNoBudgetInAnyForm] refuses to run until it has
+	// read a non-NULL budget back out of the row.
+	Budget float64
+
+	// PickupLatitude and PickupLongitude are the geocoded doorstep — the street line written as
+	// two numbers, which is why the shape that withholds the line has to withhold these too.
+	PickupLatitude  float64
+	PickupLongitude float64
 }
 
 // newVerifiedProvider is a provider who has met Docs/04 §3's automated baseline.
@@ -794,13 +826,33 @@ func draftJob(t *testing.T, pool *pgxpool.Pool, customer uuid.UUID, f jobFields)
 
 	exec(t, pool, `
 		INSERT INTO jobs (id, customer_id, pickup_suburb, pickup_state, pickup_postcode,
-		                  goods_description, weight_kg, length_cm, width_cm, height_cm)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		                  goods_description, weight_kg, length_cm, width_cm, height_cm,
+		                  pickup_line, dropoff_line, dropoff_suburb, dropoff_state, dropoff_postcode,
+		                  vehicle_requirement, handling_notes,
+		                  pickup_window_start, pickup_window_end,
+		                  dropoff_window_start, dropoff_window_end,
+		                  budget, pickup_latitude, pickup_longitude)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+		        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
 		id, customer,
 		nullText(f.PickupSuburb), nullText(f.PickupState), nullText(f.PickupPostcode),
 		nullText(f.GoodsDescription),
-		nullFloat(f.WeightKg), nullInt(f.LengthCm), nullInt(f.WidthCm), nullInt(f.HeightCm))
+		nullFloat(f.WeightKg), nullInt(f.LengthCm), nullInt(f.WidthCm), nullInt(f.HeightCm),
+		nullText(f.PickupLine), nullText(f.DropoffLine), nullText(f.DropoffSuburb),
+		nullText(f.DropoffState), nullText(f.DropoffPostcode),
+		nullText(f.VehicleRequirement), nullText(f.HandlingNotes),
+		nullTime(f.PickupWindowStart), nullTime(f.PickupWindowEnd),
+		nullTime(f.DropoffWindowStart), nullTime(f.DropoffWindowEnd),
+		nullFloat(f.Budget), nullFloat(f.PickupLatitude), nullFloat(f.PickupLongitude))
 	return id
+}
+
+// nullTime is [nullText] for an instant: the zero time is "the customer did not say".
+func nullTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
 }
 
 // publishJob writes a job and moves it to Open, then gives it an explicit deadline.

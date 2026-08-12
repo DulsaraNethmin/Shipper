@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **288 checks across 11 sections**, and `make check` green. Since
+Verified by `make verify` — **292 checks across 11 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -273,6 +273,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-79** | M3 | `provider_service_areas` and `provider_specialties`, and `GET`/`PATCH /v1/fleet/profile` — a service area is a **set of named regions, not a radius**, so §9's `internal/geo` trigger does not fire at SHIP-81 — *see below* |
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-81** | M3 | The job eligibility filter — **one SQL predicate in `fleet`, reaching four tables across three domains**, chosen over ports because ports cannot page a set intersection. Two readers, one clause; no endpoint until SHIP-82 — *see below* |
+| **SHIP-82** | M3 | `GET /v1/jobs/open` — the provider's feed, keyset-paged. **Declared in `routes_fleet.go`, not `routes_jobs.go`**: routes follow the domain that answers them, not the first segment of the path. It also deletes SHIP-81's SQL mirror from `make verify` in favour of real HTTP checks — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -2330,6 +2331,80 @@ block are the whole of it. `internal/bidding` was untouched: it owns none of the
 SHIP-91…95's award transaction is a single-owner branch that a feed query has no business sitting
 in front of.
 
+### SHIP-82 — the feed, and the route that is not in its own domain's file
+
+`GET /v1/jobs/open` puts SHIP-81's predicate in front of a provider, keyset-paged in the envelope
+`Docs/10` §4.5 gives every list. Two handlers, two contract operations, no migration and no new
+error code: the ticket is the endpoint the previous one was built for.
+
+#### The decision: a route is declared where its answer is decided, not where its path points
+
+The route is `/v1/jobs/open` and it is declared in **`cmd/api/routes_fleet.go`**, which looks wrong
+for a second and is the only arrangement that holds. Three things pointed the same way:
+
+1. **`fleet` decides eligibility, so `fleet` serves the endpoint.** The alternative is a
+   `fleet.Handler` constructed inside `routes_jobs.go`, which makes one domain's route file depend
+   on another domain's package — a shared-file edit in the exact place `Docs/10` §4.1 built the
+   manifest to avoid.
+2. **Routes are declared, not registered, and the file name is not part of the URL.** The manifest
+   sorts by path, `routes_golden.txt` records the served surface whatever file each line came from,
+   and `TestEveryRouteIsInTheContract` checks the contract in both directions. Nothing in the
+   mechanism cares which file an `init` sat in; the *tracks* care a great deal.
+3. **The path is still right, because the resource is a job.** `/v1/jobs/open` is the collection of
+   jobs offered to the calling provider and `/v1/jobs/open/{id}` is one member of it. net/http
+   prefers the more specific pattern, so it coexists with `jobs`' own `/v1/jobs/{id}` with neither
+   file knowing the other exists.
+
+**This wave proves the arrangement rather than asserting it**: track B held `routes_jobs.go` for
+the whole of it, and this branch added two routes to the served surface without touching that file
+or any other track's. The contract fragment follows the same rule — the operations live in
+`contracts/paths/fleet.yaml` and are tagged `Jobs`, because the fragment follows the *serving
+domain* and the tag follows the *resource a client is asking about*.
+
+#### What replaced SHIP-81's mirror, and why the count went up rather than down
+
+SHIP-81 demonstrated the four filters in `make verify` with a hand-written copy of the SQL
+predicate, marked as a mirror in its own section header, with the note that SHIP-82 would delete
+it. **It is deleted.** Every filter check now runs through the endpoint, so there is one
+description of the rule instead of two, and a filter that stopped working fails the run instead of
+passing against a copy of itself.
+
+The replacement asks the endpoint on every check. **SHIP-83 grows it a second half**: that ticket's
+`GET /v1/jobs/open/{id}` answers the same question about the same job, one predicate serves both,
+and a provider shown a job in the feed and then refused it on the detail screen is the worst of both
+outcomes — so the helper asks both and requires them to agree.
+
+`make verify` went from 288 checks to **292**, a net gain of four after the deletion.
+`make verify-update` wrote the figure; it was not typed.
+
+#### Pagination, and the case a one-field cursor gets wrong
+
+The cursor is `internal/pagination`'s encoding — no second one was invented — over SHIP-81's
+`JobCursor`, which is a `created_at` **and** an `id`. The reason is the tie: a customer publishing
+several jobs in one sitting writes rows the database timestamps identically, and a keyset ordered
+on time alone either repeats those rows forever or drops them, depending on whether the comparison
+is `<` or `<=`.
+
+**`TestPagingTheFeedReachesEveryJobExactlyOnce` is written against exactly that.** Seven jobs, three
+of which share a `created_at` to the microsecond, paged at every size from one to eight — because a
+page size that happens not to land between the tied rows hides the defect completely. The check is
+a *multiset*: the number of entries seen is compared as well as the set of identifiers, so a job
+returned on two consecutive pages fails a test that a set comparison would pass.
+
+It was verified by mutation rather than by inspection. Replacing the row comparison
+`(j.created_at, j.id) < ($3, $4)` with `j.created_at < $3` makes the suite fail at four page sizes,
+reporting **five of seven jobs at a page size of one** — two silently gone. `make verify` pages the
+live feed one job at a time and asserts the same property against the running service.
+
+#### A provider eligible for nothing gets an empty page, not a refusal
+
+An unverified provider, one who has declared no service area, one with no vehicle in service, and a
+customer who followed a link meant for the other role all get `{"data":[],"has_more":false}`. None
+of the four is a failure of the request — they are the truthful answer to it — and the client sends
+the provider to onboarding from an empty list and the profile it already holds. It is the reading
+`Service.Profile` already takes for a read that discloses nothing, and refusing here would make the
+client special-case a screen it can render anyway.
+
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 
 **The owner declared SHIP-91 delivered on 12 August 2026.** §6 had carried it as the wave's one
@@ -2912,6 +2987,8 @@ Kept here rather than deleted, because the shape recurs: this was described only
 **The decision, and the reasoning it was made on.** Deferring both would have left the column unbuilt for a rule it already satisfies, and SHIP-65's *Done when* incomplete for a third consecutive wave, in exchange for a test against an endpoint that does not exist. So SHIP-67 landed with the strongest proof available today, which turned out to be three tests rather than one — the source-parsing test that refuses a budget field on any shape but the owner's response, a wire test over every response a provider or a stranger can obtain, and a test on the stored event payload. §3 has the detail. **SHIP-83 remains reserved to this owner and adds the fourth**: its provider response, serialised, asserted to carry no budget. That is the test the pairing was actually for, and it is the one thing that is still owed.
 
 **The `make verify` tripwire has been moved, and this is the entry recording it.** The check asserting that no `budget` key was present is gone; what replaced it asserts the owner reads their own budget back and that no provider-facing or stranger-facing response mentions it in any form. **The tripwire is now the source-parsing test rather than a verify line** — whoever writes SHIP-82 or SHIP-83 will meet it as a failing test the moment a provider shape acquires the field, which is earlier and louder than a shell assertion would have been.
+
+**Half of that prediction is now observed.** SHIP-82's new response types are non-test files in `internal/fleet`, so the source-parsing guard reached them with no change to it — confirmed by injecting a `budget_cents` field and watching it fail. SHIP-83 is what adds the serialised-response half.
 
 ## 9. Open recommendations nobody has decided
 

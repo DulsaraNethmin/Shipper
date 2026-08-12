@@ -178,6 +178,8 @@ paths:
     $ref: './paths/fleet.yaml#/ReactivateVehicle'
   /v1/jobs:
     $ref: './paths/jobs.yaml#/Jobs'
+  /v1/jobs/open:
+    $ref: './paths/fleet.yaml#/OpenJobs'
   /v1/jobs/{id}:
     $ref: './paths/jobs.yaml#/JobByID'
   /v1/jobs/{id}/cancel:

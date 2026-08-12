@@ -615,20 +615,19 @@ serves="$("$PSQL" "$DATABASE_URL" -tAc \
 ok "the stored declaration answers eligibility by set membership — the query SHIP-81 inherits"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-81  the eligibility filter — four filters, each shown to exclude something"
+ticket "SHIP-81  the eligibility filter, through SHIP-82's GET /v1/jobs/open — four filters, each shown to exclude"
 
-# SHIP-81 adds no endpoint. SHIP-82 puts `GET /v1/jobs/open` in front of the query and this
-# section becomes HTTP checks then; until it does, the demonstration is the predicate run against
-# real rows, from outside Go.
+# **SHIP-81's SQL mirror is gone, and this is what replaced it.**
 #
-# # The SQL below is a MIRROR of internal/fleet/eligibility.go's `eligible`, and that is a cost
+# SHIP-81 had no endpoint, so it demonstrated the four filters by running a hand-written copy of
+# internal/fleet/eligibility.go's predicate against the real schema — clearly marked as a mirror,
+# and with its own section header saying SHIP-82 would delete it. This is that deletion. Every
+# check below now goes through the real endpoint, so there is one description of the rule rather
+# than two, and a filter that stopped working would fail here instead of passing against a copy of
+# itself.
 #
-# internal/fleet/eligibility_test.go is authoritative: it exercises the real predicate through the
-# real domain service, and it is what `make check` runs. What this adds is a different kind of
-# evidence — that the four filters are answerable from the real schema, against rows created
-# through the real API, with nothing Go-shaped in the path. A copy that drifts would be a check
-# quietly asserting the wrong thing, so it is written once, next to the section it serves, and
-# SHIP-82 deletes it in favour of the endpoint.
+# What the mirror bought — evidence from outside Go, against rows the real API created — is bought
+# better this way: the request is the one a provider's phone makes.
 #
 # A provider of its own, deliberately. The sections above leave several vehicles in various states
 # on $fleet_provider_id, and "no vehicle in service" cannot be demonstrated against a fleet whose
@@ -659,9 +658,9 @@ status="$(fleet_request POST "$elig_provider_token" "verify-elig-vehicle-$$" /v1
 [[ "$status" == "201" ]] || { cat "$WORKDIR/elig-vehicle.json"; fail "adding the eligibility vehicle returned $status"; }
 elig_vehicle_id="$(json "$WORKDIR/elig-vehicle.json" '["id"]')"
 
-# The job carries a budget, deliberately. It is what the last check in this section reads: the
-# feed's column list must not name it, and a job with no budget at all would make that assertion
-# vacuous.
+# The job carries a budget, deliberately, and it is the number SHIP-83's checks below search for.
+# A job with no budget would make every one of those assertions vacuous — a privacy check whose
+# fixture has nothing to leak passes forever and proves nothing.
 status="$(fleet_request POST "$fleet_customer_token" "verify-elig-job-$$" /v1/jobs \
   '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
     "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
@@ -692,33 +691,37 @@ SQL
 
 publish_job "$elig_job_id" Draft Open
 
-# eligible — 1 when the provider may bid on that one job, 0 when any filter excludes it.
+# eligible — 1 when the feed offers that one job to that one provider, 0 when it does not.
 #
 # Scoped to the single job by id, so the jobs 50-jobs.sh leaves behind cannot make a broken filter
 # look like a working one.
+#
+# **SHIP-83 grows this a second half.** `GET /v1/jobs/open/{id}` answers the same question about the
+# same job, one predicate serves both endpoints, and a disagreement between them is a defect rather
+# than a difference of emphasis — so that ticket asks both here and requires them to agree.
 eligible() {
-  "$PSQL" "$DATABASE_URL" -tAc "
-    select count(*) from jobs j
-     where j.id = '$elig_job_id'
-       and j.status in ('Open', 'Negotiating')
-       and (j.expires_at is null or j.expires_at > now())
-       and j.customer_id <> '$elig_provider_id'
-       and exists (select 1 from users u
-                    where u.id = '$elig_provider_id' and u.role = 'provider'
-                      and u.status = 'active'
-                      and u.email_verified_at is not null
-                      and u.phone_verified_at is not null)
-       and exists (select 1 from provider_service_areas a
-                    where a.provider_id = '$elig_provider_id'
-                      and ((a.scope = 'state'    and a.area = j.pickup_state)
-                        or (a.scope = 'postcode' and a.area = j.pickup_postcode)))
-       and exists (select 1 from vehicles v
-                    where v.provider_id = '$elig_provider_id' and v.deactivated_at is null
-                      and (j.weight_kg is null or v.max_weight_kg  is null or v.max_weight_kg  >= j.weight_kg)
-                      and (j.length_cm is null or v.load_length_cm is null or v.load_length_cm >= j.length_cm)
-                      and (j.width_cm  is null or v.load_width_cm  is null or v.load_width_cm  >= j.width_cm)
-                      and (j.height_cm is null or v.load_height_cm is null or v.load_height_cm >= j.height_cm));"
+  local status found
+  status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/elig-feed.json")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/elig-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
+
+  found="$(python3 - "$WORKDIR/elig-feed.json" "$elig_job_id" <<'FEED'
+import json, sys
+page = json.load(open(sys.argv[1]))
+found = any(job["id"] == sys.argv[2] for job in page["data"])
+if not found and page["has_more"]:
+    # Ambiguous rather than false: the job could be on a later page, and a check that read that
+    # as "excluded" would pass for the wrong reason on a busy database.
+    sys.exit(1)
+print(1 if found else 0)
+FEED
+)" || fail "the feed did not fit in one page of 100; this check cannot tell absent from further down"
+  printf '%s' "$found"
 }
+
+status="$(curl -s -o "$WORKDIR/open-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/open")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/open-anon.json"; fail "an unauthenticated feed read returned $status, want 401"; }
+ok "the feed cannot be reached without a credential — a provider sees it because the platform filtered it"
 
 [[ "$(eligible)" == "1" ]] || fail "the job every filter should accept is not eligible"
 ok "a verified provider serving VIC, with a truck that fits, is offered an Open Richmond job"
@@ -795,20 +798,130 @@ publish_job "$elig_job_id" Negotiating Cancelled
 [[ "$(eligible)" == "0" ]] || fail "a cancelled job was still offered"
 ok "job status — Negotiating stays biddable and Cancelled does not, exactly as Docs/02 §1 reads"
 
-# The invariant this feed exists under, checked where it can actually be broken.
-#
-# The provider's feed is the first thing in the service that reads `jobs` from outside the jobs
-# domain, and it reads it column by column — so the SELECT list *is* the disclosure boundary, and
-# `budget` sits three lines from `weight_kg` in the same table. SHIP-67's source-parsing guard
-# parses internal/jobs and cannot see this; internal/fleet has its own copy, and this is the same
-# assertion made from outside Go so that neither can be quietly deleted alone.
-stored_budget="$("$PSQL" "$DATABASE_URL" -tAc \
-  "select budget is not null from jobs where id = '$elig_job_id';")"
-[[ "$stored_budget" == "t" ]] || fail "the job carries no budget, so this check is asserting nothing"
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-82  GET /v1/jobs/open — the envelope, only eligible jobs, and paging"
 
-selected="$(sed -n '/^const eligibleJobColumns/,/`$/p' services/core/internal/fleet/eligibility.go)"
-[[ -n "$selected" ]] || fail "eligibleJobColumns is gone; the provider feed's column list is what this reads"
-if grep -qi 'budget' <<<"$selected"; then
-  fail "the provider feed's column list names the budget, which Docs/01 §4.3 forbids in every form"
-fi
-ok "the customer's budget is stored on the job and named nowhere in the provider feed's column list"
+# **A fresh job, because the one above is Cancelled and stays that way.** Docs/02 §1 makes
+# Cancelled terminal, and moving it back would demonstrate a transition the platform does not
+# offer — the database's guard only checks that a history row describes the move, so writing an
+# illegal one here would be this script inventing a lifecycle rather than exercising one.
+status="$(fleet_request POST "$fleet_customer_token" "verify-open-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "vehicle_requirement":"Ute with a tailgate lifter","handling_notes":"Second-floor walk-up, no lift.",
+    "budget_cents":150000}' \
+  "$WORKDIR/open-job.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/open-job.json"; fail "creating the open-feed job returned $status"; }
+open_job_id="$(json "$WORKDIR/open-job.json" '["id"]')"
+publish_job "$open_job_id" Draft Open
+
+# A job the provider is not eligible for, alongside one they are. "Only eligible jobs" needs
+# something in the database to be wrong about; a feed filtered by an empty table proves nothing.
+status="$(fleet_request POST "$fleet_customer_token" "verify-open-qld-$$" /v1/jobs \
+  '{"pickup":{"line":"1 Queen Street","suburb":"Brisbane","state":"QLD","postcode":"4000"},
+    "dropoff":{"line":"2 Adelaide Street","suburb":"Brisbane","state":"QLD","postcode":"4000"},
+    "goods_description":"Pallet of tiles","weight_kg":300,
+    "budget_cents":90000}' \
+  "$WORKDIR/open-qld.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/open-qld.json"; fail "creating the out-of-area job returned $status"; }
+qld_job_id="$(json "$WORKDIR/open-qld.json" '["id"]')"
+publish_job "$qld_job_id" Draft Open
+
+status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/open-feed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
+python3 - "$WORKDIR/open-feed.json" "$open_job_id" "$qld_job_id" <<'PY' || fail "the feed is not Docs/10 §4.5's envelope, or it carries a job outside the provider's service area"
+import json, sys
+page = json.load(open(sys.argv[1]))
+if set(page) - {"data", "next_cursor", "has_more"}:
+    print("unexpected keys:", set(page), file=sys.stderr); sys.exit(1)
+if not isinstance(page["data"], list) or "has_more" not in page:
+    print("wrong shape:", page, file=sys.stderr); sys.exit(1)
+ids = [job["id"] for job in page["data"]]
+if sys.argv[2] not in ids:
+    print("the eligible job is missing:", ids, file=sys.stderr); sys.exit(1)
+if sys.argv[3] in ids:
+    print("a Queensland job reached a provider who serves Victoria only", file=sys.stderr); sys.exit(1)
+created = [job["created_at"] for job in page["data"]]
+if created != sorted(created, reverse=True):
+    print("not newest first:", created, file=sys.stderr); sys.exit(1)
+PY
+ok "the envelope is data/next_cursor/has_more, newest first, and a job outside the service area is not in it"
+
+# A second eligible job, so paging has a boundary to cross. Same pickup, so the same declaration
+# and the same truck accept it.
+status="$(fleet_request POST "$fleet_customer_token" "verify-open-second-$$" /v1/jobs \
+  '{"pickup":{"line":"7 Swan Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"3 Collins Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Dining table","weight_kg":60,
+    "budget_cents":120000}' \
+  "$WORKDIR/open-second.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/open-second.json"; fail "creating the second eligible job returned $status"; }
+second_job_id="$(json "$WORKDIR/open-second.json" '["id"]')"
+publish_job "$second_job_id" Draft Open
+
+# Paging followed the way a client follows it: take next_cursor, send it back, stop at
+# has_more=false. The page size is 1 so the boundary is crossed once per job.
+python3 - "$elig_provider_token" "$VERIFY_PORT" "$auth_header" "$open_job_id" "$second_job_id" <<'PY' || fail "paging the feed did not reach every eligible job exactly once"
+import json, sys, urllib.parse, urllib.request
+
+token, port, header = sys.argv[1], sys.argv[2], sys.argv[3]
+must_appear = set(sys.argv[4:])
+base = f"http://localhost:{port}/v1/jobs/open"
+
+def get(url):
+    request = urllib.request.Request(url, headers={header: f"Bearer {token}"})
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)
+
+whole = get(f"{base}?limit=100")
+if whole["has_more"]:
+    print("more than 100 eligible jobs; this check assumes there are not", file=sys.stderr)
+    sys.exit(1)
+expected = [job["id"] for job in whole["data"]]
+
+seen, url, pages = [], f"{base}?limit=1", 0
+while True:
+    pages += 1
+    if pages > len(expected) + 2:
+        print("paging did not terminate; the cursor is not advancing", file=sys.stderr)
+        sys.exit(1)
+    page = get(url)
+    seen.extend(job["id"] for job in page["data"])
+    if not page["has_more"]:
+        if page.get("next_cursor"):
+            print("the last page carries a cursor", file=sys.stderr)
+            sys.exit(1)
+        break
+    if len(page["data"]) != 1:
+        print("a page before the last holds", len(page["data"]), "jobs, want the limit of 1", file=sys.stderr)
+        sys.exit(1)
+    url = f"{base}?limit=1&cursor={urllib.parse.quote(page['next_cursor'])}"
+
+# A repeat and a skip are both invisible to a set comparison, so the length is checked too.
+if len(seen) != len(expected) or sorted(seen) != sorted(expected):
+    print("paged over", seen, "want", expected, file=sys.stderr)
+    sys.exit(1)
+if not must_appear <= set(seen):
+    print("the jobs this section published are not all in the feed:", must_appear - set(seen), file=sys.stderr)
+    sys.exit(1)
+print(f"    {len(expected)} eligible jobs over {pages} pages of one")
+PY
+ok "paging one job at a time reaches every eligible job exactly once, and terminates"
+
+status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?cursor=not-a-cursor' "$WORKDIR/open-badcursor.json")"
+[[ "$status" == "400" ]] || fail "a mangled cursor returned $status, want 400"
+status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=0' "$WORKDIR/open-badlimit.json")"
+[[ "$status" == "400" ]] || fail "?limit=0 returned $status, want 400"
+status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=5000' "$WORKDIR/open-biglimit.json")"
+[[ "$status" == "200" ]] || fail "?limit=5000 returned $status, want it narrowed to the maximum"
+ok "a mangled cursor and a bad limit are refused; an over-large limit is narrowed"
+
+# A customer reaching the provider's feed gets an empty page rather than a 403. Being eligible for
+# nothing is the truthful answer to the question, and the client renders that from an empty list.
+status="$(fleet_get "$fleet_customer_token" /v1/jobs/open "$WORKDIR/open-customer.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-customer.json"; fail "a customer reading the feed returned $status, want 200"; }
+[[ "$(tr -d ' \n' < "$WORKDIR/open-customer.json")" == '{"data":[],"has_more":false}' ]] \
+  || { cat "$WORKDIR/open-customer.json"; fail "a customer's feed is not an empty array"; }
+ok "a caller eligible for nothing gets an empty array, never null and never a 403"
+

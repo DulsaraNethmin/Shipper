@@ -12,6 +12,15 @@
 // platform. A vehicle belonging to another provider answers 404, byte-identically to one that does
 // not exist.
 //
+// # One route here is not under /fleet, and that is deliberate
+//
+// `GET /v1/jobs/open` (SHIP-82) serves jobs, and it is served from this domain because this domain
+// decides which jobs a provider may bid on. Routes are declared rather than registered, so the file
+// a route is declared in follows the domain that answers it rather than the first segment of its
+// path. The rule that keeps it apart from `jobs`' own route is the one the budget invariant needs:
+// `/v1/jobs/{id}` is the customer's job and carries their budget, and nothing served from here has
+// a field it could go in.
+//
 // **This is not the customer's view of a vehicle.** Docs/01 §4.3 lets a customer compare "provider
 // profile, vehicle, and declared capability" when they read the bids on their job, and that shape
 // arrives with SHIP-96 as a schema of its own rather than as this one reached by another route —
@@ -610,6 +619,251 @@ func (h *Handler) Declare() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, profileFrom(declared))
 		return nil
 	})
+}
+
+// --- SHIP-82: the marketplace as a provider sees it -------------------------------------------
+
+// openJobResponse is a job a provider may bid on.
+//
+// # There is no budget field, in any form, and this is the shape that had to prove it
+//
+// Docs/01 §4.3 keeps the customer's maximum private from providers — "not as an amount, a band, or
+// a 'budget supplied' flag" — and CLAUDE.md calls a breach a defect rather than a style choice.
+// Docs/11 §8 records SHIP-83 as owing the one proof SHIP-67 could not write — the provider's
+// response, serialised, asserted to carry no budget — and **SHIP-83 answers it against this type**,
+// because this is the shape both of its endpoints put on the wire.
+//
+// # The street line is not here either, and SHIP-83 confirms or reopens that
+//
+// SHIP-81 took the decision for the feed because no document takes a position: a provider prices a
+// job on the locality, the distance and the state, and the doorstep is needed by whoever drives to
+// it, which is after an award. The coordinate is absent for the same reason rather than a different
+// one — `jobs` geocodes the whole address, so a pickup coordinate *is* the street line written as
+// two numbers.
+//
+// Nor is there a customer. Docs/01 §4.3 lets a *customer* compare provider profiles once bids
+// arrive; nothing gives the reverse before an award.
+type openJobResponse struct {
+	ID string `json:"id"`
+
+	// Status is `open` or `negotiating` and can be nothing else. A job already being negotiated is
+	// one a provider is bidding against company, which is worth their knowing before they price it.
+	Status string `json:"status"`
+
+	// Pickup is present for every job this endpoint can return: the eligibility filter matches a
+	// declared region against the pickup state or postcode, so a job with neither cannot be here.
+	// Dropoff can be absent, because 000403 lets a customer publish before they have both ends.
+	Pickup  *regionResponse `json:"pickup,omitempty"`
+	Dropoff *regionResponse `json:"dropoff,omitempty"`
+
+	GoodsDescription string  `json:"goods_description,omitempty"`
+	LengthCm         int     `json:"length_cm,omitempty"`
+	WidthCm          int     `json:"width_cm,omitempty"`
+	HeightCm         int     `json:"height_cm,omitempty"`
+	WeightKg         float64 `json:"weight_kg,omitempty"`
+
+	VehicleRequirement string `json:"vehicle_requirement,omitempty"`
+	HandlingNotes      string `json:"handling_notes,omitempty"`
+
+	PickupWindow  *windowResponse `json:"pickup_window,omitempty"`
+	DropoffWindow *windowResponse `json:"dropoff_window,omitempty"`
+
+	// ExpiresAt is when the job stops being offered (SHIP-68), so a provider deciding whether to
+	// price it today knows it will still be there tomorrow.
+	ExpiresAt string `json:"expires_at,omitempty"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+// regionResponse is one end of a job, at the grain a provider is given it.
+//
+// Three parts and no fourth. See [openJobResponse] for why the street line and the coordinate are
+// both absent, and [Region] for the decision SHIP-81 took first.
+type regionResponse struct {
+	Suburb   string `json:"suburb,omitempty"`
+	State    string `json:"state,omitempty"`
+	Postcode string `json:"postcode,omitempty"`
+}
+
+// windowResponse is a period a job's pickup or delivery has to happen in, with either end omitted
+// when the customer only cared about the other one.
+type windowResponse struct {
+	Start string `json:"start,omitempty"`
+	End   string `json:"end,omitempty"`
+}
+
+func openJobFrom(j EligibleJob) openJobResponse {
+	return openJobResponse{
+		ID:     j.ID.String(),
+		Status: wireStatus(j.Status),
+
+		Pickup:  regionFrom(j.Pickup),
+		Dropoff: regionFrom(j.Dropoff),
+
+		GoodsDescription: j.GoodsDescription,
+		LengthCm:         j.LengthCm,
+		WidthCm:          j.WidthCm,
+		HeightCm:         j.HeightCm,
+		WeightKg:         j.WeightKg,
+
+		VehicleRequirement: j.VehicleRequirement,
+		HandlingNotes:      j.HandlingNotes,
+
+		PickupWindow:  windowFrom(j.PickupWindow),
+		DropoffWindow: windowFrom(j.DropoffWindow),
+
+		ExpiresAt: timestamp(j.ExpiresAt),
+		CreatedAt: timestamp(j.CreatedAt),
+	}
+}
+
+// regionFrom omits an end of the job the customer has not filled in, rather than sending `{}`.
+func regionFrom(r Region) *regionResponse {
+	if r == (Region{}) {
+		return nil
+	}
+	return &regionResponse{Suburb: r.Suburb, State: r.State, Postcode: r.Postcode}
+}
+
+// windowFrom does the same for a window nobody stated.
+func windowFrom(w Window) *windowResponse {
+	if w.Start.IsZero() && w.End.IsZero() {
+		return nil
+	}
+	return &windowResponse{Start: timestamp(w.Start), End: timestamp(w.End)}
+}
+
+// wireStatus turns a stored job status into the form Docs/10 §4.7 puts on the wire — lower snake
+// case, so `Driver assigned` becomes `driver_assigned`.
+//
+// **A second copy of a rule `jobs` also holds**, for the reason [biddableStatuses] is a second copy
+// of two strings: domains do not import each other. It is the general transformation rather than a
+// two-entry lookup, so that it stays correct if this endpoint ever carries a third status, and
+// TestTheBiddableStatusesReachTheWireInDocs02sNames holds its output for the two statuses that can
+// reach here to the names Docs/02 §1 and the published contract both use.
+func wireStatus(stored string) string {
+	return strings.ToLower(strings.ReplaceAll(stored, " ", "_"))
+}
+
+// OpenJobs handles GET /v1/jobs/open (SHIP-82).
+//
+// The marketplace as this provider may bid on it: every open job the platform's eligibility filter
+// offers them, newest first, keyset-paged (Docs/10 §4.5).
+//
+// **There is no parameter that widens it and none that narrows it.** Not a state, not a vehicle,
+// not a goods type. Eligibility is the platform's decision (Docs/07 §3 — the app may hide, the
+// platform decides), and a filter parameter here would be a second place for that answer to be
+// argued with; a provider narrowing their own feed further is SHIP-99's client-side business.
+//
+// **A caller who is eligible for nothing gets an empty page, not a refusal**, and that includes an
+// unverified provider, one who has declared no service area, one with no vehicle in service, and a
+// customer who followed a link meant for the other role. None of the four is a failure of the
+// request — they are the truthful answer to it — and the read discloses nothing, so refusing it
+// would make the client special-case a screen it can render from an empty list and the profile it
+// already holds. That is the reading [Service.Profile] takes for the same reason.
+//
+// The route lives in cmd/api/routes_fleet.go rather than routes_jobs.go, because routes are
+// declared rather than registered and the declaring file is the one whose domain decides the
+// answer. `fleet` owns eligibility; `jobs` owns the customer's view of a job.
+func (h *Handler) OpenJobs() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		query, err := eligibilityQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		page, err := h.svc.EligibleJobs(r.Context(), pool, providerID, query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		jobs := make([]openJobResponse, 0, len(page.Jobs))
+		for _, job := range page.Jobs {
+			jobs = append(jobs, openJobFrom(job))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(jobs, encodeJobCursor(page.Next)))
+		return nil
+	})
+}
+
+// eligibilityQueryFrom reads `?limit=` and `?cursor=`, which is every parameter this feed has.
+//
+// An unknown query parameter is passed over rather than refused, which is the opposite of what
+// httpx.DecodeJSON does to an unknown *body* field. Docs/07 §6's strictness is about bodies: a URL
+// picks up parameters from link trackers and proxies that no client typed, and refusing those would
+// break a request nobody composed. What matters is the other direction — neither parameter this
+// endpoint does read can widen the filter, and there are only two of them.
+func eligibilityQueryFrom(r *http.Request) (EligibilityQuery, error) {
+	values := r.URL.Query()
+
+	var query EligibilityQuery
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return EligibilityQuery{}, err
+	}
+	query.Limit = limit
+
+	if query.After, err = decodeJobCursor(values.Get("cursor")); err != nil {
+		return EligibilityQuery{}, err
+	}
+	return query, nil
+}
+
+// jobCursorFields is how many parts a job cursor has: the created_at it is positioned at, and the
+// id that breaks ties on it. Two, for the reason [JobCursor] gives — a customer publishing several
+// jobs in one sitting writes rows in the same millisecond, and a cursor that could not break that
+// tie would repeat or drop a job at exactly the page boundary.
+const jobCursorFields = 2
+
+// encodeJobCursor renders a position for a client to hand back, in the encoding
+// `internal/pagination` owns. The zero cursor is the empty string, which is also what "no cursor"
+// looks like on the way in.
+func encodeJobCursor(c JobCursor) string {
+	if c.IsZero() {
+		return ""
+	}
+	return pagination.Cursor{
+		c.CreatedAt.UTC().Format(time.RFC3339Nano),
+		c.ID.String(),
+	}.Encode()
+}
+
+// decodeJobCursor reads one back. See [decodeVehicleCursor] for why the shape is checked by
+// `pagination` and the meaning here, and why the timestamp is nanosecond rather than the
+// millisecond precision responses render.
+func decodeJobCursor(raw string) (JobCursor, error) {
+	fields, err := pagination.Decode(raw, jobCursorFields)
+	if err != nil || fields == nil {
+		return JobCursor{}, err
+	}
+
+	at, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		return JobCursor{}, invalidJobCursor(err)
+	}
+	id, err := uuid.Parse(fields[1])
+	if err != nil {
+		return JobCursor{}, invalidJobCursor(err)
+	}
+	return JobCursor{CreatedAt: at, ID: id}, nil
+}
+
+func invalidJobCursor(cause error) error {
+	return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+		"The cursor is not one this endpoint issued. Ask for the first page without one.").
+		WithCause(cause)
 }
 
 // vehicleQueryFrom reads `?active=`, `?limit=` and `?cursor=`.
