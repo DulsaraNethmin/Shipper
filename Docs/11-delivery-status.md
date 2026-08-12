@@ -126,9 +126,11 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **208 checks**, and `make check` green. Since SHIP-15e the checks
-live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
-its section by adding a file.
+Verified by `make verify` — **218 checks across 10 sections**, and `make check` green. Since
+SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
+runner; a ticket adds its section by adding a file. The tenth section is SHIP-134's
+`scripts/verify/80-notifications.sh`, and the count is what the runner printed rather than what
+the arithmetic suggested.
 
 `make verify` covers the foundation tickets it was written for. Work that reaches no HTTP
 endpoint is demonstrated by its own tests instead and says so in the row: the wave-1
@@ -213,6 +215,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-61** | M2 | `POST /v1/jobs` — the first authenticated state-changing endpoint in the service — *see below* |
 | **SHIP-62** | M2 | `PATCH /v1/jobs/{id}` — a partial edit of a draft, and a stranger's edit is indistinguishable from no job at all — *see below* |
 | **SHIP-67a** | M2 | `cmd/worker` — a ticker and a `FOR UPDATE SKIP LOCKED` claim loop; two workers share the backlog rather than duplicating it — *see below* |
+| **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -1509,13 +1512,119 @@ tracks also add files to, which is the established pattern (`jobs_test.go`,
 `quotedLiteral` from `jobs_test.go`, since two package-level names cannot both be that and a
 second identically shaped regexp is how the two drift.
 
+### What SHIP-134 built, the dependency it took, and the two designs it rejected
+
+The publisher. `outbox` and `internal/events` have existed since the foundation; §4 has carried
+"the publisher, that is M5 and stays there" since wave 1, and this closes it. No migration —
+`outbox` is `000004` and needed nothing.
+
+**A new dependency: `github.com/segmentio/kafka-go` v0.4.51.** There was no Kafka client in
+`go.mod`, and `go.mod` is a shared surface, so this was authorised deliberately rather than taken
+opportunistically (`Docs/10` §9.2). Three things decided it. **Pure Go**, which rules out the
+librdkafka bindings — cgo costs the static binary and complicates the Linux runner, and no
+document has chosen a vendor. **Synchronous produce as the default**, which is the whole shape an
+outbox needs: a call that returns after the broker has acknowledged, not a callback. And **one
+module for producing, consuming and admin**, so SHIP-135 and SHIP-137 are served by the same
+dependency rather than a second one. franz-go is faster and more actively maintained and would
+have been the choice if throughput were the constraint; it is not, for a task draining a few
+hundred rows every two seconds, and its produce path is a callback with a `ProduceSync` wrapper
+around it. `go mod tidy` pulled `klauspost/compress`, `pierrec/lz4/v4` and the `xdg-go` SCRAM
+chain with it. The client sits behind `EventPublisher`, one method declared in `outbox.go`, so
+replacing it is a change to one file.
+
+**The publisher lives in `cmd/worker`, not in `internal/events`.** Putting the reader beside the
+writer was the obvious first answer and it is the wrong one, for the transitivity reason that
+already produced the fourth boundary rule at SHIP-15c: **every domain imports `internal/events`**,
+because every domain emits. A Kafka client imported from there is linked into `cmd/api` and into
+every domain's test binary to serve one task in one binary none of them run. `internal/events/publish`
+would have avoided that and needed no edit to `internal/boundaries` either — a subpackage of
+registered infrastructure is classified by its first segment — and it was rejected for a smaller
+reason: the drain is a claim loop, claim loops live in `cmd/worker`, and `checkClaim` is the check
+that a claim query actually says `FOR UPDATE SKIP LOCKED`. Reaching it from another package means
+exporting it or writing the query without it, and the second is the mistake `claim.go` exists to
+catch. A platform adapter was never in the running: CLAUDE.md admits one only where a second
+implementation exists today, and there is one Kafka.
+
+**Publish, then mark, then commit — and it is the commit that carries the guarantee.** The row is
+marked only after the broker acknowledges, and the mark becomes durable only at commit, which
+leaves three outcomes and no fourth. The publish fails: the pass returns an error, `db.InTx` rolls
+back, `published_at` is still NULL, the advisory locks are released, and the next pass finds the
+same rows. That is the unreachable-broker case, and it is why the mark cannot come first. The
+publish succeeds and the commit does not: the events are on the broker and the rows still look
+unpublished, so they publish again — the at-least-once window `Docs/06` §4.0 names, and the reason
+every consumer deduplicates on the event id. Or both succeed. **There is no outcome in which a row
+is marked and never published**, and that asymmetry is the entire design: a duplicate is a solved
+consumer problem, a lost award notification is not.
+
+**The unit of division is the aggregate, not the row, and that is a correction to what SKIP LOCKED
+alone gives you.** `000004` promises ordering per aggregate. A claim that only said
+`WHERE published_at IS NULL ORDER BY occurred_at, id FOR UPDATE SKIP LOCKED LIMIT n` does not keep
+it once two workers run, which a rolling deployment guarantees: worker A takes the oldest hundred
+rows including job X's first two events, worker B skips A's locks and takes the next hundred
+including job X's third, and if B reaches the broker first — it will whenever A's batch is larger
+or its connection slower — job X's events arrive out of order and nothing reports it. A
+transaction-scoped advisory lock per aggregate closes it, because the lock is atomic: B is refused
+job X outright and moves to an aggregate nobody holds, so the work is still divided rather than
+duplicated. The row lock is kept as well, and not as ceremony — it is what releases a dead
+worker's claim.
+
+**Where the qual goes is not a style question, and this is the finding worth carrying forward.**
+The first version put `pg_try_advisory_xact_lock` in the claim's `WHERE`. It is shorter and it is
+wrong, because **how many rows a qual is evaluated against is the planner's decision, not the
+query's**. With the partial index driving an ordered index scan it runs on roughly `LIMIT` rows;
+on a small table PostgreSQL prefers a bitmap scan and a `Sort`, which evaluates the qual on the
+entire backlog before `LIMIT` applies — so one worker locks every aggregate in the outbox and a
+second worker gets nothing. Correct, and a throughput collapse that appears only above a certain
+table size. `TestOneAggregateBelongsToOneWorker` found it on five rows. The fix is two statements
+with a `MATERIALIZED` CTE: the `LIMIT` is fixed before any lock is attempted, so exactly the
+distinct aggregates among the oldest batch rows are tried and no others, whatever the planner
+does.
+
+**It creates no topics, deliberately.** SHIP-135 owns the topic set, and a topic conjured here
+would take whatever partition count seemed reasonable — partitions can be added but never removed,
+and adding one moves every key to a different partition, which silently ends the ordering promise
+above. The broker refuses auto-creation too (`deploy/docker-compose.yml`). Until SHIP-135, a
+publish to a topic nobody created fails the pass and leaves the rows claimable, which is the
+correct direction to fail. `topicFor` is one line and is where SHIP-135 will change it:
+`shipper.<aggregate_type>`.
+
+**`Task.Close` was added at SHIP-15g for exactly this and is now used.** The producer is built in
+the registration closure and released by `Close`, which the scheduler calls after the loop stops
+on a fresh context bounded by `shutdownTimeout` — a flush inherited from the cancelled context
+would be cancelled before it began. `kafka.Writer.Close` takes no context, so the wait is done in
+`closeWriter`: a close that outlives the window is reported rather than waited on, because holding
+a deployment open until SIGKILL discards the buffer the hook exists to protect. **No field was
+added to `Deps`.**
+
+**`make verify` went from 208 checks across 9 sections to 218 across 10**, the new one being
+`scripts/verify/80-notifications.sh` — 80–89 is the notifications range. It is a real end-to-end
+run and not a restatement of the tests: it empties `shipper.job`, writes three events in a
+committed transaction and one in a rolled-back one, runs the actual worker binary against the
+actual broker, SIGTERMs it, and reads the messages back with Kafka's own console consumer. Two
+things it found that a test could not. First, **the topic also carries the jobs domain's own
+events** — SHIP-64's cancellations write `job.status_changed` inside the transaction that moves
+the job, so the mechanism is already carrying real domain events end to end, and the section
+asserts that the set on the topic equals the set the database says it published. Second, **the
+first version of that assertion compared the two as ordered lists and failed**: with three
+partitions the console consumer reads three independent streams and interleaves them, which is the
+shortest available demonstration that "ordering is per aggregate, not global" is a property of
+what was built rather than a sentence in a comment. The check is now a set comparison plus a
+per-aggregate order check over every aggregate on the topic.
+
+The transactional half is `services/core/cmd/worker/outbox_test.go`, against a real PostgreSQL
+with the broker stood in for by a recorder: an event whose transaction rolled back is never
+published, an unreachable broker leaves every row claimable and the next pass publishes them in
+order, a crash between publishing and committing publishes the same event twice rather than
+losing it, and one aggregate belongs to one worker while a second worker is still handed the
+other.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
 |---|---|---|
 | **SHIP-65** | The endpoint, the owner-only rule, the full customer view | The `budget` field its *Done when* names. The column is SHIP-67's, with the proof that it cannot leak |
 | **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
-| **SHIP-134** | `outbox` table, `internal/events` writer | The publisher. That is M5 and stays there |
+| ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 
 ## 5. Blocked — and only by work outside this repository
 
@@ -1779,6 +1888,18 @@ thirty days without ever refreshing.
 
 **`scripts/check-spelling.sh` only sees tracked files.** It searches with `git grep`, so a newly created file passes the check until it is staged — which let one through during wave 1. Cheap to fix in the reader rather than the script: run `make lint-spelling` after `git add`, not before. Worth a line in `Docs/10` §9.3, which is where somebody would look.
 
+**The outbox has no dead-letter path, so one event the broker will never accept stops the
+aggregates in its batch.** SHIP-134 fails the whole pass when any event in it fails to publish,
+which is right for the case that actually happens — the broker is unreachable, and every row must
+stay claimable — but it means a permanently unacceptable event, one over the message-size limit
+say, blocks its batch until somebody looks. The pass logs the oldest event's type and id, so it is
+findable rather than mysterious. Three ways out and none of them is this ticket's: bound the
+payload where the domain writes it, which is the cheapest and probably the right one; park a row
+after N failed attempts, which needs a second state column and `000004` says `published_at` is the
+publisher's only state; or publish per event and mark per event, which trades the blockage for
+more duplicates. **Decide with SHIP-135**, which is where the schema and the size of a payload get
+settled anyway.
+
 ## 10. The done list, in a form a script can read
 
 **The list is `Docs/11-done.txt`**, one ticket per line. It is still authoritative and it is
@@ -1786,9 +1907,9 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Of the three
-tickets in §4, only SHIP-134 is absent** — SHIP-65 and SHIP-149 are both in the list *and* partly
-done, and that is not a contradiction to be tidied away.
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Since
+SHIP-134 landed, every ticket §4 names is in the list** — SHIP-65 and SHIP-149 are both in the
+list *and* partly done, and that is not a contradiction to be tidied away.
 
 **A ticket can be both**, and this is the shape: it landed, it is named by a commit subject, and one
 clause of its *Done when* belongs to a ticket that does not exist yet. SHIP-65 shipped the job
