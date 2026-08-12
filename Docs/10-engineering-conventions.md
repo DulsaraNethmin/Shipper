@@ -308,6 +308,10 @@ Two rules the split depends on:
 
 It was one 1148-line file until wave 3, which is the first wave with two tracks adding endpoints. One client can append to a single file; two cannot.
 
+**The check count is measured, and the run checks that `Docs/11` §3 says what was measured** (SHIP-15i). A successful run reads the bolded `**N checks across M sections**` out of the tracker, compares it, and **fails with the true figure printed** when they differ; `make verify-update` rewrites it. Every track adds checks, so the figure moves every wave, and as a hand-typed scalar in prose it conflicted in four consecutive merges with the correct value present in only one of them. Never resolve that line by choosing a side — re-run `make verify` on the merged tree and write what it says. Historical counts elsewhere in the file are written without the bold, and the run refuses to proceed if it finds the bold form twice.
+
+**A ticket that is done needs a row in a `Docs/11` §3 summary table, and `make status` fails without one** (SHIP-15i). The prose subsection explains what the ticket built; the row above it is what says the ticket exists at all, and it is the half agents forget — three of wave 4's four tracks did, and seven tickets were found in that state going back to wave 3. The table is checked and deliberately not generated: its "What" column is one hand-written sentence per ticket.
+
 ## 8. Clients
 
 ### 8.1 The published contract
@@ -378,6 +382,7 @@ Four files in this repository carry one independent line per entry and no surrou
 | `Docs/11-done.txt` | `merge=union` in `.gitattributes` | Never conflicts. A superset is caught by `make status`, which fails on a ticket git has never seen. One ticket per line, because a union resolves line by line |
 | `Docs/10-api-error-codes.md` | Generated from the registry | **Regenerate, never hand-merge.** `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update` |
 | `contracts/openapi.yaml` `paths:` | Sorted, one `$ref` pair per path | **Take both sides and re-sort.** Then `make test` — `TestPathsBlockIsSortedAndComplete` checks the result |
+| `Docs/11` §3's check count | Measured by `make verify`, which checks the figure the file states | **Never take a side; both are usually wrong.** Re-run `make verify` on the merged tree — it fails with the true figure — then `make verify-update` (SHIP-15i) |
 
 `Docs/11-done.txt` is a file rather than the fenced block it was inside `Docs/11` §10 for exactly this reason: a git attribute applies to a whole file, and `Docs/11` §3 is prose that must never be union-merged. Separating them was the only way to treat them differently (SHIP-15e).
 

@@ -13,6 +13,10 @@
 #
 # Exits non-zero on the first failure.
 #
+# A successful run also holds Docs/11 §3's check count to what it just measured, and
+# `make verify-update` (or `--update`) rewrites that figure rather than a person retyping it.
+# See "the check count" at the foot of this file.
+#
 # # This file is the harness. The checks are in scripts/verify/
 #
 # Everything below is shared: the environment, ticket/ok/fail/json, post_json, the token
@@ -52,6 +56,17 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ROOT="$PWD"
 
+# --update rewrites Docs/11 §3's check count with what this run measures, the way
+# `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update` rewrites the error code list.
+# Without it the figure is checked and a disagreement fails the run.
+UPDATE_TRACKER=0
+for arg in "$@"; do
+  case "$arg" in
+    --update) UPDATE_TRACKER=1 ;;
+    *) echo "usage: $0 [--update]" >&2; exit 2 ;;
+  esac
+done
+
 # shellcheck disable=SC1091
 [[ -f deploy/.env ]] && source deploy/.env
 
@@ -72,6 +87,7 @@ KAFKA_BIN=/opt/kafka/bin
 PSQL="$(command -v psql || echo "$(brew --prefix libpq 2>/dev/null)/bin/psql")"
 
 SECTIONS="scripts/verify"
+TRACKER="Docs/11-delivery-status.md"
 
 WORKDIR="$(mktemp -d)"
 SERVER_PID=""
@@ -240,3 +256,76 @@ demonstrated="$(printf '%s\n' $tickets | sort -t- -k2,2n | tr '\n' ' ')"
 
 printf '\n\033[32m%s checks passed across %s sections.\033[0m\n' "$pass" "$section_count"
 printf '\033[32mDemonstrated: %s\033[0m\n\n' "${demonstrated% }"
+
+# --- the check count in Docs/11 §3 (SHIP-15i) ------------------------------------------------
+#
+# That figure had been a hand-typed scalar in prose, and prose is the one shape a merge cannot
+# resolve: it conflicted in four consecutive merges and in three of them *no* figure in the
+# conflict was correct — including develop's own, already stale by twenty before one merge began.
+# Every other shared surface a wave touches is merge=union, generated, or held sorted by a test.
+# This one was none of those, which is exactly why it was the one that kept failing.
+#
+# It is *checked* rather than generated, and that is the decision rather than an accident. The
+# figure lives in a sentence somebody reads, so generating the line would mean owning its
+# wording forever; comparing two numbers costs nothing and catches all four of the merges.
+# `--update` is the escape hatch, and it rewrites only the two numbers — the same shape as
+# `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update` and routes_golden.txt.
+#
+# It runs last, after everything has passed, so the number it writes is a number every check
+# stood behind.
+
+count_pattern='\*\*[0-9]+ checks across [0-9]+ sections\*\*'
+
+[[ -f "$TRACKER" ]] || fail "$TRACKER is missing, and it is where the check count is recorded"
+
+matches="$(grep -cE "$count_pattern" "$TRACKER" || true)"
+case "$matches" in
+  1) ;;
+  0) fail "$TRACKER no longer says \"**N checks across M sections**\" anywhere.
+     This run measured $pass across $section_count. Put the sentence back in §3, or move
+     this guard with it — a figure nothing checks is the figure that was wrong four times." ;;
+  *) fail "$TRACKER states the check count $matches times, so a reader cannot tell which is
+     current and --update would rewrite them all. Leave exactly one, in §3." ;;
+esac
+
+stated="$(grep -oE "$count_pattern" "$TRACKER")"
+[[ "$stated" =~ ([0-9]+)\ checks\ across\ ([0-9]+)\ sections ]] \
+  || fail "cannot read the two numbers out of $stated"
+stated_checks="${BASH_REMATCH[1]}"
+stated_sections="${BASH_REMATCH[2]}"
+
+# Neither branch calls ok(): $pass is the figure being written, and a check that counted itself
+# would make the number one larger than the run it describes.
+if [[ "$UPDATE_TRACKER" == 1 ]]; then
+  awk -v checks="$pass" -v sections="$section_count" '
+    match($0, /\*\*[0-9]+ checks across [0-9]+ sections\*\*/) {
+      printf "%s**%s checks across %s sections**%s\n", \
+        substr($0, 1, RSTART - 1), checks, sections, substr($0, RSTART + RLENGTH)
+      next
+    }
+    { print }
+  ' "$TRACKER" >"$WORKDIR/tracker.md"
+
+  grep -qE "\*\*$pass checks across $section_count sections\*\*" "$WORKDIR/tracker.md" \
+    || fail "the rewrite did not produce the measured figure; $TRACKER is untouched"
+
+  # Written back through the existing file rather than moved over it, so the document keeps
+  # its own permissions and its inode.
+  cat "$WORKDIR/tracker.md" >"$TRACKER"
+
+  if [[ "$stated_checks" == "$pass" && "$stated_sections" == "$section_count" ]]; then
+    printf '\033[32m%s §3 already stated %s checks across %s sections.\033[0m\n\n' \
+      "$TRACKER" "$pass" "$section_count"
+  else
+    printf '\033[32m%s §3 updated: %s across %s (was %s across %s).\033[0m\n\n' \
+      "$TRACKER" "$pass" "$section_count" "$stated_checks" "$stated_sections"
+  fi
+elif [[ "$stated_checks" != "$pass" || "$stated_sections" != "$section_count" ]]; then
+  printf '\033[31m%s §3 says %s checks across %s sections. This run measured \033[1m%s across %s\033[0m.\n' \
+    "$TRACKER" "$stated_checks" "$stated_sections" "$pass" "$section_count"
+  printf 'Write the measured figure — it is never reconciled, and never resolved by taking a side:\n'
+  printf '    make verify-update\n\n'
+  exit 1
+else
+  printf '\033[32m%s §3 states the figure this run measured.\033[0m\n\n' "$TRACKER"
+fi

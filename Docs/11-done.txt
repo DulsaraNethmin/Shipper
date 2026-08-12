@@ -61,6 +61,7 @@ SHIP-15a
 SHIP-15b
 SHIP-15c
 SHIP-15e
+SHIP-15i
 SHIP-16
 SHIP-17
 SHIP-17a
@@ -122,6 +123,7 @@ SHIP-76
 # M3 — Bidding and award
 SHIP-78
 SHIP-80
+SHIP-91
 # M4 — Delivery execution
 SHIP-105
 SHIP-110

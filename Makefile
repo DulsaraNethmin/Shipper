@@ -261,6 +261,10 @@ check: ## Everything CI will run (SHIP-20). Tracks extend it with `CHECKS +=` in
 verify: ## Demonstrate every acceptance criterion that reaches an endpoint, end to end
 	./scripts/verify-foundation.sh
 
+.PHONY: verify-update
+verify-update: ## Run verify and write the check count it measures into Docs/11 §3 (SHIP-15i)
+	./scripts/verify-foundation.sh --update
+
 # --- Per-track targets ------------------------------------------------------------------
 #
 # Included last, and optional. A track working on Flutter, the web surfaces or the store
