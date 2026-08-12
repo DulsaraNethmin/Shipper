@@ -7,26 +7,37 @@ import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/device/device_label.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
+import 'package:shipper/features/jobs/jobs_repository.dart';
 
 import '../../core/auth/fake_token_store.dart';
 import '../../core/auth/session_fixtures.dart';
+import '../jobs/fake_jobs_repository.dart';
 import 'fake_identity_repository.dart';
 
-/// The real app, with the two things a widget test cannot have.
+/// The real app, with only the things a widget test cannot have.
 ///
-/// The token store reaches a platform channel a widget test has no plugin behind, and the
-/// identity repository would reach a socket. Everything between them — the router, the guard,
-/// the session, the signup state, every screen — is the application's own, which is what makes
-/// these tests demonstrations of the journey rather than of a widget in isolation.
+/// The token store reaches a platform channel a widget test has no plugin behind, and the two
+/// repositories would reach a socket. Everything between them — the router, the guard, the
+/// session, the signup state, every screen — is the application's own, which is what makes these
+/// tests demonstrations of the journey rather than of a widget in isolation.
 ///
 /// Overridden on the **root** scope rather than by wrapping a screen in a second `ProviderScope`,
 /// for the reason `main.dart` gives: a nested scope hands its subtree a private copy of every
 /// provider, and a test that passes against one has not tested the app's wiring.
-Widget signupApp(FakeIdentityRepository identity, {FakeTokenStore? store}) {
+Widget signupApp(
+  FakeIdentityRepository identity, {
+  FakeTokenStore? store,
+  FakeJobsRepository? jobs,
+}) {
   return ProviderScope(
     overrides: [
       tokenStoreProvider.overrideWithValue(store ?? FakeTokenStore()),
       identityRepositoryProvider.overrideWithValue(identity),
+      // The customer half reads that customer's jobs as soon as it is drawn (SHIP-76), and the
+      // locations step writes one (SHIP-71). Either would otherwise open a socket to whatever is
+      // listening on the local API port — nothing on CI, and on a developer's machine the API.
+      // Same hazard as the refresher below, and the same symptom when it is forgotten.
+      jobsRepositoryProvider.overrideWithValue(jobs ?? FakeJobsRepository()),
       // A restored session refreshes as soon as the keychain answers (SHIP-50). None of these
       // tests starts with a stored token, so nothing refreshes — but a test that later does
       // would otherwise open a socket to whatever is listening on the local API port.

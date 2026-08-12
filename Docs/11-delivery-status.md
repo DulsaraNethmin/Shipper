@@ -1701,6 +1701,68 @@ computed, starts `cmd/worker`, waits for the first pass, and then asserts the st
 `Cancelled` with an `Open->Cancelled` history row attributed to `system` with no account, an
 outbox event, and the live job untouched. The count went from 208 to **224**.
 
+### SHIP-71 — the locations step, and the validation it deliberately does not do
+
+`/jobs/new` is the first screen to hang off the signed-in shell. It takes the two addresses in
+their four parts each, saves them, and shows back what the platform made of them.
+
+**Nothing on the screen validates an address, and that is the decision rather than an omission.**
+No postcode pattern, no length, no picker holding the eight states. `validators.dart` already
+describes the one duplication this client knowingly carries — the password minimum — and the
+argument that makes it safe is that it can only fail in the harmless direction. None of these
+fields has that property, and one of them is worse than merely unsafe: a client-side "all four
+parts are required" rule would refuse the empty address `Docs/01` §4.1 explicitly allows, because
+a draft may be saved half-finished and returned to. So the platform decides, its
+`validation_failed` details arrive under dotted paths, and the form renders each one beside the
+input the path names. A test drives `pickup.postcode` and `dropoff.state` through the real screen
+and checks they land under the right two of the eight inputs.
+
+**The state is a text field, not a picker.** `Docs/10` §4.7's exception says a client prints the
+state rather than branching on it, and input is accepted in any case and as the spelled-out name.
+A picker would be a second copy of the platform's list compiled into a build that has no
+over-the-air update path, for no behaviour that depends on it. What is typed is what is sent —
+`new south wales` goes out as `new south wales`, and the platform normalises.
+
+**"We could not match this to a place on the map" is drawn as information, not as a failure.**
+SHIP-59a requires that a failed lookup does not fail the job, and the platform honours it by
+storing the address as typed with no coordinate. The client's half is the other end of that: no
+error colour, no warning, and the way on stays enabled. A screen that made a customer resolve a
+rural address before continuing would be blocking on something they cannot change.
+
+**Saving twice edits the draft rather than making a second one.** The first save is `POST
+/v1/jobs`; every save after it is `PATCH /v1/jobs/{id}` against the id the first returned. Without
+that, every corrected postcode leaves an abandoned draft behind — and the customer finds it in
+their job list, where nothing can explain it. That is what `ApiClient.patchJson` was added for,
+and the idempotency interceptor already covered `PATCH`.
+
+**The idempotency key follows `ActionKey`'s rule, and both directions are tested through the
+screen.** A dropped connection keeps the key, because the platform may have created the draft and
+the answer may have been lost. A `422` retires it, because the platform saw the request and
+refused it, and the customer is about to correct something — replaying that refusal is not what
+they asked for.
+
+**The guard needed widening and this is worth knowing before the next screen.** `redirectFor` sent
+a signed-in user to `/home` from *every* other location, which was right while the shell was the
+only thing to reach. `/jobs/new` is the first that is not, so there is now a `_signedInLocations`
+set beside `_signedOutLocations`. **It grants no permission** — reaching the step any other way
+still fails server-side on the first request it makes.
+
+**Three pieces landed outside the jobs feature**, each because a second consumer is certain rather
+than speculative: `core/api/page.dart` for the list envelope `Docs/10` §4.5 gives every collection,
+`shared/formatting/dates.dart` for day-first dates, and `shared/formatting/money.dart` for cents as
+AUD. `intl` was deliberately not added: the MVP ships one locale, and what the package would buy is
+locale negotiation that would render month-first on a handset set to `en-US`.
+
+**How it was demonstrated.** `make flutter-check` in the wave-4 worktree: 264 host tests, up from
+219. The step is driven through the real router, guard, session and shell — signed in as a
+customer, opened from the shell's own button, filled in, saved, refused, corrected, saved again —
+with the socket and the Keychain the only substitutions. **What was not demonstrated live: the
+unresolved-address path against the running API.** `geocoding.UseStub` resolves every address in
+development and `NewStub()` is constructed with no unknown list, so a local API cannot answer with
+a missing coordinate. The path is covered by the screen tests and by the platform's own
+`location_test.go`; a live demonstration needs either a staging deployment with no geocoder
+configured or a stub built with an unknown address, and neither belongs in a Flutter ticket.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

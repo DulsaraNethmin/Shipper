@@ -60,11 +60,19 @@ class SignedInShell extends ConsumerWidget {
             key: const Key('shell-signed-in'),
             children: [
               switch (role) {
-                UserRole.customer => const _Half(
-                    shellKey: Key('shell-customer'),
+                UserRole.customer => _Half(
+                    shellKey: const Key('shell-customer'),
                     title: 'Deliveries you have published',
-                    body: 'Publishing a job, comparing bids and tracking a delivery arrive with '
-                        'the job screens in M2.',
+                    body: 'Comparing bids and tracking a delivery arrive with the rest of the '
+                        'job screens in M2. Publishing one starts here.',
+                    // The entry point to SHIP-71. It is here rather than on a screen of its own
+                    // because publishing is the customer's whole reason for the app, and a
+                    // journey that cannot be started is a journey that cannot be demonstrated.
+                    action: FilledButton(
+                      key: const Key('new-job'),
+                      onPressed: () => context.go(Routes.newJob),
+                      child: const Text('Publish a delivery'),
+                    ),
                   ),
                 UserRole.provider => const _Half(
                     shellKey: Key('shell-provider'),
@@ -115,15 +123,24 @@ class SignedInShell extends ConsumerWidget {
 /// belongs to a feature. What matters at SHIP-52 is that the two are different screens selected
 /// by the role, not what is written on them.
 class _Half extends StatelessWidget {
-  const _Half({required this.shellKey, required this.title, required this.body});
+  const _Half({
+    required this.shellKey,
+    required this.title,
+    required this.body,
+    this.action,
+  });
 
   final Key shellKey;
   final String title;
   final String body;
 
+  /// The one thing this half can already do, where it can do something.
+  final Widget? action;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final action = this.action;
 
     return Column(
       key: shellKey,
@@ -131,6 +148,10 @@ class _Half extends StatelessWidget {
         Text(title, style: theme.textTheme.headlineSmall, textAlign: TextAlign.center),
         const SizedBox(height: 8),
         Text(body, textAlign: TextAlign.center, style: theme.textTheme.bodySmall),
+        if (action != null) ...[
+          const SizedBox(height: 24),
+          action,
+        ],
       ],
     );
   }

@@ -63,11 +63,38 @@ class ApiClient {
     required String idempotencyKey,
     Object? body,
   }) {
+    return _write('POST', path, idempotencyKey: idempotencyKey, body: body);
+  }
+
+  /// A partial edit.
+  ///
+  /// Identical to [postJson] in everything that matters — it is state-changing, so it carries an
+  /// idempotency key and is refused without one (SHIP-15). It exists as its own method because
+  /// the platform distinguishes the two: `PATCH /v1/jobs/{id}` touches only the fields present,
+  /// which is what lets one step of a wizard save its own without sending back the fields it
+  /// cannot see. A client that reached for `POST` there would create a second job.
+  Future<Map<String, dynamic>> patchJson(
+    String path, {
+    required String idempotencyKey,
+    Object? body,
+  }) {
+    return _write('PATCH', path, idempotencyKey: idempotencyKey, body: body);
+  }
+
+  Future<Map<String, dynamic>> _write(
+    String method,
+    String path, {
+    required String idempotencyKey,
+    Object? body,
+  }) {
     return _json(
-      () => _dio.post<Object?>(
+      () => _dio.request<Object?>(
         path,
         data: body,
-        options: Options(headers: {ApiHeaders.idempotencyKey: idempotencyKey}),
+        options: Options(
+          method: method,
+          headers: {ApiHeaders.idempotencyKey: idempotencyKey},
+        ),
       ),
     );
   }

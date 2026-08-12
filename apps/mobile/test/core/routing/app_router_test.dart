@@ -71,6 +71,20 @@ void main() {
       expect(redirectFor(signedIn, Routes.starting), Routes.home);
     });
 
+    test('the job wizard is reachable while signed in and from nowhere else', () {
+      // SHIP-71 is the first screen to hang off the signed-in shell, and until it landed the
+      // guard sent a signed-in user home from *every* location but the shell. The symptom of
+      // forgetting a location here is a button that appears to do nothing, which points nowhere
+      // near this function.
+      expect(redirectFor(const SessionState.signedIn(), Routes.newJob), isNull);
+
+      // It is behind the session for the same reason the shell is, and for no stronger one:
+      // this is navigation, not authorisation. Reaching it any other way still fails on the
+      // first request it makes, because the platform decides.
+      expect(redirectFor(const SessionState.signedOut(), Routes.newJob), Routes.signIn);
+      expect(redirectFor(const SessionState.restoring(), Routes.newJob), Routes.starting);
+    });
+
     test('the connectivity screen is reachable from either shell, and during the restore', () {
       // SHIP-19's demonstration. Putting it behind the session would have made "the app can
       // reach the API" unanswerable on a fresh install, which is exactly when it is asked.

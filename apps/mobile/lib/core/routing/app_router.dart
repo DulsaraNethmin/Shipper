@@ -13,6 +13,7 @@ import 'package:shipper/features/identity/registration_complete_screen.dart';
 import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/role_selection_screen.dart';
 import 'package:shipper/features/identity/sign_in_screen.dart';
+import 'package:shipper/features/jobs/job_locations_screen.dart';
 
 /// Route paths, named once.
 ///
@@ -67,6 +68,13 @@ abstract final class Routes {
   /// The signed-in shell. Role-aware from SHIP-52.
   static const home = '/home';
 
+  /// The first step of publishing a delivery: the two addresses (SHIP-71).
+  ///
+  /// `/jobs/new` rather than `/jobs/{id}/locations`, because the draft does not exist until this
+  /// step saves it — the id arrives in the response and not in the route. Resuming a draft that
+  /// already exists is SHIP-75, and gets a route that names one.
+  static const newJob = '/jobs/new';
+
   /// The connectivity check (SHIP-19).
   ///
   /// Reachable from **both** shells on purpose. It is the only screen that demonstrates build
@@ -97,6 +105,21 @@ const _signedOutLocations = <String>{
   Routes.registered,
 };
 
+/// Locations a signed-in user may be at (SHIP-71).
+///
+/// It exists for the same reason [_signedOutLocations] does. SHIP-49's guard sent a signed-in
+/// user to the home shell from *every* other location, which was right while the shell was the
+/// only thing to reach; the first screen that hangs off it would otherwise be redirected away
+/// the instant it was opened, and the symptom — a button that appears to do nothing — points
+/// nowhere near the guard.
+///
+/// **Adding a location here grants no permission.** What the account may actually do is decided
+/// server-side on every request; this decides only where the app is willing to draw.
+const _signedInLocations = <String>{
+  Routes.home,
+  Routes.newJob,
+};
+
 /// Where the session says this location should be, or `null` to leave it alone.
 ///
 /// A pure function of the session and the location, separated from [routerProvider] so it can
@@ -119,7 +142,7 @@ String? redirectFor(SessionState session, String location) {
     SessionRestoring() => location == Routes.starting ? null : Routes.starting,
     SessionSignedOut() =>
       _signedOutLocations.contains(location) ? null : Routes.signIn,
-    SessionSignedIn() => location == Routes.home ? null : Routes.home,
+    SessionSignedIn() => _signedInLocations.contains(location) ? null : Routes.home,
   };
 }
 
@@ -239,6 +262,10 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.home,
         builder: (context, state) => const SignedInShell(),
+      ),
+      GoRoute(
+        path: Routes.newJob,
+        builder: (context, state) => const JobLocationsScreen(),
       ),
       GoRoute(
         path: Routes.health,
