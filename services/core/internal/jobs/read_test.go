@@ -44,9 +44,12 @@ func idsOf(page JobPage) []uuid.UUID {
 	return out
 }
 
-// TestJobReturnsTheWholeJobToItsOwner is SHIP-65's acceptance criterion, minus the budget column,
-// which does not exist: SHIP-67 brings it together with the test proving it cannot reach a
-// provider (Docs/11 §3, §8).
+// TestJobReturnsTheWholeJobToItsOwner is SHIP-65's acceptance criterion, and since SHIP-67 it is
+// the whole of it.
+//
+// "Returns full job including budget" was met but for the budget until SHIP-67 brought the column
+// together with the proof it cannot reach a provider (Docs/11 §3, §8). The budget is part of what
+// this test round-trips now, which closes the gap Docs/11 §4 had recorded against SHIP-65.
 //
 // "In full" is checked by round-tripping a job with every field populated rather than by naming
 // three of them, because the failure this guards against is a reader that quietly drops a column —
@@ -68,6 +71,7 @@ func TestJobReturnsTheWholeJobToItsOwner(t *testing.T) {
 		VehicleRequirement: text("Ute with a tailgate lifter"),
 		HandlingNotes:      text("Second-floor walk-up, no lift."),
 		PickupWindow:       &TimeWindow{Start: testInstant, End: testInstant.Add(24 * time.Hour)},
+		BudgetCents:        money(150_000),
 	})
 	if err != nil {
 		t.Fatalf("creating the job: %v", err)
@@ -88,6 +92,13 @@ func TestJobReturnsTheWholeJobToItsOwner(t *testing.T) {
 	}
 	if !read.Pickup.Resolved || read.Pickup.Latitude == 0 {
 		t.Errorf("the pickup came back unresolved: %+v", read.Pickup)
+	}
+	// Named explicitly as well as compared, because this is the clause of SHIP-65's *Done when*
+	// that went unmet for two waves: a struct comparison would still pass if the column were
+	// dropped from both sides of it.
+	if read.BudgetCents != 150_000 {
+		t.Errorf("budget = %d cents, want 150000 — SHIP-65 returns the full job including budget",
+			read.BudgetCents)
 	}
 }
 

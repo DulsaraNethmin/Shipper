@@ -404,11 +404,20 @@ sys.exit(0 if a == b else 1)
   || fail "the read and the write answer with different shapes"
 ok "the same shape the write endpoints answer with, so a client parses one type"
 
-# There is no budget field, and there will not be one until SHIP-67 brings the test proving it
-# cannot reach a provider. This check is here so that the day it does arrive, somebody has to
-# come to this file and say so deliberately.
-grep -q 'budget' "$WORKDIR/jobs-detail.json" && fail "a budget field appeared before SHIP-67"
-ok "no budget field yet — SHIP-67 lands the column together with its serialisation proof"
+# # The budget tripwire, moved deliberately at SHIP-67
+#
+# This check used to read `grep -q budget && fail "a budget field appeared before SHIP-67"`, and
+# it was there so that the day the column arrived, somebody had to come to this file and say so.
+# This is that day, and this is that sentence.
+#
+# What replaces it is stronger rather than weaker, which is the only acceptable direction for
+# this particular assertion (Docs/11 §8). Here it stays narrow: this job was created without a
+# budget, so the field must be *absent* — the omitempty rule that lets a client tell "no budget"
+# from "a budget of nothing". The real proof, that the owner sees theirs and nobody else sees it
+# in any form, is the SHIP-67 section below.
+grep -q 'budget' "$WORKDIR/jobs-detail.json" \
+  && fail "a job created with no budget came back carrying one"
+ok "a job with no budget omits the field rather than sending zero"
 
 status="$(job_get "$jobs_other_token" "/v1/jobs/$job_id" "$WORKDIR/jobs-detail-stranger.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/jobs-detail-stranger.json"; fail "a stranger's read returned $status, want 404"; }
@@ -540,3 +549,199 @@ status="$(job_get "$(mint_token "$(json "$WORKDIR/jobs-fresh.json" '["id"]')")" 
 [[ "$(tr -d ' \n' < "$WORKDIR/jobs-list-empty.json")" == '{"data":[],"has_more":false}' ]] \
   || { cat "$WORKDIR/jobs-list-empty.json"; fail "an empty list is not an empty array"; }
 ok "a customer with no jobs gets an empty array, never null"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-67  the budget is stored for its owner and never serialised to a provider"
+
+# Docs/01 §4.3: the customer's maximum is private from providers — not as an amount, not as a
+# band, and not as a "budget supplied" indicator. CLAUDE.md lists it among the invariants whose
+# violation is a defect rather than a style choice.
+#
+# The proof here is deliberately negative and exhaustive rather than a single check on a single
+# endpoint: every response a provider account can obtain from this domain is searched for the
+# word, in any form, and so is the domain event — which travels further than any endpoint, to
+# Kafka and whatever is behind it (SHIP-134).
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-budget-$$" /v1/jobs \
+  '{"goods_description": "Pallet of floor tiles", "budget_cents": 150000}' \
+  "$WORKDIR/jobs-budget.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-budget.json"; fail "creating a job with a budget returned $status, want 201"; }
+budget_job="$(json "$WORKDIR/jobs-budget.json" '["id"]')"
+[[ "$(json "$WORKDIR/jobs-budget.json" '["budget_cents"]')" == "150000" ]] \
+  || { cat "$WORKDIR/jobs-budget.json"; fail "the create response did not carry the budget back"; }
+ok "a customer sets a maximum on their own job, in cents"
+
+# The column, not the answer the endpoint gave about itself. numeric(12,2) and never a float
+# (Docs/10 §3.3), so the cents survive the round trip exactly.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select budget from jobs where id = '$budget_job';")" == "1500.00" ]] \
+  || fail "the stored budget is $("$PSQL" "$DATABASE_URL" -tAc "select budget from jobs where id = '$budget_job';"), want 1500.00"
+ok "it is stored as numeric(12,2) — 150000 cents is \$1500.00, exactly"
+
+status="$(job_get "$jobs_customer_token" "/v1/jobs/$budget_job" "$WORKDIR/jobs-budget-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-budget-detail.json"; fail "reading the job returned $status"; }
+[[ "$(json "$WORKDIR/jobs-budget-detail.json" '["budget_cents"]')" == "150000" ]] \
+  || { cat "$WORKDIR/jobs-budget-detail.json"; fail "the owner cannot read their own budget back"; }
+ok "the owning customer reads it back — SHIP-65's 'full job including budget', now in full"
+
+# And nobody else does, through any route this domain serves. A provider holding a valid token is
+# exactly the caller Docs/01 §4.3 is about; a second customer is the other half of the same rule.
+budget_leaks=""
+for who_and_token in "a provider:$jobs_provider_token" "another customer:$jobs_other_token"; do
+  who="${who_and_token%%:*}"
+  token="${who_and_token#*:}"
+
+  job_get "$token" "/v1/jobs/$budget_job" "$WORKDIR/jobs-budget-read.json"    >/dev/null
+  job_get "$token" /v1/jobs               "$WORKDIR/jobs-budget-list.json"    >/dev/null
+  job_request PATCH "$token" "verify-jobs-budget-patch-$who-$$" "/v1/jobs/$budget_job" \
+    '{"budget_cents": 1}' "$WORKDIR/jobs-budget-patch.json" >/dev/null
+  job_request POST "$token" "verify-jobs-budget-cancel-$who-$$" "/v1/jobs/$budget_job/cancel" \
+    '{}' "$WORKDIR/jobs-budget-refuse.json" >/dev/null
+
+  for answer in read list patch refuse; do
+    grep -qi 'budget' "$WORKDIR/jobs-budget-$answer.json" \
+      && budget_leaks="$budget_leaks $who/$answer"
+    grep -q '150000' "$WORKDIR/jobs-budget-$answer.json" \
+      && budget_leaks="$budget_leaks $who/$answer(amount)"
+  done
+done
+[[ -z "$budget_leaks" ]] || fail "the budget reached somebody who is not the owner:$budget_leaks"
+ok "no read, list, edit or cancellation by a provider or another customer mentions it at all"
+
+# The validator answers in the error contract's shape rather than letting ck_jobs_budget answer,
+# because a client told 'ck_jobs_budget' can do nothing with that (Docs/10 §4.6).
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-budget-bad-$$" /v1/jobs \
+  '{"budget_cents": -1}' "$WORKDIR/jobs-budget-bad.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/jobs-budget-bad.json"; fail "a negative budget returned $status, want 422"; }
+grep -q '"budget_cents"' "$WORKDIR/jobs-budget-bad.json" || fail "the refusal does not name budget_cents"
+ok "a budget that is not an amount is refused, naming the field"
+
+# The domain event is the copy of a job that travels furthest — past the last endpoint that could
+# have redacted anything. Cancelling is the transition available over HTTP today; the expiry event
+# below is checked the same way.
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-budget-end-$$" \
+  "/v1/jobs/$budget_job/cancel" '{}' "$WORKDIR/jobs-budget-end.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-budget-end.json"; fail "cancelling the job returned $status"; }
+budget_event="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(string_agg(payload::text, ' '), '') from outbox where aggregate_id = '$budget_job';")"
+[[ -n "$budget_event" ]] || fail "the transition emitted no event, so this check proves nothing"
+case "$budget_event" in
+  *budget*|*150000*) fail "a domain event carries the customer's budget: $budget_event" ;;
+esac
+ok "the domain event carries no budget, in a payload that reaches every consumer there will be"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-68  an Open job expires at the earlier of fourteen days or its pickup date"
+
+# Docs/02 §6.3, demonstrated against the running database and the real worker binary rather than
+# asserted. Three parts have to hold: publication sets a deadline, the deadline is the earlier of
+# the two rules, and a process acts on it — through the SHIP-57 guard, as the platform.
+#
+# The deadline is set by 000406's trigger on the transition itself, so it appears however the job
+# reaches Open. move_job above publishes with raw SQL through the guard's own protocol, which is
+# what makes that worth showing here: a route into Open that nobody has written yet still gets a
+# deadline.
+
+# Dates computed with python3 rather than date(1). BSD date takes -v and GNU date takes -d, and
+# this script runs on a developer's macOS and on CI's Linux.
+past_pickup="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-stale-$$" /v1/jobs \
+  "{\"goods_description\": \"Two pallets, urgent\", \"pickup_window\": {\"end\": \"$past_pickup\"}}" \
+  "$WORKDIR/jobs-stale.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-stale.json"; fail "creating the stale job returned $status"; }
+stale_job="$(json "$WORKDIR/jobs-stale.json" '["id"]')"
+
+live_job="$(new_draft expiry-live)"
+draft_job="$(new_draft expiry-draft)"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select expires_at is null from jobs where id = '$draft_job';")" == "t" ]] \
+  || fail "a draft already has a deadline; the clock starts at publication (Docs/02 §6.3)"
+ok "a draft carries no deadline — a saved draft may sit indefinitely (Docs/01 §4.1)"
+
+move_job "$stale_job" Draft Open || fail "could not publish the stale job"
+move_job "$live_job"  Draft Open || fail "could not publish the live job"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at = pickup_window_end from jobs where id = '$stale_job';")" == "t" ]] \
+  || fail "the deadline is not the pickup window's end: $("$PSQL" "$DATABASE_URL" -tAc "select expires_at, pickup_window_end from jobs where id = '$stale_job';")"
+ok "publication sets the deadline to the pickup date when that is the earlier of the two"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at between now() + interval '13 days' and now() + interval '15 days'
+     from jobs where id = '$live_job';")" == "t" ]] \
+  || fail "a job with no pickup date did not get the fourteen-day backstop: $("$PSQL" "$DATABASE_URL" -tAc "select expires_at from jobs where id = '$live_job';")"
+ok "a job with no pickup date gets the fourteen-day backstop instead"
+
+# The worker, built and run for real. Its first pass runs immediately at start-up rather than one
+# interval later, which is what lets this take seconds instead of five minutes.
+pushd "$ROOT/services/core" >/dev/null
+go build -o "$WORKDIR/shipper-worker" ./cmd/worker
+popd >/dev/null
+ok "the worker builds with the jobs domain's task registered"
+
+SHIPPER_ENV=development \
+LOG_FORMAT=json \
+LOG_LEVEL=debug \
+DATABASE_URL="$DATABASE_URL" \
+REDIS_URL="$REDIS_URL" \
+  "$WORKDIR/shipper-worker" >"$WORKDIR/worker.log" 2>&1 &
+worker_pid=$!
+
+for _ in $(seq 1 100); do
+  expired_status="$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$stale_job';")"
+  [[ "$expired_status" == "Cancelled" ]] && break
+  sleep 0.2
+done
+
+kill -TERM "$worker_pid" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  kill -0 "$worker_pid" 2>/dev/null || break
+  sleep 0.2
+done
+wait "$worker_pid" 2>/dev/null || true
+
+[[ "$expired_status" == "Cancelled" ]] \
+  || { cat "$WORKDIR/worker.log"; fail "the stale job is $expired_status after a pass, want Cancelled"; }
+ok "one pass of the worker ends the job whose pickup date has passed"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$live_job';")" == "Open" ]] \
+  || fail "the pass also expired a job whose deadline is thirteen days away"
+ok "and leaves alone the one whose deadline has not arrived"
+
+# Through the guard, as the platform. A job that reached Cancelled with no history row would mean
+# the sweep had gone round 000402 rather than through it.
+expiry_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select h.from_status || '->' || h.to_status || ' ' || h.actor_type || ' ' || (h.actor_id is null)
+     from job_status_history h where h.job_id = '$stale_job' and h.to_status = 'Cancelled';")"
+[[ "$expiry_row" == "Open->Cancelled system true" ]] \
+  || fail "the recorded expiry is '$expiry_row', want 'Open->Cancelled system true'"
+ok "the move went through the SHIP-57 guard, recorded as the platform with no account behind it"
+
+expiry_event="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(string_agg(payload::text, ' '), '') from outbox
+    where aggregate_id = '$stale_job' and event_type = 'job.status_changed';")"
+# Matched loosely on purpose: jsonb reformats what it stores, so the key order and the spacing in
+# the round-tripped text are PostgreSQL's business rather than the payload's.
+[[ "$expiry_event" == *Cancelled* && "$expiry_event" == *system* ]] \
+  || fail "the expiry emitted no job.status_changed event naming the platform: $expiry_event"
+case "$expiry_event" in
+  *budget*) fail "the expiry event carries a budget" ;;
+esac
+ok "it emits the domain event from the domain, inside the same transaction"
+
+grep -q '"stopped cleanly"\|scheduled task stopped' "$WORKDIR/worker.log" \
+  || { cat "$WORKDIR/worker.log"; fail "the worker did not stop cleanly on SIGTERM"; }
+ok "the worker drains its pass and stops cleanly on SIGTERM"
+
+# And the client sees both halves: the expired job is cancelled, and the live one carries the
+# deadline the app needs to warn against (SHIP-69) and to extend (SHIP-70).
+status="$(job_get "$jobs_customer_token" "/v1/jobs/$stale_job" "$WORKDIR/jobs-stale-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-stale-detail.json"; fail "reading the expired job returned $status"; }
+[[ "$(json "$WORKDIR/jobs-stale-detail.json" '["status"]')" == "cancelled" ]] \
+  || fail "the expired job reads as $(json "$WORKDIR/jobs-stale-detail.json" '["status"]')"
+
+status="$(job_get "$jobs_customer_token" "/v1/jobs/$live_job" "$WORKDIR/jobs-live-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-live-detail.json"; fail "reading the live job returned $status"; }
+[[ -n "$(json "$WORKDIR/jobs-live-detail.json" '["expires_at"]')" ]] \
+  || { cat "$WORKDIR/jobs-live-detail.json"; fail "an Open job does not tell its owner when it expires"; }
+ok "the owner sees the expiry through the API — a cancelled job, and a deadline on the live one"

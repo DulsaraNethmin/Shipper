@@ -78,6 +78,9 @@ func text(s string) *string      { return &s }
 func number(n int) *int          { return &n }
 func decimal(f float64) *float64 { return &f }
 
+// money is an amount in cents, which is the only unit this domain holds money in (Docs/10 §3.3).
+func money(cents int64) *int64 { return &cents }
+
 func sydney() *Address {
 	return &Address{Line: "12 Smith Street", Suburb: "Newtown", State: StateNSW, Postcode: "2042"}
 }
@@ -541,6 +544,9 @@ func TestEveryDraftFieldSurvivesARoundTrip(t *testing.T) {
 		HandlingNotes:      text("Second-floor walk-up, no lift.\nBuzzer 4B."),
 		PickupWindow:       &pickupWindow,
 		DropoffWindow:      &dropoffWindow,
+		// A budget whose cents are not zero, because the failure worth catching is a
+		// conversion that works for round dollars and loses the fractional part.
+		BudgetCents: money(45_067),
 	})
 	if err != nil {
 		t.Fatalf("creating a draft: %v", err)
@@ -551,6 +557,8 @@ func TestEveryDraftFieldSurvivesARoundTrip(t *testing.T) {
 	switch {
 	case stored.GoodsDescription != created.GoodsDescription:
 		t.Errorf("goods description = %q", stored.GoodsDescription)
+	case stored.BudgetCents != 45_067:
+		t.Errorf("budget = %d cents, want 45067", stored.BudgetCents)
 	case stored.Dimensions != Dimensions{LengthCm: 190, WidthCm: 90, HeightCm: 85}:
 		t.Errorf("dimensions = %#v", stored.Dimensions)
 	case stored.WeightKg != 45.5:

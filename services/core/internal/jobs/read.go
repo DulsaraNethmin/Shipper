@@ -17,15 +17,17 @@ import (
 //
 // There is no provider-facing read here and there must not be one added to it. Docs/01 §4.3 keeps
 // the customer's maximum budget private from providers — not as an amount, a band, or a "budget
-// supplied" flag — and SHIP-67 adds the column with the serialisation test that proves it cannot
-// leak. SHIP-82's feed and SHIP-83's provider detail get their own functions and their own
-// response type, because one shape with a redaction step somebody has to remember is exactly the
-// arrangement that rule is hardest to keep with.
+// supplied" flag. SHIP-82's feed and SHIP-83's provider detail get their own functions and their
+// own response type, because one shape with a redaction step somebody has to remember is exactly
+// the arrangement that rule is hardest to keep with.
 //
-// **The budget column does not exist yet**, so SHIP-65's *Done when* — "returns full job including
-// budget" — is met but for that field. It was deliberately not added here: Docs/11 §8 makes
-// SHIP-67 and SHIP-83 single-owner precisely so the field and the proof land together, and a field
-// that arrives before its proof is the one arrangement worse than a field that arrives late.
+// **SHIP-65's *Done when* — "returns full job including budget" — is met in full since SHIP-67**,
+// which brought the column and the serialisation proof together. Docs/11 §8 had made SHIP-67
+// single-owner with SHIP-83 so that the invariant would be tested against a serialised provider
+// response rather than against struct fields; SHIP-83 is three dependency hops away, so SHIP-67
+// took the proof it could actually make now — TestOnlyTheOwnersResponseCarriesTheBudget, which
+// reads this package's source and refuses the field on any shape but the owner's. Docs/11 §3 and
+// §8 record the decision and reserve SHIP-83 to the same owner.
 
 // Job is one job, for the customer who owns it (SHIP-65).
 //

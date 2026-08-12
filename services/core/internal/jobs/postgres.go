@@ -43,9 +43,18 @@ type postgresStore struct{}
 // column cannot hold — ck_jobs_length_cm refuses a dimension that is not positive — so 0 and NULL
 // cannot be confused in either direction.
 //
-// The coordinates and the four window ends are the exceptions, for opposite reasons. (0, 0) is a
-// real point in the Gulf of Guinea, so a coalesced coordinate would be indistinguishable from a
-// resolved one; and PostgreSQL's NULL has no representation in time.Time at all.
+// The coordinates, the four window ends and expires_at are the exceptions, for opposite reasons.
+// (0, 0) is a real point in the Gulf of Guinea, so a coalesced coordinate would be
+// indistinguishable from a resolved one; and PostgreSQL's NULL has no representation in
+// time.Time at all.
+//
+// # The budget is converted in SQL, in one direction here and the other in draftValues
+//
+// Docs/10 §3.3 stores money as numeric(12,2) and holds it in Go as int64 minor units, and never
+// as a float. Multiplying by 100 and casting to bigint is exact for a column whose scale is 2,
+// and it keeps the conversion in the two statements that cross the boundary rather than in a
+// helper every caller has to remember. COALESCE to 0 is safe for the same reason the dimensions
+// are: ck_jobs_budget refuses zero, so 0 and NULL cannot be confused in either direction.
 const jobColumns = `
 	id, customer_id, status,
 	COALESCE(pickup_line, ''), COALESCE(pickup_suburb, ''),
@@ -60,6 +69,8 @@ const jobColumns = `
 	COALESCE(vehicle_requirement, ''), COALESCE(handling_notes, ''),
 	pickup_window_start, pickup_window_end,
 	dropoff_window_start, dropoff_window_end,
+	COALESCE((budget * 100)::bigint, 0),
+	expires_at,
 	created_at, updated_at`
 
 // scanJob reads one row of [jobColumns].
@@ -76,6 +87,8 @@ func scanJob(row pgx.Row) (Job, error) {
 
 		pickupStart, pickupEnd   *time.Time
 		dropoffStart, dropoffEnd *time.Time
+
+		expiresAt *time.Time
 	)
 
 	if err := row.Scan(
@@ -90,9 +103,15 @@ func scanJob(row pgx.Row) (Job, error) {
 		&j.VehicleRequirement, &j.HandlingNotes,
 		&pickupStart, &pickupEnd,
 		&dropoffStart, &dropoffEnd,
+		&j.BudgetCents,
+		&expiresAt,
 		&j.CreatedAt, &j.UpdatedAt,
 	); err != nil {
 		return Job{}, err
+	}
+
+	if expiresAt != nil {
+		j.ExpiresAt = *expiresAt
 	}
 
 	// ck_jobs_pickup_coordinate_is_a_pair means one of these being present implies the other,
@@ -155,6 +174,16 @@ func nullTime(t time.Time) any {
 	return t.UTC()
 }
 
+// nullCents is the same conversion for money, and it is separate from nullInt only because Go's
+// int and int64 are different types. The amount is in minor units on the way out; draftValues
+// divides it back to the column's scale.
+func nullCents(cents int64) any {
+	if cents == 0 {
+		return nil
+	}
+	return cents
+}
+
 // locationArgs renders a location as the seven values its columns take.
 //
 // The coordinate and the formatted address go NULL together with Resolved, so a location edited
@@ -182,10 +211,15 @@ func draftArgs(j Job) []any {
 		nullText(j.VehicleRequirement), nullText(j.HandlingNotes),
 		nullTime(j.PickupWindow.Start), nullTime(j.PickupWindow.End),
 		nullTime(j.DropoffWindow.Start), nullTime(j.DropoffWindow.End),
+		nullCents(j.BudgetCents),
 	)
 }
 
 // draftColumns names the columns draftArgs supplies, in the same order.
+//
+// expires_at is deliberately absent. It is not a draft field: 000406's trigger sets it as the job
+// becomes Open, and a draft edit that named the column would be an edit able to move a deadline
+// the customer has no route to yet — SHIP-70 is that route, and it is a statement of its own.
 const draftColumns = `
 	pickup_line, pickup_suburb, pickup_state, pickup_postcode,
 	pickup_latitude, pickup_longitude, pickup_formatted,
@@ -194,7 +228,28 @@ const draftColumns = `
 	goods_description, length_cm, width_cm, height_cm, weight_kg,
 	vehicle_requirement, handling_notes,
 	pickup_window_start, pickup_window_end,
-	dropoff_window_start, dropoff_window_end`
+	dropoff_window_start, dropoff_window_end,
+	budget`
+
+// draftValues is insertDraft's VALUES list, one entry per name in draftColumns and in the same
+// order. $1 and $2 are the id and the customer, so the draft's own values start at $3.
+//
+// Written out rather than generated, and kept immediately below the names it lines up with, for
+// the reason updateDraft gives for not building its statement: a list that is one entry short
+// silently shifts every value after it, and two lists that can be read side by side is the
+// cheapest way to see that.
+//
+// The last entry is the only one that is not a bare placeholder. The budget arrives in minor
+// units and the column is numeric(12,2), so it is divided here — in SQL, exactly, with no float
+// anywhere in the round trip (Docs/10 §3.3).
+const draftValues = `
+	$3, $4, $5, $6, $7, $8, $9,
+	$10, $11, $12, $13, $14, $15, $16,
+	$17, $18, $19, $20, $21,
+	$22, $23,
+	$24, $25,
+	$26, $27,
+	($28::bigint)::numeric / 100`
 
 // isCustomer reports whether the account exists and is a customer account.
 //
@@ -229,8 +284,7 @@ func (postgresStore) isCustomer(ctx context.Context, r db.Runner, id uuid.UUID) 
 func (postgresStore) insertDraft(ctx context.Context, r db.Runner, j Job) (Job, error) {
 	const q = `
 		INSERT INTO jobs (id, customer_id, ` + draftColumns + `)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-		        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		VALUES ($1, $2, ` + draftValues + `)
 		RETURNING ` + jobColumns
 
 	args := append([]any{j.ID, j.CustomerID}, draftArgs(j)...)
@@ -263,7 +317,8 @@ func (postgresStore) updateDraft(ctx context.Context, r db.Runner, j Job) (Job, 
 			goods_description = $16, length_cm = $17, width_cm = $18, height_cm = $19,
 			weight_kg = $20, vehicle_requirement = $21, handling_notes = $22,
 			pickup_window_start = $23, pickup_window_end = $24,
-			dropoff_window_start = $25, dropoff_window_end = $26
+			dropoff_window_start = $25, dropoff_window_end = $26,
+			budget = ($27::bigint)::numeric / 100
 		WHERE id = $1
 		RETURNING ` + jobColumns
 
