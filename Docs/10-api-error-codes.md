@@ -48,6 +48,8 @@ them where the call is made, beside the thing the user was trying to do.
 
 | Code | Meaning |
 |---|---|
+| `fleet_duplicate_registration` | A vehicle with that registration is already in service in this fleet. Edit the existing one, or deactivate it first. |
+| `fleet_provider_only` | Only a provider account can keep a fleet. Customers publish jobs; they do not run vehicles. |
 | `identity_account_suspended` | The account has been suspended. Signing in is refused until support lifts it; contact support rather than retrying. |
 | `identity_credentials_invalid` | That email address and password do not match an account. Deliberately one code for both halves, so this endpoint cannot be used to find out which addresses have accounts. |
 | `identity_email_taken` | An account already exists for this email address. Sign in, or reset the password. |
