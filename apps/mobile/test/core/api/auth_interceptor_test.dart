@@ -78,7 +78,7 @@ ResponseBody _unauthorised() {
 bool _isReplay(RequestOptions options) => options.extra[AuthInterceptor.replayedFlag] == true;
 
 String? _bearerOf(RequestOptions options) {
-  final Object? header = options.headers[AuthInterceptor.bearerHeader];
+  final Object? header = options.headers[ApiHeaders.bearer];
   return header is String ? header : null;
 }
 
@@ -149,7 +149,7 @@ void main() {
 
     await container.read(apiClientProvider).getJson('/health');
 
-    expect(adapter.requests.single.headers, isNot(contains(AuthInterceptor.bearerHeader)));
+    expect(adapter.requests.single.headers, isNot(contains(ApiHeaders.bearer)));
   });
 
   group('a 401', () {

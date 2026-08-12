@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:dio/dio.dart';
 
+import 'package:shipper/core/api/idempotency_interceptor.dart';
+
 /// What `core/api` needs from the session in order to authenticate a request and to recover from
 /// a `401` (SHIP-50).
 ///
@@ -78,9 +80,6 @@ class AuthInterceptor extends Interceptor {
   /// which is a check worth running twice rather than a step worth skipping.
   final Future<Response<Object?>> Function(RequestOptions options) replay;
 
-  /// The header the platform reads (`httpx.HeaderAuthorization`).
-  static const bearerHeader = 'Authorization'; // spelling:ok — HTTP header name, RFC 9110
-
   /// Marks a request that has already been refreshed and replayed once.
   ///
   /// In `extra` rather than in a header: `extra` is client-side only and never reaches the wire,
@@ -92,7 +91,7 @@ class AuthInterceptor extends Interceptor {
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
     final token = session().accessToken;
     if (token != null && token.isNotEmpty) {
-      options.headers[bearerHeader] = 'Bearer $token';
+      options.headers[ApiHeaders.bearer] = 'Bearer $token';
     }
     handler.next(options);
   }
@@ -139,7 +138,7 @@ class AuthInterceptor extends Interceptor {
 
   /// The token the failed request carried, or `null` if it carried none.
   static String? _bearerOf(RequestOptions options) {
-    final Object? header = options.headers[bearerHeader];
+    final Object? header = options.headers[ApiHeaders.bearer];
     if (header is! String || !header.startsWith('Bearer ')) return null;
 
     final token = header.substring('Bearer '.length);

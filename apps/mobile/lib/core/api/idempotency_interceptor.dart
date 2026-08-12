@@ -2,11 +2,18 @@ import 'package:dio/dio.dart';
 
 /// Header names, spelled by the platform rather than by us.
 ///
-/// `Idempotency-Key` matches `httpx.HeaderIdempotencyKey`; `X-Request-Id` matches
-/// `httpx.HeaderRequestID`.
+/// `Idempotency-Key` matches `httpx.HeaderIdempotencyKey`, `X-Request-Id` matches
+/// `httpx.HeaderRequestID`, and the credential header below matches `httpx.HeaderAuthorization`
+/// and is spelled by RFC 9110 rather than by us.
+///
+/// All of them live here rather than beside the code that sets each one. A header name written
+/// in two places is a header name that gets corrected in one of them.
 abstract final class ApiHeaders {
   static const idempotencyKey = 'Idempotency-Key';
   static const requestId = 'X-Request-Id';
+
+  /// Where the access token travels (SHIP-50).
+  static const bearer = 'Authorization'; // spelling:ok — HTTP header name, RFC 9110
 }
 
 /// Refuses a state-changing request that carries no `Idempotency-Key`, before it is sent.
