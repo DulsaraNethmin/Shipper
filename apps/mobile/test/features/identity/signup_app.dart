@@ -7,11 +7,13 @@ import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/device/device_label.dart';
+import 'package:shipper/features/fleet/fleet_repository.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
 
 import '../../core/auth/fake_token_store.dart';
 import '../../core/auth/session_fixtures.dart';
+import '../fleet/fake_fleet_repository.dart';
 import '../jobs/fake_jobs_repository.dart';
 import 'fake_identity_repository.dart';
 
@@ -29,6 +31,7 @@ Widget signupApp(
   FakeIdentityRepository identity, {
   FakeTokenStore? store,
   FakeJobsRepository? jobs,
+  FakeFleetRepository? fleet,
   FakeSessionEnder? ender,
 }) {
   return ProviderScope(
@@ -45,6 +48,11 @@ Widget signupApp(
       // listening on the local API port — nothing on CI, and on a developer's machine the API.
       // Same hazard as the refresher below, and the same symptom when it is forgotten.
       jobsRepositoryProvider.overrideWithValue(jobs ?? FakeJobsRepository()),
+      // The fleet screens read the provider's own vehicles as soon as they are drawn (SHIP-98),
+      // and three of the five things they do are writes. Same hazard, same symptom: a socket
+      // opened by a screen nobody in a given test was thinking about is the one that goes
+      // unnoticed until CI has no API to open it against.
+      fleetRepositoryProvider.overrideWithValue(fleet ?? FakeFleetRepository()),
       // A restored session refreshes as soon as the keychain answers (SHIP-50). None of these
       // tests starts with a stored token, so nothing refreshes — but a test that later does
       // would otherwise open a socket to whatever is listening on the local API port.
