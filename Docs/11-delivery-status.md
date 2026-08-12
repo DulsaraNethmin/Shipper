@@ -126,7 +126,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **214 checks**, and `make check` green. Since SHIP-15e the checks
+Verified by `make verify` — **224 checks**, and `make check` green. Since SHIP-15e the checks
 live one file per milestone or domain in `scripts/verify/`, sourced by the runner; a ticket adds
 its section by adding a file.
 
@@ -1449,6 +1449,49 @@ refuses a budget on a job created without one — the omitempty rule that lets a
 budget" from "a budget of nothing" — and a new SHIP-67 section asserts the owner reads their own
 back, that the column holds `1500.00` for `150000` cents, and that no response to a provider or to
 another customer mentions the word or the amount anywhere.
+
+### SHIP-68 — the deadline is the database's, the sweep is the worker's
+
+Docs/02 §6.3 — the earlier of fourteen days after publication or the pickup date passing — is now
+three pieces in three places, and the split is the ticket's main decision.
+
+**000406 sets `expires_at` in a trigger on the transition into Open, not in Go.** The alternative
+was to compute it inside `Service.Transition`, and it was rejected for the reason 000402 gives for
+the status guard itself: the property wanted is that *every* published job has a deadline, and
+publication is not one code path. SHIP-63 publishes, SHIP-93 returns an Awarded job to Open after
+a provider cancellation, an administrator may reopen one — three tickets on three branches, and a
+deadline computed in one Go function is a deadline three of them can forget. The symptom would be
+an Open job that never expires, which nothing reports. `updated_at` is the precedent: a derived
+timestamp belonging to a state change is set by the trigger attached to that change.
+
+**It is a default, not a lock.** The trigger fills `expires_at` only when it is `NULL`, so a
+caller writing its own value in the same statement keeps it, and a job that already has a deadline
+keeps that. Two consequences fall out and both are what Docs/02 §6.3 asks for: SHIP-70's extend
+endpoint is an ordinary `UPDATE`, and the clock does not restart every time a job cycles
+`Negotiating → Open` as bids expire — which would let a job with a slow trickle of bids live for
+ever, the exact stale listing §6.3 is about.
+
+**`cmd/worker` needed no seam and no shared edit**, exactly as SHIP-15g predicted: `tasks_jobs.go`
+is a new file with an `init` that calls `register`, and nothing else in the tree changed. No field
+was added to `Deps`. The claim query lives in `internal/jobs` because *which* jobs are due names
+this domain's table, status and column; the loop lives in `cmd/worker` because *how* work is
+claimed is the worker's, and `ClaimIDs` refuses a query without `FOR UPDATE SKIP LOCKED`.
+
+**The claim judges against the worker's clock rather than `now()`**, which is Docs/10 §6.3 being
+useful rather than ceremonial: a test advances a `clock.Fixed` by fifteen days and watches the
+backstop fire, instead of waiting or writing a deadline into the past to fake one. Two concurrent
+passes are tested against a real database and each job is expired exactly once — no lease table,
+no leader election, just `SKIP LOCKED` and one transaction per pass.
+
+**`expires_at` is returned to the owner.** SHIP-69 warns forty-eight hours ahead and SHIP-70
+extends, and neither is usable by a client that cannot see the deadline; it is omitted while the
+job is a Draft, because the clock starts at publication.
+
+**`make verify` runs the real worker binary**, not a stand-in: it publishes one job whose pickup
+window closed an hour ago and one with no window at all, checks the two deadlines the trigger
+computed, starts `cmd/worker`, waits for the first pass, and then asserts the stale job is
+`Cancelled` with an `Open->Cancelled` history row attributed to `system` with no account, an
+outbox event, and the live job untouched. The count went from 208 to **224**.
 
 ## 4. Partly done — do not treat these as finished
 

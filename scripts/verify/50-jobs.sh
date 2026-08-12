@@ -628,3 +628,120 @@ case "$budget_event" in
   *budget*|*150000*) fail "a domain event carries the customer's budget: $budget_event" ;;
 esac
 ok "the domain event carries no budget, in a payload that reaches every consumer there will be"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-68  an Open job expires at the earlier of fourteen days or its pickup date"
+
+# Docs/02 §6.3, demonstrated against the running database and the real worker binary rather than
+# asserted. Three parts have to hold: publication sets a deadline, the deadline is the earlier of
+# the two rules, and a process acts on it — through the SHIP-57 guard, as the platform.
+#
+# The deadline is set by 000406's trigger on the transition itself, so it appears however the job
+# reaches Open. move_job above publishes with raw SQL through the guard's own protocol, which is
+# what makes that worth showing here: a route into Open that nobody has written yet still gets a
+# deadline.
+
+# Dates computed with python3 rather than date(1). BSD date takes -v and GNU date takes -d, and
+# this script runs on a developer's macOS and on CI's Linux.
+past_pickup="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-stale-$$" /v1/jobs \
+  "{\"goods_description\": \"Two pallets, urgent\", \"pickup_window\": {\"end\": \"$past_pickup\"}}" \
+  "$WORKDIR/jobs-stale.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-stale.json"; fail "creating the stale job returned $status"; }
+stale_job="$(json "$WORKDIR/jobs-stale.json" '["id"]')"
+
+live_job="$(new_draft expiry-live)"
+draft_job="$(new_draft expiry-draft)"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select expires_at is null from jobs where id = '$draft_job';")" == "t" ]] \
+  || fail "a draft already has a deadline; the clock starts at publication (Docs/02 §6.3)"
+ok "a draft carries no deadline — a saved draft may sit indefinitely (Docs/01 §4.1)"
+
+move_job "$stale_job" Draft Open || fail "could not publish the stale job"
+move_job "$live_job"  Draft Open || fail "could not publish the live job"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at = pickup_window_end from jobs where id = '$stale_job';")" == "t" ]] \
+  || fail "the deadline is not the pickup window's end: $("$PSQL" "$DATABASE_URL" -tAc "select expires_at, pickup_window_end from jobs where id = '$stale_job';")"
+ok "publication sets the deadline to the pickup date when that is the earlier of the two"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at between now() + interval '13 days' and now() + interval '15 days'
+     from jobs where id = '$live_job';")" == "t" ]] \
+  || fail "a job with no pickup date did not get the fourteen-day backstop: $("$PSQL" "$DATABASE_URL" -tAc "select expires_at from jobs where id = '$live_job';")"
+ok "a job with no pickup date gets the fourteen-day backstop instead"
+
+# The worker, built and run for real. Its first pass runs immediately at start-up rather than one
+# interval later, which is what lets this take seconds instead of five minutes.
+pushd "$ROOT/services/core" >/dev/null
+go build -o "$WORKDIR/shipper-worker" ./cmd/worker
+popd >/dev/null
+ok "the worker builds with the jobs domain's task registered"
+
+SHIPPER_ENV=development \
+LOG_FORMAT=json \
+LOG_LEVEL=debug \
+DATABASE_URL="$DATABASE_URL" \
+REDIS_URL="$REDIS_URL" \
+  "$WORKDIR/shipper-worker" >"$WORKDIR/worker.log" 2>&1 &
+worker_pid=$!
+
+for _ in $(seq 1 100); do
+  expired_status="$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$stale_job';")"
+  [[ "$expired_status" == "Cancelled" ]] && break
+  sleep 0.2
+done
+
+kill -TERM "$worker_pid" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  kill -0 "$worker_pid" 2>/dev/null || break
+  sleep 0.2
+done
+wait "$worker_pid" 2>/dev/null || true
+
+[[ "$expired_status" == "Cancelled" ]] \
+  || { cat "$WORKDIR/worker.log"; fail "the stale job is $expired_status after a pass, want Cancelled"; }
+ok "one pass of the worker ends the job whose pickup date has passed"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$live_job';")" == "Open" ]] \
+  || fail "the pass also expired a job whose deadline is thirteen days away"
+ok "and leaves alone the one whose deadline has not arrived"
+
+# Through the guard, as the platform. A job that reached Cancelled with no history row would mean
+# the sweep had gone round 000402 rather than through it.
+expiry_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select h.from_status || '->' || h.to_status || ' ' || h.actor_type || ' ' || (h.actor_id is null)
+     from job_status_history h where h.job_id = '$stale_job' and h.to_status = 'Cancelled';")"
+[[ "$expiry_row" == "Open->Cancelled system true" ]] \
+  || fail "the recorded expiry is '$expiry_row', want 'Open->Cancelled system true'"
+ok "the move went through the SHIP-57 guard, recorded as the platform with no account behind it"
+
+expiry_event="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select coalesce(string_agg(payload::text, ' '), '') from outbox
+    where aggregate_id = '$stale_job' and event_type = 'job.status_changed';")"
+# Matched loosely on purpose: jsonb reformats what it stores, so the key order and the spacing in
+# the round-tripped text are PostgreSQL's business rather than the payload's.
+[[ "$expiry_event" == *Cancelled* && "$expiry_event" == *system* ]] \
+  || fail "the expiry emitted no job.status_changed event naming the platform: $expiry_event"
+case "$expiry_event" in
+  *budget*) fail "the expiry event carries a budget" ;;
+esac
+ok "it emits the domain event from the domain, inside the same transaction"
+
+grep -q '"stopped cleanly"\|scheduled task stopped' "$WORKDIR/worker.log" \
+  || { cat "$WORKDIR/worker.log"; fail "the worker did not stop cleanly on SIGTERM"; }
+ok "the worker drains its pass and stops cleanly on SIGTERM"
+
+# And the client sees both halves: the expired job is cancelled, and the live one carries the
+# deadline the app needs to warn against (SHIP-69) and to extend (SHIP-70).
+status="$(job_get "$jobs_customer_token" "/v1/jobs/$stale_job" "$WORKDIR/jobs-stale-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-stale-detail.json"; fail "reading the expired job returned $status"; }
+[[ "$(json "$WORKDIR/jobs-stale-detail.json" '["status"]')" == "cancelled" ]] \
+  || fail "the expired job reads as $(json "$WORKDIR/jobs-stale-detail.json" '["status"]')"
+
+status="$(job_get "$jobs_customer_token" "/v1/jobs/$live_job" "$WORKDIR/jobs-live-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-live-detail.json"; fail "reading the live job returned $status"; }
+[[ -n "$(json "$WORKDIR/jobs-live-detail.json" '["expires_at"]')" ]] \
+  || { cat "$WORKDIR/jobs-live-detail.json"; fail "an Open job does not tell its owner when it expires"; }
+ok "the owner sees the expiry through the API — a cancelled job, and a deadline on the live one"

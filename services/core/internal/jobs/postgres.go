@@ -43,9 +43,10 @@ type postgresStore struct{}
 // column cannot hold — ck_jobs_length_cm refuses a dimension that is not positive — so 0 and NULL
 // cannot be confused in either direction.
 //
-// The coordinates and the four window ends are the exceptions, for opposite reasons. (0, 0) is a
-// real point in the Gulf of Guinea, so a coalesced coordinate would be indistinguishable from a
-// resolved one; and PostgreSQL's NULL has no representation in time.Time at all.
+// The coordinates, the four window ends and expires_at are the exceptions, for opposite reasons.
+// (0, 0) is a real point in the Gulf of Guinea, so a coalesced coordinate would be
+// indistinguishable from a resolved one; and PostgreSQL's NULL has no representation in
+// time.Time at all.
 //
 // # The budget is converted in SQL, in one direction here and the other in draftValues
 //
@@ -69,6 +70,7 @@ const jobColumns = `
 	pickup_window_start, pickup_window_end,
 	dropoff_window_start, dropoff_window_end,
 	COALESCE((budget * 100)::bigint, 0),
+	expires_at,
 	created_at, updated_at`
 
 // scanJob reads one row of [jobColumns].
@@ -85,6 +87,8 @@ func scanJob(row pgx.Row) (Job, error) {
 
 		pickupStart, pickupEnd   *time.Time
 		dropoffStart, dropoffEnd *time.Time
+
+		expiresAt *time.Time
 	)
 
 	if err := row.Scan(
@@ -100,9 +104,14 @@ func scanJob(row pgx.Row) (Job, error) {
 		&pickupStart, &pickupEnd,
 		&dropoffStart, &dropoffEnd,
 		&j.BudgetCents,
+		&expiresAt,
 		&j.CreatedAt, &j.UpdatedAt,
 	); err != nil {
 		return Job{}, err
+	}
+
+	if expiresAt != nil {
+		j.ExpiresAt = *expiresAt
 	}
 
 	// ck_jobs_pickup_coordinate_is_a_pair means one of these being present implies the other,
@@ -207,6 +216,10 @@ func draftArgs(j Job) []any {
 }
 
 // draftColumns names the columns draftArgs supplies, in the same order.
+//
+// expires_at is deliberately absent. It is not a draft field: 000406's trigger sets it as the job
+// becomes Open, and a draft edit that named the column would be an edit able to move a deadline
+// the customer has no route to yet — SHIP-70 is that route, and it is a statement of its own.
 const draftColumns = `
 	pickup_line, pickup_suburb, pickup_state, pickup_postcode,
 	pickup_latitude, pickup_longitude, pickup_formatted,

@@ -296,6 +296,13 @@ type jobResponse struct {
 	// tell "no budget" from "a budget of nothing" without a second flag.
 	BudgetCents int64 `json:"budget_cents,omitempty"`
 
+	// ExpiresAt is when this job stops being offered, once it is Open (SHIP-68).
+	//
+	// Omitted while the job is a Draft, because a Draft has no deadline — the clock starts at
+	// publication (Docs/02 §6.3). The client needs it to show "expires in three days" and to
+	// offer the extension SHIP-70 builds, and it is the same instant SHIP-69 warns against.
+	ExpiresAt string `json:"expires_at,omitempty"`
+
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 }
@@ -322,6 +329,7 @@ func jobFrom(j Job) jobResponse {
 		DropoffWindow: windowFrom(j.DropoffWindow),
 
 		BudgetCents: j.BudgetCents,
+		ExpiresAt:   timestamp(j.ExpiresAt),
 
 		CreatedAt: timestamp(j.CreatedAt),
 		UpdatedAt: timestamp(j.UpdatedAt),

@@ -279,9 +279,9 @@ func (d Dimensions) IsZero() bool { return d.LengthCm == 0 && d.WidthCm == 0 && 
 // Job is the job record: who owns it, what state it is in, and what the customer has said about
 // the delivery so far.
 //
-// It grows further through M2 — the goods category (SHIP-58) and expiry (SHIP-68) — and each of
-// those arrives with the ticket that gives it meaning rather than as an empty column waiting for
-// one. The budget (SHIP-67) is here now.
+// It grows further through M2 — the goods category is still SHIP-58's — and each field arrives
+// with the ticket that gives it meaning rather than as an empty column waiting for one. The
+// budget (SHIP-67) and the expiry deadline (SHIP-68) are both here now.
 //
 // **Every field below Status is optional**, because a Draft is allowed to be incomplete: Docs/01
 // §4.1 lets a customer save a draft and come back to it, and SHIP-75 has a partly completed job
@@ -332,6 +332,17 @@ type Job struct {
 	// Zero means not supplied, which is unambiguous because ck_jobs_budget refuses zero and
 	// everything below it — the same arrangement [Dimensions] relies on.
 	BudgetCents int64
+
+	// ExpiresAt is when an Open job stops being offered (SHIP-68).
+	//
+	// The earlier of fourteen days after publication and the pickup window ending
+	// (Docs/02 §6.3). Zero until the job is published: 000406's trigger sets it as the job
+	// becomes Open, so nothing in Go computes it and no route into Open can forget it.
+	//
+	// A job that has left Open keeps the value it had. Nothing reads it outside [ExpiryClaim],
+	// which filters on status, and if the job returns to Open — Docs/02 §6.2 — the original
+	// deadline is the one Docs/02 §6.3 asks for.
+	ExpiresAt time.Time
 
 	CreatedAt time.Time
 	UpdatedAt time.Time

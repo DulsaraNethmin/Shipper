@@ -702,6 +702,18 @@ Job:
         API that carries the budget.** Docs/01 §4.3 keeps it private from providers in every
         form; SHIP-82's feed and SHIP-83's provider job detail describe a job without it.
       example: 150000
+    expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the job stops being offered: the earlier of fourteen days after publication and its
+        pickup window ending (Docs/02 §6.3, SHIP-68). **Omitted while the job is a draft** —
+        the clock starts at publication, and a draft may be saved and returned to indefinitely.
+
+        A job that reaches this instant while still `open` is moved to `cancelled` by the
+        platform, with the transition recorded like any other. The customer is warned forty-eight
+        hours ahead (SHIP-69) and can extend it in one call (SHIP-70).
+      example: '2026-08-25T03:30:00.000Z'
     created_at:
       type: string
       format: date-time

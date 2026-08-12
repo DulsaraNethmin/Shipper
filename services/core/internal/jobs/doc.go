@@ -18,6 +18,11 @@
 //     rather than with review: budget_test.go reads this package's own source and refuses a
 //     budget field on any struct but the owning customer's response, so a provider shape
 //     written later cannot acquire one quietly.
+//   - An Open job carries a deadline, and it is the database that gives it one. 000406 sets
+//     expires_at on the transition into Open — the earlier of fourteen days and the pickup
+//     window ending (Docs/02 §6.3) — so no route into Open, including ones nobody has
+//     written yet, can produce a listing that never expires. cmd/worker sweeps what is due
+//     through the same guard every other transition passes (SHIP-68).
 //   - Category lists and validation limits are reference data loaded at runtime, not
 //     constants (SHIP-58). Flutter has no over-the-air update path for Dart code, so
 //     anything that moves under operational pressure has to move server-side (Docs/06
