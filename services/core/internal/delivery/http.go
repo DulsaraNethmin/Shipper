@@ -1,0 +1,296 @@
+// The HTTP surface of the delivery domain.
+//
+// Handlers live in the domain rather than in cmd/api (Docs/10 §2.1). The reason is a merge hazard
+// rather than taste: it keeps cmd/api/routes.go free of per-domain edits, which is what lets two
+// domains be built at once without touching a shared file. A domain importing internal/httpx is
+// sitting on infrastructure, not crossing a boundary, and the import lint permits it.
+//
+// # This endpoint is called by the provider, not by the driver
+//
+// Worth stating first, because the domain's name invites the opposite assumption. The driver has no
+// account and no session — the portal is link-authenticated (Docs/07 §3) — and the job-scoped token
+// they eventually hold is a separate system that cannot be exchanged for a user token in either
+// direction (Docs/10 §5, SHIP-108). Nothing here reads or issues one. The caller is the awarded
+// provider, authenticated the ordinary way, and the route declares RequireUser like every other
+// product endpoint in the service.
+//
+// # There is no field for whose job, and no field for who is assigning
+//
+// The provider is whoever the token says is calling. A provider id in the request would be an
+// authorisation decision made from client input, which Docs/07 §3 puts on the platform. The job is
+// named in the path and the platform checks it against the accepted bid.
+//
+// The blank line below keeps this a file note rather than a second package comment.
+
+package delivery
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+)
+
+// Handler serves this domain's routes.
+//
+// It is built in cmd/api/routes_delivery.go from Deps. The pool is held here rather than inside the
+// service because Docs/10 §3.2 puts the transaction boundary with whoever owns the invariant, and
+// for an assignment that is this layer: the award check, the assignment row and the status change
+// are one decision against one version of the job.
+type Handler struct {
+	svc  *Service
+	pool *pgxpool.Pool
+	log  *slog.Logger
+}
+
+// NewHandler wires the handlers to the service.
+//
+// The pool may be nil and that is not an error. The service starts with an unreachable database on
+// purpose — a rolling deployment during a failover would otherwise take every instance down at once
+// — so a nil pool is a condition the handlers answer 503 to for as long as it lasts, not a reason to
+// refuse to start.
+func NewHandler(svc *Service, pool *pgxpool.Pool, log *slog.Logger) (*Handler, error) {
+	if svc == nil {
+		return nil, errors.New("delivery: a handler needs a service")
+	}
+	if log == nil {
+		return nil, errors.New("delivery: a handler needs a logger")
+	}
+	return &Handler{svc: svc, pool: pool, log: log}, nil
+}
+
+// assignDriverRequest is the body of POST /v1/jobs/{id}/driver.
+//
+// Three fields and two ways to fill them in, which is Docs/02 §1's "nominated a driver or
+// self-assigned" written as one request:
+//
+//	{"driver_name": "Sam Patel", "driver_mobile": "0412 345 678"}   nomination
+//	{"driver_name": "Ravi Chandra", "self": true}                   self-assignment
+//
+// `self` with a mobile is refused rather than resolved either way — see [Nomination].
+//
+// There is no `job_id` and no `provider_id`. The job is in the path and the provider is the token.
+// httpx.DecodeJSON refuses unknown fields, so a client that sends either is told the field does not
+// exist rather than having it quietly ignored.
+type assignDriverRequest struct {
+	DriverName   string `json:"driver_name"`
+	DriverMobile string `json:"driver_mobile"`
+	Self         bool   `json:"self"`
+}
+
+// assignmentResponse is the driver on a job, as the awarded provider sees it.
+//
+// **The job's status is deliberately not echoed here.** The status vocabulary is `jobs`' own and its
+// wire form is `jobs`' to map (Docs/10 §4.7, and SHIP-56a takes it over for three languages); a copy
+// of the string "driver_assigned" in this package would be a second list to keep in step for the
+// sake of a field the client already knows the value of — a successful response to this endpoint
+// means the job is at 'Driver assigned' and nothing else.
+//
+// The mobile is returned because the provider typed it and needs to see it was read correctly,
+// including when the platform supplied it from their own account. It reaches nobody but the awarded
+// provider: the customer's view of a delivery (SHIP-133) is a shape of its own rather than this one
+// reached by another route, for the same reason `jobs` keeps the customer's and the provider's views
+// apart.
+type assignmentResponse struct {
+	ID    string `json:"id"`
+	JobID string `json:"job_id"`
+
+	DriverName   string `json:"driver_name"`
+	DriverMobile string `json:"driver_mobile"`
+
+	AssignedAt string `json:"assigned_at"`
+}
+
+func assignmentFrom(a Assignment) assignmentResponse {
+	return assignmentResponse{
+		ID:    a.ID.String(),
+		JobID: a.JobID.String(),
+
+		DriverName:   a.DriverName,
+		DriverMobile: a.DriverMobile,
+
+		AssignedAt: timestamp(a.CreatedAt),
+	}
+}
+
+// timestamp renders an instant the way every other endpoint does, in UTC with milliseconds.
+func timestamp(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+}
+
+// AssignDriver handles POST /v1/jobs/{id}/driver (SHIP-106).
+//
+// A noun under the resource rather than a verb, unlike `/jobs/{id}/cancel`: cancelling is an intent
+// with no record of its own, and a driver *is* a record — one row, at most one live per job. POST
+// rather than PUT because the two are not the same request: PUT would say a second call replaces
+// the first, and replacing a driver is deliberately not this endpoint (see [ErrDriverAlreadyAssigned]).
+//
+// 201 when a driver was put on the job, 200 when the job already had exactly this driver and
+// nothing was written. Both carry the assignment, so a client that does not care which happened
+// parses one shape.
+//
+// The transaction is opened here. Both the assignment and the job's move into 'Driver assigned'
+// commit together or neither does — a job at 'Driver assigned' with no driver is a state no client
+// and no support queue can read.
+func (h *Handler) AssignDriver() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req assignDriverRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var (
+			assignment Assignment
+			created    bool
+		)
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			assignment, created, err = h.svc.AssignDriver(ctx, runner, providerID, jobID, Nomination{
+				DriverName:   req.DriverName,
+				DriverMobile: req.DriverMobile,
+				Self:         req.Self,
+			})
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		if !created {
+			// The same driver, nominated twice, with two idempotency keys. Logged because
+			// it is the signal that a client is retrying without reusing its key, which is
+			// worth seeing in aggregate and impossible to see from the response.
+			httpx.LoggerFrom(r.Context()).Info("a repeated driver nomination was absorbed",
+				slog.String("job_id", jobID.String()),
+				slog.String("assignment_id", assignment.ID.String()))
+
+			httpx.WriteJSON(w, http.StatusOK, assignmentFrom(assignment))
+			return nil
+		}
+
+		httpx.WriteJSON(w, http.StatusCreated, assignmentFrom(assignment))
+		return nil
+	})
+}
+
+// jobIDFrom reads and parses the {id} path parameter.
+//
+// A path parameter of the wrong shape is bad_request rather than not_found, which is the httpx
+// registry's own description of that code. It also discloses nothing: the answer is the same whether
+// or not any job exists.
+func jobIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The job id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
+}
+
+// callerID is the authenticated provider's account id.
+//
+// The route declares RequireUser, so a subject is guaranteed by the time a handler runs — which is
+// why the absence of one is reported as an internal failure rather than as a 401. Reaching here
+// without a subject means a route was declared public and written as though it were protected, and
+// that is a wiring defect the caller can do nothing about.
+//
+// The *role* is deliberately not read from the subject, and here it is not read at all: being the
+// provider on the accepted bid is a stronger statement than carrying `role: provider`, and it is the
+// one Docs/02 §3 actually makes.
+func callerID(ctx context.Context) (uuid.UUID, error) {
+	subject := authctx.MustSubject(ctx)
+
+	id, err := uuid.Parse(subject.UserID)
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+			"Something went wrong at our end.").WithCause(err)
+	}
+	return id, nil
+}
+
+// database returns the pool, or the answer to give while there is not one.
+//
+// 503 rather than 500, because the two say different things to a mobile client: retry, or surface a
+// failure to the person holding the phone. Docs/10 §9.2 is explicit that the pool may be nil — the
+// service starts with an unreachable database on purpose — so this is an expected condition rather
+// than a defect, and it is logged at warning level for exactly that reason.
+func (h *Handler) database(r *http.Request) (*pgxpool.Pool, error) {
+	if h.pool != nil {
+		return h.pool, nil
+	}
+
+	httpx.LoggerFrom(r.Context()).Warn("a delivery request arrived with no database connection")
+	return nil, httpx.NewError(http.StatusServiceUnavailable, httpx.CodeUnavailable,
+		"This cannot be completed right now. Try again shortly.")
+}
+
+// apiError turns this domain's errors into the API's error contract.
+//
+// The mapping lives at the transport edge on purpose: the service answers in domain terms, and which
+// HTTP status a provider who was not awarded the job deserves is not a question the domain has an
+// opinion about. A *httpx.Error passes straight through, because validation already produced one in
+// the right shape.
+//
+// # Why another provider's job is 404 and not 403
+//
+// 403 would confirm that the job exists and that somebody was awarded it. Which jobs a competitor
+// won is commercial information they never published, and httpx's own description of `not_found`
+// says the two cases are deliberately indistinguishable wherever telling them apart would confirm
+// the existence of something private.
+//
+// The domain still distinguishes them ([ErrNotAwardedProvider] against [ErrJobNotFound]) so that a
+// test can tell "the stranger was refused" from "the job silently stopped existing".
+//
+// Anything unrecognised is returned as-is and becomes an opaque 500 in httpx.WriteError, which logs
+// the cause against the request id (SHIP-15i). That is the correct default: an error nobody has
+// given a status and a code has not been considered.
+func apiError(err error) error {
+	var apiErr *httpx.Error
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+
+	switch {
+	case errors.Is(err, ErrJobNotFound), errors.Is(err, ErrNotAwardedProvider):
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such job.").WithCause(err)
+
+	case errors.Is(err, ErrJobNotAssignable):
+		return httpx.NewError(http.StatusConflict, CodeJobNotAssignable,
+			"A driver can only be assigned to a job that has been awarded and has not set off yet.").
+			WithCause(err)
+
+	case errors.Is(err, ErrDriverAlreadyAssigned):
+		return httpx.NewError(http.StatusConflict, CodeDriverAlreadyAssigned,
+			"This job already has a driver.").WithCause(err)
+
+	default:
+		return err
+	}
+}

@@ -48,6 +48,8 @@ them where the call is made, beside the thing the user was trying to do.
 
 | Code | Meaning |
 |---|---|
+| `delivery_driver_already_assigned` | This job already has a driver. Reload it to see who is carrying it. |
+| `delivery_job_not_assignable` | A driver can only be assigned to a job that has been awarded and has not yet set off. Reload the job to see its current status. |
 | `fleet_duplicate_registration` | A vehicle with that registration is already in service in this fleet. Edit the existing one, or deactivate it first. |
 | `fleet_provider_only` | Only a provider account can keep a fleet. Customers publish jobs; they do not run vehicles. |
 | `identity_account_suspended` | The account has been suspended. Signing in is refused until support lifts it; contact support rather than retrying. |

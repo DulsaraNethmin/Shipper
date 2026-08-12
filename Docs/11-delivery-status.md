@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **268 checks across 11 sections**, and `make check` green. Since
+Verified by `make verify` — **282 checks across 12 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -273,6 +273,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-80** | M3 | `bids` — the eight statuses of `Docs/02` §4, and the index that makes a second accepted bid impossible. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
@@ -2367,6 +2368,93 @@ does not decay. `ratelimit` and `pagination` are the evidence it works.
 **§3's table is not generated, per above.** Both refusals are recorded here rather than left
 implicit, because the wave-4 notes recommended one of them and a reader who finds the
 recommendation but not the refusal will do it.
+
+### SHIP-106 — the first delivery endpoint, and the question SHIP-105 left it
+
+`POST /v1/jobs/{id}/driver`. The awarded provider names who is carrying the job, and the job moves
+to `Driver assigned` in the same transaction. It is the first HTTP surface in `internal/delivery`,
+which held `doc.go` and SHIP-110's milestone model and nothing else.
+
+**The interesting part is not the endpoint. It is that it needs two facts it is not allowed to
+know.** Whether the caller won the work is a `bidding` fact, and whether the job may move at all is
+`jobs`' transition guard — and domains do not import each other. So `delivery/ports.go` declares
+two interfaces and `cmd/api/routes_delivery.go` supplies both:
+
+| Port | What delivery asks | Who answers today |
+|---|---|---|
+| `Awards` | which provider holds this job, or nobody | `acceptedBids` in `cmd/api` — one `SELECT` against the accepted bid |
+| `Jobs` | move this job to `Driver assigned`, in my transaction | `jobLifecycle` in `cmd/api`, over `jobs.Service.Transition` |
+
+**`Jobs` names one move rather than taking a status.** A port shaped "move this job to whatever I
+say" would be the transition table's second opinion arriving through the back door — this domain
+would be choosing the target status, and the one thing CLAUDE.md says about job status is that
+nothing outside the guard chooses it. A domain that needs another move declares another method.
+
+**Refusals cross the seam as an enumeration, not as errors.** `errors.Is(err, jobs.ErrJobNotFound)`
+is an import by another name, so `JobMove` carries the four outcomes — moved, no such job, already
+assigned, not permitted — with a nil error, and only a real failure stays an error. This is the same
+constraint `jobs.Geocoder` met and answered with `found bool` (§9); a bool could not carry four.
+**Its zero value is `JobMoveUnrecognised` and is refused**, so a half-written adapter cannot read as
+success.
+
+**The accepted-bid query is in `cmd/api`, and that is deliberate rather than convenient.**
+`internal/bidding` is `doc.go` and `model.go`: SHIP-80 built the table and the one-accepted-bid
+index, and SHIP-92 — single-owner, never parallelised (§8) — is what gives that domain a store. The
+alternatives were putting the query in `delivery/postgres.go`, where a dependency on another
+domain's table reads as a table delivery owns and the import lint cannot see it, or waiting for
+SHIP-92. It is five lines in the composition root with a comment saying what deletes it. **When
+`bidding` grows its store, the type goes and a method is passed instead; nothing in `delivery`
+changes.** That is what the port bought.
+
+**Who may assign — the question 000600 explicitly left to this ticket.** Only the provider on the
+accepted bid. Not an administrator: `ck_users_role` refuses `'admin'`, admin sign-in is a separate
+system (SHIP-147), and Docs/02 §1 gives `Driver assigned` one primary actor. **So no migration was
+needed** — recording *who assigned* would have meant the polymorphic `actor_type`/`actor_id` pair,
+and with one possible assigner the `Awarded → Driver assigned` history row already says it. The
+delivery block is still at `000601`.
+
+**A stranger's job and a job that does not exist are one 404, byte-identically.** Which jobs a
+competitor won is commercial information they never published. The domain keeps
+`ErrNotAwardedProvider` and `ErrJobNotFound` apart so a test can tell "the stranger was refused"
+from "the job stopped existing", and the wire cannot.
+
+**Self-assignment fills the mobile and asks for the name, which is the honest half of a gap.** The
+platform holds the provider's verified number (SHIP-36) and holds no name at all — `users` has no
+name column and `profiles` is still `doc.go`. So `{"self": true}` takes the number from the account
+and `driver_name` stays required. Sending `self` *and* a mobile is refused rather than resolved
+either way: a provider who sent both has two numbers in mind, and the loser is where SHIP-107's link
+would have gone. When profiles lands, the name defaults too and the change is additive.
+
+**A repeat naming the same driver is absorbed; a different driver is refused.** The idempotency
+middleware handles the retry that reuses its key, and this handles the one that does not — the same
+call `jobs.Cancel` and fleet's deactivation make. `delivery_driver_already_assigned` is the answer
+to a *different* name, because **replacing a driver is not this ticket and no ticket owns it yet**:
+000600 describes the shape (end this assignment, insert another) and SHIP-109 reissues a link to the
+same driver, which is a different intent. Whoever picks it up has a sentinel and a code already in
+place.
+
+**What stops two drivers is `uq_driver_assignments_active`, not the check in front of it.** The
+service reads the live assignment to give a legible answer; the partial unique index is what is
+right when two requests race and both read nothing. A test inserts directly, past the check, to see
+the index refuse it.
+
+**The assignment row is written before the transition is attempted, so a refused move takes it
+with it.** Two tests and one `make verify` check assert the rollback rather than the refusal: a job
+that answered 409 and kept a driver is the exact inconsistency the single transaction exists to
+prevent.
+
+**`scripts/verify/70-delivery.sh` is new, and it is the only place the `cmd/api` half is
+exercised.** The Go tests supply their own copies of both ports — a test file may import `jobs`, and
+`cmd/api` has no database in tests — so the real adapters are demonstrated against the built binary
+or nowhere. The fixtures reach `Awarded` through 000402's protocol and award through one accepted
+bid, so even the fixture cannot bypass the guard. `make verify` went from 268 checks across 11
+sections to the figure at the top of this section.
+
+**Not built, deliberately: no milestone row and no domain event.** Assigning a driver is one of
+Docs/01 §4.4's five recordable milestones, and whether the endpoint should write one is SHIP-111's
+question rather than this ticket's — `milestones` is SHIP-110's table and SHIP-111 owns what writes
+to it. The transition already emits `job.status_changed` through the outbox, so nothing downstream
+is deaf to the assignment meanwhile.
 
 ## 4. Partly done — do not treat these as finished
 

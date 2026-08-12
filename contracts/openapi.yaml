@@ -107,6 +107,14 @@ tags:
       once it is published, and to the awarded provider's driver only through a job-scoped token.
 
       The customer's maximum budget never appears in any provider-facing shape (Docs/01 §4.3).
+  - name: Delivery
+    description: |
+      Execution and proof, from the moment a provider names a driver through to completion. Every
+      operation here is the awarded provider's own work.
+
+      The assigned driver never holds a session. Their portal is link-authenticated, and the
+      job-scoped token they carry is a separate system that grants exactly one job and cannot be
+      exchanged for a user token in either direction (Docs/10 §5).
   - name: Identity
     description: |
       Registration, verification, credentials and sessions.
@@ -176,6 +184,8 @@ paths:
     $ref: './paths/jobs.yaml#/JobByID'
   /v1/jobs/{id}/cancel:
     $ref: './paths/jobs.yaml#/CancelJob'
+  /v1/jobs/{id}/driver:
+    $ref: './paths/delivery.yaml#/AssignDriver'
 
 components:
   schemas:

@@ -1,0 +1,193 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/google/uuid"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
+)
+
+// The delivery domain's routes (SHIP-106 onwards).
+//
+// This file exists so that adding a domain adds a file and edits none. cmd/api/routes.go,
+// manifest.go and main.go are shared surfaces (Docs/10 §9.2); a route registration that had to go
+// into one of them is a line every concurrent branch also touches, and a badly resolved conflict
+// there drops an endpoint with no compile error and no failing test.
+//
+// # This is also where three domains meet, which is the only place they may
+//
+// `delivery` declares two ports and imports neither `jobs` nor `bidding` (Docs/06 §4.1). The
+// implementations are below, and they are the reason this file is longer than routes_jobs.go: the
+// composition root is doing the one thing only it can do, which is knowing about more than one
+// domain at a time.
+//
+// # The route is under /jobs and the handler is in delivery, and that is not a contradiction
+//
+// A URL is a client's map of the product, not a diagram of the packages behind it. Assigning a
+// driver is something a client does *to a job*, so it lives under the job — the same reading that
+// puts SHIP-111's milestones there. What decides which domain serves it is who owns the rule, and
+// the rule here is delivery's: one live driver per job, and a status move that only the awarded
+// provider may ask for.
+func init() {
+	register(
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/driver",
+			Group:   GroupV1,
+
+			// RequireUser, and deliberately **not** RequireDriverToken. The caller is the
+			// provider, authenticated the ordinary way. The driver's job-scoped token is a
+			// separate system that grants exactly one job and cannot be exchanged for a
+			// session in either direction (Docs/10 §5); it arrives at SHIP-107 and SHIP-108,
+			// and until the middleware behind that class exists a route declaring it panics
+			// at startup rather than being served open.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).AssignDriver() },
+		},
+	)
+}
+
+// deliveryHandler builds the domain's handler from what Deps already carries.
+//
+// Nothing delivery needs is missing from Deps, which is the test Docs/10 §9.2 sets for whether a
+// domain has been written the way the shared-surface rules ask: the job service, the outbox writer
+// and the two ports are all pure functions of the pool, the clock and the configuration, so no field
+// had to be added to a shared struct and no line to its literal in main.go.
+//
+// It panics for the same reason jobsHandler does: it runs during attach, at startup, and every
+// failure it can report is a wiring mistake that will still be there after a restart. The pool is
+// deliberately not checked — it may be nil because the database was unreachable at startup, which is
+// a transient condition the service is built to survive, and the handlers answer 503 for as long as
+// it lasts.
+func deliveryHandler(d Deps) *delivery.Handler {
+	svc := delivery.NewService(jobLifecycle{jobs: newJobService(d)}, acceptedBids{})
+
+	handler, err := delivery.NewHandler(svc, d.Pool, d.Logger)
+	if err != nil {
+		panic("cmd/api: delivery handler: " + err.Error())
+	}
+	return handler
+}
+
+// newJobService builds a job service for a domain that needs to move a job but is not `jobs`.
+//
+// No geocoder, and that is the same call cmd/worker's expiry task makes: an assignment moves a job
+// that already exists and never touches an address, and jobs.NewService is explicit that a nil
+// Geocoder is a supported state rather than a broken one. Handing this path a maps vendor would be
+// an outbound dependency nothing on it has a reason for.
+func newJobService(d Deps) *jobs.Service {
+	return jobs.NewService(events.NewOutbox(), d.Clock, nil)
+}
+
+// jobLifecycle implements delivery.Jobs over the guarded transition (SHIP-57).
+//
+// This is the seam Docs/06 §4.1 describes working as intended: `delivery` names what it needs in its
+// own ports.go, `jobs` knows nothing about `delivery`, and the two are joined here by a type that
+// translates one vocabulary into the other. Go satisfies the interface structurally, so neither
+// package imports the other.
+//
+// # The translation is of errors into outcomes, and that is the whole job
+//
+// delivery cannot call errors.Is against jobs' sentinels — that is an import — so the refusals come
+// back as a delivery.JobMove instead. Everything jobs treats as a refusal becomes an outcome with a
+// nil error; everything else stays an error, because a failing database is not an answer.
+type jobLifecycle struct {
+	jobs *jobs.Service
+}
+
+// MoveToDriverAssigned runs Docs/02 §2's `Awarded → Driver assigned` through the one guarded
+// function, inside the caller's transaction.
+//
+// The actor is the provider, which is what Docs/02 §1 names as the primary actor for this status and
+// what job_status_history records. The reason is empty on purpose: Docs/01 §3 requires one only of an
+// administrator, and a provider nominating their own driver owes nobody an explanation.
+//
+// RecordedAt is left zero, so jobs.Transition uses the platform's clock for both. That is correct
+// here and would not be for a milestone: this request is made online, by a provider looking at the
+// screen, so there is only one clock. SHIP-111 carries the actor's separately (Docs/02 §3.1).
+func (l jobLifecycle) MoveToDriverAssigned(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+) (delivery.JobMove, error) {
+	_, err := l.jobs.Transition(ctx, r, jobs.Move{
+		JobID: jobID,
+		To:    jobs.StatusDriverAssigned,
+		Actor: jobs.User(jobs.ActorProvider, providerID),
+	})
+
+	switch {
+	case err == nil:
+		return delivery.JobMoved, nil
+	case errors.Is(err, jobs.ErrJobNotFound):
+		return delivery.JobNotFound, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return delivery.JobAlreadyDriverAssigned, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted):
+		return delivery.JobNotAssignable, nil
+	default:
+		return delivery.JobMoveUnrecognised, err
+	}
+}
+
+// acceptedBids implements delivery.Awards by reading the job's accepted bid.
+//
+// # Why this query is here and not in a domain
+//
+// It belongs to `bidding`, which is `doc.go` and `model.go` today: SHIP-80 built the table and the
+// one-accepted-bid index, and SHIP-92 — the award transaction, a single-owner branch that never
+// parallelises (Docs/11 §8) — is what gives that domain a store. Until it does, this is the honest
+// place for the statement: the composition root, where a dependency between two domains is visible
+// to anyone reading how the service is wired, rather than buried in `delivery/postgres.go` where it
+// would read as a table delivery owns.
+//
+// **When `bidding` grows its store, this type is deleted and a method on that store is passed
+// instead.** Nothing in `delivery` changes, which is the point of the port.
+//
+// # 'Accepted' is the awarded provider, and the index is why that is safe to assume
+//
+// uq_bids_one_accepted_per_job is partial on `status = 'Accepted'`, so this query cannot return two
+// rows however many bids a job carries (SHIP-80, SHIP-91). Docs/02 §3 — "awarding a job atomically
+// marks one bid accepted and all others closed" — is the statement it enforces.
+type acceptedBids struct{}
+
+// AwardedProvider is the provider whose bid the customer accepted, if any.
+//
+// No lock. The award is checked again by the transition that follows it in the same transaction —
+// jobs.Transition takes the job row FOR UPDATE and re-reads its status — so a job awarded to
+// somebody else in the instant between the two statements is refused there rather than here.
+//
+// A job that does not exist and a job nobody has been awarded are the same answer, and delivery
+// turns both into one 404. See delivery.Awards.
+func (acceptedBids) AwardedProvider(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (uuid.UUID, bool, error) {
+	const q = `SELECT provider_id FROM bids WHERE job_id = $1 AND status = 'Accepted'`
+
+	var providerID uuid.UUID
+	err := r.QueryRow(ctx, q, jobID).Scan(&providerID)
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return uuid.Nil, false, nil
+	case err != nil:
+		return uuid.Nil, false, fmt.Errorf("cmd/api: reading the accepted bid on %s: %w", jobID, err)
+	}
+	return providerID, true, nil
+}
+
+// Compile-time proof that the two adapters satisfy the ports delivery declared, which is the only
+// place in the build where that can be established — delivery names neither type and neither type
+// names delivery, so nothing else links them.
+var (
+	_ delivery.Jobs   = jobLifecycle{}
+	_ delivery.Awards = acceptedBids{}
+)

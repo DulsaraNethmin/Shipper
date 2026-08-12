@@ -126,6 +126,7 @@ SHIP-80
 SHIP-91
 # M4 — Delivery execution
 SHIP-105
+SHIP-106
 SHIP-110
 
 # M5 — Notifications
