@@ -41,6 +41,18 @@ const (
 
 	// 100 tonnes, comfortably above a B-double's gross mass.
 	maxWeightKg = 100_000
+
+	// $1,000,000, in cents (SHIP-67).
+	//
+	// Far above any road-transport job this marketplace expects and far below what
+	// numeric(12,2) can hold, which is the gap that matters: the validator refuses an
+	// implausible amount and names the field, rather than letting ck_jobs_budget or an
+	// overflow answer with something a customer cannot act on.
+	//
+	// A constant rather than reference data, on the same reasoning as the two above. The
+	// commercial question — what this marketplace is willing to carry — is SHIP-58's, and
+	// this is a bound against a slipped decimal point.
+	maxBudgetCents = 100_000_000
 )
 
 // CreateDraft creates a job owned by the calling customer (SHIP-61).
@@ -230,6 +242,14 @@ func (f DraftFields) problems() validate.Errors {
 			"Enter a weight between 0 and %d kilograms.", maxWeightKg)
 	}
 
+	// The message is in dollars because that is what the customer typed, even though the field
+	// is in cents. A limit expressed as "100000000" would be read as a hundred million dollars
+	// by everybody who saw it.
+	if f.BudgetCents != nil && (*f.BudgetCents < 0 || *f.BudgetCents > maxBudgetCents) {
+		e.Add("budget_cents", validate.CodeOutOfRange,
+			"Enter a budget between $0 and $%d.", maxBudgetCents/100)
+	}
+
 	timeWindow(&e, "pickup_window", f.PickupWindow)
 	timeWindow(&e, "dropoff_window", f.DropoffWindow)
 
@@ -300,6 +320,9 @@ func (f DraftFields) applyTo(j Job) Job {
 	}
 	if f.DropoffWindow != nil {
 		j.DropoffWindow = *f.DropoffWindow
+	}
+	if f.BudgetCents != nil {
+		j.BudgetCents = *f.BudgetCents
 	}
 
 	return j
