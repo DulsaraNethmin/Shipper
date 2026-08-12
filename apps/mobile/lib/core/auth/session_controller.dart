@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/api/auth_interceptor.dart';
 import 'package:shipper/core/api/idempotency_key.dart';
 import 'package:shipper/core/auth/access_token.dart';
+import 'package:shipper/core/auth/session_ender.dart';
 import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_pair.dart';
@@ -140,13 +143,39 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
   /// that leaves the user in the signed-in shell because a delete failed is the worst of both
   /// outcomes — they believe they are signed out and the app behaves as though they are not —
   /// and there is nothing a caller could usefully do with the error either. What actually ends
-  /// the session is the server-side revocation (SHIP-46); this is the device catching up, and
-  /// a stale entry it could not delete is a token the platform has already stopped honouring.
-  Future<void> signOut() async {
+  /// the session is the server-side revocation; this is the device catching up, and a stale
+  /// entry it could not delete is a token the platform has already stopped honouring.
+  ///
+  /// ## It tells the platform, and does not wait to be told back
+  ///
+  /// The revocation the paragraph above leans on is `POST /v1/auth/logout` (SHIP-43), and until
+  /// this it was never called — so the refresh token the device discarded stayed valid
+  /// server-side for up to thirty days and the handset kept a row in `GET /v1/auth/sessions`.
+  /// `Docs/11` §9 recorded that gap and named SHIP-50 as what made closing it possible: before
+  /// it there was no access token to authenticate the call with.
+  ///
+  /// **Fire-and-forget, and it must stay that way.** It is dispatched and not awaited, its
+  /// failures are swallowed, and nothing about the local clear depends on it. `Docs/07` §3 is
+  /// explicit that the device is catching up rather than asking permission, and a sign-out that
+  /// failed because a train went into a tunnel would be a defect rather than a safeguard.
+  ///
+  /// [notifyingPlatform] is `false` on the one path where the platform has already told *us* the
+  /// session is over — a refused refresh. Telling it back would be a wasted request from a device
+  /// that may well have no signal, sent with a credential the platform has just refused.
+  Future<void> signOut({bool notifyingPlatform = true}) async {
+    // Read before the clear, because the request carries it. See `session_ender.dart` for why it
+    // is passed rather than picked up by an interceptor: the interceptor reads the token at
+    // request time, by which point this method has cleared it.
+    final spent = _accessToken;
+
     _accessToken = null;
     // Retired rather than carried: a key held from a refresh whose outcome was unknown belongs
     // to a session that no longer exists, and the next sign-in is a different action entirely.
     _refreshKey.settled(null);
+
+    if (notifyingPlatform && spent != null && spent.isNotEmpty) {
+      unawaited(_endPlatformSession(spent));
+    }
 
     try {
       await ref.read(tokenStoreProvider).clear();
@@ -155,6 +184,25 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
     }
 
     if (ref.mounted) state = const SessionState.signedOut();
+  }
+
+  /// Tells the platform this device's session is over. Never awaited, never rethrown.
+  ///
+  /// A fresh idempotency key each time rather than an [ActionKey], and that is the right choice
+  /// here rather than an omission: `Docs/07` §4 keeps a key across a retry of the *same* action,
+  /// and nothing retries this. Two sign-outs are two actions against two different sessions.
+  Future<void> _endPlatformSession(String accessToken) async {
+    try {
+      await ref.read(sessionEnderProvider).end(
+            accessToken: accessToken,
+            idempotencyKey: newIdempotencyKey(),
+          );
+    } catch (_) {
+      // Every outcome is the same outcome to this device: it has signed out. The endpoint
+      // answers `204` to a session already revoked, so the failures left are a lost connection
+      // and an access token that expired before somebody tapped the button — and neither is
+      // something to put in front of a person who is leaving.
+    }
   }
 
   @override
@@ -174,8 +222,9 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
   Future<String?> _refresh() async {
     final stored = await _storedRefreshToken();
     if (stored == null || stored.isEmpty) {
-      // Nothing to refresh with. Whatever the state said, this device has no session.
-      await signOut();
+      // Nothing to refresh with. Whatever the state said, this device has no session — and with
+      // no refresh token there is nothing for the platform to end either.
+      await signOut(notifyingPlatform: false);
       return null;
     }
 
@@ -199,7 +248,11 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
       // session is alive — signing out on those would end a perfectly good session because the
       // signal dropped. `ActionKey.outcomeUnknown` is already exactly this predicate, and using
       // it means the retry rule and the sign-out rule cannot drift apart.
-      if (!ActionKey.outcomeUnknown(failure)) await signOut();
+      //
+      // Nothing is sent to `POST /v1/auth/logout` on this path. The platform has just refused
+      // the refresh token, so it has already ended the session — and reuse detection (SHIP-40)
+      // means it may have ended it precisely because somebody presented a spent token.
+      if (!ActionKey.outcomeUnknown(failure)) await signOut(notifyingPlatform: false);
       return null;
     } catch (error) {
       // Anything that got past ApiClient's mapping is a response that was not the one expected.

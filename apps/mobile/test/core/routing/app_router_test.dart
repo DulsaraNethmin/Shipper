@@ -15,6 +15,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/session_controller.dart';
+import 'package:shipper/core/auth/session_ender.dart';
 import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_store.dart';
@@ -267,6 +268,9 @@ Widget _scope(FakeTokenStore store, {required Widget child}) => ProviderScope(
         // the customer half — which reads that customer's jobs as soon as it is drawn (SHIP-76).
         // Without this it would open a socket to whatever is listening on the local API port.
         jobsRepositoryProvider.overrideWithValue(FakeJobsRepository()),
+        // Two tests here tap sign-out, which now tells the platform the device session is over.
+        // Same hazard as the three above, and the same override.
+        sessionEnderProvider.overrideWithValue(FakeSessionEnder()),
       ],
       child: child,
     );

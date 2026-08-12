@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
+import 'package:shipper/core/auth/session_ender.dart';
 import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/auth/user_role.dart';
@@ -28,11 +29,17 @@ Widget signupApp(
   FakeIdentityRepository identity, {
   FakeTokenStore? store,
   FakeJobsRepository? jobs,
+  FakeSessionEnder? ender,
 }) {
   return ProviderScope(
     overrides: [
       tokenStoreProvider.overrideWithValue(store ?? FakeTokenStore()),
       identityRepositoryProvider.overrideWithValue(identity),
+      // Sign-out tells the platform the device session is over, and does not wait to be told
+      // back. Every test that signs out fires it, so it is overridden here rather than in each —
+      // the same hazard as the refresher below, and a socket opened from a `finally`-shaped path
+      // is the one nobody notices.
+      sessionEnderProvider.overrideWithValue(ender ?? FakeSessionEnder()),
       // The customer half reads that customer's jobs as soon as it is drawn (SHIP-76), and the
       // locations step writes one (SHIP-71). Either would otherwise open a socket to whatever is
       // listening on the local API port — nothing on CI, and on a developer's machine the API.

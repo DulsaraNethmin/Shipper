@@ -15,6 +15,7 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shipper/core/auth/session_controller.dart';
+import 'package:shipper/core/auth/session_ender.dart';
 import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/auth/token_store.dart';
@@ -25,15 +26,24 @@ import 'fake_token_store.dart';
 import 'session_fixtures.dart';
 
 void main() {
+  // The ender is a parameter rather than a returned field, deliberately: adding it to the record
+  // would change the shape every `final (:container, refresher: _)` in this file destructures,
+  // and sixteen edited lines to observe one call in two tests is the wrong trade. A test that
+  // cares constructs its own and keeps the reference.
   ({ProviderContainer container, FakeSessionRefresher refresher}) containerWith(
     FakeTokenStore store, {
     FakeSessionRefresher? refresher,
+    FakeSessionEnder? ender,
   }) {
     final refresh = refresher ?? FakeSessionRefresher();
     final container = ProviderContainer(
       overrides: [
         tokenStoreProvider.overrideWithValue(store),
         sessionRefresherProvider.overrideWithValue(refresh),
+        // Sign-out now tells the platform (`POST /v1/auth/logout`). Without this override the
+        // fire-and-forget call would open a socket to whatever is listening on the local API
+        // port — nothing on CI, and on a developer's machine the API.
+        sessionEnderProvider.overrideWithValue(ender ?? FakeSessionEnder()),
       ],
     );
     addTearDown(container.dispose);
@@ -248,6 +258,85 @@ void main() {
       // they believe they signed out and the app behaves as though they did not. The session
       // that matters is the server's (SHIP-46); this is the device catching up.
       expect(container.read(sessionProvider), isA<SessionSignedOut>());
+    });
+  });
+
+  group('signing out tells the platform', () {
+    // Docs/11 §9: `POST /v1/auth/logout` was never called, so the refresh token the device
+    // discarded stayed valid server-side for up to thirty days and the handset kept a row in
+    // `GET /v1/auth/sessions`. Closing it needed SHIP-50 — before it there was no access token
+    // to authenticate the call with.
+
+    test('with the access token it is in the act of discarding', () async {
+      // Authenticated with the token being thrown away, spent on the request that makes throwing
+      // it away mean something. The `sid` claim in it is what names the session to end, which is
+      // why the request has no body and no session identifier of its own.
+      final ender = FakeSessionEnder();
+      final (:container, refresher: _) =
+          containerWith(FakeTokenStore(refreshToken: 'refresh-1'), ender: ender);
+      await container.read(sessionProvider.notifier).restored;
+
+      final held = container.read(sessionProvider.notifier).accessToken;
+      await container.read(sessionProvider.notifier).signOut();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(ender.calls, 1);
+      expect(ender.presented.single, held);
+      expect(ender.presented.single, isNotNull);
+      expect(ender.keys.single, isNotEmpty);
+    });
+
+    test('and does not wait to be told back', () async {
+      // Fire-and-forget, and it must stay that way. Docs/07 §3 has the device catching up rather
+      // than asking permission, and a sign-out that failed because a train went into a tunnel
+      // would be a defect rather than a safeguard.
+      final ender = FakeSessionEnder()..failure = const ApiUnreachable();
+      final store = FakeTokenStore(refreshToken: 'refresh-1');
+      final (:container, refresher: _) = containerWith(store, ender: ender);
+      await container.read(sessionProvider.notifier).restored;
+
+      await container.read(sessionProvider.notifier).signOut();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(container.read(sessionProvider), isA<SessionSignedOut>());
+      expect(store.cleared, isTrue);
+      expect(container.read(sessionProvider.notifier).accessToken, isNull);
+    });
+
+    test('but not when the platform has just refused the refresh token', () async {
+      // `identity_refresh_token_invalid` is the platform saying the session is already over.
+      // Telling it back would be a wasted request from a device that may have no signal, sent
+      // with a credential it has just refused — and SHIP-40's reuse detection means it may have
+      // ended the session precisely because a spent token was presented.
+      final ender = FakeSessionEnder();
+      final refresher = FakeSessionRefresher()
+        ..failure = const ApiErrorResponse(
+          statusCode: 400,
+          code: 'identity_refresh_token_invalid',
+          message: 'This session has ended. Sign in again.',
+        );
+
+      final (:container, refresher: _) = containerWith(
+        FakeTokenStore(refreshToken: 'refresh-1'),
+        refresher: refresher,
+        ender: ender,
+      );
+      await container.read(sessionProvider.notifier).restored;
+      await Future<void>.delayed(Duration.zero);
+
+      expect(container.read(sessionProvider), isA<SessionSignedOut>());
+      expect(ender.calls, 0);
+    });
+
+    test('and not when the device has no token to end a session with', () async {
+      final ender = FakeSessionEnder();
+      final (:container, refresher: _) = containerWith(FakeTokenStore(), ender: ender);
+      await container.read(sessionProvider.notifier).restored;
+
+      await container.read(sessionProvider.notifier).signOut();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(ender.calls, 0, reason: 'a signed-out device has no session for the platform to end');
     });
   });
 
