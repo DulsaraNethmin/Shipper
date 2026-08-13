@@ -2,6 +2,7 @@ package bidding
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/fleet"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -60,10 +63,61 @@ var (
 	farFuture = testInstant.Add(30 * 24 * time.Hour)
 )
 
-// newTestService is the domain wired to the real eligibility filter.
+// newTestService is the domain wired to the real eligibility filter and the real job service.
+//
+// Both ports are satisfied by the packages cmd/api passes, for the reason this file's header gives:
+// a stub agrees with itself. SHIP-87's customer side is the sharper case — [jobParties] answers "is
+// this the job's customer" and "can this job still be awarded" out of the real `jobs` package, so
+// TestOnlyAPartyToTheNegotiationCanCounter is refused by the same comparison the served endpoint
+// makes.
 func newTestService() *Service {
-	return NewService(fleet.NewService(clock.NewFixed(testInstant)), clock.NewFixed(testInstant))
+	c := clock.NewFixed(testInstant)
+	return NewService(fleet.NewService(c), newTestNegotiation(c), c)
 }
+
+// newTestNegotiation is [Negotiation] over the real `jobs` service, as cmd/api wires it.
+//
+// A second copy of `negotiatedJobs` from cmd/api/routes_bidding.go, deliberately: the composition
+// root is not importable from here, and the whole point of the port is that this package names
+// neither type. What keeps the two honest is that both are held to the same interface and both are
+// exercised — this one by the tests below, that one by scripts/verify/61-bidding.sh against the real
+// binary.
+//
+// The sink is the real outbox writer, as cmd/api passes; the geocoder is nil because it is only
+// reached when an address is resolved. Neither is exercised — `jobs.Service.Job` is a read that emits
+// nothing — but `jobs.NewService` refuses a nil sink outright, which is the right refusal and is why
+// this passes one rather than a stub.
+func newTestNegotiation(c clock.Clock) jobParties {
+	return jobParties{jobs: jobs.NewService(events.NewOutbox(), c, nil)}
+}
+
+type jobParties struct{ jobs *jobs.Service }
+
+func (p jobParties) CustomerOf(ctx context.Context, r db.Runner, userID, jobID uuid.UUID) (bool, error) {
+	_, err := p.jobs.Job(ctx, r, userID, jobID)
+	return p.answer(err)
+}
+
+func (p jobParties) AwardableBy(ctx context.Context, r db.Runner, customerID, jobID uuid.UUID) (bool, error) {
+	job, err := p.jobs.Job(ctx, r, customerID, jobID)
+	if owned, err := p.answer(err); err != nil || !owned {
+		return false, err
+	}
+	return jobs.Permitted(job.Status, jobs.StatusAwarded), nil
+}
+
+func (jobParties) answer(err error) (bool, error) {
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, jobs.ErrNotJobOwner), errors.Is(err, jobs.ErrJobNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+var _ Negotiation = jobParties{}
 
 // refusing is [Eligibility] answering "no" to everything.
 //
@@ -74,6 +128,22 @@ type refusing struct{ err error }
 
 func (r refusing) EligibleFor(context.Context, db.Runner, uuid.UUID, uuid.UUID) (bool, error) {
 	return false, r.err
+}
+
+// brokenNegotiation is [Negotiation] failing rather than declining, which is [refusing]'s twin and
+// earns its place for the same reason.
+//
+// A port that *fails* is a condition no arrangement of rows produces, and the failure must not be
+// reported as a refusal: a caller told "no such bid" because the database was unreachable would go
+// looking for a bid that is there.
+type brokenNegotiation struct{ err error }
+
+func (b brokenNegotiation) CustomerOf(context.Context, db.Runner, uuid.UUID, uuid.UUID) (bool, error) {
+	return false, b.err
+}
+
+func (b brokenNegotiation) AwardableBy(context.Context, db.Runner, uuid.UUID, uuid.UUID) (bool, error) {
+	return false, b.err
 }
 
 // market is a verified provider who can bid, a customer, and one published job they can bid on.
@@ -189,6 +259,31 @@ func (m market) withdraw(t *testing.T, provider, job, bid uuid.UUID) (Bid, error
 	return withdrawn, err
 }
 
+// counter runs one counter-offer in a transaction, which is what [Service.CounterOffer] requires.
+func (m market) counter(t *testing.T, caller, job, bid uuid.UUID, c Counter) (Bid, bool, error) {
+	t.Helper()
+
+	var (
+		made    Bid
+		created bool
+	)
+	err := db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		made, created, err = m.svc.CounterOffer(ctx, r, caller, job, bid, c)
+		return err
+	})
+	return made, created, err
+}
+
+// counterOf is a counter-offer changing the price alone, which is the ordinary shape.
+//
+// Price alone deliberately: it is the case 000501 named when it removed `ck_bids_offer_has_timing`
+// ("a customer countering on *price alone*"), so the fixture exercises the inheritance rather than
+// hiding it behind a fully stated offer.
+func counterOf(cents int64, key string) Counter {
+	return Counter{AmountCents: ptr(cents), Key: key}
+}
+
 // row is the stored bid, read straight out of the table rather than off whatever the service said
 // about itself.
 //
@@ -199,17 +294,23 @@ func (m market) row(t *testing.T, bid uuid.UUID) storedBid {
 	t.Helper()
 
 	var (
-		s         storedBid
-		message   *string
-		key       *string
-		pickupAt  *time.Time
-		deliverBy *time.Time
+		s            storedBid
+		message      *string
+		key          *string
+		pickupAt     *time.Time
+		deliverBy    *time.Time
+		supersededBy *uuid.UUID
 	)
 	if err := m.pool.QueryRow(t.Context(), `
-		SELECT status, amount, pickup_at, deliver_by, message, idempotency_key, updated_at
+		SELECT status, offered_by, amount, pickup_at, deliver_by, message, idempotency_key,
+		       superseded_by, updated_at
 		FROM bids WHERE id = $1`, bid).
-		Scan(&s.status, &s.amount, &pickupAt, &deliverBy, &message, &key, &s.updatedAt); err != nil {
+		Scan(&s.status, &s.offeredBy, &s.amount, &pickupAt, &deliverBy, &message, &key,
+			&supersededBy, &s.updatedAt); err != nil {
 		t.Fatalf("reading bid %s: %v", bid, err)
+	}
+	if supersededBy != nil {
+		s.supersededBy = *supersededBy
 	}
 	if pickupAt != nil {
 		s.pickupAt = *pickupAt
@@ -228,13 +329,15 @@ func (m market) row(t *testing.T, bid uuid.UUID) storedBid {
 
 // storedBid is one row of the `bids` table, as the tests read it.
 type storedBid struct {
-	status    string
-	amount    float64
-	pickupAt  time.Time
-	deliverBy time.Time
-	message   string
-	key       string
-	updatedAt time.Time
+	status       string
+	offeredBy    string
+	amount       float64
+	pickupAt     time.Time
+	deliverBy    time.Time
+	message      string
+	key          string
+	supersededBy uuid.UUID
+	updatedAt    time.Time
 }
 
 // setStatus moves a bid directly, for the statuses no endpoint can reach yet.

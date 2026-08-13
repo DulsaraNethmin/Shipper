@@ -45,14 +45,16 @@ type postgresStore struct{}
 // representation in time.Time; `message` and `idempotency_key` are coalesced, because "" is what
 // this domain means by "not given" and no constraint permits an empty string in either.
 //
-// **The columns are named rather than `SELECT *`.** A column added to `bids` by SHIP-87's supersede
-// chain or SHIP-89's expiry terms must not arrive in this package's shapes with somebody else's
-// schema change; naming them makes admitting one a deliberate edit here.
+// **The columns are named rather than `SELECT *`.** A column added to `bids` by SHIP-89's expiry
+// terms or SHIP-92's award record must not arrive in this package's shapes with somebody else's
+// schema change; naming them makes admitting one a deliberate edit here. 000502's two columns were
+// admitted that way, which is what this comment predicted.
 const bidColumns = `
-	id, job_id, provider_id, status,
+	id, job_id, provider_id, offered_by, status,
 	COALESCE((amount * 100)::bigint, 0),
 	pickup_at, deliver_by,
 	COALESCE(message, ''), COALESCE(idempotency_key, ''),
+	superseded_by,
 	created_at, updated_at`
 
 // scanBid reads one row of [bidColumns].
@@ -62,29 +64,39 @@ const bidColumns = `
 // worth having.
 func scanBid(row pgx.Row) (Bid, error) {
 	var (
-		bid       Bid
-		pickupAt  *time.Time
-		deliverBy *time.Time
+		bid          Bid
+		pickupAt     *time.Time
+		deliverBy    *time.Time
+		supersededBy *uuid.UUID
 	)
 
 	if err := row.Scan(
-		&bid.ID, &bid.JobID, &bid.ProviderID, &bid.Status,
+		&bid.ID, &bid.JobID, &bid.ProviderID, &bid.OfferedBy, &bid.Status,
 		&bid.AmountCents,
 		&pickupAt, &deliverBy,
 		&bid.Message, &bid.Key,
+		&supersededBy,
 		&bid.CreatedAt, &bid.UpdatedAt,
 	); err != nil {
 		return Bid{}, err
 	}
 
-	// Never NULL on anything this package writes — ck_bids_offer_has_timing refuses an offer past
-	// Draft that names neither — but read as nullable anyway, because the column *is* nullable and a
-	// scan that relied on a constraint holding would be silently wrong if the constraint ever went.
+	// Never NULL on anything this package writes past 'Draft' — [Offer.validate] refuses an offer
+	// naming neither instant — but read as nullable anyway, because the columns *are* nullable and a
+	// scan that relied on a validator holding would be silently wrong the first time some other
+	// writer skipped it. (There is deliberately no `ck_bids_offer_has_timing`; 000501 removed it and
+	// 000502's header records that the design question it was waiting on is now answered.)
 	if pickupAt != nil {
 		bid.PickupAt = *pickupAt
 	}
 	if deliverBy != nil {
 		bid.DeliverBy = *deliverBy
+	}
+
+	// uuid.Nil for the head of a chain, which is what [Bid.SupersededBy] means by "no successor" —
+	// a total answer rather than a missing one, so the pointer stops at this boundary.
+	if supersededBy != nil {
+		bid.SupersededBy = *supersededBy
 	}
 	return bid, nil
 }
@@ -122,16 +134,26 @@ func scanBid(row pgx.Row) (Bid, error) {
 // Under a concurrent duplicate the second statement waits on the first's speculative insertion, then
 // finds the committed row and returns none — which is why the caller's follow-up read is what
 // answers, rather than this returning a partially written row.
+//
+// # The arbiter names `offered_by` since 000502, and that is 000501's own rule extended
+//
+// A negotiation now has two writers, so `(job_id, provider_id, idempotency_key)` no longer identifies
+// one caller's request: a customer and a provider whose clients generated the same value would collide
+// inside one negotiation, and the second would be answered from the first's row — a request that wrote
+// nothing, reported as though it had. The arbiter has to name the index exactly, so this clause and
+// 000502's `CREATE UNIQUE INDEX` move together or neither works.
 func (postgresStore) insertBid(ctx context.Context, r db.Runner, b Bid) (Bid, bool, error) {
 	const q = `
 		INSERT INTO bids
-			(id, job_id, provider_id, status, amount, pickup_at, deliver_by, message, idempotency_key)
-		VALUES ($1, $2, $3, $4, ($5::bigint)::numeric / 100, $6, $7, nullif($8, ''), nullif($9, ''))
-		ON CONFLICT (job_id, provider_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+			(id, job_id, provider_id, offered_by, status, amount, pickup_at, deliver_by, message,
+			 idempotency_key)
+		VALUES ($1, $2, $3, $4, $5, ($6::bigint)::numeric / 100, $7, $8, nullif($9, ''), nullif($10, ''))
+		ON CONFLICT (job_id, provider_id, offered_by, idempotency_key)
+			WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING ` + bidColumns
 
 	created, err := scanBid(r.QueryRow(ctx, q,
-		b.ID, b.JobID, b.ProviderID, string(b.Status),
+		b.ID, b.JobID, b.ProviderID, string(b.OfferedBy), string(b.Status),
 		b.AmountCents, b.PickupAt, b.DeliverBy, b.Message, b.Key))
 	switch {
 	case errors.Is(err, db.ErrNoRows):
@@ -161,23 +183,28 @@ func (postgresStore) insertBid(ctx context.Context, r db.Runner, b Bid) (Bid, bo
 // after ON CONFLICT declines, which is the concurrent duplicate. At READ COMMITTED each statement
 // takes a fresh snapshot, so a row committed by the request that won a race is visible to this one
 // even though the transaction around it began earlier.
+// **Scoped by the offering party as well since 000502**, which is the identical rule applied to the
+// negotiation's second writer. A customer's counter and a provider's offer are two callers inside one
+// `(job_id, provider_id)` pair, so a lookup without `offered_by` would hand one of them the other's
+// row on a key collision — a request that wrote nothing, answered as though it had.
 func (postgresStore) bidPlacedUnder(
 	ctx context.Context,
 	r db.Runner,
 	jobID, providerID uuid.UUID,
+	by Party,
 	key string,
 ) (Bid, bool, error) {
 	const q = `
 		SELECT ` + bidColumns + `
 		FROM bids
-		WHERE job_id = $1 AND provider_id = $2 AND idempotency_key = $3`
+		WHERE job_id = $1 AND provider_id = $2 AND offered_by = $3 AND idempotency_key = $4`
 
-	bid, err := scanBid(r.QueryRow(ctx, q, jobID, providerID, key))
+	bid, err := scanBid(r.QueryRow(ctx, q, jobID, providerID, string(by), key))
 	switch {
 	case errors.Is(err, db.ErrNoRows):
 		return Bid{}, false, nil
 	case err != nil:
-		return Bid{}, false, fmt.Errorf("bidding: reading what %s placed on %s: %w", key, jobID, err)
+		return Bid{}, false, fmt.Errorf("bidding: reading what %s wrote on %s: %w", key, jobID, err)
 	}
 	return bid, true, nil
 }
@@ -285,6 +312,66 @@ func (postgresStore) withdrawBid(ctx context.Context, r db.Runner, id uuid.UUID)
 	bid, err := scanBid(r.QueryRow(ctx, q, id, string(StatusWithdrawn)))
 	if err != nil {
 		return Bid{}, fmt.Errorf("bidding: withdrawing bid %s: %w", id, err)
+	}
+	return bid, nil
+}
+
+// supersedeHead moves the offer being answered out of the live predicate (SHIP-87).
+//
+// # It is a compare-and-set, and the WHERE clause is the whole of that
+//
+// `status = 'Submitted' AND superseded_by IS NULL` is not a filter narrowing a row already chosen; it
+// is the check itself. Under READ COMMITTED an `UPDATE` re-evaluates its `WHERE` after taking the row
+// lock, so a transaction that waited on somebody else's counter sees the committed result and matches
+// nothing — which is why this reports whether it matched rather than assuming it did.
+//
+// The caller has already taken the same row `FOR UPDATE` and read its status, so a false here is
+// unreachable through [Service.CounterOffer] and is reported rather than ignored. **That redundancy
+// is the point.** [postgresStore.lockBid] makes the refusal legible; this makes it true, and a future
+// writer that forgets the lock still cannot fork a chain.
+//
+// # `superseded_by` is deliberately not written here, and that is not tidiness
+//
+// The successor does not exist yet, and `fk_bids_superseded_by` is checked at the end of the
+// statement rather than at commit — this migration takes no deferrable constraint, so every
+// invariant holds at every instant rather than only at the end of the transaction. Writing the
+// status first is also what frees `uq_bids_one_submitted_per_provider_per_job` for the insert that
+// follows: the head leaves the predicate before the successor enters it, so the two never coexist
+// inside it. `ck_bids_superseded_is_not_live` is satisfied throughout, because `superseded_by` is
+// still NULL while the status changes and the status is no longer 'Submitted' when the link lands.
+func (postgresStore) supersedeHead(ctx context.Context, r db.Runner, id uuid.UUID) (bool, error) {
+	const q = `
+		UPDATE bids
+		SET status = $2
+		WHERE id = $1 AND status = $3 AND superseded_by IS NULL`
+
+	tag, err := r.Exec(ctx, q, id, string(StatusSuperseded), string(StatusSubmitted))
+	if err != nil {
+		return false, fmt.Errorf("bidding: superseding bid %s: %w", id, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// linkSuccessor records which offer displaced this one, completing the chain (SHIP-88).
+//
+// The third statement of a counter and the one that makes the history readable. `superseded_by IS
+// NULL` again, so a second attempt matches nothing rather than relinking a row somebody else has
+// already answered. `uq_bids_one_successor` guards the *other* direction — two offers cannot name one
+// counter as what displaced them, which would be a negotiation that merged rather than a chain.
+//
+// It returns the displaced row so the caller can assert what was written rather than what it meant to
+// write — the property fixtures_test.go's `row` helper exists for, made available to the service
+// itself.
+func (postgresStore) linkSuccessor(ctx context.Context, r db.Runner, id, successor uuid.UUID) (Bid, error) {
+	const q = `
+		UPDATE bids
+		SET superseded_by = $2
+		WHERE id = $1 AND superseded_by IS NULL
+		RETURNING ` + bidColumns
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id, successor))
+	if err != nil {
+		return Bid{}, fmt.Errorf("bidding: linking %s to its successor %s: %w", id, successor, err)
 	}
 	return bid, nil
 }

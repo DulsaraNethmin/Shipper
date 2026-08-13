@@ -26,6 +26,7 @@ GET    /v1/jobs/{id}                            user         v1
 PATCH  /v1/jobs/{id}                            user         v1
 POST   /v1/jobs/{id}/bids                       user         v1
 PATCH  /v1/jobs/{id}/bids/{bid_id}              user         v1
+POST   /v1/jobs/{id}/bids/{bid_id}/counter      user         v1
 POST   /v1/jobs/{id}/bids/{bid_id}/withdraw     user         v1
 POST   /v1/jobs/{id}/cancel                     user         v1
 POST   /v1/jobs/{id}/driver                     user         v1

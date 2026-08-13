@@ -49,23 +49,27 @@ const (
 
 // Service is this domain's rules.
 //
-// It holds the eligibility port rather than reaching for one per call, so that a caller cannot
-// supply a different answer to "may this provider bid" on one request than on another. The store is
-// a value with no state for the reason jobs' and fleet's are: it is a namespace for SQL, not a
-// dependency to swap. Docs/06 §4.1 is explicit that the database is not abstracted, and the partial
-// unique indexes this file is built against are PostgreSQL's.
+// It holds both ports rather than reaching for one per call, so that a caller cannot supply a
+// different answer to "may this provider bid" or "is this the job's customer" on one request than on
+// another. The store is a value with no state for the reason jobs' and fleet's are: it is a namespace
+// for SQL, not a dependency to swap. Docs/06 §4.1 is explicit that the database is not abstracted,
+// and the partial unique indexes this file is built against are PostgreSQL's.
 type Service struct {
 	eligibility Eligibility
+	negotiation Negotiation
 	store       postgresStore
 	clock       clock.Clock
 }
 
 // NewService wires the domain to what it cannot decide for itself.
 //
+// Two ports since SHIP-87, because a counter-offer is the first thing in this domain a *customer*
+// may do and "is this the customer who owns that job" is `jobs`' fact. See ports.go.
+//
 // The clock is injected (Docs/10 §6.3) because two of the three timing rules compare against "now",
 // and a test that had to wait for wall-clock time to pass would either be slow or be flaky.
-func NewService(eligibility Eligibility, c clock.Clock) *Service {
-	return &Service{eligibility: eligibility, clock: c}
+func NewService(eligibility Eligibility, negotiation Negotiation, c clock.Clock) *Service {
+	return &Service{eligibility: eligibility, negotiation: negotiation, clock: c}
 }
 
 // PlaceBid records one provider's offer against one job (SHIP-84).
@@ -119,7 +123,8 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 	}
 
 	// 1. The retry, answered before the world is consulted.
-	if existing, found, err := s.store.bidPlacedUnder(ctx, r, jobID, providerID, offer.Key); err != nil {
+	if existing, found, err := s.store.bidPlacedUnder(
+		ctx, r, jobID, providerID, PartyProvider, offer.Key); err != nil {
 		return Bid{}, false, err
 	} else if found {
 		return existing, false, nil
@@ -144,6 +149,7 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 		ID:          id,
 		JobID:       jobID,
 		ProviderID:  providerID,
+		OfferedBy:   PartyProvider,
 		Status:      StatusSubmitted,
 		AmountCents: offer.AmountCents,
 		PickupAt:    offer.PickupAt,
@@ -161,7 +167,7 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 	// The insert declined, so another request carrying this key committed while this one was in
 	// flight. At READ COMMITTED each statement takes a fresh snapshot, so that row is visible here
 	// even though this transaction began before it.
-	existing, found, err := s.store.bidPlacedUnder(ctx, r, jobID, providerID, offer.Key)
+	existing, found, err := s.store.bidPlacedUnder(ctx, r, jobID, providerID, PartyProvider, offer.Key)
 	if err != nil {
 		return Bid{}, false, err
 	}
@@ -311,6 +317,296 @@ func (s *Service) WithdrawBid(
 	return s.store.withdrawBid(ctx, r, bid.ID)
 }
 
+// CounterOffer answers the other party's offer with different terms (SHIP-87, SHIP-88).
+//
+// Docs/02 §4: "A customer counter-offer supersedes the prior provider offer. A provider counter-offer
+// supersedes the prior customer offer." **One method for both directions**, because those two
+// sentences describe one act — which is also why there is one endpoint rather than two, and why the
+// party is derived from the caller rather than declared.
+//
+// `created` is false when this key had already made this counter, which is a retry rather than a
+// second link in the chain.
+//
+// r must be a transaction, and this is the method with the most riding on that: it reads a status,
+// decides against it, and then writes three statements that are one act. Outside a transaction the
+// first would land and the rest might not, leaving a superseded offer with no successor — a
+// negotiation with nothing live in it and no way to tell that from a bug.
+//
+// # The chain, in three statements, and why that order
+//
+//  1. **The head leaves `uq_bids_one_submitted_per_provider_per_job`'s predicate**
+//     ([postgresStore.supersedeHead]), which is what frees it for the row about to be written. It is
+//     a compare-and-set, so a counter that waited on somebody else's matches nothing.
+//  2. **The counter is inserted at 'Submitted'**, carrying the key it was made under, so that a retry
+//     outliving the middleware's cache is answered from the record rather than adding a second link.
+//     The same division SHIP-84 drew: Redis makes the retry cheap, the column makes it correct.
+//  3. **The displaced row is linked to its successor** ([postgresStore.linkSuccessor]), which is what
+//     makes the history readable in SHIP-88's sense and what
+//     `ck_bids_superseded_is_not_live` then holds SHIP-92 to.
+//
+// `superseded_by` cannot be written in step 1 because the row it names does not exist yet, and this
+// migration takes no deferrable foreign key — so every constraint holds at every instant rather than
+// only at commit. 000502 records that trade.
+//
+// # The refusals, in the order they are made
+//
+//  1. **A counter that names no field** is [ErrNothingToCounter], before the database is touched. A
+//     counter that changes nothing is not a counter; it is agreement, and agreement is the award.
+//  2. **A bid the caller cannot reach at all** is one 404, byte-identical to a bid that does not
+//     exist: not on the job in the path, or on a negotiation the caller is neither side of.
+//  3. **The retry, answered before the world is consulted** — and *before* the status check, which is
+//     the ordering that matters. A retry of a counter arrives after that counter has already
+//     superseded the offer it answered, so a status check in front of it would refuse the caller's
+//     own successful request with "that offer is no longer live". [Service.PlaceBid] puts its retry
+//     first for the same reason and states the principle: a retry asks what happened to a request,
+//     and that answer does not change when the world does.
+//  4. **An offer that is over** is [ErrBidAccepted] or [ErrBidClosed].
+//  5. **An offer the caller made themselves** is [ErrWrongParty]. You counter the other party and
+//     revise your own; a provider answering their own live offer wants `PATCH`.
+//  6. **The merged offer**, through the same validator a placement meets.
+//  7. **Eligibility or awardability**, whichever side is countering. See below.
+//
+// # The two sides are checked against different questions, and that is not an oversight
+//
+// A **provider's** counter is a live offer the customer may accept the moment it lands, so it goes
+// through SHIP-81's filter exactly as a placement and a revision do — a provider whose only vehicle
+// left service must not be able to re-price work they can no longer do. The refusal is
+// [ErrJobNotOffered], the same 404 a placement gets.
+//
+// A **customer's** counter is not something the platform could accept on the provider's behalf —
+// `ck_bids_only_a_providers_offer_is_accepted` makes an award of it impossible — so eligibility is
+// the wrong question and would be asked of the wrong account anyway. What matters is whether the
+// negotiation can still end anywhere: [Negotiation.AwardableBy]. The refusal is [ErrNegotiationOver],
+// which is [CodeBidClosed] on the wire, because the customer's next screen is the same one — this
+// negotiation is finished.
+//
+// # It does not move the job
+//
+// Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted", which reads
+// like an instruction to this ticket more than it did to SHIP-84. It is still **SHIP-90's**, which
+// depends on this ticket and on SHIP-57 and owns that presentation status in both directions. Job
+// status is never a settable field in any case: a move passes one guarded function and leaves a
+// `job_status_history` row in the same transaction, and doing it here would be doing the half
+// without the record.
+func (s *Service) CounterOffer(
+	ctx context.Context,
+	r db.Runner,
+	callerID, jobID, bidID uuid.UUID,
+	c Counter,
+) (Bid, bool, error) {
+	if _, inTx := r.(pgx.Tx); !inTx {
+		return Bid{}, false, fmt.Errorf("bidding: countering %s: %w", bidID, ErrNotInTransaction)
+	}
+	if c.IsEmpty() {
+		return Bid{}, false, fmt.Errorf("bidding: countering %s: %w", bidID, ErrNothingToCounter)
+	}
+	if c.Key == "" {
+		return Bid{}, false, fmt.Errorf("bidding: countering %s: %w", bidID, ErrNoIdempotencyKey)
+	}
+
+	// The lock is taken before anything is decided, and it is what serialises two counters against
+	// one offer. The second waits here, then re-reads at a fresh snapshot: either it is the retry
+	// answered below, or it meets a head that is already 'Superseded' and is refused legibly.
+	answered, err := s.reachableBid(ctx, r, callerID, jobID, bidID)
+	if err != nil {
+		return Bid{}, false, err
+	}
+
+	// The counter is attributed to the caller, and [counterable] below is what makes that safe: the
+	// offer being answered has to have been made by the *other* side, so this can never write a row
+	// on somebody else's behalf.
+	by := answered.party
+
+	if existing, found, err := s.store.bidPlacedUnder(
+		ctx, r, answered.bid.JobID, answered.bid.ProviderID, by, c.Key); err != nil {
+		return Bid{}, false, err
+	} else if found {
+		return existing, false, nil
+	}
+
+	if err := counterable(answered.bid, answered.party); err != nil {
+		return Bid{}, false, err
+	}
+
+	offer := c.applyTo(answered.bid)
+	if err := offer.validate(s.clock.Now()); err != nil {
+		return Bid{}, false, err
+	}
+
+	if err := s.mayCounter(ctx, r, callerID, answered); err != nil {
+		return Bid{}, false, err
+	}
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		return Bid{}, false, fmt.Errorf("bidding: generating a counter-offer id: %w", err)
+	}
+
+	moved, err := s.store.supersedeHead(ctx, r, answered.bid.ID)
+	if err != nil {
+		return Bid{}, false, err
+	}
+	if !moved {
+		// Unreachable: the row is held FOR UPDATE and was read as 'Submitted' with no successor two
+		// statements ago. Reported rather than papered over, because continuing would insert a second
+		// live offer into a negotiation that already has one — and the index would then refuse it
+		// with a message about a live offer that says nothing about what happened.
+		return Bid{}, false, fmt.Errorf(
+			"bidding: %s was live when it was locked and is not now", answered.bid.ID)
+	}
+
+	counter, created, err := s.store.insertBid(ctx, r, Bid{
+		ID:          id,
+		JobID:       answered.bid.JobID,
+		ProviderID:  answered.bid.ProviderID,
+		OfferedBy:   by,
+		Status:      StatusSubmitted,
+		AmountCents: offer.AmountCents,
+		PickupAt:    offer.PickupAt,
+		DeliverBy:   offer.DeliverBy,
+		Message:     offer.Message,
+		Key:         c.Key,
+	})
+	if err != nil {
+		return Bid{}, false, err
+	}
+	if !created {
+		// Unreachable for the reason above: a concurrent request under this key would have waited on
+		// the head's lock and been answered as a retry. Returning an error rather than reading the
+		// row back — which is what [Service.PlaceBid] does — because the head has already been
+		// superseded by the statement above, and answering from some other row would commit a
+		// negotiation with a displaced offer and no successor. The error rolls the whole act back.
+		return Bid{}, false, fmt.Errorf(
+			"bidding: %s conflicted while %s was held locked", c.Key, answered.bid.ID)
+	}
+
+	if _, err := s.store.linkSuccessor(ctx, r, answered.bid.ID, counter.ID); err != nil {
+		return Bid{}, false, err
+	}
+	return counter, true, nil
+}
+
+// reached is a bid the caller may act on, and which side of the negotiation they are.
+type reached struct {
+	bid Bid
+
+	// party is the caller's own side. The bid may have been made by either.
+	party Party
+}
+
+// reachableBid finds the bid a caller named and works out which side of the negotiation they are on.
+//
+// **This is the widening SHIP-87 makes, and it is deliberately a separate path from [Service.ownBid]
+// rather than a loosening of it.** Every endpoint before this one is the provider's alone, and
+// `ownBid` refuses a customer by design — TestOnlyTheBidsOwnerCanReviseIt asserts exactly that,
+// including for the job's own customer. Widening `ownBid` would have widened `PATCH` and `withdraw`
+// with it, which is the shape where a rule is relaxed for one endpoint and quietly relaxed for three.
+//
+// The two comparisons `ownBid` makes are made here too and for the same reasons: the row is read by
+// its identifier and judged in Go, so "somebody else's" and "nobody's" stay different facts behind
+// one answer on the wire, and the job in the path is compared because a bid is addressed under its
+// own job.
+//
+// # The provider is recognised without asking anybody, and the customer is not
+//
+// `bids.provider_id` is on the row, so the provider side is a comparison. The customer side is
+// `jobs`' fact and is asked through [Negotiation.CustomerOf] — this domain does not decide who owns a
+// job any more than it decides who may bid.
+//
+// The order matters in one direction only: a provider is checked first because it costs nothing, and
+// the two cannot both be true — `users.role` is immutable (000005) and SHIP-81's filter excludes a
+// job's own customer from bidding on it.
+//
+// The row is taken `FOR UPDATE`, because its one caller reads a status and decides against it — and
+// that decision is only one decision while the lock is held. SHIP-88's chain read needs the same
+// lookup without the lock and will add the seam for it.
+func (s *Service) reachableBid(
+	ctx context.Context,
+	r db.Runner,
+	callerID, jobID, bidID uuid.UUID,
+) (reached, error) {
+	if bidID == uuid.Nil || jobID == uuid.Nil || callerID == uuid.Nil {
+		return reached{}, fmt.Errorf("bidding: %s on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	bid, err := s.store.lockBid(ctx, r, bidID)
+	if err != nil {
+		return reached{}, err
+	}
+	if bid.JobID != jobID {
+		return reached{}, fmt.Errorf("bidding: %s is not on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	if bid.ProviderID == callerID {
+		return reached{bid: bid, party: PartyProvider}, nil
+	}
+
+	owns, err := s.negotiation.CustomerOf(ctx, r, callerID, bid.JobID)
+	if err != nil {
+		return reached{}, fmt.Errorf("bidding: deciding whether %s owns %s: %w", callerID, bid.JobID, err)
+	}
+	if !owns {
+		return reached{}, fmt.Errorf(
+			"bidding: %s is neither party to %s: %w", callerID, bidID, ErrNotBidOwner)
+	}
+	return reached{bid: bid, party: PartyCustomer}, nil
+}
+
+// mayCounter is the last refusal, and it asks each side a different question.
+//
+// See [Service.CounterOffer] for why: a provider's counter is a live offer somebody may accept, so it
+// meets SHIP-81's filter; a customer's cannot be accepted at all, so what matters is whether the
+// negotiation can still end in an award.
+func (s *Service) mayCounter(ctx context.Context, r db.Runner, callerID uuid.UUID, a reached) error {
+	if a.party == PartyProvider {
+		permitted, err := s.eligibility.EligibleFor(ctx, r, callerID, a.bid.JobID)
+		if err != nil {
+			return fmt.Errorf("bidding: deciding whether %s may still bid on %s: %w",
+				callerID, a.bid.JobID, err)
+		}
+		if !permitted {
+			return ErrJobNotOffered
+		}
+		return nil
+	}
+
+	open, err := s.negotiation.AwardableBy(ctx, r, callerID, a.bid.JobID)
+	if err != nil {
+		return fmt.Errorf("bidding: deciding whether %s can still award %s: %w",
+			callerID, a.bid.JobID, err)
+	}
+	if !open {
+		return fmt.Errorf("bidding: %s can no longer be awarded: %w", a.bid.JobID, ErrNegotiationOver)
+	}
+	return nil
+}
+
+// counterable refuses an offer that cannot be answered with a counter (SHIP-87).
+//
+// The status half is [changeable]'s, and for the same reason: Docs/02 §4 lets only the latest valid
+// offer be acted on, and an offer that has been accepted, withdrawn, rejected, expired or superseded
+// is not it.
+//
+// **The party half is this method's own, and it is the rule that makes one endpoint serve both
+// sides.** You counter what the *other* party offered; your own offer you revise. A provider
+// answering their own live bid wants `PATCH /v1/jobs/{id}/bids/{bid_id}`, and telling them so is
+// worth a code of its own — the client's next action is a different request rather than a different
+// screen.
+//
+// Status is judged before authorship, deliberately. An offer that is over is over whoever made it,
+// and "revise it instead" would be advice about a request that would also fail.
+func counterable(b Bid, by Party) error {
+	switch {
+	case b.Status == StatusAccepted:
+		return fmt.Errorf("bidding: %s: %w", b.ID, ErrBidAccepted)
+	case !b.Status.live():
+		return fmt.Errorf("bidding: %s is %s: %w", b.ID, b.Status, ErrBidClosed)
+	case b.OfferedBy == by:
+		return fmt.Errorf("bidding: %s was offered by %s: %w", b.ID, b.OfferedBy, ErrWrongParty)
+	}
+	return nil
+}
+
 // ownBid reads the bid a caller has named and refuses anything that is not theirs.
 //
 // One function rather than the same three checks in two methods, because the alternative is two places
@@ -357,12 +653,25 @@ func (s *Service) ownBid(ctx context.Context, r db.Runner, providerID, jobID, bi
 // uq_bids_one_accepted_per_job — and Docs/02 §6.2 makes stepping away from an awarded job a provider
 // cancellation with consequences rather than a withdrawal, which is a different endpoint nobody has
 // built.
+// **The authorship check is SHIP-87's addition and it closes a hole that ticket opened.** Before
+// counters, every row in `bids` was written by the provider named in `provider_id`, so
+// [Service.ownBid]'s comparison was the whole of "this is your offer". A customer's counter-offer
+// carries the *same* provider id — 000502 explains why that is the cheaper reinterpretation — so
+// without this line a provider could `PATCH` the customer's counter, or withdraw it, and the customer
+// would find their own number rewritten by the party it was addressed to.
+//
+// It is [ErrWrongParty] rather than the 404 a stranger gets, because the caller is a party to this
+// negotiation and can read the row in its history. Answering "no such bid" about something the
+// platform will show them a moment later is the kind of inconsistency that costs a client author an
+// afternoon.
 func changeable(b Bid) error {
 	switch {
 	case b.Status == StatusAccepted:
 		return fmt.Errorf("bidding: %s: %w", b.ID, ErrBidAccepted)
 	case !b.Status.live():
 		return fmt.Errorf("bidding: %s is %s: %w", b.ID, b.Status, ErrBidClosed)
+	case b.OfferedBy != PartyProvider:
+		return fmt.Errorf("bidding: %s was offered by %s: %w", b.ID, b.OfferedBy, ErrWrongParty)
 	}
 	return nil
 }

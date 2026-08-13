@@ -65,6 +65,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("POST /v1/jobs/{id}/bids", handler.Place())
 	mux.Handle("PATCH /v1/jobs/{id}/bids/{bid_id}", handler.Revise())
 	mux.Handle("POST /v1/jobs/{id}/bids/{bid_id}/withdraw", handler.Withdraw())
+	mux.Handle("POST /v1/jobs/{id}/bids/{bid_id}/counter", handler.Counter())
 	return mux
 }
 
@@ -149,6 +150,16 @@ func (w wire) withdraw(t *testing.T, caller uuid.UUID, job, bid uuid.UUID, key s
 	t.Helper()
 	return as(t, w.router, caller, key,
 		"/v1/jobs/"+job.String()+"/bids/"+bid.String()+"/withdraw", `{}`)
+}
+
+// counter sends one POST against a bid's counter verb (SHIP-87).
+//
+// The caller is a parameter and is often the *customer*, which is what makes this the first helper in
+// this file that is not a provider acting on their own bid.
+func (w wire) counter(t *testing.T, caller uuid.UUID, job, bid uuid.UUID, key, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	return as(t, w.router, caller, key,
+		"/v1/jobs/"+job.String()+"/bids/"+bid.String()+"/counter", body)
 }
 
 // placed is one offer on the fixture job, over the wire, with its identifier read back out.
@@ -298,16 +309,22 @@ func TestASecondOfferIs409WithItsOwnCode(t *testing.T) {
 // It is the same list as the `Bid` schema in contracts/paths/bidding.yaml, which is
 // `additionalProperties: false` for the same reason, and the same list
 // scripts/verify/61-bidding.sh asserts from outside Go.
+// **SHIP-87 adds two keys, and the mechanism worked exactly as it was built to.** Adding `offered_by`
+// and `superseded_by` to the response made all four existing subtests fail before a line of the new
+// tests had been written, which is what a closed set is for: each arrived as a deliberate entry here,
+// in the contract, and in the verify script, rather than as a schema change nobody read.
 var providerBidKeys = map[string]bool{
-	"id":           true,
-	"job_id":       true,
-	"status":       true,
-	"amount_cents": true,
-	"pickup_at":    true,
-	"deliver_by":   true,
-	"message":      true,
-	"created_at":   true,
-	"updated_at":   true,
+	"id":            true,
+	"job_id":        true,
+	"status":        true,
+	"offered_by":    true,
+	"amount_cents":  true,
+	"pickup_at":     true,
+	"deliver_by":    true,
+	"message":       true,
+	"superseded_by": true,
+	"created_at":    true,
+	"updated_at":    true,
 }
 
 // TestTheBidResponseCarriesNothingOfTheCustomers is SHIP-83's proof applied to the first
@@ -382,6 +399,27 @@ func TestTheBidResponseCarriesNothingOfTheCustomers(t *testing.T) {
 		t.Fatalf("the withdrawal = %d (%s)", withdrawn.Code, withdrawn.Body)
 	}
 	responses["the withdrawal, 200"] = withdrawn.Body.Bytes()
+
+	// **SHIP-87 is the hardest case in this test and the reason it grew.** A counter-offer is an amount
+	// the *customer* chose, in a shape a provider reads — so a budget leaking through it would be doing
+	// so on the one path where an amount from the customer's side is legitimately present, which is
+	// exactly where a weaker test would stop looking. The counter is placed at 40000 cents, which is
+	// not the budget in any rendering.
+	replaced := w.bid(t, w.provider, "wire-privacy-replace", validBody())
+	if replaced.Code != http.StatusCreated {
+		t.Fatalf("bidding again after the withdrawal = %d (%s)", replaced.Code, replaced.Body)
+	}
+	replacedID, err := uuid.Parse(decode[map[string]any](t, replaced)["id"].(string))
+	if err != nil {
+		t.Fatalf("the replacement bid has no usable id: %v", err)
+	}
+
+	countered := w.counter(t, w.customer, w.job, replacedID, "wire-privacy-counter",
+		`{"amount_cents": 40000}`)
+	if countered.Code != http.StatusCreated {
+		t.Fatalf("the customer's counter = %d (%s)", countered.Code, countered.Body)
+	}
+	responses["the customer's counter, 201"] = countered.Body.Bytes()
 
 	for how, body := range responses {
 		t.Run(how, func(t *testing.T) {
@@ -1033,5 +1071,176 @@ func TestTheBidIDInThePathMustBeAnIdentifier(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s with a malformed bid id = %d, want 400 (%s)", name, rec.Code, rec.Body)
 		}
+	}
+}
+
+// --- SHIP-87 and SHIP-88 at the wire -------------------------------------------------------------
+
+// TestCounteringOverTheWire is SHIP-87's *Done when* at the wire, in both directions.
+//
+// **The customer's request is the one worth watching.** Every request in this file before it is a
+// provider acting on their own bid, and this is the first that succeeds for anybody else — so it is
+// also the first place a widened authorisation check would show up as a pass rather than as a
+// failure.
+func TestCounteringOverTheWire(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-counter-base")
+
+	rec := w.counter(t, w.customer, w.job, placed, "wire-counter", `{"amount_cents": 40000}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("the customer's counter = %d, want 201 (%s)", rec.Code, rec.Body)
+	}
+
+	countered := decode[map[string]any](t, rec)
+	if countered["id"] == placed.String() {
+		t.Error("the counter answered with the offer it superseded; a counter creates a row")
+	}
+	if countered["offered_by"] != "customer" {
+		t.Errorf("the counter is offered_by %v, want customer", countered["offered_by"])
+	}
+	if countered["status"] != "submitted" {
+		t.Errorf("the counter is %v, want submitted", countered["status"])
+	}
+	if countered["amount_cents"] != float64(40000) {
+		t.Errorf("the counter is %v cents, want 40000", countered["amount_cents"])
+	}
+	if _, present := countered["superseded_by"]; present {
+		t.Error("the live head carries superseded_by; it is omitted while nothing has displaced it")
+	}
+
+	counterID := uuid.MustParse(countered["id"].(string))
+
+	back := w.counter(t, w.provider, w.job, counterID, "wire-counter-back", `{"amount_cents": 43000}`)
+	if back.Code != http.StatusCreated {
+		t.Fatalf("the provider's counter = %d, want 201 (%s)", back.Code, back.Body)
+	}
+	if got := decode[map[string]any](t, back)["offered_by"]; got != "provider" {
+		t.Errorf("the provider's counter is offered_by %v, want provider", got)
+	}
+}
+
+// TestARetriedCounterIsTwoHundredWithTheOriginal is the retry contract at the wire.
+//
+// 201 the first time and 200 for a repeat of the same key, which is the pair [Handler.Place] answers
+// with. A client that does not care which happened parses one type; one recovering from a dropped
+// connection generally does not care.
+func TestARetriedCounterIsTwoHundredWithTheOriginal(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-counter-retry-base")
+
+	first := w.counter(t, w.customer, w.job, placed, "wire-counter-retry", `{"amount_cents": 40000}`)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("the counter = %d, want 201 (%s)", first.Code, first.Body)
+	}
+
+	again := w.counter(t, w.customer, w.job, placed, "wire-counter-retry", `{"amount_cents": 40000}`)
+	if again.Code != http.StatusOK {
+		t.Fatalf("the retry = %d, want 200 (%s)", again.Code, again.Body)
+	}
+	if decode[map[string]any](t, again)["id"] != decode[map[string]any](t, first)["id"] {
+		t.Error("the retry answered with a different counter")
+	}
+}
+
+// TestACounterFromAStrangerIsIndistinguishableFromNoBid is Docs/01 §4.3's second line at the wire.
+//
+// A competing provider and an account with nothing to do with the job both get the answer a bid that
+// does not exist gets, byte for byte. Whose offers exist is not something this API discloses, and a
+// competitor probing identifiers must not be able to tell "that is somebody's" from "that is nobody's".
+func TestACounterFromAStrangerIsIndistinguishableFromNoBid(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-counter-stranger-base")
+
+	stranger := newCustomer(t, w.pool, "wire-counter-stranger@example.com", "+61400000878")
+
+	refused := w.counter(t, stranger, w.job, placed, "wire-counter-stranger", `{"amount_cents": 1}`)
+	if refused.Code != http.StatusNotFound {
+		t.Fatalf("a stranger's counter = %d, want 404 (%s)", refused.Code, refused.Body)
+	}
+
+	missing := w.counter(t, stranger, w.job, uuid.Must(uuid.NewV7()), "wire-counter-nothing",
+		`{"amount_cents": 1}`)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("a counter on nothing = %d, want 404 (%s)", missing.Code, missing.Body)
+	}
+	if refused.Body.String() != missing.Body.String() {
+		t.Errorf("somebody else's offer answers %s and a missing one answers %s; the two must be one "+
+			"answer", refused.Body, missing.Body)
+	}
+}
+
+// TestCounteringYourOwnOfferAnswersItsOwnCode is Docs/10 §4.4's test applied to the one code SHIP-87
+// adds.
+//
+// The client's correct response is a **different request** — `PATCH` rather than a counter — which is
+// what earns a code rather than a message. Both directions of getting it backwards land on it.
+func TestCounteringYourOwnOfferAnswersItsOwnCode(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-wrongparty-base")
+
+	own := w.counter(t, w.provider, w.job, placed, "wire-wrongparty-provider", `{"amount_cents": 44000}`)
+	if own.Code != http.StatusConflict {
+		t.Fatalf("a provider countering their own offer = %d, want 409 (%s)", own.Code, own.Body)
+	}
+	if got := decode[errorEnvelope](t, own).Error.Code; got != string(CodeWrongParty) {
+		t.Errorf("the code is %q, want %q", got, CodeWrongParty)
+	}
+
+	countered := w.counter(t, w.customer, w.job, placed, "wire-wrongparty-counter", `{"amount_cents": 40000}`)
+	if countered.Code != http.StatusCreated {
+		t.Fatalf("the customer's counter = %d (%s)", countered.Code, countered.Body)
+	}
+	counterID := uuid.MustParse(decode[map[string]any](t, countered)["id"].(string))
+
+	// And the provider cannot *revise* what the customer offered, which is the hole 000502's
+	// reinterpretation of provider_id would otherwise have opened.
+	revised := w.revise(t, w.provider, w.job, counterID, "wire-wrongparty-revise", `{"amount_cents": 1}`)
+	if revised.Code != http.StatusConflict {
+		t.Fatalf("the provider revised the customer's counter = %d, want 409 (%s)", revised.Code, revised.Body)
+	}
+	if got := decode[errorEnvelope](t, revised).Error.Code; got != string(CodeWrongParty) {
+		t.Errorf("the revision's code is %q, want %q", got, CodeWrongParty)
+	}
+}
+
+// TestACounterCannotSetTheStatusOrTheParty is the two fields a client must not be able to send.
+//
+// A bid's status is the platform's, and so is *which party made the offer*: a body naming the author
+// would be an authorisation decision made from client input, which Docs/07 §3 puts on the platform.
+// httpx.DecodeJSON refuses unknown fields, so both are reported rather than ignored.
+func TestACounterCannotSetTheStatusOrTheParty(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-counter-fields-base")
+
+	for field, body := range map[string]string{
+		"status":     `{"amount_cents": 40000, "status": "accepted"}`,
+		"offered_by": `{"amount_cents": 40000, "offered_by": "provider"}`,
+	} {
+		t.Run("a body naming "+field+" is refused", func(t *testing.T) {
+			rec := w.counter(t, w.customer, w.job, placed, "wire-counter-"+field, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("= %d, want 400 (%s)", rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), field) {
+				t.Errorf("the refusal does not name %s: %s", field, rec.Body)
+			}
+		})
+	}
+}
+
+// TestACounterThatChangesNothingIsRefusedAtTheWire keeps a counter apart from an acceptance.
+//
+// `bad_request` rather than a code of its own, and the message is what carries the difference: the
+// client's next screen is the award, not the form it just submitted.
+func TestACounterThatChangesNothingIsRefusedAtTheWire(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-counter-empty-base")
+
+	rec := w.counter(t, w.customer, w.job, placed, "wire-counter-empty", `{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("an empty counter = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := decode[errorEnvelope](t, rec).Error.Code; got != string(httpx.CodeBadRequest) {
+		t.Errorf("the code is %q, want %q", got, httpx.CodeBadRequest)
 	}
 }

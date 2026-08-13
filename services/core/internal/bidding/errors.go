@@ -88,11 +88,47 @@ var (
 	// ErrNothingToRevise means a revision named no field at all.
 	ErrNothingToRevise = errors.New("bidding: the revision changes nothing")
 
+	// ErrNothingToCounter means a counter-offer named no field at all (SHIP-87).
+	//
+	// Kept apart from [ErrNothingToRevise] even though both are `bad_request` on the wire, because the
+	// two are not the same mistake and the message a client shows is not the same message. A revision
+	// naming nothing is a client defect. A *counter* naming nothing is agreement — the caller is
+	// accepting the terms in front of them — and the act for that is the award, which is the
+	// customer's and is SHIP-92's. Answering both with "send at least one field to revise" would point
+	// a client at the wrong screen.
+	ErrNothingToCounter = errors.New("bidding: the counter-offer changes nothing")
+
+	// ErrWrongParty means the caller is on the wrong side of the offer they named (SHIP-87).
+	//
+	// **Two situations, one rule: you counter the other party's offer and revise your own.** Countering
+	// an offer you made yourself is refused, and so is revising or withdrawing one the other party
+	// made — which became possible only with counters, because a customer's counter carries the same
+	// `provider_id` as the provider's offer it answers (000502).
+	//
+	// It is deliberately not the 404 a stranger gets. The caller is a party to this negotiation and can
+	// read the row in its history a moment later; answering "no such bid" about something the platform
+	// will then show them is an inconsistency a client author has to discover rather than read.
+	ErrWrongParty = errors.New("bidding: that offer belongs to the other party")
+
+	// ErrNegotiationOver means the customer's job can no longer be awarded, so a counter-offer on it
+	// leads nowhere (SHIP-87).
+	//
+	// **The customer's half of the check a provider meets as eligibility**, and a different question
+	// rather than the same one asked of a different account: a customer countering is asking whether
+	// the negotiation can still end in an award, which is Negotiation.AwardableBy.
+	//
+	// It is [CodeBidClosed] on the wire rather than a code of its own, because the client does the
+	// same thing with it as with a superseded or rejected offer — this negotiation is finished, show
+	// the job. Which of the reasons it was is the customer's own job screen to answer, not an error
+	// code's. It is also a temporary shape: once SHIP-93 closes competing bids on award, an offer on an
+	// awarded job is already `Rejected` and reaches [ErrBidClosed] directly.
+	ErrNegotiationOver = errors.New("bidding: that job can no longer be awarded")
+
 	// ErrNotInTransaction means a method that reads a row, decides against it and writes it was handed
 	// a connection pool rather than a transaction.
 	//
-	// Checked by [Service.ReviseBid] and [Service.WithdrawBid] and deliberately not by
-	// [Service.PlaceBid], because the three do not rest on the same mechanism. A placement's
+	// Checked by [Service.ReviseBid], [Service.WithdrawBid] and [Service.CounterOffer] and deliberately
+	// not by [Service.PlaceBid], because they do not rest on the same mechanism. A placement's
 	// correctness is `ON CONFLICT`'s, which holds statement by statement; a revision's and a
 	// withdrawal's is [postgresStore.lockBid]'s `FOR UPDATE`, and outside a transaction that lock is
 	// released the instant the SELECT returns — leaving the status this code decided against free to
@@ -107,12 +143,19 @@ var (
 // describes them and cmd/api's uniqueness test can see them. Named <domain>_<condition>, which is
 // what stops two domains meaning different things by one string.
 //
-// **There were deliberately one at SHIP-84 and there are three now.** Everything else these endpoints
-// can answer is already covered by the protocol codes: an implausible amount is `validation_failed`
-// with details naming the field, a job this provider may not bid on is `not_found`, a bid that is not
-// theirs is `not_found`, and a missing or reused key is the middleware's business. A domain code earns
-// its place only where a client would otherwise have to parse a message to know what to do — and each
-// of the three below leads somewhere different.
+// **There was deliberately one at SHIP-84, three at SHIP-86, and there are four now.** Everything else
+// these endpoints can answer is already covered by the protocol codes: an implausible amount is
+// `validation_failed` with details naming the field, a job this provider may not bid on is
+// `not_found`, a bid that is not theirs is `not_found`, and a missing or reused key is the
+// middleware's business. A domain code earns its place only where a client would otherwise have to
+// parse a message to know what to do — and each of the four below leads somewhere different.
+//
+// **SHIP-87 added exactly one**, and the count is the evidence for the test rather than a target: a
+// counter-offer introduces three new refusals and two of them reuse. A negotiation the customer can no
+// longer award is [CodeBidClosed] — the same screen a superseded offer leads to — and a counter naming
+// no field is `bad_request` like every other empty request body. Only "you are on the wrong side of
+// this offer" sends the client somewhere it would not otherwise go, which is `PATCH` instead of
+// `POST`, and that is what [CodeWrongParty] is for.
 var CodeAlreadyBid = httpx.RegisterCode("bidding_already_bid",
 	"You already have a live offer on this job. Revise or withdraw it rather than placing a second.")
 
@@ -133,4 +176,17 @@ var CodeBidAccepted = httpx.RegisterCode("bidding_bid_accepted",
 // rather than the form. Which of the four it was is the provider's own bid history to answer
 // (SHIP-101), not an error code's.
 var CodeBidClosed = httpx.RegisterCode("bidding_bid_closed",
-	"That offer is no longer live, so it cannot be revised or withdrawn.")
+	"That offer is no longer live, so it can be neither changed nor answered.")
+
+// CodeWrongParty is the answer to acting on the wrong side of an offer (SHIP-87).
+//
+// **You counter the other party's offer and revise your own.** Both directions of getting that
+// backwards land here: countering an offer you made yourself, and revising or withdrawing one the
+// other party made.
+//
+// It earns a code rather than a message because the client's correct response is a **different
+// request** — `PATCH /v1/jobs/{id}/bids/{bid_id}` where it sent a counter, or a counter where it sent
+// a `PATCH` — rather than a different screen. That is Docs/10 §4.4's test, and it is the same test
+// [CodeBidAccepted] passes and [ErrNegotiationOver] deliberately fails.
+var CodeWrongParty = httpx.RegisterCode("bidding_wrong_party",
+	"That offer belongs to the other party. Counter an offer they made; revise one you made yourself.")

@@ -185,9 +185,11 @@ import json, re, sys
 # direction — anything not promised is refused — and it is the same list as the `Bid` schema in
 # contracts/paths/bidding.yaml and providerBidKeys in internal/bidding/http_test.go.
 allowed = {
-    "id", "job_id", "status", "amount_cents",
-    "pickup_at", "deliver_by", "message",
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
     "created_at", "updated_at",
+    # The collection envelope of Docs/10 §4.5, which the history endpoint answers with (SHIP-88).
+    "data", "next_cursor", "has_more",
 }
 
 def keys(node):
@@ -504,9 +506,11 @@ import json, re, sys
 # The same closed set the placement is held to, asserted again because this is a second code path
 # answering with the shape — which is exactly where a field safe on one path and not the other lands.
 allowed = {
-    "id", "job_id", "status", "amount_cents",
-    "pickup_at", "deliver_by", "message",
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
     "created_at", "updated_at",
+    # The collection envelope of Docs/10 §4.5, which the history endpoint answers with (SHIP-88).
+    "data", "next_cursor", "has_more",
 }
 
 def keys(node):
@@ -619,9 +623,11 @@ python3 - "$WORKDIR/bid-withdraw.json" <<'PY' || fail "the withdrawal response c
 import json, re, sys
 
 allowed = {
-    "id", "job_id", "status", "amount_cents",
-    "pickup_at", "deliver_by", "message",
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
     "created_at", "updated_at",
+    # The collection envelope of Docs/10 §4.5, which the history endpoint answers with (SHIP-88).
+    "data", "next_cursor", "has_more",
 }
 
 def keys(node):
@@ -717,3 +723,265 @@ after="$("$PSQL" "$DATABASE_URL" -tAc \
 [[ "$after" == "Open 1" ]] \
   || fail "the job reads '$after' (status, history rows), want 'Open 1' — revising and withdrawing move no job"
 ok "the job is still Open with only the row that published it — Negotiating is SHIP-90's, both ways"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  POST /v1/jobs/{id}/bids/{bid_id}/counter — either party answers the other's offer"
+
+# # The negotiation these checks build, and why it is one fixture rather than several
+#
+# A chain only means anything after several rounds, and each round's refusals are about the state the
+# round before it left. So the checks below run against one negotiation that grows as they go, and the
+# comments say which round each one is standing on. `$revise_job` is not reused: it carries a
+# withdrawn offer and a replacement from SHIP-86's checks, and "exactly this many rows" would then be
+# an assertion about another ticket's fixture.
+status="$(bid_post "$bid_customer_token" "verify-bid-job5-$$" /v1/jobs \
+  '{"pickup":{"line":"41 Bridge Road","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"90 Moorabool Street","suburb":"Geelong","state":"VIC","postcode":"3220"},
+    "goods_description":"Office chairs, six","weight_kg":90,"budget_cents":432199}' job5)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-job5.json"; fail "creating the counter job returned $status"; }
+counter_job="$(json "$WORKDIR/bid-job5.json" '["id"]')"
+move_job "$counter_job" Draft Open
+
+# counter_at <token> <key> <bid> <cents> <name> — one round of the negotiation.
+counter_at() {
+  bid_post "$1" "$2" "/v1/jobs/$counter_job/bids/$3/counter" "{\"amount_cents\":$4}" "$5"
+}
+
+# Round 1. The provider's opening offer, at 45000 cents.
+status="$(bid_post "$bid_provider_token" "verify-bid-r1-$$" "/v1/jobs/$counter_job/bids" "$bid_body" r1c)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r1c.json"; fail "placing the offer to counter returned $status"; }
+round1="$(json "$WORKDIR/bid-r1c.json" '["id"]')"
+
+counter_path="/v1/jobs/$counter_job/bids/$round1/counter"
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-ct-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-bid-ct-anon-$$" -H 'Content-Type: application/json' \
+  -d '{"amount_cents":40000}' "http://localhost:$VERIFY_PORT$counter_path")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-ct-anon.json"; fail "an unauthenticated counter returned $status, want 401"; }
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-ct-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_customer_token" -H 'Content-Type: application/json' \
+  -d '{"amount_cents":40000}' "http://localhost:$VERIFY_PORT$counter_path")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-ct-nokey.json"; fail "a counter with no Idempotency-Key returned $status, want 400"; }
+ok "it needs a credential and an Idempotency-Key — a counter writes a row, so the key is a column"
+
+# Round 2. **The first request in this file a customer may make.** Every endpoint before it is the
+# provider's alone, and this customer's token claims `role: customer` exactly as the provider's does —
+# the platform tells them apart by reading jobs.customer_id and bids.provider_id, never by the claim.
+status="$(counter_at "$bid_customer_token" "verify-bid-r2-$$" "$round1" 40000 r2c)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r2c.json"; fail "the customer's counter returned $status, want 201"; }
+round2="$(json "$WORKDIR/bid-r2c.json" '["id"]')"
+[[ "$round2" != "$round1" ]] || fail "the counter answered with the offer it superseded — a counter creates a row"
+[[ "$(json "$WORKDIR/bid-r2c.json" '["offered_by"]')" == "customer" ]] \
+  || fail "the counter is offered_by $(json "$WORKDIR/bid-r2c.json" '["offered_by"]'), want customer"
+[[ "$(json "$WORKDIR/bid-r2c.json" '["status"]')" == "submitted" ]] || fail "the counter is not live"
+[[ "$(json "$WORKDIR/bid-r2c.json" '["amount_cents"]')" == "40000" ]] || fail "the counter's price did not come back"
+ok "the job's own customer counters a provider's offer — the first endpoint in this domain a customer may call"
+
+# Countering on price alone inherits the timing, which is the decision 000501 deferred to SHIP-87.
+[[ "$(json "$WORKDIR/bid-r2c.json" '["pickup_at"]')" == "$(json "$WORKDIR/bid-r1c.json" '["pickup_at"]')" ]] \
+  || fail "the counter did not inherit pickup_at from the offer it answers"
+[[ "$(json "$WORKDIR/bid-r2c.json" '["deliver_by"]')" == "$(json "$WORKDIR/bid-r1c.json" '["deliver_by"]')" ]] \
+  || fail "the counter did not inherit deliver_by"
+ok "a counter on price alone inherits the timing it does not restate"
+
+# The rows, not the answer the endpoint gave about itself. This is the whole of "each counter
+# supersedes the prior offer".
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || offered_by || ' ' || coalesce(superseded_by::text, 'none')
+     from bids where id = '$round1';")"
+[[ "$stored" == "Superseded provider $round2" ]] \
+  || fail "the answered offer reads '$stored', want 'Superseded provider $round2'"
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || offered_by || ' ' || amount::text || ' ' || coalesce(superseded_by::text, 'none')
+     from bids where id = '$round2';")"
+[[ "$stored" == "Submitted customer 400.00 none" ]] \
+  || fail "the counter row reads '$stored', want 'Submitted customer 400.00 none'"
+ok "the answered offer is Superseded and linked to the counter; the counter is the live head with no successor"
+
+# One live offer in the negotiation, which is what uq_bids_one_submitted_per_provider_per_job means
+# once a chain exists — and the property SHIP-92 reads under its lock.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$counter_job' and provider_id = '$bid_provider_id'
+     and status = 'Submitted';")" == "1" ]] \
+  || fail "the negotiation holds more than one live offer"
+ok "exactly one live offer in the negotiation — the head of the chain and the live row are one row"
+
+python3 - "$WORKDIR/bid-r2c.json" <<'PY' || fail "the counter response carries something of the customer's"
+import json, re, sys
+
+# **The hardest case for Docs/01 §4.3 in this domain, and the reason this block is repeated here.**
+# A counter's amount is a number the *customer* chose, in a response a provider reads back out of the
+# history. It is not the budget — a counter-offer is an offer the customer deliberately made — and the
+# way that stays true is the same closed key set, applied to the new shape.
+allowed = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
+    "created_at", "updated_at",
+    "data", "next_cursor", "has_more",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the counter response is the same closed set of keys, and the customer's budget is in none of them"
+
+# Round 3. The other direction. Docs/02 §4's two sentences are one act, so this is the same endpoint
+# with the parties the other way round.
+status="$(counter_at "$bid_provider_token" "verify-bid-r3-$$" "$round2" 43000 r3c)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r3c.json"; fail "the provider's counter returned $status, want 201"; }
+round3="$(json "$WORKDIR/bid-r3c.json" '["id"]')"
+[[ "$(json "$WORKDIR/bid-r3c.json" '["offered_by"]')" == "provider" ]] \
+  || fail "the provider's counter is attributed to the wrong party"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$round2';")" == "Superseded" ]] \
+  || fail "the customer's counter was not superseded by the provider's answer"
+ok "the provider counters back, and the customer's offer is superseded in turn — one endpoint, both directions"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  you counter the other party's offer and revise your own"
+
+# Round 3 is the live head and the provider made it, so this is the provider answering themselves.
+status="$(counter_at "$bid_provider_token" "verify-bid-ctown-$$" "$round3" 44000 ctown)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-ctown.json"; fail "a provider countered their own offer: $status"; }
+[[ "$(json "$WORKDIR/bid-ctown.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-ctown.json"; fail "expected code=bidding_wrong_party"; }
+ok "countering an offer you made yourself is refused with a code that tells the client to revise instead"
+
+# Round 1 was superseded two rounds ago. Only the latest valid offer can be acted on.
+status="$(counter_at "$bid_customer_token" "verify-bid-stale-$$" "$round1" 38000 stale)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-stale.json"; fail "a superseded offer was countered: $status"; }
+[[ "$(json "$WORKDIR/bid-stale.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-stale.json"; fail "expected code=bidding_bid_closed"; }
+ok "only the latest valid offer can be countered — a superseded one is closed"
+
+status="$(bid_post "$bid_customer_token" "verify-bid-ctempty-$$" \
+  "/v1/jobs/$counter_job/bids/$round3/counter" '{}' ctempty)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-ctempty.json"; fail "a counter naming no field returned $status, want 400"; }
+
+status="$(bid_post "$bid_customer_token" "verify-bid-ctparty-$$" \
+  "/v1/jobs/$counter_job/bids/$round3/counter" '{"amount_cents":40000,"offered_by":"provider"}' ctparty)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-ctparty.json"; fail "a body naming offered_by returned $status, want 400"; }
+grep -q 'offered_by' "$WORKDIR/bid-ctparty.json" || fail "the refusal does not name offered_by"
+ok "a counter that changes nothing is refused, and which party made an offer is not a settable field"
+
+# Round 4, so that the *other* party's offer is the live one for the two checks below.
+status="$(counter_at "$bid_customer_token" "verify-bid-r4-$$" "$round3" 41500 r4c)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r4c.json"; fail "the customer's second counter returned $status"; }
+round4="$(json "$WORKDIR/bid-r4c.json" '["id"]')"
+
+# The hole 000502's reinterpretation of provider_id would otherwise have opened: a customer's counter
+# carries the provider's id, so without the authorship check the provider could rewrite the customer's
+# own number, or withdraw it.
+status="$(bid_patch "$bid_provider_token" "verify-bid-crev-$$" \
+  "/v1/jobs/$counter_job/bids/$round4" '{"amount_cents":1}' crev)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-crev.json"; fail "the provider revised the customer's counter: $status"; }
+[[ "$(json "$WORKDIR/bid-crev.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-crev.json"; fail "expected code=bidding_wrong_party on the revision"; }
+
+status="$(bid_post "$bid_provider_token" "verify-bid-cwd-$$" \
+  "/v1/jobs/$counter_job/bids/$round4/withdraw" '{}' cwd)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-cwd.json"; fail "the provider withdrew the customer's counter: $status"; }
+[[ "$(json "$WORKDIR/bid-cwd.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-cwd.json"; fail "expected code=bidding_wrong_party on the withdrawal"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status || ' ' || amount::text from bids where id = '$round4';")" \
+   == "Submitted 415.00" ]] \
+  || fail "the customer's counter was changed by the provider"
+ok "and neither party can revise or withdraw an offer the other one made"
+
+status="$(counter_at "$bid_customer_token" "verify-bid-ctown2-$$" "$round4" 39000 ctown2)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-ctown2.json"; fail "a customer countered their own counter: $status"; }
+[[ "$(json "$WORKDIR/bid-ctown2.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-ctown2.json"; fail "expected code=bidding_wrong_party"; }
+ok "the rule holds from the customer's side too — one endpoint, one rule, both parties"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  a counter from anybody who is not a party answers what a missing bid answers"
+
+status="$(counter_at "$bid_rival_token" "verify-bid-ctrival-$$" "$round4" 1 ctrival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-ctrival.json"; fail "a competing provider countered: $status"; }
+
+status="$(bid_post "$bid_rival_token" "verify-bid-ctnothing-$$" \
+  "/v1/jobs/$counter_job/bids/00000000-0000-7000-8000-000000000087/counter" '{"amount_cents":1}' ctnothing)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-ctnothing.json"; fail "a counter on nothing returned $status"; }
+
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/bid-ctrival.json" "$WORKDIR/bid-ctnothing.json" \
+  || fail "somebody else's negotiation answers differently from one that does not exist"
+ok "a competitor's counter answers exactly what a bid that is not there answers — the refusal confirms nothing"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  a retried counter adds no second link to the chain"
+
+# **The two mechanisms again, told apart the way the placement's checks tell them apart.** The key
+# matters more here than for a revision: a counter writes a row, so a retry the cache has forgotten
+# would add a second link — and the retry has to be answered *before* the status is checked, because
+# by then the caller's own first attempt has already superseded the offer it answered.
+#
+# Round 5, made by the provider, so that the head afterwards is a provider's offer.
+before_rows="$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from bids where job_id = '$counter_job';")"
+
+status="$(counter_at "$bid_provider_token" "verify-bid-r5-$$" "$round4" 42000 r5a)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r5a.json"; fail "the counter returned $status, want 201"; }
+replayed_from_redis r5a && fail "the first counter was answered from the cache"
+round5="$(json "$WORKDIR/bid-r5a.json" '["id"]')"
+
+status="$(counter_at "$bid_provider_token" "verify-bid-r5-$$" "$round4" 42000 r5b)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r5b.json"; fail "the cached retry returned $status, want the stored 201"; }
+replayed_from_redis r5b || fail "the second request was not replayed by the middleware"
+diff -q "$WORKDIR/bid-r5a.json" "$WORKDIR/bid-r5b.json" >/dev/null \
+  || fail "the replayed response is not byte-identical to the original"
+ok "a retry inside the cache is replayed by the middleware, byte for byte"
+
+forget_the_cached_response "$bid_provider_id" "verify-bid-r5-$$"
+
+status="$(counter_at "$bid_provider_token" "verify-bid-r5-$$" "$round4" 42000 r5c)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/bid-r5c.json"; fail "a counter retried after the cache forgot it returned $status, want 200 from the row"; }
+replayed_from_redis r5c && fail "the third request was still answered from the cache"
+[[ "$(json "$WORKDIR/bid-r5c.json" '["id"]')" == "$round5" ]] \
+  || fail "the retry answered with a different counter"
+ok "and a retry the cache has forgotten is answered from the row — 200, the same counter, not a refusal"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from bids where job_id = '$counter_job';")" \
+   == "$((before_rows + 1))" ]] \
+  || fail "three requests under one key added more than one link to the chain"
+ok "one new link at the end of all three — the key is a column, not only a cache entry"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  countering does not move the job — Open → Negotiating is still SHIP-90's"
+
+# Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted", which reads like
+# an instruction to this ticket more than it did to SHIP-84. It is SHIP-90's, which depends on this
+# one. The history count is the half that catches a move made through some other path.
+after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$counter_job';")"
+[[ "$after" == "Open 1" ]] \
+  || fail "the job reads '$after' (status, history rows), want 'Open 1' — a counter moves no job"
+ok "a job with five rounds of negotiation on it is still Open, with only the row that published it"

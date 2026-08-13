@@ -1,10 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/bidding"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/fleet"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 )
 
 // The bidding domain's routes (SHIP-84 onwards).
@@ -57,6 +64,25 @@ import (
 // is one: nothing is deleted. Docs/01 §4.3 requires every withdrawal to be recorded and Docs/02 §4
 // keeps the chain readable, so the row survives at `Withdrawn`. It is not a `PATCH` writing a status
 // either — a bid's status is the platform's, and a request naming one is refused by the decoder.
+//
+// # Countering is a verb under the offer being answered, and one route serves both parties
+//
+// SHIP-87. Docs/02 §4 gives the two directions in two sentences that describe one act — "a customer
+// counter-offer supersedes the prior provider offer. A provider counter-offer supersedes the prior
+// customer offer" — so there is one endpoint and the platform works out which side the caller is on.
+// Two routes would have been two authorisation rules to keep in step, and they would have differed
+// the first time one of them was corrected.
+//
+// It names the offer being answered rather than posting to the collection, because a counter *answers
+// a particular offer*: two counters against one offer are then a race the platform can see, rather
+// than two independent creations that only collide at an index.
+//
+// **`RequireUser` and not a role, and this is where that choice pays.** The two callers are told apart
+// by the database — `bids.provider_id` for the provider, `jobs.customer_id` for the customer — and a
+// role claim in a token is evidence about the token rather than the fact. A customer whose token
+// claims `provider` is still recognised as the customer of their own job, which is what CLAUDE.md
+// means by no authorisation decision on the device.
+
 func init() {
 	register(
 		Route{
@@ -79,6 +105,13 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Withdraw() },
+		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/bids/{bid_id}/counter",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).Counter() },
 		},
 	)
 }
@@ -115,7 +148,11 @@ func init() {
 // holds state, and sharing one would be a dependency between two route files that today know nothing
 // about each other.
 func biddingHandler(d Deps) *bidding.Handler {
-	svc := bidding.NewService(fleet.NewService(d.Clock), d.Clock)
+	svc := bidding.NewService(
+		fleet.NewService(d.Clock),
+		negotiatedJobs{jobs: newJobService(d)},
+		d.Clock,
+	)
 
 	handler, err := bidding.NewHandler(svc, d.Pool, d.Logger)
 	if err != nil {
@@ -124,10 +161,85 @@ func biddingHandler(d Deps) *bidding.Handler {
 	return handler
 }
 
-// Compile-time proof that fleet's eligibility filter is what bidding's port asks for.
+// negotiatedJobs implements bidding.Negotiation over the customer's own view of a job (SHIP-87).
 //
-// This is the only place in the build where that can be established — `bidding` does not name
-// `fleet` and `fleet` does not name `bidding`, so nothing else links them. If the two ever part
-// company, this line is what says so, at compile time and in the file whose job it is to know about
-// both.
-var _ bidding.Eligibility = (*fleet.Service)(nil)
+// The second seam this file joins, and the first that needed a type. `fleet`'s answer is a bool with
+// no vocabulary to translate, so `*fleet.Service` satisfies its port structurally; `jobs` answers with
+// a `Job` and two sentinels, and turning those into two bools is exactly the translation
+// routes_delivery.go's `jobLifecycle` does for a transition. Neither package names the other.
+//
+// # Both methods go through jobs.Service.Job, which is the ownership check itself
+//
+// That method reads the row and compares `customer_id` in Go, raising `jobs.ErrNotJobOwner` for
+// somebody else's job and `jobs.ErrJobNotFound` for nobody's. **Both become `false` here**, which is
+// the same collapse `bidding` makes on the wire and `fleet` makes for eligibility: distinguishing them
+// would take a second query whose only product is the knowledge that some identifier exists.
+//
+// Anything else stays an error, because a failing database is not an answer.
+type negotiatedJobs struct {
+	jobs *jobs.Service
+}
+
+// CustomerOf reports whether this account owns this job, whatever its status.
+//
+// Status is deliberately not consulted. SHIP-88 keeps a negotiation readable to its parties after the
+// job is awarded, cancelled or completed — a record is at its most useful once the work is over.
+func (n negotiatedJobs) CustomerOf(ctx context.Context, r db.Runner, userID, jobID uuid.UUID) (bool, error) {
+	_, err := n.jobs.Job(ctx, r, userID, jobID)
+	return n.answer(err)
+}
+
+// AwardableBy reports whether this customer's job could still be awarded.
+//
+// # `jobs.Permitted(status, Awarded)` rather than a list of statuses, and that is the whole point of
+// this method
+//
+// Docs/02 §2's transition table is the authority, `jobs` holds it in exactly one place and exports the
+// question, and `Open` and `Negotiating` are the two statuses that can reach `Awarded`. Writing those
+// two strings here instead would have put a **third** copy of that list in the service — after `jobs`'
+// own table and `fleet.biddableStatuses` — and a third copy is the one nobody remembers to correct.
+//
+// It also states the rule in the form the product actually has it. A customer countering is not asking
+// whether the job is biddable; they are asking whether this negotiation can still end in an award. The
+// two select the same statuses today and they are different questions, and this one is the one whose
+// answer follows Docs/02 §2 automatically if that document ever changes.
+func (n negotiatedJobs) AwardableBy(
+	ctx context.Context,
+	r db.Runner,
+	customerID, jobID uuid.UUID,
+) (bool, error) {
+	job, err := n.jobs.Job(ctx, r, customerID, jobID)
+	if owned, err := n.answer(err); err != nil || !owned {
+		return false, err
+	}
+	return jobs.Permitted(job.Status, jobs.StatusAwarded), nil
+}
+
+// answer is the translation, in one place: what `jobs` treats as a refusal becomes `false` with a nil
+// error, and everything else stays an error.
+//
+// Written once rather than twice for the reason `jobLifecycle.move` is written once — a third method
+// added later must not be able to treat `jobs.ErrNotJobOwner` differently from these two, and that
+// drift would be invisible: both methods would still compile, still pass their own tests, and answer
+// a stranger with a refusal on one path and a 500 on the other.
+func (negotiatedJobs) answer(err error) (bool, error) {
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, jobs.ErrNotJobOwner), errors.Is(err, jobs.ErrJobNotFound):
+		return false, nil
+	default:
+		return false, fmt.Errorf("cmd/api: reading a job for a counter-offer: %w", err)
+	}
+}
+
+// Compile-time proof that the two adapters satisfy the ports bidding declared.
+//
+// This is the only place in the build where that can be established — `bidding` names neither `fleet`
+// nor `jobs`, and neither names `bidding`, so nothing else links them. If any of them ever part
+// company, these lines are what say so, at compile time and in the file whose job it is to know about
+// all three.
+var (
+	_ bidding.Eligibility = (*fleet.Service)(nil)
+	_ bidding.Negotiation = negotiatedJobs{}
+)

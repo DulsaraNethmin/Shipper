@@ -50,7 +50,8 @@ them where the call is made, beside the thing the user was trying to do.
 |---|---|
 | `bidding_already_bid` | You already have a live offer on this job. Revise or withdraw it rather than placing a second. |
 | `bidding_bid_accepted` | That offer has been accepted. An accepted bid can be neither revised nor withdrawn. |
-| `bidding_bid_closed` | That offer is no longer live, so it cannot be revised or withdrawn. |
+| `bidding_bid_closed` | That offer is no longer live, so it can be neither changed nor answered. |
+| `bidding_wrong_party` | That offer belongs to the other party. Counter an offer they made; revise one you made yourself. |
 | `delivery_driver_already_assigned` | This job already has a driver. Reload it to see who is carrying it. |
 | `delivery_job_not_assignable` | A driver can only be assigned to a job that has been awarded and has not yet set off. Reload the job to see its current status. |
 | `delivery_milestone_not_permitted` | This milestone cannot be recorded from the job's current status. Reload the delivery to see what it is, and keep the update — a late one will be absorbed rather than refused once SHIP-112 lands. |

@@ -3,6 +3,7 @@ package bidding
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/fleet"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
@@ -691,7 +693,11 @@ func TestAnOfferWithNoMessageStoresNULLRatherThanEmpty(t *testing.T) {
 // between a retryable 503 and a permanent-looking 404.
 func TestAnEligibilityFailureIsNotARefusal(t *testing.T) {
 	m := newMarket(t)
-	m.svc = NewService(refusing{err: errors.New("the filter could not run")}, m.svc.clock)
+	m.svc = NewService(
+		refusing{err: errors.New("the filter could not run")},
+		newTestNegotiation(m.svc.clock),
+		m.svc.clock,
+	)
 
 	_, _, err := m.place(t, m.provider, m.job, offer("key-broken"))
 	if err == nil {
@@ -1595,5 +1601,776 @@ func TestRevisingAndWithdrawingRefuseAConnectionPool(t *testing.T) {
 
 	if after := m.row(t, placed.ID); after.status != "Submitted" || after.amount != 450.00 {
 		t.Errorf("a refused call wrote to the row: %+v", after)
+	}
+}
+
+// --- SHIP-87: the counter-offer, from both sides -------------------------------------------------
+
+// SHIP-87's *Done when*: "Customer and provider can counter; each counter supersedes the prior
+// offer."
+//
+// Three claims, and each has a test that fails if it stops holding:
+//
+//	customer can counter          TestACustomerCountersTheProvidersOffer
+//	provider can counter          TestAProviderCountersTheCustomersCounter
+//	supersedes the prior offer    both of the above, on the stored row rather than the return value
+//
+// The chain those counters build is SHIP-88's, and so is everything that reads it or holds the award
+// to it.
+
+// TestACustomerCountersTheProvidersOffer is the first half of SHIP-87's *Done when*, and the first
+// time in this domain that a customer changes anything.
+//
+// It asserts the stored rows rather than the returned one, in both directions: the counter exists as
+// its own row attributed to the customer, and the offer it answered has been moved out of the live
+// predicate *and* linked to it. A method returning what it meant to write would satisfy a test
+// comparing against its own return value even if neither `UPDATE` had landed.
+func TestACustomerCountersTheProvidersOffer(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-base"))
+	if err != nil {
+		t.Fatalf("placing the offer to counter: %v", err)
+	}
+
+	countered, created, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-counter"))
+	if err != nil {
+		t.Fatalf("the job's customer could not counter: %v", err)
+	}
+	if !created {
+		t.Error("the first counter reports it created nothing")
+	}
+	if countered.ID == placed.ID {
+		t.Fatal("the counter is the same row as the offer it answered; a counter creates a row and a " +
+			"revision does not, and conflating them is what SHIP-85 refused to do")
+	}
+
+	if got := m.row(t, countered.ID); got.status != "Submitted" ||
+		got.offeredBy != string(PartyCustomer) || got.amount != 400.00 ||
+		got.supersededBy != uuid.Nil {
+		t.Errorf("the counter row is %+v, want a live customer offer at 400.00 with no successor", got)
+	}
+
+	// The provider party is carried across, so `uq_bids_one_submitted_per_provider_per_job` still
+	// means "one live offer in this negotiation" — 000502's whole reason for reinterpreting the
+	// column rather than storing the author in it.
+	if countered.ProviderID != m.provider {
+		t.Errorf("the counter names %s as the provider party, want %s", countered.ProviderID, m.provider)
+	}
+
+	answered := m.row(t, placed.ID)
+	if answered.status != string(StatusSuperseded) {
+		t.Errorf("the answered offer is %q, want Superseded — Docs/02 §4 has each counter "+
+			"superseding the prior offer", answered.status)
+	}
+	if answered.supersededBy != countered.ID {
+		t.Errorf("the answered offer points at %s, want the counter %s — an unlinked row is a chain "+
+			"nobody can read", answered.supersededBy, countered.ID)
+	}
+	if answered.amount != 450.00 {
+		t.Errorf("the answered offer is now %v; a counter must not rewrite the offer it answers", answered.amount)
+	}
+}
+
+// TestAProviderCountersTheCustomersCounter is the second half, and it is the direction that could
+// not exist before 000502.
+//
+// The provider answers a row whose `provider_id` is their own and whose *author* is the customer.
+// Before the `offered_by` column those two facts were the same one, and there would have been no way
+// to tell "answer this" from "revise this".
+func TestAProviderCountersTheCustomersCounter(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-round-one"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	theirs, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-round-two"))
+	if err != nil {
+		t.Fatalf("the customer's counter: %v", err)
+	}
+
+	mine, created, err := m.counter(t, m.provider, m.job, theirs.ID, counterOf(43000, "key-round-three"))
+	if err != nil {
+		t.Fatalf("the provider could not counter back: %v", err)
+	}
+	if !created {
+		t.Error("the provider's counter reports it created nothing")
+	}
+
+	if got := m.row(t, mine.ID); got.status != "Submitted" ||
+		got.offeredBy != string(PartyProvider) || got.amount != 430.00 {
+		t.Errorf("the provider's counter is %+v, want a live provider offer at 430.00", got)
+	}
+	if got := m.row(t, theirs.ID); got.status != string(StatusSuperseded) || got.supersededBy != mine.ID {
+		t.Errorf("the customer's counter is %+v, want Superseded and linked to %s", got, mine.ID)
+	}
+
+	// Exactly one live offer at the end of three rounds, which is the property
+	// uq_bids_one_submitted_per_provider_per_job holds and the one SHIP-92 will read under its lock.
+	var live int
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM bids WHERE job_id = $1 AND provider_id = $2 AND status = 'Submitted'`,
+		m.job, m.provider).Scan(&live); err != nil {
+		t.Fatalf("counting the live offers: %v", err)
+	}
+	if live != 1 {
+		t.Errorf("the negotiation holds %d live offers after three rounds, want exactly 1", live)
+	}
+}
+
+// TestACounterInheritsTheTimingItDoesNotRestate is the decision 000501 deferred to this ticket.
+//
+// That migration removed `ck_bids_offer_has_timing` in as many words: "whether a customer countering
+// on *price alone* restates the timing or inherits it from the offer it supersedes is that ticket's
+// decision." It inherits, and this is what says so.
+func TestACounterInheritsTheTimingItDoesNotRestate(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-inherit"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	countered, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-inherit-counter"))
+	if err != nil {
+		t.Fatalf("countering on price alone: %v", err)
+	}
+
+	if !countered.PickupAt.Equal(placed.PickupAt) || !countered.DeliverBy.Equal(placed.DeliverBy) {
+		t.Errorf("the counter's timing is %s–%s, want the answered offer's %s–%s: a counter names "+
+			"what it changes and takes the rest from the offer it answers",
+			countered.PickupAt, countered.DeliverBy, placed.PickupAt, placed.DeliverBy)
+	}
+	if countered.Message != placed.Message {
+		t.Errorf("the counter's message is %q, want the inherited %q", countered.Message, placed.Message)
+	}
+
+	// The stored row, not the answer the service gave about itself. An inheritance that existed only
+	// in the returned value would leave the column NULL and the next round inheriting nothing.
+	if got := m.row(t, countered.ID); !got.pickupAt.Equal(placed.PickupAt) {
+		t.Errorf("the stored counter has pickup_at %s, want %s", got.pickupAt, placed.PickupAt)
+	}
+}
+
+// TestACounterIsValidatedAsAWholeOffer holds a counter to the same rules a placement meets.
+//
+// [Counter.applyTo] merges the change over the stored offer and produces an [Offer], so there is one
+// validator rather than two sets of rules that could disagree. The consequence is the one [Revision]
+// records and it surprises in the same way: a counter on price alone against an offer whose
+// collection time has since passed is refused, naming a field the caller did not send.
+func TestACounterIsValidatedAsAWholeOffer(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-validate"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	t.Run("an implausible amount is refused, naming the field", func(t *testing.T) {
+		_, _, err := m.counter(t, m.customer, m.job, placed.ID,
+			counterOf(maxOfferCents+1, "key-counter-too-much"))
+		assertFieldRefused(t, err, "amount_cents")
+	})
+
+	t.Run("a collection time in the past is refused", func(t *testing.T) {
+		past := testInstant.Add(-time.Hour)
+		_, _, err := m.counter(t, m.customer, m.job, placed.ID,
+			Counter{PickupAt: &past, Key: "key-counter-past"})
+		assertFieldRefused(t, err, "pickup_at")
+	})
+
+	t.Run("delivery before collection is refused, including against the inherited pickup", func(t *testing.T) {
+		early := placed.PickupAt.Add(-time.Hour)
+		_, _, err := m.counter(t, m.customer, m.job, placed.ID,
+			Counter{DeliverBy: &early, Key: "key-counter-backwards"})
+		assertFieldRefused(t, err, "deliver_by")
+	})
+
+	if got := m.row(t, placed.ID); got.status != "Submitted" || got.supersededBy != uuid.Nil {
+		t.Errorf("a refused counter superseded the offer anyway: %+v", got)
+	}
+}
+
+// assertFieldRefused is the error-contract assertion the counter validation table makes three times.
+func assertFieldRefused(t *testing.T, err error, field string) {
+	t.Helper()
+
+	var apiErr *httpx.Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("the refusal is %v, want a field error in the contract's shape", err)
+	}
+	for _, detail := range apiErr.Details {
+		if detail.Field == field {
+			return
+		}
+	}
+	t.Errorf("no detail names %q: %+v", field, apiErr.Details)
+}
+
+// TestACounterThatChangesNothingIsRefused separates a counter from an acceptance.
+//
+// A counter naming no field is not a client defect in the way an empty revision is: it is agreement,
+// and agreement is the *award* — the customer's act, through an endpoint this ticket does not build.
+// Writing it would put a second identical offer at the head of the chain and leave a client believing
+// it had done something.
+func TestACounterThatChangesNothingIsRefused(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-empty-base"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID,
+		Counter{Key: "key-counter-empty"}); !errors.Is(err, ErrNothingToCounter) {
+		t.Fatalf("an empty counter = %v, want ErrNothingToCounter", err)
+	}
+	if n := m.bids(t, m.provider, m.job); n != 1 {
+		t.Errorf("an empty counter wrote a row: the negotiation holds %d", n)
+	}
+}
+
+// TestACounterWithNoKeyIsRefusedBeforeAnythingIsWritten covers the path the middleware makes
+// unreachable.
+//
+// A counter writes a row, so the key is a *column* rather than only a cache entry — the whole of
+// SHIP-84's argument, which a revision deliberately does not share. A counter stored with no key is a
+// link a later retry cannot be matched to, and that retry would then add a second one.
+func TestACounterWithNoKeyIsRefusedBeforeAnythingIsWritten(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-nokey-base"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID,
+		Counter{AmountCents: ptr(int64(40000))}); !errors.Is(err, ErrNoIdempotencyKey) {
+		t.Fatalf("a keyless counter = %v, want ErrNoIdempotencyKey", err)
+	}
+	if n := m.bids(t, m.provider, m.job); n != 1 {
+		t.Errorf("a keyless counter wrote a row: the negotiation holds %d", n)
+	}
+}
+
+// --- SHIP-87: who may counter what ---------------------------------------------------------------
+
+// TestOnlyAPartyToTheNegotiationCanCounter is Docs/01 §4.3's second privacy line, met by an endpoint
+// two different kinds of caller may legitimately reach.
+//
+// **This is the widening SHIP-87 makes and the place it could have gone wrong.** Every endpoint
+// before it is the provider's alone, and adding a customer to `Service.ownBid` would have added one
+// to `PATCH` and `withdraw` as well. `Service.reachableBid` is a separate path for exactly that
+// reason, and this test is what would catch it being widened too far — a competing provider must
+// still meet the answer a bid that does not exist gets.
+func TestOnlyAPartyToTheNegotiationCanCounter(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-privacy"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	rival := newVerifiedProvider(t, m.pool, "counter-rival@example.com", "+61400000870")
+	declare(t, m.pool, rival, "VIC")
+	addVehicle(t, m.pool, rival, "BID870")
+
+	stranger := newCustomer(t, m.pool, "counter-stranger@example.com", "+61400000871")
+
+	for who, caller := range map[string]uuid.UUID{
+		"a competing provider":                  rival,
+		"a customer who owns some other job":    stranger,
+		"an account with nothing to do with it": newCustomer(t, m.pool, "counter-nobody@example.com", "+61400000872"),
+	} {
+		t.Run(who+" cannot counter", func(t *testing.T) {
+			_, _, err := m.counter(t, caller, m.job, placed.ID, counterOf(1, "key-counter-"+who))
+			if !errors.Is(err, ErrNotBidOwner) {
+				t.Fatalf("%s countered somebody else's offer: %v", who, err)
+			}
+		})
+	}
+
+	if got := m.row(t, placed.ID); got.status != "Submitted" || got.supersededBy != uuid.Nil {
+		t.Errorf("a refused counter changed the offer: %+v", got)
+	}
+	if n := m.bids(t, m.provider, m.job); n != 1 {
+		t.Errorf("a refused counter wrote a row: the negotiation holds %d", n)
+	}
+}
+
+// TestNeitherPartyCanCounterTheirOwnOffer is the rule that makes one endpoint safe for two callers.
+//
+// **You counter the other party's offer and revise your own.** A provider answering their own live
+// bid wants `PATCH`, and telling them so is a different request rather than a different screen —
+// which is why [ErrWrongParty] has a code and [ErrNegotiationOver] does not.
+func TestNeitherPartyCanCounterTheirOwnOffer(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-own-base"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	if _, _, err := m.counter(t, m.provider, m.job, placed.ID,
+		counterOf(44000, "key-own-provider")); !errors.Is(err, ErrWrongParty) {
+		t.Fatalf("a provider countered their own offer: %v", err)
+	}
+
+	theirs, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-own-customer"))
+	if err != nil {
+		t.Fatalf("the customer's counter: %v", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, theirs.ID,
+		counterOf(39000, "key-own-customer-again")); !errors.Is(err, ErrWrongParty) {
+		t.Fatalf("a customer countered their own counter: %v", err)
+	}
+
+	if n := m.bids(t, m.provider, m.job); n != 2 {
+		t.Errorf("the negotiation holds %d rows, want 2 — neither refusal may write one", n)
+	}
+}
+
+// TestTheOtherPartysOfferIsNotRevisableOrWithdrawable closes the hole 000502's reinterpretation
+// opened.
+//
+// A customer's counter carries the *provider's* id in `provider_id`, so `Service.ownBid`'s comparison
+// passes for the provider — and before the authorship check in [changeable] they could have written
+// over the customer's own number, or withdrawn it. That would be one party editing the other's offer,
+// which is the sharpest form of the rule this domain is built on.
+//
+// It is [ErrWrongParty] rather than the 404 a stranger gets, because the provider can read that row
+// in the negotiation's history a moment later.
+func TestTheOtherPartysOfferIsNotRevisableOrWithdrawable(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-cross-edit"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	theirs, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-cross-counter"))
+	if err != nil {
+		t.Fatalf("the customer's counter: %v", err)
+	}
+
+	if _, err := m.revise(t, m.provider, m.job, theirs.ID,
+		Revision{AmountCents: ptr(int64(45000))}); !errors.Is(err, ErrWrongParty) {
+		t.Errorf("the provider revised the customer's counter: %v", err)
+	}
+	if _, err := m.withdraw(t, m.provider, m.job, theirs.ID); !errors.Is(err, ErrWrongParty) {
+		t.Errorf("the provider withdrew the customer's counter: %v", err)
+	}
+
+	if got := m.row(t, theirs.ID); got.status != "Submitted" || got.amount != 400.00 {
+		t.Errorf("the customer's counter was changed by the provider: %+v", got)
+	}
+}
+
+// TestACustomerCannotCounterOnAJobThatCanNoLongerBeAwarded is the customer's half of the check a
+// provider meets as eligibility.
+//
+// A counter-offer on a job that cannot be awarded leads nowhere, and nothing else would refuse it:
+// SHIP-93 — which closes competing bids when a job is awarded — does not exist, so the offer itself
+// is still `Submitted` on a job that is over. The port asks `jobs` whether the job could still reach
+// `Awarded`, which follows Docs/02 §2 rather than a third copy of the biddable-status list.
+func TestACustomerCannotCounterOnAJobThatCanNoLongerBeAwarded(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-job-over"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID,
+		counterOf(40000, "key-job-over-counter")); !errors.Is(err, ErrNegotiationOver) {
+		t.Fatalf("countering on a cancelled job = %v, want ErrNegotiationOver", err)
+	}
+	if got := m.row(t, placed.ID); got.status != "Submitted" || got.supersededBy != uuid.Nil {
+		t.Errorf("a refused counter changed the offer: %+v", got)
+	}
+}
+
+// TestAProviderCounterNeedsThemToStillBeEligible is the provider's half.
+//
+// A provider's counter is a live offer the customer may accept the moment it lands, so it goes
+// through SHIP-81's filter exactly as a placement and a revision do — a provider whose only vehicle
+// left service must not be able to re-price work they can no longer do. The refusal is the same 404 a
+// placement gets, byte-identically, because what became of work somebody else was given is not
+// something this API discloses.
+func TestAProviderCounterNeedsThemToStillBeEligible(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-eligible"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	theirs, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-counter-eligible-c"))
+	if err != nil {
+		t.Fatalf("the customer's counter: %v", err)
+	}
+
+	exec(t, m.pool, `UPDATE vehicles SET deactivated_at = now() WHERE provider_id = $1`, m.provider)
+
+	if _, _, err := m.counter(t, m.provider, m.job, theirs.ID,
+		counterOf(43000, "key-counter-ineligible")); !errors.Is(err, ErrJobNotOffered) {
+		t.Fatalf("a provider with no vehicle countered: %v", err)
+	}
+	if got := m.row(t, theirs.ID); got.status != "Submitted" {
+		t.Errorf("a refused counter changed the offer it answered: %+v", got)
+	}
+}
+
+// TestANegotiationFailureIsNotARefusal separates the two things the customer-side port can answer.
+//
+// The twin of TestAnEligibilityFailureIsNotARefusal, and it earns its place for the same reason: a
+// port that says "no" is an answer and produces a 404, while a port that could not *reach* an answer
+// is a failure — and reporting it as "no such bid" would tell a customer their own negotiation had
+// vanished during an outage.
+func TestANegotiationFailureIsNotARefusal(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-negotiation-broken"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	m.svc = NewService(
+		fleet.NewService(m.svc.clock),
+		brokenNegotiation{err: errors.New("the job service could not run")},
+		m.svc.clock,
+	)
+
+	_, _, err = m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-negotiation-broken-c"))
+	if err == nil {
+		t.Fatal("a broken port let a counter through")
+	}
+	if errors.Is(err, ErrNotBidOwner) {
+		t.Error("a port that failed was reported as a port that said no")
+	}
+	if !strings.Contains(err.Error(), "the job service could not run") {
+		t.Errorf("the cause was lost: %v", err)
+	}
+}
+
+// TestCounteringRefusesAConnectionPool is the guard [ErrNotInTransaction] exists for, and this is the
+// method with the most riding on it.
+//
+// A counter is three statements that are one act. Outside a transaction the first would land and the
+// rest might not, leaving an offer superseded with no successor — a negotiation with nothing live in
+// it and no way to tell that from a defect.
+func TestCounteringRefusesAConnectionPool(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-pool"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	if _, _, err := m.svc.CounterOffer(t.Context(), m.pool, m.customer, m.job, placed.ID,
+		counterOf(40000, "key-counter-pool-c")); !errors.Is(err, ErrNotInTransaction) {
+		t.Errorf("CounterOffer() on a pool = %v, want ErrNotInTransaction", err)
+	}
+	if got := m.row(t, placed.ID); got.status != "Submitted" || got.supersededBy != uuid.Nil {
+		t.Errorf("a refused counter wrote to the row: %+v", got)
+	}
+}
+
+// TestCounteringNeverMovesTheJob keeps SHIP-90's ticket intact.
+//
+// Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted", which reads like
+// an instruction to this ticket more than it did to SHIP-84 — a counter is literally the second half
+// of that sentence. It is still SHIP-90's, which depends on this ticket and owns the presentation
+// status in both directions.
+//
+// The history count is the half that matters: job status is never a settable field, so a move made
+// through some other path would still leave a `job_status_history` row, and asserting the status
+// alone would miss a move made and then reversed.
+func TestCounteringNeverMovesTheJob(t *testing.T) {
+	m := newMarket(t)
+
+	var before int
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM job_status_history WHERE job_id = $1`, m.job).Scan(&before); err != nil {
+		t.Fatalf("counting the history: %v", err)
+	}
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-nomove"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-counter-nomove-c")); err != nil {
+		t.Fatalf("countering: %v", err)
+	}
+
+	var (
+		status string
+		after  int
+	)
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT j.status, (SELECT count(*) FROM job_status_history WHERE job_id = j.id)
+		   FROM jobs j WHERE j.id = $1`, m.job).Scan(&status, &after); err != nil {
+		t.Fatalf("reading the job: %v", err)
+	}
+	if status != "Open" {
+		t.Errorf("the job is %q after a counter, want Open — Negotiating is SHIP-90's", status)
+	}
+	if after != before {
+		t.Errorf("a counter wrote %d job_status_history rows", after-before)
+	}
+}
+
+// --- SHIP-87: retries, and the race that would fork a chain --------------------------------------
+
+// TestARetriedCounterAddsNoLinkToTheChain is the guarantee a counter needs and a revision does not.
+//
+// A revision is an `UPDATE` and applying it twice reaches the state applying it once reaches. A
+// counter is an `INSERT`, so SHIP-84's argument applies instead: the key is stored on the row and a
+// retry that outlives the middleware's cache is answered from the record.
+//
+// **The retry is answered before the status is checked, and that ordering is the point.** By the time
+// a retry arrives, its own first attempt has already superseded the offer it answered — so a status
+// check in front of the key lookup would refuse the caller's own successful request with "that offer
+// is no longer live".
+func TestARetriedCounterAddsNoLinkToTheChain(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-retry-base"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	first, created, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-retry"))
+	if err != nil || !created {
+		t.Fatalf("the first counter = %v, created=%v", err, created)
+	}
+
+	again, created, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-retry"))
+	if err != nil {
+		t.Fatalf("the retry was refused: %v", err)
+	}
+	if created {
+		t.Error("the retry believes it created a second counter")
+	}
+	if again.ID != first.ID {
+		t.Errorf("the retry answered with %s, want the counter it made, %s", again.ID, first.ID)
+	}
+
+	if n := m.bids(t, m.provider, m.job); n != 2 {
+		t.Errorf("two requests under one key left %d rows in the negotiation, want 2", n)
+	}
+}
+
+// TestOneKeyFromEachPartyIsTwoDifferentCounters is 000501's privacy argument extended to the
+// negotiation's second writer.
+//
+// That migration put `provider_id` in `uq_bids_idempotency` because "two providers whose clients
+// happened to generate the same key would collide, and the second would be handed the first's bid".
+// A negotiation now has two writers inside one `(job_id, provider_id)` pair, and the identical
+// sentence applies to them — so 000502 added `offered_by` to the same index and to the lookup behind
+// it.
+//
+// Both parties deliberately send the same key, which is how the defect would be found.
+func TestOneKeyFromEachPartyIsTwoDifferentCounters(t *testing.T) {
+	m := newMarket(t)
+
+	const shared = "a-key-both-clients-generated"
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-shared-base"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	theirs, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, shared))
+	if err != nil {
+		t.Fatalf("the customer's counter: %v", err)
+	}
+
+	mine, created, err := m.counter(t, m.provider, m.job, theirs.ID, counterOf(43000, shared))
+	if err != nil {
+		t.Fatalf("the provider's counter under the same key was refused: %v", err)
+	}
+	if !created {
+		t.Fatal("the provider's counter was absorbed as the customer's retry — the key lookup is not " +
+			"scoped by the offering party")
+	}
+	if mine.ID == theirs.ID {
+		t.Fatal("the provider was handed the customer's counter")
+	}
+	if mine.AmountCents != 43000 {
+		t.Errorf("the provider's counter is %d cents, want their own 43000", mine.AmountCents)
+	}
+}
+
+// TestConcurrentCountersLeaveExactlyOneLiveOffer is the race SHIP-88 has to survive, and the shape
+// migrations/bids_test.go's TestOneAcceptedBidPerJobHoldsUnderARace established.
+//
+// **Two counters against one offer is the ordinary case rather than an exotic one**: a customer taps
+// twice, or both parties answer in the same second. What must not happen is a fork — two live offers
+// each believing they displaced the same predecessor, which would leave "the latest valid offer"
+// meaningless and SHIP-92 with two rows to choose between.
+//
+// Three mechanisms stand behind it and the test does not care which one answers, only that the
+// outcome holds: `lockBid`'s `FOR UPDATE` serialises the transactions, `supersedeHead`'s
+// compare-and-set matches nothing for the loser, and `uq_bids_one_submitted_per_provider_per_job`
+// refuses the second live offer at the index. The first is what makes the refusal legible; the last is
+// 000501's index doing exactly what its header promised, and is what holds if the first two are ever
+// removed.
+//
+// Eight goroutines under *eight different keys*, deliberately: one key would be answered as a retry
+// and would prove the idempotency path rather than this one.
+func TestConcurrentCountersLeaveExactlyOneLiveOffer(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-race-base"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	const requests = 8
+
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		succeeded int
+		refused   []error
+		broke     []error
+	)
+
+	wg.Add(requests)
+	for i := range requests {
+		go func() {
+			defer wg.Done()
+
+			_, _, err := m.counter(t, m.customer, m.job, placed.ID,
+				counterOf(int64(40000+i), fmt.Sprintf("key-race-%d", i)))
+
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, ErrBidClosed):
+				refused = append(refused, err)
+			default:
+				broke = append(broke, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(broke) > 0 {
+		t.Fatalf("%d of %d concurrent counters failed with something other than a legible refusal, "+
+			"first: %v", len(broke), requests, broke[0])
+	}
+	if succeeded != 1 {
+		t.Errorf("%d of %d concurrent counters succeeded, want exactly 1", succeeded, requests)
+	}
+	if len(refused) != requests-1 {
+		t.Errorf("%d counters were refused with ErrBidClosed, want %d — the losers must be told the "+
+			"offer they answered is no longer live", len(refused), requests-1)
+	}
+
+	// The outcome that matters, read off the table rather than off the return values.
+	var (
+		live       int
+		successors int
+		total      int
+	)
+	if err := m.pool.QueryRow(t.Context(), `
+		SELECT count(*) FILTER (WHERE status = 'Submitted'),
+		       count(*) FILTER (WHERE superseded_by IS NOT NULL),
+		       count(*)
+		  FROM bids WHERE job_id = $1 AND provider_id = $2`, m.job, m.provider).
+		Scan(&live, &successors, &total); err != nil {
+		t.Fatalf("reading the negotiation: %v", err)
+	}
+	if live != 1 {
+		t.Errorf("the negotiation holds %d live offers, want exactly 1 — a fork is what "+
+			"uq_bids_one_submitted_per_provider_per_job and the row lock exist to prevent", live)
+	}
+	if successors != 1 {
+		t.Errorf("%d offers have been superseded, want exactly 1", successors)
+	}
+	if total != 2 {
+		t.Errorf("the negotiation holds %d rows after one placement and eight racing counters, want 2", total)
+	}
+}
+
+// --- SHIP-87: what a counter does to the offer before last ---------------------------------------
+
+// TestOnlyTheHeadOfAChainCanBeCountered is what "each counter supersedes the prior offer" means for
+// the offer before last.
+//
+// A superseded offer is not the latest valid one, so it cannot be answered. Docs/02 §4 says only the
+// latest valid offer can be acted on, and this is that rule met through the endpoint — where the
+// refusal is legible. SHIP-88 makes it a constraint as well.
+func TestOnlyTheHeadOfAChainCanBeCountered(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-head-base"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-head-one")); err != nil {
+		t.Fatalf("the customer's counter: %v", err)
+	}
+
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID,
+		counterOf(38000, "key-head-stale")); !errors.Is(err, ErrBidClosed) {
+		t.Fatalf("countering a superseded offer = %v, want ErrBidClosed", err)
+	}
+	if n := m.bids(t, m.provider, m.job); n != 2 {
+		t.Errorf("a stale counter wrote a row: the negotiation holds %d", n)
+	}
+}
+
+// TestASupersededOfferCanBeNeitherRevisedNorWithdrawn is the same rule met by SHIP-85's and
+// SHIP-86's verbs.
+//
+// `Status.live()` is one predicate and all three verbs gate on it, which is what stops a provider
+// re-pricing an offer the customer has already answered — the customer would be looking at a
+// negotiation whose earlier round had changed underneath them.
+func TestASupersededOfferCanBeNeitherRevisedNorWithdrawn(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-superseded-verbs"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-superseded-c")); err != nil {
+		t.Fatalf("countering: %v", err)
+	}
+
+	if _, err := m.revise(t, m.provider, m.job, placed.ID,
+		Revision{AmountCents: ptr(int64(44000))}); !errors.Is(err, ErrBidClosed) {
+		t.Errorf("revising a superseded offer = %v, want ErrBidClosed", err)
+	}
+	if _, err := m.withdraw(t, m.provider, m.job, placed.ID); !errors.Is(err, ErrBidClosed) {
+		t.Errorf("withdrawing a superseded offer = %v, want ErrBidClosed", err)
+	}
+	if got := m.row(t, placed.ID); got.amount != 450.00 || got.status != string(StatusSuperseded) {
+		t.Errorf("a refused verb changed the superseded offer: %+v", got)
+	}
+}
+
+// TestAnAcceptedOfferCannotBeCountered keeps the award final.
+//
+// Its own sentinel rather than [ErrBidClosed], because the two lead a client somewhere different: an
+// accepted offer is a job somebody has won and the app shows it, and Docs/02 §6.2 makes stepping away
+// from awarded work a provider cancellation rather than another round of haggling.
+func TestAnAcceptedOfferCannotBeCountered(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-accepted-counter"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	m.setStatus(t, placed.ID, StatusAccepted)
+
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID,
+		counterOf(40000, "key-accepted-counter-c")); !errors.Is(err, ErrBidAccepted) {
+		t.Fatalf("countering an accepted offer = %v, want ErrBidAccepted", err)
 	}
 }

@@ -201,6 +201,22 @@ type bidResponse struct {
 	JobID  string `json:"job_id"`
 	Status string `json:"status"`
 
+	// OfferedBy is which party made this offer — `provider` or `customer` (SHIP-87).
+	//
+	// **A key added deliberately, in the three places the closed set lives**: here, `providerBidKeys`
+	// in http_test.go, and the `Bid` schema in contracts/paths/bidding.yaml. That is the cost the
+	// closed set is meant to impose, and it is paid rather than worked around.
+	//
+	// It is not derivable by the client. A chain alternates, so a client could in principle count
+	// from the end — except that it may join a negotiation halfway (a provider opening an old bid, a
+	// customer returning to a job), and a negotiation may hold more than one chain, since a withdrawn
+	// offer can be replaced. Rendering "you" against "them" is the whole of what a negotiation screen
+	// does, and inferring it is not acceptable there.
+	//
+	// [Bid.ProviderID] is still absent, and now for a better reason than SHIP-84's: both callers who
+	// can obtain a bid already know which provider the negotiation is with.
+	OfferedBy string `json:"offered_by"`
+
 	AmountCents int64 `json:"amount_cents"`
 
 	PickupAt  string `json:"pickup_at"`
@@ -210,15 +226,26 @@ type bidResponse struct {
 	// note" without a second flag.
 	Message string `json:"message,omitempty"`
 
+	// SupersededBy is the counter-offer that displaced this one, omitted while this is the live head
+	// of its chain (SHIP-88).
+	//
+	// **This is what makes a history readable rather than merely ordered.** The chain endpoint returns
+	// a negotiation's offers oldest first, which is enough to *show*; this is what lets a client say
+	// which offer answered which. Its absence is the single most useful thing in the shape — it names
+	// the one offer still standing, which is the only one anybody can act on, and it is the same fact
+	// `ck_bids_superseded_is_not_live` holds the award to.
+	SupersededBy string `json:"superseded_by,omitempty"`
+
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 }
 
 func bidFrom(b Bid) bidResponse {
-	return bidResponse{
-		ID:     b.ID.String(),
-		JobID:  b.JobID.String(),
-		Status: b.Status.Wire(),
+	response := bidResponse{
+		ID:        b.ID.String(),
+		JobID:     b.JobID.String(),
+		Status:    b.Status.Wire(),
+		OfferedBy: b.OfferedBy.Wire(),
 
 		AmountCents: b.AmountCents,
 
@@ -229,6 +256,10 @@ func bidFrom(b Bid) bidResponse {
 		CreatedAt: timestamp(b.CreatedAt),
 		UpdatedAt: timestamp(b.UpdatedAt),
 	}
+	if b.SupersededBy != uuid.Nil {
+		response.SupersededBy = b.SupersededBy.String()
+	}
+	return response
 }
 
 // timestamp renders an instant the way every other endpoint does, in UTC with milliseconds.
@@ -486,6 +517,134 @@ func (h *Handler) Withdraw() http.Handler {
 	})
 }
 
+// counterRequest is the body of POST /v1/jobs/{id}/bids/{bid_id}/counter (SHIP-87).
+//
+// **The same four pointers [reviseRequest] carries, and that is 000501's deferred decision cashed.**
+// That migration removed `ck_bids_offer_has_timing` because it would have bound this shape: "whether
+// a customer countering on *price alone* restates the timing or inherits it from the offer it
+// supersedes is that ticket's decision." It inherits — see [Counter] for the two reasons, one shared
+// with a revision and one specific to a negotiation.
+//
+// There is no `offered_by`, no `job_id`, no `provider_id` and no `status`. **Which party is
+// countering is derived from the caller and the offer being answered**, never sent: a field naming
+// the author would be an authorisation decision made from client input, which Docs/07 §3 puts on the
+// platform. httpx.DecodeJSON refuses unknown fields, so a client sending one is told it does not
+// exist rather than having it ignored.
+type counterRequest struct {
+	AmountCents *int64 `json:"amount_cents"`
+
+	// PickupAt and DeliverBy are RFC 3339 strings, parsed by hand for the reason [bidRequest]'s are.
+	PickupAt  *string `json:"pickup_at"`
+	DeliverBy *string `json:"deliver_by"`
+
+	// Message is the conditions accompanying the counter. Sending it blank clears whatever the offer
+	// being answered carried.
+	Message *string `json:"message"`
+}
+
+// counter turns the request into the domain's command, reporting anything it could not parse.
+//
+// A parse failure is answered on its own rather than merged with the domain's complaints, for the
+// reason [reviseRequest.revision] gives: a counter is validated against the *stored* offer, and
+// reading that row means finding the bid, which is behind the authorisation check. Reaching for the
+// value rules here would mean judging an offer before establishing the caller may answer it.
+//
+// The key is read from the header here and not by the middleware alone, exactly as a placement's is
+// (SHIP-84). A counter writes a row, so the key is a *column* rather than only a cache entry: the
+// middleware replays a response while its entry lives, and the column answers a retry forever. See
+// [Counter] and migration 000501.
+func (b counterRequest) counter(key string) (Counter, error) {
+	var e validate.Errors
+
+	c := Counter{AmountCents: b.AmountCents, Message: b.Message, Key: key}
+	if b.PickupAt != nil {
+		at := instant("pickup_at", *b.PickupAt, &e)
+		c.PickupAt = &at
+	}
+	if b.DeliverBy != nil {
+		by := instant("deliver_by", *b.DeliverBy, &e)
+		c.DeliverBy = &by
+	}
+
+	if err := e.Err(); err != nil {
+		return Counter{}, err
+	}
+	return c, nil
+}
+
+// Counter handles POST /v1/jobs/{id}/bids/{bid_id}/counter (SHIP-87).
+//
+// **The first endpoint in this domain a customer may call**, and the reason the domain now holds two
+// ports. Docs/02 §4 lets either party counter, so one route serves both and the platform works out
+// which side the caller is on: the provider is a comparison against `bids.provider_id`, and the
+// customer is `jobs`' fact, asked through [Negotiation.CustomerOf].
+//
+// **The route requires a user and not a role**, exactly as the three before it, and here that matters
+// more than it did. A role claim in a token would be the wrong thing to branch on for an endpoint
+// whose two callers are told apart by the *database* — and a customer presenting a token claiming
+// `provider` is still recognised as the customer of their own job, which is what CLAUDE.md means by
+// no authorisation decision on the device.
+//
+// A verb under the bid rather than a second `POST` on the collection, because a counter *answers a
+// particular offer*: the offer being superseded is the resource this acts on, and naming it in the
+// path is what makes two counters against one offer a race the platform can see rather than two
+// independent creations. `PATCH` would have been wrong for the opposite reason — a counter creates a
+// row and leaves the one it answers behind, which is precisely what SHIP-85's revision does not do.
+//
+// **201, or 200 when this key had already made this counter.** The same pair [Handler.Place] answers
+// with, and the same shape either way, so a client that does not care which happened parses one type.
+//
+// A caller who is neither party answers 404, byte-identically to a bid that does not exist. See
+// [apiError].
+func (h *Handler) Counter() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		callerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, bidID, err := pathIDs(r)
+		if err != nil {
+			return err
+		}
+
+		var req counterRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		counter, err := req.counter(r.Header.Get(httpx.HeaderIdempotencyKey))
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var (
+			bid     Bid
+			created bool
+		)
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			bid, created, err = h.svc.CounterOffer(ctx, runner, callerID, jobID, bidID, counter)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		httpx.WriteJSON(w, status, bidFrom(bid))
+		return nil
+	})
+}
+
 // pathIDs reads both identifiers a bid is addressed by.
 //
 // One function rather than two calls in each handler, so that a malformed job id and a malformed bid
@@ -615,11 +774,37 @@ func apiError(err error) error {
 
 	case errors.Is(err, ErrBidClosed):
 		return httpx.NewError(http.StatusConflict, CodeBidClosed,
-			"That offer is no longer live, so it cannot be revised or withdrawn.").WithCause(err)
+			"That offer is no longer live, so it can be neither changed nor answered.").WithCause(err)
+
+	case errors.Is(err, ErrNegotiationOver):
+		// Deliberately CodeBidClosed rather than a code of its own. The client does the same thing
+		// with it as with a superseded or rejected offer — this negotiation is finished — and the
+		// message is what says which. Once SHIP-93 closes competing bids on award, this branch is
+		// reached less and less: the offer itself will be Rejected and answer through the case above.
+		return httpx.NewError(http.StatusConflict, CodeBidClosed,
+			"That job can no longer be awarded, so there is nothing a counter-offer could "+
+				"lead to.").WithCause(err)
+
+	case errors.Is(err, ErrWrongParty):
+		// 409 rather than 404: the caller is a party to this negotiation and will see the offer in
+		// its history, so hiding it here would be an inconsistency rather than a disclosure control.
+		// Its own code, because the client's correct response is a *different request* — a `PATCH`
+		// where it sent a counter, or a counter where it sent a `PATCH`.
+		return httpx.NewError(http.StatusConflict, CodeWrongParty,
+			"That offer belongs to the other party. Counter an offer they made; revise one you "+
+				"made yourself.").WithCause(err)
 
 	case errors.Is(err, ErrNothingToRevise):
 		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
 			"The request changes nothing. Send at least one field to revise.").WithCause(err)
+
+	case errors.Is(err, ErrNothingToCounter):
+		// Kept apart from the revision's answer even though both are `bad_request`. A counter that
+		// changes nothing is agreement rather than a client defect, and the client's next screen is
+		// the award rather than the form it just submitted.
+		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"A counter-offer has to change something. To accept these terms, award the job "+
+				"rather than countering.").WithCause(err)
 
 	case errors.Is(err, ErrAlreadyBid):
 		// 409 rather than 422: the values are well formed and the request contradicts the state the

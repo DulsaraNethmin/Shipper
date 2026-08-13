@@ -36,7 +36,24 @@ const (
 	StatusSubmitted Status = "Submitted"
 
 	// StatusCountered is an offer that has been answered with a different price or timing.
-	// Docs/02 §4 lets either party counter, and each counter supersedes the prior offer.
+	//
+	// **Nothing writes it, and SHIP-87 decided that deliberately rather than by omission.** Docs/02
+	// §4 lists it beside 'Superseded' and describes the two in almost the same words — one offer
+	// "answered with a different price or timing", the other "displaced by a counter from either
+	// party" — which are the same event seen from the two ends. A platform that wrote both would be
+	// writing two statuses for one transition and would then have to say which of them a client
+	// branches on.
+	//
+	// 'Superseded' is the one written, for a reason outside this file: [CodeBidClosed] and the
+	// `BidNoLongerYours` response in contracts/paths/bidding.yaml have both enumerated "rejected,
+	// expired, superseded" as the closed statuses since SHIP-85, and neither names 'Countered'. The
+	// published vocabulary had already made the choice; this constant is what records that it was
+	// noticed rather than overlooked.
+	//
+	// It stays in `ck_bids_status` because Docs/02 §4 has it and Docs/10 §3.4 pairs the list with
+	// the constraint in both directions. The trigger for writing it: a ticket that needs to
+	// distinguish "displaced because the other party answered" from some other way of being
+	// displaced. There is no other way today. Docs/11 §3 reports the overlap in Docs/02 §4.
 	StatusCountered Status = "Countered"
 
 	// StatusAccepted is the awarded offer. At most one bid per job may hold it, and that is a
@@ -78,25 +95,76 @@ var Statuses = []Status{
 	StatusSuperseded,
 }
 
-// live reports whether an offer is still the provider's to change (SHIP-85, SHIP-86).
+// live reports whether an offer is still open for either party to act on (SHIP-85, SHIP-86,
+// SHIP-87).
 //
 // **One status, named rather than guessed at.** That is migration 000501's reading of
 // uq_bids_one_submitted_per_provider_per_job, taken here for the same reason: 'Submitted' is the only
-// status this platform writes and the only one that today means "a live offer from this provider that
-// the other party has not answered". A predicate written against the *word* "active" would be a guess
-// at a design SHIP-87 has not made.
+// status this platform writes and the only one that means "a live offer that the other party has not
+// answered". A predicate written against the *word* "active" would have been a guess at a design
+// SHIP-87 had not made.
 //
-// **Both revision and withdrawal gate on this, because Docs/01 §4.2 bounds them identically** —
-// "place, update, and withdraw a bid until it is accepted or expires". Two predicates that have to
-// agree are one predicate; the two endpoints differ in what they do about a status that fails it, not
-// in which statuses fail.
+// **SHIP-87 has now made it, and the set did not widen.** 000501 offered "if SHIP-87 finds it needs a
+// wider predicate — 'Submitted' or 'Countered', say — that is one extra value in an additive
+// migration". It does not need one. A counter-offer is a *new row* at 'Submitted', and the offer it
+// displaces is moved to 'Superseded' in the same transaction — so one status still covers "the live
+// offer in this negotiation". 000502's ck_bids_superseded_is_not_live makes that a database fact
+// rather than a convention: a displaced row cannot re-enter this predicate.
 //
-// It is deliberately not widened to 'Countered'. A provider answering a customer's counter is making a
-// counter-offer, which supersedes the prior offer (Docs/02 §4) and is SHIP-87's ticket with SHIP-88's
-// chain behind it; treating that as an in-place revision would settle their design by accident. If
-// SHIP-87 finds the set should be wider, adding a status here is one line — the same additive
-// direction 000501 deliberately left its index in.
+// **Three verbs gate on this now.** Docs/01 §4.2 bounds a revision and a withdrawal identically —
+// "place, update, and withdraw a bid until it is accepted or expires" — and Docs/02 §4 bounds a
+// counter the same way, since only the latest valid offer can be acted on. Predicates that have to
+// agree are one predicate; the endpoints differ in what they do about a status that fails it, not in
+// which statuses fail.
+//
+// 'Countered' is deliberately never written — see [StatusCountered].
 func (s Status) live() bool { return s == StatusSubmitted }
+
+// Party is who made an offer: the provider bidding, or the customer answering them (SHIP-87).
+//
+// **The values are `users.role`'s and `job_status_history.actor_type`'s**, lower case, rather than
+// Docs/02's sentence-case bid statuses. They name a kind of person rather than a lifecycle state, and
+// both existing columns in this database that name a kind of person spell them this way.
+//
+// It is a separate fact from `bids.provider_id`, which names the provider a negotiation is *with*
+// rather than the author of any one row. 000502 reinterprets that column deliberately and says why
+// the alternative is worse.
+type Party string
+
+const (
+	// PartyProvider is the provider bidding on the job.
+	PartyProvider Party = "provider"
+
+	// PartyCustomer is the customer who owns the job, answering an offer they received.
+	PartyCustomer Party = "customer"
+)
+
+// Parties is both, in the order a negotiation reaches them: a provider offers, a customer answers.
+//
+// Ordered rather than a set for the reason [Statuses] is, and paired with `ck_bids_offered_by` by
+// TestEveryOfferingPartyMatchesTheConstraint — the discipline Docs/10 §3.4 requires of every
+// enumeration held in two places.
+var Parties = []Party{PartyProvider, PartyCustomer}
+
+// Valid reports whether p is one of the two.
+func (p Party) Valid() bool {
+	for _, known := range Parties {
+		if p == known {
+			return true
+		}
+	}
+	return false
+}
+
+func (p Party) String() string { return string(p) }
+
+// Wire is the party as it appears in a response body.
+//
+// Both values are already lower snake case, so this is the identity — written as a method all the
+// same, because Docs/10 §4.7's rule is about the wire form rather than about whether a particular
+// pair of strings happens to satisfy it, and a third party added by some later ticket must not have
+// to remember that the conversion was skipped here.
+func (p Party) Wire() string { return string(p) }
 
 // Valid reports whether s is one of the eight.
 func (s Status) Valid() bool {
@@ -153,10 +221,37 @@ type Bid struct {
 	ID    uuid.UUID
 	JobID uuid.UUID
 
-	// ProviderID is who made the offer. Present on the model and deliberately absent from the wire:
-	// the only caller who can obtain a bid today is the provider who made it, so a field naming them
-	// would be the client's own identifier read back to it.
+	// ProviderID is the provider this negotiation is with — **not necessarily the author of this
+	// row**, since SHIP-87. A customer's counter-offer carries the same provider id and is
+	// distinguished by [Bid.OfferedBy]; 000502 says why that reinterpretation is cheaper than the
+	// alternative.
+	//
+	// Present on the model and deliberately absent from the wire. Both callers who can obtain a bid
+	// already know which provider the negotiation is with: the provider is that provider, and the
+	// customer reached it through their own job.
 	ProviderID uuid.UUID
+
+	// OfferedBy is which party made this offer (SHIP-87).
+	//
+	// Docs/02 §4 lets either party counter, so a chain alternates — provider, customer, provider —
+	// and this is what says which link is which. It reaches the wire, unlike [Bid.ProviderID],
+	// because a client rendering a negotiation has to show "you" against "them" and cannot derive
+	// that from a chain it may have joined halfway through.
+	OfferedBy Party
+
+	// SupersededBy is the counter-offer that displaced this one, or [uuid.Nil] if this is the live
+	// head of its chain (SHIP-88).
+	//
+	// **The link points backwards, from the displaced row to its successor**, and 000502 argues the
+	// choice at length: with the link here, "this offer has been displaced" is a fact in the row
+	// itself, which is what lets `ck_bids_superseded_is_not_live` express "only the latest valid
+	// offer is acceptable" as an ordinary column constraint rather than as a rule SHIP-92 has to
+	// remember.
+	//
+	// [uuid.Nil] rather than a pointer, because "no successor" is a total answer here rather than a
+	// missing one: every row either has been displaced or is the head, and a nil pointer would add a
+	// third state — unknown — that no read of this table can produce.
+	SupersededBy uuid.UUID
 
 	// Status is one of the eight in Docs/02 §4. Never settable by a client, on this endpoint or any
 	// other.
@@ -307,6 +402,90 @@ func (r Revision) applyTo(b Bid) Offer {
 	}
 	return o.normalise()
 }
+
+// Counter is one party answering the other party's offer with different terms (SHIP-87).
+//
+// Docs/02 §4: "A customer counter-offer supersedes the prior provider offer. A provider
+// counter-offer supersedes the prior customer offer." One type for both directions, because the two
+// sentences describe one act — which is also why there is one endpoint rather than two.
+//
+// # It carries the same pointers a [Revision] does, and that is the decision 000501 deferred to this
+// ticket
+//
+// 000501 removed `ck_bids_offer_has_timing` because it would have bound this choice: "whether a
+// customer countering on *price alone* restates the timing or inherits it from the offer it
+// supersedes is that ticket's decision."
+//
+// **It inherits.** A counter names what it is changing and takes the rest from the offer it answers,
+// for the reason [Revision] gives about a revision and one more that is specific to a negotiation.
+// The reason it shares: a client made to restate two timestamps it is not touching is a client that
+// can get them wrong, and countering on price alone is the ordinary case rather than the exceptional
+// one. The reason it does not: in a negotiation the *unchanged* fields are the agreement so far, and
+// a shape that made both parties restate them would turn every round into a fresh offer that
+// happened to look similar — which is exactly the thing "supersedes the prior offer" says a counter
+// is not.
+//
+// The merged result is validated by [Offer.validate], the same validator a placement meets, so a
+// counter cannot reach a state a placement could not. That includes the surprise [Revision] records:
+// countering on price alone against an offer whose `pickup_at` has since passed is refused naming
+// `pickup_at`, a field the caller did not send.
+//
+// # There is no party field and no status field
+//
+// Which party is countering is decided from the caller and the offer being answered, never from the
+// body — an author in a request body would be an authorisation decision made from client input,
+// which Docs/07 §3 puts on the platform. The status is the platform's, as it is on every other shape
+// in this package.
+//
+// # Unlike a [Revision], it carries a key, because it writes a row
+//
+// [Revision] has no key and says why at length: an `UPDATE` applied twice reaches the state applying
+// it once reaches, so there is no second row for a retry to create. A counter is an `INSERT`, so the
+// whole of that argument runs the other way and SHIP-84's applies instead — the key is stored on the
+// row, and a retry that outlives the middleware's cache is answered from the record rather than
+// adding a second link to the chain.
+type Counter struct {
+	AmountCents *int64
+	PickupAt    *time.Time
+	DeliverBy   *time.Time
+
+	// Message is the conditions accompanying the counter. Present and blank clears whatever the
+	// offer being answered carried, which is the treatment [Revision] gives it.
+	Message *string
+
+	// Key is the caller's idempotency key, which becomes the new row's. Required: see
+	// [ErrNoIdempotencyKey].
+	Key string
+}
+
+// terms is the counter's changes as a [Revision], so that the merge is written once.
+//
+// The two shapes are the same four pointers over the same four columns, and the merge rule is the
+// same rule: name what changes, inherit the rest, validate the whole. A second copy of `applyTo`
+// would be a second place for that rule to be corrected, and the correction that reached only one of
+// them would produce a revision and a counter that disagreed about what an omitted field means.
+//
+// It is not the other way round — [Revision] is not defined in terms of [Counter] — because a
+// revision genuinely has no key and giving it one would reintroduce the trap [Revision] documents.
+func (c Counter) terms() Revision {
+	return Revision{
+		AmountCents: c.AmountCents,
+		PickupAt:    c.PickupAt,
+		DeliverBy:   c.DeliverBy,
+		Message:     c.Message,
+	}
+}
+
+// IsEmpty reports whether the caller named no field at all.
+//
+// Refused rather than answered, for [Revision.IsEmpty]'s reason and a sharper one. A counter that
+// changes nothing is not a counter: it is agreement, and agreement is the *award* — the customer's
+// act, through an endpoint this ticket does not build. Writing it as a counter would put a second
+// identical offer at the head of the chain and leave a client believing it had done something.
+func (c Counter) IsEmpty() bool { return c.terms().IsEmpty() }
+
+// applyTo is the offer that would stand if this counter were made.
+func (c Counter) applyTo(b Bid) Offer { return c.terms().applyTo(b) }
 
 // normalise collapses whitespace and moves both instants to UTC.
 //
