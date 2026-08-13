@@ -1,0 +1,310 @@
+# Bidding — what a provider offers against a job, and what the customer eventually awards.
+#
+# The counterpart of cmd/api/routes_bidding.go. Docs/10 §8.1 keeps the two in step: a domain adds one
+# route file and one fragment, and edits neither this file's siblings nor the middle of a shared
+# document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence for
+# the contract to describe less than the service returns. Here it is doing a second job as well: the
+# schema below is the published half of a closed key set that a Go test and a `make verify` check both
+# hold the real response to, which is how Docs/01 §4.3's budget rule is enforced by default rather
+# than by remembering.
+#
+# # Two privacy rules govern everything in this file, and they are not the same rule
+#
+# **The customer's maximum budget never appears in any provider-facing shape**, in any form — not an
+# amount, not a band, not a "budget supplied" flag (Docs/01 §4.3). Nothing described here reads a job
+# at all, so there is no field to withhold.
+#
+# **And one provider never sees another provider's offer or its price.** Docs/01 §4.3's second line.
+# A bid is visible to the provider who made it, to the customer who received it, and to
+# administrators (Docs/02 §4) — never to a competitor. The endpoint below answers with the calling
+# provider's own offer and nothing else, and the idempotency key that identifies a retry is scoped to
+# the caller as well as to the job.
+
+Bids:
+  post:
+    operationId: placeBid
+    summary: Place a bid on a job
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Offers to carry a job, for a price and against a commitment about timing (SHIP-84).
+
+      Only a **verified, eligible** provider may bid, and eligibility is the platform's decision:
+      service area, vehicle capability, verification state and job status (Docs/01 §4.3). It is the
+      same filter behind `GET /v1/jobs/open`, so a job in your feed is a job you can bid on, and a
+      job that is not answers `404` here exactly as it does there.
+
+      A job you may not bid on and a job that does not exist are **the same answer**. Which jobs a
+      competitor may bid on, and what became of work you were not given, are not things this API
+      discloses.
+
+      ## Price and timing
+
+      ```json
+      {
+        "amount_cents": 45000,
+        "pickup_at": "2026-08-20T09:00:00+10:00",
+        "deliver_by": "2026-08-20T17:00:00+10:00",
+        "message": "Can collect from the loading dock any time after eight."
+      }
+      ```
+
+      `amount_cents` is **your** price in cents — a whole number, because money is never a decimal in
+      transit. It has nothing to do with anything the customer set: the customer's maximum is private
+      and this API will never show it to you in any form.
+
+      `pickup_at` and `deliver_by` are **instants, not windows**. The job states the customer's
+      flexibility; your bid states a commitment against it. Delivery must be after collection, and
+      collection must be in the future.
+
+      Your timing is deliberately **not** required to fall inside the job's own windows. Offering a
+      different day is a legitimate offer the customer is free to decline, and jobs frequently state
+      no window at all.
+
+      `message` is optional and is where conditions go, in your own words.
+
+      ## One live offer per job
+
+      A second bid on a job you already have a live offer on is refused with `bidding_already_bid`.
+      Revise it or withdraw it instead — a live offer is one the customer may accept at any moment,
+      and two from one provider is two prices for one job.
+
+      This is not what a **retry** produces. See below.
+
+      ## Retrying
+
+      Reuse the `Idempotency-Key` of the request you are retrying and you get the offer that request
+      placed, answered `200`, with nothing further recorded. That holds whether the retry arrives a
+      second later or a week later: the guarantee is a unique index in the database rather than a
+      cached response, so a phone that was out of signal for a day still gets its own bid back rather
+      than a conflict.
+
+      A **new** offer needs a **new** key. One key per action.
+
+      ## The job's status does not change
+
+      A job with offers on it presents as `negotiating` and **remains open to eligible bids**
+      (Docs/02 §1) — competitors can and do keep bidding. That presentation is not built yet; what is
+      built is the part that matters, which is that bidding on a job neither closes it nor reserves
+      it.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/BidPlacement'
+    responses:
+      '201':
+        description: |
+          The offer is placed and the customer can see it.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '200':
+        description: |
+          This `Idempotency-Key` had already placed this offer. Nothing was written and the original
+          is returned — the same shape as `201`, so a client that does not care which happened parses
+          one type.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          One of three, and they lead to three different places:
+
+          | `error.code` | What happened |
+          |---|---|
+          | `bidding_already_bid` | You have a live offer on this job already. Revise or withdraw it |
+          | `idempotency_key_reused` | This key was used for a *different* request. Generate a new one |
+          | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field, with the JSON path the client sent.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- schemas ---------------------------------------------------------------------------------
+
+BidPlacement:
+  type: object
+  additionalProperties: false
+  required: [amount_cents, pickup_at, deliver_by]
+  description: |
+    What you are offering. Unknown fields are refused, so a client typo fails loudly rather than
+    being silently ignored.
+
+    There is no field for whose bid this is and none for its status. The bidder is whoever the token
+    says is calling, and a bid's status is the platform's — a provider cannot accept their own offer.
+  properties:
+    amount_cents:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 100000000
+      description: |
+        Your price for the whole job, in cents. AUD; there is no currency field in the MVP.
+
+        Minor units as a whole number because money is never a floating-point value: `450.50` is not
+        exactly representable and the errors accumulate. `45000` is $450.00.
+      example: 45000
+    pickup_at:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. When you commit to collecting. Must be in the future.
+      example: '2026-08-20T09:00:00+10:00'
+    deliver_by:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. When you commit to having delivered. Must be after `pickup_at`.
+      example: '2026-08-20T17:00:00+10:00'
+    message:
+      type: string
+      maxLength: 2000
+      description: |
+        Conditions accompanying the offer, in your own words — access, timing caveats, what the price
+        includes. Optional.
+      example: Can collect from the loading dock any time after eight.
+
+Bid:
+  type: object
+  additionalProperties: false
+  required: [id, job_id, status, amount_cents, pickup_at, deliver_by, created_at, updated_at]
+  description: |
+    One offer against one job, as the provider who made it sees it.
+
+    **The key set here is closed, and that is a privacy mechanism rather than tidiness.** Docs/01
+    §4.3 forbids the customer's budget reaching a provider "as an amount, a band, or a 'budget
+    supplied' flag", and a rule expressed as a list of forbidden names cannot say that — `max_price`
+    is a budget and does not contain the word. `additionalProperties: false` is the other direction:
+    anything not promised is refused. A Go test and a `make verify` check assert the same closed set
+    against the real response, so a field added here is a decision somebody records in three places
+    rather than one that arrives with a schema change.
+
+    Nothing about the job travels in this shape beyond its identifier. Read `GET /v1/jobs/open/{id}`
+    for the job.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    status:
+      type: string
+      enum: [draft, submitted, countered, accepted, rejected, withdrawn, expired, superseded]
+      description: |
+        Docs/02 §4's eight bid statuses, in lower snake case. A bid placed through this endpoint is
+        `submitted`: a live offer awaiting the customer.
+
+        The other seven are reachable through endpoints that are being built — revision, withdrawal,
+        counter-offers and the award — and are listed because they are the vocabulary a client is
+        being written against.
+      example: submitted
+    amount_cents:
+      type: integer
+      format: int64
+      description: Your price, in cents, as you sent it.
+      example: 45000
+    pickup_at:
+      type: string
+      format: date-time
+      description: When you committed to collecting, in UTC.
+      example: '2026-08-19T23:00:00.000Z'
+    deliver_by:
+      type: string
+      format: date-time
+      description: When you committed to having delivered, in UTC.
+      example: '2026-08-20T07:00:00.000Z'
+    message:
+      type: string
+      description: The conditions you sent, whitespace collapsed. Omitted when you sent none.
+      example: Can collect from the loading dock any time after eight.
+    created_at:
+      type: string
+      format: date-time
+      description: When the offer was placed, on the platform's clock, in UTC.
+      example: '2026-08-13T04:15:30.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      example: '2026-08-13T04:15:30.000Z'
+
+# --- parameters ------------------------------------------------------------------------------
+
+JobID:
+  name: id
+  in: path
+  required: true
+  description: The job's identifier.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a phone that retries
+    after a dropped connection must not end up having bid twice.
+
+    Here the key is more than a retry mechanism: it is stored against the bid, so a retry that
+    arrives after any cache has forgotten it is still answered with the offer it placed rather than
+    refused as a second bid. The key is scoped to you and to the job — reusing one value across two
+    jobs is two requests that both succeed, and no key of yours can reach another provider's offer.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d

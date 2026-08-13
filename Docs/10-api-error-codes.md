@@ -48,6 +48,7 @@ them where the call is made, beside the thing the user was trying to do.
 
 | Code | Meaning |
 |---|---|
+| `bidding_already_bid` | You already have a live offer on this job. Revise or withdraw it rather than placing a second. |
 | `delivery_driver_already_assigned` | This job already has a driver. Reload it to see who is carrying it. |
 | `delivery_job_not_assignable` | A driver can only be assigned to a job that has been awarded and has not yet set off. Reload the job to see its current status. |
 | `delivery_milestone_not_permitted` | This milestone cannot be recorded from the job's current status. Reload the delivery to see what it is, and keep the update — a late one will be absorbed rather than refused once SHIP-112 lands. |

@@ -111,6 +111,18 @@ tags:
       once it is published, and to the awarded provider's driver only through a job-scoped token.
 
       The customer's maximum budget never appears in any provider-facing shape (Docs/01 §4.3).
+  - name: Bidding
+    description: |
+      What a provider offers against a job, and what the customer eventually awards.
+
+      Two privacy rules govern this surface and they are separate. The customer's maximum budget
+      never reaches a provider in any form — not an amount, not a band, not a "budget supplied"
+      indicator (Docs/01 §4.3). And one provider never sees another provider's offer or its price: a
+      bid is visible to the provider who made it, the customer who received it, and administrators,
+      never to a competitor (Docs/02 §4).
+
+      Exactly one bid per job can be accepted, and that is a database constraint rather than an
+      application rule (Docs/02 §3).
   - name: Delivery
     description: |
       Execution and proof, from the moment a provider names a driver through to completion. Every
@@ -192,6 +204,8 @@ paths:
     $ref: './paths/fleet.yaml#/OpenJobByID'
   /v1/jobs/{id}:
     $ref: './paths/jobs.yaml#/JobByID'
+  /v1/jobs/{id}/bids:
+    $ref: './paths/bidding.yaml#/Bids'
   /v1/jobs/{id}/cancel:
     $ref: './paths/jobs.yaml#/CancelJob'
   /v1/jobs/{id}/driver:

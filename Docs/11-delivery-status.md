@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **355 checks across 12 sections**, and `make check` green. Since
+Verified by `make verify` — **378 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -278,6 +278,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-81** | M3 | The job eligibility filter — **one SQL predicate in `fleet`, reaching four tables across three domains**, chosen over ports because ports cannot page a set intersection. Two readers, one clause; no endpoint until SHIP-82 — *see below* |
 | **SHIP-82** | M3 | `GET /v1/jobs/open` — the provider's feed, keyset-paged. **Declared in `routes_fleet.go`, not `routes_jobs.go`**: routes follow the domain that answers them, not the first segment of the path. It also deletes SHIP-81's SQL mirror from `make verify` in favour of real HTTP checks — *see below* |
 | **SHIP-83** | M3 | `GET /v1/jobs/open/{id}` — one job as a provider sees it, and **the fourth budget proof §8 recorded as still owed**: the serialised response, obtained over HTTP, held to a *closed set of keys* so that a budget renamed `max_price` fails too. The street line and the coordinate are confirmed withheld — *see below* |
+| **SHIP-84** | M3 | `POST /v1/jobs/{id}/bids` — a verified, eligible provider offers a price and two timing commitments. **Opens the `bidding` domain**, and reaches `fleet`'s eligibility answer through a port with no adapter behind it. "Bid once per job" and "a retry is not a second bid" are two partial unique indexes rather than two checks — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -2759,6 +2760,187 @@ Shared surfaces: two `$ref` lines in `contracts/openapi.yaml`, two lines in `rou
 (regenerated, not typed), and §3's check count (written by `make verify-update`). No
 `internal/boundaries` edit, no `Deps` field, no migration, no new error code — `not_found` already
 says the right thing — and `internal/fleet` still imports no domain.
+
+### SHIP-84 — the domain opens, and "once" turns out to be two indexes rather than one check
+
+`POST /v1/jobs/{id}/bids`. A verified, eligible provider offers a price and two commitments about
+timing, and the platform records one offer per provider per job however many times the request
+arrives. **This is the first code in `internal/bidding`**, which held `doc.go` and `model.go` and
+nothing else since SHIP-10.
+
+#### The eligibility question, and the port that needed no adapter
+
+The *Done when* opens with "a verified, eligible provider", and eligibility is `fleet`'s: SHIP-81
+built Docs/01 §4.3's four filters as one SQL predicate, and that file's own header names SHIP-84 as
+the reader `Service.EligibleFor` was built for. **So this domain does not decide who may bid; it
+asks.** `bidding/ports.go` declares a one-method `Eligibility` interface, `cmd/api/routes_bidding.go`
+passes a `*fleet.Service`, and neither package names the other.
+
+**Reimplementing the filter would have been the defect, not the import.** Two definitions of who may
+bid is one more than Docs/07 §3 permits, and the two would part company the first time one was
+corrected — leaving the endpoint that shows a provider a job and the endpoint that accepts their bid
+on it disagreeing. That is the worst available outcome: a provider prices a job the feed offered them
+and is refused after doing the work.
+
+**The wiring is one argument and one assertion, and that is worth noticing rather than assuming.**
+`routes_delivery.go` needs two adapter types, because a transition has four outcomes that cannot
+cross the boundary without naming a `jobs` sentinel. This port answers a `bool`, which has no
+vocabulary to translate, so `*fleet.Service` satisfies it structurally and the only other line is
+`var _ bidding.Eligibility = (*fleet.Service)(nil)` — the compile-time proof, in the one file that is
+allowed to know about both. **A port is only as expensive as the vocabulary it has to carry.**
+
+#### Both biddable statuses, and the test that would have caught the other answer
+
+`Docs/02` §1 makes **two** statuses biddable. Negotiating is "one or more active bids or counter-offers
+exist; **job remains open to eligible bids**", and §1 adds the sentence that settles it: "Technically,
+the job remains available for eligible bids unless the customer closes it or awards a bid."
+
+Nothing can reach Negotiating until SHIP-90, **so an implementation accepting only `Open` would pass
+every test written today and every check in `make verify`**. It would surface months from now as jobs
+silently refusing bids the moment somebody negotiated, which reads as a bidding defect rather than as
+a missing string in a filter. Wave 5 met the same shape in the feed and tested both;
+`TestABidIsAcceptedOnBothBiddableStatuses` and a `make verify` section do the same here, moving a job
+to Negotiating by hand precisely because no endpoint can. The list itself is not copied — it is
+`fleet`'s `biddableStatuses`, read through the port.
+
+#### "Once per job" and "a retry is not a second bid" are two different guarantees
+
+They look like one requirement and they are two, with two indexes behind them and two very different
+failure modes.
+
+| Mechanism | What it guarantees | Failure if it were missing |
+|---|---|---|
+| `uq_bids_one_submitted_per_provider_per_job` | one live offer per provider per job | two prices from one provider on one job |
+| `uq_bids_idempotency` on `(job_id, provider_id, idempotency_key)` | a retry is answered from the row it wrote | **a `409` for a request that succeeded** |
+| `httpx.Idempotent` (Redis) | the response is replayed, handler never runs | nothing — it is the cheap path, not the correct one |
+
+The second row is the one worth reading twice. Without the stored key, a provider whose bid was
+recorded and whose response never arrived would retry, meet the *first* index, and be told "you
+already have a live offer" — a client showing a failure for a bid that is live and awaiting an answer.
+**Redis makes the retry cheap; the key column makes it correct**, which is the division SHIP-111 drew
+for milestones, arrived at here from the opposite direction.
+
+`make verify` tells the two apart the way 70-delivery.sh does: the same key three times, with
+`redis-cli del` between the second and the third. `201`, then a byte-identical `201` carrying
+`Idempotency-Replayed: true`, then a `200` answered from the row with no such header. One bid at the
+end of all three.
+
+**There is no SELECT anywhere in this package asking whether the provider has already bid.** A read
+followed by a write is correct in a single-threaded reading and wrong under two taps on one phone.
+`ON CONFLICT (job_id, provider_id, idempotency_key) … DO NOTHING` names only the idempotency index as
+its arbiter, so a repeated key is absorbed silently while a *second* offer raises `23505` on the other
+index and becomes `bidding_already_bid`. PostgreSQL's speculative-insertion protocol checks the
+arbiter first, which is why a retry — which conflicts with both — is never mistaken for a second
+offer. Eight goroutines under one key produce exactly one row, and exactly one of them believes it
+created anything.
+
+#### A constraint that was written, applied, and then removed
+
+`ck_bids_offer_has_timing` — `status = 'Draft' OR (pickup_at IS NOT NULL AND deliver_by IS NOT NULL)`
+— is the obvious twin of 000500's `ck_bids_offer_has_an_amount`, and it is **deliberately not in
+`000501`**. It is worth recording because its absence looks like an oversight beside the constraint
+directly above it.
+
+It binds a design SHIP-87 has not made. A counter-offer is a new row in this table, and whether a
+customer countering on *price alone* restates the timing or inherits it is that ticket's decision;
+a constraint here settles it in the direction that costs a migration to undo. 000500 declined to write
+the one-active-bid index for exactly this reason — "a partial index written against a guess at that
+definition is a constraint the ticket would have to drop" — and the same reasoning applies pointing
+the other way.
+
+**The evidence was immediate rather than theoretical: it failed six of SHIP-80's own migration
+tests**, which insert `Submitted` and `Accepted` bids to exercise `ck_bids_status` and
+`uq_bids_one_accepted_per_job` and have no interest in timing. Making them pass would have meant
+editing another ticket's test file to accommodate a constraint that ticket had considered and left
+out — which is the signal that the constraint, not the test, was wrong. **Needing to edit another
+ticket's tests to make your schema change fit is worth treating as evidence about the schema change.**
+
+`ck_bids_timing_is_ordered` stays, and the difference is the test that separates them: no design
+anybody could want has a delivery preceding its own collection, so that one binds nobody. "An offer
+states its timing" is a product rule and lives in the validator, where it also produces a field error
+naming `pickup_at` rather than a constraint violation a caller cannot act on.
+
+#### Two instants, not two windows
+
+The job carries two *windows*, because a customer says "any time Thursday". The bid answers with two
+*instants*, because a provider says "I will be there at nine and it will be there by five". Three
+reasons: Docs/03 asks for "comparable price, timing" and two instants sort where four numbers do not;
+a window restates flexibility the customer already declared rather than committing to anything; and
+widening an instant into a window later is additive, where narrowing a stored window is a data
+migration with no honest answer for which end was meant.
+
+**The bid's timing is deliberately not bounded by the job's windows.** A provider offering a different
+day is making an offer the customer may decline, and Docs/01 §4.3's answer to bids that miss is better
+job detail rather than a platform that refuses them.
+
+#### Two privacy rules, and they fail in different places
+
+Docs/01 §4.3 has two lines, and this is the first endpoint where both bite at once.
+
+**The customer's budget** is kept out by there being no job in the response at all — a bid names its
+job and copies nothing from it. That is stronger than redaction, and
+`TestTheBidResponseCarriesNothingOfTheCustomers` holds the serialised bytes to a **closed set of keys
+at every depth**, so a field arriving as `max_price` fails as surely as one arriving as
+`budget_cents`. Verified by mutation in both directions, as SHIP-83 asks: a `max_price` field carrying
+`432199` fails on the key set *and* on the value search, and the test refuses to run at all against a
+fixture whose budget is NULL.
+
+**One provider never seeing another's offer** is the second rule, and **its failure mode is a `WHERE`
+clause rather than a response field** — which is why the closed key set cannot cover it. A store read
+scoped by job and idempotency key but not by provider hands the second provider the first's bid, price
+included, and every key in that response is one this API promises a provider. So
+`uq_bids_idempotency` and `postgresStore.bidPlacedUnder` are both scoped `(job_id, provider_id,
+idempotency_key)`, and `TestOneProvidersKeyCannotReachAnothersBid` sends **the same key from two
+providers** — which is how a competitor would probe for it. Also verified by mutation: dropping
+`provider_id` from that one `WHERE` fails the test and nothing else in the suite.
+
+#### Placing a bid does not move the job
+
+`Docs/02` §2 has `Open → Negotiating` on "first bid or counter-offer submitted", and that is
+**SHIP-90's**, which depends on SHIP-87 and SHIP-57. Doing it here would make every bid a status
+transition, with a `job_status_history` row and a lock on the job, for a presentation change nothing
+reads yet. The test asserts both halves — the job is where it was, and its history is unchanged —
+because the second is what would catch a move made through some other path.
+
+**No event is emitted either.** SHIP-136 adds bidding's events from a `events.go` exactly like jobs',
+editing nothing shared; emitting one now would mean inventing a payload and a version for a catalogue
+entry that ticket owns.
+
+#### `bidding` is now the second domain storing an amount independently
+
+`bids.amount` is `numeric(12,2)` and `Bid.AmountCents` is an `int64`, converted in SQL in both
+directions — `jobs`' convention for `budget` (Docs/10 §3.3), copied rather than shared.
+`maxOfferCents` is `100_000_000`, the same number as `jobs.maxBudgetCents`, arrived at independently.
+
+**That duplication is the trigger the eventual `money` ticket should be aimed at, and this is the
+entry recording it.** `internal/money` has been registered in `internal/boundaries` and unwritten
+since SHIP-15c; it is now the only pre-seeded package left unbuilt. Writing it is a shared-file edit
+a domain branch may not make, so this ticket copied the convention deliberately rather than smuggling
+the package in. The trigger has now fired twice — once here and once at the constant — and the third
+domain to hold an amount should not have to make the case again.
+
+#### What SHIP-80 handed this ticket and it declined to take
+
+000500 named four things for SHIP-84, and one is not built: **the vehicle or vehicles a bid is offered
+on**. Docs/01 §4.2 gives the provider "select one or more", which 000500 read as a join table "if it is
+taken literally — and that is SHIP-84's decision to take."
+
+**Declined, with the reasoning recorded rather than the decision deferred silently.** It is not in
+this ticket's *Done when* ("price and timing"); Docs/01 §4.3 wants it for the *customer's* comparison,
+which is SHIP-102 by way of SHIP-96; and validating it needs a second `fleet` fact — that the vehicle
+is the caller's and in service — and therefore a second port method, which is more design than a
+three-point ticket should be taking on another ticket's behalf. **The trigger is named: the first
+ticket that shows a customer a bid.** `bids` has no vehicle column and no join table, so nothing has
+to be undone.
+
+#### Shared surfaces
+
+One `$ref` pair and one `tags:` entry in `contracts/openapi.yaml`, one line in `routes_golden.txt` and
+one in `Docs/10-api-error-codes.md` (both regenerated, not typed), and §3's check count (written by
+`make verify-update`). No `internal/boundaries` edit, no `Deps` field, no shared-block migration, and
+`internal/bidding` imports no domain. `make verify` went from 355 checks across 12 sections to the
+figure at the top of this section — twenty-three checks in a new `scripts/verify/61-bidding.sh`, which
+takes the reserved 60–69 range's upper half beside `60-fleet.sh`.
 
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 
