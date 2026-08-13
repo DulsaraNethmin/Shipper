@@ -343,7 +343,8 @@ type SMS struct {
 
 // Argon2 is the password hashing cost.
 //
-// It mirrors identity.Argon2Profile, which is the type the domain takes. Two shapes rather than
+// It mirrors passwords.Argon2Profile, which is the type the hasher takes — internal/identity's
+// until SHIP-15r moved the hashing to infrastructure. Two shapes rather than
 // one shared type on purpose: internal/config does not import a domain, the domain does not
 // import configuration, and the two meet in cmd/api — which is the rule that keeps every domain
 // independently buildable (Docs/06 §4.1).

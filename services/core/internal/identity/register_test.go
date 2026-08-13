@@ -11,6 +11,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -55,7 +56,7 @@ func newTestService(t *testing.T) (*Service, *pgxpool.Pool, *recordingSender) {
 
 	pool := pgtest.DB(t)
 
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -76,7 +77,7 @@ func newTestServiceWithSMS(t *testing.T, clk clock.Clock) (*Service, *pgxpool.Po
 
 	pool := pgtest.DB(t)
 
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -202,7 +203,7 @@ func TestRegisterStoresOnlyADerivedPassword(t *testing.T) {
 		t.Errorf("stored = %q, want a PHC string", stored)
 	}
 
-	hasher, _ := NewPasswordHasher(testProfile)
+	hasher, _ := passwords.NewHasher(testProfile)
 	ok, err := hasher.Verify(stored, cmd.Password)
 	if err != nil || !ok {
 		t.Errorf("the stored hash does not verify the password that made it (ok=%v, err=%v)", ok, err)
@@ -405,7 +406,7 @@ func TestValidE164(t *testing.T) {
 // that dereferenced it would answer 500, which tells a mobile client to give up rather than to
 // retry.
 func TestRegisterWithoutADatabaseIsUnavailableNotAPanic(t *testing.T) {
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}

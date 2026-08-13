@@ -43,7 +43,7 @@ ok "role is constrained to customer and provider"
 ticket "SHIP-29  passwords are stored as argon2id, and nothing reversible is stored"
 
 pushd "$ROOT/services/core" >/dev/null
-if ! password_log="$(go test ./internal/identity/ -run TestPassword -count=1 -v 2>&1)"; then
+if ! password_log="$(go test ./internal/passwords/ -run TestPassword -count=1 -v 2>&1)"; then
   echo "$password_log"
   popd >/dev/null
   fail "the password tests do not pass"

@@ -13,6 +13,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/redistest"
@@ -24,14 +25,25 @@ import (
 // whose password was presented, and the credential column has been rewritten when the profile has
 // moved on. A mocked store reports every one of those as passing while proving none of them.
 
+// testProfile is the reduced profile Docs/10 §5 calls for: the production one is 64 MiB per hash,
+// and this package builds dozens of hashers across tests that `go test ./...` runs beside other
+// packages.
+//
+// It lived in password_test.go until SHIP-15r moved the hashing to internal/passwords, and it did
+// not move with it — every test here that needs a service needs a cheap hasher, so the fixture
+// belongs beside the constructor that takes one. internal/passwords keeps its own copy for its own
+// tests, and the two are deliberately independent: a package's test fixture is not an interface
+// between packages.
+var testProfile = passwords.Argon2Profile{MemoryKiB: 8 * 1024, Iterations: 1, Parallelism: 1}
+
 // signInService builds a service over a hasher at the given profile, and registers one account
 // through the real path so the credential it verifies is one this package wrote.
-func signInService(t *testing.T, profile Argon2Profile) (*Service, *pgxpool.Pool, User) {
+func signInService(t *testing.T, profile passwords.Argon2Profile) (*Service, *pgxpool.Pool, User) {
 	t.Helper()
 
 	pool := pgtest.DB(t)
 
-	hasher, err := NewPasswordHasher(profile)
+	hasher, err := passwords.NewHasher(profile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -207,7 +219,7 @@ func TestSignInSpendsTheSameWorkWhetherOrNotTheAccountExists(t *testing.T) {
 		t.Skip("times two argon2id derivations; -short is for the runs that skip infrastructure")
 	}
 
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -308,15 +320,15 @@ func TestASuspendedAccountIsToldSo(t *testing.T) {
 // TestSignInUpgradesAPasswordHashedAtAWeakerProfile.
 //
 // Docs/10 §5 claims the argon2id cost can be raised without a migration and without asking anyone
-// to reset anything, and password.go's NeedsRehash names sign-in as where that happens. This is
+// to reset anything, and internal/passwords' NeedsRehash names sign-in as where that happens. This is
 // the test that makes the claim true rather than available: the account registers under one
 // profile, signs in under a stronger one, and the stored hash has moved.
 //
 // Mutation-checked: removing the upgradeStoredPassword call leaves the stored hash at the weaker
 // profile and the first subtest fails.
 func TestSignInUpgradesAPasswordHashedAtAWeakerProfile(t *testing.T) {
-	weaker := Argon2Profile{MemoryKiB: 8 * 1024, Iterations: 1, Parallelism: 1}
-	stronger := Argon2Profile{MemoryKiB: 8 * 1024, Iterations: 2, Parallelism: 1}
+	weaker := passwords.Argon2Profile{MemoryKiB: 8 * 1024, Iterations: 1, Parallelism: 1}
+	stronger := passwords.Argon2Profile{MemoryKiB: 8 * 1024, Iterations: 2, Parallelism: 1}
 
 	svc, pool, user := signInService(t, weaker)
 
@@ -327,7 +339,7 @@ func TestSignInUpgradesAPasswordHashedAtAWeakerProfile(t *testing.T) {
 
 	// The same service, now writing at the stronger profile — which is what a deployment that
 	// raised the cost looks like from the database's side.
-	hasher, err := NewPasswordHasher(stronger)
+	hasher, err := passwords.NewHasher(stronger)
 	if err != nil {
 		t.Fatalf("building the stronger hasher: %v", err)
 	}
@@ -395,7 +407,7 @@ func TestSignInValidatesEveryFieldAtOnce(t *testing.T) {
 func TestSignInDoesNotApplyTheRegistrationPasswordLength(t *testing.T) {
 	svc, pool, user := signInService(t, testProfile)
 
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -456,7 +468,7 @@ func TestSignInWithoutADatabaseIsUnavailable(t *testing.T) {
 func serviceWithoutADatabase(t *testing.T) *Service {
 	t.Helper()
 
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -686,7 +698,7 @@ func TestASuspendedAccountIsNotCountedAsAGuess(t *testing.T) {
 func TestSignInWithoutARateLimiterCacheIsRefused(t *testing.T) {
 	pool := pgtest.DB(t)
 
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}

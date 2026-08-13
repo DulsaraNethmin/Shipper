@@ -20,8 +20,13 @@
 //
 // # What exists so far
 //
-//   - password.go (SHIP-29) — argon2id hashing, with the cost parameters stored in the PHC
-//     string beside each hash so the profile can be raised without a migration.
+//   - internal/passwords (SHIP-29) — argon2id hashing, with the cost parameters stored in the
+//     PHC string beside each hash so the profile can be raised without a migration. It was
+//     password.go here until SHIP-15r moved it to infrastructure: SHIP-147 gives an
+//     administrator a password, internal/admin may not import this package, and one
+//     implementation of a security parameter beats two that agree by comment. This domain
+//     keeps the three sentinels as its own names for that package's values, so errors.Is
+//     answers the same whichever a caller reaches for.
 //   - token.go (SHIP-37) — access token issue: HS256 over a keyset selected by a kid header,
 //     fifteen minutes, and a claim set that carries no permissions and no verification state.
 //     Issue only; the middleware that verifies these is SHIP-44.
