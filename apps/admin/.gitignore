@@ -1,0 +1,8 @@
+# Written by `next dev` into the application it is serving, on every start.
+#
+# The same rule as apps/driver-portal/.gitignore, and the reasoning is there: these are the
+# generator's files rather than this repository's, they are untracked and unignored so `git add -A`
+# collects them, and the rule is app-local because the root .gitignore is a shared surface and this
+# file is not. `git add -f` if this application ever wants instructions of its own.
+/AGENTS.md
+/CLAUDE.md

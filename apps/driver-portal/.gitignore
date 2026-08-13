@@ -1,0 +1,16 @@
+# Written by `next dev` into the application it is serving, on every start.
+#
+# Neither file is this repository's: `next dev` generates its own agent instructions here, and
+# there is already a CLAUDE.md at the root that says what this project's conventions are. Left
+# untracked and unignored they are picked up by `git add -A`, which is how a generated file gets
+# committed beside a ticket that has nothing to do with it.
+#
+# **Ignored here rather than in the root .gitignore on purpose.** The root file is shared with
+# every lane in the repository and this one is not, so the rule lands with no chance of a
+# conflict — and a path-scoped pattern here cannot reach the root CLAUDE.md, which a
+# `**/CLAUDE.md` in the shared file very nearly could.
+#
+# If this application ever wants instructions of its own, `git add -f` is the answer and the
+# rule below stays: the point is that nothing arrives in a commit without somebody choosing it.
+/AGENTS.md
+/CLAUDE.md
