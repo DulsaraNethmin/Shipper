@@ -136,7 +136,7 @@ type Storage struct {
 	// deployment against AWS sets it false.
 	UsePathStyle bool
 
-	// PresignTTL is how long an issued pre-signed URL works for.
+	// PresignTTL is how long an issued **upload** URL works for.
 	//
 	// Short, and bounded at load, for the reason the driver token is: **nothing can revoke one
 	// once it is signed.** The URL is the whole of the authorisation — Docs/06 §5.2 puts the
@@ -145,6 +145,26 @@ type Storage struct {
 	// phone on a poor connection to finish an upload it has already started, which is the only
 	// thing it has to outlast.
 	PresignTTL time.Duration
+
+	// DownloadTTL is how long an issued **download** URL works for, and it is a separate number
+	// because the two directions have nothing in common but the mechanism (SHIP-15r).
+	//
+	// SHIP-114 signed uploads with PresignTTL; SHIP-115 added the downloads and reused it, and both
+	// tickets recorded the request rather than parking a flag, because a field here is a
+	// shared-surface edit a domain branch may not make. This is that field.
+	//
+	// **Only one of the two requirements is generous.** An upload link has to outlast a phone
+	// finishing a slow PUT on a bad connection — minutes of a transfer that has already started. A
+	// download link has to outlast an image rendering, which is seconds. One number serving both
+	// therefore errs long in the direction that costs something: every read link is a live,
+	// unrevocable link to a photograph of somebody's front door, and it stayed live for as long as
+	// an *upload* needed.
+	//
+	// Five minutes rather than one, so that a customer's tracking view can sit open, a phone can
+	// change network mid-fetch, and a moderator can open several photographs from one listing
+	// without the first expiring underneath them. Bounded by the same [maxPresignTTL], for the
+	// same reason: nothing revokes either kind once it is signed.
+	DownloadTTL time.Duration
 
 	// MaxUploadBytes is the largest object the platform will issue an upload URL for.
 	//
@@ -676,6 +696,7 @@ func Load() (*Config, error) {
 			SecretAccessKey: l.str("STORAGE_SECRET_ACCESS_KEY", developmentStorageSecretAccessKey),
 			UsePathStyle:    l.boolean("STORAGE_USE_PATH_STYLE", true),
 			PresignTTL:      l.duration("STORAGE_PRESIGN_TTL", 15*time.Minute),
+			DownloadTTL:     l.duration("STORAGE_DOWNLOAD_TTL", 5*time.Minute),
 			MaxUploadBytes: int64(l.boundedInt("STORAGE_MAX_UPLOAD_BYTES",
 				defaultMaxUploadBytes, smallestMaxUploadBytes, largestMaxUploadBytes)),
 			AcceptedContentTypes: l.csv("STORAGE_ACCEPTED_CONTENT_TYPES",
@@ -746,6 +767,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("storage_region", c.Storage.Region),
 		slog.Bool("storage_path_style", c.Storage.UsePathStyle),
 		slog.Duration("storage_presign_ttl", c.Storage.PresignTTL),
+		slog.Duration("storage_download_ttl", c.Storage.DownloadTTL),
 		slog.Int64("storage_max_upload_bytes", c.Storage.MaxUploadBytes),
 	)
 }
@@ -1114,10 +1136,32 @@ func (l *loader) validate(cfg *Config) {
 	// See [maxPresignTTL]: a pre-signed URL is the whole of the authorisation and nothing
 	// revokes one, so an over-long window is a standing grant to a photograph of somebody's
 	// front door for whoever the link reaches.
+	//
+	// Both directions are bounded, and the download is checked separately rather than by taking
+	// the larger of the two: they are independent settings and a deployment that raised only the
+	// read window would otherwise pass unnoticed (SHIP-15r).
 	if cfg.Storage.PresignTTL > maxPresignTTL {
 		l.errf("STORAGE_PRESIGN_TTL (%s) is longer than %s; a pre-signed URL cannot be revoked "+
 			"once it is signed, so the window is the whole of the exposure",
 			cfg.Storage.PresignTTL, maxPresignTTL)
+	}
+	if cfg.Storage.DownloadTTL > maxPresignTTL {
+		l.errf("STORAGE_DOWNLOAD_TTL (%s) is longer than %s; a pre-signed URL cannot be revoked "+
+			"once it is signed, and a read link is a live link to a photograph",
+			cfg.Storage.DownloadTTL, maxPresignTTL)
+	}
+
+	// Zero is refused for both, and it is a real mistake rather than a hypothetical one: an
+	// unparseable duration is reported by [loader.duration] and a *deliberate* `0s` is not, so
+	// without this the first symptom is a startup panic from delivery's handler — a configuration
+	// fault reported as a wiring one, at the point furthest from the line that caused it.
+	if cfg.Storage.PresignTTL <= 0 {
+		l.errf("STORAGE_PRESIGN_TTL (%s) must be positive; nothing could be uploaded",
+			cfg.Storage.PresignTTL)
+	}
+	if cfg.Storage.DownloadTTL <= 0 {
+		l.errf("STORAGE_DOWNLOAD_TTL (%s) must be positive; no proof could be read back",
+			cfg.Storage.DownloadTTL)
 	}
 
 	// A credential with nowhere to go is the shape of a half-finished configuration, and the

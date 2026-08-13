@@ -731,6 +731,16 @@ func TestStorageDefaults(t *testing.T) {
 	if cfg.Storage.PresignTTL != 15*time.Minute {
 		t.Errorf("Storage.PresignTTL = %s, want 15m", cfg.Storage.PresignTTL)
 	}
+	// Shorter than the upload's, deliberately and by default (SHIP-15r): a download link only
+	// has to outlast an image rendering, and every one of them is a live link to a photograph.
+	if cfg.Storage.DownloadTTL != 5*time.Minute {
+		t.Errorf("Storage.DownloadTTL = %s, want 5m", cfg.Storage.DownloadTTL)
+	}
+	if cfg.Storage.DownloadTTL >= cfg.Storage.PresignTTL {
+		t.Errorf("the download lifetime (%s) is not shorter than the upload's (%s); the two "+
+			"requirements are different and only the upload's is generous",
+			cfg.Storage.DownloadTTL, cfg.Storage.PresignTTL)
+	}
 	if cfg.Storage.MaxUploadBytes != defaultMaxUploadBytes {
 		t.Errorf("Storage.MaxUploadBytes = %d, want %d", cfg.Storage.MaxUploadBytes, defaultMaxUploadBytes)
 	}
@@ -757,6 +767,7 @@ func TestStorageIsReadFromTheEnvironment(t *testing.T) {
 	t.Setenv("STORAGE_SECRET_ACCESS_KEY", deploymentStorageSecretAccessKey)
 	t.Setenv("STORAGE_USE_PATH_STYLE", "false")
 	t.Setenv("STORAGE_PRESIGN_TTL", "5m")
+	t.Setenv("STORAGE_DOWNLOAD_TTL", "90s")
 	t.Setenv("STORAGE_MAX_UPLOAD_BYTES", "2097152")
 	t.Setenv("STORAGE_ACCEPTED_CONTENT_TYPES", "image/jpeg, image/webp")
 
@@ -785,6 +796,9 @@ func TestStorageIsReadFromTheEnvironment(t *testing.T) {
 	}
 	if cfg.Storage.PresignTTL != 5*time.Minute {
 		t.Errorf("Storage.PresignTTL = %s, want 5m", cfg.Storage.PresignTTL)
+	}
+	if cfg.Storage.DownloadTTL != 90*time.Second {
+		t.Errorf("Storage.DownloadTTL = %s, want 90s", cfg.Storage.DownloadTTL)
 	}
 	if cfg.Storage.MaxUploadBytes != 2<<20 {
 		t.Errorf("Storage.MaxUploadBytes = %d, want %d", cfg.Storage.MaxUploadBytes, 2<<20)
@@ -875,19 +889,39 @@ func TestStorageBucketNamesArePlausible(t *testing.T) {
 	}
 }
 
-// TestStoragePresignTTLIsBounded.
+// TestStoragePresignTTLIsBounded, in both directions and for both variables.
 //
 // Nothing revokes a pre-signed URL once it is signed: the signature is the whole of the
 // authorisation, and no server-side check runs when it is redeemed (Docs/06 §5.2). The window is
 // therefore the whole of the exposure.
+//
+// **Both are checked separately rather than by taking the larger of the two** (SHIP-15r). They are
+// independent settings, and a deployment that raised only the read window is the one this is for —
+// the direction where the exposure is a standing link to somebody's front door rather than a wider
+// window to finish an upload nobody else can start.
+//
+// Zero is refused as well, and that is the less obvious half: an unparseable duration is already
+// reported, but a deliberate `0s` parses. Without this the first symptom is delivery's handler
+// panicking during attach — a configuration fault reported as a wiring one.
 func TestStoragePresignTTLIsBounded(t *testing.T) {
-	clearEnv(t)
-	t.Setenv("STORAGE_PRESIGN_TTL", "24h")
+	for name, c := range map[string]struct{ key, value string }{
+		"an upload lifetime of a day":  {"STORAGE_PRESIGN_TTL", "24h"},
+		"a download lifetime of a day": {"STORAGE_DOWNLOAD_TTL", "24h"},
+		"no upload lifetime at all":    {"STORAGE_PRESIGN_TTL", "0s"},
+		"no download lifetime at all":  {"STORAGE_DOWNLOAD_TTL", "0s"},
+		"a negative upload lifetime":   {"STORAGE_PRESIGN_TTL", "-1m"},
+		"a negative download lifetime": {"STORAGE_DOWNLOAD_TTL", "-1m"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(c.key, c.value)
 
-	if _, err := Load(); err == nil {
-		t.Fatal("Load accepted a pre-signed URL lifetime of a day")
-	} else if !strings.Contains(err.Error(), "STORAGE_PRESIGN_TTL") {
-		t.Errorf("the error does not name the variable: %v", err)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted %s=%s", c.key, c.value)
+			} else if !strings.Contains(err.Error(), c.key) {
+				t.Errorf("the error does not name the variable: %v", err)
+			}
+		})
 	}
 }
 

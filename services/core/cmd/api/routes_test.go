@@ -85,6 +85,7 @@ func testStorageConfig() config.Storage {
 		SecretAccessKey:      "cmd-api-test-secret",
 		UsePathStyle:         true,
 		PresignTTL:           15 * time.Minute,
+		DownloadTTL:          5 * time.Minute,
 		MaxUploadBytes:       5 << 20,
 		AcceptedContentTypes: []string{"image/jpeg", "image/heic"},
 	}

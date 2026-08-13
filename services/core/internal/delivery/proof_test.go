@@ -29,17 +29,22 @@ import (
 // port is stubbed here for exactly that reason: a test that also signed would be unable to fail on
 // the interesting condition, which is the platform asking for the wrong thing.
 
-// testUploadPolicy is a policy with all three fields deliberately different from anything a
+// testUploadPolicy is a policy with every field deliberately different from anything a
 // configuration default would produce.
 //
-// The lifetime especially: a stub that ignored the TTL and a service that passed the wrong one
+// The lifetimes especially: a stub that ignored the TTL and a service that passed the wrong one
 // would both pass against 15 minutes, because that is what internal/config's default is and what a
-// reader would expect to see. Seven minutes is a number nothing else in this repository uses.
+// reader would expect to see. Seven and three minutes are numbers nothing else here uses.
+//
+// **They differ from each other, which is the point of the pair** (SHIP-15r). The two were one
+// field until that ticket, so passing the upload lifetime to the download signer is exactly the
+// regression the split can produce — and it is invisible to any fixture where the two agree.
 func testUploadPolicy() UploadPolicy {
 	return UploadPolicy{
 		MaxBytes:             500_000,
 		AcceptedContentTypes: []string{"image/jpeg", "image/heic"},
-		URLTTL:               7 * time.Minute,
+		UploadTTL:            7 * time.Minute,
+		DownloadTTL:          3 * time.Minute,
 	}
 }
 
@@ -205,10 +210,10 @@ func TestAnUploadURLIsIssuedToTheAwardedProvider(t *testing.T) {
 	}
 
 	call := uploads.last(t)
-	if call.ttl != testUploadPolicy().URLTTL {
+	if call.ttl != testUploadPolicy().UploadTTL {
 		t.Errorf("the signer was asked for a URL good for %s, want the configured %s — "+
 			"the lifetime is the whole of the authorisation and nothing can revoke it",
-			call.ttl, testUploadPolicy().URLTTL)
+			call.ttl, testUploadPolicy().UploadTTL)
 	}
 	if call.contentType != "image/jpeg" || call.contentLength != 120_000 {
 		t.Errorf("the signer was asked to sign %s/%d, want image/jpeg/120000 — "+
@@ -1099,6 +1104,58 @@ func TestBothPartiesToTheDeliveryMayReadProof(t *testing.T) {
 					"revoke a signed URL, so its lifetime is the whole of the control", got.ExpiresAt)
 			}
 		})
+	}
+}
+
+// TestADownloadIsSignedForTheDownloadLifetimeAndNotTheUploadOne (SHIP-15r).
+//
+// The two were one number until this ticket, and they were one number because the download was added
+// second and reused what was there. What that cost is stated in internal/config: an upload link has
+// to outlast a phone finishing a slow PUT, a download link has to outlast an image rendering, and
+// every read link was therefore live for the longer of the two — an unrevocable link to a photograph
+// of somebody's front door.
+//
+// The stub signs `testInstant + ttl`, so the expiry is the lifetime the service asked for, read back
+// exactly. Asserting the *upload* lifetime is not what was used is the half that fails if somebody
+// re-merges the fields.
+func TestADownloadIsSignedForTheDownloadLifetimeAndNotTheUploadOne(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newAccount(t, pool, "proof-ttl-c@example.com", "+61400000771", "customer")
+	provider := newAccount(t, pool, "proof-ttl-p@example.com", "+61400000772", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+
+	objects := newRecordingObjects()
+	svc := serviceReadingProofFrom(objects)
+
+	key, err := proofObjectKey(jobID)
+	if err != nil {
+		t.Fatalf("generating an object key: %v", err)
+	}
+	objects.holding(key, aPhotograph())
+
+	if _, _, err := recordWithProof(t, pool, svc, provider, jobID, enRoute(theKey), key); err != nil {
+		t.Fatalf("recording proof: %v", err)
+	}
+
+	links, err := svc.ProofFor(t.Context(), pool, customer, jobID)
+	if err != nil {
+		t.Fatalf("reading the proof: %v", err)
+	}
+	if len(links) != 1 {
+		t.Fatalf("%d proof records, want 1", len(links))
+	}
+
+	policy := testUploadPolicy()
+	if want := testInstant.Add(policy.DownloadTTL); !links[0].ExpiresAt.Equal(want) {
+		t.Errorf("the download was signed until %s, want %s (a %s lifetime).\n"+
+			"A read link is a live link to a photograph and nothing revokes one, so it gets the "+
+			"shorter of the two lifetimes rather than the upload's %s.",
+			links[0].ExpiresAt, want, policy.DownloadTTL, policy.UploadTTL)
+	}
+	if links[0].ExpiresAt.Equal(testInstant.Add(policy.UploadTTL)) {
+		t.Error("the download was signed for the upload's lifetime, so the two fields have been " +
+			"re-merged and every read link is as long-lived as an upload again")
 	}
 }
 
