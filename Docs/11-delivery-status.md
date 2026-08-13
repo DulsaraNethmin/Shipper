@@ -356,6 +356,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
+| **SHIP-100** | M3 | Flutter provider job detail and bid placement — one job over `GET /v1/jobs/open/{id}` and an offer over `POST /v1/jobs/{id}/bids`. **The bid is sent directly and never queued**, which `Docs/07` §4 requires and SHIP-124's private `OperationKind` constructor already made impossible to get wrong; what makes a retry safe is one `ActionKey` per action against SHIP-84's stored key column. It also **closes §9's client-side budget guard** by holding every provider-facing model to a closed key set — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
@@ -4252,6 +4253,187 @@ running API and a hand-built fixture, so it is a check a person invokes rather t
 the same reasoning `make flutter-integration` already carries. `make verify` does not cover this
 ticket: it exercises HTTP endpoints and this one adds none.
 
+### SHIP-100 — the offer, the key that makes a retry safe, and the queue it deliberately does not use
+
+`Docs/09`'s *Done when* is one sentence — "a provider can review a job and submit a bid" — and it
+spans two of `Docs/07` §2's features. `GET /v1/jobs/open/{id}` (SHIP-83) is the review;
+`POST /v1/jobs/{id}/bids` (SHIP-84) is the offer. The feed's cards became tappable, `/jobs/open/{id}`
+became a route, and `internal/bidding`'s client half stopped being a `library;` with a note in it.
+
+#### Queue or send: `Docs/07` §4 answers it, and SHIP-124 had already made the wrong answer impossible
+
+The brief asked this to be decided and recorded, so: **the bid is sent directly.** `Docs/07` §4 names
+the exclusion in as many words — *"what is deliberately not offline: bidding, awarding, and
+negotiation. These are competitive, time-sensitive, and multi-party; a stale local decision is worse
+than an honest 'you are offline'."* A price queued at a loading dock and sent four hours later is an
+offer against a job that may have been awarded since, made by somebody who believes they have bid.
+
+**The interesting part is that this was not a rule to follow.** SHIP-124 wrote `OperationKind` with a
+**private constructor** and exactly two members, both `delivery.*`, so the set of queueable
+operations is closed by the compiler. A bid cannot be enqueued: there is no value to enqueue it as.
+That entry called this "what a client does with an operation it can never send", and the first
+ticket to meet it from the other side found that it had nothing to decide — which is the whole
+benefit of a closed set over a documented one. Nothing in `features/bidding` imports `core/queue` or
+`core/sync`.
+
+**What makes a retry safe instead is two mechanisms, and they are not the same one.** `ActionKey`
+(SHIP-51) mints one key per action and holds it in exactly one circumstance — the previous attempt
+failed **without saying whether the platform acted on it** and the request now being sent is
+identical. A dropped connection is precisely that case. SHIP-84's `uq_bids_idempotency` on
+`(job_id, provider_id, idempotency_key)` is the other half: a **stored column** rather than a cached
+response, so the retry is answered `200` with the bid the first attempt placed even after Redis has
+forgotten it. Without it the retry would meet the *one live offer* index instead and be told
+`bidding_already_bid` — a client showing a failure for a bid that is live and awaiting an answer.
+That entry drew the division and this is the client standing on the correct side of it.
+
+**Both directions are tested on the keys the repository actually received**, because getting either
+backwards is the defect. A dropped connection and then a retry sends `keys[0] == keys[1]`; a `422`,
+a corrected price, and a resend sends `keys[0] != keys[1]` — the platform fingerprints method, path
+and body, so an old key on a changed body is `idempotency_key_reused`.
+
+#### Optimistic local state, on a surface that is never offline
+
+`Docs/02` §3.1 asks the client to show optimistic local state clearly marked as pending and reconcile
+to whatever the platform returns. The first half is about the queue and does not apply here, and
+saying so is more useful than inventing a pending state: **nothing is drawn as offered until the
+platform says so.** The attempt is marked — the button disables, a spinner replaces its label — and
+`PlaceBidState.bid` is assigned from the response and never from the form.
+
+**The second half does apply, and it is not a formality.** A retry is answered with the offer the
+*first* attempt placed, so a screen that rendered what was typed would show a provider a price they
+are not standing behind. A test places `450` against a repository answering `399` and asserts the
+screen shows `$399.00`.
+
+#### Two features, one screen, and they meet in the router
+
+`Docs/07` §2 puts discovery and detail in `jobs` and bids in `bidding`, and features do not import one
+another — `architecture_test.dart` enforces it in both the `package:` and the relative form. This
+ticket is the first whose *Done when* crosses that line.
+
+**`OpenJobScreen` declares that it needs a panel and `core/routing/app_router.dart` supplies
+`PlaceBidPanel`.** That is the composition-root arrangement the Go side already uses: a domain and
+its adapters meet in `cmd/api` and nowhere else, and here the router is the only place allowed to
+know about both. `bidPanel` is a required parameter rather than a nullable one, because a job detail
+screen with no way to bid is half a ticket and a nullable parameter is how the missing half stops
+being obvious.
+
+The panel therefore knows the job's **identifier and nothing else about the job**, which turned out
+to cost nothing: SHIP-84 does not require a bid's timing to fall inside the job's windows, because
+offering a different day is a legitimate offer the customer may decline.
+
+#### `ProviderOnly` moved to `core/auth`, and the reason it had to is the same rule
+
+SHIP-99 predicted this — *"SHIP-100 is where `ProviderOnly` gets its next real client, because
+`/jobs/open/{id}` is an identifier-bearing route a notification payload can deliver somebody straight
+to"* — and predicted it correctly. What it could not predict is that the widget was in
+`features/fleet`, so the second caller could not import it. Duplicating it would have been the decay
+the boundary exists to prevent, so it moved to `core/auth/provider_only.dart`, which is what
+`Docs/07` §2 prescribes for behaviour two features need. Nothing about what it does changed, its keys
+are unchanged, and SHIP-98's own tests pass untouched.
+
+**Its copy generalised in the move**, deliberately: it named vehicles while the fleet was its only
+caller, and a sentence about vehicles in front of somebody who followed a link to a job is worse than
+the general one. Threading a per-surface sentence through four call sites buys a few words at the
+price of a parameter every future caller has to think about.
+
+**And the reason the widget is needed here is different from the fleet's, which is worth recording
+because the fleet's argument does not transfer.** `GET /v1/fleet/vehicles` does not check the
+caller's role and answers a customer `200` with an empty page — so a customer would see a form and a
+`403` at the end of it. `GET /v1/jobs/open/{id}` *does* refuse them, with `404`, byte-identically to a
+job that does not exist. That is the correct answer on the wire and a poor thing to render: "we could
+not find that job" is not what happened. **Both surfaces need the widget; only one of them needs it
+because the platform is permissive.**
+
+#### The 404 is one message, and the screen does not try to be more specific than the platform was
+
+Nine cases on the platform answer identically — outside the service area, no vehicle that can carry
+it, unverified, no longer open, never existed, and the owning customer reading their own job at the
+wrong address. SHIP-83 made that indistinguishability the control. So the screen has **one** state
+for all of them, it says "this job is not one you can bid on" rather than naming a reason, and it
+**offers no retry** — asking again cannot change the answer. A failure that is not a `404` is the
+other state, and that one does have a retry, because "there is no such job for you" and "we could not
+find out" are different things to be told.
+
+#### The budget guard: §9's client-side item is closed, and the mutations are recorded
+
+`Docs/11` §9 has carried this since wave 6: `budget_stays_on_the_customer_side_test.dart` searches
+`lib/` for the regular expression `budgetCents|budget_cents`, so it catches a rename in one direction
+and misses one in the other. **Re-run against this tree before anything was written, and both halves
+still held**: injecting `@JsonKey(name: 'max_price') int? maxPrice` into `OpenJob` **passed** that
+file, and renaming it `budget_cents` **failed** it, naming the file.
+
+**One refinement the entry did not have, found by running the whole suite rather than that file.**
+The `max_price` mutation was not undetected on today's tree — it failed **two tests in
+`open_job_test.dart`**, which SHIP-99 wrote and which holds `OpenJob.toJson()` to an exact key set.
+So the exposure was smaller than §9 stated, and its real shape was different: the closed key set
+existed for one type, in a file somebody had to remember to write. **A type with no such test —
+which is exactly what this ticket's `Bid` would have been — had no guard against a rename at all.**
+
+**Closed the way SHIP-83 did it**, in `budget_stays_on_the_customer_side_test.dart` itself, so that
+the two guards live in one place and neither can be quietly deleted alone:
+
+| Guard | What it catches | What it cannot |
+|---|---|---|
+| The source scan (kept) | A widget that renders a budget being reused on a provider screen — the failure the rule is realistically broken by | A rename |
+| A registry of provider-facing models, each held to a **closed key set** | A field added to `OpenJob`, `JobRegion` or `Bid` **whatever it is called**, and the *value* surviving a round trip under an innocuous key | A provider-facing model in a file nobody registered |
+| A source scan over the registered files for `@freezed` types | A **type** added to a registered file and not registered | The same |
+
+**Verified by mutation in three directions, and each fails exactly what it should.** `max_price` on
+`OpenJob` now fails `budget_stays_on_the_customer_side_test.dart` on both the key set and the value
+search, where before it passed. `customer_ceiling` on `Bid` — a budget under a name containing
+neither "budget" nor "price" nor "maximum" — fails the closed key set, which is the axis a spelling
+check cannot have. And a new unregistered `@freezed` type in `open_job.dart` fails the structural
+test naming the type and its file. Every mutation was reverted immediately and `git diff` confirmed
+the tree, generated files included.
+
+**What is left is named rather than argued away**: a provider-facing model in a file nobody adds to
+`_providerFacingFiles`. That is the same fail-closed-by-registration property `internal/boundaries`
+gives a ninth Go package — adding one is a decision somebody records rather than something that
+happens — and the file says so in its own header.
+
+#### Three smaller decisions worth finding later
+
+**`centsFromAud` converts on the text and never through a `double`.** This is the first screen that
+takes money *from* a person, and `(double.parse('450.55') * 100).round()` is right far more often
+than it is wrong. It refuses more than two decimal places rather than rounding them, because `45.005`
+is a price the platform cannot store and rounding it quietly would be the client deciding what the
+offer was. No upper bound is checked: `maxOfferCents` is `internal/bidding`'s and `Docs/06` §5.3 keeps
+it server-side.
+
+**`rfc3339` exists because `DateTime.toIso8601String()` carries no offset.** A local value encodes as
+`2026-08-20T09:00:00.000`, which is not RFC 3339, and `time.Parse(time.RFC3339, …)` refuses it — the
+provider is told "that is not a date" about a date they picked from a calendar. The offset is sent
+rather than the instant converted to UTC on the device, because the platform normalises anyway and a
+second timezone conversion is a second thing to keep correct.
+
+**No client-side ordering or bound check on the timing, on purpose, and there is a test that would
+fail if somebody added one.** Both instants come from the same pickers and land on the same value, so
+the form sends a delivery that is not after its collection — which `Offer.validate` refuses, with a
+message rendered under the field. Two definitions of a rule is one more than `Docs/07` §3 permits, and
+the copy on the device is the one that cannot be corrected without a store release.
+
+#### How it was demonstrated
+
+`make flutter-check` green in this worktree: **686 host tests** (up from 594), the analyzer clean,
+and the environment test per build flavour. The *Done when* is `place_bid_test.dart`'s first test,
+driven through the real app from the sign-in screen: a provider signs in, taps a job in their feed,
+reads it, prices it, chooses two instants through the pickers the screen actually uses, sends it, and
+sees the offer the platform recorded. `make verify` does not cover this ticket and its count does not
+move — that script exercises HTTP endpoints and this one adds none, the same position SHIP-98,
+SHIP-99, SHIP-124 and SHIP-125 are in.
+
+**No acceptance run against a live API was performed**, which is a step down from SHIP-99 and is
+recorded rather than glossed: that ticket ran its *Done when* on an iPhone 17 simulator against the
+API on port 8092 with a hand-built fixture. The equivalent here needs a verified provider, an
+eligible job, and a bid that must then be withdrawn before the run can be repeated — and the second
+run is where `bidding_already_bid` would be met rather than the `201`. It is worth doing before this
+reaches a device, and `make flutter-run` in this worktree already points at the right port.
+
+#### Shared surfaces
+
+`apps/mobile/**` and this file. No Go, no route file, no contract, no migration — which is why this
+branch merges first.
+
 ### SHIP-106 — the first delivery endpoint, and the question SHIP-105 left it
 
 `POST /v1/jobs/{id}/driver`. The awarded provider names who is carrying the job, and the job moves
@@ -6330,20 +6512,29 @@ just drawing buttons over an existing endpoint.
 written.** Two want a shared surface a domain branch may not edit, which is what a prep ticket is
 for; the rest want an ordinary ticket, a sentence in a document, or a decision. They are written one
 paragraph at a time, by whoever hit the surface first, which is the mechanism §1 describes: this is
-where wave 7's pre-step got drafted, and **one of the eight was taken by SHIP-15p** and is struck
-below.
+where wave 7's pre-step got drafted, and **two of the eight have since been taken** — one by
+SHIP-15p and one by SHIP-100 — and are struck below.
 
-**The client's budget guard is spelling-based and misses a rename, which is wave 5's lesson
-recurring on the other side of the wire.** `apps/mobile/test/features/jobs/budget_stays_on_the_customer_side_test.dart`
-scans `lib/` for the regular expression `budgetCents|budget_cents` and holds the matches to an
-allow-list of files. **Verified by mutation in both directions**: injecting a `max_price` field into
-`OpenJob` **passes** the test, and injecting `budgetCents` fails it naming the file. **The exposure
-is small and should not be overstated** — the platform's own guard is a closed key set at every
-depth (SHIP-83), so the field can never be *sent*, and this test's real job is to stop a widget that
-renders a budget being reused on a provider screen. But the client guard now has exactly the blind
-spot the platform guard no longer has, and the two were meant to be the same statement in two
-languages. **The fix is SHIP-83's shape**: hold the decoded response to a closed set of keys rather
-than searching the source for a spelling. It is a client-side ticket with no server dependency.
+**~~The client's budget guard is spelling-based and misses a rename.~~ Decided and closed at
+SHIP-100 — see §3.** `budget_stays_on_the_customer_side_test.dart` now carries both guards: the
+source scan it always had, for the failure the rule is realistically broken by — a widget that
+renders a budget being reused on a provider screen — and a registry holding every provider-facing
+model to a **closed set of keys**, which is SHIP-83's shape brought across the wire. A field added to
+`OpenJob`, `JobRegion` or `Bid` fails whatever it is called, and a *type* added to one of those files
+fails until somebody records its key set.
+
+**Two things the original entry had slightly wrong, and both are worth keeping.** The `max_price`
+mutation was re-run against the tree at SHIP-100 and still passed the file this entry names — so that
+half was right — but it did **not** go undetected: it failed two tests in `open_job_test.dart`, which
+SHIP-99 wrote and which already held `OpenJob` to an exact key set. So the exposure was smaller than
+stated, and its real shape was different from the one described: the closed key set existed for one
+type, in a file somebody had to remember to write, and **a type with no such test had no guard
+against a rename at all**. SHIP-100's `Bid` would have been exactly that type. The fix is therefore a
+registry with a structural check rather than one more test.
+
+**What remains is named rather than argued away**: a provider-facing model in a file nobody adds to
+`_providerFacingFiles`. That is the same fail-closed-by-registration property `internal/boundaries`
+gives a ninth Go package, and the file's own header says so.
 
 **`make verify` fixture phone numbers are an undocumented shared namespace, and a track lost twenty
 minutes to it.** Every account `make verify` registers needs a unique mobile number, sections are

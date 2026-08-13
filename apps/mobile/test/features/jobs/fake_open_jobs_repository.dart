@@ -109,7 +109,24 @@ class FakeOpenJobsRepository implements OpenJobsRepository {
   /// genuinely in flight rather than already finished.
   Completer<void>? gate;
 
+  /// The ids `GET /v1/jobs/open/{id}` was asked for, in order (SHIP-100).
+  ///
+  /// A second list rather than entries in [calls], so that `pages[attempt]` stays indexed by *feed*
+  /// reads — a detail read counted as a page turn would silently hand a test the wrong page.
+  final jobReads = <String>[];
+
+  /// What the single-job read answers with. `null` means the fake was not given one, which is a
+  /// test setup error rather than a case the screen has to handle.
+  OpenJob? job;
+
+  /// Thrown instead of answering the single-job read. Kept apart from [failure] because the two
+  /// endpoints fail independently — the detail screen's `404` is its own case.
+  Object? jobFailure;
+
   int get reads => calls.length;
+
+  /// Nothing at all was asked of the platform. What "no request is made on their behalf" means.
+  bool get untouched => calls.isEmpty && jobReads.isEmpty;
 
   /// Every cursor presented, in order. The first is `null` — the first page names no position.
   List<String?> get cursors => calls.map((c) => c.cursor).toList(growable: false);
@@ -126,5 +143,18 @@ class FakeOpenJobsRepository implements OpenJobsRepository {
     if (thrown != null) throw thrown;
 
     return pages[attempt < pages.length ? attempt : pages.length - 1];
+  }
+
+  @override
+  Future<OpenJob> openJob({required String jobId}) async {
+    jobReads.add(jobId);
+
+    final held = gate;
+    if (held != null) await held.future;
+
+    final thrown = jobFailure;
+    if (thrown != null) throw thrown;
+
+    return job ?? anOpenJob(id: jobId);
   }
 }

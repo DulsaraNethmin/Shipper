@@ -55,6 +55,30 @@ abstract interface class OpenJobsRepository {
   /// No idempotency key: a read changes nothing, and the middleware lets read-only methods through
   /// untouched.
   Future<ApiPage<OpenJob>> openJobs({String? cursor});
+
+  /// `GET /v1/jobs/open/{id}` (SHIP-83) — one job out of the feed, in the shape the feed sends.
+  ///
+  /// **The same type, and that is itself a privacy decision.** The platform answers both operations
+  /// with `OpenJob` deliberately, and a Go test asserts the detail response is byte-identical to the
+  /// feed entry: two shapes would be two places a budget field could be added and two responses a
+  /// test would have to know to check. A "detail" view carrying a field or two more is exactly where
+  /// somebody would later put "just a little more".
+  ///
+  /// ## A job this provider may not bid on is a job that does not exist
+  ///
+  /// `404`, with a body byte-identical to a job that is not there, and a message that says nothing
+  /// about eligibility — a refusal that explained itself would disclose what the status code is
+  /// withholding. That covers a job outside the service area, one no vehicle in service can carry,
+  /// an unverified account, a job that is no longer open, **and the owning customer**, who is
+  /// refused their own job here because `GET /v1/jobs/{id}` is where they read it.
+  ///
+  /// So a screen must not try to be more specific than the platform was. There is one failure state
+  /// for every reason, and the indistinguishability is the control.
+  ///
+  /// The read is not cached and not passed down from the feed: a screen opened from a list fetched
+  /// ten minutes ago shows what the platform holds now, and a deep link reaches the same screen with
+  /// nothing extra to supply.
+  Future<OpenJob> openJob({required String jobId});
 }
 
 /// The real one, over [ApiClient].
@@ -63,9 +87,9 @@ abstract interface class OpenJobsRepository {
 /// `contracts/openapi.yaml`, and what should survive that is the shape of the interface above and
 /// nothing in this class.
 ///
-/// **`GET /v1/jobs/open/{id}` is deliberately not here.** SHIP-83 serves it and it is the shape
-/// SHIP-100's provider job detail reads; modelling an endpoint no screen calls would be dead code
-/// that nothing holds to the contract. It arrives with the screen that needs it.
+/// `GET /v1/jobs/open/{id}` arrived with SHIP-100, which is the screen that needed it. Until then it
+/// was served and deliberately not modelled: an endpoint no screen calls is dead code that nothing
+/// holds to the contract.
 final class ApiOpenJobsRepository implements OpenJobsRepository {
   const ApiOpenJobsRepository(this._client);
 
@@ -84,6 +108,11 @@ final class ApiOpenJobsRepository implements OpenJobsRepository {
       ),
       OpenJob.fromJson,
     );
+  }
+
+  @override
+  Future<OpenJob> openJob({required String jobId}) async {
+    return OpenJob.fromJson(await _client.getJson('$_base/$jobId'));
   }
 }
 

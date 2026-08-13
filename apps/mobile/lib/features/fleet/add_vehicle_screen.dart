@@ -4,9 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import 'package:shipper/core/auth/provider_only.dart';
 import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/fleet/fleet_controller.dart';
-import 'package:shipper/features/fleet/provider_only.dart';
 import 'package:shipper/features/fleet/vehicle.dart';
 import 'package:shipper/features/fleet/vehicle_form.dart';
 

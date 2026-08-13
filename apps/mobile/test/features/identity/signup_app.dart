@@ -7,6 +7,7 @@ import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/device/device_label.dart';
+import 'package:shipper/features/bidding/bidding_repository.dart';
 import 'package:shipper/features/fleet/fleet_repository.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
@@ -14,6 +15,7 @@ import 'package:shipper/features/jobs/open_jobs_repository.dart';
 
 import '../../core/auth/fake_token_store.dart';
 import '../../core/auth/session_fixtures.dart';
+import '../bidding/fake_bidding_repository.dart';
 import '../fleet/fake_fleet_repository.dart';
 import '../jobs/fake_jobs_repository.dart';
 import '../jobs/fake_open_jobs_repository.dart';
@@ -35,6 +37,7 @@ Widget signupApp(
   FakeJobsRepository? jobs,
   FakeFleetRepository? fleet,
   FakeOpenJobsRepository? openJobs,
+  FakeBiddingRepository? bidding,
   FakeSessionEnder? ender,
 }) {
   return ProviderScope(
@@ -61,6 +64,11 @@ Widget signupApp(
       // signs a provider in reaches it, including the ones that are about the router or the
       // session and never mention a job.
       openJobsRepositoryProvider.overrideWithValue(openJobs ?? FakeOpenJobsRepository()),
+      // Placing a bid is a **write**, and the one screen that makes it is reachable by a deep link
+      // (SHIP-100). Nothing reads bidding on arrival, so this is the least likely of the four to
+      // open a socket by accident — and it is overridden here for the same reason as the rest,
+      // which is that "no test I was thinking about reaches it" is not a property anybody checks.
+      biddingRepositoryProvider.overrideWithValue(bidding ?? FakeBiddingRepository()),
       // A restored session refreshes as soon as the keychain answers (SHIP-50). None of these
       // tests starts with a stored token, so nothing refreshes — but a test that later does
       // would otherwise open a socket to whatever is listening on the local API port.
