@@ -366,6 +366,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
@@ -5653,6 +5654,170 @@ object is removed. **Every assertion names the key this run created.** The stack
 bucket may be too, so the section fences on an id rather than on a count or a timestamp — which is
 `CLAUDE.md`'s Kafka rule, applied to the one shared service that can be isolated but is not obliged
 to be.
+
+### SHIP-129 — the milestone screen, and the reconciliation signal a client does not have
+
+`Docs/09`'s *Done when* is one sentence — "provider records milestones with optimistic local state
+clearly marked pending" — and the interesting half is the second. Recording is a tap and a queue row;
+**"clearly marked as pending" is the claim that stops being true silently**, because a screen where a
+milestone the platform has and a milestone stuck on a phone render identically still passes every
+test that only asserts the milestone is on the list.
+
+The screen is `/jobs/{id}/delivery`: three large buttons, and a log of what this device has recorded
+with where each one has got to written beside it in a word, an icon and a sentence.
+
+#### The two seams SHIP-125 named were both taken, and one of them has a hazard in it
+
+`SyncWorker.record` is enqueue-and-drain in one call and needed nothing. `SyncWorker.snapshots` is
+where the interesting finding is: **a snapshot is read at one instant and delivered through a
+broadcast stream at a later one**, so a snapshot read before this screen's own `enqueue` committed
+can arrive after it — and it will not contain that recording, because it did not exist yet.
+
+That matters because of what a client can and cannot know. `OperationSender.send` returns `void` on
+success and the worker **deletes** the row, so **the only reconciliation signal this client has is
+the operation leaving the queue**. There is no response body to read: not the `201`, not
+`accepted_at`, not the milestone id. So "the platform has it" is derived from an absence, and an
+absence read from a stale snapshot is a screen telling a driver with no signal that Shipper has their
+work.
+
+The controller therefore treats a published snapshot as a **trigger** and re-reads
+`SyncWorker.queue` itself, and each read carries a sequence number: a read issued *before* an entry
+was created may not conclude that the entry has gone. `_applied` discards a read that comes back out
+of order. The cost is one extra `SELECT` over a handful of rows per drain; what it buys is that the
+one thing this screen says about the platform cannot be said wrongly.
+
+#### What "Recorded" claims, and the sentence it must not grow into
+
+It claims the platform took the operation. It deliberately does **not** claim the job moved, because
+an absorbed milestone is a `201` that moves nothing (SHIP-112) and — by that ticket's own decision —
+no field in the response distinguishes the two. So the screen says "Recorded"; "the job is now In
+transit" would be a client inventing a status, which is `Docs/02` §2's first rule broken by a caption.
+
+This is also why a late milestone is **not** presented as a failure. The client cannot tell an
+absorbed recording from an ordinary one and does not try: both are the row leaving the queue, and
+both read "Recorded", which is exactly what happened.
+
+#### Every button stays enabled, and that is the document rather than an oversight
+
+Recording one milestone disables nothing, and three separate rules would each be broken by a screen
+that walked the five as a chain. `Docs/02` §2 permits `Awarded → En route to pickup` with no
+assignment in between, so a provider driving the job themselves would be blocked by their own app.
+SHIP-111 records a **second** `en_route_to_pickup` as a second row when a driver reaches a pickup,
+finds nobody and sets off again. And SHIP-112 absorbs an update that arrives after a later one rather
+than refusing it, so a client that refused to record it would be discarding a driver's work to
+protect a rule the platform does not have. `Docs/07` §3 settles the general case: the device may hide
+or disable, and it decides nothing.
+
+#### `Delivered` is named and not offered
+
+`CLAUDE.md`'s invariant is that delivered requires photo proof or a recorded exception and never
+neither; `POST /v1/jobs/{id}/milestones` refuses every `delivered` with `delivery_proof_required`
+until SHIP-118; and this device can capture neither a photograph (SHIP-130) nor an exception
+(SHIP-131). A fourth button would queue an operation whose **only** possible outcome is a
+quarantined row — work the driver believes they recorded, waiting for a person. So the milestone
+stays in the vocabulary, the screen names it and says what it is waiting for, and
+`Milestone.offered` is derived from `needsProof` rather than being a second list that can disagree
+with the first. `driver_assigned` is absent from the vocabulary altogether, because it has an
+endpoint of its own and the milestone endpoint refuses it with a `422` pointing there.
+
+#### The finding: no endpoint serves an awarded job to the provider delivering it
+
+The screen shows the job's identifier and nothing else about the job, and that is a platform gap
+rather than a design choice:
+
+| Endpoint | Serves | To the awarded provider |
+|---|---|---|
+| `GET /v1/jobs/{id}` | the owning customer's own job | `404`, byte-identically to a job that does not exist |
+| `GET /v1/jobs/open/{id}` | a job while it is still biddable | stops answering the moment they win it |
+| `GET /v1/driver/jobs/{id}` | the job inside a driver link | a different token system, and it cannot be exchanged |
+
+So the addresses, the goods and the windows are reachable today by the driver the provider assigned
+and not by the provider. **Two consequences worth naming rather than absorbing**: the screen cannot
+show what is being delivered, and a milestone the platform has accepted is not readable back — the
+pending ones survive a relaunch because SHIP-124's queue is durable, and the accepted ones do not,
+because nothing on the device stored them and nothing serves them. SHIP-133 is the *customer's*
+tracking view and is not this. No ticket in `Docs/09` adds the provider's read.
+
+**The same gap is why the route is deep-link only.** `Docs/07` §5 makes that a first-class way in and
+SHIP-145 is the push that uses it, but there is no list to reach it from: the provider half of the
+shell shows open work to bid on (SHIP-99), and nothing serves the jobs a provider has been awarded.
+`_signedInPatterns` gained `^/jobs/[^/]+/delivery$` — one location rather than everything under
+`/jobs/{id}/` — and a test holds it, because forgetting it would not look like a broken button. It
+would look like a notification that opens the home shell.
+
+#### It was driven against the real API, on a simulator, and that closes SHIP-100's gap
+
+`integration_test/record_milestone_test.dart`, in the shape `sign_in_test.dart` established: the
+production widget tree, the production `dio` client with its auth and idempotency interceptors, the
+real Drift queue on the device's filesystem, the real worker started the way `main.dart` starts it,
+and real HTTP. A provider signs in, follows a link to `/jobs/{id}/delivery`, taps **En route to
+pickup**, and the entry settles on "Recorded".
+
+On an iPhone 17 simulator against this worktree's API on `8092`, `POST /v1/jobs/{id}/milestones`
+answered `201`, and the row is what `Docs/02` §3.1 asks for:
+
+```
+milestone          | En route to pickup
+actor_type         | provider
+actor_recorded_at  | 2026-08-13 12:15:28+00
+server_recorded_at | 2026-08-13 12:15:28.049833+00
+idempotency_key    | f397b7c4caeea3989305daaabafe18f2
+```
+
+Two clocks, separately, and the key the **queue** minted at the moment the user acted rather than one
+the sender invented. The job moved to `En route to pickup` in the same transaction. The awarded job
+had to be built the way `scripts/verify/70-delivery.sh` builds one — a guarded transition and one
+`Accepted` row in `bids` — because **SHIP-92's award endpoint does not exist**, which is worth
+knowing: no journey through the API alone can currently produce a job this screen can act on.
+
+The test is committed and is deliberately outside `make flutter-check` and `CHECKS`, exactly as
+SHIP-48's are: it needs a simulator and a running service, and the Flutter CI job is a Linux runner
+with neither. Its header names the invocation and the three `--dart-define`s it needs.
+
+#### Mutation testing, and the one that survived
+
+| Mutation | Result |
+|---|---|
+| `MilestoneSync.pending` given the recorded state's word and sentence | **Caught**, five tests — including the one that renders a settled and an unsettled milestone on the same screen and asserts they differ |
+| `rfc3339(at)` replaced with `at.toIso8601String()` | **Caught**, exactly one test, and it is run 1's finding still biting: the local form carries no offset and `time.Parse(time.RFC3339, …)` refuses it |
+| The ordering-key filter removed | **Caught**, one test — another job's queued work appearing on this job's screen |
+| **The read-sequence guard removed** | **Survived.** Nothing noticed |
+
+The fourth is the one worth reading. The guard is what stops a stale snapshot concluding that a
+recording has reached the platform, and **no test in the suite noticed its removal** — a real queue
+over a real file resolves too quickly for the interleaving to happen by chance, so the hazard is
+invisible to a test that waits for it.
+
+It was not tuned away and it was not left. `stale_snapshot_test.dart` arranges the interleaving
+instead of waiting for it: `GatedQueue` lets a read *complete* and holds its **answer**, which is the
+shape of the hazard exactly — a fresh read held late is harmless, a stale one held late is the bug.
+With the guard the entry stays "Pending"; with the mutation reapplied the test fails and nothing else
+does. **The honest summary is that the mutation survived the suite as written and the suite was
+wrong, not the guard.**
+
+Every mutation was reverted immediately and `git diff` confirmed the tree.
+
+#### Two smaller decisions worth finding later
+
+**The screen sends `recorded_at` on every recording, including an online one.** The field is
+optional and omitting it means "now" on the platform's clock, which is right for a request made the
+instant the user acted and wrong for every other one — and the client cannot tell which it is making,
+because whether the drain happens now or in four hours is the worker's business. Sending the actor's
+clock always is the only version with one answer.
+
+**A quarantined operation this screen never saw recorded is not listed on it.** A `BlockedOperation`
+carries no body — it is the shape a row takes when this build could not read one — so it cannot be
+named as a milestone. SHIP-132 is the screen for those and SHIP-126's indicator counts them meanwhile,
+which is the arrangement that keeps them from being invisible in the interval.
+
+#### How it was demonstrated
+
+`make flutter-check` green in this worktree: **714 host tests** (up from 686), the analyzer clean, and
+the environment test per build flavour. The *Done when* is `record_milestone_test.dart`'s first two
+tests — recorded with no signal and marked pending, recorded with signal and marked Recorded — and
+the acceptance run above, on a simulator against a live API. `make verify` does not cover this ticket
+and its count does not move: that script exercises HTTP endpoints and this one adds none, the same
+position SHIP-98, SHIP-99, SHIP-100, SHIP-124 and SHIP-125 are in.
 
 ## 4. Partly done — do not treat these as finished
 

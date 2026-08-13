@@ -115,6 +115,23 @@ void main() {
       expect(redirectFor(const SessionState.signedIn(), '/jobs/0198f2c1/bids'), Routes.home);
     });
 
+    test('a delivery path is reachable while signed in, and only that one', () {
+      // SHIP-129's screen is deep-link only — no card leads to it, because no endpoint serves a
+      // provider the jobs they have been awarded — so forgetting this pattern would not look like
+      // a broken button. It would look like a notification that opens the home shell, which is a
+      // great deal harder to attribute.
+      const path = '/jobs/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0/delivery';
+
+      expect(Routes.deliveryFor('abc'), '/jobs/abc/delivery');
+      expect(redirectFor(const SessionState.signedIn(), path), isNull);
+      expect(redirectFor(const SessionState.signedOut(), path), Routes.signIn);
+      expect(redirectFor(const SessionState.restoring(), path), Routes.starting);
+
+      // The segment after the id is fixed, so admitting the delivery screen admitted one location
+      // rather than everything under `/jobs/{id}/`.
+      expect(redirectFor(const SessionState.signedIn(), '/jobs/0198f2c1/delivery/notes'), Routes.home);
+    });
+
     test('the connectivity screen is reachable from either shell, and during the restore', () {
       // SHIP-19's demonstration. Putting it behind the session would have made "the app can
       // reach the API" unanswerable on a fresh install, which is exactly when it is asked.

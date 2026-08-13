@@ -8,6 +8,7 @@ import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
 import 'package:shipper/features/bidding/place_bid_panel.dart';
+import 'package:shipper/features/delivery/delivery_screen.dart';
 import 'package:shipper/features/fleet/add_vehicle_screen.dart';
 import 'package:shipper/features/fleet/fleet_screen.dart';
 import 'package:shipper/features/fleet/vehicle_screen.dart';
@@ -112,6 +113,25 @@ abstract final class Routes {
   /// [openJobDetail] for one job.
   static String openJobDetailFor(String jobId) => '/jobs/open/$jobId';
 
+  /// Recording the milestones of one delivery, as the awarded **provider** (SHIP-129).
+  ///
+  /// A third route under `/jobs/` rather than a tab on either of the two above, and for the reason
+  /// that made those two separate: they are three readers of three different things. [jobDetail] is
+  /// the customer's own job, [openJobDetail] is a job a provider may bid on — and stops answering
+  /// the moment they win it — and this is the delivery of a job already awarded.
+  ///
+  /// **It is reached by deep link today and by nothing else, which is recorded rather than hidden.**
+  /// `Docs/07` §5 makes that a first-class way in: SHIP-145 tells an awarded provider they have won
+  /// by push, and the payload opens the job it concerns. What does not exist is a *list* — the
+  /// provider half of the shell shows open work to bid on (SHIP-99), and no endpoint serves a
+  /// provider the jobs they have been awarded. `Docs/11` §3 names what would close it.
+  ///
+  /// It does not collide with [jobDetail], which matches exactly one segment.
+  static const delivery = '/jobs/:id/delivery';
+
+  /// [delivery] for one job.
+  static String deliveryFor(String jobId) => '/jobs/$jobId/delivery';
+
   /// The provider's own fleet (SHIP-98).
   ///
   /// `/fleet/vehicles` rather than `/fleet`, because the fleet is not the only thing that domain
@@ -211,6 +231,13 @@ final _signedInPatterns = <RegExp>[
   // would also admit every path under `/jobs/` that anybody adds later, and this collection decides
   // where the app is willing to *draw* — the looser it is, the less it says.
   RegExp(r'^/jobs/open/[^/]+$'),
+
+  // The awarded provider recording one delivery's milestones (SHIP-129). A third pattern for the
+  // same reason as the second: the segment after the id is fixed, so this admits exactly one more
+  // location rather than everything under `/jobs/{id}/`. The route is deep-link only today, which
+  // makes forgetting this line a link that silently lands on the home shell rather than a card that
+  // does nothing.
+  RegExp(r'^/jobs/[^/]+/delivery$'),
 
   // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
   // route reachable only through an identifier looks, from the outside, like a card that does
@@ -386,6 +413,15 @@ final routerProvider = Provider<GoRouter>((ref) {
           final id = state.pathParameters['id'] ?? '';
           return OpenJobScreen(jobId: id, bidPanel: PlaceBidPanel(jobId: id));
         },
+      ),
+      // Before `jobDetail` as well, and it does not collide either — `/jobs/:id` is one segment
+      // and this is two. Declared here so that "everything more specific under /jobs comes before
+      // /jobs/:id" keeps holding for whoever adds the next one.
+      GoRoute(
+        path: Routes.delivery,
+        builder: (context, state) => DeliveryScreen(
+          jobId: state.pathParameters['id'] ?? '',
+        ),
       ),
       // After `newJob`, deliberately. go_router takes the first route that matches, so declaring
       // `/jobs/:id` first would make `/jobs/new` a job whose id is the word "new".

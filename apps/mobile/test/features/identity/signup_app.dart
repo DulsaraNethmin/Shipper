@@ -7,6 +7,7 @@ import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/device/device_label.dart';
+import 'package:shipper/core/sync/sync_worker.dart';
 import 'package:shipper/features/bidding/bidding_repository.dart';
 import 'package:shipper/features/fleet/fleet_repository.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
@@ -39,9 +40,17 @@ Widget signupApp(
   FakeOpenJobsRepository? openJobs,
   FakeBiddingRepository? bidding,
   FakeSessionEnder? ender,
+  SyncWorker? worker,
 }) {
   return ProviderScope(
     overrides: [
+      // The delivery screen records through the sync worker (SHIP-129). **It is left unwired
+      // unless a test asks for one**, which is SHIP-124's objection kept rather than overruled:
+      // `syncWorkerProvider` builds a Drift database in the platform's application-support
+      // directory, which a widget test has no plugin behind, and `main.dart` is deliberately the
+      // only place the real one is constructed. A test that wants a queue hands over a
+      // `SyncHarness` worker over a temporary file, which is the real queue rather than a fake.
+      if (worker != null) syncWorkerProvider.overrideWithValue(worker),
       tokenStoreProvider.overrideWithValue(store ?? FakeTokenStore()),
       identityRepositoryProvider.overrideWithValue(identity),
       // Sign-out tells the platform the device session is over, and does not wait to be told
