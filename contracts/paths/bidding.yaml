@@ -1,0 +1,1011 @@
+# Bidding — what a provider offers against a job, and what the customer eventually awards.
+#
+# The counterpart of cmd/api/routes_bidding.go. Docs/10 §8.1 keeps the two in step: a domain adds one
+# route file and one fragment, and edits neither this file's siblings nor the middle of a shared
+# document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence for
+# the contract to describe less than the service returns. Here it is doing a second job as well: the
+# schema below is the published half of a closed key set that a Go test and a `make verify` check both
+# hold the real response to, which is how Docs/01 §4.3's budget rule is enforced by default rather
+# than by remembering.
+#
+# # Two privacy rules govern everything in this file, and they are not the same rule
+#
+# **The customer's maximum budget never appears in any provider-facing shape**, in any form — not an
+# amount, not a band, not a "budget supplied" flag (Docs/01 §4.3). Nothing described here reads a job
+# at all, so there is no field to withhold.
+#
+# **And one provider never sees another provider's offer or its price.** Docs/01 §4.3's second line.
+# A bid is visible to the provider who made it, to the customer who received it, and to
+# administrators (Docs/02 §4) — never to a competitor. Every endpoint below answers with the calling
+# provider's own offer and nothing else; the idempotency key that identifies a retry of a placement is
+# scoped to the caller as well as to the job, and the two endpoints that take a bid identifier refuse
+# one that is not the caller's with the answer a bid that does not exist gets.
+#
+# # Five endpoints and one shape
+#
+# Docs/01 §4.2 gives the provider three verbs — "place, update, and withdraw a bid until it is accepted
+# or expires" — and each has its own path here. Docs/02 §4 adds the fourth, which belongs to *both*
+# parties: a counter-offer supersedes the prior offer, from whichever side it comes. The fifth is the
+# read that keeps the resulting chain visible.
+#
+# All of them answer with the same `Bid`, so a client holds one type throughout: place it, revise it,
+# take it back, counter it, or list the whole exchange, and what comes back is the same object each
+# time.
+#
+# # The counter endpoint is the first thing here a customer may call, and one rule governs it
+#
+# **You counter the other party's offer and revise your own.** That single sentence is why one path
+# serves both directions, and getting it backwards — countering your own offer, or trying to revise
+# theirs — is `bidding_wrong_party` rather than a `404`: you are a party to the negotiation and can
+# read the offer in its history a moment later.
+#
+# It is also why the customer's own counter *amount* appears in a response a provider reads. That is
+# not the budget. Docs/01 §4.3 keeps the customer's private maximum out of every provider-facing shape
+# in any form, and nothing described in this file reads a job at all; a counter-offer is a number the
+# customer deliberately put in front of this provider.
+
+Bids:
+  post:
+    operationId: placeBid
+    summary: Place a bid on a job
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Offers to carry a job, for a price and against a commitment about timing (SHIP-84).
+
+      Only a **verified, eligible** provider may bid, and eligibility is the platform's decision:
+      service area, vehicle capability, verification state and job status (Docs/01 §4.3). It is the
+      same filter behind `GET /v1/jobs/open`, so a job in your feed is a job you can bid on, and a
+      job that is not answers `404` here exactly as it does there.
+
+      A job you may not bid on and a job that does not exist are **the same answer**. Which jobs a
+      competitor may bid on, and what became of work you were not given, are not things this API
+      discloses.
+
+      ## Price and timing
+
+      ```json
+      {
+        "amount_cents": 45000,
+        "pickup_at": "2026-08-20T09:00:00+10:00",
+        "deliver_by": "2026-08-20T17:00:00+10:00",
+        "message": "Can collect from the loading dock any time after eight."
+      }
+      ```
+
+      `amount_cents` is **your** price in cents — a whole number, because money is never a decimal in
+      transit. It has nothing to do with anything the customer set: the customer's maximum is private
+      and this API will never show it to you in any form.
+
+      `pickup_at` and `deliver_by` are **instants, not windows**. The job states the customer's
+      flexibility; your bid states a commitment against it. Delivery must be after collection, and
+      collection must be in the future.
+
+      Your timing is deliberately **not** required to fall inside the job's own windows. Offering a
+      different day is a legitimate offer the customer is free to decline, and jobs frequently state
+      no window at all.
+
+      `message` is optional and is where conditions go, in your own words.
+
+      ## One live offer per job
+
+      A second bid on a job you already have a live offer on is refused with `bidding_already_bid`.
+      Revise it with `PATCH /v1/jobs/{id}/bids/{bid_id}`, or take it back with
+      `POST /v1/jobs/{id}/bids/{bid_id}/withdraw` and bid again — a live offer is one the customer may
+      accept at any moment, and two from one provider is two prices for one job.
+
+      This is not what a **retry** produces. See below.
+
+      ## Retrying
+
+      Reuse the `Idempotency-Key` of the request you are retrying and you get the offer that request
+      placed, answered `200`, with nothing further recorded. That holds whether the retry arrives a
+      second later or a week later: the guarantee is a unique index in the database rather than a
+      cached response, so a phone that was out of signal for a day still gets its own bid back rather
+      than a conflict.
+
+      A **new** offer needs a **new** key. One key per action.
+
+      ## The job's status does not change
+
+      A job with offers on it presents as `negotiating` and **remains open to eligible bids**
+      (Docs/02 §1) — competitors can and do keep bidding. That presentation is not built yet; what is
+      built is the part that matters, which is that bidding on a job neither closes it nor reserves
+      it.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/BidPlacement'
+    responses:
+      '201':
+        description: |
+          The offer is placed and the customer can see it.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '200':
+        description: |
+          This `Idempotency-Key` had already placed this offer. Nothing was written and the original
+          is returned — the same shape as `201`, so a client that does not care which happened parses
+          one type.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          One of three, and they lead to three different places:
+
+          | `error.code` | What happened |
+          |---|---|
+          | `bidding_already_bid` | You have a live offer on this job already. Revise or withdraw it |
+          | `idempotency_key_reused` | This key was used for a *different* request. Generate a new one |
+          | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field, with the JSON path the client sent.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+BidByID:
+  patch:
+    operationId: reviseBid
+    summary: Revise your own live bid
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Changes the price, timing or conditions of an offer you have already placed (SHIP-85).
+
+      **This is the same offer at a new number, not a second one.** The bid keeps its `id` and its
+      `submitted` status, and the customer sees one offer rather than two. A *counter-offer* — which
+      supersedes the prior offer and leaves the whole chain readable — is a different thing and a
+      different endpoint.
+
+      ## Send only what changes
+
+      ```json
+      { "amount_cents": 39900 }
+      ```
+
+      Every field is optional and anything you leave out is left alone. Send at least one, or the
+      request is refused: a revision that changes nothing is almost always a client defect, and
+      answering `200` would hide it.
+
+      Sending `message` blank removes it.
+
+      ## The whole offer is validated, not only what you changed
+
+      The fields you did not send are taken from the stored bid, and the result has to be an offer
+      this API would accept as a new one. So re-pricing an old bid whose `pickup_at` has since passed
+      is refused, naming `pickup_at` — a field you did not send. What you are asking us to keep live
+      is an offer to collect in the past, and the customer could accept it.
+
+      ## Who may revise, and until when
+
+      Your own bid, on the job in the path, while it is still live. Somebody else's bid answers `404`,
+      byte-identically to a bid that does not exist.
+
+      Your eligibility is checked again, exactly as it was when you placed the offer — a revision
+      produces a live offer the customer may accept at any moment, so a job that is no longer offered
+      to you answers `404` here too.
+
+      ## Retrying
+
+      A revision is idempotent by nature: applying the same change twice reaches the state applying it
+      once reaches. Send the same `Idempotency-Key` you are retrying and you get the middleware's
+      replay; send a new one and you get the same outcome anyway.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/BidID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/BidRevision'
+    responses:
+      '200':
+        description: |
+          The offer now stands at the revised terms. The same shape a placement answers with.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '400':
+        description: |
+          A malformed identifier in the path, an unknown field in the body, a missing
+          `Idempotency-Key`, or a revision naming no field at all (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such bid — or one that is not yours, or not on the job in the path, or on a job that is
+          no longer offered to you. **These are one answer.** Whose bids exist, and what became of
+          work you were not given, are not things this API discloses.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        $ref: '#/BidNoLongerYours'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field — including fields you did not send, when the stored value they came from no
+          longer makes a valid offer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+WithdrawBid:
+  post:
+    operationId: withdrawBid
+    summary: Withdraw your own bid before it is accepted
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Takes an offer back. Its status becomes `withdrawn` and the customer can no longer accept it
+      (SHIP-86).
+
+      A verb rather than a `DELETE`, because **nothing is deleted**. Every offer and every withdrawal
+      is recorded, and the bid stays readable to you, to the customer and to administrators — the row
+      survives with its price intact. It is not a `PATCH` writing a status either: a bid's status is
+      the platform's, and a body naming one is refused.
+
+      The request body is `{}`.
+
+      ## Before acceptance
+
+      Once the customer has awarded your bid it is no longer yours to take back, and this answers
+      `bidding_bid_accepted`. Stepping away from work you have been awarded is a different
+      conversation with different consequences, and it is not this endpoint.
+
+      ## Withdrawing twice succeeds
+
+      A second withdrawal answers `200` with the same bid and writes nothing. That is deliberate: a
+      phone that lost its connection, was restarted and generated a **fresh** `Idempotency-Key` for
+      the same intent must not be told its withdrawal failed when it succeeded. You asked for an
+      outcome, and the outcome holds.
+
+      ## You may bid again afterwards
+
+      Withdrawing leaves you free to place a new offer on the same job. A mistyped price is not a job
+      you can never bid on again.
+
+      ## The job does not move
+
+      Withdrawing your offer does not change the job's status, and it does not withdraw anybody
+      else's.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/BidID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/BidWithdrawal'
+    responses:
+      '200':
+        description: |
+          The offer is withdrawn, and answers `withdrawn`. The same `200` is returned when it was
+          already withdrawn, in which case nothing further was recorded.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '400':
+        description: |
+          A malformed identifier in the path, an unknown field in the body, or a missing
+          `Idempotency-Key` (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such bid — or one that is not yours, or not on the job in the path. These are one
+          answer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        $ref: '#/BidNoLongerYours'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+CounterOffer:
+  post:
+    operationId: counterOffer
+    summary: Counter the other party's offer
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Answers the offer in the path with different terms (SHIP-87).
+
+      **Either party may counter, and this is the same endpoint for both.** A customer counter-offer
+      supersedes the prior provider offer; a provider counter-offer supersedes the prior customer
+      offer (Docs/02 §4). Which side you are on is decided from your credential and the offer you are
+      answering — there is no field for it, and there could not be: that would be an authorisation
+      decision made from what a client sent.
+
+      **This creates a row and leaves the one it answers behind.** The offer you countered becomes
+      `superseded` and gains a `superseded_by` pointing at your counter; your counter becomes the live
+      head of the negotiation. Nothing is deleted and nothing is overwritten, so the whole exchange
+      stays readable through `GET /v1/jobs/{id}/bids/{bid_id}/history`.
+
+      That is the difference from `PATCH /v1/jobs/{id}/bids/{bid_id}`: **you counter the other
+      party's offer and revise your own.** Getting it the wrong way round answers
+      `bidding_wrong_party`, and the fix is the other request.
+
+      ## Send only what changes
+
+      ```json
+      { "amount_cents": 40000 }
+      ```
+
+      Every field is optional and **anything you leave out is inherited from the offer you are
+      answering** — countering on price alone keeps the timing and the conditions that were on the
+      table. At least one field is required: a counter that changes nothing is agreement, and the way
+      to agree is to award the job rather than to counter.
+
+      Sending `message` blank clears the conditions the offer carried.
+
+      ## The whole offer is validated, not only what you changed
+
+      The result of merging your change over the offer you answered has to be an offer this API would
+      accept as a new one. So countering on price alone against an offer whose `pickup_at` has since
+      passed is refused, naming `pickup_at` — a field you did not send.
+
+      ## Who may counter, and until when
+
+      Only the live head of a negotiation can be countered. An offer that has been superseded,
+      withdrawn, rejected or expired answers `bidding_bid_closed`; one that has been awarded answers
+      `bidding_bid_accepted`.
+
+      A **provider** countering has their eligibility checked again, exactly as when they placed the
+      offer — a counter is a live offer the customer may accept at any moment, so a job that is no
+      longer offered to them answers `404`.
+
+      A **customer** countering is refused with `bidding_bid_closed` once their job can no longer be
+      awarded, because there is nothing a counter-offer could then lead to.
+
+      Anybody who is neither party to the negotiation answers `404`, byte-identically to a bid that
+      does not exist. Whose offers exist is not something this API discloses.
+
+      ## Retrying
+
+      Reuse the `Idempotency-Key` of the request you are retrying and you get the counter that request
+      made, answered `200`, with nothing further recorded — the same guarantee `POST
+      /v1/jobs/{id}/bids` gives, held by a unique index rather than by a cached response. A retry that
+      arrives after your counter has already superseded the offer it answered is still answered with
+      your counter rather than refused.
+
+      A **new** counter needs a **new** key.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/BidID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/BidCounter'
+    responses:
+      '201':
+        description: |
+          The counter-offer is made and is now the live head of the negotiation.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '200':
+        description: |
+          This `Idempotency-Key` had already made this counter. Nothing was written and the original
+          is returned — the same shape as `201`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '400':
+        description: |
+          A malformed identifier in the path, an unknown field in the body, a missing
+          `Idempotency-Key`, or a counter naming no field at all (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such bid — or one you are not a party to, or not on the job in the path, or on a job that
+          is no longer offered to you. **These are one answer.**
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The offer cannot be countered. Four codes, leading to four different places:
+
+          | `error.code` | What happened |
+          |---|---|
+          | `bidding_wrong_party` | That offer is yours. Revise it rather than countering it |
+          | `bidding_bid_accepted` | The customer awarded this bid. Show them the job |
+          | `bidding_bid_closed` | The offer is superseded, withdrawn, rejected or expired — or the job can no longer be awarded. The negotiation is over |
+          | `idempotency_key_reused` | This key was used for a *different* request. Generate a new one |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field — including fields you did not send, when the value inherited from the offer you
+          answered no longer makes a valid offer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+BidHistory:
+  get:
+    operationId: bidHistory
+    summary: Read one negotiation's offers
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Every offer exchanged between one customer and one provider on one job, oldest first (SHIP-88).
+
+      **Nothing is deleted and nothing is overwritten**, so every round is here at the amount it was
+      made at: the original offer, each counter, and any offer that was withdrawn and replaced. Docs/01
+      §4.3 requires the platform to record all offers, counter-offers and withdrawals, and Docs/02 §4
+      keeps that history visible.
+
+      Address it through **any** offer in the negotiation — the one you are holding will do, however
+      old. What you get back is the whole exchange either way.
+
+      ## Reading the chain
+
+      Each entry carries `offered_by`, which is `provider` or `customer`, and `superseded_by`, which
+      names the counter that displaced it. **The one entry with no `superseded_by` is the live head**,
+      and it is the only offer anybody can act on: the only one that can be countered, and the only
+      one the customer can award.
+
+      ## Who may read it
+
+      The two parties to the negotiation: the provider who is bidding, and the customer who owns the
+      job. Anybody else answers `404`, byte-identically to a bid that does not exist — **another
+      provider's prices, counters and timing are private** (Docs/01 §4.3), and this is the response
+      that would otherwise hand a competitor an entire negotiation at once.
+
+      This is one negotiation, not every bid on the job. A customer comparing offers from several
+      providers reads a different endpoint.
+
+      It keeps working after the job is awarded, cancelled or completed. A record is most useful once
+      the work is over.
+
+      ## No paging
+
+      A negotiation is a handful of rounds, so the response is the collection envelope with
+      `next_cursor` always null. `has_more` is a truncation report rather than an invitation to ask
+      for the rest.
+
+      Read-only, so no `Idempotency-Key`.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/BidID'
+    responses:
+      '200':
+        description: |
+          The negotiation's offers, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/BidChain'
+      '400':
+        description: |
+          A malformed identifier in the path (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such bid — or one you are not a party to, or not on the job in the path. These are one
+          answer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- shared responses -------------------------------------------------------------------------
+
+BidNoLongerYours:
+  description: |
+    The offer is no longer yours to change. Three codes, leading to three different places:
+
+    | `error.code` | What happened |
+    |---|---|
+    | `bidding_bid_accepted` | The customer awarded this bid. Show them the job they have won |
+    | `bidding_bid_closed` | The offer is rejected, expired, superseded — or, for a revision, already withdrawn. Show the feed |
+    | `idempotency_key_reused` | This key was used for a *different* request. Generate a new one |
+  headers:
+    X-Request-Id:
+      $ref: '../openapi.yaml#/components/headers/RequestID'
+  content:
+    application/json:
+      schema:
+        $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- schemas ---------------------------------------------------------------------------------
+
+BidPlacement:
+  type: object
+  additionalProperties: false
+  required: [amount_cents, pickup_at, deliver_by]
+  description: |
+    What you are offering. Unknown fields are refused, so a client typo fails loudly rather than
+    being silently ignored.
+
+    There is no field for whose bid this is and none for its status. The bidder is whoever the token
+    says is calling, and a bid's status is the platform's — a provider cannot accept their own offer.
+  properties:
+    amount_cents:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 100000000
+      description: |
+        Your price for the whole job, in cents. AUD; there is no currency field in the MVP.
+
+        Minor units as a whole number because money is never a floating-point value: `450.50` is not
+        exactly representable and the errors accumulate. `45000` is $450.00.
+      example: 45000
+    pickup_at:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. When you commit to collecting. Must be in the future.
+      example: '2026-08-20T09:00:00+10:00'
+    deliver_by:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. When you commit to having delivered. Must be after `pickup_at`.
+      example: '2026-08-20T17:00:00+10:00'
+    message:
+      type: string
+      maxLength: 2000
+      description: |
+        Conditions accompanying the offer, in your own words — access, timing caveats, what the price
+        includes. Optional.
+      example: Can collect from the loading dock any time after eight.
+
+BidRevision:
+  type: object
+  additionalProperties: false
+  minProperties: 1
+  description: |
+    What you are changing. **Every field is optional and anything omitted is left alone** — send the
+    price if the price is what moved. At least one field is required.
+
+    Unknown fields are refused, so a client typo fails loudly. There is still no field for whose bid
+    this is and none for its status: a bid's status is the platform's, and `withdrawn` in particular
+    is reached through `POST /v1/jobs/{id}/bids/{bid_id}/withdraw` rather than by writing it here.
+  properties:
+    amount_cents:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 100000000
+      description: |
+        Your new price for the whole job, in cents. AUD, and a whole number, exactly as when you
+        placed the offer.
+      example: 39900
+    pickup_at:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. A new commitment about when you will collect. Must be in the future.
+      example: '2026-08-22T09:00:00+10:00'
+    deliver_by:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. A new commitment about when it will be delivered. Must be after `pickup_at`,
+        including when `pickup_at` is the one already stored.
+      example: '2026-08-22T17:00:00+10:00'
+    message:
+      type: string
+      maxLength: 2000
+      description: |
+        Replaces the conditions accompanying the offer. Send it blank to remove them.
+      example: Two people and a tail lift; the price includes both.
+
+BidWithdrawal:
+  type: object
+  additionalProperties: false
+  description: |
+    Empty. `{}` is the whole request.
+
+    You name the intent and the platform decides what the state becomes, which is why there is no
+    `status` field here — a client that sends one is told it does not exist rather than having it
+    ignored. A body is required all the same, so that every endpoint in this API answers the same way
+    to a request with none.
+
+    There is no reason field either. No ticket asks a provider *why* they withdrew, and a free-text
+    reason nobody reads is a field the customer would eventually be shown.
+
+BidCounter:
+  type: object
+  additionalProperties: false
+  minProperties: 1
+  description: |
+    What you are changing about the offer you are answering. **Every field is optional and anything
+    omitted is inherited from that offer** — send the price if the price is what moved, and the timing
+    and conditions on the table stay on the table.
+
+    At least one field is required. A counter-offer that changes nothing is agreement, and the way to
+    agree is to award the job.
+
+    Unknown fields are refused, so a client typo fails loudly. There is no field for whose counter this
+    is and none for its status: which party is countering is decided from your credential and the offer
+    you named, and a bid's status is the platform's.
+  properties:
+    amount_cents:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 100000000
+      description: |
+        The price you are proposing for the whole job, in cents. AUD, and a whole number, exactly as
+        when the offer was placed.
+
+        If you are the customer, this is **your** number and it is not your budget: your maximum stays
+        private and this API never shows it to a provider in any form. A counter-offer is a number you
+        chose to put in front of them.
+      example: 40000
+    pickup_at:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. A different commitment about when collection happens. Must be in the future.
+      example: '2026-08-22T09:00:00+10:00'
+    deliver_by:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. A different commitment about when delivery happens. Must be after `pickup_at`,
+        including when `pickup_at` is the one inherited from the offer you are answering.
+      example: '2026-08-22T17:00:00+10:00'
+    message:
+      type: string
+      maxLength: 2000
+      description: |
+        Replaces the conditions accompanying the offer. Send it blank to remove them.
+      example: Happy at this price if you can make it Thursday morning.
+
+BidChain:
+  type: object
+  additionalProperties: false
+  required: [data, next_cursor, has_more]
+  description: |
+    One negotiation's offers, oldest first — the collection envelope every collection in this API uses.
+
+    `next_cursor` is always null: this does not page. `has_more` is a truncation report for a
+    negotiation longer than a hundred rounds, not an invitation to ask for the rest.
+  properties:
+    data:
+      type: array
+      description: |
+        Every offer exchanged between this customer and this provider on this job, oldest first,
+        including offers that were withdrawn and any replacement placed afterwards.
+
+        The one entry with no `superseded_by` is the live head, and it is the only offer that can be
+        countered or awarded.
+      items:
+        $ref: '#/Bid'
+    next_cursor:
+      type: string
+      nullable: true
+      description: Always null. This endpoint does not page.
+      example: null
+    has_more:
+      type: boolean
+      description: |
+        True only when the negotiation is longer than the response carries.
+      example: false
+
+Bid:
+  type: object
+  additionalProperties: false
+  required: [id, job_id, status, offered_by, amount_cents, pickup_at, deliver_by, created_at, updated_at]
+  description: |
+    One offer against one job, as the provider who made it sees it.
+
+    **The key set here is closed, and that is a privacy mechanism rather than tidiness.** Docs/01
+    §4.3 forbids the customer's budget reaching a provider "as an amount, a band, or a 'budget
+    supplied' flag", and a rule expressed as a list of forbidden names cannot say that — `max_price`
+    is a budget and does not contain the word. `additionalProperties: false` is the other direction:
+    anything not promised is refused. A Go test and a `make verify` check assert the same closed set
+    against the real response, so a field added here is a decision somebody records in three places
+    rather than one that arrives with a schema change.
+
+    Nothing about the job travels in this shape beyond its identifier. Read `GET /v1/jobs/open/{id}`
+    for the job.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    status:
+      type: string
+      enum: [draft, submitted, countered, accepted, rejected, withdrawn, expired, superseded]
+      description: |
+        Docs/02 §4's eight bid statuses, in lower snake case. An offer you place or counter with is
+        `submitted`: live, and awaiting the other party. Revising it leaves it there.
+
+        `withdrawn` comes from `POST /v1/jobs/{id}/bids/{bid_id}/withdraw`, and `superseded` is what an
+        offer becomes when the other party counters it — after which it can be neither changed nor
+        answered, only read. The remaining four are reachable through endpoints still being built:
+        expiry, the award, and the rejection an award leaves behind. `countered` is in the list because
+        Docs/02 §4 names it; nothing writes it, because `superseded` is the one status this platform
+        gives a displaced offer.
+      example: submitted
+    offered_by:
+      type: string
+      enum: [provider, customer]
+      description: |
+        Which party made this offer (SHIP-87). A negotiation alternates — a provider offers, the
+        customer counters, the provider counters back — and this is what says which entry is whose.
+
+        It is not derivable from position: you may join a negotiation halfway, and a negotiation can
+        hold more than one chain when an offer was withdrawn and replaced.
+      example: provider
+    amount_cents:
+      type: integer
+      format: int64
+      description: Your price, in cents, as you sent it.
+      example: 45000
+    pickup_at:
+      type: string
+      format: date-time
+      description: When you committed to collecting, in UTC.
+      example: '2026-08-19T23:00:00.000Z'
+    deliver_by:
+      type: string
+      format: date-time
+      description: When you committed to having delivered, in UTC.
+      example: '2026-08-20T07:00:00.000Z'
+    message:
+      type: string
+      description: |
+        The conditions accompanying the offer, whitespace collapsed. Omitted when none was given.
+      example: Can collect from the loading dock any time after eight.
+    superseded_by:
+      type: string
+      format: uuid
+      description: |
+        The counter-offer that displaced this one (SHIP-88). **Omitted while this offer is the live
+        head of its negotiation**, which is the useful case: an offer with no `superseded_by` is the
+        only one that can be countered, and the only one the customer can award.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    created_at:
+      type: string
+      format: date-time
+      description: When the offer was placed, on the platform's clock, in UTC.
+      example: '2026-08-13T04:15:30.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      example: '2026-08-13T04:15:30.000Z'
+
+# --- parameters ------------------------------------------------------------------------------
+
+JobID:
+  name: id
+  in: path
+  required: true
+  description: The job's identifier.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+
+BidID:
+  name: bid_id
+  in: path
+  required: true
+  description: |
+    The bid's identifier, as returned when you placed it.
+
+    **A bid is addressed under the job it was placed on**, and both halves are checked: a real bid
+    paired with the wrong job answers `404`, the same as a bid that does not exist. One resource has
+    one address here, which is what keeps a rule from being enforced at one of them and forgotten at
+    another.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a phone that retries
+    after a dropped connection must not end up having bid twice.
+
+    Here the key is more than a retry mechanism: it is stored against the bid, so a retry that
+    arrives after any cache has forgotten it is still answered with the offer it placed rather than
+    refused as a second bid. The key is scoped to you and to the job — reusing one value across two
+    jobs is two requests that both succeed, and no key of yours can reach another provider's offer.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d

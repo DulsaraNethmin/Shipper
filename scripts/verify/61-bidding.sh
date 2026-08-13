@@ -1,0 +1,1158 @@
+# shellcheck shell=bash
+#
+# M3 bidding — what a provider offers against a job, and the two rules that make "once" true.
+#
+# Sourced by scripts/verify-foundation.sh; see 00-stack.sh for what the runner provides.
+#
+# 60–69 is the fleet and bidding range, and 60-fleet.sh has the lower half. This file is bidding's to
+# append to and no other track's to edit — which is the whole reason the script was split
+# (Docs/11 §9, SHIP-15e).
+#
+# # This section registers its own accounts rather than reusing 60-fleet.sh's
+#
+# Sections are sourced, so everything 60-fleet.sh left behind is in scope, and using it would be
+# permitted. It is not done, on the runner's own advice: a section that needs an account registers
+# one. 60-fleet.sh leaves its eligibility provider having bid on nothing and its job in a state that
+# file controls, and "this provider has exactly one live offer" cannot be demonstrated against a
+# fixture this section does not own.
+#
+# # Every token here claims `role: customer`, including the ones that succeed
+#
+# mint_token puts `role: customer` in every token it issues, which is exactly the thing worth
+# exercising: the platform decides what a caller may do by reading the database, not by believing the
+# claim. So the provider below bids with a token that says customer, and the customer is refused with
+# an identical one — a stronger demonstration than two honest tokens would be.
+#
+# No check here signs in, so SHIP-47's per-address bucket (rl:v1:signin:*, shared across sections and
+# across runs from 127.0.0.1) is untouched by this file.
+#
+# Nothing here reads Kafka or the outbox, so no fence is needed: placing a bid emits no event
+# (SHIP-136 owns bidding's events) and moves no job.
+
+# --- the accounts and the job these checks run against -----------------------------------------
+
+status="$(post_json "verify-bid-prov-$$" /v1/auth/register \
+  "{\"email\":\"bid-provider-$$@example.com\",\"phone\":\"04145$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/bid-provider.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-provider.json"; fail "could not register the bidding provider: $status"; }
+bid_provider_id="$(json "$WORKDIR/bid-provider.json" '["id"]')"
+bid_provider_token="$(mint_token "$bid_provider_id")"
+
+status="$(post_json "verify-bid-rival-$$" /v1/auth/register \
+  "{\"email\":\"bid-rival-$$@example.com\",\"phone\":\"04146$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/bid-rival.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-rival.json"; fail "could not register the rival provider: $status"; }
+bid_rival_id="$(json "$WORKDIR/bid-rival.json" '["id"]')"
+bid_rival_token="$(mint_token "$bid_rival_id")"
+
+status="$(post_json "verify-bid-cust-$$" /v1/auth/register \
+  "{\"email\":\"bid-customer-$$@example.com\",\"phone\":\"04147$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/bid-customer.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-customer.json"; fail "could not register the bidding customer: $status"; }
+bid_customer_id="$(json "$WORKDIR/bid-customer.json" '["id"]')"
+bid_customer_token="$(mint_token "$bid_customer_id")"
+
+# bid_post <token> <key> <path> <body> <name> — one authenticated state-changing request, keeping
+# the response headers.
+#
+# The headers are not decoration: `Idempotency-Replayed` is how a check says *which* mechanism
+# answered a retry, and asserting on the status alone could not tell Redis from the database.
+bid_post() {
+  curl -s -X POST -o "$WORKDIR/bid-$5.json" -D "$WORKDIR/bid-$5.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT$3"
+}
+
+# replayed_from_redis <name> — whether the middleware answered that request from its own store.
+replayed_from_redis() { grep -qi '^idempotency-replayed: true' "$WORKDIR/bid-$1.headers"; }
+
+# forget_the_cached_response <subject> <key> — delete the middleware's entry, as a TTL expiry would.
+#
+# The key is namespaced by the authenticated subject (SHIP-44), which is what stops one client
+# reading another's stored response.
+forget_the_cached_response() {
+  redis-cli -u "$REDIS_URL" del "idem:v1:user:$1:$2" >/dev/null
+}
+
+# move_job <job> <from> <to> — a status transition made the only way 000402 permits one: a
+# job_status_history row written in the same transaction and named by shipper.job_status_transition.
+#
+# SHIP-63's publish endpoint does not exist yet, so the guard is satisfied directly rather than
+# bypassed. The same helper 60-fleet.sh defines, with this section's customer as the actor — repeated
+# rather than reused so that neither file's fixture can be broken by an edit to the other's.
+move_job() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<SQL
+DO \$do\$
+DECLARE entry uuid := gen_random_uuid();
+BEGIN
+  INSERT INTO job_status_history
+      (id, job_id, from_status, to_status, actor_type, actor_id, actor_recorded_at)
+  VALUES (entry, '$1', '$2', '$3', 'customer', '$bid_customer_id', now());
+  PERFORM set_config('shipper.job_status_transition', entry::text, true);
+  UPDATE jobs SET status = '$3' WHERE id = '$1';
+END
+\$do\$;
+SQL
+}
+
+# Both providers meet Docs/04 §3's automated baseline, serve Victoria, and run a truck that fits.
+# Driving the real verification endpoints would need the token out of the console email and the OTP
+# out of the log, which 40-identity.sh already demonstrates; repeating it here would be testing
+# identity rather than bidding.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set email_verified_at = now(), phone_verified_at = now()
+     where id in ('$bid_provider_id', '$bid_rival_id');"
+
+for pair in "$bid_provider_token:BID101" "$bid_rival_token:BID102"; do
+  status="$(bid_post "${pair%%:*}" "verify-bid-area-${pair##*:}-$$" /v1/fleet/vehicles \
+    "{\"registration\":\"${pair##*:}\",\"vehicle_type\":\"box_truck\",\"max_weight_kg\":1200,\"load_length_cm\":300,\"load_width_cm\":160,\"load_height_cm\":180}" \
+    "vehicle-${pair##*:}")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-vehicle-${pair##*:}.json"; fail "adding ${pair##*:} returned $status"; }
+
+  status="$(curl -s -X PATCH -o "$WORKDIR/bid-profile.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer ${pair%%:*}" -H "Idempotency-Key: verify-bid-prof-${pair##*:}-$$" \
+    -H 'Content-Type: application/json' -d '{"service_area":{"states":["VIC"]}}' \
+    "http://localhost:$VERIFY_PORT/v1/fleet/profile")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/bid-profile.json"; fail "declaring VIC returned $status"; }
+done
+
+# The job carries a budget, deliberately, and it is the number the privacy checks below search for.
+# A job with no budget would make every one of those assertions vacuous — a privacy check whose
+# fixture has nothing to leak passes forever and proves nothing.
+status="$(bid_post "$bid_customer_token" "verify-bid-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":432199}' job)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-job.json"; fail "creating the bidding job returned $status"; }
+bid_job_id="$(json "$WORKDIR/bid-job.json" '["id"]')"
+move_job "$bid_job_id" Draft Open
+
+# The offer every check below sends, unless it is breaking one field of it. The timestamps carry an
+# offset rather than a Z, because that is what a phone in Melbourne sends.
+bid_pickup="$(date -u -v+2d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '+2 days' '+%Y-%m-%dT%H:%M:%SZ')"
+bid_deliver="$(date -u -v+3d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '+3 days' '+%Y-%m-%dT%H:%M:%SZ')"
+bid_body="{\"amount_cents\":45000,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\",\"message\":\"Can collect from the loading dock.\"}"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  POST /v1/jobs/{id}/bids — a verified, eligible provider bids with price and timing"
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-bid-anon-$$" -H 'Content-Type: application/json' \
+  -d "$bid_body" "http://localhost:$VERIFY_PORT/v1/jobs/$bid_job_id/bids")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-anon.json"; fail "an unauthenticated bid returned $status, want 401"; }
+ok "it cannot be reached without a credential"
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" -H 'Content-Type: application/json' \
+  -d "$bid_body" "http://localhost:$VERIFY_PORT/v1/jobs/$bid_job_id/bids")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-nokey.json"; fail "a bid with no Idempotency-Key returned $status, want 400"; }
+ok "and not without an Idempotency-Key — the key is what the offer is recorded under, not just how a retry is absorbed"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-place-$$" "/v1/jobs/$bid_job_id/bids" "$bid_body" place)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-place.json"; fail "placing a bid returned $status, want 201"; }
+bid_id="$(json "$WORKDIR/bid-place.json" '["id"]')"
+[[ "$bid_id" =~ ^[0-9a-f-]{36}$ ]] || fail "the response carries no bid id: $bid_id"
+[[ "$(json "$WORKDIR/bid-place.json" '["status"]')" == "submitted" ]] \
+  || fail "the bid came back as $(json "$WORKDIR/bid-place.json" '["status"]'), want the lower snake case wire form"
+[[ "$(json "$WORKDIR/bid-place.json" '["amount_cents"]')" == "45000" ]] || fail "the amount did not come back"
+[[ "$(json "$WORKDIR/bid-place.json" '["job_id"]')" == "$bid_job_id" ]] || fail "the bid names the wrong job"
+ok "a verified, eligible provider places an offer with a price and two commitments about timing"
+
+# The row, not the answer the endpoint gave about itself. The amount is read as a numeric, which is
+# where a one-directional cents conversion would show: Go holds 45000 and the column holds 450.00.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select provider_id || ' ' || status || ' ' || amount::text || ' ' || idempotency_key
+     from bids where id = '$bid_id';")"
+[[ "$stored" == "$bid_provider_id Submitted 450.00 verify-bid-place-$$" ]] \
+  || fail "the stored bid is '$stored', want '$bid_provider_id Submitted 450.00 verify-bid-place-$$'"
+ok "the row is owned by the calling provider, is Submitted, and holds 45000 cents as 450.00"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  the customer's budget reaches no provider, in any form"
+
+# The fixture, verified rather than assumed.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select budget from jobs where id = '$bid_job_id';")" == "4321.99" ]] \
+  || fail "the job has no budget, so the checks below assert nothing"
+
+python3 - "$WORKDIR/bid-place.json" <<'PY' || fail "a provider's own bid carries something of the customer's"
+import json, re, sys
+
+# **A closed set of keys, not a search for the word "budget".** Docs/01 §4.3 forbids the customer's
+# maximum reaching a provider "as an amount, a band, or a 'budget supplied' flag", and a deny-list of
+# names cannot express that: `max_price` is a budget and does not contain the word. This is the other
+# direction — anything not promised is refused — and it is the same list as the `Bid` schema in
+# contracts/paths/bidding.yaml and providerBidKeys in internal/bidding/http_test.go.
+allowed = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
+    "created_at", "updated_at",
+    # The collection envelope of Docs/10 §4.5, which the history endpoint answers with (SHIP-88).
+    "data", "next_cursor", "has_more",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+raw = open(sys.argv[1]).read()
+
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+    print("A budget under another name is still a budget (Docs/01 §4.3).", file=sys.stderr)
+    sys.exit(1)
+
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+# Identifiers come out before the value search: a UUID is hexadecimal, so a run of digits can occur
+# inside one by chance — rarely enough to pass review and often enough to fail one morning.
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        print(raw, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the bid response is a closed set of keys, and carries neither the word nor the value nor a key under another name"
+
+# Nothing of the job travels in a bid at all, which is stronger than redaction: there is no field to
+# leak because there is no job in the shape. GET /v1/jobs/open/{id} is where a provider reads the job.
+for disclosure in 'Church Street' 'Richmond' 'sofa' '"weight' '"pickup"'; do
+  grep -q "$disclosure" "$WORKDIR/bid-place.json" \
+    && { cat "$WORKDIR/bid-place.json"; fail "the bid carries '$disclosure' — a bid names its job and nothing else"; }
+done
+ok "a bid names the job it is against and copies nothing out of it"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  one live offer per provider per job, held by a partial unique index"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-second-$$" "/v1/jobs/$bid_job_id/bids" "$bid_body" second)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-second.json"; fail "a second offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-second.json" '["error"]["code"]')" == "bidding_already_bid" ]] \
+  || { cat "$WORKDIR/bid-second.json"; fail "expected code=bidding_already_bid"; }
+ok "a second offer under a fresh key is refused with a code the app can act on"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where provider_id = '$bid_provider_id' and job_id = '$bid_job_id';")" == "1" ]] \
+  || fail "the refused second offer left a row behind"
+ok "and wrote nothing — the index refused it, not a check that could race"
+
+# The rule is per provider. A marketplace where the second provider to bid was refused would be no
+# marketplace at all.
+status="$(bid_post "$bid_rival_token" "verify-bid-rival-place-$$" "/v1/jobs/$bid_job_id/bids" "$bid_body" rival)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-rival.json"; fail "a second provider was refused a job the first had bid on: $status"; }
+ok "another provider may bid on the same job — the rule is per provider, not per job"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  a provider never sees another provider's offer or its price"
+
+# **Both providers deliberately send the same key.** Clients generate their own; two colliding is
+# unlikely and is not something this API may rely on, and reusing one is how a competitor would probe
+# for a store read scoped by job and key but not by provider. Every key in the leaked response would
+# be one this API promises a provider, so the budget check above would pass on it.
+shared_key="verify-bid-shared-$$"
+
+status="$(bid_post "$bid_customer_token" "verify-bid-job2-$$" /v1/jobs \
+  '{"pickup":{"line":"12 Swan Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"400 Collins Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Filing cabinet","weight_kg":40,"budget_cents":432199}' job2)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-job2.json"; fail "creating the second job returned $status"; }
+second_job="$(json "$WORKDIR/bid-job2.json" '["id"]')"
+move_job "$second_job" Draft Open
+
+# A distinctive price, so the rival's response can be searched for it.
+status="$(bid_post "$bid_provider_token" "$shared_key" "/v1/jobs/$second_job/bids" \
+  "{\"amount_cents\":777701,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\"}" mine)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-mine.json"; fail "the first provider's offer returned $status"; }
+
+status="$(bid_post "$bid_rival_token" "$shared_key" "/v1/jobs/$second_job/bids" "$bid_body" theirs)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/bid-theirs.json"; fail "the rival's key was refused by somebody else's bid: $status"; }
+[[ "$(json "$WORKDIR/bid-theirs.json" '["id"]')" != "$(json "$WORKDIR/bid-mine.json" '["id"]')" ]] \
+  || fail "the rival was handed the first provider's bid — the store read is not scoped by provider"
+grep -q '777701' "$WORKDIR/bid-theirs.json" \
+  && { cat "$WORKDIR/bid-theirs.json"; fail "the rival's response carries the first provider's price"; }
+[[ "$(json "$WORKDIR/bid-theirs.json" '["amount_cents"]')" == "45000" ]] || fail "the rival did not get their own offer"
+ok "two providers sharing one idempotency key each get their own offer, and neither sees the other's price"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  a retry is answered from the record, not refused as a second bid"
+
+# # This is where the two idempotency mechanisms are told apart
+#
+# The middleware replays a *response* while its Redis entry lives; the column replays the *row*
+# forever. A phone out of signal for a day outlives any TTL worth setting, and without the stored key
+# that request would meet uq_bids_one_submitted_per_provider_per_job instead and be told "you already
+# have a live offer" — a 409 for a request that actually succeeded.
+retry_key="verify-bid-retry-$$"
+retry_job_body="{\"amount_cents\":50000,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\"}"
+
+status="$(bid_post "$bid_customer_token" "verify-bid-job3-$$" /v1/jobs \
+  '{"pickup":{"line":"30 Bridge Road","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Malop Street","suburb":"Geelong","state":"VIC","postcode":"3220"},
+    "goods_description":"Pallet of tiles","weight_kg":300}' job3)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-job3.json"; fail "creating the retry job returned $status"; }
+retry_job="$(json "$WORKDIR/bid-job3.json" '["id"]')"
+move_job "$retry_job" Draft Open
+
+status="$(bid_post "$bid_provider_token" "$retry_key" "/v1/jobs/$retry_job/bids" "$retry_job_body" r1)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r1.json"; fail "the first offer returned $status, want 201"; }
+replayed_from_redis r1 && fail "the first request was answered from the cache"
+retry_bid_id="$(json "$WORKDIR/bid-r1.json" '["id"]')"
+ok "the offer is placed"
+
+status="$(bid_post "$bid_provider_token" "$retry_key" "/v1/jobs/$retry_job/bids" "$retry_job_body" r2)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r2.json"; fail "the cached retry returned $status, want the stored 201"; }
+replayed_from_redis r2 || fail "the second request was not replayed by the middleware"
+diff -q "$WORKDIR/bid-r1.json" "$WORKDIR/bid-r2.json" >/dev/null \
+  || fail "the replayed response is not byte-identical to the original"
+ok "a retry inside the cache is replayed by the middleware, byte for byte, as the original 201"
+
+# Now remove the entry, as a TTL expiry, an eviction or a failover would. The request runs all the
+# way to the table this time.
+forget_the_cached_response "$bid_provider_id" "$retry_key"
+
+status="$(bid_post "$bid_provider_token" "$retry_key" "/v1/jobs/$retry_job/bids" "$retry_job_body" r3)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/bid-r3.json"; fail "a retry after the cache forgot it returned $status, want 200 from the row"; }
+replayed_from_redis r3 && fail "the third request was still answered from the cache"
+[[ "$(json "$WORKDIR/bid-r3.json" '["id"]')" == "$retry_bid_id" ]] \
+  || fail "the retry answered with a different bid: $(json "$WORKDIR/bid-r3.json" '["id"]')"
+ok "and a retry the cache has forgotten is answered from the row — 200, the same offer, no 409"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where provider_id = '$bid_provider_id' and job_id = '$retry_job';")" == "1" ]] \
+  || fail "three requests under one key left more than one bid"
+ok "one offer at the end of all three — Redis makes the retry cheap, the index makes it correct"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  who may bid is the platform's decision, and a refusal discloses nothing"
+
+# CLAUDE.md: no authorisation decision on the device. The app hides the bid form from a customer; the
+# platform refuses it — and the token this customer presents is the same shape as the provider's.
+status="$(bid_post "$bid_customer_token" "verify-bid-cust-place-$$" "/v1/jobs/$bid_job_id/bids" "$bid_body" cust)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-cust.json"; fail "the job's own customer bid on it: $status"; }
+ok "a customer is refused, including the customer who owns the job"
+
+# A job that exists and is no longer biddable answers exactly what a job that never existed answers.
+# 403 would confirm the job is there, and what became of work a provider was not given is not
+# something this API discloses.
+move_job "$bid_job_id" Open Cancelled
+status="$(bid_post "$bid_rival_token" "verify-bid-closed-$$" "/v1/jobs/$bid_job_id/bids" "$bid_body" closed)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-closed.json"; fail "a bid on a cancelled job returned $status, want 404"; }
+
+status="$(bid_post "$bid_rival_token" "verify-bid-nothing-$$" \
+  /v1/jobs/00000000-0000-7000-8000-000000000084/bids "$bid_body" nothing)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-nothing.json"; fail "a bid on a job that does not exist returned $status"; }
+
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/bid-closed.json" "$WORKDIR/bid-nothing.json" \
+  || fail "a job that is no longer biddable answers differently from a job that does not exist"
+ok "a job nobody may bid on answers exactly what a missing job answers — the refusal confirms nothing"
+
+# An unverified provider is refused too, which is the "verified" in the *Done when*. Broken and
+# restored, so the rest of this file still runs against an eligible fleet.
+"$PSQL" "$DATABASE_URL" -q -c "update users set phone_verified_at = null where id = '$bid_rival_id';"
+status="$(bid_post "$bid_rival_token" "verify-bid-unverified-$$" "/v1/jobs/$retry_job/bids" "$bid_body" unverified)"
+"$PSQL" "$DATABASE_URL" -q -c "update users set phone_verified_at = now() where id = '$bid_rival_id';"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-unverified.json"; fail "an unverified provider bid: $status"; }
+ok "an unverified provider is refused — the eligibility filter is SHIP-81's, read through a port rather than copied"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  Docs/02 §1 makes two statuses biddable, and both are exercised"
+
+# **Negotiating remains open to eligible bids.** Docs/02 §1: "'Negotiating' is a useful presentation
+# status. Technically, the job remains available for eligible bids unless the customer closes it or
+# awards a bid."
+#
+# Nothing can reach Negotiating until SHIP-90, so a filter accepting only Open would pass every other
+# check in this file and surface months from now as jobs silently refusing bids the moment somebody
+# negotiated. The status is set here directly because no endpoint can yet.
+move_job "$retry_job" Open Negotiating
+
+status="$(bid_post "$bid_rival_token" "verify-bid-negotiating-$$" "/v1/jobs/$retry_job/bids" "$bid_body" negotiating)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/bid-negotiating.json"; fail "a Negotiating job refused a bid ($status). Docs/02 §1 keeps it open to eligible bids."; }
+ok "a job at Negotiating still accepts a bid from an eligible provider"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  placing a bid does not move the job — Open → Negotiating is SHIP-90's"
+
+# $second_job has carried two live offers since the privacy section above. A job with active bids
+# presents as Negotiating in Docs/02 §1, and moving it there is **SHIP-90's** ticket, which depends on
+# SHIP-87 and SHIP-57. It is deliberately not done here: a bid is not a status transition, so it
+# leaves no job_status_history row either — and the history count is the half that would catch a move
+# made through some other path.
+after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from bids where job_id = j.id)::text || ' '
+          || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$second_job';")"
+[[ "$after" == "Open 2 1" ]] \
+  || fail "the job reads '$after' (status, bids, history rows), want 'Open 2 1' — two offers must leave it Open with only its Draft → Open row"
+ok "a job with two live offers is still Open, with no history row beyond the one that published it"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-84  price and timing are required, and every bad field is named at once"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-empty-$$" "/v1/jobs/$second_job/bids" '{}' empty)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-empty.json"; fail "an empty offer returned $status, want 422"; }
+for field in amount_cents pickup_at deliver_by; do
+  grep -q "\"$field\"" "$WORKDIR/bid-empty.json" || fail "no detail names $field"
+done
+ok "an offer with no price and no timing names all three fields at once"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-backwards-$$" "/v1/jobs/$second_job/bids" \
+  "{\"amount_cents\":45000,\"pickup_at\":\"$bid_deliver\",\"deliver_by\":\"$bid_pickup\"}" backwards)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-backwards.json"; fail "delivering before collecting returned $status, want 422"; }
+grep -q 'deliver_by' "$WORKDIR/bid-backwards.json" || fail "the refusal does not name deliver_by"
+ok "delivery before collection is refused, naming the field"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-past-$$" "/v1/jobs/$second_job/bids" \
+  '{"amount_cents":45000,"pickup_at":"2020-01-01T09:00:00Z","deliver_by":"2020-01-02T09:00:00Z"}' past)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-past.json"; fail "a collection time in the past returned $status, want 422"; }
+ok "and so is a collection time that has already passed"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-status-$$" "/v1/jobs/$second_job/bids" \
+  "{\"amount_cents\":45000,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\",\"status\":\"accepted\"}" setstatus)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-setstatus.json"; fail "a body naming a status returned $status, want 400"; }
+grep -q 'status' "$WORKDIR/bid-setstatus.json" || fail "the refusal does not name the field"
+ok "a bid's status is not a settable field; the unknown field is reported, not ignored"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-85  PATCH /v1/jobs/{id}/bids/{bid_id} — a provider revises their own active bid"
+
+# $retry_job carries this provider's offer from the retry section above, and $bid_job_id was cancelled
+# by the disclosure section, so a fresh job is published for the two tickets below to work against.
+status="$(bid_post "$bid_customer_token" "verify-bid-job4-$$" /v1/jobs \
+  '{"pickup":{"line":"88 Bridge Road","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"7 Little Malop Street","suburb":"Geelong","state":"VIC","postcode":"3220"},
+    "goods_description":"Flat-packed shelving","weight_kg":60,"budget_cents":432199}' job4)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-job4.json"; fail "creating the revision job returned $status"; }
+revise_job="$(json "$WORKDIR/bid-job4.json" '["id"]')"
+move_job "$revise_job" Draft Open
+
+status="$(bid_post "$bid_provider_token" "verify-bid-revbase-$$" "/v1/jobs/$revise_job/bids" "$bid_body" revbase)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-revbase.json"; fail "placing the offer to revise returned $status"; }
+revise_bid="$(json "$WORKDIR/bid-revbase.json" '["id"]')"
+
+# bid_patch <token> <key> <path> <body> <name> — the same shape as bid_post, for SHIP-85's verb.
+bid_patch() {
+  curl -s -X PATCH -o "$WORKDIR/bid-$5.json" -D "$WORKDIR/bid-$5.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT$3"
+}
+
+status="$(curl -s -X PATCH -o "$WORKDIR/bid-rev-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-bid-rev-anon-$$" -H 'Content-Type: application/json' \
+  -d '{"amount_cents":39900}' "http://localhost:$VERIFY_PORT/v1/jobs/$revise_job/bids/$revise_bid")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-rev-anon.json"; fail "an unauthenticated revision returned $status, want 401"; }
+
+status="$(curl -s -X PATCH -o "$WORKDIR/bid-rev-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" -H 'Content-Type: application/json' \
+  -d '{"amount_cents":39900}' "http://localhost:$VERIFY_PORT/v1/jobs/$revise_job/bids/$revise_bid")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-rev-nokey.json"; fail "a revision with no Idempotency-Key returned $status, want 400"; }
+ok "it needs a credential and an Idempotency-Key, like every other state-changing route"
+
+status="$(bid_patch "$bid_provider_token" "verify-bid-revise-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  '{"amount_cents":39900,"message":"Two people and a tail lift."}' revise)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-revise.json"; fail "revising returned $status, want 200"; }
+[[ "$(json "$WORKDIR/bid-revise.json" '["amount_cents"]')" == "39900" ]] || fail "the revised price did not come back"
+[[ "$(json "$WORKDIR/bid-revise.json" '["id"]')" == "$revise_bid" ]] \
+  || fail "the revision answered with a different bid — a revision is not a counter-offer"
+[[ "$(json "$WORKDIR/bid-revise.json" '["status"]')" == "submitted" ]] \
+  || fail "the revised offer is $(json "$WORKDIR/bid-revise.json" '["status"]'), want submitted"
+ok "a provider revises their own active bid, and it stays the same live offer at a new number"
+
+# The row. `idempotency_key` is the one worth reading: it holds the key the offer was PLACED under,
+# and a revision that overwrote it would leave a late placement retry meeting
+# uq_bids_one_submitted_per_provider_per_job instead of its own row — a 409 for a request that
+# succeeded. The count is the other half: a revision writes no second row.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || amount::text || ' ' || idempotency_key
+     from bids where id = '$revise_bid';")"
+[[ "$stored" == "Submitted 399.00 verify-bid-revbase-$$" ]] \
+  || fail "the revised row is '$stored', want 'Submitted 399.00 verify-bid-revbase-$$' — the placement's key must survive"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where provider_id = '$bid_provider_id' and job_id = '$revise_job';")" == "1" ]] \
+  || fail "the revision wrote a second row"
+ok "the row holds the new price, the same status, and still the key the offer was placed under"
+
+# Only what was named. The timing was not sent above, so it must be exactly what was placed.
+[[ "$(json "$WORKDIR/bid-revise.json" '["pickup_at"]')" == "$(json "$WORKDIR/bid-revbase.json" '["pickup_at"]')" ]] \
+  || fail "pickup_at moved without being named"
+[[ "$(json "$WORKDIR/bid-revise.json" '["deliver_by"]')" == "$(json "$WORKDIR/bid-revbase.json" '["deliver_by"]')" ]] \
+  || fail "deliver_by moved without being named"
+ok "a revision changes only the fields it names"
+
+python3 - "$WORKDIR/bid-revise.json" <<'PY' || fail "the revision response carries something of the customer's"
+import json, re, sys
+
+# The same closed set the placement is held to, asserted again because this is a second code path
+# answering with the shape — which is exactly where a field safe on one path and not the other lands.
+allowed = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
+    "created_at", "updated_at",
+    # The collection envelope of Docs/10 §4.5, which the history endpoint answers with (SHIP-88).
+    "data", "next_cursor", "has_more",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the revision response is the same closed set of keys, and carries nothing of the customer's"
+
+status="$(bid_patch "$bid_provider_token" "verify-bid-revempty-$$" "/v1/jobs/$revise_job/bids/$revise_bid" '{}' revempty)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-revempty.json"; fail "a revision naming no field returned $status, want 400"; }
+
+status="$(bid_patch "$bid_provider_token" "verify-bid-revstatus-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  '{"status":"withdrawn"}' revstatus)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-revstatus.json"; fail "a revision naming a status returned $status, want 400"; }
+ok "a revision that names nothing is refused, and a bid's status is still not a settable field"
+
+status="$(bid_patch "$bid_provider_token" "verify-bid-revbad-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  "{\"amount_cents\":45000,\"deliver_by\":\"2020-01-01T09:00:00Z\"}" revbad)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-revbad.json"; fail "delivery before collection returned $status, want 422"; }
+grep -q 'deliver_by' "$WORKDIR/bid-revbad.json" || fail "the refusal does not name deliver_by"
+ok "the merged offer meets the same validator a placement meets, naming the field"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-85  \"their own\" is the whole of the authorisation, and a refusal discloses nothing"
+
+status="$(bid_patch "$bid_rival_token" "verify-bid-revrival-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  '{"amount_cents":1}' revrival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-revrival.json"; fail "a competitor revised somebody else's bid: $status"; }
+
+status="$(bid_patch "$bid_rival_token" "verify-bid-revnothing-$$" \
+  "/v1/jobs/$revise_job/bids/00000000-0000-7000-8000-000000000085" '{"amount_cents":1}' revnothing)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-revnothing.json"; fail "a bid that does not exist returned $status"; }
+
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/bid-revrival.json" "$WORKDIR/bid-revnothing.json" \
+  || fail "somebody else's bid answers differently from one that does not exist"
+ok "another provider's bid answers exactly what a bid that is not there answers"
+
+# The bid is real and the caller owns it; only the job it is paired with is wrong. Without that
+# comparison the first half of the URL would be decorative.
+status="$(bid_patch "$bid_provider_token" "verify-bid-revwrongjob-$$" "/v1/jobs/$retry_job/bids/$revise_bid" \
+  '{"amount_cents":1}' revwrongjob)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-revwrongjob.json"; fail "a bid was reachable under the wrong job: $status"; }
+ok "and a bid paired with the wrong job is not found either — one resource, one address"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select amount::text from bids where id = '$revise_bid';")" == "399.00" ]] \
+  || fail "a refused revision changed the row"
+ok "and none of the refusals touched the offer"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-86  POST /v1/jobs/{id}/bids/{bid_id}/withdraw — withdrawn before acceptance"
+
+withdraw_path="/v1/jobs/$revise_job/bids/$revise_bid/withdraw"
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-wd-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-bid-wd-anon-$$" -H 'Content-Type: application/json' -d '{}' \
+  "http://localhost:$VERIFY_PORT$withdraw_path")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-wd-anon.json"; fail "an unauthenticated withdrawal returned $status, want 401"; }
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-wd-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" -H 'Content-Type: application/json' -d '{}' \
+  "http://localhost:$VERIFY_PORT$withdraw_path")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-wd-nokey.json"; fail "a withdrawal with no Idempotency-Key returned $status, want 400"; }
+
+status="$(bid_post "$bid_rival_token" "verify-bid-wdrival-$$" "$withdraw_path" '{}' wdrival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-wdrival.json"; fail "a competitor withdrew somebody else's bid: $status"; }
+ok "it needs a credential and a key, and another provider cannot reach the bid at all"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-withdraw-$$" "$withdraw_path" '{}' withdraw)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-withdraw.json"; fail "withdrawing returned $status, want 200"; }
+[[ "$(json "$WORKDIR/bid-withdraw.json" '["status"]')" == "withdrawn" ]] \
+  || fail "the offer came back as $(json "$WORKDIR/bid-withdraw.json" '["status"]'), want withdrawn"
+[[ "$(json "$WORKDIR/bid-withdraw.json" '["id"]')" == "$revise_bid" ]] || fail "the withdrawal names a different bid"
+ok "a provider withdraws their own offer before acceptance, and the status becomes Withdrawn"
+
+# The row survives with its price. Docs/01 §4.3 requires every withdrawal to be recorded and Docs/02
+# §4 keeps the history readable — there is no delete on this table.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || amount::text from bids where id = '$revise_bid';")"
+[[ "$stored" == "Withdrawn 399.00" ]] \
+  || fail "the stored bid is '$stored', want 'Withdrawn 399.00' — a withdrawal is not a delete"
+ok "the row survives as record, at Withdrawn, with the price it was withdrawn at"
+
+python3 - "$WORKDIR/bid-withdraw.json" <<'PY' || fail "the withdrawal response carries something of the customer's"
+import json, re, sys
+
+allowed = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
+    "created_at", "updated_at",
+    # The collection envelope of Docs/10 §4.5, which the history endpoint answers with (SHIP-88).
+    "data", "next_cursor", "has_more",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the withdrawal response is the same closed set of keys, and carries nothing of the customer's"
+
+# A revision after a withdrawal is refused, which is the code a client acts on rather than reports.
+status="$(bid_patch "$bid_provider_token" "verify-bid-revclosed-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  '{"amount_cents":1}' revclosed)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-revclosed.json"; fail "revising a withdrawn offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-revclosed.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-revclosed.json"; fail "expected code=bidding_bid_closed"; }
+ok "a withdrawn offer can no longer be revised, with a code the app can act on"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-86  a retry of a withdrawal is not a failure, whichever key it carries"
+
+# **Two mechanisms again, and this section tells them apart the way the placement's does.** The
+# middleware replays a response while its Redis entry lives. Delete the entry and the request runs all
+# the way to the row — where, unlike a placement, there is no stored key to match it. What answers is
+# the state: the caller asked for an outcome that already holds.
+status="$(bid_post "$bid_provider_token" "verify-bid-withdraw-$$" "$withdraw_path" '{}' wd2)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-wd2.json"; fail "the cached retry returned $status, want the stored 200"; }
+replayed_from_redis wd2 || fail "the second withdrawal was not replayed by the middleware"
+diff -q "$WORKDIR/bid-withdraw.json" "$WORKDIR/bid-wd2.json" >/dev/null \
+  || fail "the replayed response is not byte-identical to the original"
+ok "a retry inside the cache is replayed by the middleware, byte for byte"
+
+forget_the_cached_response "$bid_provider_id" "verify-bid-withdraw-$$"
+before_updated="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$revise_bid';")"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-withdraw-$$" "$withdraw_path" '{}' wd3)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/bid-wd3.json"; fail "a withdrawal retried after the cache forgot it returned $status, want 200"; }
+replayed_from_redis wd3 && fail "the third request was still answered from the cache"
+ok "and a retry the cache has forgotten is still 200 — answered by the state, not by a stored key"
+
+# A *fresh* key for the same intent, which is what a phone that restarted actually sends. This is the
+# case no idempotency mechanism can absorb, and the reason withdrawing twice has to succeed.
+status="$(bid_post "$bid_provider_token" "verify-bid-withdraw-again-$$" "$withdraw_path" '{}' wd4)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/bid-wd4.json"; fail "a withdrawal under a FRESH key returned $status, want 200 — a retry must not fail because the first one succeeded"; }
+[[ "$(json "$WORKDIR/bid-wd4.json" '["status"]')" == "withdrawn" ]] || fail "the repeat answered with the wrong status"
+ok "a repeat under a brand new key succeeds too — the outcome the caller asked for holds"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$revise_bid';")" == "$before_updated" ]] \
+  || fail "an absorbed withdrawal wrote to the row"
+ok "and none of the repeats wrote to the row"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-86  a withdrawn offer frees the provider to bid again, and moves no job"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-replace-$$" "/v1/jobs/$revise_job/bids" "$bid_body" replace)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/bid-replace.json"; fail "bidding again after withdrawing returned $status, want 201"; }
+[[ "$(json "$WORKDIR/bid-replace.json" '["id"]')" != "$revise_bid" ]] || fail "the replacement is not a new row"
+ok "a provider who withdrew may place a new offer — a fat-fingered price is not a job lost forever"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where provider_id = '$bid_provider_id' and job_id = '$revise_job';")" == "2" ]] \
+  || fail "the withdrawn offer did not survive alongside the replacement"
+ok "and both rows stand — the withdrawn one as record, the new one as the live offer"
+
+# Neither verb is a job transition. Docs/02 §2 has `Negotiating → Open` on bids being withdrawn, and
+# that is SHIP-90's in both directions; the history count is the half that would catch a move made
+# through some other path.
+after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$revise_job';")"
+[[ "$after" == "Open 1" ]] \
+  || fail "the job reads '$after' (status, history rows), want 'Open 1' — revising and withdrawing move no job"
+ok "the job is still Open with only the row that published it — Negotiating is SHIP-90's, both ways"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  POST /v1/jobs/{id}/bids/{bid_id}/counter — either party answers the other's offer"
+
+# # The negotiation these checks build, and why it is one fixture rather than several
+#
+# A chain only means anything after several rounds, and each round's refusals are about the state the
+# round before it left. So the checks below run against one negotiation that grows as they go, and the
+# comments say which round each one is standing on. `$revise_job` is not reused: it carries a
+# withdrawn offer and a replacement from SHIP-86's checks, and "exactly this many rows" would then be
+# an assertion about another ticket's fixture.
+status="$(bid_post "$bid_customer_token" "verify-bid-job5-$$" /v1/jobs \
+  '{"pickup":{"line":"41 Bridge Road","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"90 Moorabool Street","suburb":"Geelong","state":"VIC","postcode":"3220"},
+    "goods_description":"Office chairs, six","weight_kg":90,"budget_cents":432199}' job5)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-job5.json"; fail "creating the counter job returned $status"; }
+counter_job="$(json "$WORKDIR/bid-job5.json" '["id"]')"
+move_job "$counter_job" Draft Open
+
+# bid_get <token> <path> <name> — one authenticated read, for SHIP-88's history.
+bid_get() {
+  curl -s -o "$WORKDIR/bid-$3.json" -D "$WORKDIR/bid-$3.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" "http://localhost:$VERIFY_PORT$2"
+}
+
+# counter_at <token> <key> <bid> <cents> <name> — one round of the negotiation.
+counter_at() {
+  bid_post "$1" "$2" "/v1/jobs/$counter_job/bids/$3/counter" "{\"amount_cents\":$4}" "$5"
+}
+
+# Round 1. The provider's opening offer, at 45000 cents.
+status="$(bid_post "$bid_provider_token" "verify-bid-r1-$$" "/v1/jobs/$counter_job/bids" "$bid_body" r1c)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r1c.json"; fail "placing the offer to counter returned $status"; }
+round1="$(json "$WORKDIR/bid-r1c.json" '["id"]')"
+
+counter_path="/v1/jobs/$counter_job/bids/$round1/counter"
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-ct-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-bid-ct-anon-$$" -H 'Content-Type: application/json' \
+  -d '{"amount_cents":40000}' "http://localhost:$VERIFY_PORT$counter_path")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-ct-anon.json"; fail "an unauthenticated counter returned $status, want 401"; }
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-ct-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_customer_token" -H 'Content-Type: application/json' \
+  -d '{"amount_cents":40000}' "http://localhost:$VERIFY_PORT$counter_path")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-ct-nokey.json"; fail "a counter with no Idempotency-Key returned $status, want 400"; }
+ok "it needs a credential and an Idempotency-Key — a counter writes a row, so the key is a column"
+
+# Round 2. **The first request in this file a customer may make.** Every endpoint before it is the
+# provider's alone, and this customer's token claims `role: customer` exactly as the provider's does —
+# the platform tells them apart by reading jobs.customer_id and bids.provider_id, never by the claim.
+status="$(counter_at "$bid_customer_token" "verify-bid-r2-$$" "$round1" 40000 r2c)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r2c.json"; fail "the customer's counter returned $status, want 201"; }
+round2="$(json "$WORKDIR/bid-r2c.json" '["id"]')"
+[[ "$round2" != "$round1" ]] || fail "the counter answered with the offer it superseded — a counter creates a row"
+[[ "$(json "$WORKDIR/bid-r2c.json" '["offered_by"]')" == "customer" ]] \
+  || fail "the counter is offered_by $(json "$WORKDIR/bid-r2c.json" '["offered_by"]'), want customer"
+[[ "$(json "$WORKDIR/bid-r2c.json" '["status"]')" == "submitted" ]] || fail "the counter is not live"
+[[ "$(json "$WORKDIR/bid-r2c.json" '["amount_cents"]')" == "40000" ]] || fail "the counter's price did not come back"
+ok "the job's own customer counters a provider's offer — the first endpoint in this domain a customer may call"
+
+# Countering on price alone inherits the timing, which is the decision 000501 deferred to SHIP-87.
+[[ "$(json "$WORKDIR/bid-r2c.json" '["pickup_at"]')" == "$(json "$WORKDIR/bid-r1c.json" '["pickup_at"]')" ]] \
+  || fail "the counter did not inherit pickup_at from the offer it answers"
+[[ "$(json "$WORKDIR/bid-r2c.json" '["deliver_by"]')" == "$(json "$WORKDIR/bid-r1c.json" '["deliver_by"]')" ]] \
+  || fail "the counter did not inherit deliver_by"
+ok "a counter on price alone inherits the timing it does not restate"
+
+# The rows, not the answer the endpoint gave about itself. This is the whole of "each counter
+# supersedes the prior offer".
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || offered_by || ' ' || coalesce(superseded_by::text, 'none')
+     from bids where id = '$round1';")"
+[[ "$stored" == "Superseded provider $round2" ]] \
+  || fail "the answered offer reads '$stored', want 'Superseded provider $round2'"
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || offered_by || ' ' || amount::text || ' ' || coalesce(superseded_by::text, 'none')
+     from bids where id = '$round2';")"
+[[ "$stored" == "Submitted customer 400.00 none" ]] \
+  || fail "the counter row reads '$stored', want 'Submitted customer 400.00 none'"
+ok "the answered offer is Superseded and linked to the counter; the counter is the live head with no successor"
+
+# One live offer in the negotiation, which is what uq_bids_one_submitted_per_provider_per_job means
+# once a chain exists — and the property SHIP-92 reads under its lock.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$counter_job' and provider_id = '$bid_provider_id'
+     and status = 'Submitted';")" == "1" ]] \
+  || fail "the negotiation holds more than one live offer"
+ok "exactly one live offer in the negotiation — the head of the chain and the live row are one row"
+
+python3 - "$WORKDIR/bid-r2c.json" <<'PY' || fail "the counter response carries something of the customer's"
+import json, re, sys
+
+# **The hardest case for Docs/01 §4.3 in this domain, and the reason this block is repeated here.**
+# A counter's amount is a number the *customer* chose, in a response a provider reads back out of the
+# history. It is not the budget — a counter-offer is an offer the customer deliberately made — and the
+# way that stays true is the same closed key set, applied to the new shape.
+allowed = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
+    "created_at", "updated_at",
+    "data", "next_cursor", "has_more",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the counter response is the same closed set of keys, and the customer's budget is in none of them"
+
+# Round 3. The other direction. Docs/02 §4's two sentences are one act, so this is the same endpoint
+# with the parties the other way round.
+status="$(counter_at "$bid_provider_token" "verify-bid-r3-$$" "$round2" 43000 r3c)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r3c.json"; fail "the provider's counter returned $status, want 201"; }
+round3="$(json "$WORKDIR/bid-r3c.json" '["id"]')"
+[[ "$(json "$WORKDIR/bid-r3c.json" '["offered_by"]')" == "provider" ]] \
+  || fail "the provider's counter is attributed to the wrong party"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$round2';")" == "Superseded" ]] \
+  || fail "the customer's counter was not superseded by the provider's answer"
+ok "the provider counters back, and the customer's offer is superseded in turn — one endpoint, both directions"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  you counter the other party's offer and revise your own"
+
+# Round 3 is the live head and the provider made it, so this is the provider answering themselves.
+status="$(counter_at "$bid_provider_token" "verify-bid-ctown-$$" "$round3" 44000 ctown)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-ctown.json"; fail "a provider countered their own offer: $status"; }
+[[ "$(json "$WORKDIR/bid-ctown.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-ctown.json"; fail "expected code=bidding_wrong_party"; }
+ok "countering an offer you made yourself is refused with a code that tells the client to revise instead"
+
+# Round 1 was superseded two rounds ago. Only the latest valid offer can be acted on.
+status="$(counter_at "$bid_customer_token" "verify-bid-stale-$$" "$round1" 38000 stale)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-stale.json"; fail "a superseded offer was countered: $status"; }
+[[ "$(json "$WORKDIR/bid-stale.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-stale.json"; fail "expected code=bidding_bid_closed"; }
+ok "only the latest valid offer can be countered — a superseded one is closed"
+
+status="$(bid_post "$bid_customer_token" "verify-bid-ctempty-$$" \
+  "/v1/jobs/$counter_job/bids/$round3/counter" '{}' ctempty)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-ctempty.json"; fail "a counter naming no field returned $status, want 400"; }
+
+status="$(bid_post "$bid_customer_token" "verify-bid-ctparty-$$" \
+  "/v1/jobs/$counter_job/bids/$round3/counter" '{"amount_cents":40000,"offered_by":"provider"}' ctparty)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-ctparty.json"; fail "a body naming offered_by returned $status, want 400"; }
+grep -q 'offered_by' "$WORKDIR/bid-ctparty.json" || fail "the refusal does not name offered_by"
+ok "a counter that changes nothing is refused, and which party made an offer is not a settable field"
+
+# Round 4, so that the *other* party's offer is the live one for the two checks below.
+status="$(counter_at "$bid_customer_token" "verify-bid-r4-$$" "$round3" 41500 r4c)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r4c.json"; fail "the customer's second counter returned $status"; }
+round4="$(json "$WORKDIR/bid-r4c.json" '["id"]')"
+
+# The hole 000502's reinterpretation of provider_id would otherwise have opened: a customer's counter
+# carries the provider's id, so without the authorship check the provider could rewrite the customer's
+# own number, or withdraw it.
+status="$(bid_patch "$bid_provider_token" "verify-bid-crev-$$" \
+  "/v1/jobs/$counter_job/bids/$round4" '{"amount_cents":1}' crev)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-crev.json"; fail "the provider revised the customer's counter: $status"; }
+[[ "$(json "$WORKDIR/bid-crev.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-crev.json"; fail "expected code=bidding_wrong_party on the revision"; }
+
+status="$(bid_post "$bid_provider_token" "verify-bid-cwd-$$" \
+  "/v1/jobs/$counter_job/bids/$round4/withdraw" '{}' cwd)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-cwd.json"; fail "the provider withdrew the customer's counter: $status"; }
+[[ "$(json "$WORKDIR/bid-cwd.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-cwd.json"; fail "expected code=bidding_wrong_party on the withdrawal"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status || ' ' || amount::text from bids where id = '$round4';")" \
+   == "Submitted 415.00" ]] \
+  || fail "the customer's counter was changed by the provider"
+ok "and neither party can revise or withdraw an offer the other one made"
+
+status="$(counter_at "$bid_customer_token" "verify-bid-ctown2-$$" "$round4" 39000 ctown2)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-ctown2.json"; fail "a customer countered their own counter: $status"; }
+[[ "$(json "$WORKDIR/bid-ctown2.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-ctown2.json"; fail "expected code=bidding_wrong_party"; }
+ok "the rule holds from the customer's side too — one endpoint, one rule, both parties"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  a counter from anybody who is not a party answers what a missing bid answers"
+
+status="$(counter_at "$bid_rival_token" "verify-bid-ctrival-$$" "$round4" 1 ctrival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-ctrival.json"; fail "a competing provider countered: $status"; }
+
+status="$(bid_post "$bid_rival_token" "verify-bid-ctnothing-$$" \
+  "/v1/jobs/$counter_job/bids/00000000-0000-7000-8000-000000000087/counter" '{"amount_cents":1}' ctnothing)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-ctnothing.json"; fail "a counter on nothing returned $status"; }
+
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/bid-ctrival.json" "$WORKDIR/bid-ctnothing.json" \
+  || fail "somebody else's negotiation answers differently from one that does not exist"
+ok "a competitor's counter answers exactly what a bid that is not there answers — the refusal confirms nothing"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-88  only the latest valid offer is acceptable, and the database is what says so"
+
+# **This is what SHIP-92 is being handed.** Docs/11 §8 warns that the award's lock ordering has to be
+# designed against uq_bids_one_accepted_per_job rather than around it; these two constraints are the
+# other half, and they hold whatever order the award takes its locks in. The statements are
+# deliberately the naive ones — no lock, no status check — because that is what a plausible first
+# draft would write.
+refusal="$("$PSQL" "$DATABASE_URL" -tAc \
+  "update bids set status = 'Accepted' where id = '$round1';" 2>&1 || true)"
+grep -q 'ck_bids_superseded_is_not_live' <<<"$refusal" \
+  || fail "a superseded offer was awarded, or refused by something else: $refusal"
+ok "a superseded offer cannot be awarded — ck_bids_superseded_is_not_live, not a rule SHIP-92 has to remember"
+
+# Round 4 is the live head and the *customer* made it. Awarding it would bind the provider to a price
+# and a date they never offered.
+refusal="$("$PSQL" "$DATABASE_URL" -tAc \
+  "update bids set status = 'Accepted' where id = '$round4';" 2>&1 || true)"
+grep -q 'ck_bids_only_a_providers_offer_is_accepted' <<<"$refusal" \
+  || fail "the customer's own counter was awarded, or refused by something else: $refusal"
+ok "and neither can the customer's own counter — Docs/02 §1's \"provider commitment exists\", as a constraint"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  a retried counter adds no second link to the chain"
+
+# **The two mechanisms again, told apart the way the placement's checks tell them apart.** The key
+# matters more here than for a revision: a counter writes a row, so a retry the cache has forgotten
+# would add a second link — and the retry has to be answered *before* the status is checked, because
+# by then the caller's own first attempt has already superseded the offer it answered.
+#
+# Round 5, made by the provider, so that the head afterwards is a provider's offer.
+before_rows="$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from bids where job_id = '$counter_job';")"
+
+status="$(counter_at "$bid_provider_token" "verify-bid-r5-$$" "$round4" 42000 r5a)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r5a.json"; fail "the counter returned $status, want 201"; }
+replayed_from_redis r5a && fail "the first counter was answered from the cache"
+round5="$(json "$WORKDIR/bid-r5a.json" '["id"]')"
+
+status="$(counter_at "$bid_provider_token" "verify-bid-r5-$$" "$round4" 42000 r5b)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-r5b.json"; fail "the cached retry returned $status, want the stored 201"; }
+replayed_from_redis r5b || fail "the second request was not replayed by the middleware"
+diff -q "$WORKDIR/bid-r5a.json" "$WORKDIR/bid-r5b.json" >/dev/null \
+  || fail "the replayed response is not byte-identical to the original"
+ok "a retry inside the cache is replayed by the middleware, byte for byte"
+
+forget_the_cached_response "$bid_provider_id" "verify-bid-r5-$$"
+
+status="$(counter_at "$bid_provider_token" "verify-bid-r5-$$" "$round4" 42000 r5c)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/bid-r5c.json"; fail "a counter retried after the cache forgot it returned $status, want 200 from the row"; }
+replayed_from_redis r5c && fail "the third request was still answered from the cache"
+[[ "$(json "$WORKDIR/bid-r5c.json" '["id"]')" == "$round5" ]] \
+  || fail "the retry answered with a different counter"
+ok "and a retry the cache has forgotten is answered from the row — 200, the same counter, not a refusal"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from bids where job_id = '$counter_job';")" \
+   == "$((before_rows + 1))" ]] \
+  || fail "three requests under one key added more than one link to the chain"
+ok "one new link at the end of all three — the key is a column, not only a cache entry"
+
+# The provider's offer at the head of a chain *is* awardable, which is what makes the pair of
+# constraints a shape rather than a wall: a customer who wants their own number waits for the provider
+# to counter at it. Reverted immediately, because the checks below still need a live negotiation.
+"$PSQL" "$DATABASE_URL" -q -c "update bids set status = 'Accepted' where id = '$round5';" \
+  || fail "a provider's offer at the head of a chain could not be awarded"
+"$PSQL" "$DATABASE_URL" -q -c "update bids set status = 'Submitted' where id = '$round5';"
+ok "a provider's counter at the head of the chain is awardable — the customer waits for the offer rather than awarding their own"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87  countering does not move the job — Open → Negotiating is still SHIP-90's"
+
+# Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted", which reads like
+# an instruction to this ticket more than it did to SHIP-84. It is SHIP-90's, which depends on this
+# one. The history count is the half that catches a move made through some other path.
+after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$counter_job';")"
+[[ "$after" == "Open 1" ]] \
+  || fail "the job reads '$after' (status, history rows), want 'Open 1' — a counter moves no job"
+ok "a job with five rounds of negotiation on it is still Open, with only the row that published it"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-88  GET /v1/jobs/{id}/bids/{bid_id}/history — the full chain stays readable"
+
+# Addressed through the *first* offer, which is the ordinary case: a client holding an old identifier
+# still gets the whole exchange.
+history_path="/v1/jobs/$counter_job/bids/$round1/history"
+
+status="$(curl -s -o "$WORKDIR/bid-hist-anon.json" -w '%{http_code}' "http://localhost:$VERIFY_PORT$history_path")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-hist-anon.json"; fail "an unauthenticated history read returned $status, want 401"; }
+
+# Read-only, so no Idempotency-Key — the middleware lets safe methods through untouched, and an
+# endpoint demanding one would be asking a client to generate a value per read.
+status="$(bid_get "$bid_customer_token" "$history_path" histcust)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-histcust.json"; fail "the customer's history read returned $status, want 200"; }
+ok "it needs a credential and no Idempotency-Key — nothing changes, so there is nothing to absorb"
+
+status="$(bid_get "$bid_provider_token" "$history_path" histprov)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-histprov.json"; fail "the provider's history read returned $status, want 200"; }
+diff -q "$WORKDIR/bid-histcust.json" "$WORKDIR/bid-histprov.json" >/dev/null \
+  || fail "the two parties see different histories; Docs/02 §4 gives both the same chain"
+ok "both parties read the negotiation, and they read the same thing"
+
+python3 - "$WORKDIR/bid-histprov.json" "$round1" "$round2" "$round3" "$round4" "$round5" \
+  <<'PY' || fail "the chain is not readable end to end"
+import json, sys
+
+page = json.load(open(sys.argv[1]))
+want = sys.argv[2:]
+
+if page["has_more"] or page["next_cursor"] is not None:
+    print("the history paged or reported itself truncated:", page, file=sys.stderr)
+    sys.exit(1)
+
+got = [entry["id"] for entry in page["data"]]
+if got != want:
+    print("the chain reads", got, "want", want, "oldest first", file=sys.stderr)
+    sys.exit(1)
+
+parties = [entry["offered_by"] for entry in page["data"]]
+if parties != ["provider", "customer", "provider", "customer", "provider"]:
+    print("the rounds are attributed", parties, file=sys.stderr)
+    sys.exit(1)
+
+amounts = [entry["amount_cents"] for entry in page["data"]]
+if amounts != [45000, 40000, 43000, 41500, 42000]:
+    print("an intermediate price was lost:", amounts, file=sys.stderr)
+    sys.exit(1)
+
+for i, entry in enumerate(page["data"][:-1]):
+    if entry["status"] != "superseded":
+        print("round", i + 1, "is", entry["status"], "want superseded", file=sys.stderr)
+        sys.exit(1)
+    if entry.get("superseded_by") != page["data"][i + 1]["id"]:
+        print("round", i + 1, "points at", entry.get("superseded_by"), file=sys.stderr)
+        sys.exit(1)
+
+head = page["data"][-1]
+if head["status"] != "submitted" or "superseded_by" in head:
+    print("the last round is not the live head:", head, file=sys.stderr)
+    sys.exit(1)
+PY
+ok "five rounds, oldest first, each at the price it was made at, each linked to the one that answered it"
+
+python3 - "$WORKDIR/bid-histprov.json" <<'PY' || fail "the history carries something of the customer's"
+import json, re, sys
+
+# **The response where the customer's own numbers reach a provider**, which makes it the sharpest case
+# for Docs/01 §4.3 in this domain. The counters are offers the customer deliberately made and are
+# meant to be read; the budget is not, and is not here in any form.
+allowed = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
+    "created_at", "updated_at",
+    "data", "next_cursor", "has_more",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the history is the same closed set of keys at every depth, and carries nothing of the customer's budget"
+
+status="$(bid_get "$bid_rival_token" "$history_path" histrival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-histrival.json"; fail "a competing provider read the negotiation: $status"; }
+ok "a competing provider cannot read it at all — a whole negotiation in one response is exactly what Docs/01 §4.3 keeps private"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-88  the record outlives the job, and a chain cannot fork"
+
+move_job "$counter_job" Open Cancelled
+
+status="$(bid_get "$bid_customer_token" "$history_path" histover)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-histover.json"; fail "the history on a cancelled job returned $status"; }
+[[ "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['data']))" "$WORKDIR/bid-histover.json")" == "5" ]] \
+  || fail "the chain shrank when the job ended; a record is most useful once the work is over"
+ok "both parties still read the whole chain after the job is cancelled — CustomerOf is asked, AwardableBy is not"
+
+# And a counter on it is refused, which is the customer's half of the check a provider meets as
+# eligibility: there is nothing a counter-offer could now lead to.
+status="$(counter_at "$bid_customer_token" "verify-bid-ctover-$$" "$round5" 39000 ctover)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-ctover.json"; fail "a counter on a cancelled job returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-ctover.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-ctover.json"; fail "expected code=bidding_bid_closed"; }
+ok "and a counter on a job that can no longer be awarded is refused — the negotiation is over"
+
+# A chain is a list rather than a tree. "At most one successor per offer" is true by construction, and
+# this is the direction the column shape does not give: two offers cannot name one counter as what
+# displaced them.
+refusal="$("$PSQL" "$DATABASE_URL" -tAc \
+  "update bids set superseded_by = '$round3' where id = '$round1';" 2>&1 || true)"
+grep -q 'uq_bids_one_successor' <<<"$refusal" \
+  || fail "a negotiation merged: two offers were displaced by one counter ($refusal)"
+ok "two offers cannot be displaced by the same counter — a chain is a list, not a tree"

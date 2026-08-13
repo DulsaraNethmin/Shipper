@@ -181,7 +181,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **403 checks across 12 sections**, and `make check` green. Since
+Verified by `make verify` — **476 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -307,6 +307,11 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-81** | M3 | The job eligibility filter — **one SQL predicate in `fleet`, reaching four tables across three domains**, chosen over ports because ports cannot page a set intersection. Two readers, one clause; no endpoint until SHIP-82 — *see below* |
 | **SHIP-82** | M3 | `GET /v1/jobs/open` — the provider's feed, keyset-paged. **Declared in `routes_fleet.go`, not `routes_jobs.go`**: routes follow the domain that answers them, not the first segment of the path. It also deletes SHIP-81's SQL mirror from `make verify` in favour of real HTTP checks — *see below* |
 | **SHIP-83** | M3 | `GET /v1/jobs/open/{id}` — one job as a provider sees it, and **the fourth budget proof §8 recorded as still owed**: the serialised response, obtained over HTTP, held to a *closed set of keys* so that a budget renamed `max_price` fails too. The street line and the coordinate are confirmed withheld — *see below* |
+| **SHIP-84** | M3 | `POST /v1/jobs/{id}/bids` — a verified, eligible provider offers a price and two timing commitments. **Opens the `bidding` domain**, and reaches `fleet`'s eligibility answer through a port with no adapter behind it. "Bid once per job" and "a retry is not a second bid" are two partial unique indexes rather than two checks — *see below* |
+| **SHIP-85** | M3 | `PATCH /v1/jobs/{id}/bids/{bid_id}` — a provider revises their own live offer **in place**: same row, same status, same key. That last one is the point — writing a revision's key over the placement's would turn a late retry into a `409` for a request that succeeded — *see below* |
+| **SHIP-86** | M3 | `POST /v1/jobs/{id}/bids/{bid_id}/withdraw` — the offer becomes `Withdrawn` and the row survives as record. **Idempotent by state rather than by key**, which is stronger than a stored key and is why this endpoint needed neither a column nor a migration — *see below* |
+| **SHIP-87** | M3 | `POST /v1/jobs/{id}/bids/{bid_id}/counter` — **the first endpoint in this domain a customer may call**, and one route for both directions because Docs/02 §4's two sentences describe one act. Each counter is a new row and the offer it answers becomes `Superseded`; a counter inherits the terms it does not restate, which is the choice `000501` deferred to it — *see below* |
+| **SHIP-88** | M3 | The supersede chain — `superseded_by` on the **displaced** row, which is what turns "only the latest valid offer is acceptable" into a column `CHECK` SHIP-92 cannot violate rather than a rule it must remember. Plus `GET …/history`, because a chain nobody can read is not one that remains readable — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
@@ -2796,6 +2801,754 @@ Shared surfaces: two `$ref` lines in `contracts/openapi.yaml`, two lines in `rou
 `internal/boundaries` edit, no `Deps` field, no migration, no new error code — `not_found` already
 says the right thing — and `internal/fleet` still imports no domain.
 
+### SHIP-84 — the domain opens, and "once" turns out to be two indexes rather than one check
+
+`POST /v1/jobs/{id}/bids`. A verified, eligible provider offers a price and two commitments about
+timing, and the platform records one offer per provider per job however many times the request
+arrives. **This is the first code in `internal/bidding`**, which held `doc.go` and `model.go` and
+nothing else since SHIP-10.
+
+#### The eligibility question, and the port that needed no adapter
+
+The *Done when* opens with "a verified, eligible provider", and eligibility is `fleet`'s: SHIP-81
+built Docs/01 §4.3's four filters as one SQL predicate, and that file's own header names SHIP-84 as
+the reader `Service.EligibleFor` was built for. **So this domain does not decide who may bid; it
+asks.** `bidding/ports.go` declares a one-method `Eligibility` interface, `cmd/api/routes_bidding.go`
+passes a `*fleet.Service`, and neither package names the other.
+
+**Reimplementing the filter would have been the defect, not the import.** Two definitions of who may
+bid is one more than Docs/07 §3 permits, and the two would part company the first time one was
+corrected — leaving the endpoint that shows a provider a job and the endpoint that accepts their bid
+on it disagreeing. That is the worst available outcome: a provider prices a job the feed offered them
+and is refused after doing the work.
+
+**The wiring is one argument and one assertion, and that is worth noticing rather than assuming.**
+`routes_delivery.go` needs two adapter types, because a transition has four outcomes that cannot
+cross the boundary without naming a `jobs` sentinel. This port answers a `bool`, which has no
+vocabulary to translate, so `*fleet.Service` satisfies it structurally and the only other line is
+`var _ bidding.Eligibility = (*fleet.Service)(nil)` — the compile-time proof, in the one file that is
+allowed to know about both. **A port is only as expensive as the vocabulary it has to carry.**
+
+#### Both biddable statuses, and the test that would have caught the other answer
+
+`Docs/02` §1 makes **two** statuses biddable. Negotiating is "one or more active bids or counter-offers
+exist; **job remains open to eligible bids**", and §1 adds the sentence that settles it: "Technically,
+the job remains available for eligible bids unless the customer closes it or awards a bid."
+
+Nothing can reach Negotiating until SHIP-90, **so an implementation accepting only `Open` would pass
+every test written today and every check in `make verify`**. It would surface months from now as jobs
+silently refusing bids the moment somebody negotiated, which reads as a bidding defect rather than as
+a missing string in a filter. Wave 5 met the same shape in the feed and tested both;
+`TestABidIsAcceptedOnBothBiddableStatuses` and a `make verify` section do the same here, moving a job
+to Negotiating by hand precisely because no endpoint can. The list itself is not copied — it is
+`fleet`'s `biddableStatuses`, read through the port.
+
+#### "Once per job" and "a retry is not a second bid" are two different guarantees
+
+They look like one requirement and they are two, with two indexes behind them and two very different
+failure modes.
+
+| Mechanism | What it guarantees | Failure if it were missing |
+|---|---|---|
+| `uq_bids_one_submitted_per_provider_per_job` | one live offer per provider per job | two prices from one provider on one job |
+| `uq_bids_idempotency` on `(job_id, provider_id, idempotency_key)` | a retry is answered from the row it wrote | **a `409` for a request that succeeded** |
+| `httpx.Idempotent` (Redis) | the response is replayed, handler never runs | nothing — it is the cheap path, not the correct one |
+
+The second row is the one worth reading twice. Without the stored key, a provider whose bid was
+recorded and whose response never arrived would retry, meet the *first* index, and be told "you
+already have a live offer" — a client showing a failure for a bid that is live and awaiting an answer.
+**Redis makes the retry cheap; the key column makes it correct**, which is the division SHIP-111 drew
+for milestones, arrived at here from the opposite direction.
+
+`make verify` tells the two apart the way 70-delivery.sh does: the same key three times, with
+`redis-cli del` between the second and the third. `201`, then a byte-identical `201` carrying
+`Idempotency-Replayed: true`, then a `200` answered from the row with no such header. One bid at the
+end of all three.
+
+**There is no SELECT anywhere in this package asking whether the provider has already bid.** A read
+followed by a write is correct in a single-threaded reading and wrong under two taps on one phone.
+`ON CONFLICT (job_id, provider_id, idempotency_key) … DO NOTHING` names only the idempotency index as
+its arbiter, so a repeated key is absorbed silently while a *second* offer raises `23505` on the other
+index and becomes `bidding_already_bid`. PostgreSQL's speculative-insertion protocol checks the
+arbiter first, which is why a retry — which conflicts with both — is never mistaken for a second
+offer. Eight goroutines under one key produce exactly one row, and exactly one of them believes it
+created anything.
+
+#### A constraint that was written, applied, and then removed
+
+`ck_bids_offer_has_timing` — `status = 'Draft' OR (pickup_at IS NOT NULL AND deliver_by IS NOT NULL)`
+— is the obvious twin of 000500's `ck_bids_offer_has_an_amount`, and it is **deliberately not in
+`000501`**. It is worth recording because its absence looks like an oversight beside the constraint
+directly above it.
+
+It binds a design SHIP-87 has not made. A counter-offer is a new row in this table, and whether a
+customer countering on *price alone* restates the timing or inherits it is that ticket's decision;
+a constraint here settles it in the direction that costs a migration to undo. 000500 declined to write
+the one-active-bid index for exactly this reason — "a partial index written against a guess at that
+definition is a constraint the ticket would have to drop" — and the same reasoning applies pointing
+the other way.
+
+**The evidence was immediate rather than theoretical: it failed six of SHIP-80's own migration
+tests**, which insert `Submitted` and `Accepted` bids to exercise `ck_bids_status` and
+`uq_bids_one_accepted_per_job` and have no interest in timing. Making them pass would have meant
+editing another ticket's test file to accommodate a constraint that ticket had considered and left
+out — which is the signal that the constraint, not the test, was wrong. **Needing to edit another
+ticket's tests to make your schema change fit is worth treating as evidence about the schema change.**
+
+`ck_bids_timing_is_ordered` stays, and the difference is the test that separates them: no design
+anybody could want has a delivery preceding its own collection, so that one binds nobody. "An offer
+states its timing" is a product rule and lives in the validator, where it also produces a field error
+naming `pickup_at` rather than a constraint violation a caller cannot act on.
+
+#### Two instants, not two windows
+
+The job carries two *windows*, because a customer says "any time Thursday". The bid answers with two
+*instants*, because a provider says "I will be there at nine and it will be there by five". Three
+reasons: Docs/03 asks for "comparable price, timing" and two instants sort where four numbers do not;
+a window restates flexibility the customer already declared rather than committing to anything; and
+widening an instant into a window later is additive, where narrowing a stored window is a data
+migration with no honest answer for which end was meant.
+
+**The bid's timing is deliberately not bounded by the job's windows.** A provider offering a different
+day is making an offer the customer may decline, and Docs/01 §4.3's answer to bids that miss is better
+job detail rather than a platform that refuses them.
+
+#### Two privacy rules, and they fail in different places
+
+Docs/01 §4.3 has two lines, and this is the first endpoint where both bite at once.
+
+**The customer's budget** is kept out by there being no job in the response at all — a bid names its
+job and copies nothing from it. That is stronger than redaction, and
+`TestTheBidResponseCarriesNothingOfTheCustomers` holds the serialised bytes to a **closed set of keys
+at every depth**, so a field arriving as `max_price` fails as surely as one arriving as
+`budget_cents`. Verified by mutation in both directions, as SHIP-83 asks: a `max_price` field carrying
+`432199` fails on the key set *and* on the value search, and the test refuses to run at all against a
+fixture whose budget is NULL.
+
+**One provider never seeing another's offer** is the second rule, and **its failure mode is a `WHERE`
+clause rather than a response field** — which is why the closed key set cannot cover it. A store read
+scoped by job and idempotency key but not by provider hands the second provider the first's bid, price
+included, and every key in that response is one this API promises a provider. So
+`uq_bids_idempotency` and `postgresStore.bidPlacedUnder` are both scoped `(job_id, provider_id,
+idempotency_key)`, and `TestOneProvidersKeyCannotReachAnothersBid` sends **the same key from two
+providers** — which is how a competitor would probe for it. Also verified by mutation: dropping
+`provider_id` from that one `WHERE` fails the test and nothing else in the suite.
+
+#### Placing a bid does not move the job
+
+`Docs/02` §2 has `Open → Negotiating` on "first bid or counter-offer submitted", and that is
+**SHIP-90's**, which depends on SHIP-87 and SHIP-57. Doing it here would make every bid a status
+transition, with a `job_status_history` row and a lock on the job, for a presentation change nothing
+reads yet. The test asserts both halves — the job is where it was, and its history is unchanged —
+because the second is what would catch a move made through some other path.
+
+**No event is emitted either.** SHIP-136 adds bidding's events from a `events.go` exactly like jobs',
+editing nothing shared; emitting one now would mean inventing a payload and a version for a catalogue
+entry that ticket owns.
+
+#### `bidding` is now the second domain storing an amount independently
+
+`bids.amount` is `numeric(12,2)` and `Bid.AmountCents` is an `int64`, converted in SQL in both
+directions — `jobs`' convention for `budget` (Docs/10 §3.3), copied rather than shared.
+`maxOfferCents` is `100_000_000`, the same number as `jobs.maxBudgetCents`, arrived at independently.
+
+**That duplication is the trigger the eventual `money` ticket should be aimed at, and this is the
+entry recording it.** `internal/money` has been registered in `internal/boundaries` and unwritten
+since SHIP-15c; it is now the only pre-seeded package left unbuilt. Writing it is a shared-file edit
+a domain branch may not make, so this ticket copied the convention deliberately rather than smuggling
+the package in. The trigger has now fired twice — once here and once at the constant — and the third
+domain to hold an amount should not have to make the case again.
+
+#### What SHIP-80 handed this ticket and it declined to take
+
+000500 named four things for SHIP-84, and one is not built: **the vehicle or vehicles a bid is offered
+on**. Docs/01 §4.2 gives the provider "select one or more", which 000500 read as a join table "if it is
+taken literally — and that is SHIP-84's decision to take."
+
+**Declined, with the reasoning recorded rather than the decision deferred silently.** It is not in
+this ticket's *Done when* ("price and timing"); Docs/01 §4.3 wants it for the *customer's* comparison,
+which is SHIP-102 by way of SHIP-96; and validating it needs a second `fleet` fact — that the vehicle
+is the caller's and in service — and therefore a second port method, which is more design than a
+three-point ticket should be taking on another ticket's behalf. **The trigger is named: the first
+ticket that shows a customer a bid.** `bids` has no vehicle column and no join table, so nothing has
+to be undone.
+
+#### Shared surfaces
+
+One `$ref` pair and one `tags:` entry in `contracts/openapi.yaml`, one line in `routes_golden.txt` and
+one in `Docs/10-api-error-codes.md` (both regenerated, not typed), and §3's check count (written by
+`make verify-update`). No `internal/boundaries` edit, no `Deps` field, no shared-block migration, and
+`internal/bidding` imports no domain. `make verify` went from 355 checks across 12 sections to 378
+across 13 — twenty-three checks in a new `scripts/verify/61-bidding.sh`, which takes the reserved
+60–69 range's upper half beside `60-fleet.sh`.
+
+### SHIP-85 — a revision is an `UPDATE`, and the key it must not touch
+
+`PATCH /v1/jobs/{id}/bids/{bid_id}`. A provider changes the price, timing or conditions of an offer
+they have already placed. **The row keeps its identifier, its `Submitted` status and the key it was
+placed under**, which is what makes this the same offer at a new number rather than a second offer.
+
+Docs/01 §4.2 gives the provider three verbs — "place, update, and withdraw a bid until it is accepted
+or expires" — and this branch built the second and third of them on top of SHIP-84's first.
+
+#### It is an in-place edit, and the alternative would have settled SHIP-87's design
+
+The tempting shape is the one SHIP-87 will need: write a new row and move the old one to `Superseded`.
+It is rejected, and for the reason 000500 and 000501 both give for declining to guess — **a
+counter-offer is what makes a new row** (Docs/02 §4: "a customer counter-offer supersedes the prior
+provider offer"), the link between rows is SHIP-88's supersede chain, and there is no column for one.
+Building half of that chain here would hand SHIP-87 a design it did not choose and a migration to undo.
+
+Docs/02 §4 also never says a provider revising their *own* offer supersedes anything. There is no
+counter from the other party to supersede: the customer has not answered yet, which is what
+`Submitted` means.
+
+**What this does cost is that the intermediate prices are not retained.** Docs/01 §4.3 requires the
+platform to "record all offers, counter-offers, withdrawals, and acceptances", and a revision is
+none of those three named things — it is an edit to an offer nobody has answered.
+
+**~~If SHIP-88 decides the chain should record revisions too, that is an additive change.~~ SHIP-88
+decided, and it does not** — see its entry below. The reasoning it added to this one: making a
+revision write a chain entry would leave the three verbs indistinguishable in the history, and a
+provider who dropped their price twice before anybody answered would read as a negotiation with
+themselves. The chain records every round somebody *answered*, which is what Docs/01 §4.3's list
+actually names. The additive route stays open if a later ticket wants the intermediate prices for
+some other reason.
+
+#### The key the revision must not write, and the mutation that proves it
+
+`bids.idempotency_key` holds the key the offer was **placed** under. 000501 added it so that a
+placement retried after Redis has forgotten it is answered from its own row rather than meeting
+`uq_bids_one_submitted_per_provider_per_job` and being told the provider already has a live offer.
+
+**Writing a revision's key over it reintroduces exactly that failure**, and it is the kind of defect
+that looks like tidiness. `postgresStore.reviseOffer` names four columns and that is deliberate;
+`TestARevisionDoesNotConsumeThePlacementsKey` places under one key, revises, and then sends the
+*placement* again. Verified by mutation: adding `idempotency_key = $6` to the `SET` list makes that
+test fail with `bidding_already_bid` — a `409` for a request that had succeeded — and nothing else in
+the suite notices.
+
+**So this endpoint stores no key at all**, which is the second half of the same finding. A revision is
+an `UPDATE` of a row that already exists: applying it twice reaches the state applying it once
+reaches, there is no second row for a repeat to create, and no constraint for it to trip. That is the
+natural idempotency `PATCH /v1/jobs/{id}` and `PATCH /v1/fleet/vehicles/{id}` already rely on, and
+neither of those stores a key either. **Redis makes the retry cheap and the `UPDATE` makes it
+correct** — the same division SHIP-84 drew, reaching the opposite conclusion about whether a column is
+needed, which is what makes it a division rather than a habit.
+
+#### The whole offer is validated, not only the fields that changed
+
+`Revision.applyTo` merges the request over the stored bid and produces an `Offer`, so the *same*
+validator runs. An offer that could not be placed today is therefore not reachable by revising one
+that could be placed yesterday.
+
+The consequence is worth stating because it surprises: a provider re-pricing a three-day-old bid whose
+`pickup_at` has since passed is refused, **naming a field they did not send**. That is the honest
+answer — what they are asking the platform to keep live is an offer to collect in the past, and the
+customer could accept it — and validating only what arrived would make the stored offer's coherence
+depend on the order somebody edited it in.
+
+#### Eligibility is checked again here and deliberately not on the withdrawal
+
+The one asymmetry in the pair. **A revision produces a live offer at a new number that the customer may
+accept the moment it lands**, so it goes through SHIP-81's filter exactly as a placement does: a
+provider whose only vehicle left service must not be able to re-price work they can no longer do, and a
+job that has been cancelled or awarded elsewhere must not acquire a fresh price. Docs/07 §3 puts that
+decision server-side in one place, and there is only one.
+
+That matters more than it looks, because **nothing closes a bid when its job ends** — SHIP-93 is the
+ticket that rejects competing bids on award, and it does not exist. Without this check a provider could
+re-price an offer against work that is over.
+
+The refusal is the same `404` a placement gets, byte-identically. It reads oddly to a caller who
+plainly knows the job exists, and it is still right: the platform must not tell one provider that a job
+was awarded, cancelled or expired, because that is what became of work somebody else was given.
+
+#### "Their own" is the whole of the authorisation, and it is two comparisons
+
+`Service.ownBid` reads the row **by its identifier** and then compares `provider_id` and `job_id` in
+Go. A `WHERE … AND provider_id = $2` returning nothing could not tell a competitor's bid from a bid
+that does not exist, and only one of those is somebody probing — the arrangement `fleet.Service.owned`
+takes, and the discipline SHIP-84 established by deleting `provider_id` from a `WHERE` and watching one
+test fail.
+
+Both comparisons were mutation-tested. Deleting the ownership check fails
+`TestOnlyTheBidsOwnerCanReviseIt`, `TestOnlyTheBidsOwnerCanWithdrawIt` and
+`TestAnotherProvidersBidIsUnreachable`; deleting the job comparison fails
+`TestABidIsAddressedUnderItsOwnJob`. **The second is the one that is easy to leave out**, and without
+it `/v1/jobs/{id}/bids/{bid_id}` would be one resource reachable at as many addresses as there are
+jobs — the shape where a rule gets enforced at one address and forgotten at the rest.
+
+#### Shared surfaces, for both tickets on this branch
+
+Two `$ref` entries in `contracts/openapi.yaml` (one per new path), two lines in `routes_golden.txt` and
+two in `Docs/10-api-error-codes.md` — all four regenerated rather than typed — and §3's check count,
+written by `make verify-update`. **No migration**: a revision writes columns 000501 already added and a
+withdrawal writes a status `ck_bids_status` has held since 000500, so block 500–599 is untouched and
+the out-of-order guard never fires. No `internal/boundaries` edit, no `Deps` field, and
+`internal/bidding` still imports no domain.
+
+### SHIP-86 — withdrawal is idempotent by state, which is stronger than by key
+
+`POST /v1/jobs/{id}/bids/{bid_id}/withdraw`. The offer becomes `Withdrawn`, the customer can no longer
+accept it, and **the row survives with its price intact**. Docs/01 §4.3 requires every withdrawal to be
+recorded and Docs/02 §4 keeps bid history readable to the customer, the bidding provider and
+administrators — so there is no delete on this table and there is not going to be one. The same reading
+`fleet` gives a deactivated vehicle.
+
+A verb rather than a `DELETE`, and not a `PATCH` writing `"status": "withdrawn"`: a bid's status is the
+platform's, the client names an intent, and `httpx.DecodeJSON` refuses the field outright. The shape
+`POST /v1/jobs/{id}/cancel` and `POST /v1/fleet/vehicles/{id}/deactivate` already use.
+
+#### Withdrawing twice succeeds, and that is what makes a retry safe
+
+The question the ticket turns on is what a *retry* of a withdrawal means. The idempotency middleware
+absorbs the one that reuses its key; it cannot absorb the one that does not — a phone that lost its
+connection, was restarted, and generated a **fresh** key for the same intent, which is the ordinary
+shape rather than an exotic one. Refusing that with "this offer is no longer live" would tell a
+provider their withdrawal failed when it succeeded.
+
+So a second withdrawal answers `200` with the bid and **writes nothing further**. `jobs` makes the same
+call for a repeated cancellation and `fleet` for a repeated deactivation, and both say why: the caller
+asked for an outcome, and the outcome holds.
+
+**This is a stronger guarantee than a stored key gives, and it is why no column was needed.** A key
+scopes idempotency to one client's one request; state scopes it to the outcome, so two different
+clients with two different keys still cannot withdraw one offer twice. `make verify` asserts the row's
+`updated_at` across all three repeats — status alone could not tell an absorbed request from one that
+rewrote `Withdrawn` over `Withdrawn`.
+
+Verified by mutation: removing the three-line absorption makes the second withdrawal `409
+bidding_bid_closed`, failing both the service test and the wire test.
+
+#### Before acceptance, and what happens after is a different ticket
+
+An accepted offer answers `bidding_bid_accepted` and is neither revised nor withdrawn. Docs/01 §4.2
+draws the line in the sentence this branch is built on — "until it is accepted or expires" — and
+CLAUDE.md's one-accepted-bid invariant is what stands behind it: `uq_bids_one_accepted_per_job` means
+an award is a commitment two parties hold, not a state one of them leaves unilaterally.
+
+**Withdrawal after acceptance is a different thing entirely.** Docs/02 §6.2 makes a provider stepping
+away from awarded work a *provider cancellation*: the job moves back to Open, every bid closes, and the
+cancellation is recorded against the provider. Allowing it here would be that flow with none of its
+consequences, and it would break the award silently — the job still `Awarded`, to a bid nobody could
+see.
+
+#### `bidding_bid_accepted` and `bidding_bid_closed` are two codes because they are two screens
+
+`bidding_bid_accepted` is good news: the provider won the job, and the app's next screen is that job.
+`bidding_bid_closed` covers `Rejected`, `Expired`, `Superseded` — and `Withdrawn`, for a revision —
+where the offer is over and the app shows the feed. One code for four statuses, because the client does
+the same thing with all four; which of them it was belongs to the provider's own bid list (SHIP-101),
+not to an error code.
+
+Docs/10 §4.4's test still applies: a domain code earns its place only where a client would otherwise
+parse a message to know what to do. `bidding` had one code at SHIP-84 and has three.
+
+#### No eligibility check, which is the deliberate half of the asymmetry
+
+**A provider must always be able to take back their own offer.** Refusing a withdrawal because their
+only vehicle left service, or their verification lapsed, or the job was cancelled underneath them,
+would strand a live offer the customer can still accept and the provider can no longer retract — the
+worst of both answers. SHIP-81's filter governs what a provider may *offer*; it has no business
+governing what they may stop offering. `TestAWithdrawalNeedsNoEligibility` breaks four different
+filters and expects a withdrawal through each.
+
+#### Neither verb moves the job, and one of them looks like it should
+
+Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", which
+reads like an instruction to this ticket. It is **SHIP-90's**, in both directions — nothing reaches
+`Negotiating` until that ticket exists, so there is nothing to move back from. And job status is never
+a settable field in any case: a transition passes one guarded function and leaves a
+`job_status_history` row in the same transaction, so doing it here would mean doing the half without
+the record. Both the test and a `make verify` check assert the job's status *and* its history count,
+because the second is what would catch a move made through some other path.
+
+**SHIP-84 left this ticket a property to confirm rather than to build.** It wrote
+`TestAWithdrawnOfferCanBeReplaced` against a hand-set status with the note "SHIP-86 should find this
+already true"; it did, and the hand-set status is now `Service.WithdrawBid`. A provider who withdraws
+leaves `uq_bids_one_submitted_per_provider_per_job`'s predicate and may bid again — a fat-fingered
+price is not a job lost forever.
+
+#### The transaction, and the lock that is the reason for it
+
+`ReviseBid` and `WithdrawBid` both refuse a connection pool. `PlaceBid` does not, and the difference is
+the mechanism: a placement's correctness is `ON CONFLICT`'s and holds statement by statement, while
+these two read a status, decide against it, and write. `postgresStore.lockBid`'s `FOR UPDATE` is what
+makes that one decision, and outside a transaction the lock is released the instant the `SELECT`
+returns — leaving an award free to commit in the window, and a withdrawal to unpick a bid
+`uq_bids_one_accepted_per_job` says two parties are committed to, with nothing to report afterwards.
+
+#### The budget rule now has four responses rather than two
+
+`TestTheBidResponseCarriesNothingOfTheCustomers` held the `201` and the `200` replay to a closed set of
+keys at every depth. It now holds four: the revision and the withdrawal answer with the same shape from
+two more code paths, and **a shape that is safe on one path and not another is the failure several
+paths invite**. Verified by mutation, as SHIP-83 asks: a `max_price` field carrying `432199` fails on
+all four subtests, on the key set and on the value search. `make verify` runs the same closed-set
+assertion from outside Go against both new responses.
+
+### SHIP-87 — one endpoint, both parties, and the column that had to be reinterpreted
+
+`POST /v1/jobs/{id}/bids/{bid_id}/counter`. Either party answers the other's offer with different
+terms; the offer they answered becomes `Superseded` and the counter becomes the live head of the
+negotiation. **This is the first endpoint in `internal/bidding` a customer may call** — every one
+before it is the provider's alone.
+
+Docs/02 §4 gives the two directions in two sentences — "a customer counter-offer supersedes the prior
+provider offer. A provider counter-offer supersedes the prior customer offer" — and they describe one
+act, so there is one route. Two would have been two authorisation rules to keep in step, and they
+would have parted company the first time one was corrected.
+
+#### `bids.provider_id` stops meaning "who wrote this row", and that is the cheapest of the options
+
+A negotiation is one `(job_id, provider_id)` pair, and every row in a chain carries it — **including
+the customer's counters**. So `provider_id` now names the provider a negotiation is *with*, and a new
+column `offered_by` names the author.
+
+The alternative was to put the customer's id in `provider_id` for their own rows, and it is much
+worse: `uq_bids_one_submitted_per_provider_per_job` would stop meaning "one live offer in this
+negotiation", `idx_bids_provider` would stop serving the provider's own bid list, and
+`fk_bids_provider` would point at a customer. **One column changes meaning; four objects keep
+working**, and `uq_bids_one_submitted_per_provider_per_job` in particular keeps doing the job 000501
+built it for without the widening that migration offered — "SHIP-87 and SHIP-88 move the prior offer
+out before writing the next" turned out to be exactly right.
+
+**The reinterpretation opens one hole and closing it is the sharpest thing in this ticket.** A
+customer's counter carries the provider's id, so `Service.ownBid`'s comparison passes for the
+provider — and without an authorship check they could have `PATCH`ed the customer's counter, or
+withdrawn it. One party editing the other's offer is the worst available failure in a negotiation, and
+it would have looked exactly like SHIP-85 working. `changeable` gained one line;
+`TestTheOtherPartysOfferIsNotRevisableOrWithdrawable` and two `make verify` checks are what say so.
+
+#### The widening is a separate path, not a loosened `ownBid`
+
+`Service.reachableBid` is new rather than `ownBid` being relaxed, and the distinction is the whole
+reason SHIP-87 did not quietly widen SHIP-85 and SHIP-86. `ownBid` refuses a customer by design — run
+2's `TestOnlyTheBidsOwnerCanReviseIt` asserts it *including for the job's own customer* — and a
+customer added there would have been added to `PATCH` and `withdraw` at the same time. That is the
+shape where a rule is relaxed for one endpoint and silently relaxed for three.
+
+Both comparisons `ownBid` makes are made in the new path too, for the reasons that file already gives:
+the row is read by its identifier and judged in Go, so "somebody else's" and "nobody's" stay different
+facts behind one 404; and the job in the path is compared, because a bid is addressed under its own
+job.
+
+#### A counter inherits what it does not restate, which is `000501`'s deferred decision
+
+That migration removed `ck_bids_offer_has_timing` in as many words: "whether a customer countering on
+*price alone* restates the timing or inherits it from the offer it supersedes is that ticket's
+decision." **It inherits**, for the reason `Revision` gives about a revision and one more that is
+specific to a negotiation: the unchanged fields *are* the agreement so far, and a shape that made both
+parties restate them would turn every round into a fresh offer that happened to look similar — which
+is the thing "supersedes the prior offer" says a counter is not.
+
+`Counter` and `Revision` share one merge and one validator, so a counter cannot reach a state a
+placement could not. The consequence surprises in the same way: countering on price alone against an
+offer whose `pickup_at` has since passed is refused, naming a field the caller did not send.
+
+**The constraint that question was blocking is still not added, and the trade has changed rather than
+disappeared.** Every offer this platform writes past `Draft` now names both instants, so
+`ck_bids_offer_has_timing` would be true — but 000501's *other* finding still holds: it failed six of
+SHIP-80's own migration tests, which insert `Submitted` and `Accepted` bids with no timing to exercise
+`ck_bids_status`, and making them pass means editing another ticket's test file. **The question is
+answered and the constraint is a separate, small ticket**; it is recorded here rather than taken.
+
+#### The two sides are checked against different questions
+
+A **provider's** counter is a live offer the customer may accept the moment it lands, so it goes
+through SHIP-81's filter exactly as a placement and a revision do. The refusal is the same `404`.
+
+A **customer's** counter cannot be accepted at all — `ck_bids_only_a_providers_offer_is_accepted`
+makes that a database fact — so eligibility is the wrong question and would be asked of the wrong
+account anyway. What matters is whether the negotiation can still end anywhere, and the port asks
+`jobs` whether the job could still be **awarded**.
+
+**That phrasing is the point, and it is what kept a third copy of the biddable-status list out of the
+service.** `jobs` holds Docs/02 §2's transition table in one place and exports `Permitted`, so
+`AwardableBy` is `jobs.Permitted(job.Status, jobs.StatusAwarded)` — which selects `Open` and
+`Negotiating` today and follows that document automatically if it ever changes. Writing the two
+strings in `cmd/api` instead would have put a third copy after `jobs`' table and
+`fleet.biddableStatuses`, and the third copy is the one nobody remembers to correct.
+
+The refusal is `bidding_bid_closed` rather than a code of its own, because the client does the same
+thing with it as with a superseded offer: the negotiation is over. It is also a temporary shape —
+once SHIP-93 closes competing bids on award, the offer itself is `Rejected` and reaches that code
+directly.
+
+#### One new error code, and the two that were deliberately reused
+
+`bidding_wrong_party`. **You counter the other party's offer and revise your own**, and both
+directions of getting that backwards land on it — countering your own live offer, and revising or
+withdrawing one the other party made. It earns a code by Docs/10 §4.4's test because the client's
+correct response is a *different request* rather than a different screen.
+
+The other two new refusals reuse. A negotiation the customer can no longer award is
+`bidding_bid_closed`; a counter naming no field is `bad_request` with its own message, because a
+counter that changes nothing is agreement rather than a client defect and the next screen is the
+award. `bidding` had one code at SHIP-84, three at SHIP-86 and has four.
+
+It is `409` and not the `404` a stranger gets, deliberately: the caller is a party to this negotiation
+and can read the offer in the negotiation's history a moment later, so hiding it here would be an
+inconsistency rather than a disclosure control.
+
+#### The retry has to be answered before the status is checked
+
+A counter is an `INSERT`, so SHIP-84's argument applies where SHIP-85's did not: the key is a
+*column*, and a retry that outlives Redis is answered from the record rather than adding a second link
+to the chain.
+
+**The ordering is the part worth reading twice.** By the time a retry arrives, its own first attempt
+has already superseded the offer it answered — so a status check in front of the key lookup would
+refuse the caller's own successful request with "that offer is no longer live". `Service.PlaceBid`
+puts its retry first for the same reason and states the principle: a retry asks what happened to a
+request, and that answer does not change when the world does.
+
+`uq_bids_idempotency` gained `offered_by`, which is 000501's own argument extended rather than
+reversed. That index carries `provider_id` because "two providers whose clients happened to generate
+the same key would collide, and the second would be handed the first's bid"; a negotiation now has two
+writers inside one `(job_id, provider_id)` pair and the identical sentence applies to them. It is a
+strict widening — every row written before 000502 is a provider's offer — and
+`TestOneKeyFromEachPartyIsTwoDifferentCounters` sends the same key from both sides, which is how the
+defect would be found.
+
+#### Countering does not move the job, and this is the ticket where that reads oddest
+
+Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted". A counter is
+literally the second half of that sentence, and it is still **SHIP-90's**, which depends on this
+ticket and on SHIP-57 and owns the presentation status in both directions. Job status is never a
+settable field in any case: a move passes one guarded function and leaves a `job_status_history` row
+in the same transaction, so doing it here would be doing the half without the record. Both the test
+and a `make verify` check assert the status **and** the history count, because the second is what
+catches a move made through some other path.
+
+#### Shared surfaces
+
+One `$ref` pair in `contracts/openapi.yaml`, one line in `cmd/api/routes_golden.txt` and one in
+`Docs/10-api-error-codes.md` (all regenerated, not typed), and §3's check count, written by
+`make verify-update`. One migration, `000502`, in bidding's own block 500–599 — which tripped
+SHIP-15g's out-of-order guard on the first `make migrate-up` exactly as predicted, at a database on
+`602`.
+
+**The guard's printed fix needed one thing the guard does not say, and it cost a dirty database to
+find.** `make migrate-down n=all` walks the file list downward from the current version, so it runs a
+*new* migration's `down` **before that migration's `up` has ever run** — which fails on the first
+`DROP INDEX` of an index that does not exist, and leaves the schema dirty partway through. `000302`,
+`000407` and `000602` all use `IF EXISTS` throughout for exactly this reason; `000502` now does too,
+and its header says why. **Whoever writes the next below-the-line migration should start from that
+rather than discovering it**, and it is worth `scripts/`'s guard message eventually saying so.
+
+No `internal/boundaries` edit and no `Deps` field. `internal/bidding` still imports no domain: the
+customer-side facts arrive through a second port, satisfied in `cmd/api` by a small adapter over
+`*jobs.Service`.
+
+### SHIP-88 — the chain link goes on the displaced row, and that is why a `CHECK` can hold the award
+
+SHIP-88's *Done when* is "only the latest valid offer is acceptable; full chain remains readable", and
+it is two halves with two very different mechanisms: a pair of column constraints, and a read.
+
+#### The link points backwards, and the choice was made on what it makes possible
+
+Two representations were available and 000500 named both — "whether that is a self-referencing column
+or a separate offer table is SHIP-87 and SHIP-88's design".
+
+| Where the link lives | What "has this offer been displaced?" becomes |
+|---|---|
+| `supersedes_bid_id` on the **new** row | a question about some *other* row — no single-row constraint can ask it |
+| `superseded_by` on the **displaced** row | a fact **in the row itself** — an ordinary column `CHECK` can |
+
+**The second wins because of what it makes possible, not because of what it stores.**
+`ck_bids_superseded_is_not_live` — `superseded_by IS NULL OR status NOT IN ('Submitted','Accepted')` —
+is what turns Docs/02 §4's "only the latest valid offer can be accepted" into something SHIP-92
+physically cannot violate. An award that writes `status = 'Accepted'` over a countered offer, because
+it read the status before taking its lock or did not re-read it at all, is refused by PostgreSQL. The
+other direction would have left that as application logic with a comment asking somebody to keep it.
+
+`Submitted` is in the list as well as `Accepted`, doing separate work: a displaced row cannot re-enter
+`uq_bids_one_submitted_per_provider_per_job`'s predicate, so **the live offer and the head of the chain
+are the same row by construction** rather than by agreement between two writers.
+
+**A separate `offers` table was rejected**, and the reason is `uq_bids_one_accepted_per_job`: it is an
+index on `bids`, SHIP-91 was built against it, and the whole award branch is designed around it
+(Docs/11 §8). Moving offers out would mean either moving that index to a table nobody wrote it for or
+keeping the accepted amount in two places. Every status in `ck_bids_status` is a status of an *offer*;
+the table has been the chain all along and only lacked the link.
+
+#### The second constraint is the one counters made necessary
+
+`ck_bids_only_a_providers_offer_is_accepted` — `status <> 'Accepted' OR offered_by = 'provider'`.
+
+With a chain, the head of a negotiation is sometimes the **customer's own offer**, and awarding that
+would bind a provider to a price and a date they never agreed to, with `uq_bids_one_accepted_per_job`
+allowing it and nothing else noticing. Docs/02 §1 defines Awarded as "Customer has accepted one
+**provider** bid; provider commitment exists", and this constraint is that sentence.
+
+It costs a customer nothing: a customer who wants their own number accepted waits for the provider to
+counter at it, and *that* row is the provider's commitment and is awardable. `make verify` asserts
+both refusals and then awards the provider's head successfully, so the pair is a shape rather than a
+wall.
+
+#### What SHIP-92 may rely on, and the lock ordering it should take
+
+Docs/11 §8 warns that two people produce two lock orderings and that is a deadlock or a lost update.
+**There is one obvious answer and this is it, written down.**
+
+*What the database enforces, whatever the award remembers:*
+
+| Guarantee | Mechanism |
+|---|---|
+| At most one `Accepted` bid per job | `uq_bids_one_accepted_per_job` (SHIP-80/91) |
+| A displaced offer can never become `Accepted` or `Submitted` | `ck_bids_superseded_is_not_live` |
+| Only an offer a **provider** made can be `Accepted` | `ck_bids_only_a_providers_offer_is_accepted` |
+| At most one live offer per `(job, provider)` | `uq_bids_one_submitted_per_provider_per_job` (SHIP-84) |
+| A chain is a list — no offer is displaced by a counter that displaced another | `uq_bids_one_successor` |
+
+*What application logic still has to do:* **check that the bid it is accepting is `Submitted`.** No
+constraint can express "only a live offer becomes accepted", because that is a statement about a
+transition rather than about a row, and 000500 deliberately declined to give `bids` the transition
+trigger `jobs` has. What the constraints do is make every *other* way of getting it wrong impossible.
+
+*The lock ordering:*
+
+1. **`jobs` first** — `SELECT … FROM jobs WHERE id = $1 FOR UPDATE`. It is the outermost lock and the
+   only one shared with the status guard and `job_status_history`.
+2. **Then the bid being awarded, by its identifier** — `FOR UPDATE`, and re-read `status`,
+   `superseded_by`, `offered_by` and `job_id` under it.
+3. **Then the accept** — the write that takes the `uq_bids_one_accepted_per_job` btree entry, which is
+   what serialises two awards that somehow got past step 1.
+4. **Then the rejection sweep** (SHIP-93), ordered by `id` if it locks explicitly.
+5. **Then the transition**, through `jobs`' one guarded function, in the same transaction.
+
+**Everything else in `bidding` locks only its own `bids` rows, by identifier, and never locks a `jobs`
+row.** That is true of the counter, the revision and the withdrawal today, and it is what makes the
+ordering acyclic: `jobs` → `bids` in one direction, and nothing going the other way. A future writer in
+this domain that needs a `jobs` lock has to take it *first*, or reintroduce the cycle.
+
+There is one window this does not close and SHIP-95 owns it: a counter whose eligibility read
+committed before an award and whose insert lands after it leaves a live offer on an awarded job. It is
+harmless — nothing can accept it, and `uq_bids_one_accepted_per_job` blocks a second award — and it is
+the "withdraw-during-award" family by another name. Closing it properly means the counter taking a
+`jobs` lock, which is the cycle, or SHIP-93 running last, which is where it already is.
+
+#### The concurrent-counter race, and what it actually proved
+
+`TestConcurrentCountersLeaveExactlyOneLiveOffer` runs eight goroutines against one live offer under
+**eight different keys** — one key would be answered as a retry and would prove the idempotency path
+instead. Exactly one succeeds, the other seven are refused with `bidding_bid_closed`, and the
+negotiation holds two rows with one live offer and one successor.
+
+Three mechanisms stand behind that and the test deliberately does not care which answers: `lockBid`'s
+`FOR UPDATE` serialises the transactions, `supersedeHead`'s compare-and-set matches nothing for the
+loser, and `uq_bids_one_submitted_per_provider_per_job` refuses the second live offer at the index.
+**The first is what makes the refusal legible; the last is what holds if the first two are ever
+removed.**
+
+**One claim was written and then corrected, which is worth recording.** The migration first said
+`uq_bids_one_successor` was the guard against that race. It is not: the loser's second row would be
+refused by 000501's index, not by this one. What `uq_bids_one_successor` actually guarantees is the
+direction the column shape does not give — *at most one predecessor per offer*, since "at most one
+successor" is already true of a single column. Two offers naming one counter as what displaced them
+would be a negotiation that merged rather than a chain, and `TestAChainCannotMergeOrPointAtItself` and
+a `make verify` check are what say so. Overclaiming which index does what is exactly the kind of thing
+SHIP-92 would then design against.
+
+#### "Readable" needed a read, and it is deliberately not SHIP-96's or SHIP-102's
+
+`GET /v1/jobs/{id}/bids/{bid_id}/history`, addressed through **any** offer in the negotiation, oldest
+first. Docs/02 §4 keeps bid history "visible to the customer, bidding provider, and administrators",
+and the administrator's third of that is **SHIP-96's** along with the visibility rules in full.
+
+It is emphatically not `GET /v1/jobs/{id}/bids`, which `routes_bidding.go` reserved for **SHIP-102's**
+customer comparison at SHIP-84. That is a different resource with a different privacy rule — every
+provider's offer side by side, where this is one negotiation's — and serving it here would have taken
+that ticket's design.
+
+**The chain read is a negotiation, not a walk along the links**, and that is a decision rather than a
+shortcut. SHIP-86 established that a provider who withdraws may bid again, so a negotiation
+legitimately holds rows outside any one link chain. Following `superseded_by` from the first row would
+omit exactly the rows somebody is most likely to be asking about, and Docs/01 §4.3 requires every
+withdrawal to be *recorded*, not merely retained where a query happens to look.
+`TestAWithdrawnOfferAndItsReplacementAreBothInTheChain` is that.
+
+It asks `CustomerOf` and deliberately not `AwardableBy`: **a record is at its most useful once the job
+is over** — the customer reconstructing why they awarded elsewhere, the provider checking what they
+committed to, an administrator handling a dispute. A read gated on the job still being live would go
+dark exactly then.
+
+#### The budget and a counter amount are different things, and `Docs/01` §4.3 does settle it
+
+This is the shape this domain has been most careful about, and SHIP-88 is where it bites hardest: **a
+counter-offer is an amount the customer chose, in a response a provider reads.**
+
+They are different for a reason the document states rather than implies. Docs/01 §4.3's decision is
+about the customer's *maximum*: "The customer's maximum budget is **private**. Providers never see it
+— not as an amount, not as a band, and not as a 'budget supplied' indicator." The reasoning it gives
+is asymmetry — "if providers can see the maximum, bids converge on it, which defeats the competitive
+pricing that is the marketplace's purpose". A counter-offer is the opposite artefact: a number the
+customer **deliberately put in front of this provider**, in a negotiation the same document requires
+the platform to record (§4.3: "record all offers, counter-offers, withdrawals, and acceptances") and
+Docs/02 §4 requires to stay visible to both parties. Withholding it would leave a counter-offer
+endpoint whose counters nobody can read.
+
+**`Docs/01` was clear enough to settle it, and no document needs changing.** What is worth telling a
+customer, and is a product note rather than a defect: **a customer who counters at exactly their
+budget has disclosed their budget**, by their own act. The platform's obligation is not to leak it;
+it is not to prevent the customer offering it. If the pilot shows customers doing that habitually,
+the fix is a warning in the client at SHIP-103, not a change here.
+
+The mechanism is unchanged and was extended rather than trusted.
+`TestTheBidResponseCarriesNothingOfTheCustomers` now holds **six** responses to a closed set of keys
+at every depth — the two SHIP-84 had, SHIP-85's and SHIP-86's, and now the counter and the history —
+and `make verify` makes the same assertion from outside Go against both new shapes. The counter in
+every fixture is placed at a number that is not the budget in any rendering, so the value search stays
+meaningful.
+
+**The closed set did its job before a line of the new tests was written.** Adding `offered_by` and
+`superseded_by` to the response failed all four existing subtests immediately, which is exactly the
+cost it exists to impose: both keys were then added deliberately in three places — the Go list, the
+`Bid` schema, and the verify script — rather than arriving with a schema change nobody read.
+
+#### `Countered` is never written, and Docs/02 §4 is ambiguous about why it exists
+
+Docs/02 §4 lists both `Countered` and `Superseded` and describes them in almost the same words — one
+offer "answered with a different price or timing", the other "displaced by a counter from either
+party". Those are the same event seen from the two ends, and a platform that wrote both would be
+writing two statuses for one transition and would then owe clients an answer about which to branch on.
+
+**`Superseded` is the one written, and the published vocabulary had already chosen it**: `CodeBidClosed`
+and the `BidNoLongerYours` response in `contracts/paths/bidding.yaml` have both enumerated "rejected,
+expired, superseded" since SHIP-85 and neither names `Countered`. This ticket noticed rather than
+overlooked. `Countered` stays in `ck_bids_status` because Docs/02 §4 has it and Docs/10 §3.4 pairs the
+list with the constraint in both directions, and the trigger for writing it is named in `model.go`: a
+ticket that needs to distinguish "displaced because the other party answered" from some other way of
+being displaced. There is no other way today. **Reported as a documentation ambiguity rather than
+resolved in the document** — see §9.
+
+#### What SHIP-85's entry left open, answered
+
+That subsection recorded a cost — "the intermediate prices are not retained … if SHIP-88 decides the
+chain should record revisions too, that is an additive change" — and this is the ticket that decides.
+
+**A revision is still an in-place `UPDATE` and does not become a chain entry.** Docs/02 §4 never says
+a provider revising their *own* offer supersedes anything, and it is right: there is no counter from
+the other party to supersede, which is what `Submitted` means. Making a revision write a row would
+also make the three verbs indistinguishable in the history — a provider who dropped their price twice
+before anybody answered would look like a negotiation with itself.
+
+What the chain does record is every round anybody **answered**, which is what Docs/01 §4.3's list
+names. SHIP-85's subsection has been amended to point here rather than left holding an open question.
+
+#### Shared surfaces
+
+One `$ref` pair in `contracts/openapi.yaml` and one line in `cmd/api/routes_golden.txt`, both
+regenerated rather than typed, and §3's check count, written by `make verify-update`. **No
+migration**: `000502` shipped with SHIP-87, because the counter that writes a chain and the
+constraints that hold one are the same file, and splitting a migration across two commits would mean
+editing one that had already been applied.
+
+No `internal/boundaries` edit, no `Deps` field, and no new port — the chain read uses the
+[Negotiation] seam SHIP-87 introduced, asking `CustomerOf` and deliberately not `AwardableBy`.
+
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 
 **The owner declared SHIP-91 delivered on 12 August 2026.** §6 had carried it as the wave's one
@@ -4598,10 +5351,16 @@ Strict build order says the next ticket is the lowest-numbered open one, which i
 
 **Eight tickets left this table in wave 5** — SHIP-69, 70, 77, 79, 98, 106, 111 and 135, every one of them delivered — and three arrived behind them: SHIP-84 unblocked by SHIP-83, SHIP-99 by SHIP-98 and SHIP-82 together, and SHIP-112 by SHIP-111. A wave that closes eleven tickets does not shorten this list by eleven, and that is the shape to expect.
 
+**SHIP-88 is now built, and that is the sentence this wave existed to change.** SHIP-92's dependencies are both met, and so are SHIP-90's and SHIP-96's — three tickets and ten points that have been unreachable for three consecutive waves. **SHIP-92…95 never parallelise** and take a branch of their own with nothing else on it (§8); §3's SHIP-88 entry records the lock ordering that branch should take and what the database enforces on its behalf, so it starts against a design rather than against a blank page.
+
 | Ticket | Pts | Area |
 |---|---|---|
 | SHIP-56a | 2 | Status codegen for Go, Dart and TypeScript — cut from waves 2, 3, 4 and 5 because it writes into four trees. Four cuts is a ticket nobody will ever pick under contention; it wants a serial slot |
 | SHIP-84 | 3 | Place bid endpoint — **the first endpoint `internal/bidding` will ever serve**, and SHIP-83's provider detail was its last dependency |
+| SHIP-89 | 3 | Bid expiry — the terms an offer runs out on. It fits 000502 without change: expiry moves the head from `Submitted` to `Expired`, which leaves every constraint satisfied |
+| SHIP-90 | 2 | The `Negotiating` presentation status — unblocked by SHIP-87, and the ticket four entries in §3 have now deferred to |
+| SHIP-92 | 5 | The award transaction — **unblocked by SHIP-88**, single-owner, own branch, and SHIP-91 is already met by SHIP-80's index |
+| SHIP-96 | 3 | Bid history visibility rules — unblocked by SHIP-88, which built the chain and the two-party read it refines |
 | SHIP-99 | 3 | Flutter provider job feed — SHIP-98's fleet screens and SHIP-82's feed endpoint both landed in wave 5, and this is what joins them |
 | SHIP-107 | 5 | Job-scoped token generation — SHIP-106's assignment is what it hangs off, and §8's SHIP-108 gate sits one hop behind it |
 | SHIP-112 | 5 | Out-of-order milestone absorption — SHIP-111's endpoint and its per-key uniqueness are what a late milestone gets absorbed against |
@@ -4991,6 +5750,14 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 **~~A ticket for the web CI workflows.~~ Written as SHIP-23a at SHIP-15c, and built — see §3.** Two workflows, path-filtered per surface, and the filter demonstrated against a changed-file matrix rather than believed.
 
 **~~`make web-check` runs its type-check before its build.~~ Decided and fixed at SHIP-15e — see §3.** `web-check` is now `web-lint web-build web-typecheck`, and the `make web-build` workaround is deleted from both web workflows. Demonstrated by removing `.next` from both applications and running the target to green — the state CI is always in and a developer never is.
+
+**`Docs/02` §4 gives one event two statuses, and SHIP-87 could not tell them apart.** The section lists both `Countered` — "an offer that has been answered with a different price or timing" — and `Superseded` — "an offer displaced by a counter from either party". Read carefully those are the same transition described from the two ends, and there is no third thing either could mean: an offer is displaced by a counter, or it is not.
+
+**SHIP-87 wrote `Superseded` and left `Countered` with no writer**, because the published vocabulary had already chosen: `bidding_bid_closed` and the `BidNoLongerYours` response in `contracts/paths/bidding.yaml` have enumerated "rejected, expired, superseded" since SHIP-85 and neither names `Countered`. The constant is kept, because Docs/10 §3.4 pairs the Go list with `ck_bids_status` in both directions and Docs/02 §4 is the authority for the list.
+
+**This is reported rather than resolved, deliberately.** Two options and neither is a code change: `Docs/02` §4 gains a sentence saying `Countered` is a synonym retained for the vocabulary and `Superseded` is what the platform writes; or it gains a distinction the two statuses are actually for, at which point `bidding` writes both and `bidding_bid_closed`'s list grows by one. The first costs a sentence and the second costs a ticket. Whoever writes **SHIP-96** — the bid-history visibility rules — is the natural owner, because they are the first person who has to render a chain to three audiences and will notice immediately if a distinction was wanted.
+
+**`ck_bids_offer_has_timing` is now answerable and is still not written.** `000501` removed it because it would have bound SHIP-87's design; SHIP-87 made that design and every offer this platform writes past `Draft` names both instants, so the constraint would be true. It is not added because 000501's *other* finding still holds — it failed six of SHIP-80's own migration tests, which insert `Submitted` and `Accepted` bids with no timing to exercise `ck_bids_status`, and making them pass means editing another ticket's test file. **A small ticket: one migration and an edit to `migrations/bids_test.go`'s fixtures.** Worth taking, because a stated-timing rule enforced only by a validator is one a worker or an admin path could bypass.
 
 **`flutter_secure_storage` is held at 10.x because version 11 needs `compileSdk = 37`.** The client compiles against 36 today, and Android Gradle Plugin 9.0.1 names 36 as its own maximum recommended — so taking 11 means moving the SDK and probably the Gradle plugin together. There is no urgency: 10.3.1 uses the same Keystore-wrapped ciphers and the same API 23 requirement. **Decide it with SHIP-24 and SHIP-26**, which are the tickets that touch the Android build configuration anyway.
 

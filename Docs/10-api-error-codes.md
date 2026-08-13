@@ -50,6 +50,10 @@ them where the call is made, beside the thing the user was trying to do.
 |---|---|
 | `admin_dispute_already_open` | This job already has a dispute waiting on an outcome. Open it rather than raising another — one job is disputed once at a time. |
 | `admin_job_not_disputable` | A dispute can only be raised on a job that has been awarded and has not yet been completed or cancelled. Reload the job to see its current status. |
+| `bidding_already_bid` | You already have a live offer on this job. Revise or withdraw it rather than placing a second. |
+| `bidding_bid_accepted` | That offer has been accepted. An accepted bid can be neither revised nor withdrawn. |
+| `bidding_bid_closed` | That offer is no longer live, so it can be neither changed nor answered. |
+| `bidding_wrong_party` | That offer belongs to the other party. Counter an offer they made; revise one you made yourself. |
 | `delivery_driver_already_assigned` | This job already has a driver. Reload it to see who is carrying it. |
 | `delivery_driver_link_expired` | This delivery link has expired. There is nothing to refresh — ask the transport provider to send a new one. |
 | `delivery_job_not_assignable` | A driver can only be assigned to a job that has been awarded and has not yet set off. Reload the job to see its current status. |
