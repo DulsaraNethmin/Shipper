@@ -230,10 +230,10 @@ func (b brokenNegotiation) AwardableBy(context.Context, db.Runner, uuid.UUID, uu
 // answers and a transition that then does not is the shape [Service.AwardBid]'s last branch exists
 // for, and one field could not express it.
 type brokenAwarding struct {
-	lock     JobAward
-	lockErr  error
-	move     JobAward
-	moveErr  error
+	lock    JobAward
+	lockErr error
+	move    JobAward
+	moveErr error
 }
 
 func (b brokenAwarding) LockForAward(context.Context, db.Runner, uuid.UUID, uuid.UUID) (JobAward, error) {
