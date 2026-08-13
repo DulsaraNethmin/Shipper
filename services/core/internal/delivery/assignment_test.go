@@ -89,10 +89,32 @@ func (j testJobs) move(ctx context.Context, r db.Runner, m jobs.Move) (JobMove, 
 	case errors.Is(err, jobs.ErrAlreadyInStatus):
 		return JobAlreadyInStatus, nil
 	case errors.Is(err, jobs.ErrTransitionNotPermitted):
-		return JobNotAssignable, nil
+		return j.refusal(ctx, r, m)
 	default:
 		return JobMoveUnrecognised, err
 	}
+}
+
+// refusal splits jobs.ErrTransitionNotPermitted into "the job has already been there" and "the job
+// has not reached it yet" (SHIP-112), exactly as cmd/api/routes_delivery.go does.
+//
+// The duplication is the arrangement this file's header describes and not an accident: the
+// production adapter lives in package main, which has no database in a Go test, so the only way to
+// drive the real guard from here is to hold a copy. Both are exercised — this one by the tests
+// below, and cmd/api's by scripts/verify/70-delivery.sh against the running binary — and a copy that
+// drifted would show up as a late milestone absorbed by one and refused by the other.
+func (j testJobs) refusal(ctx context.Context, r db.Runner, m jobs.Move) (JobMove, error) {
+	history, err := j.svc.History(ctx, r, m.JobID)
+	if err != nil {
+		return JobMoveUnrecognised, err
+	}
+
+	for _, change := range history {
+		if change.To == m.To {
+			return JobAlreadyPast, nil
+		}
+	}
+	return JobNotAssignable, nil
 }
 
 // testAwards is delivery.Awards over the accepted bid, as cmd/api reads it.
@@ -674,6 +696,49 @@ func TestAJobAlreadyDriverAssignedKeepsTheNewDriver(t *testing.T) {
 	}
 	if assignment.DriverName != "Sam Patel" {
 		t.Errorf("driver_name = %q", assignment.DriverName)
+	}
+}
+
+// TestAJobPastDriverAssignedIsRefused is SHIP-112's new outcome arriving on the assignment path.
+//
+// **An assignment is not absorbed the way a late milestone is**, and this is the test that says so.
+// A milestone is a claim about something that already happened, so keeping it costs nothing; an
+// assignment is an instruction about who drives the job *now*, and a driver_assignments row written
+// for a job that has already gone would name a live driver on a delivery somebody else is carrying.
+//
+// The port is stubbed because no fixture can produce this. Reaching it needs a job that has been at
+// 'Driver assigned' and has no live assignment, and nothing writes `unassigned_at` until SHIP-109 —
+// the same reason TestAJobAlreadyDriverAssignedKeepsTheNewDriver stubs its outcome. A job that set
+// off without ever being 'Driver assigned' is JobNotAssignable and is covered by
+// TestAJobThatHasSetOffCannotTakeADriver, against the real guard.
+//
+// The second assertion is wave 5's invariant, which SHIP-112 must not have loosened: the assignment
+// row is inserted before the transition is attempted, so a refusal has to take it with it.
+func TestAJobPastDriverAssignedIsRefused(t *testing.T) {
+	pool := pgtest.DB(t)
+	customer := newAccount(t, pool, "past-c@example.com", "+61400000627", "customer")
+	provider := newAccount(t, pool, "past-p@example.com", "+61400000628", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+
+	svc := newTestServiceWith(staticJobs{move: JobAlreadyPast})
+
+	_, _, err := assign(t, pool, svc, provider, jobID, Nomination{
+		DriverName:   "Sam Patel",
+		DriverMobile: "+61412345678",
+	})
+	if !errors.Is(err, ErrJobNotAssignable) {
+		t.Fatalf("AssignDriver() = %v, want ErrJobNotAssignable — a job past 'Driver assigned' "+
+			"has nothing historical to keep, so there is nothing to absorb", err)
+	}
+
+	var rows int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM driver_assignments WHERE job_id = $1`, jobID).Scan(&rows); err != nil {
+		t.Fatalf("counting assignments: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("%d assignment rows survived the refusal; absorption must not have turned a "+
+			"rollback into a partial write", rows)
 	}
 }
 

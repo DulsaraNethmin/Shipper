@@ -213,6 +213,65 @@ type Record struct {
 	ServerRecordedAt time.Time
 }
 
+// Outcome is what the platform did with a recording (SHIP-112).
+//
+// # It replaced a bool, and the third value is the reason
+//
+// SHIP-111 answered "was anything written?", which had two answers and needed no type. SHIP-112
+// adds a third thing that can happen to a perfectly good milestone — it is written, and the job is
+// deliberately left where it is — and a second bool beside the first would have made the caller
+// work out which pairs are possible. Three named values do not.
+//
+// It travels no further than [Handler.RecordMilestone]. **The response body is unchanged and
+// carries no outcome field**, which is a decision rather than an omission: the milestone response
+// has never told a client what status the job is in (see [milestoneResponse]), Docs/02 §3.1 puts
+// reconciliation on the job resource — "the app displays optimistic local state, clearly marked as
+// pending, and reconciles to whatever the platform returns" — and a field here would be answered
+// from a *stored* fact on a replay and a *computed* one on the first attempt, which is two answers
+// to one question. What the client is told is that the request succeeded, which before SHIP-112 was
+// the one thing a late milestone could not be told.
+type Outcome int
+
+const (
+	// OutcomeUnrecognised is the zero value and never accompanies a nil error.
+	//
+	// First for the reason [JobMoveUnrecognised] is first: a path that forgets to say what it did
+	// must not be indistinguishable from one that recorded something.
+	OutcomeUnrecognised Outcome = iota
+
+	// OutcomeRecorded means the row was written and the job is where the milestone says it is —
+	// either because the milestone moved it, or because it was already there (Docs/02 §5's
+	// failed pickup attempt).
+	//
+	// The two are one outcome because nothing downstream treats them differently: in both, what
+	// the actor recorded and what the platform holds agree.
+	OutcomeRecorded
+
+	// OutcomeAbsorbed means the row was written and the job was deliberately not moved, because
+	// it has already been past this point (SHIP-112, Docs/02 §3.1).
+	//
+	// Nothing else happened. No job_status_history row, no status change, no event — see
+	// [Service.RecordMilestone].
+	OutcomeAbsorbed
+
+	// OutcomeAlreadyRecorded means this idempotency key had already recorded this milestone and
+	// nothing was written. The record returned is the one the first attempt wrote.
+	OutcomeAlreadyRecorded
+)
+
+func (o Outcome) String() string {
+	switch o {
+	case OutcomeRecorded:
+		return "recorded"
+	case OutcomeAbsorbed:
+		return "absorbed"
+	case OutcomeAlreadyRecorded:
+		return "already recorded"
+	default:
+		return "unrecognised"
+	}
+}
+
 // ActorType is who recorded a milestone.
 //
 // Narrower than job_status_history's five on purpose. Docs/02 §3: "delivery-status updates must

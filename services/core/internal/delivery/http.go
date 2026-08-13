@@ -36,6 +36,7 @@ package delivery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -280,7 +281,8 @@ type recordMilestoneRequest struct {
 //
 // The job's status is not echoed, for the reason [assignmentResponse] gives — it is the jobs
 // endpoints' vocabulary — and here there is a second reason: a milestone may deliberately move
-// nothing at all.
+// nothing at all. Since SHIP-112 there are two ways for that to happen and this shape distinguishes
+// neither of them; [Outcome] is where the decision not to is argued.
 type milestoneResponse struct {
 	ID    string `json:"id"`
 	JobID string `json:"job_id"`
@@ -331,6 +333,17 @@ func milestoneFrom(rec Record) milestoneResponse {
 // milestone the first attempt recorded. A driver's phone reconnecting after a day in a valley takes
 // that path, and it is the only reason "records a milestone once per idempotency key" is true of the
 // platform rather than of its cache.
+//
+// # An absorbed milestone is a 201 like any other, and the response says nothing more (SHIP-112)
+//
+// A late milestone — one whose point in the delivery the job has already passed — is recorded and
+// the job is left where it stands. The row was created, so the status is `201`, and the body is the
+// same body: **there is no field saying the job did not move**, because this response has never told
+// a client what status the job is in and Docs/02 §3.1 puts that reconciliation on the job resource.
+// See [Outcome] for why one was not added.
+//
+// What changes for a client is that the `409` it used to get here has gone, which is the whole point:
+// the driver's work is now safe on the platform rather than pending on a phone forever.
 func (h *Handler) RecordMilestone() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		providerID, err := callerID(r.Context())
@@ -359,19 +372,40 @@ func (h *Handler) RecordMilestone() http.Handler {
 		}
 
 		var (
-			record   Record
-			recorded bool
+			record  Record
+			outcome Outcome
 		)
 		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
 			var err error
-			record, recorded, err = h.svc.RecordMilestone(ctx, runner, providerID, jobID, recording)
+			record, outcome, err = h.svc.RecordMilestone(ctx, runner, providerID, jobID, recording)
 			return err
 		})
 		if err != nil {
 			return apiError(err)
 		}
 
-		if !recorded {
+		switch outcome {
+		case OutcomeRecorded:
+			httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+			return nil
+
+		case OutcomeAbsorbed:
+			// Logged because it is the *only* trace absorption leaves. The row is
+			// indistinguishable from any other milestone, the job did not move, no history
+			// row was written and no event was emitted — so without this line a late
+			// milestone is invisible to operations, and Docs/02 §3.1's escalation is
+			// entirely about how long updates have been out of sync.
+			httpx.LoggerFrom(r.Context()).Info("a late milestone was absorbed as history and the job was not moved",
+				slog.String("job_id", jobID.String()),
+				slog.String("milestone", record.Milestone.Wire()),
+				slog.String("milestone_id", record.ID.String()),
+				slog.Time("recorded_at", record.ActorRecordedAt),
+				slog.Time("accepted_at", record.ServerRecordedAt))
+
+			httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+			return nil
+
+		case OutcomeAlreadyRecorded:
 			// Logged because it is the signal that the middleware's entry had gone and the
 			// database caught the retry instead. That is the mechanism working, and it is
 			// otherwise invisible: the response is indistinguishable from an ordinary one.
@@ -382,10 +416,17 @@ func (h *Handler) RecordMilestone() http.Handler {
 
 			httpx.WriteJSON(w, http.StatusOK, milestoneFrom(record))
 			return nil
-		}
 
-		httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
-		return nil
+		default:
+			// The service returned no error and no outcome, which is a defect here rather
+			// than anything the caller did. Answering 201 would be the tempting default and
+			// the wrong one: it would report a recording that nothing in this function can
+			// say happened.
+			return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+				"Something went wrong at our end.").WithCause(fmt.Errorf(
+				"delivery: recording %s on %s answered %q with no error",
+				recording.Milestone, jobID, outcome))
+		}
 	})
 }
 
@@ -674,8 +715,11 @@ func apiError(err error) error {
 			WithCause(err)
 
 	case errors.Is(err, ErrMilestoneNotPermitted):
+		// Since SHIP-112 this can only mean "too early". A milestone the delivery has already
+		// passed is absorbed and never reaches here, so the message says which direction the
+		// conflict is in rather than leaving a client to work out whether retrying is futile.
 		return httpx.NewError(http.StatusConflict, CodeMilestoneNotPermitted,
-			"This milestone cannot be recorded from the job's current status.").WithCause(err)
+			"This delivery has not reached the point where that milestone can be recorded.").WithCause(err)
 
 	default:
 		return err

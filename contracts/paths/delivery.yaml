@@ -297,7 +297,8 @@ Milestones:
       - BearerAccessToken: []
     description: |
       Records what happened on a delivery — that the driver has set off, collected the goods, or
-      begun the journey — and moves the job when the lifecycle has a transition for it (SHIP-111).
+      begun the journey — and moves the job when the lifecycle has a transition for it
+      (SHIP-111, SHIP-112).
 
       Only the provider whose bid the customer accepted may call it. The customer of the job may
       not: they are shown milestones and confirm the delivery at the end, and neither of those is
@@ -346,12 +347,25 @@ Milestones:
       Reusing one key for two *different* milestones is refused with `idempotency_key_reused`. One
       key per action.
 
-      ## A milestone the job has moved past
+      ## A milestone that arrives late, and one that arrives early
 
-      Refused for now with `delivery_milestone_not_permitted`. **Do not discard the update when you
-      get it** — hold it and show it as pending. Docs/02 §3.1 requires a late milestone to be
-      absorbed into the record rather than rejected, and the platform will do that shortly; a client
-      that deletes the driver's work on this answer will lose real records when it stops being sent.
+      These are different answers, and which one you get depends on where the delivery is rather
+      than on how long you held the update.
+
+      **Late — the job has already moved past this point.** A queued `picked_up` that syncs after
+      `in_transit` is already recorded answers `201` and is kept, with your `recorded_at` exactly as
+      you sent it. The job is **not** moved backwards: what you have added is a historical fact, not
+      the delivery's current state. Send late updates whenever you have them; the platform is where
+      they belong, not the phone.
+
+      **Early — the delivery has not reached this point.** An `in_transit` recorded while the job is
+      still on its way to the pickup answers `409 delivery_milestone_not_permitted` and writes
+      nothing. **Hold the update and retry it** — with the same key, unchanged — once the delivery
+      catches up. This one is worth retrying; there is no state in which a late milestone becomes
+      recordable a second time, and none in which an early one stays refused forever.
+
+      The response is the same shape either way and says nothing about the job's status, so a client
+      that needs to know where the delivery now stands reads the job.
     parameters:
       - $ref: '#/JobID'
       - $ref: '#/IdempotencyKey'
@@ -365,7 +379,8 @@ Milestones:
       '201':
         description: |
           The milestone is recorded. The job has moved too, unless it was already where this
-          milestone would have put it.
+          milestone would have put it, or has already moved past it — see "a milestone that arrives
+          late, and one that arrives early" above.
         headers:
           X-Request-Id:
             $ref: '../openapi.yaml#/components/headers/RequestID'
@@ -397,7 +412,7 @@ Milestones:
 
           | `error.code` | What happened |
           |---|---|
-          | `delivery_milestone_not_permitted` | The job has moved past this milestone, or has not reached where it makes sense. Keep the update — see above |
+          | `delivery_milestone_not_permitted` | The delivery has not reached this milestone yet. Keep the update and retry it once it has — see above. A milestone the job has already *passed* is recorded rather than refused |
           | `delivery_proof_required` | `delivered` needs photo proof or a recorded exception, and capturing either is not built yet |
           | `idempotency_key_reused` | This key already recorded a *different* milestone on this job. Generate a new one |
           | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |

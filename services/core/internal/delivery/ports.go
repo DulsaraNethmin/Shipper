@@ -95,12 +95,47 @@ const (
 	// every use.
 	JobAlreadyInStatus
 
-	// JobNotAssignable means Docs/02 §2 has no row from the job's status to 'Driver assigned'.
+	// JobNotAssignable means Docs/02 §2 has no row from the job's status to the one this move
+	// would take it to, **and the job has never been in that status**.
 	//
-	// The ordinary case is a job that has not been awarded yet, or one that has already left
-	// for the pickup — Docs/02 §2 permits Awarded → En route to pickup directly, and offers no
-	// way back to 'Driver assigned' from there.
+	// The ordinary case is a job that has not been awarded yet, or a milestone recorded for a
+	// point in the delivery the job has not reached — an `in_transit` on a job still at
+	// 'En route to pickup'.
+	//
+	// **SHIP-112 narrowed this**, and the second clause is the narrowing. Until then it covered
+	// every refusal of the transition table in both directions; [JobAlreadyPast] is now the half
+	// of it that points backwards.
 	JobNotAssignable
+
+	// JobAlreadyPast means the job has been in the status this move would take it to and has
+	// since moved on (SHIP-112).
+	//
+	// # It is a refinement of JobNotAssignable, and the two want opposite handling
+	//
+	// Both mean the guard refused, and Docs/02 §3.1 treats them as different events. A milestone
+	// whose status the job has already passed is **late**: it is a true statement about work that
+	// was done, and Docs/02 §2 offers no way back, so retrying it can never succeed and refusing
+	// it discards the driver's record permanently. A milestone the job has not reached yet is
+	// **premature**: the identical request succeeds once the delivery gets there, so a refusal
+	// costs a retry rather than a record.
+	//
+	// # "Already been there" is a recorded fact, not an inference
+	//
+	// The test is whether `job_status_history` holds a transition **into** the target status, which
+	// is Docs/02 §3.1's own phrasing — "a queued update that arrives after a later transition has
+	// already been recorded". It is deliberately not a reachability search over Docs/02 §2's table:
+	// a job cancelled or disputed before it ever reached the status has not passed the milestone,
+	// it has lost to something else, and that is SHIP-113's "queued update contradicting an
+	// administrative action" rather than this.
+	//
+	// # An implementation that never returns this is not a compile error, and there is no
+	// mechanism that could make it one
+	//
+	// The value degrades to a refusal, which is what the platform did before SHIP-112. Both
+	// adapters — cmd/api/routes_delivery.go and the copy in this package's tests — are held to it
+	// by tests that record a late milestone against a real database, and by
+	// scripts/verify/70-delivery.sh against the running binary.
+	JobAlreadyPast
 )
 
 func (m JobMove) String() string {
@@ -113,6 +148,8 @@ func (m JobMove) String() string {
 		return "already in that status"
 	case JobNotAssignable:
 		return "not assignable"
+	case JobAlreadyPast:
+		return "already past that status"
 	default:
 		return "unrecognised"
 	}
@@ -139,6 +176,15 @@ func (m JobMove) String() string {
 // 06:40 and synced at 09:15 is one act, and the two rows it writes — a milestone and a
 // job_status_history transition — must agree about when the actor says it happened (Docs/02 §3.1).
 // Each table stamps its own arrival time; neither takes the other's word for the actor's.
+//
+// # An implementation owes one thing beyond the translation, since SHIP-112
+//
+// A refusal must be reported as [JobAlreadyPast] when the job has already recorded a transition
+// into the status the move names, and as [JobNotAssignable] when it has not. `jobs` reports both as
+// one sentinel, because the transition table has no opinion about which direction a refused move
+// was pointing in; telling them apart is a second question about the same job, asked of the same
+// domain, in the same transaction. It is asked in the composition root because that is the only
+// place a `jobs.Status` may be named at all.
 type Jobs interface {
 	// MoveToDriverAssigned runs the guarded transition on behalf of the provider, inside the
 	// caller's transaction. providerID is the actor recorded against it.

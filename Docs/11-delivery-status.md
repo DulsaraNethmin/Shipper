@@ -181,7 +181,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **376 checks across 12 sections**, and `make check` green. Since
+Verified by `make verify` — **381 checks across 12 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -315,6 +315,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-108** | M4 | The driver token verifier and `GET /v1/driver/jobs/{id}` — the first route in the service served on something other than a mobile session. **The one-job check is the auth class**, so a driver route cannot declare the class and skip it, and both directions of the exchange invariant are now demonstrated over HTTP rather than only in Go — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
+| **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
@@ -3861,6 +3862,96 @@ it checks against already exists.
 
 `make verify` went from 366 checks across 12 sections to the figure at the top of this section, all
 ten of the new ones in `scripts/verify/70-delivery.sh`.
+
+### SHIP-112 — absorption, and what "backwards" had to be decided to mean
+
+A queued `en_route_to_pickup` that syncs after the job is already `In transit` is now **kept and
+moves nothing**. SHIP-111 refused it with `delivery_milestone_not_permitted` and rolled the row back
+with its transaction; `Docs/02` §3.1 had always said it must be "absorbed, not rejected as an
+error… the platform accepts the historical fact without moving the job backwards", and this is that
+sentence built.
+
+**SHIP-111's seam held exactly as it promised.** The milestone row is inserted before the move is
+attempted and is already independent of whether the job moved, so absorbing costs nothing but
+declining to return an error. What SHIP-111 could not predict is that the change is *not* confined to
+`Service.RecordMilestone` — one `case` of that switch is where absorption happens, and deciding
+**which** refusals get it needed a fifth value on the port and a second question asked in `cmd/api`.
+
+**"Backwards" is: the job has already recorded a transition into the status this milestone names.**
+That is a fact in `job_status_history`, not an inference over `Docs/02` §2's table, and it is the
+document's own phrasing — "a queued update that arrives after a later transition has already been
+recorded". Two alternatives were considered and rejected:
+
+| Considered | Rejected because |
+|---|---|
+| Absorb **every** refusal of the transition guard | It would answer `201` to a milestone the delivery has not reached — an `in_transit` while the job is still on its way to the pickup — and the job would then never move to `In transit` at all. The client is told "recorded" for a move that silently never happens, which is the same loss this ticket exists to prevent, wearing a success code |
+| Absorb whatever the job can no longer **reach** by any permitted sequence | A job cancelled or disputed at `Awarded` can no longer reach `Picked up` either, and it has not moved *past* the pickup — it lost the delivery to something else. That is `Docs/02` §3.1's administrative-conflict bullet and **SHIP-113's ticket**, and folding it in here would have finished half of that ticket by accident and in the wrong place |
+
+So the split is **late** against **premature**, and the asymmetry is not fastidiousness: a late
+milestone can never succeed on a retry, because `Docs/02` §2 has no way back, so refusing it discards
+a driver's record permanently. A premature one succeeds unchanged as soon as the delivery gets there,
+so refusing it costs a retry. `TestAMilestoneTheDeliveryHasNotReachedIsRefused` records the second
+half by recording the refused milestone, moving the job on, and replaying the identical recording
+successfully.
+
+**An absorbed milestone writes one row and nothing else.** No `job_status_history` row — every row in
+that table describes a status change, and one written for a move that did not happen would be read by
+SHIP-77's timeline and by support as though it had. No status update, and **no domain event**, because
+`jobs` emits `job.status_changed` from inside the transition and there was no transition. The one
+trace it leaves besides the row is a log line, which is deliberate: absorption is otherwise entirely
+invisible, and `Docs/02` §3.1's escalation ladder is about exactly how long updates have been unsynced.
+
+**The distinction is made in `cmd/api`, because it is a question about a `jobs.Status`.**
+`jobs.ErrTransitionNotPermitted` says only that the table has no such edge — it has no notion of
+forwards, and should not. `jobLifecycle.refusal` asks `jobs.Service.History`, inside the caller's
+transaction and after `Transition` has taken the job row `FOR UPDATE`, and answers the domain in the
+domain's own vocabulary: a fifth `delivery.JobMove`, `JobAlreadyPast`. `internal/delivery` still names
+no status and still holds no second copy of the transition table. `internal/jobs` was not touched.
+
+**`AssignDriver` sees the new outcome too, and refuses it.** A job past `Driver assigned` is still
+`delivery_job_not_assignable` — a milestone is a claim about something that already happened, so
+keeping it costs nothing, while an assignment is an instruction about who drives the job *now*, and
+there is nothing historical to keep. The case is written out rather than left to fall through, because
+an unnamed outcome becomes a `500` and that is the right answer for something nobody has considered
+and the wrong one for this.
+
+**The response shape did not change, and that was a decision.** No `absorbed` field, no third status
+code. The milestone response has never told a client what status the job is in — `Docs/02` §3.1 puts
+that reconciliation on the job resource — and a flag here would have to be answered from a *stored*
+fact on a retry and a *computed* one on the first attempt, which is two answers to one question. What
+changed for a client is that the `409` has gone, which is the whole point: the driver's work is now on
+the platform instead of pending on a phone forever. `delivery.Outcome` carries the distinction as far
+as the handler and no further.
+
+**SHIP-111's boundary test was inverted rather than deleted**, keeping what it was protecting.
+`TestAMilestoneTheJobHasMovedPastIsRefusedForNow` became
+`TestAMilestoneTheJobHasMovedPastIsAbsorbedAsHistory`, and its milestone count — which existed to
+prove the transaction left nothing behind — is now the assertion that the row survives. Three further
+assertions carry the second clause: the status is untouched, the transition count into that status is
+still the one the job really made, and the job's latest recorded transition is unchanged.
+
+**`Delivered` cannot be reached through absorption**, and the check that stops it is a matter of
+ordering rather than a new rule. `ErrProofRequired` is tested in front of the insert, so a `delivered`
+never reaches the switch that absorbs and never reaches the table.
+`TestAbsorptionCannotReachDelivered` drives it from a job that has already *been* `Delivered` — the
+one state where "the job has moved past it" is true and absorption would otherwise apply.
+
+**It does not make the `anonymous` idempotency scope live, and §9 has the wrong ticket.** §9 says
+"decide with SHIP-112, which is the first ticket whose retries are a driver's rather than a
+provider's". It is not: `POST /v1/jobs/{id}/milestones` declares `RequireUser` and is the awarded
+provider's, SHIP-108's driver route is a read, and **no driver-token route in the service changes
+state**. The first one that does is **SHIP-121**, the driver portal's milestone controls, and that is
+where §9's decision belongs. Nothing about the scope changed here and nothing needed to.
+
+**No migration** — the delivery block is still at `000602`. Absorption stores no new fact: the row,
+its two clocks and its idempotency key were all already there, which is what made a five-point ticket
+a change to one switch, one adapter and their two test copies.
+
+`make verify` went from 376 checks across 12 sections to the figure at the top of this section, all
+of the new ones in `scripts/verify/70-delivery.sh` — five in a `SHIP-112` section of its own, which
+is where the production adapter's half is exercised at all. `internal/delivery`'s tests drive a
+*copy* of `jobLifecycle`, because `cmd/api` has no database in a Go test, and a copy that drifted
+would show as a late milestone absorbed by one and refused by the other.
 
 ## 4. Partly done — do not treat these as finished
 

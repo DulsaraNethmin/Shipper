@@ -587,19 +587,89 @@ status="$(milestone_request "$delivery_provider_token" "$milestone_key-delivered
   || fail "a job reached Delivered with neither proof nor a recorded exception"
 ok "delivered is refused while nothing can prove it — the invariant holds without SHIP-118, which narrows the refusal rather than adding it"
 
-status="$(milestone_request "$delivery_provider_token" "$milestone_key-late" '{"milestone":"en_route_to_pickup"}' late)"
-[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-late.json"; fail "a milestone the job has moved past returned $status, want 409"; }
-[[ "$(json "$WORKDIR/ms-late.json" '["error"]["code"]')" == "delivery_milestone_not_permitted" ]] \
-  || { cat "$WORKDIR/ms-late.json"; fail "expected code=delivery_milestone_not_permitted"; }
-[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "4" ]] \
-  || fail "the refused recording left a row behind; SHIP-112 keeps it deliberately, and until then the transaction must not"
-ok "a milestone the job has moved past is refused and rolls back whole — SHIP-112 is the ticket that absorbs it instead"
-
 status="$(milestone_request "$delivery_provider_token" "$milestone_key-assigned" '{"milestone":"driver_assigned"}' assigned)"
 [[ "$status" == "422" ]] || { cat "$WORKDIR/ms-assigned.json"; fail "driver_assigned returned $status, want 422"; }
 [[ "$(json "$WORKDIR/ms-assigned.json" '["error"]["details"][0]["field"]')" == "milestone" ]] \
   || { cat "$WORKDIR/ms-assigned.json"; fail "the refusal does not name the milestone field"; }
 ok "driver_assigned is refused here — it has an endpoint of its own, and nothing writes it to this table"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-112  a late milestone is recorded as history without moving the job backwards"
+
+# # Why these checks are here and not only in Go
+#
+# The refusal `delivery` absorbs is produced by neither `delivery` nor `jobs`: the transition guard
+# answers one sentinel for a move that points backwards and one that points forwards, and telling
+# them apart is the composition root's half — `jobLifecycle.refusal` in cmd/api/routes_delivery.go.
+# internal/delivery's tests drive a *copy* of that adapter, because cmd/api has no database in a Go
+# test. The production one is exercised here or nowhere, and a copy that drifted would show as a
+# late milestone absorbed by one and refused by the other.
+#
+# $milestone_job is In transit with four milestone rows and one transition into 'En route to pickup'
+# behind it. The driver's queued `en_route_to_pickup`, recorded at dawn in a yard with no signal, is
+# about to arrive — which is Docs/02 §3.1's own example read backwards.
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-late" \
+  '{"milestone":"en_route_to_pickup","recorded_at":"2026-08-12T06:40:11Z"}' late)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-late.json"; fail "a late milestone returned $status, want 201 — Docs/02 §3.1 requires it absorbed, not rejected"; }
+milestone_late_id="$(json "$WORKDIR/ms-late.json" '["id"]')"
+[[ "$milestone_late_id" =~ ^[0-9a-f-]{36}$ ]] || fail "the absorbed milestone came back with no id"
+ok "a milestone the job has moved past is recorded rather than refused — the 409 SHIP-111 answered with has gone"
+
+# The row, read from the table rather than from what the endpoint said about itself. This is the
+# load-bearing half: a late milestone that is silently discarded is what this ticket exists to stop.
+milestone_late_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select milestone || ' @ ' || to_char(actor_recorded_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+        || ' arrived ' || (server_recorded_at > actor_recorded_at)
+     from milestones where id = '$milestone_late_id';")"
+[[ "$milestone_late_row" == "En route to pickup @ 2026-08-12 06:40:11 arrived true" ]] \
+  || fail "the absorbed milestone is stored as '$milestone_late_row', want 'En route to pickup @ 2026-08-12 06:40:11 arrived true'"
+ok "the row is there afterwards, carrying the actor's own clock uncorrected and the platform's beside it — absorption is what the pair SHIP-110 built is for"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "5" ]] \
+  || fail "the late milestone did not survive its own request"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$milestone_job';")" == "In transit" ]] \
+  || fail "a late milestone moved the job backwards"
+ok "five rows and the job still In transit — the record grew and the delivery did not go backwards"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$milestone_job' and to_status = 'En route to pickup';")" == "1" ]] \
+  || fail "an absorbed milestone wrote a job_status_history row for a move that did not happen"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select to_status from job_status_history where job_id = '$milestone_job' order by server_recorded_at desc limit 1;")" \
+  == "In transit" ]] || fail "the job's latest recorded transition is no longer the one it really made last"
+ok "and no transition was recorded for it — 'without moving the job backwards' means the history says nothing moved, because nothing did"
+
+# The retry, because absorption must not have opened a second way past uq_milestones_idempotency.
+forget_the_cached_response "$milestone_key-late"
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-late" \
+  '{"milestone":"en_route_to_pickup","recorded_at":"2026-08-12T06:40:11Z"}' late-again)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/ms-late-again.json"; fail "the retry of an absorbed milestone returned $status, want 200"; }
+[[ "$(json "$WORKDIR/ms-late-again.json" '["id"]')" == "$milestone_late_id" ]] \
+  || fail "the retry answered with a different milestone"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "5" ]] \
+  || fail "the retry of an absorbed milestone wrote a second row"
+ok "retried with its cached response deleted it is answered from the row it already wrote — once per key, absorbed or not"
+
+# --- the other direction, which is deliberately still a refusal ---------------------------------
+#
+# A milestone the delivery has not *reached* is not a historical fact that arrived out of order. It
+# is refused, and SHIP-113 is the ticket that decides what a job cancelled out from under a queued
+# update does with one.
+
+milestone_early_job="$(delivery_awarded_job early)"
+delivery_move "$milestone_early_job" Awarded 'En route to pickup'
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-early.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-early" \
+  -H 'Content-Type: application/json' -d '{"milestone":"in_transit"}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$milestone_early_job/milestones")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-early.json"; fail "a premature milestone returned $status, want 409"; }
+[[ "$(json "$WORKDIR/ms-early.json" '["error"]["code"]')" == "delivery_milestone_not_permitted" ]] \
+  || { cat "$WORKDIR/ms-early.json"; fail "expected code=delivery_milestone_not_permitted"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_early_job';")" == "0" ]] \
+  || fail "a premature recording left a row behind; only a late one is kept"
+ok "a milestone the delivery has not reached yet is still refused and still rolls back whole — retrying it succeeds, which is what makes the refusal cost a retry rather than a record"
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-108  a driver token grants exactly one job and cannot be exchanged for a user session"

@@ -470,6 +470,76 @@ func TestARetriedMilestoneAnswers200WithTheOriginal(t *testing.T) {
 	}
 }
 
+// TestALateMilestoneIsAbsorbedAtTheWire is SHIP-112 seen from a client.
+//
+// The 409 this used to get is the whole of what changed for the app: the driver's queued record now
+// lands, so it can stop being pending on a phone. What did *not* change is the shape — the same
+// `201` and the same body as any other recording, with no field saying the job did not move, because
+// this response has never carried the job's status and Docs/02 §3.1 puts that reconciliation on the
+// job resource.
+func TestALateMilestoneIsAbsorbedAtTheWire(t *testing.T) {
+	pool := pgtest.DB(t)
+	router := newTestRouter(t, pool)
+
+	customer := newAccount(t, pool, "http-late-c@example.com", "+61400000707", "customer")
+	provider := newAccount(t, pool, "http-late-p@example.com", "+61400000708", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+
+	moveJob(t, pool, jobID, jobs.User(jobs.ActorProvider, provider),
+		jobs.StatusEnRouteToPickup, jobs.StatusPickedUp, jobs.StatusInTransit)
+
+	rec := recordAs(t, router, provider, jobID, theKey,
+		`{"milestone": "picked_up", "recorded_at": "2026-08-12T02:00:00Z"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (%s)", rec.Code, rec.Body)
+	}
+
+	body := decode[milestoneBody](t, rec)
+	if body.Milestone != "picked_up" {
+		t.Errorf("milestone = %q", body.Milestone)
+	}
+	if body.RecordedAt != "2026-08-12T02:00:00.000Z" {
+		t.Errorf("recorded_at = %q, want the actor's own time uncorrected — it is the only "+
+			"statement of when a late milestone actually happened", body.RecordedAt)
+	}
+
+	// The same body as any other recording. An `absorbed` field would have to be answered from a
+	// stored fact on the retry below and a computed one here, which is two answers to one
+	// question — see delivery.Outcome.
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("the response is not JSON: %v", err)
+	}
+	for _, field := range []string{"status", "absorbed"} {
+		if _, present := raw[field]; present {
+			t.Errorf("the response carries %q; the milestone shape says nothing about the job's state", field)
+		}
+	}
+
+	if n := milestoneCount(t, pool, jobID); n != 1 {
+		t.Errorf("%d milestone rows, want 1 — the late record must survive the request", n)
+	}
+	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusInTransit) {
+		t.Errorf("the job is %q, want In transit — the late milestone moved it backwards", got)
+	}
+	if n := historyCount(t, pool, jobID, jobs.StatusPickedUp); n != 1 {
+		t.Errorf("%d transitions into Picked up, want the 1 the job really made", n)
+	}
+
+	// And it is still once per key, which absorption must not have opened a second path around.
+	retry := recordAs(t, router, provider, jobID, theKey,
+		`{"milestone": "picked_up", "recorded_at": "2026-08-12T02:00:00Z"}`)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("the retry = %d, want 200 (%s)", retry.Code, retry.Body)
+	}
+	if decode[milestoneBody](t, retry).ID != body.ID {
+		t.Error("the retry answered with a different milestone")
+	}
+	if n := milestoneCount(t, pool, jobID); n != 1 {
+		t.Errorf("%d milestone rows after the retry, want 1", n)
+	}
+}
+
 // TestTheMilestoneWireRefusals covers every failure a client can produce, and the code each carries.
 func TestTheMilestoneWireRefusals(t *testing.T) {
 	pool := pgtest.DB(t)
@@ -532,9 +602,14 @@ func TestTheMilestoneWireRefusals(t *testing.T) {
 			status: http.StatusConflict, code: "idempotency_key_reused",
 		},
 		{
-			name:   "a milestone the job has moved past",
-			caller: provider, job: inTransit, key: theKey + "-late",
-			body:   `{"milestone": "en_route_to_pickup"}`,
+			// The opposite direction from the case this replaced. `awarded` has been left at
+			// En route to pickup by the spent key above, so `in_transit` is a claim about
+			// something that has not happened yet. **A milestone the job has moved past is no
+			// longer a refusal at all** — it answers 201, and TestALateMilestoneIsAbsorbedAtTheWire
+			// is where that case went (SHIP-112).
+			name:   "a milestone the delivery has not reached",
+			caller: provider, job: awarded, key: theKey + "-early",
+			body:   `{"milestone": "in_transit"}`,
 			status: http.StatusConflict, code: "delivery_milestone_not_permitted",
 		},
 		{

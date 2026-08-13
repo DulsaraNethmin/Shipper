@@ -273,6 +273,14 @@ func (l jobLifecycle) MoveToInTransit(
 // jobs.ErrAlreadyInStatus differently from the four before it. That is exactly the drift that would
 // be invisible: every one of these methods would still compile, still pass its own test, and answer
 // a repeated milestone with a refusal on one path and an absorption on another.
+//
+// # One refusal becomes two answers, and SHIP-112 is why
+//
+// jobs.ErrTransitionNotPermitted says only that Docs/02 §2 has no row from where the job stands. It
+// does not say which way the refused move was pointing, and it should not: the transition table is a
+// set of permitted edges and has no notion of forwards. Docs/02 §3.1 does, and it turns on exactly
+// one thing — whether "a later transition has already been recorded" — so that is what is asked
+// here, of the same domain, in the same transaction.
 func (l jobLifecycle) move(ctx context.Context, r db.Runner, m jobs.Move) (delivery.JobMove, error) {
 	_, err := l.jobs.Transition(ctx, r, m)
 
@@ -284,10 +292,50 @@ func (l jobLifecycle) move(ctx context.Context, r db.Runner, m jobs.Move) (deliv
 	case errors.Is(err, jobs.ErrAlreadyInStatus):
 		return delivery.JobAlreadyInStatus, nil
 	case errors.Is(err, jobs.ErrTransitionNotPermitted):
-		return delivery.JobNotAssignable, nil
+		return l.refusal(ctx, r, m)
 	default:
 		return delivery.JobMoveUnrecognised, err
 	}
+}
+
+// refusal tells a job that has already been past this status from one that has not reached it
+// (SHIP-112).
+//
+// # It reads history rather than reasoning about the table
+//
+// The question could have been asked of Docs/02 §2's graph — "can the job still reach this status by
+// any permitted sequence?" — and that answer would be wrong in a way nobody would notice for a while.
+// A job cancelled or disputed at Awarded can no longer reach 'Picked up' either, and it has not moved
+// *past* the pickup; it has lost the delivery to something else. Docs/02 §3.1 keeps those two apart
+// and gives them different handling — the second is the administrative-conflict bullet, which is
+// SHIP-113 — so the test is the recorded fact, not the reachable set.
+//
+// # Why the composition root and not the domain
+//
+// `delivery` may not name a jobs.Status (Docs/06 §4.1), and this question is about one. Everything
+// below is already visible here: the target status is in the Move this file built, and
+// jobs.Service.History is that domain's own reader. The domain gets an answer in its own vocabulary
+// and still holds no second copy of the transition table.
+//
+// The read runs in the caller's transaction, after Transition has taken the job row FOR UPDATE, so
+// nothing can move the job between the refusal and this question.
+//
+// An error here is reported rather than resolved to either answer. Guessing "not assignable" would
+// discard a driver's late milestone on a failing database, and guessing "already past" would commit
+// one that should have been refused.
+func (l jobLifecycle) refusal(ctx context.Context, r db.Runner, m jobs.Move) (delivery.JobMove, error) {
+	history, err := l.jobs.History(ctx, r, m.JobID)
+	if err != nil {
+		return delivery.JobMoveUnrecognised, fmt.Errorf(
+			"cmd/api: reading whether %s has already been %s: %w", m.JobID, m.To, err)
+	}
+
+	for _, change := range history {
+		if change.To == m.To {
+			return delivery.JobAlreadyPast, nil
+		}
+	}
+	return delivery.JobNotAssignable, nil
 }
 
 // acceptedBids implements delivery.Awards by reading the job's accepted bid.
