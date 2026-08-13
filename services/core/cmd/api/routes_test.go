@@ -40,9 +40,36 @@ func testIdentityConfig() config.Identity {
 	}
 }
 
+// testDriverSigningKey is the driver token's throwaway, and it is deliberately **not**
+// testSigningKey (SHIP-107).
+//
+// Docs/10 §5 requires the two token systems to have separate signing key material, config.Load
+// refuses a configuration in which they share a secret, and a test fixture that shared one would be
+// the only place in the repository where they did.
+var testDriverSigningKey = []byte("cmd-api-test-driver-token-key-012")
+
+const testDriverKID = "test-driver"
+
+// testDeliveryConfig is the driver token keyset the delivery handler is built from.
+//
+// It has to be a real one for the reason [testIdentityConfig]'s argon2 profile does: the delivery
+// handler is built during attach, from every test in this package that constructs a router, and a
+// keyset that cannot sign stops the process at startup rather than producing a service that quietly
+// hands out no link.
+func testDeliveryConfig() config.Delivery {
+	return config.Delivery{
+		DriverTokenTTL:       7 * 24 * time.Hour,
+		DriverTokenKeys:      map[string][]byte{testDriverKID: testDriverSigningKey},
+		DriverTokenActiveKID: testDriverKID,
+	}
+}
+
 func testDeps() Deps {
 	return Deps{
-		Config:    &config.Config{Identity: testIdentityConfig()},
+		Config: &config.Config{
+			Identity: testIdentityConfig(),
+			Delivery: testDeliveryConfig(),
+		},
 		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		Clock:     clock.System{},
 		StartedAt: time.Now(),

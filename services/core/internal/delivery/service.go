@@ -45,6 +45,7 @@ import (
 type Service struct {
 	jobs   Jobs
 	awards Awards
+	tokens *DriverTokenIssuer
 	clock  clock.Clock
 	store  postgresStore
 }
@@ -56,10 +57,11 @@ type Service struct {
 // collaborator is a programming mistake rather than a runtime condition, and the alternative here
 // is a service that starts and then answers every assignment with a nil-pointer panic.
 //
-// Neither may be defaulted to something harmless, which is the reason they are not optional the way
-// jobs' geocoder is. A nil Awards is "nobody is checked", and a nil Jobs is "the job never moves" —
-// both are silent failures of the two rules this endpoint exists to enforce.
-func NewService(jobs Jobs, awards Awards, c clock.Clock) *Service {
+// None of them may be defaulted to something harmless, which is the reason they are not optional
+// the way jobs' geocoder is. A nil Awards is "nobody is checked", a nil Jobs is "the job never
+// moves", and a nil issuer is an assignment that produces no link — all three are silent failures
+// of a rule this endpoint exists to enforce.
+func NewService(jobs Jobs, awards Awards, tokens *DriverTokenIssuer, c clock.Clock) *Service {
 	if jobs == nil {
 		panic("delivery: NewService needs the job lifecycle; an assignment that moves no job " +
 			"leaves a driver on a job nothing downstream believes has one (Docs/02 §2)")
@@ -68,19 +70,43 @@ func NewService(jobs Jobs, awards Awards, c clock.Clock) *Service {
 		panic("delivery: NewService needs the award lookup; without it any provider could put a " +
 			"driver on any job (Docs/02 §3)")
 	}
+	if tokens == nil {
+		// Refused rather than made optional, because SHIP-107's *Done when* is that the token
+		// is generated **on assignment**: a service that could assign a driver without minting
+		// one would leave a job at 'Driver assigned' whose driver has no way to reach it, and
+		// no later request would notice.
+		panic("delivery: NewService needs the driver token issuer; an assignment with no " +
+			"job-scoped link leaves the driver nothing to open (SHIP-107)")
+	}
 	if c == nil {
 		// Defaulting to clock.System{} would start the service, and the first milestone
 		// recorded without an actor-supplied time would be stamped from a clock nobody chose.
 		panic("delivery: NewService needs a clock (Docs/10 §6.3)")
 	}
-	return &Service{jobs: jobs, awards: awards, clock: c}
+	return &Service{jobs: jobs, awards: awards, tokens: tokens, clock: c}
 }
 
-// AssignDriver puts a driver on a job the caller was awarded, and moves the job to
-// 'Driver assigned' (SHIP-106).
+// AssignDriver puts a driver on a job the caller was awarded, moves the job to 'Driver assigned',
+// and mints the driver's job-scoped link (SHIP-106, SHIP-107).
 //
 // It reports whether the assignment was created. False means the job already had this exact driver
 // and nothing was written — see "a repeated nomination" below.
+//
+// # The token is generated here, and "on assignment" is SHIP-107's whole specification
+//
+// Every success returns a [DriverToken] for this assignment and this job, and there is no other
+// way to obtain one: minting is not an endpoint of its own, so a token cannot exist without a
+// driver_assignments row behind it. It is minted **inside the caller's transaction**, before the
+// commit, which costs nothing — signing is an HMAC over a few hundred bytes and touches no I/O —
+// and buys the property that a failure to sign takes the assignment with it rather than leaving a
+// committed driver with no way to reach the job.
+//
+// A repeated nomination gets a *fresh* token for the same assignment, and both remain valid until
+// they expire. That is deliberate rather than overlooked: the two tokens grant the same one job to
+// the same one driver, so nothing is widened, and refusing to reissue would mean a provider whose
+// phone lost the response could never obtain the link again. **Invalidating a previous link is
+// SHIP-109**, which is a different intent — reissue *and revoke* — and needs state this ticket
+// does not write.
 //
 // # The refusals, in this order, and the order is the point
 //
@@ -122,30 +148,30 @@ func (s *Service) AssignDriver(
 	r db.Runner,
 	providerID, jobID uuid.UUID,
 	n Nomination,
-) (Assignment, bool, error) {
+) (Assignment, DriverToken, bool, error) {
 	// pgx.Tx and *pgxpool.Pool both satisfy db.Runner and only one of them is a transaction.
 	// Asking the type is blunt, and it is the only way to tell: Runner exists precisely so that
 	// a query does not have to know which it is holding.
 	if _, inTx := r.(pgx.Tx); !inTx {
-		return Assignment{}, false, fmt.Errorf("delivery: assigning a driver to %s: %w", jobID, ErrNotInTransaction)
+		return s.refused(fmt.Errorf("delivery: assigning a driver to %s: %w", jobID, ErrNotInTransaction))
 	}
 
 	nomination := n.normalise()
 	problems := nomination.problems()
 	if err := problems.Err(); err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 
 	awarded, isAwarded, err := s.awards.AwardedProvider(ctx, r, jobID)
 	if err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 	if !isAwarded {
-		return Assignment{}, false, fmt.Errorf("delivery: %s has no accepted bid: %w", jobID, ErrJobNotFound)
+		return s.refused(fmt.Errorf("delivery: %s has no accepted bid: %w", jobID, ErrJobNotFound))
 	}
 	if awarded != providerID {
-		return Assignment{}, false, fmt.Errorf("delivery: %s was awarded to %s, not %s: %w",
-			jobID, awarded, providerID, ErrNotAwardedProvider)
+		return s.refused(fmt.Errorf("delivery: %s was awarded to %s, not %s: %w",
+			jobID, awarded, providerID, ErrNotAwardedProvider))
 	}
 
 	if nomination.Self {
@@ -154,26 +180,26 @@ func (s *Service) AssignDriver(
 		// only one of them is worth putting a job-scoped link on (SHIP-107).
 		phone, err := s.store.accountPhone(ctx, r, providerID)
 		if err != nil {
-			return Assignment{}, false, err
+			return s.refused(err)
 		}
 		nomination.DriverMobile = phone
 	}
 
 	live, hasDriver, err := s.store.liveAssignment(ctx, r, jobID)
 	if err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 	if hasDriver {
 		if live.DriverName == nomination.DriverName && live.DriverMobile == nomination.DriverMobile {
-			return live, false, nil
+			return s.granted(live, false)
 		}
-		return Assignment{}, false, fmt.Errorf("delivery: %s is already driven by %s: %w",
-			jobID, live.ID, ErrDriverAlreadyAssigned)
+		return s.refused(fmt.Errorf("delivery: %s is already driven by %s: %w",
+			jobID, live.ID, ErrDriverAlreadyAssigned))
 	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
-		return Assignment{}, false, fmt.Errorf("delivery: generating an assignment id: %w", err)
+		return s.refused(fmt.Errorf("delivery: generating an assignment id: %w", err))
 	}
 
 	assignment, err := s.store.insert(ctx, r, Assignment{
@@ -183,38 +209,68 @@ func (s *Service) AssignDriver(
 		DriverMobile: nomination.DriverMobile,
 	})
 	if err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 
 	move, err := s.jobs.MoveToDriverAssigned(ctx, r, jobID, providerID)
 	if err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 
 	switch move {
 	case JobMoved:
-		return assignment, true, nil
+		return s.granted(assignment, true)
 
 	case JobAlreadyInStatus:
 		// The job says 'Driver assigned' and no assignment was live, which is the state a
 		// stood-down driver leaves behind. The new assignment stands and the job is already
 		// where it should be, so there is nothing to move and no history row to write —
 		// exactly the absorption Docs/02 §3.1 asks for rather than an error.
-		return assignment, true, nil
+		return s.granted(assignment, true)
 
 	case JobNotAssignable:
-		return Assignment{}, false, fmt.Errorf("delivery: %s cannot take a driver: %w", jobID, ErrJobNotAssignable)
+		return s.refused(fmt.Errorf("delivery: %s cannot take a driver: %w", jobID, ErrJobNotAssignable))
 
 	case JobNotFound:
 		// Reachable only if the job was deleted between the award lookup and here, which
 		// nothing in this platform does — fk_driver_assignments_job would have refused the
 		// insert first. Reported rather than assumed away.
-		return Assignment{}, false, fmt.Errorf("delivery: %s vanished mid-assignment: %w", jobID, ErrJobNotFound)
+		return s.refused(fmt.Errorf("delivery: %s vanished mid-assignment: %w", jobID, ErrJobNotFound))
 
 	default:
-		return Assignment{}, false, fmt.Errorf("delivery: moving %s: %q: %w",
-			jobID, move, ErrJobMoveUnrecognised)
+		return s.refused(fmt.Errorf("delivery: moving %s: %q: %w",
+			jobID, move, ErrJobMoveUnrecognised))
 	}
+}
+
+// granted is every successful exit from [Service.AssignDriver]: the assignment stands, so the
+// driver gets their link.
+//
+// One function rather than a mint at each of the three success points, for the reason
+// cmd/api/routes_delivery.go gives about its own `move`: a fourth outcome that minted differently —
+// or not at all — would still compile, still pass its own test, and hand one path a link the other
+// two did not.
+//
+// The token names the assignment rather than the driver, because a driver has nothing else to be
+// named by (see [DriverClaims.AssignmentID]).
+func (s *Service) granted(a Assignment, created bool) (Assignment, DriverToken, bool, error) {
+	token, err := s.tokens.Issue(a.JobID, a.ID)
+	if err != nil {
+		// Inside the transaction, so this rolls the assignment back. An assignment that
+		// committed without a link would leave a driver on a job they cannot open, and nothing
+		// downstream would notice: the row is complete and the status is right.
+		return s.refused(fmt.Errorf("delivery: minting the link for %s on %s: %w", a.ID, a.JobID, err))
+	}
+	return a, token, created, nil
+}
+
+// refused is the empty answer, so that a refusal cannot accidentally carry a token.
+//
+// Four return values is three too many to retype at twelve exit points, and the one that matters is
+// the second: a `DriverToken{}` written by hand at each of them is a `DriverToken{Value: token}`
+// away from a refusal that hands out a link anyway.
+func (s *Service) refused(err error) (Assignment, DriverToken, bool, error) {
+	return Assignment{}, DriverToken{}, false, err
 }
 
 // RecordMilestone records what the awarded provider says happened on a delivery, and moves the job
@@ -338,11 +394,12 @@ func (s *Service) RecordMilestone(
 		JobID:     jobID,
 		Milestone: recording.Milestone,
 
-		// The provider, always, in this ticket. The driver's job-scoped token is SHIP-107 and
-		// SHIP-108 and cannot be presented here yet, so ActorDriver is declared (000601, and
-		// milestone.go) and unreachable: a driver's milestone would name their
-		// driver_assignments row rather than an account, which is why Service.Driver exists
-		// and why this is the one field that changes when that token lands.
+		// The provider, always, in this ticket. SHIP-107 mints the driver's job-scoped
+		// token and **nothing verifies one** until SHIP-108, so no request can arrive here
+		// as a driver and ActorDriver stays declared (000601, and milestone.go) and
+		// unreachable. What that ticket needs for the attribution is already inside the
+		// token: DriverClaims.AssignmentID names the driver_assignments row, which is the
+		// only identity a driver has.
 		Actor:   ActorProvider,
 		ActorID: providerID,
 
@@ -460,11 +517,14 @@ func (s *Service) moveFor(
 //
 // SHIP-106 wrote it for SHIP-111, expecting it to be how a driver's milestone is attributed.
 // **SHIP-111 does not use it, and that is the honest outcome rather than an oversight**: every
-// caller of [Service.RecordMilestone] is the awarded provider, because the job-scoped token a driver
-// would present is SHIP-107 and SHIP-108 and does not exist. The attribution it was written for is
-// one field — `Actor` in that function — and it needs this lookup on the day a driver token can name
-// the assignment it belongs to, not before. It stays because this domain's tests read it and because
-// deleting it would only mean writing it again at SHIP-108.
+// caller of [Service.RecordMilestone] is the awarded provider, because nothing verifies a driver
+// token until SHIP-108.
+//
+// **SHIP-107 narrows what it will eventually be for, and that is worth recording before somebody
+// reaches for it.** A verified token already names the assignment
+// ([DriverClaims.AssignmentID]), so SHIP-108 does not need this lookup to *identify* a driver —
+// what it needs it for is the question the claim cannot answer, which is whether that assignment
+// is still live. A token outlives a stand-down; the row is what says so.
 func (s *Service) Driver(ctx context.Context, r db.Runner, jobID uuid.UUID) (Assignment, bool, error) {
 	return s.store.liveAssignment(ctx, r, jobID)
 }

@@ -586,7 +586,7 @@ func TestAnUnrecognisedOutcomeFailsARecording(t *testing.T) {
 	provider := newAccount(t, pool, "unknown-mp@example.com", "+61400000690", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	svc := NewService(staticJobs{move: JobMoveUnrecognised}, testAwards{}, testClock())
+	svc := newTestServiceWith(staticJobs{move: JobMoveUnrecognised})
 
 	_, _, err := recordMilestone(t, pool, svc, provider, jobID, enRoute(theKey))
 	if !errors.Is(err, ErrJobMoveUnrecognised) {

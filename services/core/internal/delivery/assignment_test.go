@@ -146,11 +146,17 @@ func (s staticJobs) MoveToInTransit(context.Context, db.Runner, uuid.UUID, uuid.
 func testClock() *clock.Fixed { return clock.NewFixed(testInstant) }
 
 func newTestService() *Service {
-	return NewService(
-		testJobs{svc: jobs.NewService(events.NewOutbox(), testClock(), nil)},
-		testAwards{},
-		testClock(),
-	)
+	return newTestServiceWith(testJobs{svc: jobs.NewService(events.NewOutbox(), testClock(), nil)})
+}
+
+// newTestServiceWith is the same service over a different job lifecycle, which is what the tests
+// covering outcomes no fixture can produce need.
+//
+// One constructor rather than four literals, so that the driver token issuer SHIP-107 added arrives
+// in every one of them: a test built without one panics, which is the right answer and a tedious one
+// to rediscover four times.
+func newTestServiceWith(lifecycle Jobs) *Service {
+	return NewService(lifecycle, testAwards{}, testDriverIssuer(testClock()), testClock())
 }
 
 // newAccount inserts a user with the role the test needs.
@@ -229,19 +235,38 @@ func awardedJob(t *testing.T, pool *pgxpool.Pool, customer, provider uuid.UUID) 
 }
 
 // assign runs one assignment in its own transaction, which is what the handler does.
+//
+// It drops the driver token, because most of the tests below are about the assignment and the
+// status move. [assignGranting] is the same call with the token kept, and token_test.go is where the
+// tests that care about it live.
 func assign(t *testing.T, pool *pgxpool.Pool, svc *Service, provider, jobID uuid.UUID, n Nomination) (Assignment, bool, error) {
+	t.Helper()
+
+	assignment, _, created, err := assignGranting(t, pool, svc, provider, jobID, n)
+	return assignment, created, err
+}
+
+// assignGranting runs one assignment and keeps the job-scoped token it minted (SHIP-107).
+func assignGranting(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	svc *Service,
+	provider, jobID uuid.UUID,
+	n Nomination,
+) (Assignment, DriverToken, bool, error) {
 	t.Helper()
 
 	var (
 		assignment Assignment
+		token      DriverToken
 		created    bool
 	)
 	err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
 		var err error
-		assignment, created, err = svc.AssignDriver(ctx, r, provider, jobID, n)
+		assignment, token, created, err = svc.AssignDriver(ctx, r, provider, jobID, n)
 		return err
 	})
-	return assignment, created, err
+	return assignment, token, created, err
 }
 
 // jobStatus reads the column, not what the service said about it.
@@ -598,7 +623,7 @@ func TestAssignmentOutsideATransactionIsRefused(t *testing.T) {
 	provider := newAccount(t, pool, "notx-p@example.com", "+61400000622", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	_, _, err := newTestService().AssignDriver(t.Context(), pool, provider, jobID, Nomination{
+	_, _, _, err := newTestService().AssignDriver(t.Context(), pool, provider, jobID, Nomination{
 		DriverName:   "Sam Patel",
 		DriverMobile: "+61412345678",
 	})
@@ -617,7 +642,7 @@ func TestAnUnrecognisedOutcomeIsAFailure(t *testing.T) {
 	provider := newAccount(t, pool, "unknown-p@example.com", "+61400000624", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	svc := NewService(staticJobs{move: JobMoveUnrecognised}, testAwards{}, testClock())
+	svc := newTestServiceWith(staticJobs{move: JobMoveUnrecognised})
 
 	_, _, err := assign(t, pool, svc, provider, jobID, Nomination{
 		DriverName:   "Sam Patel",
@@ -638,7 +663,7 @@ func TestAJobAlreadyDriverAssignedKeepsTheNewDriver(t *testing.T) {
 	provider := newAccount(t, pool, "already-p@example.com", "+61400000626", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	svc := NewService(staticJobs{move: JobAlreadyInStatus}, testAwards{}, testClock())
+	svc := newTestServiceWith(staticJobs{move: JobAlreadyInStatus})
 
 	assignment, created, err := assign(t, pool, svc, provider, jobID, Nomination{
 		DriverName:   "Sam Patel",
@@ -654,20 +679,27 @@ func TestAJobAlreadyDriverAssignedKeepsTheNewDriver(t *testing.T) {
 
 // TestNewServiceRefusesAMissingCollaborator.
 //
-// All three are load-bearing rules rather than conveniences: without Awards nobody is checked,
-// without Jobs the job never moves, and without a clock a milestone recorded with no actor-supplied
-// time has nothing to be stamped from. A service that started without any of them would fail
-// silently, in production, at the first request.
+// All four are load-bearing rules rather than conveniences: without Awards nobody is checked,
+// without Jobs the job never moves, without a token issuer an assignment produces no link for the
+// driver (SHIP-107), and without a clock a milestone recorded with no actor-supplied time has
+// nothing to be stamped from. A service that started without any of them would fail silently, in
+// production, at the first request.
 func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		jobs   Jobs
 		awards Awards
+		tokens *DriverTokenIssuer
 		clk    clock.Clock
 	}{
-		{name: "no job lifecycle", jobs: nil, awards: testAwards{}, clk: testClock()},
-		{name: "no award lookup", jobs: staticJobs{move: JobMoved}, awards: nil, clk: testClock()},
-		{name: "no clock", jobs: staticJobs{move: JobMoved}, awards: testAwards{}, clk: nil},
+		{name: "no job lifecycle", jobs: nil, awards: testAwards{},
+			tokens: testDriverIssuer(testClock()), clk: testClock()},
+		{name: "no award lookup", jobs: staticJobs{move: JobMoved}, awards: nil,
+			tokens: testDriverIssuer(testClock()), clk: testClock()},
+		{name: "no driver token issuer", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
+			tokens: nil, clk: testClock()},
+		{name: "no clock", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
+			tokens: testDriverIssuer(testClock()), clk: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer func() {
@@ -675,7 +707,7 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 					t.Error("NewService returned a service that cannot work")
 				}
 			}()
-			NewService(tc.jobs, tc.awards, tc.clk)
+			NewService(tc.jobs, tc.awards, tc.tokens, tc.clk)
 		})
 	}
 }

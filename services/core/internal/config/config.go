@@ -14,6 +14,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -56,6 +57,7 @@ type Config struct {
 	Kafka       Kafka
 	Idempotency Idempotency
 	Identity    Identity
+	Delivery    Delivery
 	Email       Email
 	SMS         SMS
 	Geocoding   Geocoding
@@ -168,6 +170,57 @@ type Identity struct {
 	// in each token's `kid` header, which is how a verifier knows which key to use before it
 	// can trust anything else in the token.
 	AccessTokenActiveKID string
+}
+
+// Delivery configures the driver's job-scoped token (SHIP-107).
+//
+// # Why a second keyset rather than a second audience over the first
+//
+// Docs/10 §5 requires the driver token to have "separate signing key material **and**
+// `aud=shipper-driver`", and both halves are here because either alone is weaker than the pair. The
+// audience is what refuses a mobile token presented to a driver route and a driver token presented
+// to a mobile one; separate key material is what makes that refusal survive a mistake in the
+// audience check, because neither verifier can even produce a valid signature over the other's
+// tokens. [loader.validate] refuses a configuration in which the two sets share a secret, so a
+// deployment cannot arrive at one keyset by copying a value.
+//
+// The shape mirrors [Identity]'s three access-token fields deliberately: it is the same rotation
+// mechanism, read the same way, so an operator rotating one already knows how to rotate the other.
+type Delivery struct {
+	// DriverTokenTTL is how long a job-scoped link works for.
+	//
+	// **Seven days, and it is the one number here that is a product judgement rather than a
+	// mechanism.** The reasoning, because the obvious comparison — identity's fifteen minutes —
+	// is the wrong one:
+	//
+	//   - There is no refresh. A driver has no account and holds no second credential, so this
+	//     TTL is the entire life of their access rather than the short leg of a pair. Fifteen
+	//     minutes would mean a link that expires before the provider has finished forwarding it.
+	//   - It has to outlast a delivery. Australian road freight is quoted in days across the
+	//     long-haul corridors, and a token that lapsed mid-run would strand the driver with
+	//     milestones they cannot record — which Docs/02 §3.1 treats as work that must not be
+	//     lost.
+	//   - It does not have to outlast the *job*. The 72-hour auto-complete (Docs/02 §6.1) runs
+	//     after delivery and the driver plays no part in it, so nothing needs the link past the
+	//     drop-off.
+	//   - Longer is a real cost. The link is forwarded by whatever channel the provider uses, so
+	//     it lands in a message thread and stays there; a week means a forwarded link stops
+	//     working within a week rather than for the life of the handset.
+	//
+	// A driver who needs one after it lapses gets a fresh link from the provider, which is
+	// SHIP-109 — and that ticket, rather than a longer TTL, is the answer to "it expired".
+	DriverTokenTTL time.Duration
+
+	// DriverTokenKeys is the HMAC signing keyset for driver tokens, by key identifier.
+	//
+	// Rotated exactly as the access-token keyset is, with one difference worth knowing before
+	// doing it: an access token lives fifteen minutes, so an outgoing key can be dropped within
+	// the hour. A driver token lives a week, and dropping its key sooner breaks every link
+	// already forwarded — with nothing at the other end that can refresh.
+	DriverTokenKeys map[string][]byte
+
+	// DriverTokenActiveKID names the key in DriverTokenKeys that signs new tokens.
+	DriverTokenActiveKID string
 }
 
 // SMS configures the text-message adapter (SHIP-35), first consumed by the phone verification
@@ -334,7 +387,12 @@ type Idempotency struct {
 // credentialBearingDefaults are variables whose built-in defaults embed a local
 // throwaway credential. They make a fresh clone work against docker-compose and are
 // refused outside development — see loader.validate.
-var credentialBearingDefaults = []string{"DATABASE_URL", "REDIS_URL", "IDENTITY_ACCESS_TOKEN_KEYS"}
+var credentialBearingDefaults = []string{
+	"DATABASE_URL",
+	"REDIS_URL",
+	"IDENTITY_ACCESS_TOKEN_KEYS",
+	"DELIVERY_DRIVER_TOKEN_KEYS",
+}
 
 // The development signing key, which is in the repository and therefore public.
 //
@@ -345,6 +403,20 @@ var credentialBearingDefaults = []string{"DATABASE_URL", "REDIS_URL", "IDENTITY_
 const (
 	developmentActiveKID  = "dev"
 	developmentSigningKey = "shipper-local-development-signing-key-not-a-secret"
+
+	// The driver token's development key, and it is a **different string** rather than the same
+	// one under a second variable (SHIP-107).
+	//
+	// That is the whole of Docs/10 §5's "separate signing key material", made true in the
+	// environment a developer actually runs. Sharing the development key would leave the two
+	// token systems separated by the audience alone on every machine anybody works on, which is
+	// precisely the configuration the tests deliberately construct to prove the audience is
+	// enough — and it should not be the default, because then nothing would be testing the pair.
+	//
+	// The identifier differs too, so a decoded header says which system signed a token without
+	// anybody having to check the key.
+	developmentDriverActiveKID  = "driver-dev"
+	developmentDriverSigningKey = "shipper-local-development-driver-token-key-not-a-secret"
 )
 
 // developmentSigningKeys builds a fresh map each time rather than sharing one package-level
@@ -354,6 +426,11 @@ func developmentSigningKeys() map[string][]byte {
 	return map[string][]byte{developmentActiveKID: []byte(developmentSigningKey)}
 }
 
+// developmentDriverSigningKeys is the same, for the driver token's own keyset.
+func developmentDriverSigningKeys() map[string][]byte {
+	return map[string][]byte{developmentDriverActiveKID: []byte(developmentDriverSigningKey)}
+}
+
 // minimumSigningKeyBytes mirrors the same constant in internal/identity, which is where the
 // keyset enforces it.
 //
@@ -361,6 +438,13 @@ func developmentSigningKeys() map[string][]byte {
 // and the domain does not import configuration (Docs/06 §4.1). Checking it here as well means a
 // short key is refused at startup rather than at the first sign-in.
 const minimumSigningKeyBytes = 32
+
+// maxDriverTokenTTL is a typo guard on the one TTL nothing can shorten once issued.
+//
+// Thirty days rather than a number close to the seven-day default, because the default is a product
+// judgement that operations may legitimately move and this is only refusing the values that would
+// defeat the design — `720h` typed for `72h`, or a duration somebody meant as "no expiry".
+const maxDriverTokenTTL = 30 * 24 * time.Hour
 
 // Load reads configuration from the process environment.
 //
@@ -413,6 +497,14 @@ func Load() (*Config, error) {
 			AccessTokenTTL:       l.duration("IDENTITY_ACCESS_TOKEN_TTL", 15*time.Minute),
 			AccessTokenKeys:      l.signingKeys("IDENTITY_ACCESS_TOKEN_KEYS", developmentSigningKeys()),
 			AccessTokenActiveKID: l.str("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", developmentActiveKID),
+		},
+		Delivery: Delivery{
+			// Seven days — see [Delivery.DriverTokenTTL] for why it is measured against a
+			// delivery rather than against a session.
+			DriverTokenTTL:  l.duration("DELIVERY_DRIVER_TOKEN_TTL", 7*24*time.Hour),
+			DriverTokenKeys: l.signingKeys("DELIVERY_DRIVER_TOKEN_KEYS", developmentDriverSigningKeys()),
+			DriverTokenActiveKID: l.str("DELIVERY_DRIVER_TOKEN_ACTIVE_KID",
+				developmentDriverActiveKID),
 		},
 		Email: Email{
 			ProviderBaseURL: l.str("EMAIL_PROVIDER_BASE_URL", ""),
@@ -480,6 +572,11 @@ func (c Config) LogValue() slog.Value {
 		// neither says anything an attacker can sign with.
 		slog.String("access_token_active_kid", c.Identity.AccessTokenActiveKID),
 		slog.Int("access_token_keys", len(c.Identity.AccessTokenKeys)),
+		// The second keyset, on the same terms. Two identifiers in one startup line is also the
+		// cheapest confirmation that the two token systems are configured separately.
+		slog.Duration("driver_token_ttl", c.Delivery.DriverTokenTTL),
+		slog.String("driver_token_active_kid", c.Delivery.DriverTokenActiveKID),
+		slog.Int("driver_token_keys", len(c.Delivery.DriverTokenKeys)),
 		// Whether a base URL is set, not what it is, and never the key. "Email is going to
 		// the console" is the line somebody needs when a verification message has not
 		// arrived, and it is the one thing a hostname would not tell them.
@@ -745,6 +842,48 @@ func (l *loader) validate(cfg *Config) {
 			"cannot be revoked before it expires", cfg.Identity.AccessTokenTTL)
 	}
 
+	// The same rule as the access token's active identifier, for the same reason: a signature
+	// nobody can produce is not a token anybody can use, and the failure is otherwise the first
+	// assignment after a deploy — which is a provider being told the platform is broken.
+	if _, ok := cfg.Delivery.DriverTokenKeys[cfg.Delivery.DriverTokenActiveKID]; !ok {
+		l.errf("DELIVERY_DRIVER_TOKEN_ACTIVE_KID: %q names no key in DELIVERY_DRIVER_TOKEN_KEYS",
+			cfg.Delivery.DriverTokenActiveKID)
+	}
+
+	// **The two token systems may not share a secret, in any environment.**
+	//
+	// Docs/10 §5 requires separate signing key material, and CLAUDE.md makes "neither can be
+	// exchanged for the other" an invariant. The audience check enforces it either way — both
+	// verifiers pin their own and a test proves each refuses the other's tokens with the keys
+	// deliberately shared — so this is the second lock rather than the first. It is worth having
+	// because it is the one failure that would leave the invariant resting on a single check
+	// while looking entirely correct in every log line and every response.
+	//
+	// Checked in development too, unlike the rules below it: this is not a deployment-hardening
+	// rule but a structural one, and a developer who set the two variables to the same value
+	// should be told immediately rather than at their first staging deploy.
+	for driverKID, driverSecret := range cfg.Delivery.DriverTokenKeys {
+		for accessKID, accessSecret := range cfg.Identity.AccessTokenKeys {
+			if bytes.Equal(driverSecret, accessSecret) {
+				l.errf("DELIVERY_DRIVER_TOKEN_KEYS: key %q is the same secret as "+
+					"IDENTITY_ACCESS_TOKEN_KEYS key %q; the driver token and the mobile "+
+					"session token must have separate signing key material (Docs/10 §5)",
+					driverKID, accessKID)
+			}
+		}
+	}
+
+	// A driver token cannot be revoked before it expires either — there is nothing to check it
+	// against until SHIP-109 — so an over-long TTL is a standing grant to one job's delivery
+	// detail sitting in whatever message thread the link was forwarded through. The cap is
+	// generous rather than exact: Docs/10 §5 and [Delivery.DriverTokenTTL] settle on seven days,
+	// and this refuses only the values that would defeat the design.
+	if cfg.Delivery.DriverTokenTTL > maxDriverTokenTTL {
+		l.errf("DELIVERY_DRIVER_TOKEN_TTL (%s) is longer than %s; an issued driver token cannot "+
+			"be revoked before it expires, so a link forwarded to a driver would outlive the job",
+			cfg.Delivery.DriverTokenTTL, maxDriverTokenTTL)
+	}
+
 	// A default larger than the ceiling would mean a request that named no ?limit= got a
 	// bigger page than one that asked for the maximum, which is the sort of inversion that is
 	// obvious in a sentence and invisible in two environment variables.
@@ -795,6 +934,16 @@ func (l *loader) validate(cfg *Config) {
 		for kid, secret := range cfg.Identity.AccessTokenKeys {
 			if string(secret) == developmentSigningKey {
 				l.errf("IDENTITY_ACCESS_TOKEN_KEYS: key %q is the development key from "+
+					"deploy/.env.example, which is public; it may not be used when "+
+					"SHIPPER_ENV is %s", kid, cfg.Env)
+			}
+		}
+	}
+
+	if !l.defaulted["DELIVERY_DRIVER_TOKEN_KEYS"] {
+		for kid, secret := range cfg.Delivery.DriverTokenKeys {
+			if string(secret) == developmentDriverSigningKey {
+				l.errf("DELIVERY_DRIVER_TOKEN_KEYS: key %q is the development key from "+
 					"deploy/.env.example, which is public; it may not be used when "+
 					"SHIPPER_ENV is %s", kid, cfg.Env)
 			}

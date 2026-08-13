@@ -11,10 +11,15 @@
 # # These operations are called by the provider, not by the driver
 #
 # The assigned driver never holds a session. Their portal is link-authenticated (Docs/07 §3) and the
-# job-scoped token they eventually carry is a separate system with its own key material and its own
-# audience, which grants exactly one job and cannot be exchanged for a user token in either direction
-# (Docs/10 §5). It arrives with SHIP-107 and SHIP-108. Every operation here takes the ordinary mobile
-# access token and is the awarded provider acting on their own work.
+# job-scoped token they carry is a separate system with its own key material and its own audience,
+# which grants exactly one job and cannot be exchanged for a user token in either direction
+# (Docs/10 §5). Every operation here takes the ordinary mobile access token and is the awarded
+# provider acting on their own work.
+#
+# **`AssignDriver` returns that token and still does not accept one** (SHIP-107): the provider is
+# handed the link to forward, because Shipper sends no SMS in the MVP (Docs/01 §4.5). No operation
+# in this document is authenticated by a driver token, and the middleware that would verify one
+# arrives with SHIP-108.
 #
 # # There is no field for whose job and none for who is assigning
 #
@@ -192,20 +197,25 @@ DriverNomination:
 Assignment:
   type: object
   additionalProperties: false
-  required: [id, job_id, driver_name, driver_mobile, assigned_at]
+  required:
+    [id, job_id, driver_name, driver_mobile, assigned_at, driver_token, driver_token_expires_at]
   description: |
-    The driver on one job.
+    The driver on one job, and the link to give them.
 
     **The job's status is deliberately not here.** A successful response means the job is
     `driver_assigned` and nothing else; repeating the status would be a second copy of a vocabulary
     the jobs endpoints own.
+
+    **This response carries a credential.** `driver_token` is the driver's whole access to the
+    platform, so treat it as one: do not log it, do not put it in analytics, and hand it only to the
+    driver it was minted for.
   properties:
     id:
       type: string
       format: uuid
       description: |
         The assignment's identifier. It is what a milestone recorded by this driver is attributed
-        to, and what SHIP-107's job-scoped link will be issued against.
+        to, and what the job-scoped link is issued against.
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
     job_id:
       type: string
@@ -223,6 +233,32 @@ Assignment:
       format: date-time
       description: When the driver was put on the job, on the platform's clock, in UTC.
       example: '2026-08-12T04:15:30.000Z'
+    driver_token:
+      type: string
+      description: |
+        The driver's job-scoped credential (SHIP-107). **Forward it to them — Shipper does not.**
+
+        Shipper sends no SMS in the MVP, so this response is the only place a link comes from and
+        you are the one who has to pass it on. It grants exactly this job: it names no account, no
+        role and no session, and it cannot be exchanged for a mobile session in either direction.
+
+        A signed JWT, and its contents are the platform's business rather than a client's. Do not
+        decode it and do not branch on anything inside it — `driver_token_expires_at` is beside it
+        precisely so that you never have to.
+
+        Assigning the same driver again returns a **new** token and the previous one keeps working
+        until it expires. Reissuing a link that invalidates the last one is a separate action and is
+        not built yet.
+      example: eyJhbGciOiJIUzI1NiIsImtpZCI6ImRyaXZlci0yMDI2LTA4IiwidHlwIjoiSldUIn0.…
+    driver_token_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the link stops working, in UTC. Seven days after it was issued by default.
+
+        There is nothing to refresh: the driver holds no other credential, so this is the whole life
+        of their access. Show it to them, and reissue when it has passed.
+      example: '2026-08-19T04:15:30.000Z'
 
 # --- parameters ------------------------------------------------------------------------------
 

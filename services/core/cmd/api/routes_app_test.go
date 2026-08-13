@@ -14,7 +14,15 @@ func routerWithApp(t *testing.T, app config.App) http.Handler {
 	t.Helper()
 
 	deps := testDeps()
-	deps.Config = &config.Config{App: app, Identity: testIdentityConfig()}
+	// Every domain's handler is built during attach, so this literal has to carry what all of
+	// them need rather than what this test reads. Replacing Config wholesale is what makes that
+	// easy to forget: the delivery keyset is here because a router built without one stops the
+	// process (SHIP-107), not because a minimum-version test has any use for it.
+	deps.Config = &config.Config{
+		App:      app,
+		Identity: testIdentityConfig(),
+		Delivery: testDeliveryConfig(),
+	}
 	return newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), nil)
 }
 

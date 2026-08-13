@@ -115,6 +115,31 @@ var (
 	// reply that invents an answer.
 	ErrMilestoneVanished = errors.New("delivery: a milestone was refused as a duplicate of a row that is not there")
 
+	// ErrInvalidKeyset means the driver token signing material cannot be used to sign anything
+	// (SHIP-107).
+	//
+	// A configuration failure rather than a request failure. internal/config catches every form
+	// of it at startup — a short key, an active identifier naming no key, a set that shares a
+	// secret with identity's — so reaching this means [NewKeyset] was called with something
+	// configuration never produced.
+	ErrInvalidKeyset = errors.New("delivery: the driver token keyset cannot sign")
+
+	// ErrNoSigningKey means a token names a key identifier the keyset does not hold.
+	//
+	// The ordinary cause is a key rotated out of the set while tokens signed with it were still
+	// live, which is why a rotation leaves the outgoing key in place until the last token it
+	// signed has expired — unlike a mobile client, a driver holds a link with nothing behind it
+	// that can refresh.
+	ErrNoSigningKey = errors.New("delivery: no signing key with that identifier")
+
+	// ErrMalformedDriverToken means a token verified cryptographically and then said something
+	// that is not an identifier.
+	//
+	// Distinct from a signature failure on purpose: this is a token *this service signed* whose
+	// claims cannot be acted on, which is a defect here rather than an attack. It exists so that
+	// a `job_id` of "" cannot be read as uuid.Nil and become a grant over the nil job.
+	ErrMalformedDriverToken = errors.New("delivery: the driver token names something that is not an identifier")
+
 	// ErrJobMoveUnrecognised means the [Jobs] port answered with a [JobMove] this domain has no
 	// case for.
 	//

@@ -181,7 +181,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **355 checks across 12 sections**, and `make check` green. Since
+Verified by `make verify` — **366 checks across 12 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -311,6 +311,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
+| **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
@@ -3641,6 +3642,105 @@ gets its own database — and has no equivalent for a topic. **On a Kafka topic 
 not a timestamp.** `scripts/verify/80-notifications.sh` fences on `published_at` and has been correct
 by luck; it is another domain's file and this ticket deliberately did not touch it, so the rule is
 stated and the instance is left where §9 recorded it.
+
+### SHIP-107 — the driver's token, and the claim it deliberately does not carry
+
+The driver holds a signed, seven-day token naming exactly one job, minted when the provider assigns
+them and available from nowhere else. It is the first half of the pair §8 has always kept with one
+owner; SHIP-108 is the verifier.
+
+**The interesting decision is an omission.** `Docs/10` §5 specifies separate key material, a
+`shipper-driver` audience and one `job_id`, and all three are here — but the claim set is
+`job_id`, `assignment_id`, `iat`, `exp`, `jti`, `iss`, `aud` and **nothing else**. No `sub`, no
+`role`, no `sid`. An `authctx.Subject` is built from a user id, and this token has none: the
+exchange CLAUDE.md forbids is not merely refused by a check somebody could remove, it has no
+material to work from. A closed-set test holds the seven keys, for the reason SHIP-83's budget test
+holds a closed set of response keys — searching for `sub` catches `sub` and misses `user_id`.
+
+**`assignment_id` is required by code that already exists, not added speculatively.** A driver has
+no account, so `milestones.actor_type = 'driver'` names their `driver_assignments` row (000601,
+following 000401), and `RecordMilestone` says in place that this is the one field which changes when
+a driver can present a credential. Without the claim, SHIP-108 could authenticate a driver and still
+have nothing to attribute their work to. It also narrows what `Service.Driver` is for: the token
+identifies the assignment, so that lookup exists to answer the question a claim cannot — whether the
+assignment is still live.
+
+**Seven days, and the comparison with identity's fifteen minutes is the wrong one.** There is no
+refresh: a driver holds no second credential, so the TTL is the whole life of their access rather
+than the short leg of a pair. It has to outlast a delivery — Australian long-haul freight is quoted
+in days — and it does not have to outlast the job, because the 72-hour completion window
+(`Docs/02` §6.1) is the customer's and the driver plays no part in it. Longer is a real cost: the
+provider forwards the link by whatever channel they already use (`Docs/01` §4.5), so it lands in a
+message thread and stays there. `DELIVERY_DRIVER_TOKEN_TTL`, refused above thirty days at load.
+
+**Two keysets, and configuration refuses one.** `internal/config` grew a `Delivery` section with its
+own `kid`-indexed keyset and its own development default — a *different* throwaway from identity's,
+because sharing one would leave the two systems separated by the audience alone on every machine
+anybody works on. `validate` refuses a configuration in which the two sets share a secret, **in
+development as well**, since that is a structural rule rather than a deployment-hardening one. The
+audience alone is still sufficient, and the tests prove it by constructing exactly the configuration
+that is refused: both directions are exercised with the key material deliberately shared.
+
+**Which direction of the separation this run could prove, and which could not.** Both, in Go —
+`internal/delivery`'s test file imports `internal/identity` (the boundary lint skips `_test.go`,
+which is what makes it possible), mints a real token from each issuer, and shows each parser
+refusing the other's. That is stronger than identity's existing
+`TestAccessTokenWithTheDriverAudienceIsRejected`, which builds a driver-audience token by hand
+because it cannot import this package. **Over HTTP only one direction exists**: `make verify`
+presents a real driver token to `GET /v1/jobs` and gets `401`. The other — a mobile token presented
+to a driver route — needs a route that accepts one, and that is SHIP-108's.
+
+**Minted inside the assignment transaction, which costs nothing and buys the rollback.** Signing is
+an HMAC over a few hundred bytes and touches no I/O, so putting it before the commit means a failure
+to sign takes the assignment with it. The alternative — commit, then mint — would leave a driver on
+a job with no way to open it, and nothing downstream would notice, because the row is complete and
+the status is right. `Service.AssignDriver` grew a fourth return value and two helpers,
+`granted` and `refused`, so that a refusal cannot accidentally carry a token and a fifth success
+path cannot forget to mint one.
+
+**It is returned in the assignment response, and it is a credential in there.** Shipper sends no SMS
+in the MVP, so the response to the request that created the assignment is the only place a link
+comes from. That puts a credential in a body the idempotency middleware stores — under
+`idem:v1:user:<provider>:<key>` (SHIP-44), which is a stronger scope than the anonymous one the
+sign-in endpoints already store their tokens under, and worth stating because it is not obvious from
+the shape. The token is never logged; the expiry is, which is what somebody diagnosing a dead link
+actually wants. **No URL is assembled** — the portal's landing route is SHIP-120's to define, and a
+base URL here would be this domain asserting a path in an application it does not own.
+
+**A repeated nomination gets a fresh token and the previous one keeps working.** Both grant the same
+one job to the same one driver, so nothing is widened, and refusing to reissue would strand a
+provider whose phone lost the first response. **Invalidating the previous link is SHIP-109**, which
+is a different intent and needs state this ticket does not write. There is a test asserting that
+both links verify, so the ticket that changes it has a test to change.
+
+**What makes it single-job is that the job identifier is inside the signature.** Two tests and one
+`make verify` check take a valid token, rewrite `job_id` to another job, re-encode, and show the
+signature refusing it — which is the property the *Done when* is asking for. Asserting that the
+claim contains one job id would have proved nothing on its own. `make verify` also assigns a second
+job and confirms its token grants that job and not the first, and verifies the signature under the
+driver development key while confirming it does **not** verify under identity's — the one check that
+makes "separate key material" a fact about the running service rather than about a struct.
+
+**No migration, and the delivery block is still at `000602`.** The token is stateless and the
+assignment row it names already exists. SHIP-109 is the ticket that will need state, and it has a
+cheap route to it: a token whose `assignment_id` is no longer live names a row that says so.
+
+`make verify` went from 355 checks across 12 sections to the figure at the top of this section, all
+eleven of the new ones in `scripts/verify/70-delivery.sh`. The Go tests cover the issuer; the verify
+section covers what only the wiring can show — that the *service as configured* signs with the
+driver keyset and not with identity's, and that a real driver token is refused as a session by a
+running instance.
+
+**One finding about SHIP-15m's seam, and it is a gap rather than a fault.** The seam did exactly
+what it promised for the *router*: `newDriverTokenGuard` is in place, `cmd/api/routes.go`,
+`manifest.go`, `main.go` and `Deps` are untouched, and no route was declared with
+`RequireDriverToken`. What it did not carry is the **configuration** its own comments say SHIP-108 is
+certain to need — `newDriverTokenGuard(cfg, clk)` takes a `*config.Config` that had no driver-token
+fields in it. So this ticket edited `internal/config`, `deploy/.env.example`, and two `cmd/api` test
+files whose `config.Config` literals build every domain's handler during attach
+(`routes_test.go`'s `testDeps`, `routes_app_test.go`'s `routerWithApp`). None of those is on the
+forbidden list and none was a conflict, but a wave-7 prep ticket that pre-seeds a configuration
+section the way `Deps` was pre-seeded would remove the class.
 
 ## 4. Partly done — do not treat these as finished
 

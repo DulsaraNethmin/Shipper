@@ -19,6 +19,7 @@ var allKeys = []string{
 	"KAFKA_BROKERS", "KAFKA_REPLICATION_FACTOR",
 	"IDENTITY_ARGON2_MEMORY_KIB", "IDENTITY_ARGON2_ITERATIONS", "IDENTITY_ARGON2_PARALLELISM",
 	"IDENTITY_ACCESS_TOKEN_TTL", "IDENTITY_ACCESS_TOKEN_KEYS", "IDENTITY_ACCESS_TOKEN_ACTIVE_KID",
+	"DELIVERY_DRIVER_TOKEN_TTL", "DELIVERY_DRIVER_TOKEN_KEYS", "DELIVERY_DRIVER_TOKEN_ACTIVE_KID",
 	"GEOCODING_BASE_URL", "GEOCODING_API_KEY",
 	"PAGINATION_DEFAULT_PAGE_SIZE", "PAGINATION_MAX_PAGE_SIZE",
 }
@@ -26,6 +27,11 @@ var allKeys = []string{
 // deploymentSigningKeys is a keyset a staging or production configuration can legitimately be
 // given: thirty-two bytes, and not the development key this repository publishes.
 const deploymentSigningKeys = "2026-08:ZGVwbG95bWVudC1zaWduaW5nLWtleS0wMTIzNDU2YWM="
+
+// deploymentDriverSigningKeys is the same for the driver token, and it is deliberately a different
+// secret: Docs/10 §5 requires separate signing key material and validate refuses a configuration in
+// which the two sets share one (SHIP-107).
+const deploymentDriverSigningKeys = "2026-08:ZGVwbG95bWVudC1kcml2ZXItdG9rZW4ta2V5LTAxMjM0NTY3"
 
 // clearEnv blanks every configuration variable for the duration of the test. An empty
 // value is treated as absent by loader.lookup, which is what makes this equivalent to
@@ -91,6 +97,9 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("IDENTITY_ACCESS_TOKEN_TTL", "10m")
 	t.Setenv("IDENTITY_ACCESS_TOKEN_KEYS", deploymentSigningKeys)
 	t.Setenv("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", "2026-08")
+	t.Setenv("DELIVERY_DRIVER_TOKEN_TTL", "72h")
+	t.Setenv("DELIVERY_DRIVER_TOKEN_KEYS", deploymentDriverSigningKeys)
+	t.Setenv("DELIVERY_DRIVER_TOKEN_ACTIVE_KID", "2026-08")
 
 	cfg, err := Load()
 	if err != nil {
@@ -256,6 +265,8 @@ func TestDeploymentGuards(t *testing.T) {
 		"LOG_FORMAT":                       "json",
 		"IDENTITY_ACCESS_TOKEN_KEYS":       deploymentSigningKeys,
 		"IDENTITY_ACCESS_TOKEN_ACTIVE_KID": "2026-08",
+		"DELIVERY_DRIVER_TOKEN_KEYS":       deploymentDriverSigningKeys,
+		"DELIVERY_DRIVER_TOKEN_ACTIVE_KID": "2026-08",
 	}
 
 	t.Run("valid production configuration loads", func(t *testing.T) {
@@ -530,5 +541,110 @@ func TestGeocodingAcceptsABaseURLWithoutAKey(t *testing.T) {
 
 	if _, err := Load(); err != nil {
 		t.Fatalf("Load refused a base URL with no key: %v", err)
+	}
+}
+
+// --- the driver's job-scoped token (SHIP-107) --------------------------------------------------
+
+// TestTheTwoTokenKeysetsMayNotShareASecret is Docs/10 §5's "separate signing key material", enforced
+// rather than documented.
+//
+// The audience check refuses a token from either system on the other side even when the keys are
+// shared, and internal/delivery has a test that proves exactly that. This is the second lock: the
+// arrangement where the invariant rests on one check while every log line and every response looks
+// entirely correct is the one worth refusing at startup.
+//
+// Checked in development too, which is why this test does not set SHIPPER_ENV: it is a structural
+// rule rather than a deployment-hardening one, and a developer who set both variables to the same
+// value should be told immediately.
+func TestTheTwoTokenKeysetsMayNotShareASecret(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("IDENTITY_ACCESS_TOKEN_KEYS", deploymentSigningKeys)
+	t.Setenv("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", "2026-08")
+	// The same bytes under a different identifier, which is the form the mistake actually takes:
+	// somebody copies a value rather than a variable name.
+	t.Setenv("DELIVERY_DRIVER_TOKEN_KEYS", "driver-2026-08:"+strings.SplitN(deploymentSigningKeys, ":", 2)[1])
+	t.Setenv("DELIVERY_DRIVER_TOKEN_ACTIVE_KID", "driver-2026-08")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load accepted one secret shared between the mobile and driver token systems")
+	}
+	if !strings.Contains(err.Error(), "DELIVERY_DRIVER_TOKEN_KEYS") {
+		t.Errorf("the error does not name the variable: %v", err)
+	}
+}
+
+// TestTheDevelopmentDefaultsAreTwoDifferentKeys.
+//
+// The pair above is only enforced when both are set; this is the case nobody sets anything, which
+// is every developer machine. Sharing one development key would leave the two systems separated by
+// the audience alone everywhere anybody works.
+func TestTheDevelopmentDefaultsAreTwoDifferentKeys(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned %v", err)
+	}
+
+	access := cfg.Identity.AccessTokenKeys[cfg.Identity.AccessTokenActiveKID]
+	driver := cfg.Delivery.DriverTokenKeys[cfg.Delivery.DriverTokenActiveKID]
+
+	if len(access) == 0 || len(driver) == 0 {
+		t.Fatal("one of the development keysets has no active key")
+	}
+	if string(access) == string(driver) {
+		t.Error("the development defaults sign both token systems with one key")
+	}
+	if cfg.Identity.AccessTokenActiveKID == cfg.Delivery.DriverTokenActiveKID {
+		t.Error("the two development keysets share a key identifier, so a decoded header cannot " +
+			"say which system signed a token")
+	}
+}
+
+// TestTheDriverTokenActiveKeyMustExist.
+//
+// A signature nobody can produce is not a token anybody can use, and the symptom is the first
+// assignment after a deploy — a provider being told the platform is broken.
+func TestTheDriverTokenActiveKeyMustExist(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DELIVERY_DRIVER_TOKEN_KEYS", deploymentDriverSigningKeys)
+	t.Setenv("DELIVERY_DRIVER_TOKEN_ACTIVE_KID", "a-kid-that-is-not-in-the-set")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted an active identifier naming no key")
+	} else if !strings.Contains(err.Error(), "DELIVERY_DRIVER_TOKEN_ACTIVE_KID") {
+		t.Errorf("the error does not name the variable: %v", err)
+	}
+}
+
+// TestTheDriverTokenTTLIsBounded.
+//
+// Nothing shortens an issued driver token — SHIP-109 is what reissues a link, and there is no
+// revocation before it — so an over-long value is a standing grant to one job's delivery detail
+// sitting in whatever message thread the link was forwarded through.
+func TestTheDriverTokenTTLIsBounded(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DELIVERY_DRIVER_TOKEN_TTL", "8760h") // a year
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted a driver token TTL of a year")
+	} else if !strings.Contains(err.Error(), "DELIVERY_DRIVER_TOKEN_TTL") {
+		t.Errorf("the error does not name the variable: %v", err)
+	}
+}
+
+// TestTheDriverTokenDefaultsToSevenDays holds the number the tracker and deploy/.env.example both
+// state, so that a change to it is a change somebody makes rather than one that drifts.
+func TestTheDriverTokenDefaultsToSevenDays(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned %v", err)
+	}
+	if cfg.Delivery.DriverTokenTTL != 7*24*time.Hour {
+		t.Errorf("Delivery.DriverTokenTTL = %s, want 168h", cfg.Delivery.DriverTokenTTL)
 	}
 }

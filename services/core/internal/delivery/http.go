@@ -9,10 +9,13 @@
 //
 // Worth stating first, because the domain's name invites the opposite assumption. The driver has no
 // account and no session — the portal is link-authenticated (Docs/07 §3) — and the job-scoped token
-// they eventually hold is a separate system that cannot be exchanged for a user token in either
-// direction (Docs/10 §5, SHIP-108). Nothing here reads or issues one. The caller is the awarded
-// provider, authenticated the ordinary way, and the route declares RequireUser like every other
-// product endpoint in the service.
+// they hold is a separate system that cannot be exchanged for a user token in either direction
+// (Docs/10 §5). The caller of every route below is the awarded provider, authenticated the ordinary
+// way, and each declares RequireUser like every other product endpoint in the service.
+//
+// **The assignment response now carries a driver token, and that does not change the sentence
+// above** (SHIP-107). The provider is handed the link to forward (Docs/01 §4.5); nothing here reads
+// one, no route accepts one, and the middleware that would is SHIP-108's.
 //
 // # There is no field for whose job, and no field for who is assigning
 //
@@ -101,6 +104,23 @@ type assignDriverRequest struct {
 // provider: the customer's view of a delivery (SHIP-133) is a shape of its own rather than this one
 // reached by another route, for the same reason `jobs` keeps the customer's and the provider's views
 // apart.
+//
+// # The driver's token is returned here, and the awarded provider is the right person to hand it to
+//
+// Docs/01 §4.5 decides it: "the provider forwards the job-scoped portal link to their driver
+// themselves". Shipper sends no SMS in the MVP, so the only way the link reaches the driver is
+// through the response to the request that created the assignment — which is also what makes
+// SHIP-107's *Done when* readable as one sentence, since the token is generated on assignment and
+// obtainable nowhere else.
+//
+// **This response therefore carries a credential, and it is scoped like one.** The idempotency
+// middleware stores it under `idem:v1:user:<provider>:<key>` (SHIP-44), so a replay reaches only the
+// provider who made the request — a stronger position than the anonymous scope the sign-in endpoints
+// already store their tokens under, and one worth stating because it is not obvious from the shape.
+//
+// The URL is deliberately **not** assembled here. The driver portal's landing route is SHIP-120's to
+// define, and a base URL in this response would be this domain asserting a path in an application it
+// does not own; a client that has the token can build the link once that route exists.
 type assignmentResponse struct {
 	ID    string `json:"id"`
 	JobID string `json:"job_id"`
@@ -109,9 +129,23 @@ type assignmentResponse struct {
 	DriverMobile string `json:"driver_mobile"`
 
 	AssignedAt string `json:"assigned_at"`
+
+	// DriverToken is the signed, job-scoped credential the driver presents (SHIP-107).
+	//
+	// It grants exactly this job and cannot be exchanged for a mobile session in either
+	// direction (Docs/10 §5). Nothing verifies one until SHIP-108, so today it is a value the
+	// provider can forward and a driver cannot yet spend.
+	DriverToken string `json:"driver_token"`
+
+	// DriverTokenExpiresAt is when the link stops working, in UTC.
+	//
+	// Returned rather than left to the client to decode out of the token, for two reasons: a
+	// client that parsed the JWT to find it would be reading a credential it has no business
+	// interpreting, and the provider needs to be able to tell the driver how long they have.
+	DriverTokenExpiresAt string `json:"driver_token_expires_at"`
 }
 
-func assignmentFrom(a Assignment) assignmentResponse {
+func assignmentFrom(a Assignment, token DriverToken) assignmentResponse {
 	return assignmentResponse{
 		ID:    a.ID.String(),
 		JobID: a.JobID.String(),
@@ -120,6 +154,9 @@ func assignmentFrom(a Assignment) assignmentResponse {
 		DriverMobile: a.DriverMobile,
 
 		AssignedAt: timestamp(a.CreatedAt),
+
+		DriverToken:          token.Value,
+		DriverTokenExpiresAt: timestamp(token.ExpiresAt),
 	}
 }
 
@@ -169,11 +206,12 @@ func (h *Handler) AssignDriver() http.Handler {
 
 		var (
 			assignment Assignment
+			token      DriverToken
 			created    bool
 		)
 		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
 			var err error
-			assignment, created, err = h.svc.AssignDriver(ctx, runner, providerID, jobID, Nomination{
+			assignment, token, created, err = h.svc.AssignDriver(ctx, runner, providerID, jobID, Nomination{
 				DriverName:   req.DriverName,
 				DriverMobile: req.DriverMobile,
 				Self:         req.Self,
@@ -188,15 +226,20 @@ func (h *Handler) AssignDriver() http.Handler {
 			// The same driver, nominated twice, with two idempotency keys. Logged because
 			// it is the signal that a client is retrying without reusing its key, which is
 			// worth seeing in aggregate and impossible to see from the response.
+			//
+			// The token is not logged and never is — it is the credential itself, and a
+			// log line carrying one is a credential in whatever collects the logs. The
+			// expiry is safe and is what somebody diagnosing a dead link actually wants.
 			httpx.LoggerFrom(r.Context()).Info("a repeated driver nomination was absorbed",
 				slog.String("job_id", jobID.String()),
-				slog.String("assignment_id", assignment.ID.String()))
+				slog.String("assignment_id", assignment.ID.String()),
+				slog.Time("driver_token_expires_at", token.ExpiresAt))
 
-			httpx.WriteJSON(w, http.StatusOK, assignmentFrom(assignment))
+			httpx.WriteJSON(w, http.StatusOK, assignmentFrom(assignment, token))
 			return nil
 		}
 
-		httpx.WriteJSON(w, http.StatusCreated, assignmentFrom(assignment))
+		httpx.WriteJSON(w, http.StatusCreated, assignmentFrom(assignment, token))
 		return nil
 	})
 }

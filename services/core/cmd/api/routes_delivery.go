@@ -46,9 +46,13 @@ func init() {
 			// RequireUser, and deliberately **not** RequireDriverToken. The caller is the
 			// provider, authenticated the ordinary way. The driver's job-scoped token is a
 			// separate system that grants exactly one job and cannot be exchanged for a
-			// session in either direction (Docs/10 §5); it arrives at SHIP-107 and SHIP-108,
-			// and until the middleware behind that class exists a route declaring it panics
-			// at startup rather than being served open.
+			// session in either direction (Docs/10 §5).
+			//
+			// **This route now mints one (SHIP-107) and still does not accept one**, which is
+			// exactly the right pair: the provider is handed the link to forward, and the
+			// class that would verify it has no middleware behind it until SHIP-108. A route
+			// declaring RequireDriverToken today panics at startup rather than being served
+			// open, which is the outcome the seam was built to keep (SHIP-15m).
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).AssignDriver() },
 		},
@@ -59,10 +63,10 @@ func init() {
 
 			// RequireUser again, and the reason bears repeating because this is the route
 			// whose name most invites the other answer. A driver records milestones from a
-			// link-authenticated portal, and that portal's token is SHIP-107 and SHIP-108.
-			// RequireDriverToken is declarable with no middleware behind it: a route
-			// declaring it panics at startup rather than being served open, which is the
-			// right outcome and not one to work around. The caller here is the awarded
+			// link-authenticated portal; SHIP-107 signs that portal's token and SHIP-108 is
+			// what verifies one. RequireDriverToken is declarable with no middleware behind
+			// it: a route declaring it panics at startup rather than being served open, which
+			// is the right outcome and not one to work around. The caller here is the awarded
 			// provider, and the platform checks that against the accepted bid.
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordMilestone() },
@@ -73,9 +77,10 @@ func init() {
 // deliveryHandler builds the domain's handler from what Deps already carries.
 //
 // Nothing delivery needs is missing from Deps, which is the test Docs/10 §9.2 sets for whether a
-// domain has been written the way the shared-surface rules ask: the job service, the outbox writer
-// and the two ports are all pure functions of the pool, the clock and the configuration, so no field
-// had to be added to a shared struct and no line to its literal in main.go.
+// domain has been written the way the shared-surface rules ask: the job service, the outbox writer,
+// the two ports and — since SHIP-107 — the driver token issuer are all pure functions of the pool,
+// the clock and the configuration, so no field had to be added to a shared struct and no line to its
+// literal in main.go.
 //
 // It panics for the same reason jobsHandler does: it runs during attach, at startup, and every
 // failure it can report is a wiring mistake that will still be there after a restart. The pool is
@@ -83,13 +88,45 @@ func init() {
 // a transient condition the service is built to survive, and the handlers answer 503 for as long as
 // it lasts.
 func deliveryHandler(d Deps) *delivery.Handler {
-	svc := delivery.NewService(jobLifecycle{jobs: newJobService(d)}, acceptedBids{}, d.Clock)
+	svc := delivery.NewService(
+		jobLifecycle{jobs: newJobService(d)},
+		acceptedBids{},
+		driverTokenIssuer(d),
+		d.Clock,
+	)
 
 	handler, err := delivery.NewHandler(svc, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: delivery handler: " + err.Error())
 	}
 	return handler
+}
+
+// driverTokenIssuer builds the signer of the driver's job-scoped link (SHIP-107).
+//
+// # Why this is a panic and newDriverTokenGuard is an error
+//
+// The two look like they should agree and they should not. That constructor is called from main.go
+// before the router exists, where a configuration failure can be *returned* and reported beside every
+// other one; this runs during attach, from a Handler closure that has nowhere to put an error. Both
+// stop the process, which is the outcome that matters: a keyset that cannot be built will still be
+// unbuildable after the next restart, and a service that came up unable to sign a driver token would
+// answer every assignment with a 500 while reporting itself healthy.
+//
+// config.Load has already refused a short key, an active identifier naming no key, and a keyset
+// sharing a secret with identity's — so reaching either failure below means configuration produced
+// something it validates against, which is a defect in this package rather than in a deployment.
+func driverTokenIssuer(d Deps) *delivery.DriverTokenIssuer {
+	keys, err := delivery.NewKeyset(d.Config.Delivery.DriverTokenKeys, d.Config.Delivery.DriverTokenActiveKID)
+	if err != nil {
+		panic("cmd/api: driver token keyset: " + err.Error())
+	}
+
+	issuer, err := delivery.NewDriverTokenIssuer(keys, d.Config.Delivery.DriverTokenTTL, d.Clock)
+	if err != nil {
+		panic("cmd/api: driver token issuer: " + err.Error())
+	}
+	return issuer
 }
 
 // newJobService builds a job service for a domain that needs to move a job but is not `jobs`.

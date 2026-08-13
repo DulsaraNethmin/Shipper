@@ -87,6 +87,9 @@ type assignmentBody struct {
 	DriverName   string `json:"driver_name"`
 	DriverMobile string `json:"driver_mobile"`
 	AssignedAt   string `json:"assigned_at"`
+
+	DriverToken          string `json:"driver_token"`
+	DriverTokenExpiresAt string `json:"driver_token_expires_at"`
 }
 
 type errorEnvelope struct {
@@ -141,6 +144,20 @@ func TestAssignEndpointAnswersWithTheAssignmentItCreated(t *testing.T) {
 	if _, present := raw["status"]; present {
 		t.Error("the response carries a job status, which is the jobs domain's to serialise")
 	}
+
+	// SHIP-107 at the wire: the link the provider forwards, and when it stops working. What the
+	// token *contains* is token_test.go's; what is checked here is that this endpoint returns one
+	// at all, in the shape contracts/paths/delivery.yaml publishes.
+	if strings.Count(body.DriverToken, ".") != 2 {
+		t.Errorf("driver_token = %q, want a signed token", body.DriverToken)
+	}
+	if !strings.HasSuffix(body.DriverTokenExpiresAt, "Z") {
+		t.Errorf("driver_token_expires_at = %q, want UTC", body.DriverTokenExpiresAt)
+	}
+	if body.DriverTokenExpiresAt <= body.AssignedAt {
+		t.Errorf("the link expires at %q, which is not after the assignment at %q",
+			body.DriverTokenExpiresAt, body.AssignedAt)
+	}
 }
 
 // TestSelfAssignmentNeedsNoMobile is the second half of the Done when, at the wire.
@@ -183,6 +200,13 @@ func TestARepeatedNominationAnswers200(t *testing.T) {
 	}
 	if decode[assignmentBody](t, second).ID != decode[assignmentBody](t, first).ID {
 		t.Error("the repeat answered with a different assignment")
+	}
+
+	// The 200 carries a link too. A provider whose phone lost the first response has no other
+	// way to obtain one, and an absorbed repeat that answered without it would leave them with
+	// a driver they cannot reach (SHIP-107).
+	if decode[assignmentBody](t, second).DriverToken == "" {
+		t.Error("the absorbed repeat answered with no driver_token")
 	}
 }
 
