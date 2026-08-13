@@ -22,7 +22,17 @@ var allKeys = []string{
 	"DELIVERY_DRIVER_TOKEN_TTL", "DELIVERY_DRIVER_TOKEN_KEYS", "DELIVERY_DRIVER_TOKEN_ACTIVE_KID",
 	"GEOCODING_BASE_URL", "GEOCODING_API_KEY",
 	"PAGINATION_DEFAULT_PAGE_SIZE", "PAGINATION_MAX_PAGE_SIZE",
+	"STORAGE_ENDPOINT", "STORAGE_BUCKET", "STORAGE_REGION",
+	"STORAGE_ACCESS_KEY_ID", "STORAGE_SECRET_ACCESS_KEY", "STORAGE_USE_PATH_STYLE",
+	"STORAGE_PRESIGN_TTL", "STORAGE_MAX_UPLOAD_BYTES", "STORAGE_ACCEPTED_CONTENT_TYPES",
 }
+
+// deploymentStorageCredentials is a credential a staging or production configuration can
+// legitimately be given: not the pair this repository publishes in deploy/.env.example.
+const (
+	deploymentStorageAccessKeyID     = "AKIAIOSFODNN7EXAMPLE"
+	deploymentStorageSecretAccessKey = "wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY"
+)
 
 // deploymentSigningKeys is a keyset a staging or production configuration can legitimately be
 // given: thirty-two bytes, and not the development key this repository publishes.
@@ -100,6 +110,9 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("DELIVERY_DRIVER_TOKEN_TTL", "72h")
 	t.Setenv("DELIVERY_DRIVER_TOKEN_KEYS", deploymentDriverSigningKeys)
 	t.Setenv("DELIVERY_DRIVER_TOKEN_ACTIVE_KID", "2026-08")
+	t.Setenv("STORAGE_ENDPOINT", "https://s3.ap-southeast-2.amazonaws.com")
+	t.Setenv("STORAGE_ACCESS_KEY_ID", deploymentStorageAccessKeyID)
+	t.Setenv("STORAGE_SECRET_ACCESS_KEY", deploymentStorageSecretAccessKey)
 
 	cfg, err := Load()
 	if err != nil {
@@ -267,6 +280,9 @@ func TestDeploymentGuards(t *testing.T) {
 		"IDENTITY_ACCESS_TOKEN_ACTIVE_KID": "2026-08",
 		"DELIVERY_DRIVER_TOKEN_KEYS":       deploymentDriverSigningKeys,
 		"DELIVERY_DRIVER_TOKEN_ACTIVE_KID": "2026-08",
+		"STORAGE_ENDPOINT":                 "https://s3.ap-southeast-2.amazonaws.com",
+		"STORAGE_ACCESS_KEY_ID":            deploymentStorageAccessKeyID,
+		"STORAGE_SECRET_ACCESS_KEY":        deploymentStorageSecretAccessKey,
 	}
 
 	t.Run("valid production configuration loads", func(t *testing.T) {
@@ -320,6 +336,38 @@ func TestDeploymentGuards(t *testing.T) {
 		_, err := Load()
 		if err == nil || !strings.Contains(err.Error(), "development key") {
 			t.Fatalf("Load() returned %v, want a refusal of the published development key", err)
+		}
+	})
+
+	// The same mistake on the object store's credential, and it is worth its own case because the
+	// consequence differs: a published signing key forges sessions, a published storage secret
+	// hands over a bucket of proof photographs and verification documents.
+	t.Run("the published development storage credential is refused", func(t *testing.T) {
+		clearEnv(t)
+		for k, v := range base {
+			t.Setenv(k, v)
+		}
+		t.Setenv("STORAGE_SECRET_ACCESS_KEY", developmentStorageSecretAccessKey)
+
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "STORAGE_SECRET_ACCESS_KEY") {
+			t.Fatalf("Load() returned %v, want a refusal of the published development credential", err)
+		}
+	})
+
+	// An endpoint carries no credential, so the rule above cannot see a deployment still pointing
+	// at the development container. The symptom would be a proof photograph the platform believes
+	// it stored and nobody can ever retrieve — the same class as sslmode=disable above.
+	t.Run("a loopback object store is refused", func(t *testing.T) {
+		clearEnv(t)
+		for k, v := range base {
+			t.Setenv(k, v)
+		}
+		t.Setenv("STORAGE_ENDPOINT", "http://localhost:9000")
+
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "STORAGE_ENDPOINT") {
+			t.Fatalf("Load() returned %v, want a refusal of a loopback object store", err)
 		}
 	})
 }
@@ -646,5 +694,251 @@ func TestTheDriverTokenDefaultsToSevenDays(t *testing.T) {
 	}
 	if cfg.Delivery.DriverTokenTTL != 7*24*time.Hour {
 		t.Errorf("Delivery.DriverTokenTTL = %s, want 168h", cfg.Delivery.DriverTokenTTL)
+	}
+}
+
+// --- the object store (SHIP-15p, first consumed at SHIP-114) ------------------------------------
+
+// TestStorageDefaults holds the values deploy/.env.example, deploy/docker-compose.yml and the
+// Makefile all state, so that a change to any one of them is a change somebody makes rather than
+// a drift somebody discovers.
+//
+// The endpoint is the pointed one. SigV4 signs the `host` header, so a URL minted against
+// `minio:9000` inside the compose network and fetched from the host is refused as
+// SignatureDoesNotMatch — an error naming neither the address nor the cause.
+func TestStorageDefaults(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned %v", err)
+	}
+
+	if cfg.Storage.Endpoint != "http://localhost:9000" {
+		t.Errorf("Storage.Endpoint = %q, want the published host port", cfg.Storage.Endpoint)
+	}
+	if cfg.Storage.Bucket != "shipper-dev" {
+		t.Errorf("Storage.Bucket = %q, want shipper-dev", cfg.Storage.Bucket)
+	}
+	if cfg.Storage.Region != "ap-southeast-2" {
+		t.Errorf("Storage.Region = %q, want ap-southeast-2 — it must match MINIO_REGION in "+
+			"deploy/docker-compose.yml, because SigV4 signs the region", cfg.Storage.Region)
+	}
+	if !cfg.Storage.UsePathStyle {
+		t.Error("Storage.UsePathStyle = false; the virtual-host form needs " +
+			"shipper-dev.localhost to resolve, and it does not")
+	}
+	if cfg.Storage.PresignTTL != 15*time.Minute {
+		t.Errorf("Storage.PresignTTL = %s, want 15m", cfg.Storage.PresignTTL)
+	}
+	if cfg.Storage.MaxUploadBytes != defaultMaxUploadBytes {
+		t.Errorf("Storage.MaxUploadBytes = %d, want %d", cfg.Storage.MaxUploadBytes, defaultMaxUploadBytes)
+	}
+	want := []string{"image/jpeg", "image/png", "image/heic"}
+	if len(cfg.Storage.AcceptedContentTypes) != len(want) {
+		t.Fatalf("Storage.AcceptedContentTypes = %v, want %v", cfg.Storage.AcceptedContentTypes, want)
+	}
+	for i := range want {
+		if cfg.Storage.AcceptedContentTypes[i] != want[i] {
+			t.Errorf("Storage.AcceptedContentTypes[%d] = %q, want %q",
+				i, cfg.Storage.AcceptedContentTypes[i], want[i])
+		}
+	}
+}
+
+// TestStorageIsReadFromTheEnvironment is the half that matters for a deployment: every field is a
+// variable, including the endpoint, which is always explicit rather than inferred from the region.
+func TestStorageIsReadFromTheEnvironment(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("STORAGE_ENDPOINT", "https://s3.ap-southeast-4.amazonaws.com")
+	t.Setenv("STORAGE_BUCKET", "shipper-production-evidence")
+	t.Setenv("STORAGE_REGION", "ap-southeast-4")
+	t.Setenv("STORAGE_ACCESS_KEY_ID", deploymentStorageAccessKeyID)
+	t.Setenv("STORAGE_SECRET_ACCESS_KEY", deploymentStorageSecretAccessKey)
+	t.Setenv("STORAGE_USE_PATH_STYLE", "false")
+	t.Setenv("STORAGE_PRESIGN_TTL", "5m")
+	t.Setenv("STORAGE_MAX_UPLOAD_BYTES", "2097152")
+	t.Setenv("STORAGE_ACCEPTED_CONTENT_TYPES", "image/jpeg, image/webp")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned %v", err)
+	}
+
+	if cfg.Storage.Endpoint != "https://s3.ap-southeast-4.amazonaws.com" {
+		t.Errorf("Storage.Endpoint = %q", cfg.Storage.Endpoint)
+	}
+	if cfg.Storage.Bucket != "shipper-production-evidence" {
+		t.Errorf("Storage.Bucket = %q", cfg.Storage.Bucket)
+	}
+	if cfg.Storage.Region != "ap-southeast-4" {
+		t.Errorf("Storage.Region = %q", cfg.Storage.Region)
+	}
+	if cfg.Storage.AccessKeyID != deploymentStorageAccessKeyID {
+		t.Errorf("Storage.AccessKeyID = %q", cfg.Storage.AccessKeyID)
+	}
+	if cfg.Storage.SecretAccessKey != deploymentStorageSecretAccessKey {
+		t.Error("Storage.SecretAccessKey did not come from the environment")
+	}
+	if cfg.Storage.UsePathStyle {
+		t.Error("Storage.UsePathStyle = true; STORAGE_USE_PATH_STYLE=false was set")
+	}
+	if cfg.Storage.PresignTTL != 5*time.Minute {
+		t.Errorf("Storage.PresignTTL = %s, want 5m", cfg.Storage.PresignTTL)
+	}
+	if cfg.Storage.MaxUploadBytes != 2<<20 {
+		t.Errorf("Storage.MaxUploadBytes = %d, want %d", cfg.Storage.MaxUploadBytes, 2<<20)
+	}
+	if len(cfg.Storage.AcceptedContentTypes) != 2 ||
+		cfg.Storage.AcceptedContentTypes[1] != "image/webp" {
+		t.Errorf("Storage.AcceptedContentTypes = %v, want the surrounding spaces trimmed",
+			cfg.Storage.AcceptedContentTypes)
+	}
+}
+
+// TestStorageUsePathStyleRefusesAValueItCannotRead.
+//
+// The values people actually type are "yes" and "on", and reading either as false would turn a
+// switch somebody deliberately set into one they did not — an upload URL that 404s rather than a
+// configuration error.
+func TestStorageUsePathStyleRefusesAValueItCannotRead(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("STORAGE_USE_PATH_STYLE", "yes")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted STORAGE_USE_PATH_STYLE=yes")
+	} else if !strings.Contains(err.Error(), "STORAGE_USE_PATH_STYLE") {
+		t.Errorf("the error does not name the variable: %v", err)
+	}
+}
+
+// TestStorageEndpointMustBeAnAbsoluteURL.
+//
+// There is no empty state — an empty variable is an absent one to loader.lookup, so it would fall
+// back to the development default and put a production deployment on somebody's loopback. The
+// endpoint is therefore always typed, and something that is not a URL is caught here rather than
+// by the SDK at the first upload.
+func TestStorageEndpointMustBeAnAbsoluteURL(t *testing.T) {
+	for _, endpoint := range []string{"s3.amazonaws.com", "localhost:9000", "ftp://files.internal"} {
+		t.Run(endpoint, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("STORAGE_ENDPOINT", endpoint)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted the endpoint %q", endpoint)
+			} else if !strings.Contains(err.Error(), "STORAGE_ENDPOINT") {
+				t.Errorf("the error does not name the variable: %v", err)
+			}
+		})
+	}
+}
+
+// TestStorageBucketNamesArePlausible.
+//
+// The bucket name is per-worktree in development, which makes it a value a person types. Without
+// this the first thing to notice a name S3 will not accept is a driver's proof upload.
+func TestStorageBucketNamesArePlausible(t *testing.T) {
+	refused := map[string]string{
+		"underscores":      "shipper_dev",
+		"upper case":       "Shipper-Dev",
+		"too short":        "sd",
+		"a trailing dash":  "shipper-dev-",
+		"a leading dash":   "-shipper-dev",
+		"a leading dot":    ".shipper-dev",
+		"a slash":          "shipper/dev",
+		"a path with keys": "shipper-dev/proof",
+	}
+	for name, bucket := range refused {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("STORAGE_BUCKET", bucket)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted the bucket name %q", bucket)
+			} else if !strings.Contains(err.Error(), "STORAGE_BUCKET") {
+				t.Errorf("the error does not name the variable: %v", err)
+			}
+		})
+	}
+
+	// A worktree's derived-looking name has to pass, or the isolation CLAUDE.md's worktree table
+	// prescribes would be refused at startup by the very check meant to protect it.
+	for _, bucket := range []string{"shipper-dev", "ship-84-88-bids-and-offers", "shipper.proof.au"} {
+		t.Run(bucket, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("STORAGE_BUCKET", bucket)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load refused the bucket name %q: %v", bucket, err)
+			}
+		})
+	}
+}
+
+// TestStoragePresignTTLIsBounded.
+//
+// Nothing revokes a pre-signed URL once it is signed: the signature is the whole of the
+// authorisation, and no server-side check runs when it is redeemed (Docs/06 §5.2). The window is
+// therefore the whole of the exposure.
+func TestStoragePresignTTLIsBounded(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("STORAGE_PRESIGN_TTL", "24h")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted a pre-signed URL lifetime of a day")
+	} else if !strings.Contains(err.Error(), "STORAGE_PRESIGN_TTL") {
+		t.Errorf("the error does not name the variable: %v", err)
+	}
+}
+
+// TestStorageUploadPolicyIsRefusedWhenItCannotWork.
+//
+// Both halves are policy the platform is expected to move under operational pressure, which is
+// exactly why a wrong value has to fail at startup: a size below any real photograph, or a media
+// type that matches nothing, both present as a driver unable to finish a delivery.
+func TestStorageUploadPolicyIsRefusedWhenItCannotWork(t *testing.T) {
+	cases := map[string]struct{ key, value, want string }{
+		"a size below any photograph": {"STORAGE_MAX_UPLOAD_BYTES", "1024", "STORAGE_MAX_UPLOAD_BYTES"},
+		"a size past a photograph":    {"STORAGE_MAX_UPLOAD_BYTES", "268435456", "STORAGE_MAX_UPLOAD_BYTES"},
+		"a media type with no slash":  {"STORAGE_ACCEPTED_CONTENT_TYPES", "jpeg", "STORAGE_ACCEPTED_CONTENT_TYPES"},
+		"a media type in upper case":  {"STORAGE_ACCEPTED_CONTENT_TYPES", "Image/JPEG", "STORAGE_ACCEPTED_CONTENT_TYPES"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(c.key, c.value)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted %s=%s", c.key, c.value)
+			} else if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("the error does not name the variable: %v", err)
+			}
+		})
+	}
+}
+
+// TestLogValueOmitsTheStorageCredential.
+//
+// The bucket and the endpoint are worth a startup line — the bucket especially, because it is
+// per-worktree and a process writing into the wrong one succeeds at everything. The secret is
+// worth none, for the reason the signing keys are not logged either: a startup line is collected,
+// shipped and retained.
+func TestLogValueOmitsTheStorageCredential(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("STORAGE_SECRET_ACCESS_KEY", "a-secret-nobody-should-see-in-a-log")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned %v", err)
+	}
+
+	rendered := cfg.LogValue().String()
+	if strings.Contains(rendered, "a-secret-nobody-should-see-in-a-log") {
+		t.Error("the storage secret appears in the startup log line")
+	}
+	for _, want := range []string{"storage_bucket", "storage_endpoint", "storage_region"} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the startup log line does not carry %s: %s", want, rendered)
+		}
 	}
 }
