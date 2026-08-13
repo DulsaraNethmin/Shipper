@@ -58,6 +58,52 @@ type Awards interface {
 	AwardedProvider(ctx context.Context, r db.Runner, jobID uuid.UUID) (providerID uuid.UUID, awarded bool, err error)
 }
 
+// ProofUploads is somewhere to put a proof photograph, declared by the domain that needs one
+// (SHIP-114).
+//
+// # It signs a URL and does nothing else
+//
+// Docs/06 §5.2 puts the bytes outside this service entirely: the client is handed a short-lived
+// pre-signed URL and uploads straight to the store. So this port has no Put, no Get and no Delete —
+// there is no method here that moves a byte, because no byte ever reaches the platform. What the
+// implementation is asked for is permission, in the form of a URL, and permission is all it can
+// give.
+//
+// # The wide signature is forced, exactly as jobs.Geocoder's was
+//
+// A port may not name a type declared in the package that implements it — that is the import the
+// lint refuses — so no struct from internal/platform/storage can appear below, in either direction.
+// The answer is the one Docs/11 §9 records for geocoding: primitives in, primitives out, with the
+// domain's own [Upload] assembled from them one statement later.
+//
+// # What the four arguments are, and why the domain supplies every one of them
+//
+// The key, because which object a job's proof goes to is this domain's question and not the
+// store's — nothing in internal/platform/storage knows what a job is (its doc.go says so). The
+// content type and the length, because they are what the implementation must *sign*: an upload URL
+// that does not bind them authorises any body at all, and the platform's limits become a promise
+// the client made to itself. And the lifetime, because "short-lived" is the whole of the
+// authorisation — nothing can revoke a pre-signed URL once it is signed — and the number comes from
+// configuration rather than from the signer.
+//
+// An implementation may refuse: a key that names another object, a content type carrying a newline,
+// a length of zero. Those are failures of the mechanism rather than answers, so they come back as
+// errors and become an opaque 500 — the domain has already checked everything a client could get
+// wrong, so reaching one means this platform asked for something it should not have.
+type ProofUploads interface {
+	// PresignUpload returns a URL the client may PUT exactly one object to, and when it stops
+	// working.
+	//
+	// The expiry is returned rather than computed by the caller, so that what a client is told
+	// and what the store will enforce come from one clock and one arithmetic.
+	PresignUpload(
+		ctx context.Context,
+		key, contentType string,
+		contentLength int64,
+		ttl time.Duration,
+	) (uploadURL string, expiresAt time.Time, err error)
+}
+
 // JobMove is what the guarded transition did, in terms this domain can act on.
 //
 // The four values are the four outcomes of Docs/02 §2's table as seen from one caller: it moved,

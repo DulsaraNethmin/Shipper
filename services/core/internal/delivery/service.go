@@ -43,11 +43,23 @@ import (
 // clock and the platform's are two values and stay two values — is untestable, because the two
 // would agree to within a millisecond on every run.
 type Service struct {
-	jobs   Jobs
-	awards Awards
-	tokens *DriverTokenIssuer
-	clock  clock.Clock
-	store  postgresStore
+	jobs    Jobs
+	awards  Awards
+	tokens  *DriverTokenIssuer
+	uploads proofUploader
+	clock   clock.Clock
+	store   postgresStore
+}
+
+// proofUploader is the signer and the limits it is asked to sign within, held together (SHIP-114).
+//
+// One field rather than two on [Service], because they are never useful apart: a signer with no
+// policy would issue URLs for anything, and a policy with no signer is a struct nobody reads. It is
+// also what stops a fifth positional argument to [NewService] becoming a sixth and a seventh as
+// SHIP-115 and SHIP-155 add their own.
+type proofUploader struct {
+	store  ProofUploads
+	policy UploadPolicy
 }
 
 // NewService builds the domain service.
@@ -61,7 +73,14 @@ type Service struct {
 // the way jobs' geocoder is. A nil Awards is "nobody is checked", a nil Jobs is "the job never
 // moves", and a nil issuer is an assignment that produces no link — all three are silent failures
 // of a rule this endpoint exists to enforce.
-func NewService(jobs Jobs, awards Awards, tokens *DriverTokenIssuer, c clock.Clock) *Service {
+func NewService(
+	jobs Jobs,
+	awards Awards,
+	tokens *DriverTokenIssuer,
+	uploads ProofUploads,
+	policy UploadPolicy,
+	c clock.Clock,
+) *Service {
 	if jobs == nil {
 		panic("delivery: NewService needs the job lifecycle; an assignment that moves no job " +
 			"leaves a driver on a job nothing downstream believes has one (Docs/02 §2)")
@@ -78,12 +97,35 @@ func NewService(jobs Jobs, awards Awards, tokens *DriverTokenIssuer, c clock.Clo
 		panic("delivery: NewService needs the driver token issuer; an assignment with no " +
 			"job-scoped link leaves the driver nothing to open (SHIP-107)")
 	}
+	if uploads == nil {
+		// Refused rather than made optional, for the reason the issuer above is. A service
+		// that could answer an upload request with no signer would have to answer it with
+		// something, and every candidate is worse than not starting: a URL nobody signed, an
+		// empty string a client would PUT to nowhere, or a 500 on the one request path
+		// Docs/01 §4.4 makes the condition of completing a delivery.
+		panic("delivery: NewService needs somewhere to put proof; a delivery cannot be " +
+			"completed without a photograph or a recorded exception (SHIP-114)")
+	}
+	if !policy.valid() {
+		// Checked here rather than per request, so a configuration failure stops the process
+		// at startup instead of surfacing as a validation error blaming a client's perfectly
+		// good photograph. internal/config has already refused a zero TTL and an empty type
+		// list, so reaching this means the policy came from somewhere other than configuration.
+		panic("delivery: NewService needs an upload policy with a size limit, at least one " +
+			"accepted content type, and a lifetime (SHIP-114)")
+	}
 	if c == nil {
 		// Defaulting to clock.System{} would start the service, and the first milestone
 		// recorded without an actor-supplied time would be stamped from a clock nobody chose.
 		panic("delivery: NewService needs a clock (Docs/10 §6.3)")
 	}
-	return &Service{jobs: jobs, awards: awards, tokens: tokens, clock: c}
+	return &Service{
+		jobs:    jobs,
+		awards:  awards,
+		tokens:  tokens,
+		uploads: proofUploader{store: uploads, policy: policy},
+		clock:   c,
+	}
 }
 
 // AssignDriver puts a driver on a job the caller was awarded, moves the job to 'Driver assigned',

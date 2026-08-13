@@ -809,3 +809,176 @@ status="$(open_delivery "$driver_wrong_key" "$delivery_job" wrong-key)"
 [[ "$(json "$WORKDIR/driver-wrong-key.json" '["error"]["code"]')" == "unauthenticated" ]] \
   || { cat "$WORKDIR/driver-wrong-key.json"; fail "expected code=unauthenticated"; }
 ok "and one signed with the mobile session's key is refused too — separate key material, checked by the service that is running"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-114  a client receives a short-lived pre-signed URL and uploads directly"
+
+# The *Done when* is "client receives a short-lived pre-signed URL and uploads directly", and the
+# word this section exists to demonstrate is **directly**. Everything else here is a Go test as
+# well; the upload is the only claim that cannot be made without a running service, a running object
+# store and a client that talks to one without going through the other.
+#
+# # The API is not in the path, and that is asserted rather than described
+#
+# The URL is checked to be at $STORAGE_ENDPOINT before it is used, the upload goes there, and the
+# object is read back out of the bucket from inside the container. If SHIP-114 were ever
+# "simplified" into a proxy upload, the first of those three fails.
+#
+# # Everything here fences on ids
+#
+# The object key carries the job id and a fresh UUIDv7, and the bucket may be shared with four other
+# worktrees (CLAUDE.md's worktree table). So no check counts objects or lists a prefix; each one
+# names the key it created, which is the rule that file states for Kafka applied to the one shared
+# service that *can* be isolated but is not obliged to be.
+
+proof_key_of() { json "$1" '["object_key"]'; }
+
+status="$(delivery_request "$delivery_provider_token" "verify-del-proof-$$" \
+  "/v1/jobs/$delivery_job/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' \
+  "$WORKDIR/delivery-proof.json")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/delivery-proof.json"; fail "minting an upload URL answered $status, want 200"; }
+
+proof_key="$(proof_key_of "$WORKDIR/delivery-proof.json")"
+proof_url="$(json "$WORKDIR/delivery-proof.json" '["upload_url"]')"
+proof_method="$(json "$WORKDIR/delivery-proof.json" '["method"]')"
+proof_type="$(json "$WORKDIR/delivery-proof.json" '["content_type"]')"
+proof_length="$(json "$WORKDIR/delivery-proof.json" '["content_length"]')"
+proof_expires="$(json "$WORKDIR/delivery-proof.json" '["expires_at"]')"
+
+[[ "$proof_method" == "PUT" && "$proof_type" == "image/jpeg" && "$proof_length" == "48" ]] \
+  || fail "the response describes a $proof_method of $proof_length bytes of $proof_type"
+[[ "$proof_key" == proof/$delivery_job/* ]] \
+  || fail "object_key is $proof_key, want it prefixed by proof/$delivery_job/"
+ok "the awarded provider is issued an upload URL, an object key under their own job, and the two headers the store will hold them to"
+
+# 200 rather than 201, because nothing was created: no row here and no object there. The record
+# that turns an uploaded object into proof is SHIP-115's, and that one is a 201.
+[[ "$proof_url" == "$STORAGE_ENDPOINT/"* ]] \
+  || fail "upload_url is $proof_url, which is not the object store at $STORAGE_ENDPOINT"
+[[ "$proof_url" != *"localhost:$VERIFY_PORT"* && "$proof_url" != *"/v1/"* ]] \
+  || fail "upload_url points back at this service: $proof_url"
+ok "and it points at the object store rather than at this API — the bytes are never proxied (Docs/06 §5.2)"
+
+# Short-lived, checked two ways: the store's own expiry window is in the URL, and the instant the
+# response reports is inside it. Neither number is typed here — internal/config owns the lifetime,
+# and a check that hard-coded fifteen minutes would keep passing after somebody stopped reading it.
+proof_window="$(python3 - "$proof_url" "$proof_expires" <<'PY'
+import datetime, sys, urllib.parse
+
+query = urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[1]).query)
+expires = int(query["X-Amz-Expires"][0])
+reported = datetime.datetime.strptime(sys.argv[2], "%Y-%m-%dT%H:%M:%S.%f%z")
+ahead = (reported - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+print(f"{expires} {ahead:.0f}")
+PY
+)"
+read -r proof_expires_seconds proof_seconds_ahead <<<"$proof_window"
+(( proof_expires_seconds > 0 && proof_expires_seconds <= 3600 )) \
+  || fail "the URL is signed to last $proof_expires_seconds seconds; internal/config caps the lifetime at an hour because nothing can revoke one"
+(( proof_seconds_ahead > 0 && proof_seconds_ahead <= proof_expires_seconds + 5 )) \
+  || fail "expires_at is $proof_seconds_ahead seconds away against a signed window of $proof_expires_seconds"
+ok "the URL is short-lived — $proof_expires_seconds seconds in the signature, and expires_at agrees with it"
+
+# --- the upload itself, with this service in neither direction ---------------------------------
+
+printf '%s' 'not a photograph, but exactly forty-eight bytes.' > "$WORKDIR/proof.bin"
+[[ "$(wc -c < "$WORKDIR/proof.bin" | tr -d ' ')" == "48" ]] || fail "the fixture is not 48 bytes"
+
+put_status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "Content-Type: $proof_type" --data-binary "@$WORKDIR/proof.bin" "$proof_url")"
+[[ "$put_status" == "200" ]] \
+  || fail "the pre-signed PUT answered $put_status — the client could not upload directly, which is the whole of SHIP-114"
+ok "the client uploaded the photograph straight to the object store with that URL and nothing else"
+
+stored="$("${COMPOSE[@]}" exec -T minio sh -c \
+  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; \
+   mc cat "local/'"$STORAGE_BUCKET/$proof_key"'"' 2>/dev/null)"
+[[ "$stored" == "not a photograph, but exactly forty-eight bytes." ]] \
+  || fail "the object in $STORAGE_BUCKET reads back as '$stored'"
+ok "and the bytes are in $STORAGE_BUCKET under the key the API named, read back out of the store itself"
+
+unsigned_status="$(curl -s -o /dev/null -w '%{http_code}' "$STORAGE_ENDPOINT/$STORAGE_BUCKET/$proof_key")"
+[[ "$unsigned_status" == "403" ]] \
+  || fail "an unsigned GET of the proof answered $unsigned_status, want 403 — a proof photograph identifies an address and a recipient"
+ok "the same object is refused without a signature: there is no public read path to a proof photograph"
+
+# --- what the store refuses, which is what makes the platform's limits enforcement -------------
+
+status="$(delivery_request "$delivery_provider_token" "verify-del-proof-swap-$$" \
+  "/v1/jobs/$delivery_job/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' \
+  "$WORKDIR/delivery-proof-swap.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/delivery-proof-swap.json"; fail "minting the second URL answered $status"; }
+proof_swap_url="$(json "$WORKDIR/delivery-proof-swap.json" '["upload_url"]')"
+proof_swap_key="$(proof_key_of "$WORKDIR/delivery-proof-swap.json")"
+
+[[ "$proof_swap_key" != "$proof_key" ]] \
+  || fail "two requests were issued the same object key; a reissued key can overwrite an object that already holds proof"
+
+wrong_type_status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H 'Content-Type: image/svg+xml' --data-binary "@$WORKDIR/proof.bin" "$proof_swap_url")"
+[[ "$wrong_type_status" == "403" ]] \
+  || fail "uploading as image/svg+xml answered $wrong_type_status, want 403 — the content type is signed, so an accepted-formats list the store does not enforce is a list the client gave itself"
+
+printf '%s' 'this body is a different length from the one that was authorised' > "$WORKDIR/proof-longer.bin"
+wrong_size_status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "Content-Type: $proof_type" --data-binary "@$WORKDIR/proof-longer.bin" "$proof_swap_url")"
+[[ "$wrong_size_status" == "403" ]] \
+  || fail "uploading a longer body answered $wrong_size_status, want 403 — the content length is the only bound a pre-signed PUT has"
+ok "an upload that changes the type or the size the platform authorised is refused by the store, not by us"
+
+# --- who may ask, and what they may ask for ----------------------------------------------------
+
+status="$(delivery_request "$delivery_other_token" "verify-del-proof-other-$$" \
+  "/v1/jobs/$delivery_job/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' \
+  "$WORKDIR/delivery-proof-other.json")"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/delivery-proof-other.json"; fail "another provider was issued an upload URL for this job: $status"; }
+[[ "$(json "$WORKDIR/delivery-proof-other.json" '["error"]["code"]')" == "not_found" ]] \
+  || { cat "$WORKDIR/delivery-proof-other.json"; fail "expected code=not_found; a 403 would confirm the job exists and that somebody won it"; }
+ok "a provider who was not awarded the job gets what a job that does not exist gets — the platform decides which job a caller may upload against, not the device"
+
+status="$(delivery_request "$delivery_provider_token" "verify-del-proof-svg-$$" \
+  "/v1/jobs/$delivery_job/proof-uploads" '{"content_type":"image/svg+xml","content_length":48}' \
+  "$WORKDIR/delivery-proof-svg.json")"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/delivery-proof-svg.json"; fail "image/svg+xml was accepted: $status"; }
+[[ "$(json "$WORKDIR/delivery-proof-svg.json" '["error"]["details"][0]["field"]')" == "content_type" ]] \
+  || { cat "$WORKDIR/delivery-proof-svg.json"; fail "the refusal does not name content_type"; }
+
+proof_over_limit=$(( ${STORAGE_MAX_UPLOAD_BYTES:-10485760} + 1 ))
+status="$(delivery_request "$delivery_provider_token" "verify-del-proof-big-$$" \
+  "/v1/jobs/$delivery_job/proof-uploads" \
+  "{\"content_type\":\"image/jpeg\",\"content_length\":$proof_over_limit}" \
+  "$WORKDIR/delivery-proof-big.json")"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/delivery-proof-big.json"; fail "$proof_over_limit bytes was accepted: $status"; }
+[[ "$(json "$WORKDIR/delivery-proof-big.json" '["error"]["details"][0]["field"]')" == "content_length" ]] \
+  || { cat "$WORKDIR/delivery-proof-big.json"; fail "the refusal does not name content_length"; }
+ok "a script container being an image and a photograph over the configured limit are both refused before anything is signed, with the field named"
+
+# --- the key, and what a retry gets ------------------------------------------------------------
+
+status="$(curl -s -X POST -o "$WORKDIR/delivery-proof-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H 'Content-Type: application/json' \
+  -d '{"content_type":"image/jpeg","content_length":48}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$delivery_job/proof-uploads")"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/delivery-proof-nokey.json"; fail "minting a URL with no Idempotency-Key answered $status, want 400"; }
+[[ "$(json "$WORKDIR/delivery-proof-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || { cat "$WORKDIR/delivery-proof-nokey.json"; fail "expected code=idempotency_key_required"; }
+ok "minting a URL is a state-changing request and is refused without an Idempotency-Key — issuing a credential nothing can revoke is not a safe method"
+
+status="$(delivery_request "$delivery_provider_token" "verify-del-proof-$$" \
+  "/v1/jobs/$delivery_job/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' \
+  "$WORKDIR/delivery-proof-retry.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/delivery-proof-retry.json"; fail "the retry answered $status"; }
+diff -q "$WORKDIR/delivery-proof.json" "$WORKDIR/delivery-proof-retry.json" >/dev/null \
+  || { cat "$WORKDIR/delivery-proof-retry.json"; fail "a retry with the same key returned a different URL; one intent buys one upload slot and a retry must not extend a credential's life"; }
+ok "a retry with the same key replays the identical URL and the identical expiry, already running down — a new slot needs a new key"
+
+"${COMPOSE[@]}" exec -T minio sh -c \
+  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; \
+   mc rm --force "local/'"$STORAGE_BUCKET/$proof_key"'" >/dev/null 2>&1 || true' \
+  || fail "could not remove the object this section uploaded"
+ok "the object this run uploaded was removed from $STORAGE_BUCKET"

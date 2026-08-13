@@ -42,6 +42,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs/{id}/driver", handler.AssignDriver())
 	mux.Handle("POST /v1/jobs/{id}/milestones", handler.RecordMilestone())
+	mux.Handle("POST /v1/jobs/{id}/proof-uploads", handler.PresignProofUpload())
 	return mux
 }
 

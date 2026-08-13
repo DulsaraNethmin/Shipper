@@ -64,11 +64,38 @@ func testDeliveryConfig() config.Delivery {
 	}
 }
 
+// testStorageConfig is the object store the proof-upload signer is built from (SHIP-114).
+//
+// It is here for the third time in this file's history and for the third identical reason, after
+// the argon2 profile and the driver keyset above: the delivery handler is built during attach, from
+// every test in this package that constructs a router, and a signer that cannot sign stops the
+// process at startup. `config.Storage{}` has an empty endpoint, and an empty endpoint is not a URL
+// — internal/config refuses one at load for exactly the same reason.
+//
+// **Nothing here reaches the store.** Signing is an HMAC over a few hundred bytes and touches no
+// I/O, so these values need to be well-formed rather than real: no test in this package uploads
+// anything, and the URLs the signer produces are exercised against a live bucket in
+// internal/platform/storage instead.
+func testStorageConfig() config.Storage {
+	return config.Storage{
+		Endpoint:             "http://localhost:9000",
+		Bucket:               "cmd-api-test",
+		Region:               "ap-southeast-2",
+		AccessKeyID:          "cmd-api-test-key",
+		SecretAccessKey:      "cmd-api-test-secret",
+		UsePathStyle:         true,
+		PresignTTL:           15 * time.Minute,
+		MaxUploadBytes:       5 << 20,
+		AcceptedContentTypes: []string{"image/jpeg", "image/heic"},
+	}
+}
+
 func testDeps() Deps {
 	return Deps{
 		Config: &config.Config{
 			Identity: testIdentityConfig(),
 			Delivery: testDeliveryConfig(),
+			Storage:  testStorageConfig(),
 		},
 		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		Clock:     clock.System{},

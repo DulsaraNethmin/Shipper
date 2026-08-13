@@ -13,6 +13,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/storage"
 )
 
 // The delivery domain's routes (SHIP-106 onwards).
@@ -69,6 +70,31 @@ func init() {
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordMilestone() },
 		},
 		Route{
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/proof-uploads",
+			Group:   GroupV1,
+
+			// RequireUser, and the third route in this file to explain why it is not the
+			// driver's. The caller is the awarded provider, checked against the accepted
+			// bid.
+			//
+			// **SHIP-122 needs the driver's version of this and it is not here**, which is a
+			// gap recorded in Docs/11 §3 rather than a decision. A driver-token route is
+			// served with the idempotency scope `anonymous` — the scope is computed
+			// group-wide, outside the middleware, while a guard runs per route inside it —
+			// and this response carries a URL that can write into the evidence bucket. That
+			// is the SHIP-44 shape the whole service was fixed for, and it stays shut until
+			// SHIP-121 settles the scope.
+			//
+			// # A pre-signed URL is minted here and spent nowhere in this service
+			//
+			// The same pairing as `/jobs/{id}/driver` above: this route hands out a
+			// credential and no route in the manifest accepts one. The bytes go straight to
+			// the object store (Docs/06 §5.2), so there is no upload endpoint to declare.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).PresignProofUpload() },
+		},
+		Route{
 			Method:  http.MethodGet,
 			Pattern: "/driver/jobs/{id}",
 			Group:   GroupV1,
@@ -120,6 +146,12 @@ func deliveryHandler(d Deps) *delivery.Handler {
 		jobLifecycle{jobs: newJobService(d)},
 		acceptedBids{},
 		driverTokenIssuer(d),
+		proofUploads(d),
+		delivery.UploadPolicy{
+			MaxBytes:             d.Config.Storage.MaxUploadBytes,
+			AcceptedContentTypes: d.Config.Storage.AcceptedContentTypes,
+			URLTTL:               d.Config.Storage.PresignTTL,
+		},
 		d.Clock,
 	)
 
@@ -128,6 +160,44 @@ func deliveryHandler(d Deps) *delivery.Handler {
 		panic("cmd/api: delivery handler: " + err.Error())
 	}
 	return handler
+}
+
+// proofUploads builds the signer behind POST /v1/jobs/{id}/proof-uploads (SHIP-114).
+//
+// # This is the only place the domain and the adapter meet, and neither names the other
+//
+// `delivery` declares delivery.ProofUploads in its own ports.go and imports nothing from
+// internal/platform; `storage` knows what a bucket is and has never heard of a job. Go satisfies
+// the interface structurally, so the two are joined by the assignment below and by the compile-time
+// assertion at the foot of this file — which is, as with the two ports above, the only place in the
+// build where that can be established at all.
+//
+// # Three of the nine configured values are read here and the other three in the policy above
+//
+// The split is not arbitrary: everything below describes the *store* — where it is, what it is
+// called, how to authenticate to it — and everything in [delivery.UploadPolicy] describes what the
+// platform will allow into it. The first is the adapter's business and the second is the domain's,
+// which is Docs/06 §4.1's division written as two structs.
+//
+// It panics for the reason driverTokenIssuer does: it runs during attach, from a Handler closure
+// with nowhere to put an error, and every failure it can report is a configuration fault that will
+// still be there after a restart. config.Load has already refused an unparseable endpoint, a
+// loopback host outside development, an implausible bucket name and an empty credential, so
+// reaching this means configuration produced something it validates against.
+func proofUploads(d Deps) *storage.S3 {
+	signer, err := storage.NewS3(storage.Options{
+		Endpoint:        d.Config.Storage.Endpoint,
+		Bucket:          d.Config.Storage.Bucket,
+		Region:          d.Config.Storage.Region,
+		AccessKeyID:     d.Config.Storage.AccessKeyID,
+		SecretAccessKey: d.Config.Storage.SecretAccessKey,
+		UsePathStyle:    d.Config.Storage.UsePathStyle,
+		Clock:           d.Clock,
+	})
+	if err != nil {
+		panic("cmd/api: proof upload signer: " + err.Error())
+	}
+	return signer
 }
 
 // driverTokenIssuer builds the signer of the driver's job-scoped link (SHIP-107).
@@ -389,6 +459,7 @@ func (acceptedBids) AwardedProvider(
 // place in the build where that can be established — delivery names neither type and neither type
 // names delivery, so nothing else links them.
 var (
-	_ delivery.Jobs   = jobLifecycle{}
-	_ delivery.Awards = acceptedBids{}
+	_ delivery.Jobs         = jobLifecycle{}
+	_ delivery.Awards       = acceptedBids{}
+	_ delivery.ProofUploads = (*storage.S3)(nil)
 )

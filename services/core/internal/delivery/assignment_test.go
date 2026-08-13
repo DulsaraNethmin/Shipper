@@ -176,9 +176,10 @@ func newTestService() *Service {
 //
 // One constructor rather than four literals, so that the driver token issuer SHIP-107 added arrives
 // in every one of them: a test built without one panics, which is the right answer and a tedious one
-// to rediscover four times.
+// to rediscover four times. SHIP-114's upload signer and policy arrive the same way.
 func newTestServiceWith(lifecycle Jobs) *Service {
-	return NewService(lifecycle, testAwards{}, testDriverIssuer(testClock()), testClock())
+	return NewService(lifecycle, testAwards{}, testDriverIssuer(testClock()),
+		&recordingUploads{}, testUploadPolicy(), testClock())
 }
 
 // newAccount inserts a user with the role the test needs.
@@ -744,27 +745,48 @@ func TestAJobPastDriverAssignedIsRefused(t *testing.T) {
 
 // TestNewServiceRefusesAMissingCollaborator.
 //
-// All four are load-bearing rules rather than conveniences: without Awards nobody is checked,
+// All six are load-bearing rules rather than conveniences: without Awards nobody is checked,
 // without Jobs the job never moves, without a token issuer an assignment produces no link for the
-// driver (SHIP-107), and without a clock a milestone recorded with no actor-supplied time has
-// nothing to be stamped from. A service that started without any of them would fail silently, in
-// production, at the first request.
+// driver (SHIP-107), without an upload signer or a usable policy proof cannot be captured at all
+// (SHIP-114), and without a clock a milestone recorded with no actor-supplied time has nothing to be
+// stamped from. A service that started without any of them would fail silently, in production, at
+// the first request.
 func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		jobs   Jobs
-		awards Awards
-		tokens *DriverTokenIssuer
-		clk    clock.Clock
+		name    string
+		jobs    Jobs
+		awards  Awards
+		tokens  *DriverTokenIssuer
+		uploads ProofUploads
+		policy  UploadPolicy
+		clk     clock.Clock
 	}{
 		{name: "no job lifecycle", jobs: nil, awards: testAwards{},
-			tokens: testDriverIssuer(testClock()), clk: testClock()},
+			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
+			policy: testUploadPolicy(), clk: testClock()},
 		{name: "no award lookup", jobs: staticJobs{move: JobMoved}, awards: nil,
-			tokens: testDriverIssuer(testClock()), clk: testClock()},
+			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
+			policy: testUploadPolicy(), clk: testClock()},
 		{name: "no driver token issuer", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
-			tokens: nil, clk: testClock()},
+			tokens: nil, uploads: &recordingUploads{},
+			policy: testUploadPolicy(), clk: testClock()},
+		{name: "nowhere to put proof", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
+			tokens: testDriverIssuer(testClock()), uploads: nil,
+			policy: testUploadPolicy(), clk: testClock()},
+		{name: "no size limit", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
+			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
+			policy: UploadPolicy{AcceptedContentTypes: []string{"image/jpeg"}, URLTTL: time.Minute},
+			clk:    testClock()},
+		{name: "no accepted content types", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
+			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
+			policy: UploadPolicy{MaxBytes: 1 << 20, URLTTL: time.Minute}, clk: testClock()},
+		{name: "no URL lifetime", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
+			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
+			policy: UploadPolicy{MaxBytes: 1 << 20, AcceptedContentTypes: []string{"image/jpeg"}},
+			clk:    testClock()},
 		{name: "no clock", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
-			tokens: testDriverIssuer(testClock()), clk: nil},
+			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
+			policy: testUploadPolicy(), clk: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer func() {
@@ -772,7 +794,7 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 					t.Error("NewService returned a service that cannot work")
 				}
 			}()
-			NewService(tc.jobs, tc.awards, tc.tokens, tc.clk)
+			NewService(tc.jobs, tc.awards, tc.tokens, tc.uploads, tc.policy, tc.clk)
 		})
 	}
 }

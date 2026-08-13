@@ -219,7 +219,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **481 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **493 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -363,6 +363,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
+| **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
@@ -5471,6 +5472,198 @@ object is removed. **Every assertion names the key this run created.** The stack
 bucket may be too, so the section fences on an id rather than on a count or a timestamp — which is
 `CLAUDE.md`'s Kafka rule, applied to the one shared service that can be isolated but is not obliged
 to be.
+
+### SHIP-114 — the upload the API is not in the path of, and the implementation that was deleted before it was written
+
+Five points, one endpoint, one adapter, **no migration and no table**. `POST /v1/jobs/{id}/proof-uploads`
+answers the awarded provider with a short-lived pre-signed URL and an object key; the client PUTs the
+photograph **to the object store**, and this service sees neither the request nor the bytes. That is
+`Docs/06` §5.2 read exactly, and it is the word the *Done when* turns on — "uploads **directly**" —
+so it is the one claim `scripts/verify/70-delivery.sh` checks three separate ways: the URL is
+asserted to be at `STORAGE_ENDPOINT` before it is used, the upload goes there, and the object is
+read back out of the bucket from inside the container.
+
+**The ticket had been struck in §6 for five consecutive waves** for want of a store to demonstrate
+against. SHIP-15p supplied it, and the pre-step earned its three points here: the two findings it
+recorded — that SigV4 signs the `host` header, and that there is no empty-endpoint state — were both
+load-bearing and neither cost this ticket an hour.
+
+#### The recorded question: `local.go` is dropped, and the filesystem implementation is not written
+
+SHIP-15p left this open deliberately and it is now decided. **`internal/platform/storage` holds one
+implementation, `s3.go`, used in every environment.** `doc.go` carries the reasoning; the four
+arguments are:
+
+- **The premise is gone.** That specification was written at SHIP-10, when development had no object
+  store. It has one now, so the implementation that runs in production is the one exercised locally
+  against genuine pre-signed-URL semantics — which is the argument `CLAUDE.md` already makes for
+  testing against a real PostgreSQL rather than a mocked repository, and the one SHIP-15p made for
+  putting a real store in compose rather than a stub.
+- **`Docs/06` §4.1's test is "does a second implementation exist today"**, and writing one so that
+  the answer becomes yes inverts the test into the thing it was written to refuse. Email and SMS
+  have two because console-versus-provider is a real operational difference — development must not
+  send mail to a person. Storage has no equivalent: writing a byte into a local bucket harms nobody.
+- **It would be a second signing scheme**, plus a verifier inside the API, plus a route serving the
+  bytes — and that last part contradicts the one rule this package states most firmly. A filesystem
+  implementation is not a second implementation of the same thing; it is a *different architecture*
+  that only development would ever run, which is the drift that produces "it worked locally".
+- **"A developer with no container running"** is answered the way it already is for PostgreSQL and
+  Redis: `make up`. The tests fail rather than skip without the stack, deliberately.
+
+**`Docs/06` §4.1's adapter table still says "Local storage in development, S3 deployed", and that row
+is now wrong.** Correcting it is a shared-file edit this branch may not make — **a request to
+whoever owns the wave**, not a commit.
+
+#### No SDK, and the reason is the architecture rather than `go.mod`
+
+The signature is about eighty lines of HMAC against the standard library. `aws-sdk-go-v2` was not
+taken, and the first reason is not the one a reader expects: **this package makes no request to the
+object store, ever.** There is no upload, download, listing or delete — only signing — so an SDK
+would contribute a transport, a retry policy and a credential chain that nothing here would call.
+The second reason is the rule: `go.mod` is a shared surface no domain branch may edit, so the
+dependency would have been a request rather than a commit. It did not decide the design, but it is
+what made the question worth asking first.
+
+**The algorithm is held to AWS's own published example** —
+`TestTheAWSExampleSignsToThePublishedSignature` reproduces the documented query-string request and
+its signature `aeeed9bb…`, a value nobody in this repository computed. Every other test here would
+still pass if the implementation were self-consistently wrong; that one would not. Beside it, the
+signer is exercised against the running MinIO, which is the only evidence that matters for the
+*Done when*.
+
+#### The type and the size are signed, which is what makes them enforcement rather than advice
+
+This is the design decision most worth reading. `STORAGE_MAX_UPLOAD_BYTES` and
+`STORAGE_ACCEPTED_CONTENT_TYPES` are checked before a URL is issued — and **that check on its own
+enforces nothing**, because the request it inspects carries no bytes. A URL signed over `host` alone
+authorises *any* body: a client could ask for a 200 KB JPEG, be told yes, and PUT four hundred
+megabytes of anything.
+
+So the URL signs `content-type` and `content-length` as well, and the client is told both back and
+must send them exactly. The store recomputes the signature over the headers the request actually
+carried, so an upload that changes either is refused with `403 SignatureDoesNotMatch` — **by the
+store, on the request that matters, with this service nowhere in the path**. `content-length` is the
+only bound available to a pre-signed PUT at all (S3's `content-length-range` belongs to the browser
+POST-policy form, a different protocol), which is why a client states the exact size rather than a
+maximum. It has the file; it knows.
+
+The consequence for the wire is that `content_type` comes back possibly re-spelled — lower-cased and
+trimmed — and a client that sends its own spelling gets a signature failure with no explanation. The
+contract says so at the top of the operation.
+
+#### What a retry returns, and why there is no row behind it
+
+**The middleware's replay is the whole of the guarantee, and here that is the right amount.** A
+repeat carrying the same `Idempotency-Key` never reaches the handler: the client gets the identical
+URL, the identical key and the identical `expires_at`, already running down. One intent bought one
+upload slot, and a retry must not extend the life of a credential nothing can revoke. Once the Redis
+entry has gone, a retry mints a **new** URL for a **new** object key.
+
+That is deliberately weaker than SHIP-111's arrangement, and the difference is what is durable.
+`RecordMilestone` needed a unique index because a second row would be a second *recorded fact* about
+the delivery. Here nothing was written the first time — no row, no object — so a second URL leaves at
+most one unreferenced object, and SHIP-115 is what decides which key is the job's proof.
+
+**A key derived from the idempotency key was considered and rejected**, and the rejection is the
+interesting half. It would make a retry return the same object key, which sounds better and is
+worse: a client holding an old key could ask for a fresh URL over an object that already holds
+proof, and **proof is evidence**. A key nothing can predict means an issued URL can only ever write
+an object that did not exist when it was signed. `TestEveryUploadGetsAKeyOfItsOwn` is what fails if
+somebody "fixes" the retry behaviour later.
+
+The key is `proof/<job>/<uuidv7>`, prefixed so it is legible in a log without a lookup, and **with no
+file extension** — an extension would have to come from a hard-coded content-type-to-suffix map that
+had to stay in step with a *configured* list, which is exactly the drift `Docs/06` §5.3 is about. The
+store already records the media type from the signed header.
+
+#### 200 rather than 201, and no migration at all
+
+Nothing is created. The platform holds no record of the URL and the bucket holds no object until the
+client PUTs one, so this answers `200` like `POST /v1/auth/login` — the other endpoint whose whole
+output is a credential. **SHIP-115 is the ticket that creates something**, and migrations `000603`
+onward are still unallocated: "uploaded proof is linked to a job and milestone with access control"
+is its *Done when*, not this one's, and a `proof` table written here would have been building into
+its way. `internal/platform/storage` likewise has no `PresignDownload`; reading proof back needs an
+authorisation check this package must not make and a consumer that does not exist (SHIP-115,
+SHIP-155). When one arrives it is four lines.
+
+#### What was needed of `internal/config` beyond SHIP-15p: nothing
+
+All nine fields were used and none was missing, which is the first time a wave-7 track can say that
+about a shared surface. The split is worth recording because it is not arbitrary: six describe the
+*store* and are read by `cmd/api` into `storage.Options`; three — `PresignTTL`, `MaxUploadBytes`,
+`AcceptedContentTypes` — describe what the platform will allow into it and are read into
+`delivery.UploadPolicy`. That is `Docs/06` §4.1's division of labour written as two structs, and it
+is why the adapter takes the TTL as an argument rather than holding it.
+
+#### Two edits outside this lane's own files, both minimal
+
+`cmd/api/routes_test.go` gained a `testStorageConfig()` beside the argon2 profile and the driver
+keyset already there, for the third instance of one cause: the delivery handler is built during
+attach from every test that constructs a router, and a signer that cannot sign stops the process.
+`config.Storage{}` has an empty endpoint and an empty endpoint is not a URL. **This is the shape
+SHIP-15p fixed in `routerWithApp` and did not fix here** — `testDeps` still substitutes a whole
+`config.Config` literal, so it collects a section per domain requirement. A guard like
+`TestTheAppFixtureOverwritesNothingButApp` cannot help, because this fixture *is* the base. Worth a
+§9 item rather than a fix from a domain branch.
+
+And `routes_golden.txt` gained one line. The sorted set was confirmed unchanged apart from the
+addition before `-update` was run.
+
+#### Mutation testing: seven mutations, seven caught, and one instructive survivor
+
+Each was reverted immediately and the revert confirmed with `git diff`.
+
+| Mutation | Result |
+|---|---|
+| Ignore the configured TTL and sign for the protocol maximum | **Caught** — four tests, including `TestAnExpiredURLIsRefused` against the real store |
+| Neuter the accepted-content-type check | **Caught** — four cases across the domain and the wire |
+| Neuter the size limit | **Caught** — two cases |
+| Remove the `awarded != providerID` check | **Caught** — `TestOnlyTheAwardedProviderGetsAnUploadURL`, both refusals, and the 404-parity test |
+| Sign `host` alone, dropping the two content headers | **Caught** — and by the test that matters: the *real store accepted a substituted content type and a longer body* |
+| Make the object key deterministic per job | **Caught** — `TestEveryUploadGetsAKeyOfItsOwn` |
+| Set `mc anonymous set download` on the bucket | **Caught** — twice, by `TestTheBucketHasNoPublicReadPath` and by `scripts/verify/00-stack.sh`'s SHIP-15p block |
+
+**The survivor is inside the fifth**, and it is worth naming rather than tuning away: with the signer
+reduced to `host` alone, **`internal/delivery`'s entire test package stays green.** That is correct —
+the domain's tests use a stub port, and a domain test that also signed could not fail on the
+condition that matters — but it means the enforcement claim has exactly two guards, both outside the
+domain: `internal/platform/storage`'s integration tests and `scripts/verify/70-delivery.sh`. Anybody
+who ever finds those slow and skips them has removed the check that the platform's upload limits are
+enforced at all, and no delivery test will say so.
+
+#### One thing recorded rather than built: SHIP-121 and SHIP-122 both need a driver-token *write*
+
+§9 already carries the mechanism — `httpx.SubjectScope` keys on the `authctx.Subject`, a driver
+token deliberately produces none, and the scope is computed group-wide **outside** `Idempotent`
+while a guard runs per route **inside** it, so a driver-token request scopes its idempotency key to
+`anonymous` whatever the guard does. Building this endpoint sharpens it from a scoping question into
+a concrete one, and the shape is now obvious enough to write down:
+
+- **SHIP-121** needs `POST /v1/driver/jobs/{id}/milestones`, `RequireDriverToken`, under `/driver/`
+  beside SHIP-108's read. The handler is `RecordMilestone` with `callerID` replaced by
+  `driverGrantFrom` and `Record.Actor` set to `ActorDriver` — which `000601` and `milestone.go`
+  already declare and nothing can yet reach. `delivery.Awards` is not consulted: a verified grant
+  *is* the authorisation, and the grant already names the job and the assignment.
+- **SHIP-122** needs the driver's version of this ticket's endpoint,
+  `POST /v1/driver/jobs/{id}/proof-uploads`, on the same guard.
+
+**Neither is built here, and the reason is not effort.** Both are state-changing, so both would land
+in the `anonymous` idempotency scope — and SHIP-122's response body *is a credential that can write
+into the evidence bucket*. That is precisely the cross-tenant read SHIP-44 was written to close, so
+the honest position is that **the scope has to be settled before either endpoint exists**, not
+alongside them. §9's two options stand: a second group-wide resolver a driver grant can populate
+with `SubjectScope` widened to read either, or an explicit decision that a job-scoped grant scopes on
+the job identifier already in the path. The first is right if a driver ever holds two links.
+
+`make verify` went from 481 checks to 493 across the same 13 sections, all twelve in
+`scripts/verify/70-delivery.sh`: the URL is issued, it points at the store and not at this API, it is
+short-lived by its own signed window, the client uploads with it, the bytes are read back out of the
+bucket, the object is refused unsigned, a substituted type or size is refused by the store, a
+provider who was not awarded the job gets a 404, a script container and an over-limit photograph are
+both refused with the field named, the request is refused without an `Idempotency-Key`, a retry
+replays the identical URL, and the object is removed. **Every assertion names the key it created**,
+because the bucket may be shared with four other worktrees.
 
 ## 4. Partly done — do not treat these as finished
 

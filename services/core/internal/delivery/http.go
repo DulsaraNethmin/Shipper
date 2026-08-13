@@ -430,6 +430,144 @@ func (h *Handler) RecordMilestone() http.Handler {
 	})
 }
 
+// proofUploadRequest is the body of POST /v1/jobs/{id}/proof-uploads.
+//
+//	{"content_type": "image/jpeg", "content_length": 1874233}
+//
+// **Both fields are signed into the URL**, which is why they are required and why neither is a
+// hint. A URL that did not bind them would authorise any body at all, and the platform's size limit
+// and accepted-type list would be advice the client gave itself (see [UploadPolicy]).
+//
+// `content_length` is the exact size, not a maximum. A pre-signed PUT has one bound available to it
+// and that is the signed `Content-Length` header, so an upload of any other size is refused by the
+// store. The client has the file, so it knows.
+//
+// There is no `job_id`, no `provider_id` and no `object_key`. The first two are the path and the
+// token; the third is the platform's to choose, and a client that could name the object it writes
+// to could name one that already holds somebody's proof.
+type proofUploadRequest struct {
+	ContentType   string `json:"content_type"`
+	ContentLength int64  `json:"content_length"`
+}
+
+// proofUploadResponse is one place to put one photograph.
+//
+// # It carries a credential, and it is scoped like one
+//
+// `upload_url` is the whole of the authorisation to write that object — anyone holding it can,
+// until `expires_at`, and nothing can revoke it. The idempotency middleware stores this response
+// under `idem:v1:user:<provider>:<key>` (SHIP-44), so even a replay reaches only the provider who
+// asked. That is the same property [assignmentResponse] relies on, stated again because neither
+// shape looks like a credential.
+//
+// # The two echoed fields are instructions rather than confirmations
+//
+// `content_type` and `content_length` are what the client **must** send on the PUT, byte for byte:
+// they are inside the signature. They are echoed rather than assumed because a client that
+// normalised its own media type differently — `IMAGE/JPEG`, or a `; charset=` parameter — would get
+// a signature failure from the store with no explanation, and the platform has already decided on
+// one spelling by the time it signs.
+//
+// The method is stated for the same reason. A PUT is not guessable from a `201`-shaped response
+// body, and SHIP-122's caller is a browser doing this by hand.
+type proofUploadResponse struct {
+	ObjectKey string `json:"object_key"`
+
+	UploadURL string `json:"upload_url"`
+	Method    string `json:"method"`
+
+	ContentType   string `json:"content_type"`
+	ContentLength int64  `json:"content_length"`
+
+	ExpiresAt string `json:"expires_at"`
+}
+
+func proofUploadFrom(u Upload) proofUploadResponse {
+	return proofUploadResponse{
+		ObjectKey: u.ObjectKey,
+
+		UploadURL: u.URL,
+		Method:    http.MethodPut,
+
+		ContentType:   u.ContentType,
+		ContentLength: u.ContentLength,
+
+		ExpiresAt: timestamp(u.ExpiresAt),
+	}
+}
+
+// PresignProofUpload handles POST /v1/jobs/{id}/proof-uploads (SHIP-114).
+//
+// # 200 rather than 201, and the difference is not pedantry
+//
+// Nothing was created. The platform holds no record of this URL, wrote no row and reserved no
+// object — the same request a minute later produces a different key, and the bucket is untouched
+// until the client PUTs. What happened is that a credential was issued, which is what
+// `POST /v1/auth/login` does and what it also answers `200` to. **SHIP-115 is the ticket that
+// creates something**: the record linking an uploaded object to a job and a milestone, at which
+// point the object becomes proof and the response that says so is a `201`.
+//
+// # POST on a read-shaped request, and it is state-changing enough to need a key
+//
+// It reads nothing and writes nothing, so `GET` was available and is wrong twice over: the request
+// carries a body the platform signs, and issuing a credential that cannot be revoked is not a safe
+// method whatever the database did. It therefore requires an `Idempotency-Key` like every other
+// state-changing route (SHIP-15), and what a retry gets is argued at [Service.PresignProofUpload] —
+// the short version is that the middleware replays the identical URL with its expiry already
+// running down, which is correct, because one intent bought one upload slot.
+//
+// # The bytes do not come back through here, and that is the ticket
+//
+// A successful response is the end of this service's involvement. The client PUTs to `upload_url`
+// directly (Docs/06 §5.2) and the API sees neither the request nor the photograph — which is what
+// `scripts/verify/70-delivery.sh` demonstrates by uploading to a host that is not the API's.
+func (h *Handler) PresignProofUpload() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req proofUploadRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		upload, err := h.svc.PresignProofUpload(r.Context(), pool, providerID, jobID, UploadRequest{
+			ContentType:   req.ContentType,
+			ContentLength: req.ContentLength,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Logged because the URL is otherwise invisible to operations: the upload it authorises
+		// never touches this service, so this line and the store's own access log are the only
+		// two records that it was issued. **The URL itself is not logged and never is** — it is
+		// the credential, and a log line carrying one is a credential in whatever collects the
+		// logs. The key and the expiry are what somebody reconciling a missing photograph wants.
+		httpx.LoggerFrom(r.Context()).Info("an upload URL was issued for proof of delivery",
+			slog.String("job_id", jobID.String()),
+			slog.String("object_key", upload.ObjectKey),
+			slog.String("content_type", upload.ContentType),
+			slog.Int64("content_length", upload.ContentLength),
+			slog.Time("expires_at", upload.ExpiresAt))
+
+		httpx.WriteJSON(w, http.StatusOK, proofUploadFrom(upload))
+		return nil
+	})
+}
+
 // driverJobResponse is what a driver's link opens (SHIP-108).
 //
 // # It is the assignment, and deliberately not the delivery
