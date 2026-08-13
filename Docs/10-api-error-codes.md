@@ -61,7 +61,7 @@ them where the call is made, beside the thing the user was trying to do.
 | `delivery_proof_already_recorded` | That photograph is already the proof for another milestone. Ask for a new upload URL and send it again. |
 | `delivery_proof_not_uploaded` | That photograph is not in the store yet. Finish uploading it to the URL you were given, then record the milestone again. |
 | `delivery_proof_rejected` | That file is not a photograph this platform accepts. Capture it again, and compress it if it is large. |
-| `delivery_proof_required` | A delivery is recorded with photo proof, or with a reason why there is none. Capturing either is not built yet, so 'delivered' cannot be recorded through this endpoint. |
+| `delivery_proof_required` | A delivery is recorded with photo proof, or with a reason why there is none. Send the object_key of a photograph you have uploaded, or one of the exception reasons, in this request's proof field. |
 | `fleet_duplicate_registration` | A vehicle with that registration is already in service in this fleet. Edit the existing one, or deactivate it first. |
 | `fleet_provider_only` | Only a provider account can keep a fleet. Customers publish jobs; they do not run vehicles. |
 | `identity_account_suspended` | The account has been suspended. Signing in is refused until support lifts it; contact support rather than retrying. |

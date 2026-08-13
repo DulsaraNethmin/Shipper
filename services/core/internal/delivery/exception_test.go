@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -521,5 +522,181 @@ func TestTheEvidenceFieldRefusesBothAndNeitherAtTheWire(t *testing.T) {
 
 	if n := milestoneCount(t, pool, jobID); n != 0 {
 		t.Errorf("%d milestone rows survived four refused requests", n)
+	}
+}
+
+// --- SHIP-118: Delivered requires proof or exception ---------------------------------------------
+//
+// The refusal — a delivery carrying neither — is
+// [TestDeliveredWithNeitherProofNorExceptionIsRefused] in recording_test.go, beside the other
+// milestone rules. What is here is the half that had never been reachable at all: `Delivered`
+// recorded *with* each kind of evidence, and the job moving because of it.
+
+// deliveredJob is a job driven honestly to 'In transit', which is the only status Docs/02 §2 offers
+// a route to 'Delivered' from.
+func deliveredJob(t *testing.T, pool *pgxpool.Pool, customer, provider uuid.UUID) uuid.UUID {
+	t.Helper()
+
+	jobID := awardedJob(t, pool, customer, provider)
+	moveJob(t, pool, jobID, jobs.User(jobs.ActorProvider, provider),
+		jobs.StatusEnRouteToPickup, jobs.StatusPickedUp, jobs.StatusInTransit)
+	return jobID
+}
+
+// TestADeliveryIsRecordedWithAPhotograph is the first half of what SHIP-118 opens.
+//
+// Every ticket from SHIP-114 built towards a `Delivered` that could carry something, and until this
+// one nothing could reach the status at all — there was no `MoveToDelivered` on the port, which was
+// half of the enforcement while neither kind of evidence existed.
+func TestADeliveryIsRecordedWithAPhotograph(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newAccount(t, pool, "deliv-photo-c@example.com", "+61400000818", "customer")
+	provider := newAccount(t, pool, "deliv-photo-p@example.com", "+61400000819", "provider")
+	jobID := deliveredJob(t, pool, customer, provider)
+
+	objects := newRecordingObjects()
+	svc := serviceReadingProofFrom(objects)
+
+	key, err := proofObjectKey(jobID)
+	if err != nil {
+		t.Fatalf("generating an object key: %v", err)
+	}
+	objects.holding(key, aPhotograph())
+
+	record, outcome, err := recordWithProof(t, pool, svc, provider, jobID,
+		Recording{Milestone: MilestoneDelivered, Key: theKey}, key)
+	if err != nil {
+		t.Fatalf("recording a photographed delivery: %v", err)
+	}
+	switch {
+	case outcome != OutcomeRecorded:
+		t.Fatalf("outcome = %s, want recorded", outcome)
+	case record.Milestone != MilestoneDelivered:
+		t.Fatalf("recorded %q, want Delivered", record.Milestone)
+	}
+
+	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusDelivered) {
+		t.Errorf("the job is %q, want Delivered — the milestone was recorded and moved nothing", got)
+	}
+	if n := proofCount(t, pool, jobID); n != 1 {
+		t.Errorf("%d evidence rows on a photographed delivery, want 1", n)
+	}
+	if n := historyCount(t, pool, jobID, jobs.StatusDelivered); n != 1 {
+		t.Errorf("%d transitions into Delivered; the move went round the guard", n)
+	}
+}
+
+// TestADeliveryIsRecordedWithAReasonedException is the other half, and it is the one Docs/01 §4.4
+// spends a paragraph on: a driver whose recipient objects, whose camera is denied, or who is
+// standing somewhere unlit must be able to finish the job.
+func TestADeliveryIsRecordedWithAReasonedException(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newAccount(t, pool, "deliv-exc-c@example.com", "+61400000820", "customer")
+	provider := newAccount(t, pool, "deliv-exc-p@example.com", "+61400000821", "provider")
+	jobID := deliveredJob(t, pool, customer, provider)
+
+	svc := serviceReadingProofFrom(newRecordingObjects())
+
+	_, outcome, err := recordWithException(t, pool, svc, provider, jobID,
+		Recording{Milestone: MilestoneDelivered, Key: theExceptionKey}, ExceptionRecipientObjected)
+	if err != nil {
+		t.Fatalf("recording a delivery evidenced by a reasoned exception: %v", err)
+	}
+	if outcome != OutcomeRecorded {
+		t.Fatalf("outcome = %s, want recorded", outcome)
+	}
+
+	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusDelivered) {
+		t.Errorf("the job is %q, want Delivered — an exception-completed delivery is a delivery", got)
+	}
+
+	// What SHIP-117 will query and what X-6 will be decided about, asserted here so that neither
+	// finds the fact missing.
+	var reason string
+	if err := pool.QueryRow(t.Context(), `
+		SELECT p.exception_reason
+		  FROM proofs p
+		  JOIN milestones m ON m.id = p.milestone_id
+		 WHERE p.job_id = $1 AND m.milestone = 'Delivered'`, jobID).Scan(&reason); err != nil {
+		t.Fatalf("the exception on the delivered milestone is not joinable: %v", err)
+	}
+	if reason != string(ExceptionRecipientObjected) {
+		t.Errorf("the delivered milestone's reason is %q, want %q", reason, ExceptionRecipientObjected)
+	}
+}
+
+// TestTheDeliveredRuleIsTheDatabase'sToo — the Go check removed, driven where it cannot be.
+//
+// The two layers are exercised separately on purpose. This one writes the milestone with no
+// evidence directly, inside a transaction, exactly as a future writer that had not read
+// [Service.RecordMilestone] would; the domain's refusal never runs.
+//
+// migrations/proofs_test.go holds the same rule with a fuller table. It is repeated here because
+// this is the package whose function is the first layer, and a reader deciding whether that
+// function may be simplified should find the answer beside it.
+func TestTheDeliveredRuleIsAlsoTheDatabases(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newAccount(t, pool, "deliv-db-c@example.com", "+61400000822", "customer")
+	provider := newAccount(t, pool, "deliv-db-p@example.com", "+61400000823", "provider")
+	jobID := deliveredJob(t, pool, customer, provider)
+
+	tx, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("beginning: %v", err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+
+	if _, err := tx.Exec(t.Context(), `
+		INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
+		VALUES ($1, $2, 'Delivered', 'provider', $3, now())`,
+		uuid.Must(uuid.NewV7()), jobID, provider); err != nil {
+		t.Fatalf("the insert itself must succeed — the trigger is deferred so that evidence can "+
+			"be written second: %v", err)
+	}
+
+	if err := tx.Commit(t.Context()); err == nil {
+		t.Fatal("a delivered milestone with nothing behind it was committed past the domain " +
+			"entirely; CLAUDE.md's invariant would then hold only for callers who check")
+	}
+}
+
+// TestADeliveryWithNothingBehindItIsRefusedAtTheWire is SHIP-118's *Done when* on the wire, with the
+// code a client branches on.
+func TestADeliveryWithNothingBehindItIsRefusedAtTheWire(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newAccount(t, pool, "http-deliv-c@example.com", "+61400000824", "customer")
+	provider := newAccount(t, pool, "http-deliv-p@example.com", "+61400000825", "provider")
+	jobID := deliveredJob(t, pool, customer, provider)
+
+	router := newTestRouterFor(t, pool, serviceReadingProofFrom(newRecordingObjects()))
+
+	rec := recordAs(t, router, provider, jobID, theKey, `{"milestone": "delivered"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("a delivery with nothing behind it answered %d, want 409 (%s)", rec.Code, rec.Body)
+	}
+	if code := decode[errorEnvelope](t, rec).Error.Code; code != string(CodeProofRequired) {
+		t.Errorf("code = %q, want %q", code, CodeProofRequired)
+	}
+
+	if n := milestoneCount(t, pool, jobID); n != 0 {
+		t.Errorf("%d milestone rows survived a refused delivery", n)
+	}
+	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusInTransit) {
+		t.Errorf("the job is %q, want In transit — it reached Delivered with no evidence", got)
+	}
+
+	// The same request with a reason in it is accepted, so the refusal above is not the endpoint
+	// being broken for `delivered` in general.
+	rec = recordAs(t, router, provider, jobID, theExceptionKey,
+		`{"milestone": "delivered", "proof": {"exception_reason": "location_unsafe"}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("a delivery with a reasoned exception answered %d, want 201 (%s)", rec.Code, rec.Body)
+	}
+	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusDelivered) {
+		t.Errorf("the job is %q after an accepted delivery, want Delivered", got)
 	}
 }

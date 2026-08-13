@@ -1258,3 +1258,100 @@ ok "both together, neither, and a reason nobody published are each refused with 
 [[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from proofs where job_id = '$exc_job';")" == "1" ]] \
   || fail "a refused request left evidence behind on the job"
 ok "and none of the three refusals wrote anything"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-118  Delivered is refused with neither proof nor an exception, and accepted with either"
+
+# # What only this section can show
+#
+# CLAUDE.md's invariant — "Delivered requires photo proof or a recorded exception reason — never
+# neither" — end to end on the running binary, through the composition root's own `MoveToDelivered`.
+# The Go tests hold both layers separately; this is where they are the same platform.
+#
+# The `In transit → Delivered` transition is cmd/api's `jobLifecycle` translating the guard, and it
+# was the one move `delivery.Jobs` deliberately did not declare until this ticket. A wiring that
+# reached Delivered without the domain's check, or a domain check with no wiring behind it, would
+# both pass every Go test in internal/delivery and fail here.
+
+deliv_job="$(delivery_awarded_job delivered)"
+# One call per step rather than a loop over pairs: three of the four statuses contain a space, so
+# anything that word-splits them writes "En" into job_status_history and the CHECK refuses it.
+delivery_move "$deliv_job" Awarded "En route to pickup"
+delivery_move "$deliv_job" "En route to pickup" "Picked up"
+delivery_move "$deliv_job" "Picked up" "In transit"
+
+# --- neither, which is the refusal the invariant is ---------------------------------------------
+
+status="$(record_milestone_on "$deliv_job" "verify-p118-neither-$$" \
+  '{"milestone":"delivered"}' deliv-neither)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/p115-deliv-neither.json"; fail "a delivery with nothing behind it answered $status, want 409"; }
+[[ "$(json "$WORKDIR/p115-deliv-neither.json" '["error"]["code"]')" == "delivery_proof_required" ]] \
+  || { cat "$WORKDIR/p115-deliv-neither.json"; fail "expected code=delivery_proof_required"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$deliv_job';")" == "In transit" ]] \
+  || fail "the job reached Delivered with neither a photograph nor a reason"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$deliv_job';")" == "0" ]] \
+  || fail "a milestone row survived a refused delivery"
+ok "a delivery recorded with neither a photograph nor a reason is refused, the job does not move, and nothing is written — CLAUDE.md's invariant, demonstrated"
+
+# The database's own copy of it, past the service entirely. The insert succeeds and the COMMIT is
+# what fails, which is why the trigger is deferred: evidence points at the milestone, so it can only
+# ever be written second.
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
+BEGIN;
+INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
+VALUES (gen_random_uuid(), '$deliv_job', 'Delivered', 'provider', '$delivery_provider_id', now());
+COMMIT;
+SQL
+then
+  fail "a delivered milestone was committed in raw SQL with nothing behind it"
+fi
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$deliv_job';")" == "0" ]] \
+  || fail "the refused transaction left a milestone behind"
+ok "and the same row is refused in raw SQL at COMMIT — the rule holds for a writer that never read the service"
+
+# --- a reasoned exception, which is the whole of Docs/01 §4.4's second path ---------------------
+
+status="$(record_milestone_on "$deliv_job" "verify-p118-exc-$$" \
+  '{"milestone":"delivered","reason":"handed over at the loading dock","proof":{"exception_reason":"location_unsafe"}}' \
+  deliv-exc)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/p115-deliv-exc.json"; fail "a delivery evidenced by a reasoned exception answered $status, want 201"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$deliv_job';")" == "Delivered" ]] \
+  || fail "the job did not move to Delivered on an accepted delivery"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+   "select count(*) from job_status_history where job_id = '$deliv_job' and to_status = 'Delivered';")" == "1" ]] \
+  || fail "the move to Delivered left no history row; it went round the guard"
+ok "the same delivery with a reason in place of the photograph is accepted, and the job moves through the transition guard"
+
+# What SHIP-117 will read and what X-6 will be decided about — asserted here so neither finds it
+# missing. Nothing in this section flags the job or completes it: both are those tickets'.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+   "select p.exception_reason from proofs p join milestones m on m.id = p.milestone_id
+     where p.job_id = '$deliv_job' and m.milestone = 'Delivered';")" == "location_unsafe" ]] \
+  || fail "an exception-completed delivery cannot be found by joining its evidence to its milestone"
+ok "and an exception-completed job is identifiable by a join, which is what SHIP-117's queue and X-6's decision both start from"
+
+# --- a photograph, which is the ordinary path ---------------------------------------------------
+
+deliv_photo_job="$(delivery_awarded_job delivered-photo)"
+delivery_move "$deliv_photo_job" Awarded "En route to pickup"
+delivery_move "$deliv_photo_job" "En route to pickup" "Picked up"
+delivery_move "$deliv_photo_job" "Picked up" "In transit"
+
+deliv_key="$(proof_url_for "$deliv_photo_job" deliv "$WORKDIR/p118-url.json")"
+upload_to "$WORKDIR/p118-url.json" "$WORKDIR/p115-proof.bin"
+
+status="$(record_milestone_on "$deliv_photo_job" "verify-p118-photo-$$" \
+  "{\"milestone\":\"delivered\",\"proof\":{\"object_key\":\"$deliv_key\"}}" deliv-photo)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/p115-deliv-photo.json"; fail "a photographed delivery answered $status, want 201"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$deliv_photo_job';")" == "Delivered" ]] \
+  || fail "a photographed delivery did not move the job"
+ok "and a delivery evidenced by a photograph is accepted the same way — both halves of the invariant reach Delivered, and nothing else does"
+
+"${COMPOSE[@]}" exec -T minio sh -c \
+  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; \
+   mc rm --force "local/'"$STORAGE_BUCKET/$deliv_key"'" >/dev/null 2>&1 || true' \
+  || fail "could not remove the object this section uploaded"
+ok "the object this section uploaded was removed from $STORAGE_BUCKET"

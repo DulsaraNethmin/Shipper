@@ -312,16 +312,21 @@ Milestones:
       and a delivery that runs to plan produces both. **The response does not echo the job's
       status** — read the job if you need it.
 
-      `driver_assigned` is recorded by `POST /v1/jobs/{id}/driver` rather than here. `delivered` is
-      still refused: both kinds of evidence can now be captured — a photograph and a reasoned
-      exception — and whether a delivery may be recorded at all is a separate rule that is not built
-      yet. See the responses below.
+      `driver_assigned` is recorded by `POST /v1/jobs/{id}/driver` rather than here.
 
-      ## Evidence, on any milestone
+      ## Evidence, on any milestone — and required on one
 
       Any milestone may carry `proof`: the photograph you uploaded, or one of three reasons there is
       none. A driver whose camera permission is denied at a pickup is in the same position as one at
       a delivery, so the exception is not reserved for the last milestone. See `ProofAttachment`.
+
+      **`delivered` is the one that requires it.** A delivery recorded with neither a photograph nor
+      a reason there is none is refused with `409 delivery_proof_required`, nothing is written, and
+      the job does not move. There is no retry that helps: send one or the other.
+
+      This is the platform's oldest promise about a delivery and it is enforced twice — once here,
+      so you are told which of the two to send, and once in the database, so it holds whatever writes
+      the record.
 
       ## Two clocks, and you must send the first one when they differ
 
@@ -421,7 +426,7 @@ Milestones:
           | `error.code` | What happened |
           |---|---|
           | `delivery_milestone_not_permitted` | The delivery has not reached this milestone yet. Keep the update and retry it once it has — see above. A milestone the job has already *passed* is recorded rather than refused |
-          | `delivery_proof_required` | `delivered` needs photo proof or a recorded exception. Both can now be captured; recording a delivery at all is not built yet |
+          | `delivery_proof_required` | `delivered` was sent with neither a photograph nor a reason there is none. Send one of the two in `proof`; retrying unchanged will not help |
           | `idempotency_key_reused` | This key already recorded a *different* milestone on this job. Generate a new one |
           | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
         headers:
@@ -470,9 +475,8 @@ MilestoneRecording:
         Which milestone. `driver_assigned` is deliberately absent: a driver is put on a job through
         `POST /v1/jobs/{id}/driver`, which is a different act with a record of its own.
 
-        `delivered` is accepted by the schema and refused by the platform until SHIP-118 decides
-        what a delivery must carry. It is listed because it is a real milestone and the client that
-        will send it is being built against this document.
+        `delivered` requires `proof` — a photograph or a reasoned exception — and is refused with
+        `409 delivery_proof_required` without one. The other three accept it and do not require it.
       example: picked_up
     recorded_at:
       type: string

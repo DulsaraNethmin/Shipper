@@ -1147,8 +1147,11 @@ func apiError(err error) error {
 				"for each action.", httpx.HeaderIdempotencyKey).WithCause(err)
 
 	case errors.Is(err, ErrProofRequired):
+		// 409 rather than 422, and the difference is which thing is wrong: the body is a
+		// perfectly good milestone recording. What it contradicts is a rule about deliveries,
+		// and a client fixes it by capturing something rather than by correcting a field.
 		return httpx.NewError(http.StatusConflict, CodeProofRequired,
-			"A delivery cannot be recorded without proof, and capturing proof is not built yet.").
+			"A delivery is recorded with a photograph, or with a reason there is none.").
 			WithCause(err)
 
 	case errors.Is(err, ErrProofNotForThisJob):

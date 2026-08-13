@@ -219,7 +219,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **514 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **520 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -366,6 +366,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
 | **SHIP-115** | M4 | `proofs` and `GET /v1/jobs/{id}/delivery/proof` — an uploaded object becomes evidence for **one recorded milestone**, and the customer and the awarded provider read it back through short-lived signed URLs issued *after* an authorisation check. Because the platform is not in the upload path it **asks the store whether the object arrived** rather than believing the client, and records what the store reports — which is also what finally puts SHIP-114's upload limits under a guard inside the domain — *see below* |
 | **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
+| **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
@@ -5953,6 +5954,128 @@ and a checksum.
 interaction at all, the row holds the reason and four NULLs, the table refuses both-and-neither in
 raw SQL, the customer and the awarded provider each read the reason with no URL, and both-together,
 neither and an unpublished reason are each refused with the field named and the three published.
+
+### SHIP-118 — the invariant stops being intended
+
+`Delivered` is recordable, and refused when it carries neither a photograph nor a reasoned
+exception. `delivery.Jobs` gains `MoveToDelivered`, `Service.RecordMilestone`'s blanket refusal
+becomes a condition, and migration `000605` adds a deferred constraint trigger.
+
+**This is the ticket the four before it were for.** SHIP-114 put a photograph in a bucket, SHIP-115
+made it evidence, SHIP-116 gave a delivery that could not be photographed something to say instead —
+and none of them could reach `Delivered` at all. `CLAUDE.md` has listed "Delivered requires photo
+proof or a recorded exception reason — never neither" as an invariant since before any of it existed,
+and `Docs/02` §3's own line has had no enforcement since the status model was written.
+
+#### The missing port method was half the enforcement, and it is deliberately given up
+
+`cmd/api/routes_delivery.go` said it plainly: "a method here would be a way to reach that status
+without either… having no method behind it as well means the refusal cannot be removed by editing
+one file." That was right while nothing could be captured, and it is the wrong shape now — a status
+nobody can reach is not a rule, it is an absence.
+
+So the second layer is a real one instead:
+
+```sql
+CREATE CONSTRAINT TRIGGER milestones_delivered_has_evidence
+    AFTER INSERT ON milestones
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW WHEN (NEW.milestone = 'Delivered')
+    EXECUTE FUNCTION milestones_delivered_needs_evidence();
+```
+
+**Deferred, because the evidence points at the milestone and can therefore only be written second.**
+An ordinary `AFTER INSERT` trigger fires between the two statements and refuses every honest delivery
+there is — which is not a hypothetical: making it `NOT DEFERRABLE` fails nine tests. Deferring moves
+the check to `COMMIT`, which is the first moment the question is answerable at all.
+
+`WHEN (NEW.milestone = 'Delivered')` keeps the other four free of it. `Docs/01` §4.4 requires a
+photograph of one moment, not of five.
+
+#### Two layers, and each one is for something the other cannot do
+
+| Layer | What it is for |
+|---|---|
+| `Service.RecordMilestone` | The answer a client can act on: `409 delivery_proof_required`, pointing at the camera and the exception path beside it. Nothing is written — not even a row the transaction later unwinds |
+| `000605`'s trigger | The rule surviving a writer that never read that function. SHIP-121 gives the driver's portal a milestone endpoint, SHIP-113 rewrites the switch deciding what an administrative conflict does with one, and `cmd/worker` already applies transitions on a timer |
+
+Removing the Go check leaves the invariant standing and the API broken — a `500` with a constraint
+name where a `409` should be, which is exactly what `Docs/10` §4.6 says a constraint is a bad
+explanation for. That is not a hypothetical either; it is what the mutation run produced, and four
+named tests report it.
+
+**The trigger has no actor exemption**, and that is a decision rather than an oversight. `Docs/02` §3
+lets an administrator record a delivery "acting with an audit reason"; `CLAUDE.md`'s invariant has no
+"unless" in it, so an administrator recording one needs evidence like anybody else. Two SHIP-110
+tests recorded a `Delivered` milestone as a convenient arbitrary value and now record `In transit`
+instead, each with a line saying why.
+
+#### The ordering with SHIP-112's absorption, which is where this could have gone wrong
+
+The check sits **in front of the insert**, and since SHIP-112 that placement carries weight it did
+not have before. Absorption *commits* a milestone whose move was refused — so a `Delivered` reaching
+the switch on a job that has already been there would be kept rather than unwound.
+`TestAbsorptionCannotReachDelivered` drives precisely that job, and it is one of the four tests that
+fail if the condition is removed.
+
+The other direction is unchanged and worth stating: a **late** `Delivered` that does carry evidence
+is now absorbed like any other late milestone, keeps its photograph or its reason, and moves nothing.
+That is `Docs/02` §3.1 read exactly, and it is what SHIP-115's decision to hang proof off the
+milestone bought.
+
+#### What this does *not* build, and the document it would otherwise contradict
+
+`Docs/01` §4.4 requires a delivered job to carry a **recipient name** and a **delivery note** as well
+as proof, and `Docs/02` §3 repeats it. **Neither is captured, and this ticket opens `Delivered`
+without them.** That is recorded here rather than resolved quietly:
+
+- SHIP-123's *Done when* is "recipient name, note, and proof captured; portal becomes read-only
+  after", and it **depends on SHIP-118**. The field set is therefore behind this ticket in build
+  order, and capturing it here would be building SHIP-123's API half inside this one.
+- What SHIP-118 is judged on is the clause `CLAUDE.md` calls an invariant, and that clause is closed
+  end to end.
+- `milestones.reason` is a plausible home for the delivery note and was **not** quietly reused for
+  it. It is the actor's optional note on any milestone; making it mean something specific on one
+  would be the drift `Docs/06` §5.3 is written about.
+
+Whoever takes SHIP-123 should expect to add both columns and to make them required for `Delivered`,
+beside the evidence rule rather than instead of it.
+
+#### SHIP-117 and X-6 are unblocked and untouched
+
+Both now have something to work on that did not exist an hour ago: **an exception-completed job**.
+The join is `proofs.exception_reason IS NOT NULL` against the job's `Delivered` milestone, indexed by
+SHIP-116's `idx_proofs_exception`, and `70-delivery.sh` asserts it end to end so that neither ticket
+finds the fact missing.
+
+Neither is answered here. Nothing flags a job for moderation and nothing completes one; X-6's
+question — whether a job completed through the exception path may auto-complete under `Docs/02` §6.1
+— is a decision for operations, and the schema branches either way without a column changing.
+
+#### What was needed of `internal/config`: nothing
+
+No setting, no limit and no lifetime. The two requests standing are still SHIP-115's
+`STORAGE_DOWNLOAD_TTL` and SHIP-116's note that the *words* beside the three exception reasons are
+copy rather than vocabulary, and belong server-side rather than compiled into Dart.
+
+#### Mutation testing: four mutations, four caught
+
+Each was reverted immediately, by copy rather than by `git checkout`, and confirmed with `git diff`
+and a checksum.
+
+| Mutation | Result |
+|---|---|
+| **Remove the refusal itself** — `Delivered` with neither is recorded | **Caught, by four named tests**, and the way it fails is the finding. `TestDeliveredWithNeitherProofNorExceptionIsRefused` and `TestAbsorptionCannotReachDelivered` both report `a delivered milestone needs photo proof or a recorded exception` **from the COMMIT**, and `TestADeliveryWithNothingBehindItIsRefusedAtTheWire` gets a `500` where a `409` belongs. The invariant holds; the API stops being usable |
+| `Recording.hasEvidence` always true | **Caught** — ten tests, most of them nothing to do with deliveries: every milestone then tries to write an evidence row it does not have, and `ErrEvidenceNotCoherent` refuses it. A mutation that fails loudly and far from its own subject, which is the shape a shared helper produces |
+| The trigger is never created | **Caught** — `TestTheDeliveredRuleIsAlsoTheDatabases` in the domain and `TestADeliveredMilestoneCannotBeWrittenWithoutEvidence` in `migrations`, and **nothing else**. Every path through the service still refuses, which is exactly why the second layer needs a test that goes round the service |
+| The trigger is `NOT DEFERRABLE` | **Caught** — nine tests. Evidence points at the milestone, so it is written second; a trigger that fires between the two statements refuses every honest delivery. The deferral is load-bearing rather than tidy |
+
+`make verify` went from 514 checks to 520 across the same 13 sections, all six in
+`scripts/verify/70-delivery.sh`: a delivery with neither is refused with the job unmoved and nothing
+written, the same row is refused in raw SQL at `COMMIT`, a delivery evidenced by a reasoned exception
+is accepted and moves the job through the transition guard leaving one history row, the
+exception-completed job is findable by the join SHIP-117 and X-6 both start from, and a delivery
+evidenced by a photograph is accepted the same way.
 
 ## 4. Partly done — do not treat these as finished
 

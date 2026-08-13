@@ -402,7 +402,7 @@ func (s *Service) refused(err error) (Assignment, DriverToken, bool, error) {
 //  1. nothing recorded, and nothing said, without an idempotency key: [ErrNoIdempotencyKey];
 //  2. a job nobody was awarded, or no job at all: [ErrJobNotFound];
 //  3. a job awarded to another provider: [ErrNotAwardedProvider];
-//  4. 'Delivered', until proof can be captured: [ErrProofRequired];
+//  4. 'Delivered' carrying neither a photograph nor a reasoned exception: [ErrProofRequired];
 //  5. a milestone the job has not reached the point for: [ErrMilestoneNotPermitted].
 //
 // The customer of the job is refused by (2) and (3) like any other stranger, which is Docs/02 §3
@@ -488,20 +488,29 @@ func (s *Service) RecordMilestone(
 			jobID, awarded, providerID, ErrNotAwardedProvider))
 	}
 
-	// Checked in front of the insert, so nothing is written for a 'Delivered' at all.
+	// **CLAUDE.md's invariant, and SHIP-118 is the ticket that turns it from intended into
+	// enforced.** "Delivered requires photo proof or a recorded exception reason — never neither."
 	//
-	// **This is the first of three layers, and mutation testing was what established the order
-	// of them.** Moving this check to *after* the insert changes nothing today, because it still
-	// returns an error and the transaction still rolls the row back — and because [Service.moveFor]
-	// has no case for 'Delivered' either, so one reaching the switch below would fail there. What
-	// SHIP-112 changes is that a case in that switch now *commits* rather than rolling back, so the
-	// layer that has to hold is the one that keeps a delivered milestone from reaching it. Only
-	// removing this check **and** giving 'Delivered' a move that answers [JobAlreadyPast] produces
-	// a delivered milestone with neither photo proof nor an exception behind it — which is what
-	// SHIP-118 will be editing, and the shape TestAbsorptionCannotReachDelivered exists to catch.
-	if recording.Milestone == MilestoneDelivered {
-		return notRecorded(fmt.Errorf("delivery: %s cannot be recorded delivered yet: %w",
-			jobID, ErrProofRequired))
+	// Checked in front of the insert, so a delivery with nothing to show for it writes no row at
+	// all — not even one the transaction later rolls back. The ordering matters more since
+	// SHIP-112 than it did before it: absorption *commits* a milestone whose move was refused, so
+	// a 'Delivered' that reached the switch below on a job that has already been there would be
+	// kept rather than unwound. TestAbsorptionCannotReachDelivered drives exactly that job.
+	//
+	// It is one of two layers and neither is decorative. 000605's deferred constraint trigger
+	// refuses a 'Delivered' milestone with no `proofs` row at commit, whoever wrote it — which is
+	// what makes this a property of the platform rather than of this function. What *this* layer
+	// buys is the answer a client can act on: `delivery_proof_required` names the camera and the
+	// exception path beside it, where the constraint would give a name and a 500 (Docs/10 §4.6).
+	//
+	// **Docs/01 §4.4 numbers more than this.** A delivered job also requires a recipient name and
+	// a delivery note, and neither is captured by any endpoint yet; SHIP-123 is the ticket whose
+	// *Done when* names them ("recipient name, note, and proof captured") and it depends on this
+	// one. Docs/11 §3 records the gap rather than leaving the document and the code to disagree
+	// quietly.
+	if recording.Milestone == MilestoneDelivered && !recording.hasEvidence() {
+		return notRecorded(fmt.Errorf("delivery: %s cannot be recorded delivered with neither a "+
+			"photograph nor a reason there is none: %w", jobID, ErrProofRequired))
 	}
 
 	recordedAt := recording.RecordedAt
@@ -658,10 +667,14 @@ func (s *Service) alreadyRecorded(
 // moveFor runs the transition a milestone implies, through the port method that names it.
 //
 // A switch rather than a map, so that a milestone with no move is a compile-time-visible case
-// rather than a missing key that reads as zero. The two milestones with no case here are refused
-// before this is reached — 'Driver assigned' by [Recording.problems] and 'Delivered' by
-// [ErrProofRequired] — and reaching it with either would mean one of those checks had been removed,
-// which is worth an error rather than a silent no-op.
+// rather than a missing key that reads as zero. The one milestone with no case here is
+// 'Driver assigned', refused by [Recording.problems] before this is reached, and reaching it would
+// mean that check had been removed — which is worth an error rather than a silent no-op.
+//
+// **'Delivered' gained a case at SHIP-118 and did not gain a condition here**, deliberately.
+// Whether the delivery has anything to show for itself was decided above, before the milestone was
+// inserted; repeating it at the move would be a second copy of a rule with no way to keep the two
+// in step, and the copy that ran later would be the one that mattered.
 func (s *Service) moveFor(
 	ctx context.Context,
 	r db.Runner,
@@ -676,6 +689,8 @@ func (s *Service) moveFor(
 		return s.jobs.MoveToPickedUp(ctx, r, jobID, providerID, recordedAt)
 	case MilestoneInTransit:
 		return s.jobs.MoveToInTransit(ctx, r, jobID, providerID, recordedAt)
+	case MilestoneDelivered:
+		return s.jobs.MoveToDelivered(ctx, r, jobID, providerID, recordedAt)
 	default:
 		return JobMoveUnrecognised, fmt.Errorf("delivery: %s implies no move this domain can ask for: %w",
 			m, ErrJobMoveUnrecognised)

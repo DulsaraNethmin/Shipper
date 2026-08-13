@@ -330,11 +330,12 @@ func (l jobLifecycle) MoveToDriverAssigned(
 // and nowhere else.** `delivery` names milestones, this names statuses, and the mapping between the
 // two vocabularies lives in the composition root where both are visible.
 //
-// `Delivered` is deliberately absent. Docs/01 §4.4 makes photo proof or a recorded exception the
-// condition of recording one, neither can be captured until SHIP-114…SHIP-116, and a method here
-// would be a way to reach that status without either. The delivery domain refuses it in front of
-// this (delivery.ErrProofRequired); having no method behind it as well means the refusal cannot be
-// removed by editing one file.
+// **`Delivered` was deliberately absent until SHIP-118, and this is where that ends.** While
+// neither photo proof nor a reasoned exception could be captured, having no method here meant the
+// refusal could not be removed by editing one file. Both can be captured now (SHIP-115, SHIP-116),
+// so the refusal has a condition rather than being unconditional, and what replaces this method's
+// absence as the second layer is a database constraint: 000605 refuses a `Delivered` milestone with
+// no `proofs` row at commit, whoever wrote it and through whatever code path.
 //
 // RecordedAt is the actor's clock, passed through to job_status_history's actor_recorded_at. The
 // transition and the milestone that caused it are one act, and the pair of rows they leave must
@@ -378,6 +379,26 @@ func (l jobLifecycle) MoveToInTransit(
 	return l.move(ctx, r, jobs.Move{
 		JobID:      jobID,
 		To:         jobs.StatusInTransit,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: recordedAt,
+	})
+}
+
+// MoveToDelivered is `In transit → Delivered` (SHIP-118).
+//
+// Identical in shape to the three above, which is the point: whether the delivery has anything to
+// show for itself was decided in `delivery` before this was called, and the transition table has no
+// opinion about it. Docs/02 §2's condition on this row — "proof-of-delivery data recorded, or a
+// reasoned exception recorded" — is a fact about `proofs`, and `jobs` has never heard of that table.
+func (l jobLifecycle) MoveToDelivered(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+	recordedAt time.Time,
+) (delivery.JobMove, error) {
+	return l.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusDelivered,
 		Actor:      jobs.User(jobs.ActorProvider, providerID),
 		RecordedAt: recordedAt,
 	})

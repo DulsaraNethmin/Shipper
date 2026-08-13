@@ -330,4 +330,27 @@ type Jobs interface {
 	// the actor's path and is not widened to carry an actor type it would only ever be given one
 	// value of.
 	MoveToInTransit(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+
+	// MoveToDelivered is `In transit → Delivered` (SHIP-118).
+	//
+	// # It is the fifth method, and its absence used to be half of the enforcement
+	//
+	// SHIP-111 deliberately left it out, and cmd/api's own comment said why: "a method here would
+	// be a way to reach that status without either [proof or an exception]… having no method
+	// behind it as well means the refusal cannot be removed by editing one file." That was the
+	// right arrangement while neither kind of evidence could be captured. Both can now, so the
+	// refusal has a condition instead of being unconditional, and the condition is
+	// [Service.RecordMilestone]'s to check.
+	//
+	// **What replaces the missing method as the second layer is a database constraint** —
+	// 000605's deferred trigger, which refuses a `Delivered` milestone with no `proofs` row at
+	// commit whoever wrote it. A rule that lives in one function is a rule the next function does
+	// not have; this one now lives in the domain, in the schema, and in
+	// scripts/verify/70-delivery.sh against the running binary.
+	//
+	// Docs/02 §2's condition on this row — "proof-of-delivery data recorded, or a reasoned
+	// exception recorded" — is deliberately not `jobs`' to check. The transition table says which
+	// moves exist; what a delivery must carry is this domain's, and asking `jobs` to know about
+	// `proofs` would be the import the lint refuses.
+	MoveToDelivered(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
 }

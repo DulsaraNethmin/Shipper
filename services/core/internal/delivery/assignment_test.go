@@ -78,6 +78,15 @@ func (j testJobs) MoveToInTransit(ctx context.Context, r db.Runner, jobID, provi
 	})
 }
 
+func (j testJobs) MoveToDelivered(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
+	return j.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusDelivered,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: at,
+	})
+}
+
 func (j testJobs) move(ctx context.Context, r db.Runner, m jobs.Move) (JobMove, error) {
 	_, err := j.svc.Transition(ctx, r, m)
 
@@ -156,6 +165,10 @@ func (s staticJobs) MoveToPickedUp(context.Context, db.Runner, uuid.UUID, uuid.U
 }
 
 func (s staticJobs) MoveToInTransit(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+	return s.move, s.err
+}
+
+func (s staticJobs) MoveToDelivered(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 

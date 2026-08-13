@@ -82,18 +82,18 @@ var (
 	// make "once per key" false.
 	ErrIdempotencyKeyReused = errors.New("delivery: that idempotency key already recorded a different milestone")
 
-	// ErrProofRequired means a delivery was recorded with nothing to show for it.
+	// ErrProofRequired means a delivery was recorded with nothing to show for it (SHIP-118).
 	//
 	// CLAUDE.md states the invariant and Docs/01 §4.4 decides it: "a job cannot be recorded as
-	// Delivered without photo proof, except through the exception path". **Both halves can now be
-	// captured** — the photograph at SHIP-115 and the reasoned exception at SHIP-116 — and
-	// 'Delivered' is still refused unconditionally here, because whether a delivery may be
-	// recorded at all is a rule about milestones rather than about evidence, and that rule is
-	// SHIP-118's.
+	// Delivered without photo proof, except through the exception path". This is the refusal that
+	// makes it true, and **it is now a condition rather than a blanket**: 'Delivered' carrying a
+	// photograph (SHIP-115) or a reasoned exception (SHIP-116) is recorded, and 'Delivered'
+	// carrying neither is refused here before anything is written.
 	//
-	// **SHIP-118 is the ticket that narrows this**, from "always" to "when the recording carries
-	// neither". The sentinel, the code and the message already say what that ticket needs to say;
-	// what changes is the condition in front of them.
+	// It is one of two layers. 000605's deferred constraint trigger refuses the same row at
+	// commit, whoever wrote it and through whatever path — which is what makes the invariant a
+	// property of the platform rather than of one function. What this layer buys is the answer a
+	// client can act on; see [CodeProofRequired].
 	ErrProofRequired = errors.New("delivery: a delivery needs photo proof or a recorded exception")
 
 	// ErrEvidenceNotCoherent means a [Recording] reached the insert carrying evidence that is not
@@ -349,10 +349,13 @@ var (
 	//
 	// A code of its own because it leads somewhere specific: the camera, or the exception path
 	// beside it (Docs/01 §4.4). What a client must never do with it is offer "try again", which
-	// is what a generic conflict would suggest.
+	// is what a generic conflict would suggest — the identical request will be refused for as long
+	// as it carries nothing, and the way out is to capture something or to say why there is
+	// nothing to capture.
 	CodeProofRequired = httpx.RegisterCode("delivery_proof_required",
-		"A delivery is recorded with photo proof, or with a reason why there is none. Capturing "+
-			"either is not built yet, so 'delivered' cannot be recorded through this endpoint.")
+		"A delivery is recorded with photo proof, or with a reason why there is none. Send the "+
+			"object_key of a photograph you have uploaded, or one of the exception reasons, in "+
+			"this request's proof field.")
 
 	// CodeDriverLinkExpired is returned when a driver's job-scoped link has run out (SHIP-108).
 	//

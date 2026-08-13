@@ -432,12 +432,16 @@ func TestOnlyTheAwardedProviderMayRecordAMilestone(t *testing.T) {
 	}
 }
 
-// TestDeliveredIsRefusedWhileNothingCanProveIt.
+// TestDeliveredWithNeitherProofNorExceptionIsRefused is SHIP-118's *Done when*, and it is the test
+// CLAUDE.md's invariant rests on: never Delivered with neither photo proof nor a recorded
+// exception.
 //
-// CLAUDE.md's invariant and Docs/01 §4.4's decision: never Delivered with neither photo proof nor a
-// recorded exception. Neither can be captured until SHIP-114…SHIP-116, so every 'Delivered' is
-// refused for now — and SHIP-118 is the ticket that narrows "every" to "those with neither".
-func TestDeliveredIsRefusedWhileNothingCanProveIt(t *testing.T) {
+// **It is the mutation target for this ticket.** Removing the condition in
+// [Service.RecordMilestone] leaves this failing — and leaves it failing in a specific way worth
+// knowing about, because 000605's deferred trigger then refuses the same row at COMMIT. The rule
+// survives; what is lost is a `delivery_proof_required` a client can act on, in exchange for a
+// constraint name in a 500 (Docs/10 §4.6).
+func TestDeliveredWithNeitherProofNorExceptionIsRefused(t *testing.T) {
 	pool := pgtest.DB(t)
 	customer := newAccount(t, pool, "proof-c@example.com", "+61400000679", "customer")
 	provider := newAccount(t, pool, "proof-p@example.com", "+61400000680", "provider")
