@@ -1374,20 +1374,22 @@ ok "and one under a fresh key is still 200 with the same bid, having written not
   || fail "three awards left more than one transition on the job"
 ok "three awards, one transition — the job moved once"
 
-# A **different** offer on the job that has been awarded — the rival's, placed before the award. It is
-# still Submitted, because SHIP-93 is what closes the competition and it has not been built; what
-# refuses this is the job's own status, held under the lock the award takes first.
-[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$rival_award_bid';")" == "Submitted" ]] \
-  || fail "the competing offer is not Submitted; SHIP-93 has not been built and nothing should have closed it"
+# A **different** offer on the job that has been awarded — the rival's, placed before the award. Since
+# SHIP-93 it is `Rejected`, closed by the award itself, and that is what makes the refusal below worth
+# checking rather than obvious: an implementation that judged the *offer* before the *job* would
+# answer `bidding_bid_closed` here and send the customer to offers the same sweep has just closed.
+# What refuses it is the job's own status, held under the lock the award takes first.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$rival_award_bid';")" == "Rejected" ]] \
+  || fail "the competing offer is not Rejected; the award is supposed to have closed it (SHIP-93)"
 
 status="$(award "$award_customer_token" "verify-award-second-$$" "$award_job" "$rival_award_bid" awsecond)"
 [[ "$status" == "409" ]] || { cat "$WORKDIR/bid-awsecond.json"; fail "a second award on one job returned $status, want 409"; }
 [[ "$(json "$WORKDIR/bid-awsecond.json" '["error"]["code"]')" == "conflict" ]] \
-  || { cat "$WORKDIR/bid-awsecond.json"; fail "expected code=conflict"; }
+  || { cat "$WORKDIR/bid-awsecond.json"; fail "expected code=conflict, not bidding_bid_closed — the job is what the customer has to look at"; }
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
   "select count(*) from bids where job_id = '$award_job' and status = 'Accepted';")" == "1" ]] \
   || fail "a second bid was accepted on one job"
-ok "a second award naming a different offer is refused with conflict, and the job still holds exactly one accepted bid"
+ok "a second award naming an offer the sweep closed is refused with conflict and not bid_closed, and the job still holds exactly one accepted bid"
 
 # The database's own half of the same rule, which is what holds if the ordering above is ever changed.
 refusal="$("$PSQL" "$DATABASE_URL" -tAc \
@@ -1479,3 +1481,167 @@ status="$(award "$award_customer_token" "verify-award-cancelled-$$" "$gone_job" 
 [[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$gone_bid';")" == "Submitted" ]] \
   || fail "the refused award moved the bid"
 ok "a job that has been cancelled can no longer be awarded, and the refused award leaves the offer where it was"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-93  the award closes every other live offer, and leaves the already-closed ones alone"
+
+# # Two more providers, and every offer below is placed before the award for one reason
+#
+# **Once the job is Awarded it is offered to nobody**, so a provider asked to bid afterwards is
+# refused by SHIP-81's eligibility filter with a 404 — a true answer to a different question that
+# reads exactly like a broken fixture. SHIP-92's block met that once with one rival; a sweep needs a
+# market, so the whole market is built first and awarded second.
+#
+# The accounts take 04162 and 04163, which is the 0416x block this file's header allocates to bidding.
+status="$(post_json "verify-sweep-p2-$$" /v1/auth/register \
+  "{\"email\":\"sweep-second-$$@example.com\",\"phone\":\"04162$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/sweep-second.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/sweep-second.json"; fail "could not register the second sweep provider: $status"; }
+sweep_second_id="$(json "$WORKDIR/sweep-second.json" '["id"]')"
+sweep_second_token="$(mint_token "$sweep_second_id")"
+
+status="$(post_json "verify-sweep-p3-$$" /v1/auth/register \
+  "{\"email\":\"sweep-third-$$@example.com\",\"phone\":\"04163$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/sweep-third.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/sweep-third.json"; fail "could not register the third sweep provider: $status"; }
+sweep_third_id="$(json "$WORKDIR/sweep-third.json" '["id"]')"
+sweep_third_token="$(mint_token "$sweep_third_id")"
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set email_verified_at = now(), phone_verified_at = now()
+     where id in ('$sweep_second_id', '$sweep_third_id');"
+
+for pair in "$sweep_second_token:SWP102" "$sweep_third_token:SWP103"; do
+  status="$(bid_post "${pair%%:*}" "verify-sweep-veh-${pair##*:}-$$" /v1/fleet/vehicles \
+    "{\"registration\":\"${pair##*:}\",\"vehicle_type\":\"box_truck\",\"max_weight_kg\":1200,\"load_length_cm\":300,\"load_width_cm\":160,\"load_height_cm\":180}" \
+    "vehicle-${pair##*:}")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-vehicle-${pair##*:}.json"; fail "adding ${pair##*:} returned $status"; }
+
+  status="$(curl -s -X PATCH -o "$WORKDIR/sweep-profile.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer ${pair%%:*}" -H "Idempotency-Key: verify-sweep-prof-${pair##*:}-$$" \
+    -H 'Content-Type: application/json' -d '{"service_area":{"states":["VIC"]}}' \
+    "http://localhost:$VERIFY_PORT/v1/fleet/profile")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/sweep-profile.json"; fail "declaring VIC returned $status"; }
+done
+
+sweep_job="$(new_award_job four)"
+
+# A second job, with one live offer on it, standing beside the first for the whole of the award. The
+# sweep's `WHERE job_id` is the one clause whose absence would be catastrophic *and* silent — every
+# live offer in the marketplace closes on the first award of the day, no constraint is violated, and
+# the customers whose jobs were emptied are not the ones who made the request.
+bystander_job="$(new_award_job five)"
+status="$(bid_post "$bid_provider_token" "verify-sweep-bystander-$$" "/v1/jobs/$bystander_job/bids" "$bid_body" swbystander)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swbystander.json"; fail "the offer on the second job returned $status"; }
+sweep_bystander_bid="$(json "$WORKDIR/bid-swbystander.json" '["id"]')"
+
+# 1. The offer that wins.
+status="$(bid_post "$bid_provider_token" "verify-sweep-winner-$$" "/v1/jobs/$sweep_job/bids" "$bid_body" swwinner)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swwinner.json"; fail "the winning offer returned $status"; }
+sweep_winner="$(json "$WORKDIR/bid-swwinner.json" '["id"]')"
+
+# 2. A negotiation that loses, which is two rows and two different fates. The provider's first offer is
+#    displaced by the customer's counter and is already terminal at Superseded; the counter is the live
+#    head, it was made by the *customer*, and it is still a live offer on the job.
+status="$(bid_post "$bid_rival_token" "verify-sweep-neg1-$$" "/v1/jobs/$sweep_job/bids" "$bid_body" swneg1)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swneg1.json"; fail "the losing negotiation's first offer returned $status"; }
+sweep_displaced="$(json "$WORKDIR/bid-swneg1.json" '["id"]')"
+
+status="$(bid_post "$award_customer_token" "verify-sweep-neg2-$$" \
+  "/v1/jobs/$sweep_job/bids/$sweep_displaced/counter" '{"amount_cents":41000}' swneg2)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swneg2.json"; fail "the customer's counter returned $status"; }
+sweep_counter="$(json "$WORKDIR/bid-swneg2.json" '["id"]')"
+
+# 3. A plain competing offer.
+status="$(bid_post "$sweep_second_token" "verify-sweep-live-$$" "/v1/jobs/$sweep_job/bids" "$bid_body" swlive)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swlive.json"; fail "the competing offer returned $status"; }
+sweep_live="$(json "$WORKDIR/bid-swlive.json" '["id"]')"
+
+# 4. And one the provider had already taken back, which the award must not touch.
+status="$(bid_post "$sweep_third_token" "verify-sweep-wd-$$" "/v1/jobs/$sweep_job/bids" "$bid_body" swwd)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swwd.json"; fail "the offer to withdraw returned $status"; }
+sweep_withdrawn="$(json "$WORKDIR/bid-swwd.json" '["id"]')"
+status="$(bid_post "$sweep_third_token" "verify-sweep-wdo-$$" \
+  "/v1/jobs/$sweep_job/bids/$sweep_withdrawn/withdraw" '{}' swwdo)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-swwdo.json"; fail "withdrawing returned $status"; }
+
+before="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(status, ',' order by status) from bids where job_id = '$sweep_job';")"
+[[ "$before" == "Submitted,Submitted,Submitted,Superseded,Withdrawn" ]] \
+  || fail "the market before the award reads '$before', want three live offers, one superseded and one withdrawn"
+ok "five offers stand on one job — three live, one displaced by a counter, one withdrawn"
+
+# The two timestamps that say whether a row was written at all. bids_set_updated_at moves on any
+# write, so a sweep that rewrote a closed offer with the status it already had would still show here.
+withdrawn_before="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$sweep_withdrawn';")"
+displaced_before="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$sweep_displaced';")"
+
+status="$(award "$award_customer_token" "verify-sweep-award-$$" "$sweep_job" "$sweep_winner" swaward)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-swaward.json"; fail "awarding returned $status, want 200"; }
+
+# Every row of the job, by name, in one query. Read as a whole rather than one assertion per offer:
+# what is being demonstrated is a *state of the job*, and five separate checks would pass individually
+# on a sweep that closed four of the five.
+after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (select status from bids where id = '$sweep_winner')
+       || ' ' || (select status from bids where id = '$sweep_counter')
+       || ' ' || (select status from bids where id = '$sweep_live')
+       || ' ' || (select status from bids where id = '$sweep_displaced')
+       || ' ' || (select status from bids where id = '$sweep_withdrawn');")"
+[[ "$after" == "Accepted Rejected Rejected Superseded Withdrawn" ]] \
+  || fail "after the award the five offers read '$after', want 'Accepted Rejected Rejected Superseded Withdrawn'"
+ok "the award accepts one offer and rejects every other live one — including the customer's own outstanding counter, which they decline by awarding elsewhere"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$sweep_withdrawn';")" == "$withdrawn_before" ]] \
+  || fail "the sweep wrote to a withdrawn offer"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$sweep_displaced';")" == "$displaced_before" ]] \
+  || fail "the sweep wrote to a superseded offer"
+ok "and it does not touch an offer that had already ended — how an offer closed is the record, and no constraint would have refused overwriting it"
+
+live_and_accepted="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) filter (where status = 'Submitted')::text || ' ' || count(*) filter (where status = 'Accepted')::text
+     from bids where job_id = '$sweep_job';")"
+[[ "$live_and_accepted" == "0 1" ]] \
+  || fail "the awarded job reads '$live_and_accepted' (live, accepted), want '0 1'"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$sweep_job';")" == "Awarded 2" ]] \
+  || fail "the sweep did not happen inside the award's own transaction"
+ok "nothing is left live on the awarded job, and the whole act is still one transition — Docs/02 §3's 'atomically', both halves"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$sweep_bystander_bid';")" == "Submitted" ]] \
+  || fail "the sweep closed an offer on another job entirely"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$bystander_job';")" == "Open" ]] \
+  || fail "the award moved a job it was not made on"
+ok "a live offer on another job is untouched — the sweep is scoped to the job that was awarded, and nothing would have said so if it were not"
+
+# What the sweep buys the rest of the domain: the three verbs that gate on a live offer now all refuse.
+# Before it, a provider could revise the price of an offer on a job somebody else had already won.
+status="$(curl -s -X PATCH -o "$WORKDIR/bid-swrevise.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $sweep_second_token" -H "Idempotency-Key: verify-sweep-rev-$$" \
+  -H 'Content-Type: application/json' -d '{"amount_cents":30000}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$sweep_job/bids/$sweep_live")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-swrevise.json"; fail "revising a closed offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-swrevise.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-swrevise.json"; fail "expected code=bidding_bid_closed"; }
+
+status="$(bid_post "$sweep_second_token" "verify-sweep-wdlost-$$" \
+  "/v1/jobs/$sweep_job/bids/$sweep_live/withdraw" '{}' swwdlost)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-swwdlost.json"; fail "withdrawing a closed offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-swwdlost.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-swwdlost.json"; fail "expected code=bidding_bid_closed"; }
+
+status="$(bid_post "$award_customer_token" "verify-sweep-ctlost-$$" \
+  "/v1/jobs/$sweep_job/bids/$sweep_live/counter" '{"amount_cents":30000}' swctlost)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-swctlost.json"; fail "countering a closed offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-swctlost.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-swctlost.json"; fail "expected code=bidding_bid_closed"; }
+ok "a losing offer can no longer be revised, withdrawn or countered — one code for all three, because the client does the same thing with all three"
+
+# The record survives, which is the whole reason a rejection is a status rather than a delete. Both
+# parties can still read the losing negotiation from end to end.
+status="$(bid_get "$award_customer_token" "/v1/jobs/$sweep_job/bids/$sweep_counter/history" swhist)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-swhist.json"; fail "the losing negotiation's history returned $status"; }
+[[ "$(python3 -c "import json,sys; d=json.load(open(sys.argv[1]))['data']; print(str(len(d)) + ' ' + d[0]['status'] + ' ' + d[1]['status'])" "$WORKDIR/bid-swhist.json")" == "2 superseded rejected" ]] \
+  || { cat "$WORKDIR/bid-swhist.json"; fail "the losing negotiation is not readable end to end after the award"; }
+ok "and the whole losing negotiation is still readable, each row saying how it ended — Docs/01 §4.3 records every offer, and a status is the record"

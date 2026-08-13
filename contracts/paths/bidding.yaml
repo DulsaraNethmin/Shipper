@@ -712,9 +712,14 @@ AwardJob:
       |---|---|
       | The job is yours | otherwise `404` |
       | The bid is on **this** job | otherwise `404` — a real offer paired with the wrong job names nothing |
+      | The job can still be awarded | otherwise `conflict`: it has already been awarded, cancelled, or has expired |
       | The offer is **live** | otherwise `bidding_bid_closed`: it has been withdrawn, superseded, rejected or has expired |
       | The offer is a **provider's** | otherwise `bidding_wrong_party`: awarding your own counter would commit a provider to terms they never agreed to |
-      | The job can still be awarded | otherwise `conflict`: it has already been awarded, cancelled, or has expired |
+
+      They are checked in that order, and the order matters on a job you have already awarded. Since
+      the award closes every other offer (below), "that offer is closed" and "you have already awarded
+      this job" become the same fact about every offer on it — and only the second tells you where to
+      look, so it is the one you are given.
 
       **Only the latest offer in a negotiation can be awarded.** Each counter supersedes the one it
       answers, so the offer you award is the one with no `superseded_by` — read
@@ -733,11 +738,22 @@ AwardJob:
       Awarding a **different** offer on a job you have already awarded is `conflict`. One job, one
       accepted bid — enforced by the database rather than by a check.
 
-      ## What this does not do yet
+      ## Every other offer on the job closes with it
 
-      The competing offers on the job are **not** closed by this endpoint. That is a separate ticket,
-      and until it lands they remain `submitted` — they cannot be awarded, because the job has moved
-      on, but they have not been marked rejected either.
+      In the same transaction, every offer on the job that was still `submitted` becomes `rejected`
+      (SHIP-93) — Docs/02 §3: "awarding a job atomically marks one bid accepted and all others
+      closed". One award, one accepted offer, and nothing left live on the job.
+
+      Offers that had **already** ended keep the status that says how they ended. A `superseded` offer
+      stays `superseded`, a `withdrawn` one stays `withdrawn`, an `expired` one stays `expired`: the
+      status is the record of what happened to an offer, and the award did not happen to those.
+
+      For a **provider**, this is where an offer goes when somebody else wins the job. It is not a
+      notification — poll your own bids, or wait for the push — and it is final: a `rejected` offer
+      can no longer be revised, withdrawn or countered, and all three answer `bidding_bid_closed`.
+
+      Nothing about the closed offers travels in the response. This endpoint answers with the offer
+      you accepted; the rest of the job's bids are read where they were always read.
     parameters:
       - $ref: '#/JobID'
       - $ref: '#/IdempotencyKey'
@@ -1080,8 +1096,11 @@ Bid:
 
         `withdrawn` comes from `POST /v1/jobs/{id}/bids/{bid_id}/withdraw`, and `superseded` is what an
         offer becomes when the other party counters it — after which it can be neither changed nor
-        answered, only read. The remaining four are reachable through endpoints still being built:
-        expiry, the award, and the rejection an award leaves behind. `countered` is in the list because
+        answered, only read. `accepted` and `rejected` are the two halves of one award: the offer the
+        customer chose, and every offer that was still live on that job when they chose it.
+
+        `expired` waits on the ticket that gives an offer its own terms. `draft` is not written by any
+        endpoint — an offer you send is live when you send it — and `countered` is in the list because
         Docs/02 §4 names it; nothing writes it, because `superseded` is the one status this platform
         gives a displaced offer.
       example: submitted

@@ -742,6 +742,12 @@ func (a awardRequest) bid() (uuid.UUID, error) {
 // The response is the accepted bid, in the same [bidResponse] every other endpoint here answers with
 // — the closed key set stays one list rather than two, and nothing of the job travels in it beyond
 // its identifier. A client that wants the job's new status reads the job.
+//
+// **Nothing of the offers the award closed travels in it either** (SHIP-93). One request accepted one
+// offer, and that is what it answers with; the competing offers now at `Rejected` are read where the
+// job's bids have always been read. Listing them here would put another provider's identifiers, and
+// with a shape this domain has been careful about, into a response that had no reason to carry them —
+// and it would make the response depend on how many people happened to bid.
 func (h *Handler) Award() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		customerID, err := callerID(r.Context())
@@ -985,8 +991,10 @@ func apiError(err error) error {
 	case errors.Is(err, ErrNegotiationOver):
 		// Deliberately CodeBidClosed rather than a code of its own. The client does the same thing
 		// with it as with a superseded or rejected offer — this negotiation is finished — and the
-		// message is what says which. Once SHIP-93 closes competing bids on award, this branch is
-		// reached less and less: the offer itself will be Rejected and answer through the case above.
+		// message is what says which. **SHIP-93 has narrowed what reaches it**: a counter on a job
+		// that was *awarded* now meets a `Rejected` offer and answers through the case above, so what
+		// is left here is a job cancelled or expired without ever being awarded — where the offers
+		// really are still live and only the job has moved.
 		return httpx.NewError(http.StatusConflict, CodeBidClosed,
 			"That job can no longer be awarded, so there is nothing a counter-offer could "+
 				"lead to.").WithCause(err)

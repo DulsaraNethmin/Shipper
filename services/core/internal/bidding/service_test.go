@@ -2981,9 +2981,13 @@ func TestASecondAwardOnOneJobIsRefused(t *testing.T) {
 	if _, err := m.award(t, m.customer, m.job, theirs.ID); !errors.Is(err, ErrJobNotAwardable) {
 		t.Fatalf("awarding a second bid on one job: %v, want ErrJobNotAwardable", err)
 	}
-	if stored := m.row(t, theirs.ID); stored.status != string(StatusSubmitted) {
-		t.Errorf("the rival's offer is %s after the refused award, want Submitted — SHIP-93 is what "+
-			"closes it, and it has not been built", stored.status)
+	// **SHIP-93 makes this the interesting assertion rather than a formality.** The rival's offer is
+	// already `Rejected` when the second award arrives, so an implementation that judged the *offer*
+	// before the *job* would answer ErrBidClosed — a true statement that sends the customer to the
+	// job's other offers, every one of which the same sweep has just closed. The job is what they
+	// need to look at, and that is what the refusal above says.
+	if stored := m.row(t, theirs.ID); stored.status != string(StatusRejected) {
+		t.Errorf("the rival's offer is %s, want Rejected — the award closed it (SHIP-93)", stored.status)
 	}
 
 	var accepted int
@@ -3233,5 +3237,297 @@ func TestAwardingRefusesAnIdentifierThatNamesNothing(t *testing.T) {
 	}
 	if _, err := m.award(t, m.customer, m.job, uuid.Nil); !errors.Is(err, ErrBidNotFound) {
 		t.Errorf("awarding the nil bid: %v, want ErrBidNotFound", err)
+	}
+}
+
+// TestAnAwardClosesEveryCompetingOffer is SHIP-93's *Done when*: "every other bid on the job becomes
+// Rejected in the same transaction".
+//
+// Docs/02 §3 is the sentence behind it — "awarding a job atomically marks one bid accepted and all
+// others closed" — and SHIP-92 met half of it. This is the other half.
+//
+// **Three competitors rather than one**, because a sweep against a single row is indistinguishable
+// from a statement that closes whatever it happens to find first, and because the shape a customer
+// actually meets is a job with several offers on it.
+//
+// The final assertion is the one that matters most and is the easiest to leave out: the job has
+// exactly one accepted bid and no live one. A sweep that closed two of the three would leave a
+// provider whose offer the customer can no longer act on and who has been told nothing.
+func TestAnAwardClosesEveryCompetingOffer(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+
+	losers := make([]uuid.UUID, 0, 3)
+	for n := 930; n < 933; n++ {
+		placed, _, err := m.place(t, m.rival(t, n), m.job, offer(fmt.Sprintf("key-sweep-%d", n)))
+		if err != nil {
+			t.Fatalf("the offer from rival %d: %v", n, err)
+		}
+		losers = append(losers, placed.ID)
+	}
+
+	before := m.statuses(t, m.job)
+	if len(before) != 4 {
+		t.Fatalf("the job carries %d offers before the award, want 4", len(before))
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+
+	after := m.statuses(t, m.job)
+	if after[winner.ID] != string(StatusAccepted) {
+		t.Errorf("the awarded offer is %s, want Accepted", after[winner.ID])
+	}
+	for _, loser := range losers {
+		if after[loser] != string(StatusRejected) {
+			t.Errorf("the competing offer %s is %s, want Rejected", loser, after[loser])
+		}
+	}
+
+	var live, accepted int
+	if err := m.pool.QueryRow(t.Context(), `
+		SELECT count(*) FILTER (WHERE status = 'Submitted'),
+		       count(*) FILTER (WHERE status = 'Accepted')
+		FROM bids WHERE job_id = $1`, m.job).Scan(&live, &accepted); err != nil {
+		t.Fatalf("counting the offers on %s: %v", m.job, err)
+	}
+	if live != 0 || accepted != 1 {
+		t.Errorf("the awarded job holds %d live offers and %d accepted, want 0 and 1", live, accepted)
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 2 {
+		t.Errorf("the job is %s with %d transitions, want Awarded with 2", status, changes)
+	}
+}
+
+// TestTheSweepReachesNoOtherJob is the `WHERE job_id` clause, which is the one part of the statement
+// whose absence would be catastrophic and silent.
+//
+// A sweep without it closes every live offer in the marketplace on the first award of the day, and
+// nothing else in the platform would notice: the rows are legitimately `Rejected`, no constraint is
+// violated, and the customers whose jobs were emptied are not the ones making the request. This test
+// is what says so — one job awarded, another job's offers untouched, including one from the same
+// provider.
+func TestTheSweepReachesNoOtherJob(t *testing.T) {
+	m := newMarket(t)
+
+	elsewhere := m.publish(t)
+	bystander := m.rival(t, 933)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-scope-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	if _, _, err := m.place(t, bystander, m.job, offer("key-sweep-scope-loser")); err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	// The same provider bidding on the other job as well, which is what makes the scope a *job*
+	// scope rather than something a provider filter would also have satisfied.
+	untouched, _, err := m.place(t, m.provider, elsewhere, offer("key-sweep-scope-other"))
+	if err != nil {
+		t.Fatalf("the offer on the other job: %v", err)
+	}
+	alsoUntouched, _, err := m.place(t, bystander, elsewhere, offer("key-sweep-scope-other-rival"))
+	if err != nil {
+		t.Fatalf("the rival's offer on the other job: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+
+	other := m.statuses(t, elsewhere)
+	for name, bid := range map[string]uuid.UUID{
+		"the winning provider's offer on the other job": untouched.ID,
+		"a rival's offer on the other job":              alsoUntouched.ID,
+	} {
+		if other[bid] != string(StatusSubmitted) {
+			t.Errorf("%s is %s, want Submitted — the sweep left its own job", name, other[bid])
+		}
+	}
+	if status, _ := m.jobStatus(t, elsewhere); status != "Open" {
+		t.Errorf("the other job is %s, want Open", status)
+	}
+}
+
+// TestTheSweepLeavesAnAlreadyClosedOfferAsItWas is the predicate's other half, and the half no
+// constraint would catch.
+//
+// `ck_bids_superseded_is_not_live` refuses `Submitted` and `Accepted` on a displaced row and permits
+// `Rejected` — so a sweep written as "everything except the winner" would overwrite a `Superseded`
+// row with `Rejected`, the database would allow it, and the negotiation's history would then say the
+// customer declined an offer that was actually displaced by their own counter. Docs/01 §4.3 requires
+// every offer, counter-offer and withdrawal to be *recorded*; a status is the record.
+//
+// So each closed status is set up and checked by name rather than as a group, because the four end
+// in four different ways and only one predicate keeps all four.
+func TestTheSweepLeavesAnAlreadyClosedOfferAsItWas(t *testing.T) {
+	for _, closed := range []Status{StatusWithdrawn, StatusRejected, StatusExpired, StatusSuperseded} {
+		t.Run(string(closed), func(t *testing.T) {
+			m := newMarket(t)
+
+			winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-closed-winner"))
+			if err != nil {
+				t.Fatalf("the winning offer: %v", err)
+			}
+			done, _, err := m.place(t, m.rival(t, 934), m.job, offer("key-sweep-closed"))
+			if err != nil {
+				t.Fatalf("the offer that is already over: %v", err)
+			}
+			m.setStatus(t, done.ID, closed)
+			was := m.row(t, done.ID)
+
+			if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+				t.Fatalf("awarding: %v", err)
+			}
+
+			now := m.row(t, done.ID)
+			if now.status != string(closed) {
+				t.Errorf("the sweep rewrote a %s offer as %s — how an offer ended is the record, "+
+					"and no constraint would have refused this", closed, now.status)
+			}
+			if !now.updatedAt.Equal(was.updatedAt) {
+				t.Errorf("the sweep wrote to a %s offer: updated_at moved from %s to %s",
+					closed, was.updatedAt, now.updatedAt)
+			}
+		})
+	}
+}
+
+// TestTheSweepClosesALosingNegotiationsHeadAndNotItsHistory is the chain case, which is where "every
+// other bid" stops being one question.
+//
+// A negotiation the customer did not award holds two kinds of row: the offers already displaced by a
+// counter, which are `Superseded` and terminal, and the one at the head, which is live. **Only the
+// head is swept**, and both halves of that are defects if they go the other way — leaving the head
+// `Submitted` would strand a live offer on an awarded job, and closing the predecessors would erase
+// how they ended.
+//
+// The head here is the **customer's own counter**, which is the awkward case and the reason it is the
+// one written: they decline their own outstanding offer by awarding somebody else, and `Rejected` —
+// "an offer the customer declined" — is the only status in Docs/02 §4 that says so.
+func TestTheSweepClosesALosingNegotiationsHeadAndNotItsHistory(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-chain-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+
+	losing := m.rival(t, 935)
+	round1, _, err := m.place(t, losing, m.job, offer("key-sweep-chain-1"))
+	if err != nil {
+		t.Fatalf("the losing provider's offer: %v", err)
+	}
+	round2, _, err := m.counter(t, m.customer, m.job, round1.ID, counterOf(40000, "key-sweep-chain-2"))
+	if err != nil {
+		t.Fatalf("the customer's counter: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+
+	after := m.statuses(t, m.job)
+	if after[round1.ID] != string(StatusSuperseded) {
+		t.Errorf("the displaced offer is %s, want Superseded — it was already terminal and the "+
+			"sweep has no business saying how it ended", after[round1.ID])
+	}
+	if after[round2.ID] != string(StatusRejected) {
+		t.Errorf("the live head of the losing negotiation is %s, want Rejected — a live offer on an "+
+			"awarded job is what the sweep exists to remove", after[round2.ID])
+	}
+	if stored := m.row(t, round1.ID); stored.supersededBy != round2.ID {
+		t.Errorf("the chain link was lost: %s points at %s", round1.ID, stored.supersededBy)
+	}
+}
+
+// TestASweptOfferCanNoLongerBeActedOn is what the sweep buys the rest of the domain, and it is more
+// than tidiness.
+//
+// Before SHIP-93 a competing offer stayed `Submitted` after the award, so the three verbs that gate
+// on [Status.live] all let it through: its provider could revise the price of an offer on a job
+// somebody else had already won, or withdraw it, or counter it. Nothing corrupted — the customer
+// could not accept it, because the job had moved — but every one of those is a provider acting on
+// work that no longer exists and being told it worked.
+//
+// The refusals all answer [ErrBidClosed], which is the code that already means "this offer is over".
+func TestASweptOfferCanNoLongerBeActedOn(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-acted-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	loser := m.rival(t, 936)
+	theirs, _, err := m.place(t, loser, m.job, offer("key-sweep-acted"))
+	if err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+
+	newPrice := int64(30000)
+	if _, err := m.revise(t, loser, m.job, theirs.ID, Revision{AmountCents: &newPrice}); !errors.Is(err, ErrBidClosed) {
+		t.Errorf("revising a swept offer: %v, want ErrBidClosed", err)
+	}
+	if _, err := m.withdraw(t, loser, m.job, theirs.ID); !errors.Is(err, ErrBidClosed) {
+		t.Errorf("withdrawing a swept offer: %v, want ErrBidClosed", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, theirs.ID, counterOf(30000, "key-sweep-acted-c")); !errors.Is(err, ErrBidClosed) {
+		t.Errorf("countering a swept offer: %v, want ErrBidClosed", err)
+	}
+	if stored := m.row(t, theirs.ID); stored.status != string(StatusRejected) {
+		t.Errorf("the swept offer is %s after three refused acts, want Rejected", stored.status)
+	}
+}
+
+// TestAFailedTransitionRollsTheSweepBackToo extends SHIP-92's rollback proof to the statement SHIP-93
+// added between the accept and the move.
+//
+// "In the same transaction" is SHIP-93's *Done when* as much as SHIP-92's, and the only way to
+// demonstrate it is to make the last step fail: an award that rolled back leaving three offers
+// `Rejected` would have closed a live market on a job that is still open, with no accepted bid to
+// show for it and nothing for the providers to be told.
+func TestAFailedTransitionRollsTheSweepBackToo(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-rollback-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	loser, _, err := m.place(t, m.rival(t, 937), m.job, offer("key-sweep-rollback"))
+	if err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	m.svc = NewService(
+		fleet.NewService(m.svc.clock),
+		newTestNegotiation(m.svc.clock),
+		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},
+		m.svc.clock,
+	)
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err == nil {
+		t.Fatal("the award reported success with the job left where it was")
+	}
+
+	after := m.statuses(t, m.job)
+	if after[winner.ID] != string(StatusSubmitted) {
+		t.Errorf("the accept survived the rollback: the awarded offer is %s", after[winner.ID])
+	}
+	if after[loser.ID] != string(StatusSubmitted) {
+		t.Errorf("the sweep survived the rollback: the competing offer is %s — a job still Open "+
+			"with its offers closed is a market emptied by a request that failed", after[loser.ID])
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "Open" || changes != 1 {
+		t.Errorf("the job is %s with %d transitions, want Open with 1", status, changes)
 	}
 }

@@ -521,8 +521,10 @@ func (s *Service) CounterOffer(
 //     and `job_id` re-read under it.
 //  3. **Then the accept**, which takes the `uq_bids_one_accepted_per_job` btree entry and serialises
 //     two awards that somehow got past step 1.
-//  4. **Then the rejection sweep**, which is SHIP-93's and is not here yet. The order is what leaves
-//     room for it: every other bid is closed after this one is accepted and before the job moves.
+//  4. **Then the rejection sweep** (SHIP-93) — every other live offer on the job closes, after this
+//     one is accepted and before the job moves. **After the accept is not a detail.** The accept is
+//     what serialises two awards that got past step 1, so a sweep in front of it would run in both of
+//     them; behind it, the loser is refused before it can close anybody's offer.
 //  5. **Then the transition**, through `jobs`' one guarded function, in the same transaction.
 //
 // # What the database enforces whatever this function remembers, and the one thing it cannot
@@ -537,7 +539,7 @@ func (s *Service) CounterOffer(
 // deliberately declined to give `bids` the transition trigger `jobs` has. So it is checked here,
 // under the lock, and [postgresStore.acceptBid] checks it again in its `WHERE` clause.
 //
-// # The refusals, in the order they are made, and why the retry is not last
+// # The refusals, in the order they are made, and why the retry is first and the job is second
 //
 //  1. **A job that is not this customer's** is [ErrNotJobCustomer], before any bid is read. A
 //     provider probing this endpoint learns nothing about whether an identifier is a real bid.
@@ -550,9 +552,19 @@ func (s *Service) CounterOffer(
 //     awarded". [Service.PlaceBid] and [Service.CounterOffer] put their retries first for the same
 //     reason and state the principle — a retry asks what happened to a request, and that answer does
 //     not change when the world does.
-//  4. **An offer that is not live** is [ErrBidClosed]: withdrawn, rejected, expired or superseded.
-//  5. **The customer's own offer** is [ErrNotAProvidersOffer]. You award the provider's commitment.
-//  6. **A job that has moved on** is [ErrJobNotAwardable] — held from step 1 and answered here.
+//  4. **A job that has moved on** is [ErrJobNotAwardable] — held under the lock from step 1 and
+//     answered here.
+//  5. **An offer that is not live** is [ErrBidClosed]: withdrawn, rejected, expired or superseded.
+//  6. **The customer's own offer** is [ErrNotAProvidersOffer]. You award the provider's commitment.
+//
+// **SHIP-93 moved the job's standing in front of the offer's, and it had to.** Before the sweep, a
+// second award naming a *different* offer on an awarded job met a `Submitted` row and was refused
+// with [ErrJobNotAwardable] — `conflict`, whose registered description has said "a second award on
+// one job" since SHIP-12. After the sweep that same offer is `Rejected`, so an offer-first ordering
+// would answer [ErrBidClosed] instead and send the client to the job's other offers, which are now
+// all closed too. The two refusals differ in where they send a client (Docs/10 §4.4), and only one of
+// them is somewhere worth going: the job. So the fact that closed *everything* is reported ahead of
+// any one thing it closed.
 //
 // # Idempotent by state rather than by key, which is stronger
 //
@@ -611,11 +623,14 @@ func (s *Service) AwardBid(
 	if bid.Status == StatusAccepted {
 		return bid, nil
 	}
-	if err := acceptable(bid); err != nil {
-		return Bid{}, err
-	}
+	// Then the job, ahead of the offer. Since SHIP-93 every competing offer on an awarded job is
+	// `Rejected`, so an offer-first ordering would answer "that offer is closed" to a customer whose
+	// actual position is "you have already awarded this job".
 	if standing != JobAwardable {
 		return Bid{}, fmt.Errorf("bidding: %s is %s: %w", jobID, standing, ErrJobNotAwardable)
+	}
+	if err := acceptable(bid); err != nil {
+		return Bid{}, err
 	}
 
 	// 3. The accept, which takes the index entry.
@@ -631,8 +646,14 @@ func (s *Service) AwardBid(
 		return Bid{}, fmt.Errorf("bidding: %s was live when it was locked and is not now", bid.ID)
 	}
 
-	// 4. SHIP-93's rejection sweep belongs here: every other bid on this job closes after this one is
-	//    accepted and before the job moves.
+	// 4. The rejection sweep (SHIP-93). Docs/02 §3: "awarding a job atomically marks one bid accepted
+	//    and all others closed." It runs after the accept, so the awarded row is already outside the
+	//    predicate and needs no exclusion — and a sweep moved in front of it would close the row the
+	//    statement above is about to name, which is a failure a test can see rather than one only a
+	//    race can.
+	if err := s.store.rejectCompeting(ctx, r, jobID); err != nil {
+		return Bid{}, err
+	}
 
 	// 5. The transition, through jobs' one guarded function, in this transaction.
 	switch move, err := s.awarding.MoveToAwarded(ctx, r, jobID, customerID); {

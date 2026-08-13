@@ -1523,6 +1523,12 @@ func TestAwardingAClosedOfferAnswersItsOwnCode(t *testing.T) {
 // `conflict`'s description in Docs/10-api-error-codes.md has named "a second award on one job" since
 // SHIP-12, before this endpoint existed. The client's next screen is the *job*, which is what
 // separates it from `bidding_bid_closed` above.
+//
+// **SHIP-93 is what makes this test load-bearing rather than a formality.** The rival's offer is
+// `Rejected` by the time the second award is sent, so an implementation that judged the offer's
+// status before the job's would answer `bidding_bid_closed` here — sending the customer to offers
+// the same sweep has closed, and quietly retiring a description the error registry has carried
+// since SHIP-12.
 func TestASecondAwardOnOneJobIsAConflictAtTheWire(t *testing.T) {
 	w := newWire(t)
 	mine := w.placed(t, "wire-award-second-base")
@@ -1540,6 +1546,11 @@ func TestASecondAwardOnOneJobIsAConflictAtTheWire(t *testing.T) {
 
 	if rec := w.award(t, w.customer, w.job, "wire-award-second-first", awarding(mine)); rec.Code != http.StatusOK {
 		t.Fatalf("the first award = %d (%s)", rec.Code, rec.Body)
+	}
+
+	if stored := w.row(t, theirID); stored.status != string(StatusRejected) {
+		t.Fatalf("the competing offer is %s after the award, want Rejected — without the sweep this "+
+			"test proves the wrong thing", stored.status)
 	}
 
 	rec := w.award(t, w.customer, w.job, "wire-award-second", awarding(theirID))

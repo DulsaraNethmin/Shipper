@@ -219,7 +219,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **499 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **506 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -355,6 +355,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-88** | M3 | The supersede chain — `superseded_by` on the **displaced** row, which is what turns "only the latest valid offer is acceptable" into a column `CHECK` SHIP-92 cannot violate rather than a rule it must remember. Plus `GET …/history`, because a chain nobody can read is not one that remains readable — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-92** | M3 | `POST /v1/jobs/{id}/award` — one offer accepted and the job moved, in one transaction, against the lock ordering SHIP-88 wrote down rather than one invented here. **A verb on the job, so the bid travels in the body**, and the one rule no constraint can express — that the offer was live when it was accepted — is the only thing application logic checks. Idempotent by **state**, so it needs no key column and no migration — *see below* |
+| **SHIP-93** | M3 | The rejection sweep — every offer still live on the awarded job becomes `Rejected` in the award's own transaction, and every offer that had **already** closed keeps the status saying how it closed. One `UPDATE` at step 4 of the recorded lock ordering, no `id <> winner` in it, and the refusal order changed so that a second award still answers `conflict` rather than `bidding_bid_closed` — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -3762,12 +3763,14 @@ test puts the database in the state a race would have to produce — a job still
 accepted bid, which is what a writer that skipped the job lock would leave — and asserts that
 `uq_bids_one_accepted_per_job`'s violation comes back as a conflict rather than as a 500.
 
-**SHIP-93's rejection sweep.** Every competing offer is still `Submitted` after an award. It cannot be
-awarded, because the job has moved on, and `make verify` asserts that state explicitly rather than
+~~**SHIP-93's rejection sweep.** Every competing offer is still `Submitted` after an award. It cannot
+be awarded, because the job has moved on, and `make verify` asserts that state explicitly rather than
 letting it be discovered. `Docs/02` §3's "awarding a job atomically marks one bid accepted and all
 others closed" is therefore half met, and the half that is missing is a ticket rather than a gap in
 this one. The transaction is shaped to grow it: step 4 is marked in `AwardBid` and the sweep goes
-after the accept and before the transition.
+after the accept and before the transition.~~ **Built — see the SHIP-93 entry below.** The prediction
+held to the line: the sweep is one statement at step 4 and nothing else about this transaction moved.
+What did change is a refusal order this entry did not anticipate, and that entry says why.
 
 #### Mutation testing
 
@@ -3818,12 +3821,176 @@ One `$ref` line in `contracts/openapi.yaml`'s sorted `paths:` block, one line in
 count, written by `make verify-update`. **No migration, no `internal/boundaries` edit, no `Deps`
 field, and no new error code** — so `Docs/10-api-error-codes.md` is untouched.
 
-`make verify` went from 481 checks across 13 sections to the figure at the top of this section, all
+`make verify` went from 481 checks across 13 sections to 499, all
 eighteen in `scripts/verify/61-bidding.sh`. Its three new accounts are the first in that file to draw
 the **`0416x`** block, and the corrected allocation map now sits in that file's own header — §9
 recorded that the only copy lived in `90-admin.sh` and did not mention bidding at all, and that
 `61-bidding.sh`'s existing `04145`–`04147` sit inside fleet's block, free by coincidence. The existing
 three are left where they are; anything new takes `0416x`.
+
+### SHIP-93 — the sweep is one statement, and what it does *not* touch is the half with no constraint behind it
+
+SHIP-93's *Done when* is "every other bid on the job becomes `Rejected` in the same transaction", and
+`Docs/02` §3 is the sentence it comes from: "awarding a job atomically marks one bid accepted and all
+others closed." SHIP-92 built the accept and left the sweep marked as step 4 of the recorded lock
+ordering. This fills that step, and **nothing else about the transaction moved** — one `UPDATE`, no
+migration, no new port method and no new error code.
+
+```sql
+UPDATE bids SET status = 'Rejected' WHERE job_id = $1 AND status = 'Submitted'
+```
+
+#### `Rejected` was chosen by `Docs/02` §4 rather than here
+
+Eight statuses, and exactly one of them means *the customer said no*: `Rejected`, "an offer the
+customer declined". Awarding somebody else **is** declining every other offer, and it is the customer
+who did it. The other three closed statuses each name a different event and would be a lie about how
+the offer ended — `Superseded` is displacement by a counter, `Withdrawn` is the provider's own act,
+`Expired` is the offer's own terms running out. `model.go`'s `StatusRejected` has named this ticket
+since SHIP-84, so the vocabulary was settled before the writer arrived. **`ck_bids_status` is
+untouched and no status was invented**, which §9's open `Countered`/`Superseded` question makes worth
+saying out loud: this ticket adds no third description of one event.
+
+**The awkward case is a customer's own outstanding counter, and it is swept.** A negotiation the
+customer did not award can have their own counter at its head — live, `Submitted`, `offered_by =
+customer`. Leaving it would strand a live offer on an awarded job, which is exactly what the sweep
+exists to prevent, and `Rejected` still reads correctly: they declined it by awarding elsewhere.
+
+#### What a chain's non-head rows get is *nothing*, and that is the half no constraint would catch
+
+The brief for this ticket asked what the sweep does to a chain's already-displaced rows. **It leaves
+them exactly as they are**, and the predicate is how: they are `Superseded`, not `Submitted`.
+
+That reads like a narrowing and it is not. `ck_bids_superseded_is_not_live` makes the live offer and
+the head of a chain **the same row by construction** (SHIP-88), so `status = 'Submitted'` misses no
+live offer anywhere. What it excludes is every row that had already ended — and excluding those is the
+point rather than a side effect. Overwriting `Superseded` with `Rejected` would replace the record of
+*how* an offer ended with the record of *when*: the history would then say the customer declined an
+offer that was actually displaced by their own counter, and `Docs/01` §4.3 requires every offer,
+counter-offer and withdrawal to be **recorded**, which a status is.
+
+**No constraint would have refused that write.** `ck_bids_superseded_is_not_live` forbids `Submitted`
+and `Accepted` on a displaced row and permits `Rejected`. So unlike almost everything else on this
+branch, this rule is application logic with nothing underneath it — which is why there is a subtest
+per closed status rather than one for the shape, and why each asserts `updated_at` as well as the
+status. A sweep that rewrote `Withdrawn` as `Withdrawn` would pass a status check and fail this one.
+
+#### There is deliberately no `id <> $winner`, and that is what makes the ordering testable
+
+The sweep runs **after** the accept, which SHIP-88's ordering says and SHIP-92's comment repeats: the
+accept takes the `uq_bids_one_accepted_per_job` entry and is what serialises two awards, so a sweep in
+front of it would run in both of them.
+
+The obvious way to write the statement is "every bid on this job except the winner". It is not
+written that way. Excluding the winner by identifier would make the statement correct under an
+ordering it is not meant to run in — and moving it in front of the accept would then be a change **no
+test could see**. Left out, a sweep that ran first would close the row the accept is about to name,
+`acceptBid`'s compare-and-set would match nothing, and the award would fail loudly and roll back with
+nothing written.
+
+**That matters more here than it would have in another ticket.** SHIP-92's mutation run found that
+the lock ordering is held by review rather than by any test, because no award test starts a second
+goroutine. This is one position in that ordering that a single-threaded suite *can* check, and it
+checks it because of a clause that is not there. Confirmed by mutation, below.
+
+#### The refusal order changed, and leaving it alone would have retired a registered error code
+
+This is the consequence the ticket did not advertise. Before the sweep, a customer awarding a
+*different* offer on a job they had already awarded met a `Submitted` row: `acceptable` passed, the
+job's standing refused it, and the answer was `conflict` — the protocol code whose registered
+description has read "a second award on one job" since SHIP-12. After the sweep that same offer is
+`Rejected`, so an offer-first ordering answers `bidding_bid_closed` instead.
+
+Both are true. Only one is useful. `Docs/10` §4.4's test is where a code sends the client, and §3's
+SHIP-92 entry states the split: `bidding_bid_closed` sends them to the job's other offers, `conflict`
+sends them to the job. **After an award there are no other offers** — the sweep closed them — so the
+first answer sends the customer somewhere empty and the description in the error registry quietly
+stops describing anything the platform produces.
+
+So `AwardBid` judges the job's standing immediately after the retry branch and before the offer's:
+
+1. not this customer's job → `404`
+2. bid not on the job in the path → `404`
+3. **already `Accepted` → the caller's own award, answered** (unchanged, and still first — the retry
+   has to be recognised before the job's status is judged, or a successful award refuses its own retry)
+4. **job has moved on → `conflict`** ← moved up
+5. offer not live → `bidding_bid_closed`
+6. the customer's own counter → `bidding_wrong_party`
+
+The retry branch stays in front of all of it, which is the ordering SHIP-92 argued for and this does
+not disturb. `TestASecondAwardOnOneJobIsAConflictAtTheWire` now asserts the competing offer is
+`Rejected` *before* sending the second award, so the test says which of the two mechanisms it is
+exercising instead of passing for either reason.
+
+#### What the sweep buys the rest of the domain, which is more than tidiness
+
+Three verbs gate on `Status.live`. Before this ticket, a competing offer stayed `Submitted` after the
+award, so all three let it through: **its provider could revise the price of an offer on a job
+somebody else had already won**, or withdraw it, or the customer could counter it. Nothing was
+corrupted — the job had moved, so none of it could lead to an award — but every one of those told
+somebody their action on dead work had succeeded. All three now answer `bidding_bid_closed`, and one
+code covers all three because the client does the same thing with all three.
+
+It also narrows `ErrNegotiationOver` to what it should always have been. A counter on an **awarded**
+job now meets a `Rejected` offer and answers through the ordinary closed-offer branch; what still
+reaches the negotiation-over branch is a job cancelled or expired without ever being awarded, where
+the offers really are live and only the job has moved.
+
+#### Mutation testing
+
+Four mutations, run against the real database, each reverted immediately and confirmed with
+`git diff` before the next. These are additions to SHIP-92's table above rather than a replacement
+for it.
+
+| Mutation | Result |
+|---|---|
+| `rejectCompeting`'s `WHERE job_id = $1` dropped — the sweep reaches every job in the database | **Caught**, by `TestTheSweepReachesNoOtherJob` alone: both offers on the bystander job came back `Rejected`. Nothing else in the suite noticed, which is the argument for that test existing |
+| `AND status = 'Submitted'` dropped — the sweep reaches every row on the job | **Caught by 11 tests**, including every happy-path award. Louder than expected and for a reason worth knowing: without the predicate the sweep also rewrites the row the accept wrote one statement earlier, so the winner ends `Rejected` and `TestAwardingAcceptsTheBidAndMovesTheJob` fails before any of the four closed-status subtests are reached |
+| The sweep moved **in front of** the accept | **Caught by 14 tests**, on `acceptBid`'s compare-and-set matching nothing and the award reporting "was live when it was locked and is not now". This is the catch the absent `id <> $winner` buys, and it is the only position in the recorded lock ordering any test in this repository holds |
+| The whole call removed | **Caught by 5**: `TestAnAwardClosesEveryCompetingOffer`, `TestTheSweepClosesALosingNegotiationsHeadAndNotItsHistory`, `TestASweptOfferCanNoLongerBeActedOn`, and both second-award tests. Run because it is the one that says the *Done when* is demonstrated rather than asserted |
+
+**None survived**, which is a different result from SHIP-92's and for a reason worth stating rather
+than celebrating: **every one of these is a single-threaded property**. Whether a statement touches
+the right rows, and whether it runs before or after another statement in the same transaction, are
+both visible to a suite that never overlaps two transactions. SHIP-92's two survivors were both
+*serialisation* mechanisms, and those remain exactly as untested as that entry says. This ticket did
+not close that hole and did not widen it — see below.
+
+#### What this adds to SHIP-95's list, and what it deliberately does not
+
+**Nothing new that only a race can distinguish.** The sweep is an unconditional `UPDATE` over rows the
+job's lock already covers, and it has no compare-and-set to remove and no lock of its own to take —
+so there is no third mechanism here that a single-threaded test cannot see. The two survivors named in
+SHIP-92's entry are still the whole list.
+
+**One thing SHIP-95 should know about it anyway**, because it changes what a race would produce rather
+than adding a mechanism: the sweep locks *several* `bids` rows where every other writer in this domain
+locks one. Two sweeps on one job are serialised long before that matters — by the `jobs` lock at step
+1 and by the accept at step 3 — and two sweeps on different jobs touch disjoint rows, so there is no
+cycle to find. `Docs/11` §3's SHIP-88 entry allowed for a sweep that locks explicitly and asked for
+`ORDER BY id` if it did; a plain `UPDATE` takes no explicit lock, so that caveat does not apply, and
+if a future edit turns this into `SELECT … FOR UPDATE` it does.
+
+**No concurrency suite was written here**, and §8 is the reason: SHIP-95 is to be written from
+`Docs/02` §3 and `Docs/08`'s named races by somebody who has not read this implementation, and a race
+test written on this branch would anchor them.
+
+#### Shared surfaces
+
+**None.** No migration, no `internal/boundaries` edit, no `Deps` field, no new route and therefore no
+`routes_golden.txt` change, no new error code and so no `Docs/10-api-error-codes.md` edit, and not one
+`$ref` in `contracts/openapi.yaml` — the award path already existed and only its description grew.
+Everything is inside `internal/bidding/**`, `contracts/paths/bidding.yaml`, `scripts/verify/61-bidding.sh`
+and this file.
+
+`make verify` went from 499 checks across 13 sections to 506, all seven in
+`scripts/verify/61-bidding.sh`, and its two new accounts take `04162` and `04163` from the `0416x`
+block that file's header allocates. **The ordering trap SHIP-92's script warned about was met
+immediately and is worth repeating**: every offer in the sweep's fixture — the winner, a losing
+negotiation, a plain competitor and one already withdrawn — has to be placed *before* the award, because
+once the job is `Awarded` it is offered to nobody and a provider asked to bid afterwards is refused by
+the eligibility filter with a `404`. A true answer to a different question that reads exactly like a
+broken fixture.
 
 ### What SHIP-105 built, and the two rules that follow from a driver having no account
 

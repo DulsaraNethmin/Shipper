@@ -3,6 +3,7 @@ package bidding
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -389,6 +390,54 @@ func (m market) award(t *testing.T, customer, job, bid uuid.UUID) (Bid, error) {
 	return accepted, err
 }
 
+// rival is a second eligible provider, built from one number (SHIP-93).
+//
+// The sweep is not a sweep against one competitor, and building three by hand is three copies of the
+// same four statements where the only interesting difference is which offer wins. `n` is the whole of
+// an account's identity here — an address, a mobile in this package's own block and a registration —
+// so a test names a rival by a number and cannot collide with another test's by accident.
+func (m market) rival(t *testing.T, n int) uuid.UUID {
+	t.Helper()
+
+	id := newVerifiedProvider(t, m.pool,
+		fmt.Sprintf("bid-rival-%d@example.com", n), fmt.Sprintf("+6140000%04d", n))
+	declare(t, m.pool, id, "VIC")
+	addVehicle(t, m.pool, id, fmt.Sprintf("RIV%03d", n%1000))
+	return id
+}
+
+// statuses is what every bid on one job reads, keyed by identifier.
+//
+// Read out of the table rather than assembled from what each call returned, for the reason [market.row]
+// is: **the sweep writes rows no caller ever named**, so a test built from return values could not see
+// what it did — which is the whole of what SHIP-93 has to demonstrate.
+func (m market) statuses(t *testing.T, job uuid.UUID) map[uuid.UUID]string {
+	t.Helper()
+
+	rows, err := m.pool.Query(t.Context(),
+		`SELECT id, status FROM bids WHERE job_id = $1`, job)
+	if err != nil {
+		t.Fatalf("reading the bids on %s: %v", job, err)
+	}
+	defer rows.Close()
+
+	found := map[uuid.UUID]string{}
+	for rows.Next() {
+		var (
+			id     uuid.UUID
+			status string
+		)
+		if err := rows.Scan(&id, &status); err != nil {
+			t.Fatalf("scanning a bid on %s: %v", job, err)
+		}
+		found[id] = status
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("reading the bids on %s: %v", job, err)
+	}
+	return found
+}
+
 // jobStatus is the job's status and how many transitions have been recorded against it.
 //
 // Read together, and out of the tables rather than off anything the service said about itself: an
@@ -484,8 +533,10 @@ type storedBid struct {
 
 // setStatus moves a bid directly, for the statuses no endpoint can reach yet.
 //
-// Accepted is SHIP-92's, Rejected is SHIP-93's, Expired is SHIP-89's and Superseded is SHIP-88's, so a
-// test that needs one of them writes it. Unlike a job, a bid's status has no trigger guarding it
+// Expired is SHIP-89's and has no writer yet. Accepted, Rejected and Superseded all have one now —
+// the award, its sweep and a counter — and a test still writes them directly when what it needs is a
+// *starting* state rather than the act that produces one. Unlike a job, a bid's status has no trigger
+// guarding it
 // (000500 says why), so this is the same statement the platform itself would run — not a back door
 // around a guard.
 func (m market) setStatus(t *testing.T, bid uuid.UUID, status Status) {
