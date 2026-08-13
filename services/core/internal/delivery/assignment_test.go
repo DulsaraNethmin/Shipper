@@ -176,10 +176,36 @@ func newTestService() *Service {
 //
 // One constructor rather than four literals, so that the driver token issuer SHIP-107 added arrives
 // in every one of them: a test built without one panics, which is the right answer and a tedious one
-// to rediscover four times. SHIP-114's upload signer and policy arrive the same way.
+// to rediscover four times. SHIP-114's upload signer and policy arrive the same way, and SHIP-115's
+// object reader and ownership lookup after them.
 func newTestServiceWith(lifecycle Jobs) *Service {
-	return NewService(lifecycle, testAwards{}, testDriverIssuer(testClock()),
-		&recordingUploads{}, testUploadPolicy(), testClock())
+	return NewService(lifecycle, testAwards{}, testJobOwners(), testDriverIssuer(testClock()),
+		&recordingUploads{}, newRecordingObjects(), testUploadPolicy(), testClock())
+}
+
+// testJobOwners is delivery.JobOwners over jobs.Service.Job, as cmd/api reads it.
+//
+// A copy of jobCustomers for the reason testJobs is a copy of jobLifecycle: the production adapter
+// lives in package main, which has no database in a Go test. It goes through `jobs` rather than
+// running its own SELECT, so that "owns the job" means here exactly what it means there.
+func testJobOwners() JobOwners {
+	return testOwners{svc: jobs.NewService(events.NewOutbox(), testClock(), nil)}
+}
+
+type testOwners struct {
+	svc *jobs.Service
+}
+
+func (o testOwners) IsCustomer(ctx context.Context, r db.Runner, jobID, userID uuid.UUID) (bool, error) {
+	_, err := o.svc.Job(ctx, r, userID, jobID)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, jobs.ErrNotJobOwner), errors.Is(err, jobs.ErrJobNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // newAccount inserts a user with the role the test needs.
@@ -743,50 +769,68 @@ func TestAJobPastDriverAssignedIsRefused(t *testing.T) {
 	}
 }
 
+// collaborators is everything [NewService] insists on, for the test below.
+type collaborators struct {
+	jobs    Jobs
+	awards  Awards
+	owners  JobOwners
+	tokens  *DriverTokenIssuer
+	uploads ProofUploads
+	objects ProofObjects
+	policy  UploadPolicy
+	clk     clock.Clock
+}
+
+// working is a set that builds a service, which every case below then removes exactly one thing
+// from.
+//
+// **Written as a base plus one removal rather than eight literals**, which is a change SHIP-115 made
+// while adding two more collaborators. Eight full literals is where a case that is missing *two*
+// things still passes, because a panic proves only that something was wrong; starting from a set
+// that is known to work makes each case a statement about one field.
+func workingCollaborators() collaborators {
+	return collaborators{
+		jobs:    staticJobs{move: JobMoved},
+		awards:  testAwards{},
+		owners:  testJobOwners(),
+		tokens:  testDriverIssuer(testClock()),
+		uploads: &recordingUploads{},
+		objects: newRecordingObjects(),
+		policy:  testUploadPolicy(),
+		clk:     testClock(),
+	}
+}
+
 // TestNewServiceRefusesAMissingCollaborator.
 //
-// All six are load-bearing rules rather than conveniences: without Awards nobody is checked,
-// without Jobs the job never moves, without a token issuer an assignment produces no link for the
-// driver (SHIP-107), without an upload signer or a usable policy proof cannot be captured at all
-// (SHIP-114), and without a clock a milestone recorded with no actor-supplied time has nothing to be
-// stamped from. A service that started without any of them would fail silently, in production, at
-// the first request.
+// Every one is a load-bearing rule rather than a convenience: without Awards nobody is checked,
+// without Jobs the job never moves, without JobOwners a customer cannot be told from a stranger
+// asking after their own delivery (SHIP-115), without a token issuer an assignment produces no link
+// for the driver (SHIP-107), without an upload signer or a usable policy proof cannot be captured
+// at all (SHIP-114), without an object reader the platform can only take the client's word that a
+// photograph exists (SHIP-115), and without a clock a milestone recorded with no actor-supplied
+// time has nothing to be stamped from. A service that started without any of them would fail
+// silently, in production, at the first request.
 func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
+	// The base itself must build, or every case below would "pass" for the wrong reason.
+	base := workingCollaborators()
+	NewService(base.jobs, base.awards, base.owners, base.tokens,
+		base.uploads, base.objects, base.policy, base.clk)
+
 	for _, tc := range []struct {
-		name    string
-		jobs    Jobs
-		awards  Awards
-		tokens  *DriverTokenIssuer
-		uploads ProofUploads
-		policy  UploadPolicy
-		clk     clock.Clock
+		name   string
+		remove func(*collaborators)
 	}{
-		{name: "no job lifecycle", jobs: nil, awards: testAwards{},
-			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
-			policy: testUploadPolicy(), clk: testClock()},
-		{name: "no award lookup", jobs: staticJobs{move: JobMoved}, awards: nil,
-			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
-			policy: testUploadPolicy(), clk: testClock()},
-		{name: "no driver token issuer", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
-			tokens: nil, uploads: &recordingUploads{},
-			policy: testUploadPolicy(), clk: testClock()},
-		{name: "nowhere to put proof", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
-			tokens: testDriverIssuer(testClock()), uploads: nil,
-			policy: testUploadPolicy(), clk: testClock()},
-		{name: "no size limit", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
-			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
-			policy: UploadPolicy{AcceptedContentTypes: []string{"image/jpeg"}, URLTTL: time.Minute},
-			clk:    testClock()},
-		{name: "no accepted content types", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
-			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
-			policy: UploadPolicy{MaxBytes: 1 << 20, URLTTL: time.Minute}, clk: testClock()},
-		{name: "no URL lifetime", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
-			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
-			policy: UploadPolicy{MaxBytes: 1 << 20, AcceptedContentTypes: []string{"image/jpeg"}},
-			clk:    testClock()},
-		{name: "no clock", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
-			tokens: testDriverIssuer(testClock()), uploads: &recordingUploads{},
-			policy: testUploadPolicy(), clk: nil},
+		{"no job lifecycle", func(c *collaborators) { c.jobs = nil }},
+		{"no award lookup", func(c *collaborators) { c.awards = nil }},
+		{"no job ownership lookup", func(c *collaborators) { c.owners = nil }},
+		{"no driver token issuer", func(c *collaborators) { c.tokens = nil }},
+		{"nowhere to put proof", func(c *collaborators) { c.uploads = nil }},
+		{"no way to read an object back", func(c *collaborators) { c.objects = nil }},
+		{"no size limit", func(c *collaborators) { c.policy.MaxBytes = 0 }},
+		{"no accepted content types", func(c *collaborators) { c.policy.AcceptedContentTypes = nil }},
+		{"no URL lifetime", func(c *collaborators) { c.policy.URLTTL = 0 }},
+		{"no clock", func(c *collaborators) { c.clk = nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer func() {
@@ -794,7 +838,10 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 					t.Error("NewService returned a service that cannot work")
 				}
 			}()
-			NewService(tc.jobs, tc.awards, tc.tokens, tc.uploads, tc.policy, tc.clk)
+
+			c := workingCollaborators()
+			tc.remove(&c)
+			NewService(c.jobs, c.awards, c.owners, c.tokens, c.uploads, c.objects, c.policy, c.clk)
 		})
 	}
 }

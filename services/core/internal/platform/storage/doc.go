@@ -41,20 +41,33 @@
 // a photograph through the API would occupy a request goroutine and a server timeout for
 // the duration, and would put megabytes of image through a service sized for JSON.
 //
-// The consequence for this package is total: it makes no request to the object store, ever. There
-// is no upload, no download, no listing and no delete — only signing. s3.go's header has what
-// follows from that, including why the signature is written against the standard library rather
-// than an SDK.
+// The consequence for this package is nearly total: there is no upload, no download, no listing
+// and no delete. s3.go's header has what follows from that, including why the signature is written
+// against the standard library rather than an SDK.
+//
+// **SHIP-114 wrote that as "makes no request to the object store, ever", and SHIP-115 narrowed
+// it.** `S3.Stored` asks what the store holds under one key, and it exists *because* of the rule
+// above rather than in spite of it: with the bytes going straight from the client to the store,
+// asking is the only way the platform can ever learn that an upload happened. The rule that was
+// always doing the work is **no transfer through this service**, and a metadata request carries no
+// body in either direction. Docs/11 §3 records the change and why the alternative — recording the
+// client's word for it — was refused.
 //
 // The database keeps the metadata and the access controls (Docs/06 §4). Nothing here is
 // authoritative about which job a file belongs to or who may see it — that is the delivery
-// and profiles domains' answer, and this package only stores bytes.
+// and profiles domains' answer, and this package only stores bytes. `S3.PresignDownload` will sign
+// a URL for any key it is handed; the authorisation happens in the domain, before the call.
 //
 // # Everything in here is private
 //
 // There is no public read path. Verification documents are private evidence and proof
 // photographs identify an address and a recipient; both are reached only through a
-// short-lived signed URL issued after an authorisation check (SHIP-115, SHIP-155).
+// short-lived signed URL issued after an authorisation check.
+//
+// **SHIP-115 built the first half of that.** `GET /v1/jobs/{id}/proof` decides from the `proofs`
+// table who is asking — the customer who owns the job or the provider who was awarded it — and
+// only then calls `S3.PresignDownload`. The administrator's half is SHIP-155's, and it is waiting
+// on an administrator to exist (SHIP-147) rather than on anything here.
 //
 // The interface this package satisfies is declared by the domain that needs a file stored
 // — delivery for proof, profiles for verification documents — never here.

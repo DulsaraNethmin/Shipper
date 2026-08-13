@@ -35,14 +35,15 @@ import (
 // the content type and the length — are **signed** rather than merely checked here. A limit this
 // file enforces and the URL does not carry is a limit the client could have made up.
 //
-// # What this ticket deliberately does not do
+// # What this half deliberately does not do
 //
-// It writes nothing. There is no `proof` table, no row, no migration — **SHIP-115 is "uploaded
-// proof is linked to a job and milestone with access control"**, and that record is its *Done
-// when* rather than this one's. An object in the bucket is not proof of anything until SHIP-115
-// says which job and which milestone it belongs to; until then it is bytes with a key.
+// It writes nothing. Issuing a URL reserves no object and records no row — **an object in the
+// bucket is not proof of anything until something says which job and which milestone it belongs
+// to**, and until then it is bytes with a key. That is also the honest answer to what a retry
+// returns; see [Service.PresignProofUpload].
 //
-// That is also the honest answer to what a retry returns — see [Service.PresignProofUpload].
+// SHIP-115 is the other half of this file, below [proofObjectKey], and it is where the record and
+// the access control live.
 
 // maxProofContentType bounds the media type a client may ask for.
 //
@@ -231,7 +232,7 @@ func (s *Service) PresignProofUpload(
 	req UploadRequest,
 ) (Upload, error) {
 	request := req.normalise()
-	problems := request.problems(s.uploads.policy)
+	problems := request.problems(s.proof.policy)
 	if err := problems.Err(); err != nil {
 		return Upload{}, err
 	}
@@ -253,8 +254,8 @@ func (s *Service) PresignProofUpload(
 		return Upload{}, err
 	}
 
-	url, expiresAt, err := s.uploads.store.PresignUpload(
-		ctx, key, request.ContentType, request.ContentLength, s.uploads.policy.URLTTL)
+	url, expiresAt, err := s.proof.uploads.PresignUpload(
+		ctx, key, request.ContentType, request.ContentLength, s.proof.policy.URLTTL)
 	if err != nil {
 		// A failure of the signer rather than of the request: the domain has already checked
 		// everything a client could get wrong, so this is a configuration or a wiring fault and
@@ -297,4 +298,403 @@ func proofObjectKey(jobID uuid.UUID) (string, error) {
 		return "", fmt.Errorf("delivery: generating an object key for %s: %w", jobID, err)
 	}
 	return proofKeyPrefix + "/" + jobID.String() + "/" + id.String(), nil
+}
+
+// Proof of delivery, part two: making an uploaded object evidence (SHIP-115).
+//
+// # The platform never saw the photograph, and this is the file where that has to be dealt with
+//
+// Part one hands out permission and writes nothing. The client PUTs the bytes to the object store
+// with this service in neither direction, so at the end of SHIP-114 the platform holds **no record
+// that anything was uploaded** and cannot obtain one by waiting: there is no callback, no
+// notification and nothing to poll. Two failures follow directly from that, and they are not
+// symmetric:
+//
+//   - **a row with no object.** The client says "I uploaded proof/<job>/<uuid>" and nothing did.
+//     The platform would then hold a record asserting that a delivery was photographed, when it
+//     has never looked. Docs/01 §4.4 makes proof "the *only* evidence that the job happened as
+//     claimed" — a record that might point at nothing is not evidence, and a dispute (Docs/04 §7)
+//     is where that would be discovered.
+//   - **an object with no row.** A URL was issued and spent and the client never came back, or
+//     came back into a request that failed. The bucket holds bytes nothing references.
+//
+// **The first is refused and the second is expected**, and the asymmetry is the decision this file
+// exists to record. [Service.VerifyProof] asks the store what it holds before anything is written,
+// so a `proofs` row always has an object behind it — checked, not asserted. An unreferenced object
+// is proof of nothing, cannot be found by anybody (the bucket has no public read path and the keys
+// are unguessable), and ages out under a lifecycle rule, which is what SHIP-114 chose UUIDv7 keys
+// for. Making *that* direction impossible would mean recording something at the moment a URL is
+// issued, and SHIP-114 argues at length why nothing is recorded then.
+//
+// # What is stored is what the store reported
+//
+// [VerifiedProof] carries the content type, the length and the entity tag the store answered with,
+// not the ones the client asked for. Those are usually the same values — the upload URL signs both
+// — and this is the copy that is still right when they are not, which is what lets [UploadPolicy]
+// be enforced against the object that exists rather than only against the request that asked to
+// create one.
+
+// VerifiedProof is an object the platform has looked at, and it is the only thing that can be
+// recorded as proof.
+//
+// # Its fields are unexported, and that is the mechanism rather than a style
+//
+// The zero value means "no proof", and it is the only value another package can construct: nothing
+// outside `delivery` can set a field, so nothing outside `delivery` can hand [Service.RecordMilestone]
+// a photograph the platform has not checked. This is the same shape [DriverGrant] uses — a value
+// obtainable from one function and from nowhere else — and it is here for the same reason: a rule
+// enforced by what a caller is *able* to build survives a refactor that a rule enforced by calling
+// order does not.
+type VerifiedProof struct {
+	objectKey string
+
+	contentType   string
+	contentLength int64
+	etag          string
+}
+
+// present reports whether this recording carries proof at all.
+func (p VerifiedProof) present() bool { return p.objectKey != "" }
+
+// complete reports whether every fact the store answered with is here.
+//
+// Checked before the insert rather than left to 000603's CHECK constraints, for the reason
+// Docs/10 §4.6 gives about validation generally: a constraint name in a 500 explains nothing.
+// Nothing can produce a partial value through an endpoint — the fields are unexported and
+// [Service.VerifyProof] sets all four or returns an error — so this is the guard against a future
+// caller *inside* this package assembling one and skipping the store.
+func (p VerifiedProof) complete() bool {
+	return p.objectKey != "" && p.contentType != "" && p.contentLength > 0 && p.etag != ""
+}
+
+// ObjectKey is where the photograph is, for a caller that needs to log or display it.
+//
+// A reader rather than an exported field, so the zero value stays the only one another package can
+// make.
+func (p VerifiedProof) ObjectKey() string { return p.objectKey }
+
+// VerifyProof checks that an object exists, belongs to this job, and is something the platform will
+// accept as evidence (SHIP-115).
+//
+// # It runs outside the transaction, deliberately
+//
+// This makes a network request to the object store, and a database transaction held open across a
+// call to another service is a pool connection hostage to that service's worst day. So the handler
+// calls this first, against the pool, and opens its transaction afterwards with the answer in hand.
+// The awarded check is therefore made twice — once here and once inside [Service.RecordMilestone] —
+// which is one indexed read, and the alternative is worse in both directions: skipping it here would
+// let a stranger learn whether an object exists, and skipping it there would make this function's
+// return value load-bearing for authorisation.
+//
+// # The refusals, in this order, and the order is the same one every other write in this domain uses
+//
+//  1. a key the platform did not issue for *this* job is [ErrProofNotForThisJob] — decided from the
+//     string alone, with no lookup, so it discloses nothing but the caller's own body;
+//  2. a job nobody was awarded, or no job at all, is [ErrJobNotFound];
+//  3. a job awarded to another provider is [ErrNotAwardedProvider];
+//  4. an object that is not there is [ErrProofNotUploaded];
+//  5. an object outside [UploadPolicy] is [ErrProofRejected].
+//
+// (2) and (3) are one 404 on the wire, for the reason [apiError] gives. They come before the store
+// is asked anything, which is what stops this endpoint being a way to probe whether a key exists.
+//
+// # Why the policy is checked again here
+//
+// It was checked before the URL was signed and signed into the URL, so an upload that changed either
+// value is refused by the store on the request that carried the bytes. That guard is real and it is
+// **entirely outside this package** — the domain's tests stub the signer, so no test here can fail
+// when it stops working, which is what SHIP-114's mutation testing recorded as an open hole. Reading
+// the stored values back and judging them closes it from the other end: whatever route an object
+// took into the bucket, it is measured against the platform's current limits before it becomes
+// evidence.
+func (s *Service) VerifyProof(
+	ctx context.Context,
+	r db.Runner,
+	providerID, jobID uuid.UUID,
+	objectKey string,
+) (VerifiedProof, error) {
+	key := strings.TrimSpace(objectKey)
+	if !keyBelongsToJob(key, jobID) {
+		return VerifiedProof{}, fmt.Errorf("delivery: %q is not an object key %s issued: %w",
+			key, jobID, ErrProofNotForThisJob)
+	}
+
+	awarded, isAwarded, err := s.awards.AwardedProvider(ctx, r, jobID)
+	if err != nil {
+		return VerifiedProof{}, err
+	}
+	if !isAwarded {
+		return VerifiedProof{}, fmt.Errorf("delivery: %s has no accepted bid: %w", jobID, ErrJobNotFound)
+	}
+	if awarded != providerID {
+		return VerifiedProof{}, fmt.Errorf("delivery: %s was awarded to %s, not %s: %w",
+			jobID, awarded, providerID, ErrNotAwardedProvider)
+	}
+
+	contentType, contentLength, etag, found, err := s.proof.objects.Stored(ctx, key)
+	if err != nil {
+		// A failure of the store rather than an answer from it — see [ProofObjects.Stored]. It
+		// becomes an opaque 500 with its cause logged (SHIP-15i), which is the right answer: the
+		// client did nothing wrong and there is nothing it can usefully be told.
+		return VerifiedProof{}, fmt.Errorf("delivery: asking the store about %s on %s: %w", key, jobID, err)
+	}
+	if !found {
+		return VerifiedProof{}, fmt.Errorf("delivery: %s holds nothing on %s: %w",
+			key, jobID, ErrProofNotUploaded)
+	}
+
+	// Normalised the way an upload request is, and for the same reason: the configured list is
+	// lower case, media types are case-insensitive (RFC 9110 §8.3), and a store echoing back
+	// `Image/JPEG` must not be a reason to refuse a perfectly good photograph. A parameter —
+	// `image/jpeg; charset=binary` — is not trimmed off, because the platform signed a bare type
+	// and an object carrying a parameter is not the object it authorised.
+	stored := strings.ToLower(strings.TrimSpace(contentType))
+
+	switch {
+	case !slices.Contains(s.proof.policy.AcceptedContentTypes, stored):
+		return VerifiedProof{}, fmt.Errorf("delivery: %s holds %q, which is not one of %s: %w",
+			key, stored, strings.Join(s.proof.policy.AcceptedContentTypes, ", "), ErrProofRejected)
+
+	case contentLength <= 0:
+		return VerifiedProof{}, fmt.Errorf("delivery: %s holds %d bytes: %w",
+			key, contentLength, ErrProofRejected)
+
+	case contentLength > s.proof.policy.MaxBytes:
+		return VerifiedProof{}, fmt.Errorf("delivery: %s holds %d bytes, over the %d-byte limit: %w",
+			key, contentLength, s.proof.policy.MaxBytes, ErrProofRejected)
+	}
+
+	if strings.TrimSpace(etag) == "" {
+		// Every S3-compatible store answers a HEAD with one, and a record without it could not
+		// later show that the bytes had been replaced. Reported rather than stored empty:
+		// ck_proofs_etag would refuse the row anyway, and a constraint name is a worse
+		// explanation than this.
+		return VerifiedProof{}, fmt.Errorf("delivery: %s exists and the store reported no entity tag: %w",
+			key, ErrProofRejected)
+	}
+
+	return VerifiedProof{
+		objectKey:     key,
+		contentType:   stored,
+		contentLength: contentLength,
+		etag:          etag,
+	}, nil
+}
+
+// keyBelongsToJob reports whether key is one [proofObjectKey] could have produced for jobID.
+//
+// # It is an authorisation check, not a tidiness check
+//
+// Every key is chosen by the platform and prefixed with the job the URL was issued against, so a
+// key naming another job is a client attaching one delivery's photograph to another. The bucket is
+// one namespace shared by every job and — from SHIP-155 — by verification documents, so without
+// this the only thing standing between two jobs' evidence is that keys are hard to guess. They are
+// hard to guess and easy to *pass on*: a provider awarded two jobs holds keys for both.
+//
+// The last segment is checked to be an identifier rather than merely non-empty, so that
+// `proof/<job>/../<other-job>/<id>` cannot arrive by being correctly prefixed — storage's own
+// validateObjectKey refuses a `..` segment as well, and one of the two being enough is not a reason
+// for the other to trust it.
+func keyBelongsToJob(key string, jobID uuid.UUID) bool {
+	rest, ok := strings.CutPrefix(key, proofKeyPrefix+"/"+jobID.String()+"/")
+	if !ok {
+		return false
+	}
+	_, err := uuid.Parse(rest)
+	return err == nil
+}
+
+// recordProof writes the row that makes an object evidence, inside the caller's transaction.
+//
+// It is called from [Service.RecordMilestone] and from nowhere else, which is what keeps the
+// proof and the milestone one act: there is no path that records a photograph against a milestone
+// recorded earlier, because a milestone that has been committed without proof is a state SHIP-118
+// will have to refuse and this domain therefore never produces.
+//
+// r must be the transaction the milestone was written in. Not asserted here — [Service.RecordMilestone]
+// checks it once at the top, and a second check would suggest this is reachable on its own.
+func (s *Service) recordProof(
+	ctx context.Context,
+	r db.Runner,
+	jobID, milestoneID uuid.UUID,
+	proof VerifiedProof,
+) (Proof, error) {
+	if !proof.complete() {
+		return Proof{}, fmt.Errorf("delivery: %q was not checked against the store: %w",
+			proof.objectKey, ErrProofNotVerified)
+	}
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		return Proof{}, fmt.Errorf("delivery: generating a proof id for %s: %w", jobID, err)
+	}
+
+	return s.store.insertProof(ctx, r, Proof{
+		ID:          id,
+		JobID:       jobID,
+		MilestoneID: milestoneID,
+
+		ObjectKey:     proof.objectKey,
+		ContentType:   proof.contentType,
+		ContentLength: proof.contentLength,
+		ETag:          proof.etag,
+	})
+}
+
+// Proof is one photograph, and the recorded claim it is evidence for.
+//
+// # It is attached to a milestone, and through the milestone to a job
+//
+// Docs/01 §4.4 numbers five things an actor records and requires a photograph of one of them, so
+// proof is evidence *for a recorded claim* rather than a property of the delivery. The consequence
+// worth knowing is what an absorbed milestone does with it: SHIP-112 keeps a late milestone's row
+// and moves nothing, so **proof follows the milestone**, is kept with it, and appears on a
+// timeline at the time the actor recorded it rather than at the time the phone found signal. Proof
+// hung off the job would have had to answer "which one is current" from the arrival order, which is
+// the one order Docs/02 §3.1 says not to show a customer.
+//
+// RecordedAt is the *milestone's* actor clock and AcceptedAt is when this row was written. There is
+// no third timestamp and no actor: both are already on the milestone, in one row, written in the
+// same transaction, and a second copy could only ever disagree with the first.
+type Proof struct {
+	ID          uuid.UUID
+	JobID       uuid.UUID
+	MilestoneID uuid.UUID
+
+	Milestone Milestone
+
+	ObjectKey string
+
+	ContentType   string
+	ContentLength int64
+
+	// ETag is the store's tag for the bytes at the moment they became proof.
+	//
+	// Not returned to any client and stored because it is unrecoverable later: a pre-signed PUT
+	// stays usable until it expires, so a holder of the URL can overwrite the object inside that
+	// window, and this is what makes such an overwrite detectable rather than silent. SHIP-155's
+	// viewer is where an administrator would be shown a mismatch.
+	ETag string
+
+	RecordedAt time.Time
+	AcceptedAt time.Time
+}
+
+// ProofLink is a [Proof] with somewhere to actually look at it.
+//
+// The URL is issued **after** the authorisation check in [Service.ProofFor] and never before —
+// internal/platform/storage will sign one for any key it is handed and says so, so the decision
+// about who may see a delivery photograph lives here and only here.
+//
+// It is short-lived on the same reasoning as the upload URL: nothing can revoke a pre-signed URL, so
+// its lifetime is the whole of the control. A rendered image URL that leaks out of a customer's
+// browser history reaches a photograph of somebody's front door until it expires.
+type ProofLink struct {
+	Proof
+
+	URL       string
+	ExpiresAt time.Time
+}
+
+// ProofFor is the proof on one job, for a reader entitled to see it (SHIP-115).
+//
+// # Who may read a delivery's proof, and it is a shorter list than it looks
+//
+// Two parties, decided from the database rather than from a role claim:
+//
+//   - **the customer who owns the job.** Docs/01 §4.4's acceptance measure is theirs — "a customer
+//     can see the latest delivery milestone and proof of delivery for their awarded job" — and
+//     SHIP-133 is the screen.
+//   - **the provider the job was awarded to**, on the same accepted bid every write in this domain
+//     is checked against. They took the photograph; being unable to see what they submitted would
+//     make a dispute about it unanswerable from their side.
+//
+// Both get the same thing, and that is a decision rather than an omission: there is no reduced view
+// for one of them. A photograph is not a field that can be redacted, and a customer and a provider
+// looking at the same delivery are arguing about the same object when they argue (Docs/04 §7).
+//
+// **The assigned driver is not on the list**, and the reason is not that they are untrusted. It is
+// that nothing they could do with it exists yet: SHIP-122 is the ticket that has a driver capture
+// proof at all, it is blocked on the idempotency scope (Docs/11 §3, SHIP-114), and a driver's link
+// is forwardable through whatever channel the provider used and lives seven days. A proof
+// photograph identifies an address and a recipient, which is the most sensitive thing a delivery
+// produces, and widening a seven-day forwardable credential to reach one before any driver can even
+// take one is a cost with no matching benefit. **SHIP-122 is where that gets revisited**, with a
+// concrete need in front of it.
+//
+// **An administrator is not on the list either, and cannot be.** Docs/04 §6 and §7 both put proof in
+// front of one, and there is no administrator: `ck_users_role` refuses 'admin' and admin sign-in is
+// a separate system (SHIP-147). SHIP-155 is that reader, and what it needs from here is the
+// download signing this function already uses plus the access log Docs/04 §6 requires.
+//
+// # A stranger and a job that does not exist get the same answer
+//
+// Both are [ErrJobNotFound] and one 404, which is the reading every other endpoint in this domain
+// takes: a 403 would confirm that a job exists and that somebody is delivering it.
+//
+// # A customer whose job has no proof yet gets an empty list rather than a 404
+//
+// They are entitled to look, and "nothing has been photographed" is a true and useful answer.
+// Distinguishing it from "no such job" tells them nothing they did not already know, because it is
+// their job.
+//
+// r is a reader rather than a transaction: two statements, no writes, nothing to keep consistent.
+func (s *Service) ProofFor(
+	ctx context.Context,
+	r db.Runner,
+	readerID, jobID uuid.UUID,
+) ([]ProofLink, error) {
+	mayRead, err := s.mayReadProof(ctx, r, readerID, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if !mayRead {
+		return nil, fmt.Errorf("delivery: %s may not read the proof on %s: %w",
+			readerID, jobID, ErrJobNotFound)
+	}
+
+	stored, err := s.store.proofOn(ctx, r, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	links := make([]ProofLink, 0, len(stored))
+	for _, p := range stored {
+		url, expiresAt, err := s.proof.objects.PresignDownload(ctx, p.ObjectKey, s.proof.policy.URLTTL)
+		if err != nil {
+			return nil, fmt.Errorf("delivery: signing a download for %s on %s: %w", p.ObjectKey, jobID, err)
+		}
+		links = append(links, ProofLink{Proof: p, URL: url, ExpiresAt: expiresAt})
+	}
+	return links, nil
+}
+
+// mayReadProof answers whether this account is one of the two parties to the delivery.
+//
+// The customer is asked first and the awarded provider second, which is an ordering rather than a
+// preference: the two are never the same account today — `ck_users_role` fixes the role at
+// registration and SHIP-45's trigger keeps it fixed — and cmd/api's jobPartiesLookup records the
+// same ordering for the same reason.
+//
+// Both questions are asked of ports rather than of a role claim on the token. Being the customer on
+// the job and the provider on its accepted bid are facts; `role: provider` is an assertion the
+// platform issued about an account and says nothing about *this* delivery.
+func (s *Service) mayReadProof(
+	ctx context.Context,
+	r db.Runner,
+	readerID, jobID uuid.UUID,
+) (bool, error) {
+	isCustomer, err := s.owners.IsCustomer(ctx, r, jobID, readerID)
+	if err != nil {
+		return false, err
+	}
+	if isCustomer {
+		return true, nil
+	}
+
+	awarded, isAwarded, err := s.awards.AwardedProvider(ctx, r, jobID)
+	if err != nil {
+		return false, err
+	}
+	return isAwarded && awarded == readerID, nil
 }

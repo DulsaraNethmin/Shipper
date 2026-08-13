@@ -95,6 +95,46 @@ func init() {
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).PresignProofUpload() },
 		},
 		Route{
+			Method: http.MethodGet,
+
+			// **`/jobs/{id}/proof` was the intended pattern and it cannot be served**, which
+			// is a finding SHIP-115 made rather than a preference. `GET /jobs/open/{id}`
+			// (SHIP-83) puts a literal in the `{id}` position, so it and any three-segment
+			// `GET /jobs/{id}/<literal>` both match `/jobs/open/proof` with neither more
+			// specific — Go's ServeMux refuses the pair at registration and the process does
+			// not start. `POST /jobs/{id}/proof-uploads` is unaffected only because the other
+			// route is a GET.
+			//
+			// So the delivery domain takes a shelf of its own under the job, and that turns
+			// out to be worth having rather than a workaround: **every read this domain adds
+			// under a job would have hit the same wall** — SHIP-116's exception, SHIP-133's
+			// tracking view, a milestone timeline — and each now has somewhere to go that
+			// composes. Docs/11 §3 records the collision for whoever owns `/jobs/open/{id}`,
+			// because it is the shape that will keep costing tickets an hour.
+			Pattern: "/jobs/{id}/delivery/proof",
+			Group:   GroupV1,
+
+			// **The route above hands out a credential to write into the evidence bucket;
+			// this one hands out credentials to read out of it** (SHIP-115), and the pairing
+			// is why the auth class alone is not the access control here. RequireUser gets a
+			// caller as far as the handler, and the handler asks the database which of two
+			// parties they are — the customer who owns the job, or the provider on its
+			// accepted bid. Being neither answers exactly what a job that does not exist
+			// answers.
+			//
+			// A proof photograph identifies an address and a recipient, so there is no public
+			// read path to one anywhere in this service and no route that serves the bytes.
+			// What this returns is short-lived signed URLs at the object store, issued after
+			// the check and never before.
+			//
+			// **Not RequireDriverToken, and not a second route under /driver/ either.** The
+			// assigned driver is deliberately not a reader yet — internal/delivery's
+			// Service.ProofFor argues it, and SHIP-122 is where it gets revisited with a
+			// driver who can actually capture proof in front of it.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).ProofOnJob() },
+		},
+		Route{
 			Method:  http.MethodGet,
 			Pattern: "/driver/jobs/{id}",
 			Group:   GroupV1,
@@ -142,11 +182,19 @@ func init() {
 // a transient condition the service is built to survive, and the handlers answer 503 for as long as
 // it lasts.
 func deliveryHandler(d Deps) *delivery.Handler {
+	// One signer, handed to the domain as two ports (SHIP-115). `delivery` asks for permission to
+	// upload through one and reads an object back through the other, and the two are separate
+	// interfaces so that a path holding the reader cannot mint permission to write. That they are
+	// satisfied by the same value is this file's business and nothing the domain can see.
+	store := proofUploads(d)
+
 	svc := delivery.NewService(
 		jobLifecycle{jobs: newJobService(d)},
 		acceptedBids{},
+		jobCustomers{jobs: newJobService(d)},
 		driverTokenIssuer(d),
-		proofUploads(d),
+		store,
+		store,
 		delivery.UploadPolicy{
 			MaxBytes:             d.Config.Storage.MaxUploadBytes,
 			AcceptedContentTypes: d.Config.Storage.AcceptedContentTypes,
@@ -455,11 +503,57 @@ func (acceptedBids) AwardedProvider(
 	return providerID, true, nil
 }
 
-// Compile-time proof that the two adapters satisfy the ports delivery declared, which is the only
-// place in the build where that can be established — delivery names neither type and neither type
+// jobCustomers implements delivery.JobOwners by asking `jobs` whether this account owns the job
+// (SHIP-115).
+//
+// # Why this one goes through the domain and acceptedBids does not
+//
+// acceptedBids is raw SQL here because `bidding` has no store yet and will not until SHIP-92. `jobs`
+// does, and jobs.Service.Job is the reader that already knows what ownership means — it takes the
+// job without a lock and compares customer_id, keeping "somebody else's" and "nobody's" apart in Go
+// while answering the same thing on the wire. Writing `SELECT customer_id FROM jobs` here instead
+// would be a second definition of a rule that domain owns, in a file that cannot be tested against a
+// database.
+//
+// # Both refusals collapse to false, which is the port's own contract
+//
+// jobs.ErrNotJobOwner and jobs.ErrJobNotFound are two facts and one answer: "no". delivery turns
+// that into the 404 a stranger gets, and a reader who could tell them apart would learn that
+// somebody else's job exists (delivery.JobOwners says so).
+type jobCustomers struct {
+	jobs *jobs.Service
+}
+
+// IsCustomer reports whether userID is the customer who owns jobID.
+//
+// No lock and no transaction: one read, and nothing downstream of it changes the answer — a job's
+// customer_id is fixed at creation and no endpoint updates it.
+func (c jobCustomers) IsCustomer(
+	ctx context.Context,
+	r db.Runner,
+	jobID, userID uuid.UUID,
+) (bool, error) {
+	_, err := c.jobs.Job(ctx, r, userID, jobID)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, jobs.ErrNotJobOwner), errors.Is(err, jobs.ErrJobNotFound):
+		return false, nil
+	default:
+		return false, fmt.Errorf("cmd/api: reading whether %s owns %s: %w", userID, jobID, err)
+	}
+}
+
+// Compile-time proof that the adapters satisfy the ports delivery declared, which is the only place
+// in the build where that can be established — delivery names none of these types and none of them
 // names delivery, so nothing else links them.
+//
+// *storage.S3 appears twice on purpose. delivery declares upload signing and object reading as two
+// ports, and this is where one value is shown to satisfy both.
 var (
 	_ delivery.Jobs         = jobLifecycle{}
 	_ delivery.Awards       = acceptedBids{}
+	_ delivery.JobOwners    = jobCustomers{}
 	_ delivery.ProofUploads = (*storage.S3)(nil)
+	_ delivery.ProofObjects = (*storage.S3)(nil)
 )

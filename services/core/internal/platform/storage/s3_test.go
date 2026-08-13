@@ -533,3 +533,207 @@ func removeObject(t *testing.T, signer *S3, key string) {
 	_, _ = io.Copy(io.Discard, response.Body)
 	_ = response.Body.Close()
 }
+
+// --- SHIP-115: reading an object back ------------------------------------------------------------
+
+// TestStoredReportsWhatTheStoreActuallyHolds is the one request this package makes, against the
+// store that is actually running.
+//
+// **It is the only place the claim can be checked.** The delivery domain stubs this port, so the
+// assertion that a HEAD against a self-signed URL returns the object's real type, size and entity
+// tag has nowhere else to live — and the values it reports are what `proofs` records and what the
+// platform's upload limits are then applied to (SHIP-115).
+func TestStoredReportsWhatTheStoreActuallyHolds(t *testing.T) {
+	signer, _ := liveSigner(t)
+	key := testKey(t)
+	t.Cleanup(func() { removeObject(t, signer, key) })
+
+	const body = "forty-nine bytes of something that is not a photo."
+
+	signed, _, err := signer.PresignUpload(t.Context(), key, "image/jpeg", int64(len(body)), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("signing the upload: %v", err)
+	}
+	if status := put(t, signed, "image/jpeg", body); status != http.StatusOK {
+		t.Fatalf("uploading answered %d, want 200", status)
+	}
+
+	contentType, contentLength, etag, found, err := signer.Stored(t.Context(), key)
+	if err != nil {
+		t.Fatalf("asking the store about %s: %v", key, err)
+	}
+	if !found {
+		t.Fatal("the object was uploaded and the store says it is not there")
+	}
+
+	if contentType != "image/jpeg" {
+		t.Errorf("content type = %q, want image/jpeg", contentType)
+	}
+	if contentLength != int64(len(body)) {
+		t.Errorf("content length = %d, want %d", contentLength, len(body))
+	}
+	if etag == "" {
+		t.Error("no entity tag came back, so a later overwrite of the bytes would be undetectable")
+	}
+	if strings.Contains(etag, `"`) {
+		t.Errorf("etag = %q — the quotes are the header's syntax, not part of the tag", etag)
+	}
+}
+
+// TestStoredSaysSoWhenNothingWasUploaded.
+//
+// This is the case SHIP-115 exists for: a URL is issued, the client never PUTs, and the platform
+// has no other way to find out. A missing object is an answer with a nil error, so the domain can
+// turn it into a refusal telling the driver to upload again rather than into a 500.
+func TestStoredSaysSoWhenNothingWasUploaded(t *testing.T) {
+	signer, _ := liveSigner(t)
+
+	_, _, _, found, err := signer.Stored(t.Context(), testKey(t))
+	if err != nil {
+		t.Fatalf("asking about an object that was never uploaded: %v, want no error", err)
+	}
+	if found {
+		t.Error("the store reported an object nobody uploaded")
+	}
+}
+
+// TestStoredRefusesAWrongCredentialRatherThanCallingItMissing.
+//
+// A store answers 403 when the signature does not verify, and folding that into "not there" would
+// turn a configuration fault into a message telling every driver their photograph never arrived.
+// Driven with a signer holding the wrong secret, which is the shape a rotated key produces.
+func TestStoredRefusesAWrongCredentialRatherThanCallingItMissing(t *testing.T) {
+	good, bucket := liveSigner(t)
+	key := testKey(t)
+	t.Cleanup(func() { removeObject(t, good, key) })
+
+	const body = "a real object, asked about with the wrong key"
+
+	signed, _, err := good.PresignUpload(t.Context(), key, "image/jpeg", int64(len(body)), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("signing the upload: %v", err)
+	}
+	if status := put(t, signed, "image/jpeg", body); status != http.StatusOK {
+		t.Fatalf("uploading answered %d, want 200", status)
+	}
+
+	bad, err := NewS3(Options{
+		Endpoint:        env("STORAGE_ENDPOINT", "http://localhost:9000"),
+		Bucket:          bucket,
+		Region:          env("STORAGE_REGION", "ap-southeast-2"),
+		AccessKeyID:     env("STORAGE_ACCESS_KEY_ID", "shipper"),
+		SecretAccessKey: "this-is-not-the-secret-the-store-holds",
+		UsePathStyle:    env("STORAGE_USE_PATH_STYLE", "true") != "false",
+	})
+	if err != nil {
+		t.Fatalf("building a signer with a wrong secret: %v", err)
+	}
+
+	_, _, _, found, err := bad.Stored(t.Context(), key)
+	if found {
+		t.Fatal("an unverifiable signature was accepted")
+	}
+	if err == nil {
+		t.Fatal("a refused credential was reported as an object that is not there, which would " +
+			"tell every driver their photograph had failed to upload")
+	}
+}
+
+// TestADownloadURLReadsTheObjectAndNothingElseDoes is the read path's half of SHIP-115's access
+// control, at the store.
+//
+// Two claims in one test because they are one claim: the signed URL works, and the same object is
+// refused without it. A download signer that happened to work on a bucket with a public read path
+// would prove nothing at all — TestTheBucketHasNoPublicReadPath is the other half of that pairing
+// and this one repeats the unsigned check on the object it just wrote.
+func TestADownloadURLReadsTheObjectAndNothingElseDoes(t *testing.T) {
+	signer, bucket := liveSigner(t)
+	key := testKey(t)
+	t.Cleanup(func() { removeObject(t, signer, key) })
+
+	const body = "a photograph of somebody's front door, allegedly"
+
+	upload, _, err := signer.PresignUpload(t.Context(), key, "image/jpeg", int64(len(body)), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("signing the upload: %v", err)
+	}
+	if status := put(t, upload, "image/jpeg", body); status != http.StatusOK {
+		t.Fatalf("uploading answered %d, want 200", status)
+	}
+
+	download, expiresAt, err := signer.PresignDownload(t.Context(), key, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("signing the download: %v", err)
+	}
+	if !expiresAt.After(time.Now()) {
+		t.Fatalf("the download expires at %s, which has already happened", expiresAt)
+	}
+
+	got, status := get(t, download)
+	if status != http.StatusOK {
+		t.Fatalf("the signed download answered %d, want 200", status)
+	}
+	if got != body {
+		t.Errorf("the object reads back as %q, want %q", got, body)
+	}
+
+	// The same object, unsigned. A proof photograph identifies an address and a recipient, so
+	// there is no route to one that does not carry a signature.
+	endpoint := env("STORAGE_ENDPOINT", "http://localhost:9000")
+	if _, status := get(t, endpoint+"/"+bucket+"/"+key); status != http.StatusForbidden {
+		t.Errorf("an unsigned GET answered %d, want 403", status)
+	}
+}
+
+// TestADownloadURLStopsWorkingWhenItSaysItWill.
+//
+// The lifetime is the whole of the control: nothing can revoke a pre-signed URL, so a URL that
+// outlived its stated expiry would be a permanent link to a photograph of somebody's front door.
+// Signed with a clock five minutes in the past against a one-minute window, so the store refuses it
+// without the test waiting.
+func TestADownloadURLStopsWorkingWhenItSaysItWill(t *testing.T) {
+	_, bucket := liveSigner(t)
+
+	expired, err := NewS3(Options{
+		Endpoint:        env("STORAGE_ENDPOINT", "http://localhost:9000"),
+		Bucket:          bucket,
+		Region:          env("STORAGE_REGION", "ap-southeast-2"),
+		AccessKeyID:     env("STORAGE_ACCESS_KEY_ID", "shipper"),
+		SecretAccessKey: env("STORAGE_SECRET_ACCESS_KEY", "shipperminio"),
+		UsePathStyle:    env("STORAGE_USE_PATH_STYLE", "true") != "false",
+		Clock:           clock.NewFixed(time.Now().UTC().Add(-5 * time.Minute)),
+	})
+	if err != nil {
+		t.Fatalf("building a signer with a past clock: %v", err)
+	}
+
+	signed, _, err := expired.PresignDownload(t.Context(), testKey(t), time.Minute)
+	if err != nil {
+		t.Fatalf("signing the download: %v", err)
+	}
+	if _, status := get(t, signed); status != http.StatusForbidden {
+		t.Errorf("an expired download URL answered %d, want 403", status)
+	}
+}
+
+// get fetches a URL and answers with its body and status.
+func get(t *testing.T, signed string) (string, int) {
+	t.Helper()
+
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, signed, nil)
+	if err != nil {
+		t.Fatalf("building the download request: %v", err)
+	}
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("downloading: %v", err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("reading the download: %v", err)
+	}
+	return string(body), response.StatusCode
+}

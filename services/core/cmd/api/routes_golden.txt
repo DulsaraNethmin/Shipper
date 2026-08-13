@@ -31,6 +31,7 @@ POST   /v1/jobs/{id}/bids/{bid_id}/counter      user         v1
 GET    /v1/jobs/{id}/bids/{bid_id}/history      user         v1
 POST   /v1/jobs/{id}/bids/{bid_id}/withdraw     user         v1
 POST   /v1/jobs/{id}/cancel                     user         v1
+GET    /v1/jobs/{id}/delivery/proof             user         v1
 POST   /v1/jobs/{id}/disputes                   user         v1
 POST   /v1/jobs/{id}/driver                     user         v1
 POST   /v1/jobs/{id}/extend                     user         v1

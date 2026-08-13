@@ -982,3 +982,181 @@ ok "a retry with the same key replays the identical URL and the identical expiry
    mc rm --force "local/'"$STORAGE_BUCKET/$proof_key"'" >/dev/null 2>&1 || true' \
   || fail "could not remove the object this section uploaded"
 ok "the object this run uploaded was removed from $STORAGE_BUCKET"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-115  uploaded proof is linked to a job and a milestone, with access control"
+
+# # What only this section can show
+#
+# The Go tests in internal/delivery stub the object store, deliberately — a test cannot drive "the
+# store is holding a 900 KB SVG" against a real bucket without uploading one. So the *reconciliation*
+# this ticket turns on is demonstrated here or nowhere: **the platform is not in the upload path, so
+# it asks the store whether the object arrived**, and a recording that names an object nobody
+# uploaded is refused by the running service against the running MinIO.
+#
+# The access control is the other half, and it is checked from four directions on one binary: the
+# job's customer, the awarded provider, a provider who won nothing, and a stranger's job.
+#
+# Everything fences on ids. The bucket may be shared with four other worktrees, so no check counts
+# objects or lists a prefix — each names the key it created (CLAUDE.md's worktree table).
+
+proof_job="$(delivery_awarded_job proof115)"
+
+# proof_url_for <job> <key-suffix> <outfile> — one upload URL, answering with its object key.
+proof_url_for() {
+  local status
+  status="$(delivery_request "$delivery_provider_token" "verify-p115-$2-$$" \
+    "/v1/jobs/$1/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' "$3")"
+  [[ "$status" == "200" ]] || { cat "$3"; fail "minting an upload URL for $2 answered $status"; }
+  json "$3" '["object_key"]'
+}
+
+# upload_to <outfile> <file> — PUT a file to the URL in a proof-upload response.
+upload_to() {
+  local put
+  put="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: image/jpeg' \
+    --data-binary "@$2" "$(json "$1" '["upload_url"]')")"
+  [[ "$put" == "200" ]] || fail "uploading to the pre-signed URL answered $put"
+}
+
+# record_milestone_on <job> <key> <body> <name> — one milestone recording on any job.
+record_milestone_on() {
+  curl -s -X POST -o "$WORKDIR/p115-$4.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$3" \
+    "http://localhost:$VERIFY_PORT/v1/jobs/$1/milestones"
+}
+
+# read_proof <token> <job> <name> — the proof on a job, as whoever holds that token.
+read_proof() {
+  curl -s -o "$WORKDIR/p115-read-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/jobs/$2/delivery/proof"
+}
+
+# --- a photograph that never arrived, which is the case the platform cannot infer ---------------
+
+proof115_missing="$(proof_url_for "$proof_job" missing "$WORKDIR/p115-missing.json")"
+
+status="$(record_milestone_on "$proof_job" "verify-p115-nofile-$$" \
+  "{\"milestone\":\"en_route_to_pickup\",\"proof\":{\"object_key\":\"$proof115_missing\"}}" nofile)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/p115-nofile.json"; fail "a milestone naming an object nobody uploaded answered $status, want 409"; }
+[[ "$(json "$WORKDIR/p115-nofile.json" '["error"]["code"]')" == "delivery_proof_not_uploaded" ]] \
+  || { cat "$WORKDIR/p115-nofile.json"; fail "expected code=delivery_proof_not_uploaded"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$proof_job';")" == "0" ]] \
+  || fail "a milestone was recorded for a photograph that was never sent"
+ok "a URL was issued, the client never uploaded, and the platform refuses to record it as proof — it asked the store rather than taking the client's word"
+
+# --- the upload, and then the record ------------------------------------------------------------
+
+printf '%s' 'not a photograph, but exactly forty-eight bytes.' > "$WORKDIR/p115-proof.bin"
+
+proof115_key="$(proof_url_for "$proof_job" real "$WORKDIR/p115-real.json")"
+upload_to "$WORKDIR/p115-real.json" "$WORKDIR/p115-proof.bin"
+
+status="$(record_milestone_on "$proof_job" "verify-p115-record-$$" \
+  "{\"milestone\":\"en_route_to_pickup\",\"proof\":{\"object_key\":\"$proof115_key\"}}" record)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/p115-record.json"; fail "recording a milestone with proof answered $status, want 201"; }
+proof115_milestone="$(json "$WORKDIR/p115-record.json" '["id"]')"
+ok "the photograph is uploaded straight to the store, and the milestone that cites it is accepted"
+
+# The link, read from the table rather than from what the endpoint said about itself. This is the
+# *Done when*: linked to a job and to a milestone.
+proof115_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (p.job_id = '$proof_job') || ' ' || (p.milestone_id = '$proof115_milestone')
+        || ' ' || p.content_type || ' ' || p.content_length || ' ' || (length(p.etag) > 0)
+     from proofs p where p.object_key = '$proof115_key';")"
+[[ "$proof115_row" == "true true image/jpeg 48 true" ]] \
+  || fail "the proof row is '$proof115_row', want 'true true image/jpeg 48 true'"
+ok "the row names this job and this milestone, and holds the type, the size and the tag the store reported — not what the client said it would send"
+
+# The composite foreign key, from outside Go. A proof whose job disagrees with its milestone's job
+# is the row this table exists to make unwritable, and no endpoint can produce it.
+proof115_other="$(delivery_awarded_job proof115-other)"
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
+INSERT INTO proofs (id, job_id, milestone_id, object_key, content_type, content_length, etag)
+VALUES (gen_random_uuid(), '$proof115_other', '$proof115_milestone', 'proof/x/y', 'image/jpeg', 1, 'e');
+SQL
+then
+  fail "a proof row named one job and a milestone recorded on another"
+fi
+ok "and the pair cannot be forged even in SQL — the composite key makes 'this proof's job is its milestone's job' the database's"
+
+# --- who may read it ----------------------------------------------------------------------------
+
+status="$(read_proof "$delivery_customer_token" "$proof_job" customer)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/p115-read-customer.json"; fail "the job's customer reading proof answered $status"; }
+[[ "$(json "$WORKDIR/p115-read-customer.json" '["data"][0]["object_key"]')" == "$proof115_key" ]] \
+  || fail "the customer's read does not carry the object just recorded"
+[[ "$(json "$WORKDIR/p115-read-customer.json" '["data"][0]["milestone_id"]')" == "$proof115_milestone" ]] \
+  || fail "the record does not name the milestone it proves"
+ok "the customer who owns the job sees the proof on it — Docs/01 §4.4's acceptance measure"
+
+proof115_download="$(json "$WORKDIR/p115-read-customer.json" '["data"][0]["download_url"]')"
+[[ "$proof115_download" == "$STORAGE_ENDPOINT/"* ]] \
+  || fail "download_url is $proof115_download, which is not the object store at $STORAGE_ENDPOINT"
+[[ "$proof115_download" != *"localhost:$VERIFY_PORT"* ]] \
+  || fail "download_url points back at this API; the bytes are never proxied (Docs/06 §5.2)"
+ok "and it is a signed URL at the object store rather than a route on this API"
+
+proof115_bytes="$(curl -s "$proof115_download")"
+[[ "$proof115_bytes" == "not a photograph, but exactly forty-eight bytes." ]] \
+  || fail "the signed download read back as '$proof115_bytes'"
+ok "the URL fetches the photograph the driver uploaded, straight from the store"
+
+proof115_unsigned="$(curl -s -o /dev/null -w '%{http_code}' "$STORAGE_ENDPOINT/$STORAGE_BUCKET/$proof115_key")"
+[[ "$proof115_unsigned" == "403" ]] \
+  || fail "the same object answered $proof115_unsigned unsigned, want 403 — a proof photograph identifies an address and a recipient"
+ok "and the same object is refused without a signature: the only way to a photograph is a URL issued after an authorisation check"
+
+status="$(read_proof "$delivery_provider_token" "$proof_job" provider)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/p115-read-provider.json"; fail "the awarded provider reading proof answered $status"; }
+[[ "$(json "$WORKDIR/p115-read-provider.json" '["data"][0]["object_key"]')" == "$proof115_key" ]] \
+  || fail "the provider's read does not carry the object they recorded"
+ok "the provider who was awarded the job sees it too, and the same record — a photograph is not a field that can be redacted for one party"
+
+status="$(read_proof "$delivery_other_token" "$proof_job" stranger)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/p115-read-stranger.json"; fail "a provider who won nothing read the proof: $status"; }
+[[ "$(json "$WORKDIR/p115-read-stranger.json" '["error"]["code"]')" == "not_found" ]] \
+  || { cat "$WORKDIR/p115-read-stranger.json"; fail "expected code=not_found; a 403 would confirm the delivery exists"; }
+# The same request against a job that does not exist. Compared on the code *and* the message rather
+# than on the whole body, because every error envelope carries its own request id (SHIP-12) and two
+# responses can never be byte-identical over HTTP — the Go test in internal/delivery is where the
+# whole body is held to the whole body.
+read_proof "$delivery_other_token" "$("$PSQL" "$DATABASE_URL" -tAc 'select gen_random_uuid();')" absent >/dev/null
+[[ "$(json "$WORKDIR/p115-read-stranger.json" '["error"]["code"]')" \
+   == "$(json "$WORKDIR/p115-read-absent.json" '["error"]["code"]')" ]] \
+  || fail "a stranger's 404 carries a different code from a missing job's"
+[[ "$(json "$WORKDIR/p115-read-stranger.json" '["error"]["message"]')" \
+   == "$(json "$WORKDIR/p115-read-absent.json" '["error"]["message"]')" ]] \
+  || fail "a stranger's 404 is worded differently from a missing job's, which tells a competitor the job exists"
+ok "a reader who is neither party gets what a job that does not exist gets — same status, same code, same words"
+
+status="$(curl -s -o "$WORKDIR/p115-read-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$proof_job/delivery/proof")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/p115-read-anon.json"; fail "proof was readable with no credential: $status"; }
+ok "and it cannot be reached without one at all"
+
+# --- one object, one milestone ------------------------------------------------------------------
+
+status="$(record_milestone_on "$proof_job" "verify-p115-twice-$$" \
+  "{\"milestone\":\"picked_up\",\"proof\":{\"object_key\":\"$proof115_key\"}}" twice)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/p115-twice.json"; fail "one object became proof of two milestones: $status"; }
+[[ "$(json "$WORKDIR/p115-twice.json" '["error"]["code"]')" == "delivery_proof_already_recorded" ]] \
+  || { cat "$WORKDIR/p115-twice.json"; fail "expected code=delivery_proof_already_recorded"; }
+ok "the same photograph cannot become the proof of a second milestone — one object is evidence for one recorded claim"
+
+status="$(record_milestone_on "$proof_job" "verify-p115-else-$$" \
+  "{\"milestone\":\"picked_up\",\"proof\":{\"object_key\":\"proof/$proof115_other/00000000-0000-7000-8000-000000000000\"}}" else)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/p115-else.json"; fail "another job's object key was accepted: $status"; }
+[[ "$(json "$WORKDIR/p115-else.json" '["error"]["details"][0]["field"]')" == "proof.object_key" ]] \
+  || { cat "$WORKDIR/p115-else.json"; fail "the refusal does not name proof.object_key"; }
+ok "and a key issued against another job is refused on the string alone, before the store is asked anything"
+
+"${COMPOSE[@]}" exec -T minio sh -c \
+  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; \
+   mc rm --force "local/'"$STORAGE_BUCKET/$proof115_key"'" >/dev/null 2>&1 || true' \
+  || fail "could not remove the object this section uploaded"
+ok "the object this run uploaded was removed from $STORAGE_BUCKET"

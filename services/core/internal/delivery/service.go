@@ -43,23 +43,31 @@ import (
 // clock and the platform's are two values and stay two values — is untestable, because the two
 // would agree to within a millisecond on every run.
 type Service struct {
-	jobs    Jobs
-	awards  Awards
-	tokens  *DriverTokenIssuer
-	uploads proofUploader
-	clock   clock.Clock
-	store   postgresStore
+	jobs   Jobs
+	awards Awards
+	owners JobOwners
+	tokens *DriverTokenIssuer
+	proof  proofStorage
+	clock  clock.Clock
+	store  postgresStore
 }
 
-// proofUploader is the signer and the limits it is asked to sign within, held together (SHIP-114).
+// proofStorage is everything the object store is asked for, and the limits it is asked within
+// (SHIP-114, SHIP-115).
 //
-// One field rather than two on [Service], because they are never useful apart: a signer with no
-// policy would issue URLs for anything, and a policy with no signer is a struct nobody reads. It is
-// also what stops a fifth positional argument to [NewService] becoming a sixth and a seventh as
-// SHIP-115 and SHIP-155 add their own.
-type proofUploader struct {
-	store  ProofUploads
-	policy UploadPolicy
+// One field rather than three on [Service], because they are never useful apart: a signer with no
+// policy would issue URLs for anything, a policy with no signer is a struct nobody reads, and a
+// metadata reader judged against a different policy from the one that signed would accept objects
+// the platform refused to authorise. It is also what stops one positional argument to [NewService]
+// becoming three as SHIP-155 adds its own.
+//
+// **SHIP-114 called this `proofUploader` and SHIP-115 renamed it.** With one port the specific name
+// was clearer; with a second port that exists to *read* an object back, "uploader" would have been
+// actively wrong about half of what it holds.
+type proofStorage struct {
+	uploads ProofUploads
+	objects ProofObjects
+	policy  UploadPolicy
 }
 
 // NewService builds the domain service.
@@ -76,8 +84,10 @@ type proofUploader struct {
 func NewService(
 	jobs Jobs,
 	awards Awards,
+	owners JobOwners,
 	tokens *DriverTokenIssuer,
 	uploads ProofUploads,
+	objects ProofObjects,
 	policy UploadPolicy,
 	c clock.Clock,
 ) *Service {
@@ -88,6 +98,13 @@ func NewService(
 	if awards == nil {
 		panic("delivery: NewService needs the award lookup; without it any provider could put a " +
 			"driver on any job (Docs/02 §3)")
+	}
+	if owners == nil {
+		// Refused rather than defaulted to "nobody is the customer", which would start the
+		// service and quietly answer 404 to every customer asking for the proof on their own
+		// job — a broken screen (Docs/01 §4.4's acceptance measure) reported as a missing one.
+		panic("delivery: NewService needs the job ownership lookup; without it a customer cannot " +
+			"be told apart from a stranger asking about their delivery (SHIP-115)")
 	}
 	if tokens == nil {
 		// Refused rather than made optional, because SHIP-107's *Done when* is that the token
@@ -106,6 +123,15 @@ func NewService(
 		panic("delivery: NewService needs somewhere to put proof; a delivery cannot be " +
 			"completed without a photograph or a recorded exception (SHIP-114)")
 	}
+	if objects == nil {
+		// Refused rather than made optional, and this one has the sharpest failure direction of
+		// the four. Without it the platform cannot ask whether a photograph was ever uploaded,
+		// and the only way to record proof at all would be to believe the client — which is
+		// precisely the arrangement SHIP-115 exists to refuse (see proof.go).
+		panic("delivery: NewService needs to be able to read an object back; the platform is not " +
+			"in the upload path, so asking the store is the only way it can know proof exists " +
+			"(SHIP-115)")
+	}
 	if !policy.valid() {
 		// Checked here rather than per request, so a configuration failure stops the process
 		// at startup instead of surfacing as a validation error blaming a client's perfectly
@@ -120,11 +146,12 @@ func NewService(
 		panic("delivery: NewService needs a clock (Docs/10 §6.3)")
 	}
 	return &Service{
-		jobs:    jobs,
-		awards:  awards,
-		tokens:  tokens,
-		uploads: proofUploader{store: uploads, policy: policy},
-		clock:   c,
+		jobs:   jobs,
+		awards: awards,
+		owners: owners,
+		tokens: tokens,
+		proof:  proofStorage{uploads: uploads, objects: objects, policy: policy},
+		clock:  c,
 	}
 }
 
@@ -515,6 +542,18 @@ func (s *Service) RecordMilestone(
 
 	if !recorded {
 		return s.alreadyRecorded(ctx, r, jobID, recording)
+	}
+
+	// The photograph, in the same transaction as the claim it proves (SHIP-115).
+	//
+	// Written after the milestone because it points at it, and before the move because the move
+	// is the one step that can *commit* on a refusal: SHIP-112's absorption keeps the row and
+	// leaves the job alone, and a delivery whose absorbed milestone lost its photograph on the way
+	// through would be the record growing and the evidence not.
+	if recording.Proof.present() {
+		if _, err := s.recordProof(ctx, r, jobID, stored.ID, recording.Proof); err != nil {
+			return notRecorded(err)
+		}
 	}
 
 	move, err := s.moveFor(ctx, r, providerID, jobID, recording.Milestone, recordedAt)

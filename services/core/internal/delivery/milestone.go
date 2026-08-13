@@ -128,11 +128,26 @@ const maxMilestoneReason = 500
 //
 // It reaches the milestones row, so it is part of what is recorded rather than part of how the
 // request was made. The uniqueness it buys is the database's (000602), not this struct's.
+//
+// # Proof is part of the recording rather than a request of its own (SHIP-115)
+//
+// A photograph is evidence for a claim, so it arrives with the claim: one request, one transaction,
+// and a `proofs` row that cannot exist without the `milestones` row it points at. The alternative —
+// record the milestone, then attach proof to it afterwards — has a window in which a delivery has
+// been recorded and its photograph has not, which is precisely the state SHIP-118 exists to refuse
+// ("Delivered is rejected without either"). A rule cannot be enforced against a state the platform
+// deliberately passes through.
+//
+// **The field is a [VerifiedProof] and not a string**, which is the whole of the guarantee: the only
+// value another package can construct is the zero one, so nothing outside `delivery` can put a
+// photograph here that the platform has not looked at. [Service.VerifyProof] is what produces one.
 type Recording struct {
 	Milestone  Milestone
 	RecordedAt time.Time
 	Reason     string
 	Key        string
+
+	Proof VerifiedProof
 }
 
 // normalise trims what the client sent into what the columns should hold.

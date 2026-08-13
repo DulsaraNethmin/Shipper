@@ -222,6 +222,116 @@ func (postgresStore) milestoneRecordedBy(
 	return rec, true, nil
 }
 
+// proofColumns is every column of a proof, in the order [scanProof] reads them.
+//
+// The milestone's own two facts are joined in rather than copied into `proofs`: which milestone was
+// recorded, and when the actor says they recorded it. 000603 keeps neither, because both are already
+// one row away and a second copy is a second thing that can be wrong.
+const proofColumns = `
+	p.id, p.job_id, p.milestone_id, m.milestone, p.object_key,
+	p.content_type, p.content_length, p.etag, m.actor_recorded_at, p.created_at`
+
+// scanProof reads one row of [proofColumns].
+func scanProof(row pgx.Row) (Proof, error) {
+	var p Proof
+	if err := row.Scan(
+		&p.ID, &p.JobID, &p.MilestoneID, &p.Milestone, &p.ObjectKey,
+		&p.ContentType, &p.ContentLength, &p.ETag, &p.RecordedAt, &p.AcceptedAt,
+	); err != nil {
+		return Proof{}, err
+	}
+	return p, nil
+}
+
+// insertProof records one object as the proof of one milestone (SHIP-115).
+//
+// # ON CONFLICT on the object key, for the reason [postgresStore.insertMilestone] gives
+//
+// A bare unique violation aborts the surrounding transaction, and this insert runs inside one that
+// still has a status transition to make. `DO NOTHING` turns the conflict into a row count, which the
+// caller reads as [ErrProofAlreadyRecorded] — the same shape, and the same reason, as the milestone
+// insert one function up.
+//
+// **Only uq_proofs_object_key is named.** uq_proofs_milestone is unreachable from here: the milestone
+// this row points at was inserted moments ago in this transaction, and a request whose key had
+// already recorded one never reaches this statement ([Service.RecordMilestone] returns first). A
+// conflict on it would be a defect rather than a race, and a defect should abort loudly rather than
+// be absorbed into "already recorded".
+//
+// # It writes what the store reported
+//
+// content_type, content_length and etag come from [Service.VerifyProof], which read them off the
+// object. They are not the client's stated values and the difference is the point — see proof.go.
+func (postgresStore) insertProof(ctx context.Context, r db.Runner, p Proof) (Proof, error) {
+	const q = `
+		WITH inserted AS (
+			INSERT INTO proofs
+				(id, job_id, milestone_id, object_key, content_type, content_length, etag)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (object_key) DO NOTHING
+			RETURNING id, job_id, milestone_id, object_key, content_type, content_length, etag, created_at
+		)
+		SELECT ` + proofColumns + `
+		FROM inserted p
+		JOIN milestones m ON m.id = p.milestone_id`
+
+	stored, err := scanProof(r.QueryRow(ctx, q,
+		p.ID, p.JobID, p.MilestoneID, p.ObjectKey, p.ContentType, p.ContentLength, p.ETag))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Proof{}, fmt.Errorf("delivery: %s is already proof of something: %w",
+			p.ObjectKey, ErrProofAlreadyRecorded)
+	case err != nil:
+		return Proof{}, fmt.Errorf("delivery: recording %s as proof on %s: %w", p.ObjectKey, p.JobID, err)
+	}
+	return stored, nil
+}
+
+// proofOn is every photograph recorded against one job, most recently acted first.
+//
+// # Ordered by the actor's clock rather than by arrival
+//
+// Docs/02 §3.1 shows a customer what the driver recorded, not when the phone synced, and SHIP-112's
+// absorption makes the two orders genuinely differ: a queued milestone photographed at dawn arrives
+// after ones recorded later in the day. `created_at` and then `id` break the tie, because
+// actor_recorded_at is not unique — an offline batch synced together carries whatever times the
+// device stamped — and an ordering that is not total returns rows in whatever order the plan
+// happened to produce.
+//
+// No pagination and no limit. A delivery has at most five recordable milestones (Docs/01 §4.4) and
+// at most one proof each, so the collection is bounded by the domain rather than by a page size —
+// the same reading `bidding`'s negotiation chain takes of its own bound.
+//
+// **This does not check who is asking.** [Service.ProofFor] does, before calling it, which is the
+// division doc.go states and the reason this method is unexported.
+func (postgresStore) proofOn(ctx context.Context, r db.Runner, jobID uuid.UUID) ([]Proof, error) {
+	const q = `
+		SELECT ` + proofColumns + `
+		FROM proofs p
+		JOIN milestones m ON m.id = p.milestone_id
+		WHERE p.job_id = $1
+		ORDER BY m.actor_recorded_at DESC, p.created_at DESC, p.id DESC`
+
+	rows, err := r.Query(ctx, q, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("delivery: reading the proof on %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	var proof []Proof
+	for rows.Next() {
+		p, err := scanProof(rows)
+		if err != nil {
+			return nil, fmt.Errorf("delivery: reading a proof row on %s: %w", jobID, err)
+		}
+		proof = append(proof, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("delivery: reading the proof on %s: %w", jobID, err)
+	}
+	return proof, nil
+}
+
 // accountPhone is the caller's own verified mobile, for a self-assignment.
 //
 // Reading `users` from here is the sanctioned kind of cross-table read: the table is in the shared

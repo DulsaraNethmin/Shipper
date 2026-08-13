@@ -486,6 +486,37 @@ MilestoneRecording:
         say — "nobody at the gate, returning at four". It is kept with the record and shown to
         support.
       example: nobody at the gate, returning at four
+    proof:
+      $ref: '#/ProofAttachment'
+
+ProofAttachment:
+  type: object
+  additionalProperties: false
+  required: [object_key]
+  description: |
+    The photograph this milestone is evidenced by (SHIP-115).
+
+    Upload it first with `POST /v1/jobs/{id}/proof-uploads`, PUT the bytes to the URL you are given,
+    and then send that response's `object_key` here. The platform **asks the object store whether
+    the object is actually there** before it records anything, so a milestone naming a key that was
+    never uploaded to is refused with `delivery_proof_not_uploaded` rather than recorded on trust —
+    finish the upload and send the request again.
+
+    There is no `content_type` and no `content_length`. You stated both when you asked for the URL;
+    what is recorded is what the store reports it is holding, which is the copy that is still right
+    if the two ever differ.
+
+    The key must be one issued for **this** job. A key from another job is refused with
+    `validation_failed` naming `proof.object_key`, and an object that is already the proof of
+    another milestone is refused with `delivery_proof_already_recorded` — ask for a new upload URL,
+    which always names a new object.
+  properties:
+    object_key:
+      type: string
+      description: |
+        The `object_key` from the upload URL you were given. Not a name you choose: the platform
+        picks every key, and one it did not issue for this job is refused.
+      example: proof/6f1c9d2e-0f3b-7a51-9b6e-1f2a3b4c5d6e/019bd7a1-2c44-7f10-9a2c-3d4e5f607182
 
 Milestone:
   type: object
@@ -747,6 +778,180 @@ ProofUpload:
       description: |
         When the store stops honouring the URL, in UTC. Minutes rather than hours, deliberately.
       example: '2026-08-13T04:45:00.000Z'
+
+ProofOnJob:
+  get:
+    operationId: proofOnJob
+    summary: The proof recorded on a delivery
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Every photograph recorded against this job, most recently acted first, each with a short-lived
+      signed URL to fetch it with (SHIP-115).
+
+      ## Who may call it
+
+      Two parties, and being either is decided from the job rather than from your role: **the
+      customer who owns the job**, and **the provider whose bid they accepted**. Both see exactly
+      the same thing — a photograph is not a field that can be redacted, and the two of you are
+      looking at the same object if you ever disagree about a delivery.
+
+      Anybody else gets `404`, identical to a job that does not exist. The job's assigned driver is
+      not a reader yet: their portal cannot capture proof either, and both arrive together
+      (SHIP-122).
+
+      ## `download_url` is a credential
+
+      There is no public path to a proof photograph anywhere in this platform — it identifies an
+      address and a recipient. What you get is a URL signed for you *after* this request checked who
+      you are, and **anybody holding it can fetch the image until `download_expires_at`**; nothing
+      can revoke one. Render it, and do not store it, log it, or pass it on. A cached response is a
+      cache of expiring links.
+
+      The URLs are minted per request, so calling this again gives you fresh ones.
+
+      ## Ordering, and why it is not arrival order
+
+      Sorted by the actor's clock — when the driver says they took the photograph — newest first.
+      That is deliberately not the order the platform received them in: a milestone recorded at dawn
+      in a yard with no signal arrives after ones recorded later in the day, and showing a customer
+      the sync order would show them a delivery that ran backwards.
+
+      ## It does not page
+
+      A delivery has at most five recordable milestones and at most one photograph each, so
+      `has_more` is always `false` and `next_cursor` always `null`. The collection envelope is here
+      so a client can tell a collection from a single resource without knowing the endpoint.
+    parameters:
+      - $ref: '#/JobID'
+    responses:
+      '200':
+        description: |
+          The proof on this delivery, which may be empty — a job nothing has been photographed on
+          yet answers `data: []` rather than `404`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ProofList'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ProofList:
+  type: object
+  additionalProperties: false
+  required: [data, next_cursor, has_more]
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/Proof'
+    next_cursor:
+      type: string
+      nullable: true
+      description: Always null. This collection is bounded by the delivery rather than by a page.
+    has_more:
+      type: boolean
+      description: Always false, for the same reason.
+
+Proof:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - job_id
+    - milestone_id
+    - milestone
+    - object_key
+    - content_type
+    - content_length
+    - download_url
+    - download_expires_at
+    - recorded_at
+    - accepted_at
+  description: |
+    One photograph, and the recorded milestone it is evidence for.
+
+    Proof is attached to a **milestone** rather than to the job, so a late milestone the platform
+    absorbed without moving the job still carries its photograph — at the time the driver acted.
+  properties:
+    id:
+      type: string
+      format: uuid
+    job_id:
+      type: string
+      format: uuid
+    milestone_id:
+      type: string
+      format: uuid
+      description: The milestone this photograph proves. It is on this job by construction.
+    milestone:
+      type: string
+      enum: [driver_assigned, en_route_to_pickup, picked_up, in_transit, delivered]
+      description: Which milestone was recorded, in the wire vocabulary.
+      example: picked_up
+    object_key:
+      type: string
+      description: |
+        Where the photograph lives in private storage. Useful to support and to a client
+        reconciling a list; it is not a URL, and there is no unsigned way to fetch it.
+      example: proof/6f1c9d2e-0f3b-7a51-9b6e-1f2a3b4c5d6e/019bd7a1-2c44-7f10-9a2c-3d4e5f607182
+    content_type:
+      type: string
+      description: What the object store reports it is holding — not what the client said it sent.
+      example: image/jpeg
+    content_length:
+      type: integer
+      format: int64
+      description: The size the store reports, in bytes.
+      example: 137402
+    download_url:
+      type: string
+      format: uri
+      description: |
+        A signed URL at the object store, good until `download_expires_at`. **It is a credential.**
+        Anybody holding it can fetch the image until it expires, and nothing can revoke it.
+      example: https://store.example.com/shipper/proof/6f1c9d2e-0f3b-7a51-9b6e-1f2a3b4c5d6e/019bd7a1-2c44-7f10-9a2c-3d4e5f607182?X-Amz-Algorithm=AWS4-HMAC-SHA256
+    download_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When `download_url` stops working. Read it rather than assuming a lifetime: it is
+        configuration and may be shortened without notice.
+      example: '2026-08-13T04:45:00.000Z'
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        The **actor's** clock, carried through from the milestone: when the driver says they took
+        the photograph. This is what to show a customer.
+      example: '2026-08-12T06:40:11.000Z'
+    accepted_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform recorded it. What support reasons about, and not what to display beside a
+        delivery event.
+      example: '2026-08-12T09:15:02.000Z'
 
 # --- the driver's own surface -----------------------------------------------------------------
 
