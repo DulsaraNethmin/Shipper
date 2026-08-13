@@ -5513,9 +5513,14 @@ arguments are:
 - **"A developer with no container running"** is answered the way it already is for PostgreSQL and
   Redis: `make up`. The tests fail rather than skip without the stack, deliberately.
 
-**`Docs/06` §4.1's adapter table still says "Local storage in development, S3 deployed", and that row
-is now wrong.** Correcting it is a shared-file edit this branch may not make — **a request to
-whoever owns the wave**, not a commit.
+**`Docs/06` §4.1's adapter table said "Local storage in development, S3 deployed", and that row went
+wrong the moment `local.go` was dropped. The repository owner has ruled: accept the drop — one
+`s3.go`, in every environment.** The row now reads "the store, not the code", and the four arguments
+above are condensed into a paragraph under the table, so the document and the tree agree. The row is
+**corrected rather than deleted**: `CLAUDE.md` names object storage in its adapter list, the seam is
+still there — `delivery` declares the port and may not import the adapter — and what changed is only
+that the second implementation is the store rather than a second Go type. That correction is the one
+shared-file edit this branch was unlocked for, and it carries no ticket of its own.
 
 #### No SDK, and the reason is the architecture rather than `go.mod`
 
@@ -6023,11 +6028,16 @@ is now absorbed like any other late milestone, keeps its photograph or its reaso
 That is `Docs/02` §3.1 read exactly, and it is what SHIP-115's decision to hang proof off the
 milestone bought.
 
-#### What this does *not* build, and the document it would otherwise contradict
+#### What this does *not* build: the recipient name and the delivery note
 
-`Docs/01` §4.4 requires a delivered job to carry a **recipient name** and a **delivery note** as well
-as proof, and `Docs/02` §3 repeats it. **Neither is captured, and this ticket opens `Delivered`
-without them.** That is recorded here rather than resolved quietly:
+**Two documents are ahead of the code here, and the gap belongs to SHIP-123 rather than being a
+defect in this ticket.** `Docs/01` §4.4 requires a delivered job to carry a **recipient name** and a
+**delivery note** as well as proof, and `Docs/02` §3 repeats it, naming `01` §4.4 as authoritative
+for the field set. **No column holds either.** `milestones` carries `job_id`, `milestone`,
+`actor_type`, `actor_id`, `reason` and the two clocks; `proofs` carries the object metadata and
+`exception_reason`; neither table has a field for a recipient or for a note about the delivery
+itself. **This ticket opens `Delivered` without them**, and that is recorded here rather than
+resolved quietly:
 
 - SHIP-123's *Done when* is "recipient name, note, and proof captured; portal becomes read-only
   after", and it **depends on SHIP-118**. The field set is therefore behind this ticket in build
@@ -6035,11 +6045,14 @@ without them.** That is recorded here rather than resolved quietly:
 - What SHIP-118 is judged on is the clause `CLAUDE.md` calls an invariant, and that clause is closed
   end to end.
 - `milestones.reason` is a plausible home for the delivery note and was **not** quietly reused for
-  it. It is the actor's optional note on any milestone; making it mean something specific on one
-  would be the drift `Docs/06` §5.3 is written about.
+  it. It is the actor's optional note on any milestone; making it mean a second, specific thing on
+  one milestone is exactly the one-column-two-meanings `Docs/10` §3.3 already refuses, in the row
+  holding the actor clock and the server clock to two explicit columns rather than one.
 
 Whoever takes SHIP-123 should expect to add both columns and to make them required for `Delivered`,
-beside the evidence rule rather than instead of it.
+beside the evidence rule rather than instead of it. **This is a gap with an owner, not an undecided
+question**, so a wave reconciliation should carry it as documentation ahead of code against
+SHIP-123 rather than as a §9 recommendation waiting on somebody's ruling.
 
 #### SHIP-117 and X-6 are unblocked and untouched
 
