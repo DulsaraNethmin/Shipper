@@ -136,8 +136,14 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
   /// Ends the session on this device.
   ///
   /// `Docs/07` §3 also clears the offline queue, cached job data and the push registration at
-  /// sign-out. Those arrive with SHIP-124, SHIP-143 and the caching work, and each clears its
-  /// own store; this method is the point they will be called from.
+  /// sign-out. Each clears its own store; this method is the point they are called from.
+  ///
+  /// **The queue's half is wired, and deliberately not from inside this method.** SHIP-125's
+  /// `syncWorkerProvider` listens to this state and clears the queue when it becomes signed out,
+  /// which keeps `core/auth` from learning about `core/queue`, keeps a widget test that signs out
+  /// from opening a platform directory — SHIP-124's objection to wiring it here — and covers the
+  /// sign-out that was killed halfway through, because the next launch resolves to signed out and
+  /// the listener fires then. `Docs/11` §3, SHIP-125.
   ///
   /// The state changes even when clearing throws, and the failure is not rethrown. A sign-out
   /// that leaves the user in the signed-in shell because a delete failed is the worst of both

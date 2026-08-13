@@ -309,6 +309,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-83** | M3 | `GET /v1/jobs/open/{id}` — one job as a provider sees it, and **the fourth budget proof §8 recorded as still owed**: the serialised response, obtained over HTTP, held to a *closed set of keys* so that a budget renamed `max_price` fails too. The street line and the coordinate are confirmed withheld — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
+| **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
@@ -316,6 +317,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
+| **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
@@ -3334,6 +3337,127 @@ replacement is already in service on the same plate, and the `400 idempotency_ke
 gets without a key. **What is held by widget test alone is the screens**: what is drawn, what is
 tapped, and which of them a customer is refused. `make verify` does not cover this ticket — it
 exercises HTTP endpoints, and this one adds none.
+
+### SHIP-99 — the feed, and the filters the endpoint deliberately does not accept
+
+The provider half of the shell stops being a placeholder and becomes the work, which is what
+SHIP-76 did for the customer half. `ProviderJobFeed` reads `GET /v1/jobs/open` (SHIP-82), draws one
+card per job, pages by cursor, and narrows by pickup state and by whether a job already has bids on
+it. The fleet keeps its entry point — the same `manage-vehicles` key SHIP-98 gave it — moved inside
+the feed, because an empty feed is the question the fleet is the answer to.
+
+#### The finding: the endpoint accepts no filter, and the *Done when* says "with filters"
+
+`GET /v1/jobs/open` takes `limit` and `cursor` and **nothing else**. That is deliberate and the
+contract argues it: "there is no parameter that widens this and none that narrows it — no state, no
+vehicle, no goods type", because eligibility is the platform's decision and a filter parameter would
+be a second place for that answer to be argued with (`Docs/07` §3).
+
+The same paragraph names where narrowing does belong — *"a provider narrowing their own feed further
+is SHIP-99's client-side business"* — so this is a delegation rather than a gap, and the ticket was
+built to it. **What matters is that the narrowing is subtractive and can only be subtractive.** Every
+job it is given has already passed the platform's four checks; all it can do is hide some of them
+from the person who asked. `open_jobs_filter_test.dart` asserts that as a property over a set of
+filters rather than as a comment: whatever is selected, the result is a subset. There is no
+arrangement of the controls that shows a provider a job the platform withheld, which is the property
+that stops a client-side filter disagreeing with server-side eligibility.
+
+**The options are derived from the jobs, never compiled in.** `CLAUDE.md` keeps anything that changes
+under operational pressure server-side and Dart has no over-the-air path, so a list of the eight
+states written into the client would be a vocabulary needing a store release. The chips are built
+from the states the platform actually sent. A facet with one option is not drawn at all — a single
+chip can only ever hide the whole feed.
+
+**Two filters is what the response can honestly support**, and it is worth saying which were
+considered and dropped. Sorting or filtering by price is forbidden outright (`Docs/01` §4.3, below).
+Distance needs a coordinate the response withholds on purpose. `vehicle_requirement` is free text
+until SHIP-79's capability vocabulary exists, so matching on it would be the client inventing an
+eligibility rule. What is left — where the job starts, and whether somebody has already bid — is
+what a provider deciding whether to price a job actually asks.
+
+#### A filter over a paged list is a filter over what was read, and the screen says so
+
+The consequence a screen gets wrong. Narrow to a state that only appears on page three and nothing
+matches until page three arrives. So the feed distinguishes **three** empty-ish states rather than
+two: nothing eligible at all, which sends the provider to their fleet; nothing matching the filter
+with more still to read, which offers the next page; and nothing matching with the list exhausted.
+Conflating the first two would tell a provider with a perfectly good fleet that there is no work.
+
+The counter beside the chips reads "11 of 20 jobs **read**", and the last word is load-bearing: the
+list is paged, so "11 of 20" without it would be a claim about the marketplace.
+
+#### The budget: a second type, and a closed key set asserted from the client's side
+
+`Docs/01` §4.3 keeps the customer's maximum away from a provider — not as an amount, a band, or a
+"budget supplied" flag. The client mirrors what the platform did rather than reusing `Job` with a
+field skipped: `OpenJob` is a separate type with no field a budget could go in, and
+`budget_stays_on_the_customer_side_test.dart` needed no new entry on its allow list, which is the
+cheapest possible confirmation that no provider-facing file names the budget.
+
+Two tests go further, and both were written because SHIP-83 found that *searching for the word*
+catches `budget_cents` and misses `max_price`. `open_job_test.dart` decodes a payload carrying
+`budget_cents`, `max_price`, `budget` and `customer_maximum_cents` and asserts the round trip
+produces **a closed set of keys**, none containing budget, price, maximum, amount or cents.
+`provider_job_feed_test.dart` renders that same payload through the real decoder and asserts none of
+the numbers, and no affordance implying a maximum was or was not supplied, reaches the screen.
+
+`JobRegion` is held to the same closed set — `suburb`, `state`, `postcode` — which is SHIP-83's other
+disclosure decision confirmed from the client: no street line, and **no coordinate**, because `jobs`
+geocodes the whole address so a pickup coordinate *is* the street line written as two numbers.
+
+#### `ProviderOnly` was not used, and that is a decision rather than an oversight
+
+SHIP-98's gate exists because a route is reachable by a deep link with no button involved, and
+`GET /v1/fleet/vehicles` answers a customer `200` with an empty page rather than refusing them. Both
+halves of that are true of this endpoint as well — the contract lists "a customer who followed a link
+meant for the other role" among the four situations answered with `[]`.
+
+**The feed has no route of its own.** It is the provider half of `/home`, exactly as
+`CustomerJobList` is the customer half, and the shell's own role switch is what selects it. Wrapping
+it in `ProviderOnly` would be a second answer to a question the shell has just answered in the same
+frame — the arrangement SHIP-98's own `_AddVehicleButton` argues against — and no test could tell
+the two apart. `provider_job_feed_test.dart` asserts what actually matters instead: a customer signed
+in reaches their own list and **`feed.calls` is empty**, so nothing is read on their behalf.
+
+**SHIP-100 is where `ProviderOnly` gets its next real client**, because `/jobs/open/{id}` is an
+identifier-bearing route a notification payload can deliver somebody straight to.
+
+#### Two smaller things worth finding later
+
+**`/v1/jobs/open` is served by `internal/fleet` and modelled in `features/jobs`**, and neither is a
+mistake. `fleet` owns eligibility so the route is declared in `routes_fleet.go` and the shape lives
+in `contracts/paths/fleet.yaml`; `Docs/07` §2 puts *discovery* in the `jobs` feature, so the client
+puts it beside the customer's list. Both halves of the marketplace are now in one Dart package and
+they share no type and no widget — two response shapes, two cards, two controllers.
+
+**`OpenJobsRepository` is separate from `JobsRepository`** for the same reason the platform wrote a
+second response type: one repository holding both would be one place a screen could reach the wrong
+shape. It models the feed alone. `GET /v1/jobs/open/{id}` is served and deliberately not modelled —
+an endpoint no screen calls is dead code nothing holds to the contract, and it arrives with SHIP-100.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **495 host tests** (up from 429), the analyzer clean, and the environment
+test per build flavour.
+
+Separately, and this is the part worth trusting: **the *Done when* was run on an iPhone 17 simulator
+against the API on port 8092**, through the real `dio` transport and the real Keychain, with nothing
+substituted. The fixture was one verified provider serving VIC and NSW with a box truck in service,
+and 26 eligible published jobs — every one of which carried a budget its customer had stated — plus
+seven QLD jobs the platform excluded and the device never saw. What the run showed, in order: the
+feed drawn on arrival; the state chips present and the **status** chips absent, because every job on
+page one was `Open` and a one-option facet is not drawn; narrowing to VIC giving `11 of 20 jobs
+read`; the cursor followed to a second page; the status facet *appearing* once that page brought a
+`Negotiating` job, which is the derived-from-the-data rule working on real data; narrowing to VIC
+again giving `14 of 26 jobs read`, where the denominator is the proof the page was appended rather
+than substituted; VIC and Negotiating together giving `1 of 26`; and the whole feed scrolled end to
+end with no budget, in any form, on any screenful.
+
+The acceptance test that drove it was deliberately **not committed**. It needs a booted simulator, a
+running API and a hand-built fixture, so it is a check a person invokes rather than one CI can run —
+the same reasoning `make flutter-integration` already carries. `make verify` does not cover this
+ticket: it exercises HTTP endpoints and this one adds none.
+
 ### SHIP-106 — the first delivery endpoint, and the question SHIP-105 left it
 
 `POST /v1/jobs/{id}/driver`. The awarded provider names who is carrying the job, and the job moves
@@ -4078,6 +4202,354 @@ built binary — which is the only place the composition root's half of the tick
 off the row rather than off the response, the response's key set is held closed so that SHIP-162's
 internal notes cannot reach a complainant by accident, and the retry is exercised through both
 mechanisms in turn.
+### SHIP-124 — the queue, and what a client does with an operation it can never send
+
+`core/queue` stops being a folder with a note in it. `Docs/07` §4 calls the durable queue the single
+most important client capability, and its *Done when* has two halves that are not the same size:
+"queued operations survive app restart" is a storage question, and "are never silently dropped" is
+an invariant over everything the class can do.
+
+**The first half is one paragraph.** Drift over SQLite, which `Docs/10` §8.3 and `Docs/07` §9 closed
+long before this ticket, and the argument they closed it on is the one that held up: the requirement
+is transactional rather than about storage. An operation, its idempotency key, the time the user
+acted and the path to its proof image either all commit or none of them do. `enqueue` returns only
+after its transaction commits, which is what makes it safe for a screen to confirm at that point —
+`Docs/07` §4's "the UI confirms immediately, marked clearly as pending". Every test runs against a
+real file and the restart is a genuine close-and-reopen over the same bytes; an in-memory database
+would have made all of them pass while proving nothing about the sentence being demonstrated.
+
+#### The six ways an operation could vanish, and what stops each
+
+This is the ticket. A test showing the happy path surviving a relaunch does not demonstrate "never
+silently dropped" at all, so the failure modes were enumerated first and
+`queued_operations_are_never_silently_dropped_test.dart` is one group per mode.
+
+| Way it could vanish | What stops it |
+|---|---|
+| A crash between enqueue and commit | One transaction. Nothing partial can exist, and the confirmation is lost with the operation rather than surviving it |
+| A crash mid-drain | The claimed row stays in the table `in_flight`; `recover()` returns it at the next launch, under **the key it was created with**. There is no lease and no timeout — a handset runs one app process, so the next launch is the only other party there is |
+| A row this build cannot read | **Quarantined, not skipped.** Skipping is the drop; throwing stalls everything behind it. It becomes `blocked` with a recorded reason, still counted and still listed |
+| A queue that grows without bound | A cap that **refuses the new operation rather than evicting the oldest**. Eviction is precisely a silent drop, and it drops the operation that has waited longest |
+| Two writers racing | Every state change is a conditional `UPDATE`/`DELETE` whose affected-row count is checked, and the capacity check runs inside the insert's own transaction |
+| A removal nobody asked for | Exactly three paths remove a row — `complete`, `acknowledge`, `clear` — and a test drives every other public method against a populated queue and asserts the count does not move |
+
+All three of the mechanisms worth doubting were confirmed by mutation rather than believed: making
+`snapshot` skip an unreadable row fails four tests, ignoring the claim's affected-row count fails
+two, and dropping the per-key head rule fails three.
+
+#### The poison item: SHIP-135's move, taken as far as it goes, and then not
+
+§9 recorded the same question answered on the platform side, and SHIP-135's answer was better than a
+dead-letter path: **a permanently unpublishable outbox row is now unwritable**, because all three of
+its failure classes are decided inside the transaction that makes the state change. The client takes
+that move and then has to stop, and the reason it has to stop is worth writing down because it is
+structural rather than a shortfall.
+
+**Taken.** An operation of a kind that does not exist cannot be written at all — `OperationKind`'s
+constructor is private, so the set is closed by the compiler and `enqueue` needs no check for it. A
+body over the bound is refused by `enqueue`. A duplicate idempotency key is refused by `enqueue` and
+by a `UNIQUE` constraint behind it, which is the same shape as `uq_bids_one_accepted_per_job`.
+
+**Not available.** The platform has one deployment; a handset has whatever build was installed last
+week. A row written by *another build of this app* — a kind since removed, a body shape since
+changed — is a case no enqueue-time check can reach, because the check that would have caught it was
+not in the build that wrote the row. Nor can the client know in advance that the platform will refuse
+an operation: that answer arrives hours later, being offline being the entire point.
+
+**So for those two: quarantine and escalate, never delete.** The row moves to `blocked` with the
+reason recorded, and what stops it being quiet is not this package but `Docs/02` §3.1's ladder that
+`Docs/09` already schedules — the indicator immediately (SHIP-126), the provider nudge at four hours
+(SHIP-127), the operations alert at 24 (SHIP-128). Nothing removes it after N attempts; a person
+acknowledging it does (SHIP-132). **A dead-letter path was rejected for the same reason SHIP-135
+rejected one**: it is a place things go to stop being anybody's problem, and the queue's whole promise
+is the opposite.
+
+**The one that would be a silent drop if it were not deliberate: an unrecognised `state`.** Reading
+treats *anything* that is not `pending` or `in_flight` as blocked, rather than matching a known list.
+The alternative reads as harmless and is not — a state written by a later build would be a row present
+in the table and absent from every list, which is a silent drop wearing a database row as a disguise.
+Blocked is the default bucket, and `total` is counted in SQL so it depends on nothing decoding.
+
+#### Ordering: FIFO within an ordering key, and nothing between keys
+
+A decision, and it was taken on this queue's own terms rather than on SHIP-112's — that ticket was
+being built in the same wave and nothing here depends on it.
+
+**Not global FIFO**: one job's stuck operation would hold up every other job's, which turns one
+problem into a stalled queue and is how a driver discovers at six in the evening that the morning
+never left the handset. **Not unordered**: `Docs/02` §3.1 has the platform absorb a milestone that
+arrives after a later one, and SHIP-112 builds that — but it is a safety net, and sending a driver's
+recorded sequence in an arbitrary order would make every reconnection depend on it. **Per key, then**,
+conventionally `job:<id>`: one job's sequence arrives in the order it was recorded, and one job's
+problem stalls nothing else.
+
+A blocked operation **does** hold its own key, and that is the deliberate half. Releasing what is
+behind it past it would silently reorder exactly the sequence the key exists to preserve. It is
+head-of-line blocking confined to one job, and it is visible — the pending indicator and the
+escalation ladder are counting it, which is what separates "held" from "dropped".
+
+#### Two smaller decisions worth finding later
+
+**The capacity and the body bound are values the queue is given, not constants it holds.**
+`CLAUDE.md` keeps anything that changes under operational pressure server-side, and a queue cannot
+wait for the platform to tell it how large it may be — being unreachable is the situation it exists
+for. So a compiled-in default is unavoidable, and what is available is that it is a default rather
+than a constant: `QueuePolicy` is a constructor argument, and a server-supplied bound needs no change
+in `core/queue`. Neither number is tuned; their job is to make unbounded growth and an unsendable
+body impossible, which is the reasoning SHIP-135 records for the outbox's 16 KiB bound.
+
+**Sign-out does not clear the queue yet, and that is recorded rather than missed.** `Docs/07` §3
+requires it and `OperationQueue.clear` exists, returning how many operations it discarded so that
+even the one bulk removal is something a user can be told about. What is missing is a queue anything
+writes to: **SHIP-125** opens the database at start-up and calls `recover()`, and **SHIP-129** is the
+first screen that puts anything in it. Wiring `SessionController.signOut` today would have every
+widget test open a platform directory in order to clear a store that is always empty.
+`session_controller.dart` carries the same note beside the method.
+
+#### The seam left for SHIP-125, deliberately unbuilt
+
+No sync worker, no backoff, no drain, and no connectivity listener. What is there for it:
+`recover()` for start-up and resume; `claim()` which takes the next sendable operation and counts the
+attempt; `release(id, nextAttemptAt:)` which stores the delay **durably**, because a backoff reset by
+every app launch is no backoff on a handset; `complete(id)` for an accepted one; and
+`block(id, reason: refused)` for one the platform would not take, which is the state SHIP-132 renders
+from. `QueueSnapshot.unsynced` counts pending and in-flight work and deliberately excludes blocked
+work — a number that never falls however long the driver stands in the open is not the number
+`Docs/02` §3.1's indicator is asking for. `OperationKind` has two members, `delivery.milestone` and
+`delivery.proof`, both named by `Docs/01` §4.4 and `Docs/07` §4 rather than invented here; the proof
+is separate because §4 uploads it as a local file and not as part of the milestone request.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **534 host tests** (up from 495), the analyzer clean, and the environment
+test per build flavour. `make verify` does not cover this ticket and its count does not move — that
+script exercises HTTP endpoints and this one adds none, which is the same position SHIP-80, SHIP-105
+and SHIP-110 are in.
+
+**One thing this ticket cannot verify from a Linux CI runner or a macOS host, and it should be
+watched on the first device build.** `sqlite3` 3.x supplies its native library through a build hook
+rather than through `sqlite3_flutter_libs`, which now resolves to an empty `0.6.0+eol` marker
+version. Host tests exercise the hook and pass; `make flutter-build` was not run, because iOS and
+Android builds are not part of `flutter-check` and SHIP-24…27 are where they get a runner. Whoever
+first builds for a device confirms the library arrives in the bundle.
+
+### SHIP-125 — the worker, and the trigger that has to exist because reconnection does not fire
+
+`core/sync`. SHIP-124 built a queue that never loses what the driver recorded; this is the half that
+gets it off the handset. The *Done when* has three clauses and each was taken as a separate
+decision, because two of them have an obvious reading that is wrong.
+
+#### "Drains on reconnection" — six triggers, and the honest one is the worker's own
+
+The obvious implementation is a connectivity plugin and a listener. It is wrong in **both**
+directions on a phone, which is why there is no new dependency in `pubspec.yaml`:
+
+- **A connectivity event is not sufficient.** "Joined a network" is true on a hotel captive portal,
+  on an access point whose uplink is down, and on a bar of GPRS that times out every request. The
+  only honest test of "can this device reach the platform" is a request to the platform — which is
+  the thing the worker was about to make anyway.
+- **A connectivity event is not necessary, and this is the half that strands work.** A route comes
+  back with no event at all: a mast recovers, a carrier repairs transit, a captive portal is signed
+  into, a VPN reconnects. The operating system reports the same network throughout. **A worker that
+  drains only on a connectivity event waits forever for one that never comes**, with a driver's
+  afternoon in the queue.
+
+| Trigger | Covers | Source |
+|---|---|---|
+| `launch` | A relaunch after a crash or a flat battery. Runs `recover()` first | `main` |
+| `session` | A credential appeared; nothing could be sent before one | the session listener |
+| `recorded` | The driver just recorded something, usually while they still have signal | `SyncWorker.record` |
+| `resumed` | The phone came out of a pocket — where an outage most often ended unobserved | `AppLifecycleListener` |
+| `scheduled` | **The worker's own wake-up, at the earliest moment any operation may be tried** | itself |
+| `connectivity` | A hint from outside | nothing supplies one today |
+
+The fifth is the one that makes the rest safe to get wrong, and it is **a schedule rather than a
+poll**, which is the difference between correct and expensive. After every pass the worker computes
+the earliest stored `next_attempt_at` among the operations at the head of their ordering key and
+arms exactly one wake-up for that instant. An empty queue arms nothing; a queue whose only work is
+blocked arms nothing, because a blocked operation is waiting for a person and not a connection; an
+operation in a five-minute backoff wakes the phone once in five minutes. Two tests hold the "arms
+nothing" cases, because a worker that polled would pass every other test in the file.
+
+`SyncSignals` is the seam a connectivity package plugs into later. Adding one buys **latency** —
+draining a second after the radio returns rather than up to a backoff later — and buys nothing for
+correctness, which is the right basis on which to weigh a native dependency against the store
+privacy declarations §9 already weighs them on.
+
+#### "With exponential backoff" — and the ceiling is the decision, because nothing resets a wait
+
+Base five seconds, ceiling five minutes, **equal jitter**, stored durably through SHIP-124's
+`release(id, nextAttemptAt:)`.
+
+The ceiling matters more than it looks, and the reason is a property of the seam rather than a
+preference. **SHIP-124's queue can set a wait and cannot clear one** — `release` writes
+`next_attempt_at` and no method takes it back — and that is deliberate, because a worker able to
+pull an operation forward is a worker able to reorder the sequence its ordering key exists to
+preserve. So nothing shortens a stored wait: not a resume, not a connectivity event, not a relaunch.
+**The ceiling therefore *is* the worst case between signal returning and the work leaving the
+phone**, and five minutes is what a driver watching an indicator that says their work is not
+recorded can be asked to accept. An hour would have been cheaper and would have meant standing under
+a clear sky for fifty-five minutes with a full bar of signal. What does reset the schedule is the
+operation leaving the queue, and a fresh operation starting at zero — which has its own test,
+because a queue where one long-failing operation slowed down a new one would be the natural bug.
+
+**Jitter is equal jitter, not full jitter.** Without any, every queued operation on every handset in
+a region retries in the same instant after a mast comes back — the thundering herd the ceiling does
+not save you from, since the ceiling decides *how often* and the jitter decides *whether they arrive
+together*. Full jitter (`0` to the whole delay) spreads better and is the wrong trade here: its short
+draws retry pointlessly early against a link that has not changed. Half the nominal delay is never
+skipped and the other half is spread.
+
+Doubling is done in a loop that stops at the ceiling rather than computing `base × 2ⁿ` and clamping,
+because a phone left in a depot over a long weekend reaches attempt counts where the shift overflows
+and a wrapped delay clamps to whatever sign it landed on. A test passes `1 << 40`.
+
+#### "And per-item idempotency keys" — proved twice, because one proof was not the claim
+
+Nothing in `core/sync` mints a key. It was minted where the user acted, stored in the row by
+SHIP-124, and put on the wire by `OperationSender` unchanged on every attempt — including the
+attempt after a relaunch, and including the replay `AuthInterceptor` performs after refreshing a
+token, which reuses the original `RequestOptions` and therefore the original header.
+
+Two tests, and the second exists because the first is not the whole claim. `sync_worker_test.dart`
+shows the **row's** key unchanged across three attempts, which a worker that re-minted at send time
+would still pass. `operation_sender_test.dart` reads the outgoing `Idempotency-Key` **header** across
+three sends. Mutating the sender to call `newIdempotencyKey()` fails the second and nothing else.
+
+`ApiClient` grew one method for this — `send`, which answers with the status code rather than a
+decoded body. Reusing `postJson` would have raised `ApiMalformedResponse` for a `2xx` carrying no
+JSON object, which for a queued operation is **a success reported as a failure and then retried
+forever** against an endpoint that had already recorded it. `postNoContent` exists for the same trap
+at one call site; this is the general form.
+
+#### Retry or refuse: the classification, and the three answers that are wrong in an interesting way
+
+Getting this wrong in either direction is the defect. Retrying a refusal burns battery on a request
+that cannot converge; quarantining a transient failure strands a real delivery update until somebody
+notices. Neither announces itself.
+
+| What came back | Decision | Why |
+|---|---|---|
+| `2xx`, including a replay | complete | The platform has it |
+| no route, a timeout | retry, **stop the pass** | The case the queue exists for |
+| `401` | retry, **stop the pass** | About the **credential**, never about the operation |
+| `409 idempotency_request_in_progress` | retry | This operation's own earlier attempt is still running |
+| `429 rate_limited` | retry, **stop the pass** | About this **caller**, so every operation is equally refused |
+| `503 service_unavailable` | retry, **stop the pass** | A dependency is down — including the idempotency store, which fails closed |
+| `408`, other `5xx` | retry | The platform may even have committed; the stored key makes trying again safe |
+| a body that was not the contract | retry | A proxy's error page says nothing about whether the service saw it |
+| any other `4xx` | **block(refused)** | Understood and refused. A retry can only be told no again |
+| anything that is not an `ApiFailure` | **block(unsupported)** | The request never left this build |
+
+**Only a `4xx` is a refusal somebody made.** A `3xx`, or a status the transport could not read, is an
+unknown, and the safe direction for an unknown is to try again — a wrong quarantine strands a
+delivery until a person looks at it.
+
+*The `401` a token refresh would fix.* It never arrives untried: `AuthInterceptor` (SHIP-50) already
+refreshed once and replayed. So a `401` here means no credential could be had at that moment, which
+on a handset is most often a refresh that failed on the same dead link the operation did. Treating it
+as a refusal would quarantine a driver's update because a token expired in a tunnel. It cannot loop
+either: the worker does not drain without a session, and a session that has genuinely ended clears
+the queue.
+
+*The `409` that is a success in disguise.* A **replayed** success is not a `409` at all —
+`httpx.Idempotent` replays the stored response byte for byte, so the second attempt of an accepted
+milestone comes back `201` with `Idempotency-Replayed: true` and is completed like any other success.
+What is genuinely a `409` is `idempotency_request_in_progress`: the platform is at that moment
+running this operation's own first attempt. Refusing it would quarantine an operation seconds before
+it was recorded. `409 conflict` — "valid, but it contradicts the current state" — is the opposite,
+and is exactly SHIP-132's case.
+
+*The `422` that will change meaning.* SHIP-111 refuses a late milestone with
+`delivery_milestone_not_permitted`, and its own message tells the client to keep the update because
+SHIP-112 will have the platform absorb it. Quarantine **is** "keep it": the operation stays in the
+table with its key and its attempt count until a person acknowledges it.
+
+**Which failures stop the pass is a second decision inside the first.** A failure that came back from
+the platform proves there is a route, so the pass moves on to the next ordering key — stopping would
+let one job's problem stall another's, the head-of-line block SHIP-124's per-key ordering exists to
+confine. Only failures about the link, the caller, or the platform as a whole end a pass, because
+nothing else would fare differently and continuing is one radio wake-up per queued operation in
+exchange for nothing. The pass terminates for a stated reason rather than by hope: every outcome
+either removes the operation or writes a `next_attempt_at` in the future, and `claim()` will not
+offer an operation before that time, so each pass offers each key's head at most once.
+
+There is **no dead-letter path and no attempt limit**, which is SHIP-124's position and SHIP-135's
+before it. Nothing removes a quarantined operation after N attempts; a person acknowledging it does
+(SHIP-132). What is stored beside it is `ApiFailure.toString` — status, machine-readable code and
+request id, and deliberately not the platform's copy or the response body, which `Docs/07` §3 keeps
+out of anything readable later. A test asserts both halves of that string.
+
+#### Sign-out clears the queue, and the wiring is the answer to SHIP-124's objection
+
+SHIP-124 recorded this as deferred rather than missed, and named the condition: there was no queue
+anything wrote to. **That is not quite what changed.** What changed is that until this commit a
+leftover row was inert, and from it a leftover row is one the worker will pick up and send under
+whatever credential the device holds *next*. The invariant `Docs/07` §3 is protecting goes live with
+the worker, not with the first screen that queues anything — so it had to land here.
+
+It is wired as a listener on `sessionProvider` inside `syncWorkerProvider`, not as a call inside
+`SessionController.signOut`, for three reasons in increasing order of importance: `core/auth` does
+not learn about `core/queue`; a widget test that signs out still touches nothing, because it does not
+build this provider, which answers SHIP-124's objection rather than overruling it; and **it also
+covers the sign-out that did not finish** — a process killed between clearing the keychain and
+clearing the queue leaves rows behind, and the next launch resolves the session to signed out and the
+listener fires then. An inline call would have run in exactly the one case that had already happened.
+Both are tested against the real providers.
+
+The same listener **pauses** the worker while there is no session, which is what stops a cold start
+spending an attempt — and a stored backoff — on a request carrying no bearer token. A session that
+cannot be read is treated as no session by `SessionController`, and therefore clears the queue too:
+with no refresh token there is no credential those operations could ever be sent under, and the
+alternative is unsendable rows waiting for the next account on the device.
+
+#### Where the app is started from, and why `main.dart` changed
+
+`recover()` has to run before the first frame and nothing else in the application looks at an
+`in_flight` row, so the worker is started from a provider read outside the widget tree —
+`ProviderContainer` plus `UncontrolledProviderScope`, still exactly one scope with every override on
+it. **Deliberately not from `ShipperApp`:** every widget test builds that widget, and a worker there
+would have each of them open the platform's application-support directory to construct a queue
+database. That is SHIP-124's objection arriving from the other direction, and `main` is the one place
+the real application exists and no test does.
+
+#### What is left for the four tickets written against this one
+
+`SyncWorker.snapshots` publishes a `QueueSnapshot` after every pass and costs nothing, because the
+worker already reads one to decide when to wake — **SHIP-126** reads `unsynced`, which counts pending
+and in-flight work and excludes blocked. **SHIP-127**'s four-hour clock is `enqueuedAt`, already
+stored. **SHIP-129** calls `SyncWorker.record`, which is enqueue-and-drain in one call so that "wake
+the worker afterwards" is not a rule every screen has to remember. **SHIP-132** renders
+`snapshot.blocked` and removes an entry through `SyncWorker.queue.acknowledge`. No widget was built.
+
+**SHIP-130 has one thing waiting for it and it is loud rather than silent.** `Docs/07` §4 uploads a
+proof photograph as a local file and not as part of the milestone request, which is a multipart send
+this build has no code for. Nothing can enqueue one yet — SHIP-130 comes after SHIP-129 — so
+`ApiOperationSender` throws for an operation carrying an `attachmentPath`, and the worker quarantines
+it rather than looping against a request it cannot construct. A test holds the case so it cannot
+become a silent half-send.
+
+#### How it was demonstrated
+
+`make flutter-check` green in the worktree: **594 host tests** (up from 534), the analyzer clean, and
+the environment test per build flavour. `make verify` does not cover this ticket and its count does
+not move — that script exercises HTTP endpoints and this one adds none, the same position SHIP-80,
+SHIP-105, SHIP-110 and SHIP-124 are in.
+
+**Five mutations, and each fails exactly the tests it should.** Making the backoff ignore the attempt
+count fails six; treating a `401` as a refusal fails one; removing the pass-stopping break fails the
+two that assert it; dropping the per-key head rule from the wake-up calculation fails the blocked-key
+test; and minting a fresh key in the sender fails the header test and nothing else. The queue
+underneath is the real one over a real SQLite file, and the relaunch tests are genuine
+close-and-reopen cycles — an in-memory database would have made the durable-backoff tests pass while
+proving nothing.
+
+**No acceptance test against a running API is in the committed suite**, which follows the precedent
+SHIP-48 set and SHIP-124 repeated: `flutter test` runs on a Linux CI runner with no device and no
+service, and a test that needs either is a test that gets skipped or commented out. What a person can
+run by hand is `make up && make migrate-up && make run` in this worktree and `make flutter-run` with
+a queued milestone; that was **not** performed for this ticket, and the first device build is also
+where SHIP-124's note about `sqlite3`'s native library still wants confirming.
 
 ## 4. Partly done — do not treat these as finished
 

@@ -10,11 +10,13 @@ import 'package:shipper/core/device/device_label.dart';
 import 'package:shipper/features/fleet/fleet_repository.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
+import 'package:shipper/features/jobs/open_jobs_repository.dart';
 
 import '../../core/auth/fake_token_store.dart';
 import '../../core/auth/session_fixtures.dart';
 import '../fleet/fake_fleet_repository.dart';
 import '../jobs/fake_jobs_repository.dart';
+import '../jobs/fake_open_jobs_repository.dart';
 import 'fake_identity_repository.dart';
 
 /// The real app, with only the things a widget test cannot have.
@@ -32,6 +34,7 @@ Widget signupApp(
   FakeTokenStore? store,
   FakeJobsRepository? jobs,
   FakeFleetRepository? fleet,
+  FakeOpenJobsRepository? openJobs,
   FakeSessionEnder? ender,
 }) {
   return ProviderScope(
@@ -53,6 +56,11 @@ Widget signupApp(
       // opened by a screen nobody in a given test was thinking about is the one that goes
       // unnoticed until CI has no API to open it against.
       fleetRepositoryProvider.overrideWithValue(fleet ?? FakeFleetRepository()),
+      // The **provider half of the shell** reads the eligible feed as soon as it is drawn
+      // (SHIP-99), which is the same hazard one step earlier than the fleet's: every test that
+      // signs a provider in reaches it, including the ones that are about the router or the
+      // session and never mention a job.
+      openJobsRepositoryProvider.overrideWithValue(openJobs ?? FakeOpenJobsRepository()),
       // A restored session refreshes as soon as the keychain answers (SHIP-50). None of these
       // tests starts with a stored token, so nothing refreshes — but a test that later does
       // would otherwise open a socket to whatever is listening on the local API port.

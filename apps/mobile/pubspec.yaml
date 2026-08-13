@@ -38,6 +38,28 @@ dependencies:
   # ciphers, needs API 23, and its options are the ones token_store.dart asserts on.
   flutter_secure_storage: ^10.3.1
 
+  # SHIP-124. Named by Docs/10 §8.3 and Docs/07 §9 rather than chosen here: **Drift over SQLite**
+  # for the offline queue and cached reads. The reason is transactional rather than about storage
+  # — an operation, its idempotency key, the time the user acted and the path to its proof image
+  # either all commit or none of them do, and the sync worker has to mark an item in flight and
+  # recover cleanly when the process dies mid-upload. A key-value store expresses neither.
+  #
+  # `drift_flutter` is one method, `driftDatabase(name:)`, resolving the platform's
+  # application-support directory. It is the alternative to depending on `path_provider` here and
+  # writing the same five lines by hand.
+  #
+  # **The native footprint, since Docs/11 §9 raises exactly this about packages with native
+  # integrations.** `sqlite3` 3.x carries a build hook that supplies libsqlite3 per platform;
+  # `sqlite3_flutter_libs` and `sqlcipher_flutter_libs` resolve in the lockfile at `0.6.0+eol` and
+  # `0.7.0+eol`, which are empty marker versions their author publishes so the superseded
+  # Flutter-specific build scripts cannot be used alongside the hook. None of it reads a device
+  # identifier, a contact, a location or an advertising id — so unlike `device_info_plus`, which
+  # §9 declines for precisely that reason, neither the Apple privacy labels nor the Play
+  # data-safety declaration moves. What is stored is the user's own operations, on their own
+  # device, which the app already held in memory.
+  drift: ^2.34.3
+  drift_flutter: ^0.3.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -62,6 +84,11 @@ dev_dependencies:
   # the instance is how a test observes what actually reached the Keychain or the Keystore —
   # SHIP-48's *Done when* is not otherwise demonstrable without a device.
   flutter_secure_storage_platform_interface: ^2.0.3
+
+  # SHIP-124. Generates the `.g.dart` half of core/queue/queue_database.dart under the same
+  # build_runner invocation freezed and json_serializable already use, so `make flutter-codegen`
+  # covers it and SHIP-21's `git diff --exit-code` on the generated files covers it too.
+  drift_dev: ^2.34.0
 
 flutter:
   uses-material-design: true

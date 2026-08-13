@@ -110,6 +110,36 @@ class ApiClient {
     );
   }
 
+  /// A write whose **status** is the answer, rather than its body (SHIP-125).
+  ///
+  /// For the sync worker, which needs to know one thing about a queued operation — did the
+  /// platform take it — and has no use for what came back. Returns the status code on any
+  /// success and throws [ApiFailure] on everything else, exactly as the methods above do.
+  ///
+  /// It exists rather than reusing [postJson] because of a trap that would be invisible until it
+  /// bit: [postJson] raises [ApiMalformedResponse] for a `2xx` with no JSON object in it, which
+  /// for a queued operation would be **a success reported as a failure, and then retried
+  /// forever** against an endpoint that had already recorded it. The same reasoning gave
+  /// [postNoContent] its existence; this is the general form of it.
+  Future<int> send(
+    String method,
+    String path, {
+    required String idempotencyKey,
+    Object? body,
+  }) async {
+    final response = await _guarded(
+      () => _dio.request<Object?>(
+        path,
+        data: body,
+        options: Options(
+          method: method,
+          headers: {ApiHeaders.idempotencyKey: idempotencyKey},
+        ),
+      ),
+    );
+    return response.statusCode ?? 0;
+  }
+
   Future<Map<String, dynamic>> _write(
     String method,
     String path, {

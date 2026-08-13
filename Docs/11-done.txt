@@ -133,6 +133,7 @@ SHIP-82
 SHIP-83
 SHIP-91
 SHIP-98
+SHIP-99
 
 # M4 — Delivery execution
 SHIP-105
@@ -142,6 +143,8 @@ SHIP-108
 SHIP-110
 SHIP-111
 SHIP-112
+SHIP-124
+SHIP-125
 
 # M5 — Notifications
 SHIP-134
