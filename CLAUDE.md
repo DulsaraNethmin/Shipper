@@ -41,6 +41,7 @@ If something contradicts a document, the document wins — or the document needs
 | Database | PostgreSQL |
 | Cache / tokens / idempotency | Redis |
 | Events | Kafka |
+| Object storage | S3 — proof photographs and verification documents, private, reached only by short-lived pre-signed URL. MinIO in development, which speaks the same API |
 | Push | Firebase Cloud Messaging |
 | Cloud / observability | AWS / Datadog |
 
@@ -180,6 +181,7 @@ Each concurrent piece of work gets its own git worktree, never the primary tree.
 | Ports | `HTTP_PORT` and `VERIFY_PORT` per worktree, likewise |
 | Compose | One shared stack. `COMPOSE_PROJECT_NAME` is pinned in the `Makefile` so worktrees do not each start their own and fight over 5432, 6379 and 29092 |
 | **Kafka** | **There is no isolation, and there is no equivalent to add.** One broker, one `shipper.job`, and **every worktree publishes into the same topics** — the shared stack is safe for PostgreSQL only because each tree gets its own database on the cluster, and a topic has no such split. So **on a Kafka topic a fence must be an id, not a timestamp**: a concurrent run in another worktree is not ordered against this one, and a `published_at > $fence` window contains that run's events as readily as your own. Wave 5 lost a run proving it — a count over a topic failed on a tree where nothing was wrong, and the count was right about what it saw |
+| **Object storage** | **`STORAGE_BUCKET` in `deploy/.env`, one per worktree — and this is the one shared service that genuinely can be split, which is why the row exists rather than repeating the Kafka one.** A bucket is a namespace the store makes on demand, so five trees get five buckets on one MinIO and never see each other's objects; a topic is created from the event catalogue, shared by every tree, and has no per-tree equivalent. `make up` creates whatever `STORAGE_BUCKET` names, so a tree that sets the line has isolation from its next `make up` and needs nothing else. **Unlike `TEST_TEMPLATE_DB` it is not derived from the directory**, so a tree that leaves it alone shares `shipper-dev` with every other tree that did — which is safe for keyed reads and writes and is not safe for a count or a listing. Set it, or fence on an id |
 | **`git stash`** | **Never.** The stash is shared across worktrees through one `.git`, and this repository already carries the scar — `CLAUDE.md` was committed with `Stashed changes` conflict markers in it |
 | Shared files | Do not edit from a domain branch: `cmd/api/routes.go`, `internal/boundaries/boundaries.go`, `internal/httpx/**`, `go.mod`, the root `Makefile`, migrations in the shared block, `scripts/verify-foundation.sh`, `CLAUDE.md`, `Docs/**`. A domain's own `scripts/verify/<n>-<domain>.sh` is not shared — that is what the split is for. See `Docs/10` §9.2 |
 
@@ -214,10 +216,13 @@ Read the diff at the first gate, not the second — by the time work reaches a `
 All run from the repository root. `make` with no target lists them.
 
 ```
-make up             Start Postgres, Redis and Kafka, waiting until each is healthy
+make up             Start Postgres, Redis, Kafka and the object store, waiting until each
+                    is healthy, then create this worktree's bucket
 make down           Stop the stack, keeping data
 make reset          Stop the stack and destroy all data
 make ps / logs      Stack status; follow stack logs
+make storage-bucket Create this worktree's object-storage bucket, private. Idempotent, and
+                    already run by `make up`
 
 make migrate-up     Apply all pending migrations
 make migrate-down   Reverse the last migration (make migrate-down n=all for everything)
@@ -290,7 +295,7 @@ services/core/        Go — the versioned public API and domain
   internal/testsupport/ pgtest and redistest — real infrastructure for tests
   internal/validate/  field-level validation in the error contract's shape
   migrations/         SQL schema history, in reserved per-domain blocks
-deploy/               docker-compose for local Postgres, Redis, Kafka
+deploy/               docker-compose for local Postgres, Redis, Kafka, MinIO
 scripts/              verify-foundation.sh — the acceptance harness; the checks are
                       one file per milestone or domain in scripts/verify/, so a track
                       adds a file and edits none. Also check-spelling.sh and

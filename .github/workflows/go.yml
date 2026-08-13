@@ -49,6 +49,13 @@ jobs:
     # success. .github/workflows/README.md names the trap: "they pass by being skipped, which
     # reads as green." internal/testsupport now fails instead of skipping, which turns a
     # missing service into a loud failure rather than a quiet one.
+    #
+    # The object store is the third dependency and it is **not** here (SHIP-15p). The argument
+    # above applies to it unchanged — a storage test written against a missing service turns this
+    # job red rather than quietly green — but a service container cannot express it: the block
+    # takes an image, environment, ports and `docker create` options and **no command**, while
+    # minio/minio's default command prints its usage and exits. It is started by a step instead,
+    # from the same pinned release development runs. See "object storage" below.
     services:
       postgres:
         image: postgres:17-alpine
@@ -85,6 +92,49 @@ jobs:
         with:
           go-version-file: services/core/go.mod
           cache-dependency-path: services/core/go.sum
+
+      # The object store (SHIP-15p), started here rather than in `services:` above for the
+      # reason that block's comment gives: a service container cannot be given a command, and
+      # this image needs one.
+      #
+      # Two images could have gone in the block instead, and both are worse than a step.
+      # minio/minio:edge-cicd carries `server /data` as its command and is an unreleased build
+      # frozen in 2021; bitnami/minio starts a server unprompted and creates a bucket from an
+      # environment variable, and its public repository was retired in 2025. Either would mean CI
+      # exercising a different object store from the one `make up` runs, which is the drift this
+      # repository avoids everywhere else — the compose stack and this workflow already run the
+      # same PostgreSQL and the same Redis.
+      #
+      # The bucket is made here for the reason the Makefile makes it rather than compose: `mc`
+      # ships inside the image, so it needs no second image and no second pull. Every value below
+      # matches deploy/docker-compose.yml and internal/config's development defaults, the way this
+      # file's POSTGRES_* already match deploy/.env.example — nothing sets STORAGE_* for the
+      # tests, because the defaults are these.
+      - name: object storage
+        env:
+          MINIO_IMAGE: minio/minio:RELEASE.2025-09-07T16-13-09Z
+        run: |
+          docker run -d --name shipper-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=shipper \
+            -e MINIO_ROOT_PASSWORD=shipperminio \
+            -e MINIO_REGION=ap-southeast-2 \
+            "$MINIO_IMAGE" server /data
+          for _ in $(seq 1 60); do
+            curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://localhost:9000/minio/health/live >/dev/null || {
+            echo "::error::the object store did not become live"
+            docker logs shipper-minio
+            exit 1
+          }
+          docker exec shipper-minio sh -c '
+            set -e
+            mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
+            mc mb --ignore-existing local/shipper-dev >/dev/null
+            mc anonymous set none local/shipper-dev >/dev/null'
+          echo "bucket shipper-dev exists and has no public read path"
 
       # `make check` rather than a list of steps. It is already vet + the SHIP-11 boundary
       # lint + `go test -race`, and a workflow that reimplements that list drifts from it —

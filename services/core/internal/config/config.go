@@ -62,7 +62,105 @@ type Config struct {
 	SMS         SMS
 	Geocoding   Geocoding
 	Pagination  Pagination
+	Storage     Storage
 	App         App
+}
+
+// Storage configures the private object store that holds proof-of-delivery photographs and
+// provider verification documents (SHIP-114).
+//
+// Added at SHIP-15p rather than at SHIP-114, and for once that is not the usual story of a
+// domain branch parking a request against a shared surface after the fact. Docs/11 §9 records
+// that three prep tickets in a row absorbed a parked internal/config request, and that the
+// conclusion was to **ask each track at dispatch what configuration it expects to need**. Wave 7
+// asked, Track B answered with the nine fields below, and this is that answer written down
+// before the track opened rather than a wave later.
+//
+// # Nothing here is an adapter decision
+//
+// internal/platform/storage/doc.go names two implementations — the filesystem in development and
+// S3 for staging and production — and choosing between them is cmd/api's job, from Env, exactly
+// as it is for email, SMS and geocoding. These values describe the *store*, not the choice.
+//
+// # Why the last two fields are here at all
+//
+// MaxUploadBytes and AcceptedContentTypes are policy rather than plumbing, and a limit compiled
+// into the client is a limit that needs an app release to change. Docs/06 §5.3 is explicit:
+// Flutter has no over-the-air path for Dart code, so anything expected to move under operational
+// pressure lives server-side. A proof photograph that a driver cannot upload is a delivery that
+// cannot be completed, which is the failure Docs/01 §4.4 spends a whole section avoiding.
+type Storage struct {
+	// Endpoint is the S3 API's base URL, and it is always explicit.
+	//
+	// **The host in it is signed.** SigV4 covers the `host` header, so a pre-signed URL minted
+	// against one address and fetched at another is refused as SignatureDoesNotMatch — an error
+	// that names neither the address nor the cause. In development that means the *published*
+	// port on the host, not `minio:9000` inside the compose network, because whatever resolves
+	// the URL is on the host.
+	//
+	// There is no "leave it empty and let the SDK pick the regional endpoint" state, and that is
+	// a decision rather than an oversight: [loader.lookup] treats an empty variable as absent, so
+	// an empty value would silently become this field's development default — an object store on
+	// somebody's loopback, configured in production, reported as nothing. AWS's own regional
+	// endpoint is `https://s3.<region>.amazonaws.com` and is perfectly typeable, so a deployment
+	// types it and [loader.validate] refuses a loopback host outside development.
+	Endpoint string
+
+	// Bucket holds every object the platform stores. One bucket, prefixed by concern — there is
+	// no second bucket for verification documents, because both kinds of object are private
+	// evidence under the same access rules and a second bucket is a second set of them.
+	//
+	// **It is per-worktree in development** (CLAUDE.md's worktree table). A bucket is a cheap
+	// namespace, which is precisely what a Kafka topic is not, so the one shared service that
+	// can be split per tree is this one.
+	Bucket string
+
+	// Region is the S3 region the bucket lives in, and it is signed as part of the credential
+	// scope rather than merely routed on. The local MinIO is started with the same value for
+	// that reason; a mismatch is a signature failure, not a redirect.
+	Region string
+
+	// AccessKeyID and SecretAccessKey authenticate to the store.
+	//
+	// Static credentials, because the MVP has one deployment shape and no instance-role story
+	// yet. Whoever moves the service onto an IAM role deletes these two and the SDK finds its
+	// own; nothing else in the section changes.
+	AccessKeyID     string
+	SecretAccessKey string
+
+	// UsePathStyle addresses a bucket as `endpoint/bucket/key` rather than
+	// `bucket.endpoint/key`.
+	//
+	// True by default because the development store is MinIO on localhost, where the
+	// virtual-host form would need `shipper-dev.localhost` to resolve and does not. A
+	// deployment against AWS sets it false.
+	UsePathStyle bool
+
+	// PresignTTL is how long an issued pre-signed URL works for.
+	//
+	// Short, and bounded at load, for the reason the driver token is: **nothing can revoke one
+	// once it is signed.** The URL is the whole of the authorisation — Docs/06 §5.2 puts the
+	// bytes outside the API entirely — so its lifetime is the window in which a copied link
+	// reaches a photograph of somebody's front door. Fifteen minutes is long enough for a
+	// phone on a poor connection to finish an upload it has already started, which is the only
+	// thing it has to outlast.
+	PresignTTL time.Duration
+
+	// MaxUploadBytes is the largest object the platform will issue an upload URL for.
+	//
+	// Docs/01 §5.2 requires the client to compress before uploading, so this is a bound on a
+	// mistake rather than on ordinary use: a phone photograph compressed for a metered
+	// connection is one or two megabytes.
+	MaxUploadBytes int64
+
+	// AcceptedContentTypes is the set of media types an upload URL may be issued for, lower
+	// case, one `type/subtype` per entry.
+	//
+	// Server-side because the answer changes: HEIC arrived on iOS without an app release
+	// anywhere, and a client-side list would have needed one. It is a list rather than a
+	// prefix match so that `image/svg+xml` — a script container that browsers execute — cannot
+	// arrive by being an image.
+	AcceptedContentTypes []string
 }
 
 // Geocoding configures the address-lookup adapter (SHIP-35), first consumed by SHIP-60's
@@ -392,6 +490,11 @@ var credentialBearingDefaults = []string{
 	"REDIS_URL",
 	"IDENTITY_ACCESS_TOKEN_KEYS",
 	"DELIVERY_DRIVER_TOKEN_KEYS",
+	// Both halves, unlike DATABASE_URL which carries user and password in one variable. A
+	// deployment that set the secret and left the identifier as the local throwaway would
+	// authenticate as nobody, and the symptom would be the first upload rather than the start-up.
+	"STORAGE_ACCESS_KEY_ID",
+	"STORAGE_SECRET_ACCESS_KEY",
 }
 
 // The development signing key, which is in the repository and therefore public.
@@ -438,6 +541,40 @@ func developmentDriverSigningKeys() map[string][]byte {
 // and the domain does not import configuration (Docs/06 §4.1). Checking it here as well means a
 // short key is refused at startup rather than at the first sign-in.
 const minimumSigningKeyBytes = 32
+
+// The development object-store credential, on exactly the terms the signing keys above are on:
+// it is in this repository and therefore public, it exists so that a fresh clone runs without
+// setup, and validate refuses it outside development.
+//
+// It matches MINIO_ROOT_USER and MINIO_ROOT_PASSWORD in deploy/docker-compose.yml, the way
+// DATABASE_URL matches POSTGRES_USER and POSTGRES_PASSWORD. The password is not `shipper` twice
+// over because MinIO refuses a root password shorter than eight characters.
+const (
+	developmentStorageAccessKeyID     = "shipper"
+	developmentStorageSecretAccessKey = "shipperminio"
+)
+
+// maxPresignTTL bounds the one credential in this file that is a URL.
+//
+// Nothing revokes a pre-signed URL once it is signed — Docs/06 §5.2 puts the bytes outside the
+// API entirely, so the signature *is* the authorisation and no server-side check runs when it is
+// redeemed. The cap is an hour rather than a number close to the fifteen-minute default, for the
+// same reason maxDriverTokenTTL is thirty days: the default is a judgement operations may
+// legitimately move, and this only refuses the values that would defeat the design.
+const maxPresignTTL = time.Hour
+
+// The upload-size bounds, and the range is deliberately wide.
+//
+// A phone photograph compressed for a metered connection (Docs/01 §5.2) is one or two megabytes,
+// so ten is generous. The floor exists because a value below it refuses every real photograph —
+// a configuration mistake that presents as a driver unable to finish a delivery — and the ceiling
+// because past it the number has stopped describing a photograph and started describing how much
+// of somebody's data allowance a single upload may consume.
+const (
+	defaultMaxUploadBytes  = 10 << 20 // 10 MiB
+	smallestMaxUploadBytes = 64 << 10 // 64 KiB
+	largestMaxUploadBytes  = 64 << 20 // 64 MiB
+)
 
 // maxDriverTokenTTL is a typo guard on the one TTL nothing can shorten once issued.
 //
@@ -527,6 +664,22 @@ func Load() (*Config, error) {
 			DefaultPageSize: l.boundedInt("PAGINATION_DEFAULT_PAGE_SIZE", 20, 1, 500),
 			MaxPageSize:     l.boundedInt("PAGINATION_MAX_PAGE_SIZE", 100, 1, 500),
 		},
+		Storage: Storage{
+			// The published host port, not the compose-internal name — see [Storage.Endpoint].
+			// It matches the Makefile's STORAGE_ENDPOINT, which derives the port rather than
+			// assuming it.
+			Endpoint:        l.str("STORAGE_ENDPOINT", "http://localhost:9000"),
+			Bucket:          l.str("STORAGE_BUCKET", "shipper-dev"),
+			Region:          l.str("STORAGE_REGION", "ap-southeast-2"),
+			AccessKeyID:     l.str("STORAGE_ACCESS_KEY_ID", developmentStorageAccessKeyID),
+			SecretAccessKey: l.str("STORAGE_SECRET_ACCESS_KEY", developmentStorageSecretAccessKey),
+			UsePathStyle:    l.boolean("STORAGE_USE_PATH_STYLE", true),
+			PresignTTL:      l.duration("STORAGE_PRESIGN_TTL", 15*time.Minute),
+			MaxUploadBytes: int64(l.boundedInt("STORAGE_MAX_UPLOAD_BYTES",
+				defaultMaxUploadBytes, smallestMaxUploadBytes, largestMaxUploadBytes)),
+			AcceptedContentTypes: l.csv("STORAGE_ACCEPTED_CONTENT_TYPES",
+				[]string{"image/jpeg", "image/png", "image/heic"}),
+		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
 			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
@@ -584,6 +737,15 @@ func (c Config) LogValue() slog.Value {
 		slog.String("email_sender", c.Email.Sender),
 		slog.Bool("sms_provider_configured", c.SMS.ProviderBaseURL != ""),
 		slog.String("sms_sender", c.SMS.Sender),
+		// The bucket and the endpoint, never the credential. The bucket is the one worth
+		// insisting on: it is per-worktree in development, and a process writing into the
+		// wrong one succeeds at everything and puts the objects where nobody looks.
+		slog.String("storage_endpoint", redactURL(c.Storage.Endpoint)),
+		slog.String("storage_bucket", c.Storage.Bucket),
+		slog.String("storage_region", c.Storage.Region),
+		slog.Bool("storage_path_style", c.Storage.UsePathStyle),
+		slog.Duration("storage_presign_ttl", c.Storage.PresignTTL),
+		slog.Int64("storage_max_upload_bytes", c.Storage.MaxUploadBytes),
 	)
 }
 
@@ -744,6 +906,26 @@ func (l *loader) boundedInt(key string, def, low, high int) int {
 	return n
 }
 
+// boolean reads a flag, accepting everything strconv.ParseBool does — 1/0, t/f, true/false,
+// TRUE/FALSE — and refusing everything it does not.
+//
+// Refusing rather than treating an unrecognised value as false, because the values people
+// actually type are "yes" and "on", and silently reading either as false would turn a switch
+// somebody deliberately set into one they did not. The one setting this reads today decides
+// whether a bucket is addressed by path, and getting it wrong is an upload URL that 404s.
+func (l *loader) boolean(key string, def bool) bool {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		l.errf("%s: %q is not true or false", key, v)
+		return def
+	}
+	return b
+}
+
 func (l *loader) port(key string, def int) int {
 	v, ok := l.lookup(key)
 	if !ok {
@@ -892,6 +1074,51 @@ func (l *loader) validate(cfg *Config) {
 			cfg.Pagination.DefaultPageSize, cfg.Pagination.MaxPageSize)
 	}
 
+	// An endpoint that is not an absolute http(s) URL cannot be signed against, and the SDK's
+	// own complaint about it arrives at the first upload rather than at startup.
+	if endpoint, err := url.Parse(cfg.Storage.Endpoint); err != nil {
+		l.errf("STORAGE_ENDPOINT: %q is not a URL", cfg.Storage.Endpoint)
+	} else if endpoint.Host == "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {
+		l.errf("STORAGE_ENDPOINT: %q is not an absolute http or https URL "+
+			"(AWS S3's own is https://s3.%s.amazonaws.com)", cfg.Storage.Endpoint, cfg.Storage.Region)
+	}
+
+	// A bucket name S3 will not accept is a startup problem rather than an upload problem, and
+	// the difference matters here more than it usually would: the name is per-worktree in
+	// development (CLAUDE.md), so it is a value a person types, and the first thing that would
+	// otherwise notice is a driver's proof upload.
+	//
+	// The subset checked is the one the full rule is made of — length, character set, and both
+	// ends alphanumeric. AWS also refuses dotted names that parse as an IP address and names
+	// with consecutive dots, which are not worth encoding here: neither is a mistake anybody
+	// makes by hand, and the store refuses them anyway.
+	if err := checkBucketName(cfg.Storage.Bucket); err != nil {
+		l.errf("STORAGE_BUCKET: %q %s", cfg.Storage.Bucket, err)
+	}
+
+	// A media type that is not `type/subtype` cannot match anything an upload declares, so the
+	// list would silently accept nothing. Checked lower case because HTTP media types are
+	// case-insensitive and a comparison somewhere downstream will not be.
+	for _, mediaType := range cfg.Storage.AcceptedContentTypes {
+		kind, sub, separated := strings.Cut(mediaType, "/")
+		if !separated || kind == "" || sub == "" {
+			l.errf("STORAGE_ACCEPTED_CONTENT_TYPES: %q is not a type/subtype media type", mediaType)
+			continue
+		}
+		if mediaType != strings.ToLower(mediaType) {
+			l.errf("STORAGE_ACCEPTED_CONTENT_TYPES: %q must be lower case", mediaType)
+		}
+	}
+
+	// See [maxPresignTTL]: a pre-signed URL is the whole of the authorisation and nothing
+	// revokes one, so an over-long window is a standing grant to a photograph of somebody's
+	// front door for whoever the link reaches.
+	if cfg.Storage.PresignTTL > maxPresignTTL {
+		l.errf("STORAGE_PRESIGN_TTL (%s) is longer than %s; a pre-signed URL cannot be revoked "+
+			"once it is signed, so the window is the whole of the exposure",
+			cfg.Storage.PresignTTL, maxPresignTTL)
+	}
+
 	// A credential with nowhere to go is the shape of a half-finished configuration, and the
 	// symptom is silence: cmd/api builds no geocoder, addresses are stored unresolved, and the
 	// key sitting in the environment suggests the opposite. The reverse — a base URL with no
@@ -924,6 +1151,19 @@ func (l *loader) validate(cfg *Config) {
 		l.errf("DATABASE_URL: sslmode=disable is not permitted when SHIPPER_ENV is %s", cfg.Env)
 	}
 
+	// The same shape for the object store, and it is needed here rather than covered by the
+	// credential rule above: STORAGE_ENDPOINT carries no credential, so nothing else notices a
+	// deployment left pointing at the development container. The symptom would be a proof
+	// photograph the platform believes it stored and nobody can ever retrieve.
+	if endpoint, err := url.Parse(cfg.Storage.Endpoint); err == nil {
+		switch endpoint.Hostname() {
+		case "localhost", "127.0.0.1", "::1":
+			l.errf("STORAGE_ENDPOINT: %q is a loopback address and cannot be right when "+
+				"SHIPPER_ENV is %s (AWS S3's own is https://s3.%s.amazonaws.com)",
+				cfg.Storage.Endpoint, cfg.Env, cfg.Storage.Region)
+		}
+	}
+
 	// The credential-default rule above catches a variable that was never set. This catches
 	// the other way in: the development key copied out of deploy/.env.example into a real
 	// environment, which is a signing key published in this repository.
@@ -949,4 +1189,38 @@ func (l *loader) validate(cfg *Config) {
 			}
 		}
 	}
+
+	// The same second door, for the object store. The rule above catches a variable nobody set;
+	// this catches the local throwaway copied out of deploy/.env.example into a real
+	// environment, which would be a published credential against a bucket of private evidence.
+	if !l.defaulted["STORAGE_SECRET_ACCESS_KEY"] &&
+		cfg.Storage.SecretAccessKey == developmentStorageSecretAccessKey {
+		l.errf("STORAGE_SECRET_ACCESS_KEY: this is the development credential from "+
+			"deploy/.env.example, which is public; it may not be used when SHIPPER_ENV is %s",
+			cfg.Env)
+	}
+}
+
+// checkBucketName reports why a name is not one S3 will accept, or nil.
+//
+// The message completes the sentence "STORAGE_BUCKET: %q …", so it reads as a description of the
+// name rather than as an instruction.
+func checkBucketName(name string) error {
+	if len(name) < 3 || len(name) > 63 {
+		return fmt.Errorf("is %d characters; a bucket name is between 3 and 63", len(name))
+	}
+
+	alphanumeric := func(c byte) bool {
+		return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+	}
+	if !alphanumeric(name[0]) || !alphanumeric(name[len(name)-1]) {
+		return errors.New("must start and end with a lower-case letter or a digit")
+	}
+	for i := 0; i < len(name); i++ {
+		if !alphanumeric(name[i]) && name[i] != '-' && name[i] != '.' {
+			return fmt.Errorf("contains %q; a bucket name holds only lower-case letters, "+
+				"digits, hyphens and dots", name[i])
+		}
+	}
+	return nil
 }

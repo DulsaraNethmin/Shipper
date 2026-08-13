@@ -78,6 +78,16 @@ REDIS_PORT="${REDIS_PORT:-6379}"
 DATABASE_URL="${DATABASE_URL:-postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${POSTGRES_DB}?sslmode=disable}"
 REDIS_URL="${REDIS_URL:-redis://localhost:${REDIS_PORT}/0}"
 
+# The object store (SHIP-15p). Every default matches deploy/.env.example, internal/config and
+# deploy/docker-compose.yml; `make verify` exports whatever deploy/.env overrides, so a worktree
+# with its own bucket is checked against its own bucket.
+MINIO_PORT="${MINIO_PORT:-9000}"
+STORAGE_ENDPOINT="${STORAGE_ENDPOINT:-http://localhost:${MINIO_PORT}}"
+STORAGE_BUCKET="${STORAGE_BUCKET:-shipper-dev}"
+STORAGE_REGION="${STORAGE_REGION:-ap-southeast-2}"
+STORAGE_ACCESS_KEY_ID="${STORAGE_ACCESS_KEY_ID:-shipper}"
+STORAGE_SECRET_ACCESS_KEY="${STORAGE_SECRET_ACCESS_KEY:-shipperminio}"
+
 # A port of its own, so the run is not affected by whatever is already bound locally and
 # so SHIP-5's "listens on a configured port" is actually being exercised.
 VERIFY_PORT="${VERIFY_PORT:-18080}"

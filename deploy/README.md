@@ -1,6 +1,7 @@
 # deploy — local development stack
 
-PostgreSQL, Redis, and Kafka for local development (SHIP-2, SHIP-3, SHIP-4). Production
+PostgreSQL, Redis, Kafka and an S3-compatible object store for local development
+(SHIP-2, SHIP-3, SHIP-4, SHIP-15p). Production
 runs on managed AWS services (`Docs/06` §2); nothing in this directory is a deployment
 artefact.
 
@@ -18,6 +19,8 @@ make reset         # stop and destroy all data
 | PostgreSQL 17 | `postgres:5432` | `localhost:5432` | System of record |
 | Redis 7 | `redis:6379` | `localhost:6379` | Refresh tokens, device registry, idempotency keys, rate limits |
 | Kafka 3.9 (KRaft) | `kafka:9092` | `localhost:29092` | Domain events |
+| MinIO | `minio:9000` | `localhost:9000` | Proof photographs and verification documents, private, reached only by pre-signed URL |
+| MinIO console | — | `localhost:9001` | A browser view of the bucket. Nothing depends on it |
 
 The Go service runs **on the host** during development, not in a container, which is why
 every service publishes a port. `make run` starts it against the stack.
@@ -56,7 +59,7 @@ a machine with a *different* PostgreSQL on 5432 means connecting to the wrong da
 and getting a confusing authentication error. Run through the make targets, or export
 the variables yourself.
 
-## Two things in the compose file that are easy to get wrong
+## Three things in the compose file that are easy to get wrong
 
 **Kafka listeners.** A Kafka client bootstraps once, then reconnects to whatever address
 the broker *advertises*. There are two listeners for that reason: `kafka:9092` for
@@ -73,12 +76,25 @@ controller listener is not advertised, so Kafka derives its advertised address f
 is identical on every machine. Left to the host locale it is not, and the resulting
 differences surface as tests that pass locally and fail in CI.
 
+**The object store's address is signed, not merely routed to.** SigV4 covers the `host`
+header, so a pre-signed URL minted against `minio:9000` inside the network and fetched
+from the host is refused as `SignatureDoesNotMatch` — an error naming neither the address
+nor the cause. `STORAGE_ENDPOINT` is therefore the *published* host port, and the same
+applies to the region, which SigV4 puts in the credential scope: the container is started
+with `MINIO_REGION` taken from `STORAGE_REGION` so the two cannot drift apart.
+
+The bucket is created by `make up` rather than by a container in this file. `up -d --wait`
+fails when any service exits — including a one-shot init container that exits `0` having
+done its job — and the bucket is per-worktree while the stack is shared, so it has to be
+made on every `make up` in every tree. `make storage-bucket` is the same step on its own,
+and it is idempotent.
+
 ## Verifying the stack
 
 `make verify` runs `scripts/verify-foundation.sh`, which demonstrates the acceptance
 criterion of every ticket from SHIP-1 to SHIP-9 — including a real psql connection, a
-`redis-cli` ping, a Kafka produce/consume round trip, and a migration applied and
-reversed.
+`redis-cli` ping, a Kafka produce/consume round trip, a pre-signed upload and download
+against the object store, and a migration applied and reversed.
 
 It needs two host clients that are not part of the stack:
 
