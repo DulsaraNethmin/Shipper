@@ -280,6 +280,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-83** | M3 | `GET /v1/jobs/open/{id}` — one job as a provider sees it, and **the fourth budget proof §8 recorded as still owed**: the serialised response, obtained over HTTP, held to a *closed set of keys* so that a budget renamed `max_price` fails too. The street line and the coordinate are confirmed withheld — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
+| **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -3301,6 +3302,127 @@ replacement is already in service on the same plate, and the `400 idempotency_ke
 gets without a key. **What is held by widget test alone is the screens**: what is drawn, what is
 tapped, and which of them a customer is refused. `make verify` does not cover this ticket — it
 exercises HTTP endpoints, and this one adds none.
+
+### SHIP-99 — the feed, and the filters the endpoint deliberately does not accept
+
+The provider half of the shell stops being a placeholder and becomes the work, which is what
+SHIP-76 did for the customer half. `ProviderJobFeed` reads `GET /v1/jobs/open` (SHIP-82), draws one
+card per job, pages by cursor, and narrows by pickup state and by whether a job already has bids on
+it. The fleet keeps its entry point — the same `manage-vehicles` key SHIP-98 gave it — moved inside
+the feed, because an empty feed is the question the fleet is the answer to.
+
+#### The finding: the endpoint accepts no filter, and the *Done when* says "with filters"
+
+`GET /v1/jobs/open` takes `limit` and `cursor` and **nothing else**. That is deliberate and the
+contract argues it: "there is no parameter that widens this and none that narrows it — no state, no
+vehicle, no goods type", because eligibility is the platform's decision and a filter parameter would
+be a second place for that answer to be argued with (`Docs/07` §3).
+
+The same paragraph names where narrowing does belong — *"a provider narrowing their own feed further
+is SHIP-99's client-side business"* — so this is a delegation rather than a gap, and the ticket was
+built to it. **What matters is that the narrowing is subtractive and can only be subtractive.** Every
+job it is given has already passed the platform's four checks; all it can do is hide some of them
+from the person who asked. `open_jobs_filter_test.dart` asserts that as a property over a set of
+filters rather than as a comment: whatever is selected, the result is a subset. There is no
+arrangement of the controls that shows a provider a job the platform withheld, which is the property
+that stops a client-side filter disagreeing with server-side eligibility.
+
+**The options are derived from the jobs, never compiled in.** `CLAUDE.md` keeps anything that changes
+under operational pressure server-side and Dart has no over-the-air path, so a list of the eight
+states written into the client would be a vocabulary needing a store release. The chips are built
+from the states the platform actually sent. A facet with one option is not drawn at all — a single
+chip can only ever hide the whole feed.
+
+**Two filters is what the response can honestly support**, and it is worth saying which were
+considered and dropped. Sorting or filtering by price is forbidden outright (`Docs/01` §4.3, below).
+Distance needs a coordinate the response withholds on purpose. `vehicle_requirement` is free text
+until SHIP-79's capability vocabulary exists, so matching on it would be the client inventing an
+eligibility rule. What is left — where the job starts, and whether somebody has already bid — is
+what a provider deciding whether to price a job actually asks.
+
+#### A filter over a paged list is a filter over what was read, and the screen says so
+
+The consequence a screen gets wrong. Narrow to a state that only appears on page three and nothing
+matches until page three arrives. So the feed distinguishes **three** empty-ish states rather than
+two: nothing eligible at all, which sends the provider to their fleet; nothing matching the filter
+with more still to read, which offers the next page; and nothing matching with the list exhausted.
+Conflating the first two would tell a provider with a perfectly good fleet that there is no work.
+
+The counter beside the chips reads "11 of 20 jobs **read**", and the last word is load-bearing: the
+list is paged, so "11 of 20" without it would be a claim about the marketplace.
+
+#### The budget: a second type, and a closed key set asserted from the client's side
+
+`Docs/01` §4.3 keeps the customer's maximum away from a provider — not as an amount, a band, or a
+"budget supplied" flag. The client mirrors what the platform did rather than reusing `Job` with a
+field skipped: `OpenJob` is a separate type with no field a budget could go in, and
+`budget_stays_on_the_customer_side_test.dart` needed no new entry on its allow list, which is the
+cheapest possible confirmation that no provider-facing file names the budget.
+
+Two tests go further, and both were written because SHIP-83 found that *searching for the word*
+catches `budget_cents` and misses `max_price`. `open_job_test.dart` decodes a payload carrying
+`budget_cents`, `max_price`, `budget` and `customer_maximum_cents` and asserts the round trip
+produces **a closed set of keys**, none containing budget, price, maximum, amount or cents.
+`provider_job_feed_test.dart` renders that same payload through the real decoder and asserts none of
+the numbers, and no affordance implying a maximum was or was not supplied, reaches the screen.
+
+`JobRegion` is held to the same closed set — `suburb`, `state`, `postcode` — which is SHIP-83's other
+disclosure decision confirmed from the client: no street line, and **no coordinate**, because `jobs`
+geocodes the whole address so a pickup coordinate *is* the street line written as two numbers.
+
+#### `ProviderOnly` was not used, and that is a decision rather than an oversight
+
+SHIP-98's gate exists because a route is reachable by a deep link with no button involved, and
+`GET /v1/fleet/vehicles` answers a customer `200` with an empty page rather than refusing them. Both
+halves of that are true of this endpoint as well — the contract lists "a customer who followed a link
+meant for the other role" among the four situations answered with `[]`.
+
+**The feed has no route of its own.** It is the provider half of `/home`, exactly as
+`CustomerJobList` is the customer half, and the shell's own role switch is what selects it. Wrapping
+it in `ProviderOnly` would be a second answer to a question the shell has just answered in the same
+frame — the arrangement SHIP-98's own `_AddVehicleButton` argues against — and no test could tell
+the two apart. `provider_job_feed_test.dart` asserts what actually matters instead: a customer signed
+in reaches their own list and **`feed.calls` is empty**, so nothing is read on their behalf.
+
+**SHIP-100 is where `ProviderOnly` gets its next real client**, because `/jobs/open/{id}` is an
+identifier-bearing route a notification payload can deliver somebody straight to.
+
+#### Two smaller things worth finding later
+
+**`/v1/jobs/open` is served by `internal/fleet` and modelled in `features/jobs`**, and neither is a
+mistake. `fleet` owns eligibility so the route is declared in `routes_fleet.go` and the shape lives
+in `contracts/paths/fleet.yaml`; `Docs/07` §2 puts *discovery* in the `jobs` feature, so the client
+puts it beside the customer's list. Both halves of the marketplace are now in one Dart package and
+they share no type and no widget — two response shapes, two cards, two controllers.
+
+**`OpenJobsRepository` is separate from `JobsRepository`** for the same reason the platform wrote a
+second response type: one repository holding both would be one place a screen could reach the wrong
+shape. It models the feed alone. `GET /v1/jobs/open/{id}` is served and deliberately not modelled —
+an endpoint no screen calls is dead code nothing holds to the contract, and it arrives with SHIP-100.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **495 host tests** (up from 429), the analyzer clean, and the environment
+test per build flavour.
+
+Separately, and this is the part worth trusting: **the *Done when* was run on an iPhone 17 simulator
+against the API on port 8092**, through the real `dio` transport and the real Keychain, with nothing
+substituted. The fixture was one verified provider serving VIC and NSW with a box truck in service,
+and 26 eligible published jobs — every one of which carried a budget its customer had stated — plus
+seven QLD jobs the platform excluded and the device never saw. What the run showed, in order: the
+feed drawn on arrival; the state chips present and the **status** chips absent, because every job on
+page one was `Open` and a one-option facet is not drawn; narrowing to VIC giving `11 of 20 jobs
+read`; the cursor followed to a second page; the status facet *appearing* once that page brought a
+`Negotiating` job, which is the derived-from-the-data rule working on real data; narrowing to VIC
+again giving `14 of 26 jobs read`, where the denominator is the proof the page was appended rather
+than substituted; VIC and Negotiating together giving `1 of 26`; and the whole feed scrolled end to
+end with no budget, in any form, on any screenful.
+
+The acceptance test that drove it was deliberately **not committed**. It needs a booted simulator, a
+running API and a hand-built fixture, so it is a check a person invokes rather than one CI can run —
+the same reasoning `make flutter-integration` already carries. `make verify` does not cover this
+ticket: it exercises HTTP endpoints and this one adds none.
+
 ### SHIP-106 — the first delivery endpoint, and the question SHIP-105 left it
 
 `POST /v1/jobs/{id}/driver`. The awarded provider names who is carrying the job, and the job moves

@@ -13,6 +13,18 @@
 ///   per-transition history is recorded in the database and served by no endpoint.
 /// - `job_actions.dart` — what the platform would permit on a job right now, which the app uses
 ///   to decide what is worth offering and never to decide anything else.
+/// - `open_job.dart` — the `OpenJob` schema from `contracts/paths/fleet.yaml`: a job as a
+///   *provider* sees it, which is a second type rather than `Job` with a field hidden.
+/// - `open_jobs_repository.dart` — `GET /v1/jobs/open`, the provider's eligible feed (SHIP-82).
+/// - `open_jobs_filter.dart` — the narrowing a provider applies to their own feed, which the
+///   endpoint deliberately accepts no parameter for.
+/// - `provider_job_feed.dart` and its controller — the provider half of the shell (SHIP-99).
+///
+/// **Both halves of the marketplace are in this package, and they meet nowhere.** `Docs/07` §2
+/// puts *discovery* in `jobs` and the feed is discovery, so the provider's screen lives beside the
+/// customer's rather than in `fleet` — where the endpoint's own domain is, or in `bidding`, where
+/// the bid it leads to will be. What keeps them apart is that they share no type and no widget:
+/// two response shapes, two cards, two controllers, and the rule below is why.
 ///
 /// ## Three rules this package is held to
 ///
@@ -25,9 +37,10 @@
 /// does not exist yet, so `job_status.dart` is the Dart copy, written to be replaced.
 ///
 /// **The customer's budget never reaches a provider's device** (`Docs/01` §4.3). Not as an
-/// amount, a band, or a "budget supplied" flag. Every screen in this package today is a customer
-/// screen, which is what makes `Job.budgetCents` legitimate — and the moment a provider screen
-/// exists (SHIP-82, SHIP-83) it reads a different type rather than this one with a field skipped.
+/// amount, a band, or a "budget supplied" flag. `Job.budgetCents` is legitimate because every
+/// screen that reads `Job` is the owner's own — and **the provider screen this package now holds
+/// reads `OpenJob` instead**, a type with no field a budget could go in, exactly as the platform
+/// writes a second response shape rather than redacting the first.
 /// `test/features/jobs/budget_stays_on_the_customer_side_test.dart` is what keeps that honest,
 /// and it is the client's half of the platform's own serialisation test.
 library;
