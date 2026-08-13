@@ -373,6 +373,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
+| **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -5918,6 +5919,188 @@ That run also demonstrated something neither ticket claimed. It was the **second
 answered `201` — SHIP-111's "a repeat that is not a retry is a second row", which is `Docs/02` §5's
 failed pickup attempt. **The app presented it as "Recorded", not as an error**, which is the behaviour
 `Docs/02` §3.1 requires of a client whose update the platform keeps without moving the job.
+
+### SHIP-168 — the gate, and the four decisions "at launch" turns out to contain
+
+`Docs/09` is one line: *a build below the floor blocks with an update prompt linking to the store.*
+SHIP-167 built the endpoint eight months of tickets early, because `Docs/08` Step 3 is right that a
+gate cannot be added retroactively to builds already on devices. This is the other half, and it is
+the client's first **self-limiting** feature: everything before it decided what the app could do,
+and this decides whether it runs at all.
+
+**The strike this ticket carried for four waves was right about the store and wrong about the
+ticket, and the wave-6 reconciliation was right to lift it.** The old reason read "its store link
+does not exist until X-2/X-3 publish listings". Building it settles the question the reconciliation
+argued from the outside: the pilot's shape — blocked, with no link — is not a degraded version of
+the feature, it is **the** version, and the platform decided it deliberately.
+`internal/config/config.go` allows an empty `IOS_STORE_URL` rather than refusing it at startup, and
+says why in its own comment. So the only thing X-2 and X-3 supply is a URL that resolves. Both
+shapes are built, both are tested, and both were driven against the running service.
+
+#### Where the build number comes from, which was the decision with a wrong answer available
+
+The floor is an integer build number per platform, and the running build's number is the **native**
+one: `CFBundleVersion` on iOS, `versionCode` on Android, read through `package_info_plus`. Flutter
+already writes it — `Info.plist` holds `$(FLUTTER_BUILD_NUMBER)`, `build.gradle.kts` holds
+`flutter.versionCode` — so what is compared is exactly what `--build-number` set and, locally,
+exactly the `+1` of `version: 1.0.0+1`.
+
+**The alternative needed no package at all and was rejected.** `ApiEnvironment` already selects the
+deployment with `--dart-define`, and a `SHIPPER_BUILD_NUMBER` define would have followed that
+pattern for nothing. It is a *second* place the build number lives, and nothing can make the two
+agree: the release pipeline at SHIP-24…27 would have to pass `--build-number=N` and a matching
+define forever, and the first build that passes only one compares the wrong integer. Too low locks
+out a supported build; too high admits exactly the build the floor was raised to retire. Neither
+produces a test failure or a log line. That is a large silent failure to buy with one avoided
+dependency, so the number is read from the place the store itself reads it.
+
+Two packages arrive with this ticket — `package_info_plus` and `url_launcher`, both
+flutter.dev-published. `pubspec.yaml` carries the reasoning and the native-footprint check §9 asks
+for: neither reads a device identifier, a contact, a location or an advertising id, so unlike
+`device_info_plus` — which §9 declines for exactly that reason — **neither the Apple privacy labels
+nor the Play data-safety declaration moves.** Both compile against `flutter.compileSdkVersion` with
+minSdk 19 and 24, so the API 24 floor that pins `flutter_secure_storage` at 10.x does not move
+either, which was the question worth asking before adding anything with a native half.
+
+The comparison is `build.number >= floor` runs, `<` blocks. **Equal to the floor runs**, because
+`internal/config` calls the field "the lowest build number still permitted" — and `<=` would lock
+out every device on the exact build the floor was just raised to, which is the largest population
+there is at that moment.
+
+#### What an unreachable API means: it does not block, and that is the ticket's real decision
+
+The check runs on the first frame, and the app draws normally while it is in flight. **A check that
+has not answered, has failed, or has thrown while decoding leaves the app running.**
+
+Three things make failing open right, and they are worth having written down because failing closed
+is the instinct:
+
+- **The gate is not a control.** `Docs/07` §3 and `CLAUDE.md` put every authorisation decision on
+  the platform, and this is the same rule wearing different clothes: the app may block, the platform
+  decides. What actually retires a build is `/v1` refusing it. This screen exists to tell somebody
+  *why*, and where to go.
+- **Failing closed brands the app on the platform's worst day.** Every device that opened the app
+  during an outage would show an update prompt for an update that does not exist, and the way out
+  would be a release — which is precisely the loop `Docs/07` §6 says mobile does not have. A gate
+  that turns a partial outage into a total one is worse than the builds it guards against.
+- **`Docs/07` §4 makes working without signal the client's most important capability.** Holding the
+  first frame behind a round trip would mean up to ten seconds of blank screen on a bad connection,
+  and an app that will not open on a loading dock.
+
+**The cost of failing open is smaller than it looks, and Riverpod is why.**
+`ProviderContainer.defaultRetry` re-runs a failed provider ten times with exponential backoff from
+200ms to a 6.4-second ceiling, so a launch that lands in a lift gets its answer about forty-five
+seconds later with nobody doing anything, and a device with no signal at all stops asking rather
+than polling for as long as the app is open. That default is **kept deliberately** rather than
+replaced: SHIP-125 already owns this application's one hand-written backoff, and its five minutes
+are for a queue that must eventually drain rather than for a courtesy at start-up.
+
+**One thing found while building it, which the next person to touch `updateVerdictProvider` has to
+know: while Riverpod is retrying, the state is `AsyncLoading` *carrying an error*, not
+`AsyncError`.** A fail-open written as "block unless the state is an error" would therefore be wrong
+in the one case it was written for. Matching on the value is the only safe form.
+
+**The limitation, stated rather than hidden:** the check runs once per process, and a handset
+process survives for days. A floor raised this morning reaches a device at its next cold start, not
+its next foreground. A resume trigger is the obvious extension — `sync_signals.dart` already listens
+to the lifecycle — and it was left out because `Docs/09` says *launch*, and because a second trigger
+wants `Docs/07` §6's soft-prompt half, which is a different ticket.
+
+#### "Blocks" was read as the strong word, so the gate replaces the app rather than covering it
+
+`VersionGate` sits inside `MaterialApp.router`'s builder, above the navigator and above SHIP-126's
+indicator, and below the floor it returns the prompt **in place of** its child. The router is
+therefore not built at all: there is no screen behind this one to reach by dismissing it, by the
+Android back gesture, or by a deep link, because there is nothing there. A dialog or a `Stack`
+overlay would have left a live application underneath, and on Android a modal barrier is dismissible
+almost by definition. There is no "later" — `Docs/07` §6 has a soft prompt for the case where
+carrying on is acceptable, and that is a different mechanism for a different situation.
+
+The queue keeps draining while the prompt is up, because the sync worker runs from `main` rather
+than from the widget tree. That is deliberate: work a driver already recorded belongs to them, and a
+blocked build should still hand it over if the platform will still take it.
+
+#### The screen with no link is the pilot's screen, not a broken one
+
+Both shapes carry the same icon, the same headline — *Update Shipper to keep going* — and the same
+explanation. The difference is the last element: a button that goes there, or a sentence saying
+where to go. *"Open the app store you installed Shipper from and install the latest version"* is
+true whether that was TestFlight, Play internal testing, or eventually a public listing, so the
+screen never has to know which. There is no spinner, no disabled button and no empty space where a
+control should be — a greyed-out "Update" is exactly the thing that reads as broken.
+
+A link that fails to open falls back to the same sentence and prints the destination, because
+`launchUrl` returns `false` when nothing on the device handles a URL and a button that appears to do
+nothing is worse than no button, on a screen with no way off it.
+
+**The destination itself remains provisional**, in the same way and for the same reason as the
+bundle identifier in §9: `IOS_STORE_URL` and `ANDROID_STORE_URL` are configuration with no correct
+value until X-2 and X-3 publish, and setting them is a deployment change rather than a release.
+
+#### Two seams, and the reason both are empty by default
+
+`runningBuildProvider` is `null` until `main.dart` supplies it, which is SHIP-126's inversion used a
+second time and for the same objection: **every widget test builds `ShipperApp`**, and a gate that
+reached the package-info channel on its own would have every one of them call a plugin with nothing
+behind it and then open a connection to whatever base URL the test binary was compiled with. With
+the seam empty there is no build number, so nothing is compared and **no request is made at all** —
+which is held as a test rather than assumed. The consequence is the same one SHIP-126 wrote down:
+an application that never overrides it is never blocked, so `version_gate_wiring_test.dart` holds
+`main`'s override with a source assertion.
+
+The launch check travels on `unauthenticatedApiClientProvider`, and that is not tidiness.
+`cmd/api/routes_app.go` made the route public because "a build old enough to be blocked may be old
+enough that its authentication no longer works" — so putting the check behind the session would
+leave exactly those builds unable to discover they must update.
+
+#### Mutation testing
+
+| Mutation | Result |
+|---|---|
+| `>=` becomes `>`, so a build equal to the floor blocks | **Caught**, two tests — the boundary case and the wiring test's supported build |
+| `verdictFor` always returns a link, blank or not | **Caught**, two tests |
+| The screen accepts a destination with no scheme as a link | **Caught**, one test |
+| The prompt drawn in a `Stack` over the app instead of in place of it | **Caught**, two tests — the shell is still in the tree |
+| The "no build number, no request" guard removed from the launch check | **Caught**, two tests |
+| `main.dart`'s `runningBuildProvider` override removed | **Caught**, one test — the source assertion |
+| **The `try/catch` removed from `RunningBuild.read`** | **SURVIVED** — see below |
+
+**The survivor is the one worth reading.** `RunningBuild.read` swallows everything and answers
+`null`, and deleting that guard broke no test in the suite — while in production `main` **awaits** it
+before `runApp`, so a `MissingPluginException` there is not an inert gate but an application that
+never draws a frame. A launch-time check that can stop the launch is the worst available version of
+this ticket, and nothing was holding it. It survived because every host test supplied a build number
+rather than reading one, and every device test had a real plugin behind the channel — so the failure
+path existed on neither side.
+
+Fixed in the suite rather than tuned away, following SHIP-129's precedent:
+`test/core/version/running_build_test.dart` now asks for the build number **with no plugin behind
+the channel** and requires `null`, then mocks the platform for the two cases it can only reach that
+way. Its tests run in declaration order and have to — `PackageInfo` caches the first answer in a
+static with no reset, so the un-mocked case can only be asked first.
+
+#### How it was demonstrated
+
+`make flutter-check` green in this worktree: **766 host tests** (up from 726), the analyzer clean,
+and the environment test per build flavour. `make verify` does not cover this ticket and its count
+does not move — SHIP-167's section already demonstrates the endpoint, and this ticket adds none.
+
+**And on a device, against the live API**, which is where the *Done when* is actually met.
+`integration_test/version_gate_test.dart` runs the production widget tree with the real
+`package_info_plus` channel and real HTTP to `GET /v1/app/minimum-version`, and the three cases are
+three **service configurations** rather than three fixtures — which is `Docs/07` §6's point that
+raising the floor is an operational act, demonstrated rather than restated. On an iPhone 17
+simulator and a Pixel emulator, against this worktree's API on port 8092:
+
+| Service configuration | What the device did |
+|---|---|
+| Default floor of 1 | Ran normally. `RunningBuild.read()` returned the real `+1` from the bundle |
+| `MIN_SUPPORTED_*_BUILD=9999`, no store URL | **Blocked**, with the instruction and no button, and no shell anywhere in the tree |
+| …and `IOS_STORE_URL` / `ANDROID_STORE_URL` set | **Blocked**, with the button carrying the platform's URL |
+
+The store link is deliberately not tapped on a device: `launchUrl` would leave the simulator's App
+Store in front of the harness, and what a live run demonstrates is that the platform's URL reached
+the screen. The tap is a host test, over a seam.
 
 ## 4. Partly done — do not treat these as finished
 
