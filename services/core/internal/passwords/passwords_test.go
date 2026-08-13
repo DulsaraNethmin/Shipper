@@ -1,10 +1,11 @@
-package identity
+package passwords
 
 import (
 	"errors"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testProfile is the reduced profile Docs/10 §5 calls for: the production one is 64 MiB per
@@ -14,9 +15,9 @@ import (
 // exercise.
 var testProfile = Argon2Profile{MemoryKiB: 8 * 1024, Iterations: 1, Parallelism: 1}
 
-func testHasher(t *testing.T) *PasswordHasher {
+func testHasher(t *testing.T) *Hasher {
 	t.Helper()
-	h, err := NewPasswordHasher(testProfile)
+	h, err := NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building a hasher at the test profile: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestPasswordSurvivesTheProfileBeingRaised(t *testing.T) {
 		t.Fatalf("hashing at the old profile: %v", err)
 	}
 
-	raised, err := NewPasswordHasher(Argon2Profile{
+	raised, err := NewHasher(Argon2Profile{
 		MemoryKiB:   testProfile.MemoryKiB * 2,
 		Iterations:  testProfile.Iterations + 1,
 		Parallelism: testProfile.Parallelism + 1,
@@ -212,7 +213,7 @@ func TestPasswordSurvivesTheProfileBeingRaised(t *testing.T) {
 //
 // Every case here is something that could genuinely be in the column: a truncated write, a hash
 // from another system, a value someone edited at a psql prompt. None of them may panic, and none
-// may be treated as a password mismatch — see ErrMalformedPasswordHash.
+// may be treated as a password mismatch — see ErrMalformedHash.
 func TestPasswordVerifyRejectsAMalformedHash(t *testing.T) {
 	h := testHasher(t)
 
@@ -251,7 +252,7 @@ func TestPasswordVerifyRejectsAMalformedHash(t *testing.T) {
 			if err == nil {
 				t.Fatal("a malformed hash was reported as an ordinary password mismatch")
 			}
-			if !errors.Is(err, ErrMalformedPasswordHash) && !errors.Is(err, ErrInvalidArgon2Profile) {
+			if !errors.Is(err, ErrMalformedHash) && !errors.Is(err, ErrInvalidProfile) {
 				t.Errorf("unexpected error kind: %v", err)
 			}
 		})
@@ -289,9 +290,9 @@ func TestPasswordHasherRejectsAnImpossibleProfile(t *testing.T) {
 
 	for name, profile := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewPasswordHasher(profile); err == nil {
+			if _, err := NewHasher(profile); err == nil {
 				t.Fatalf("%+v was accepted", profile)
-			} else if !errors.Is(err, ErrInvalidArgon2Profile) {
+			} else if !errors.Is(err, ErrInvalidProfile) {
 				t.Errorf("unexpected error kind: %v", err)
 			}
 		})
@@ -304,6 +305,69 @@ func TestPasswordHasherRefusesToHashNothing(t *testing.T) {
 	if _, err := h.Hash(""); !errors.Is(err, ErrEmptyPassword) {
 		t.Errorf("hashing the empty string returned %v, want ErrEmptyPassword", err)
 	}
+}
+
+// TestSpendEquivalentWorkCostsWhatVerifyCosts is the disclosure control, checked in the package
+// that now owns it (SHIP-15r).
+//
+// The end-to-end proof is `internal/identity`'s
+// TestSignInSpendsTheSameWorkWhetherOrNotTheAccountExists, and it stays there because that is where
+// the disclosure would happen. **It needs a real PostgreSQL, and this does not** — which is the gap
+// worth closing on the way past: after the move, emptying this function's body would leave every
+// test in this package green and be caught only by an integration test in another one.
+//
+// Mutation-checked: replacing the body with a return makes this fail.
+func TestSpendEquivalentWorkCostsWhatVerifyCosts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("times two argon2id derivations; -short is for the runs that skip infrastructure")
+	}
+
+	h := testHasher(t)
+	stored, err := h.Hash("correct-horse-battery-staple")
+	if err != nil {
+		t.Fatalf("hashing: %v", err)
+	}
+
+	verify := medianDuration(t, func() {
+		if _, err := h.Verify(stored, "the-wrong-password"); err != nil {
+			t.Fatalf("verifying: %v", err)
+		}
+	})
+	spend := medianDuration(t, func() { h.SpendEquivalentWork("the-wrong-password") })
+
+	// A quarter, not a half: the true ratio is one — both are a single derivation at the same
+	// profile — and the margin is there so a loaded machine cannot fail an honest build. What it
+	// still catches is the defect, which is a path that does no work at all.
+	if spend < verify/4 {
+		t.Errorf("the decoy derivation costs %s and a real verification costs %s.\n"+
+			"A caller who can time two sign-ins can then tell an unknown address from a wrong "+
+			"password, which is what one error code refuses to tell them.", spend, verify)
+	}
+}
+
+// medianDuration is `internal/identity`'s, copied rather than shared: it is fifteen lines of test
+// helper, and the alternative to a copy across a package boundary is an exported testing utility in
+// non-test code.
+//
+// Medians rather than single readings, because this runs beside other packages under
+// `go test ./... -race` and one descheduled sample would otherwise decide the result.
+func medianDuration(t *testing.T, fn func()) time.Duration {
+	t.Helper()
+
+	const samples = 5
+	var taken [samples]time.Duration
+	for i := range taken {
+		start := time.Now()
+		fn()
+		taken[i] = time.Since(start)
+	}
+
+	for i := 1; i < samples; i++ {
+		for j := i; j > 0 && taken[j] < taken[j-1]; j-- {
+			taken[j], taken[j-1] = taken[j-1], taken[j]
+		}
+	}
+	return taken[samples/2]
 }
 
 // TestPasswordProductionProfileMatchesTheDocument pins the numbers Docs/10 §5 fixes, so that a

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 )
 
 // SHIP-34 against a real PostgreSQL. Every property here is a constraint or a count over rows,
@@ -127,7 +128,7 @@ func TestRequestOTPIssuesATimeLimitedCode(t *testing.T) {
 			"table a laptop builds in under a second", hash)
 	}
 
-	hasher, _ := NewPasswordHasher(testProfile)
+	hasher, _ := passwords.NewHasher(testProfile)
 	ok, err := hasher.Verify(hash, code)
 	if err != nil || !ok {
 		t.Errorf("the stored hash does not verify the code that was sent (ok=%v, err=%v)", ok, err)

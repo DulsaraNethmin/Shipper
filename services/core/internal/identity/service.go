@@ -23,6 +23,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
@@ -68,7 +69,7 @@ const (
 // method.
 type Service struct {
 	pool    *pgxpool.Pool
-	hasher  *PasswordHasher
+	hasher  *passwords.Hasher
 	issuer  *AccessTokenIssuer
 	limiter *ratelimit.Limiter
 	email   EmailSender
@@ -85,7 +86,7 @@ type Service struct {
 // mistake rather than a transient condition: a service with no hasher would accept a password
 // and store nothing derivable from it, and one with no email or SMS sender would register
 // accounts that can never be verified.
-func NewService(pool *pgxpool.Pool, hasher *PasswordHasher, issuer *AccessTokenIssuer, limiter *ratelimit.Limiter, sender EmailSender, texter SMSSender, clk clock.Clock) (*Service, error) {
+func NewService(pool *pgxpool.Pool, hasher *passwords.Hasher, issuer *AccessTokenIssuer, limiter *ratelimit.Limiter, sender EmailSender, texter SMSSender, clk clock.Clock) (*Service, error) {
 	if hasher == nil {
 		return nil, errors.New("identity: a service needs a password hasher")
 	}

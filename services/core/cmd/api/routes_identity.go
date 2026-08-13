@@ -5,6 +5,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/email"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/sms"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
@@ -141,7 +142,7 @@ func init() {
 // startup, which is a transient condition the service is built to survive (see the note on
 // Deps); the handlers answer 503 for as long as it lasts.
 func identityHandler(d Deps) *identity.Handler {
-	hasher, err := identity.NewPasswordHasher(identity.Argon2Profile{
+	hasher, err := passwords.NewHasher(passwords.Argon2Profile{
 		MemoryKiB:   d.Config.Identity.Argon2.MemoryKiB,
 		Iterations:  d.Config.Identity.Argon2.Iterations,
 		Parallelism: d.Config.Identity.Argon2.Parallelism,
