@@ -1750,3 +1750,93 @@ status="$(award "$award_stranger_token" "$idem_key" "$idem_job" "$idem_winner" i
 [[ "$status" == "404" ]] || { cat "$WORKDIR/bid-idstranger.json"; fail "a stranger reusing the key returned $status, want 404"; }
 replayed_from_redis idstranger && fail "a stranger was handed this customer's stored response"
 ok "and another caller sending the same key is answered in their own scope, never from this customer's stored response"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-95  two awards arriving together leave exactly one accepted offer"
+
+# SHIP-95's races are pinned in Go, where a test can hold one transaction open and ask PostgreSQL
+# whether the other is waiting on it — see internal/bidding/race_test.go. This is the one assertion
+# that cannot be made there: the same race through the **served binary**, against cmd/api's own
+# `LockForAward` rather than the copy the package's fixtures carry.
+#
+# **What is asserted is the outcome invariant, not the interleaving.** Two curls started together may
+# or may not overlap on any given run, and a shell check that depended on them overlapping would be
+# flaky rather than strict. Either way exactly one award may succeed — Docs/01 §6, "a job can have one
+# accepted bid only" — and the loser is `conflict` rather than `bidding_bid_closed`, because the sweep
+# has made "that offer is closed" true of every offer on the job and only "you have already awarded
+# this job" tells the client where to look.
+#
+# The fixture is a job of its own. The sections above have already awarded theirs, and a race needs a
+# job with two live offers on it.
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set email_verified_at = now(), phone_verified_at = now()
+     where id in ('$bid_provider_id', '$bid_rival_id');"
+
+status="$(bid_post "$bid_customer_token" "verify-race-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":432199}' race-job)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-race-job.json"; fail "creating the race job returned $status"; }
+race_job_id="$(json "$WORKDIR/bid-race-job.json" '["id"]')"
+move_job "$race_job_id" Draft Open
+
+status="$(bid_post "$bid_provider_token" "verify-race-bid-a-$$" "/v1/jobs/$race_job_id/bids" "$bid_body" race-bid-a)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-race-bid-a.json"; fail "the first racer's offer returned $status"; }
+race_bid_a="$(json "$WORKDIR/bid-race-bid-a.json" '["id"]')"
+
+status="$(bid_post "$bid_rival_token" "verify-race-bid-b-$$" "/v1/jobs/$race_job_id/bids" "$bid_body" race-bid-b)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-race-bid-b.json"; fail "the second racer's offer returned $status"; }
+race_bid_b="$(json "$WORKDIR/bid-race-bid-b.json" '["id"]')"
+
+# race_award <key> <bid> <name> — one award, writing its status to a file so a background job can
+# report it. Distinct keys deliberately: under one key the middleware refuses the second request with
+# `idempotency_request_in_progress` and the platform below it never sees two.
+race_award() {
+  curl -s -X POST -o "$WORKDIR/bid-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $bid_customer_token" -H "Idempotency-Key: $1" \
+    -H 'Content-Type: application/json' -d "{\"bid_id\":\"$2\"}" \
+    "http://localhost:$VERIFY_PORT/v1/jobs/$race_job_id/award" > "$WORKDIR/bid-$3.status"
+}
+
+race_award "verify-race-a-$$" "$race_bid_a" race-a &
+race_pid_a=$!
+race_award "verify-race-b-$$" "$race_bid_b" race-b &
+race_pid_b=$!
+wait "$race_pid_a" || fail "the first concurrent award never answered"
+wait "$race_pid_b" || fail "the second concurrent award never answered"
+
+race_won=0
+race_refused=0
+for race_name in race-a race-b; do
+  race_status="$(< "$WORKDIR/bid-$race_name.status")"
+  case "$race_status" in
+    200) race_won=$((race_won + 1)) ;;
+    409)
+      race_refused=$((race_refused + 1))
+      race_code="$(json "$WORKDIR/bid-$race_name.json" '["error"]["code"]')"
+      [[ "$race_code" == "conflict" ]] \
+        || fail "the losing award answered $race_code, want conflict — a second award is a job that has moved on, not an offer that closed"
+      ;;
+    *) cat "$WORKDIR/bid-$race_name.json"; fail "a concurrent award returned $race_status, want 200 or 409" ;;
+  esac
+done
+[[ "$race_won" == 1 ]] || fail "$race_won of 2 concurrent awards succeeded, want exactly 1"
+[[ "$race_refused" == 1 ]] || fail "$race_refused of 2 concurrent awards were refused, want exactly 1"
+ok "two awards on one job answer one 200 and one 409 conflict, whichever arrives first"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$race_job_id' and status = 'Accepted';")" == "1" ]] \
+  || fail "the race left more or fewer than one accepted offer — two providers each believing they have the job is a marketplace-credibility failure"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$race_job_id' and status = 'Submitted';")" == "0" ]] \
+  || fail "an offer is still live on an awarded job"
+ok "the database holds exactly one accepted offer and nothing still live, which is what uq_bids_one_accepted_per_job is for"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$race_job_id';")" == "Awarded" ]] \
+  || fail "the job did not reach Awarded"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$race_job_id' and to_status = 'Awarded';")" == "1" ]] \
+  || fail "the job was moved to Awarded more than once — the losing award ran the transition as well"
+ok "and the job was moved to Awarded exactly once, through the guarded transition"

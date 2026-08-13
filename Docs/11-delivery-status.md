@@ -219,7 +219,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **513 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **516 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -357,6 +357,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-92** | M3 | `POST /v1/jobs/{id}/award` — one offer accepted and the job moved, in one transaction, against the lock ordering SHIP-88 wrote down rather than one invented here. **A verb on the job, so the bid travels in the body**, and the one rule no constraint can express — that the offer was live when it was accepted — is the only thing application logic checks. Idempotent by **state**, so it needs no key column and no migration — *see below* |
 | **SHIP-93** | M3 | The rejection sweep — every offer still live on the awarded job becomes `Rejected` in the award's own transaction, and every offer that had **already** closed keeps the status saying how it closed. One `UPDATE` at step 4 of the recorded lock ordering, no `id <> winner` in it, and the refusal order changed so that a second award still answers `conflict` rather than `bidding_bid_closed` — *see below* |
 | **SHIP-94** | M3 | Award idempotency — **two mechanisms, and the ticket is settling which does which work.** Redis replays the response while its entry lives; the accepted offer answers every retry it cannot, including one under a fresh key. They disagree on exactly one request — a key reused for a *different* offer — and the middleware refuses it, rightly. **No key column, no migration, no handler change**: what it adds is the proof, and the two retries nobody had tested — the one that runs after SHIP-93's sweep, and the one that arrives after the delivery has started — *see below* |
+| **SHIP-95** | M3 | The award concurrency suite — Docs/08's four races, **written adversarially from the documents by an agent that did not read the implementation**, and every one of them observed racing rather than assumed to: a transaction is held open and `pg_blocking_pids` is polled until PostgreSQL confirms the other is waiting on it. Three properties no existing test could see are now pinned — that the job row is held, that it is held *before* the bid, and that an offer which stopped being live mid-award is not accepted — each demonstrated by breaking the implementation and watching a named test fail. It also found the liveness rule is kept **twice**, and that either guard alone is invisible — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -4106,6 +4107,62 @@ place anyway: a **stranger** sending this customer's key is answered in their ow
 handed the stored `200`. That is SHIP-44's subject-scoped namespace demonstrated on the endpoint with
 the most to lose from `idem:v1:anonymous:<key>`, which is the gate `CLAUDE.md` held every
 authenticated state-changing endpoint behind.
+
+### SHIP-95 — the races were run, and two of the three things they were built to see were not there to be seen by anything else
+
+SHIP-95's *Done when* is "tests prove correctness under double award, withdraw-during-award, and expiry-during-award races". `Docs/08` names a fourth — a retry arriving after the original award succeeded — and all four are covered by `services/core/internal/bidding/race_test.go`, ten tests in a file of their own.
+
+**It was written adversarially, and §8 had asked for exactly that for six waves.** One agent built SHIP-92…94; a second wrote this from `Docs/02` §3, `Docs/08`, `Docs/01` §4.3 and §6, the published `contracts/paths/bidding.yaml`, `errors.go`, `model.go`, the fixtures, and `go doc` for the signatures — without opening `service.go`, `postgres.go`, `ports.go`, `http.go`, `cmd/api/routes_bidding.go`, or any test whose name contains "Award". The arrangement earned its keep: a suite written from the reading that produced the code proves the code agrees with itself, and two of the three properties below turned out to be invisible to every test in the repository.
+
+#### The mechanism: a race is *observed*, not started and hoped for
+
+Two goroutines released together prove nothing. If the second runs to completion before the first reaches its first statement, every assertion afterwards holds for the reason it would hold sequentially — and the test reports a guarantee it never exercised. That is the failure mode this file is most exposed to, so it is designed against directly.
+
+Each deterministic test opens one transaction the test itself drives, runs a call inside it and **does not commit**, starts the racing call in a goroutine, and then polls `pg_blocking_pids` until PostgreSQL reports the second backend waiting on the first's locks. Only then is the held transaction released. If the racing call ever finishes without having waited, `waitUntilBlockedBy` fails the test naming what did not happen. `pg_stat_activity` is filtered to `current_database()`, which is exact rather than indicative: `pgtest.DB` clones a database per test, so the only backends in it are that test's own.
+
+The two free-running tests — six awards released together through a pool sized to them — keep a watcher on the same view throughout and fail if it never sees one attempt waiting on another. Between the two shapes the file covers both "the window is closed when I hold it open" and "the window is closed when the scheduler chooses".
+
+#### What the mutations found
+
+Each of the three properties the suite was commissioned for was demonstrated the way this repository demonstrates a guard: break it, watch a named test fail, put it back. The implementation is unchanged; the mutations were reverted from copies and the tree confirmed by checksum.
+
+| Mutation | What failed | What it printed |
+|---|---|---|
+| `FOR UPDATE` off the `jobs` read | `TestTheJobIsTakenBeforeTheBid`, plus real deadlocks in `TestConcurrentAwardsOfDifferentOffersLeaveOneAcceptedBid` | five of six racers killed with `SQLSTATE 40P01`, and the double-award test's loser answered `bidding_bid_closed` where the contract publishes `conflict` |
+| a bid lock taken **before** the job lock | the same two | "the award was holding the bid row while it waited for the job row" |
+| the accept's compare-and-set made unconditional | **nothing** | — |
+| the bid's locking re-read made non-locking | `TestAWithdrawalCommittedMidAwardIsNotOverwritten`, `TestAnAwardInFlightRefusesTheWithdrawalRacingIt`, `TestAnExpiryCommittedMidAwardIsNotOverwritten` | "was live when it was locked and is not now" |
+| **both** liveness guards removed | the same three | "the award = &lt;nil&gt;, want ErrBidClosed" — the award **succeeded** on a withdrawn offer |
+
+**The fourth row is the finding worth carrying forward.** The rule `Docs/11` §3's SHIP-88 entry says application logic still has to keep — "check that the bid it is accepting is `Submitted`" — is kept *twice*: a locking re-read of the bid at step 2, and a compare-and-set on the accept at step 3. Either alone is sufficient, so removing one is invisible to every test in the repository including this one, and removing the other is caught only by the races below. That is not a defect and nothing was changed. It is a note for whoever next edits `acceptBid` or `lockBid`: the two are one guarantee held twice, the redundancy is not visible from either site, and a change that removes both passes nothing but these three tests.
+
+It also settles a question by black-box inference rather than by reading: because the withdrawal race is refused when only the compare-and-set is removed, the award's liveness decision must be made **under the bid's row lock**. In READ COMMITTED a plain read would have seen the pre-withdrawal version and let the accept through.
+
+**Two of the three commissioned properties were genuinely unseen.** With `race_test.go` removed, the pre-existing package passes under the bid-before-job mutation entirely, and passes under the two-guards-removed mutation except for `TestConcurrentCountersLeaveExactlyOneLiveOffer` — which fires about *counters*, not about the award. No award test noticed either.
+
+#### One test's claim was narrowed by its own mutation, and the pair is deliberate
+
+`TestAnAwardHoldsTheJobRowUntilItCommits` survives the outermost `FOR UPDATE` being deleted, and the reason is worth recording: the transition at step 5 runs through `jobs`' guarded function, which locks the job row itself, so the award still cannot commit past a row somebody else holds. What changes is *when* — the bid has been read, accepted and swept by then, and the ordering has quietly become `bids` → `jobs`.
+
+So the two tests are kept apart rather than merged. One says an award cannot slip past a job another transaction is holding, which is what stops two of them interleaving. The other says nothing on `bids` is touched while it waits, which is what stops the ordering closing into a cycle. The comment on the first was corrected to say so after the mutation showed it over-claimed.
+
+#### The deadlock is real, and is deliberately asserted as an ordering rather than as a deadlock
+
+`Docs/11` §3's SHIP-88 entry predicted the cycle and the mutation produced it: with the bid taken first, two awards on one job each hold a bid and then contend for the job, and the winner's rejection sweep waits for the bid the loser is holding. PostgreSQL killed five of six racers.
+
+The suite still asserts the *ordering* instead, for two reasons. Reaching the deadlock needs both racers past their bid locks before either reaches the job, which is a scheduling coincidence rather than something a test arranges; and a deadlock arrives as an *error*, so a test that accepted "one of them failed" as its pass condition would accept the deadlock as correct behaviour. `TestTheJobIsTakenBeforeTheBid` asks the only question that separates the two orderings from outside — while the award is held at the job row, is the bid it is about to accept still free — with one `FOR UPDATE` under a short `lock_timeout`.
+
+#### Race 4 is two properties at two layers, and the file says which is which
+
+At the HTTP layer a retry is *sequential* and is answered by the middleware's stored response; that is SHIP-94's and `scripts/verify/61-bidding.sh` demonstrates it over the wire. Below the middleware a retry is *concurrent* — two requests under one key never both reach the service, since the second is refused `idempotency_request_in_progress` — so the concurrent half has to be driven at the service layer, exactly as SHIP-111's `TestConcurrentRetriesRecordOneMilestone` is. Six awards of one offer released together all answer with it, one transition is recorded, and one row is `Accepted`.
+
+#### Three `make verify` checks, because the Go suite cannot reach the served adapter
+
+The package's fixtures carry their own copy of `cmd/api`'s `awardableJobs`, which is what makes the Go tests honest about the real `FOR UPDATE` and the real guarded transition — and also means they exercise the copy rather than the served one. So SHIP-95 adds a section that races two awards **through the running binary**, with distinct keys so the middleware does not collapse them: one `200`, one `409 conflict`, one accepted offer, nothing left live, and the job moved to `Awarded` exactly once. What is asserted there is the outcome invariant rather than the interleaving — two curls may or may not overlap on a given run, and a shell check that depended on them overlapping would be flaky rather than strict.
+
+#### What is not covered, said plainly
+
+Nothing in `Docs/08`'s four is left out, and no defect was found. Two limits are worth naming. The expiry race is run against the statement a sweep *is* — one conditional `UPDATE` to `Expired` — because SHIP-89 has no writer yet; when it arrives, the race it has to survive is already written down here. And `TestAnAwardedOfferIsOutOfAnExpirySweepsReach` pins the other direction as a property of what the award *writes* rather than of what a sweep checks: after an award there is nothing on the job in the `Submitted` predicate, so a sweep written against `Docs/02` §4 cannot un-award anything however late it runs.
 
 ### What SHIP-105 built, and the two rules that follow from a driver having no account
 
