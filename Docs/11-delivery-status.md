@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **355 checks across 12 sections**, and `make check` green. Since
+Verified by `make verify` — **377 checks across 12 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -287,6 +287,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
+| **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
 
@@ -3516,6 +3517,132 @@ transition, which is `Docs/02` §5's failed attempt and the case 000601 has no u
 **The delivery block moved to `000602`** — one column, one check, one partial unique index. It is the
 first migration in this repository written to hold a guarantee that a piece of infrastructure was
 already believed to provide.
+
+### SHIP-163 — M6's first code, and the readings `Docs/04` §7 forced
+
+`POST /v1/jobs/{id}/disputes`. A customer or the awarded provider reports that a delivery went
+wrong; the dispute is recorded and **the job freezes in the same transaction**. It opens
+`internal/admin`, which held `doc.go` and nothing else, and it is the first migration in the
+`000800`–`000899` block.
+
+**The endpoint is a user endpoint, and that is the first thing to know about it.** The domain's name
+invites the opposite assumption and `Docs/04` §7 settles it: intake is a *party to the delivery*
+reporting a problem, and only the investigation and outcome stages are administrative. The route
+declares `RequireUser`. `RequireAdmin` is still declarable with nothing behind it — a route
+declaring it panics at startup — and SHIP-164 arrives with SHIP-147's middleware.
+
+#### Raising a dispute freezes the job, and `Docs/02` had already decided that
+
+`Docs/02` §2 has one row for it — "Awarded through Delivered → Disputed, eligible user/admin opens a
+supported dispute" — and §3 says what it is for: "a dispute freezes automatic completion until an
+administrator resolves it". SHIP-164's *Done when* speaks of an outcome that "unfreezes the job",
+which is the same sentence read from the other end.
+
+So intake is an insert **and** a guarded transition, committed together. Nothing here chooses the
+target status: `admin` declares `MoveToDisputed` on its own port and `cmd/api` runs
+`jobs.Service.Transition`, so the transition table stays in one place. The `job_status_history` row
+carries the dispute's **category as its reason**, which is what makes a job's history say why it
+froze rather than only that it did. No status was invented — the twelfth status already existed and
+had no way of being reached.
+
+#### `Docs/04` §7 names seven fields; two of them needed a decision, and here they are
+
+> "Capture job, complainant, category, description, desired outcome, time of event, and evidence."
+
+Five are unambiguous. **Two are recorded here rather than resolved silently**, which is what
+`CLAUDE.md` asks of a documented ambiguity.
+
+**Category — §7 names the field and enumerates no values.** The six in `ck_disputes_category` are
+derived from `Docs/02` §5's exception table, the only list in the documents of what actually goes
+wrong on a delivery, plus `Other`. Two of §5's seven rows are excluded as operational events rather
+than complaints (a lost portal link, unsynced milestones), and one string is shortened: §5 writes
+"Customer unavailable at pickup/delivery", and the slash has no legal form under `Docs/10` §4.7's
+derived lower-snake-case wire mapping, which is a constraint on three generated client languages
+rather than a preference. **`Other` is deliberate** — a closed list with no escape hatch turns every
+unanticipated complaint into a mis-filed one, and the filing is what an administrator triages from.
+
+**Evidence — §7 names it and there is nowhere for it to live.** Verification evidence uploads to
+private object storage through short-lived pre-signed URLs (`Docs/04` §3.1) and delivery proof does
+the same from SHIP-114; neither exists, so no complainant can produce an object reference and no
+endpoint would hand them one. Capturing nothing would drop a field the *Done when* names; capturing
+an upload path would be building SHIP-114 inside SHIP-163. **What is captured is references in the
+complainant's own words** — "photographed the crates at the depot" — as `text[]` the platform stores
+and does not resolve. When uploads land, an attachment is a row in a table of its own pointing at
+this one, and nothing about the column changes.
+
+**`occurred_at` is required rather than defaulted, and that is the third decision.** §7 names "time
+of event" as an intake field distinct from the report, and the platform records the filing time
+itself in `created_at`. A default would write the report's time into the incident's column on every
+request that omitted it, and support could not afterwards tell that value from one somebody meant —
+the same collapse `Docs/02` §3.1 refuses for milestones. It is unbounded backwards (a complaint about
+last month is still a complaint) and refused forwards, which is the one bound.
+
+#### It writes no audit row, and that is a scope decision rather than an oversight
+
+§4 records that SHIP-149's Go write helper does not exist. **Intake does not need it and does not
+write one.** `audit_log` is for *privileged* actions — `Docs/04` §6 and §9, and SHIP-150's *Done
+when* is "all admin mutations write an audit entry". A customer reporting damaged goods is an
+ordinary product action that already leaves two durable records: the `disputes` row, which carries
+actor, time and reason by construction, and the `job_status_history` row the guard wrote.
+
+Writing the helper here would have been building SHIP-149's missing half on a branch that owns
+neither it nor SHIP-150. **SHIP-164 is the privileged mutation** — it resolves the dispute and
+unfreezes the job — and it depends on SHIP-150, which is where the helper belongs.
+
+#### A stranger is refused explicitly, which is the wave-5 finding acted on
+
+Wave 5 found six of eight `fleet` endpoints scoping to the caller's own id rather than refusing an
+outsider: nothing leaks, and somebody with no business asking is told their request was fine. This
+endpoint asks *who the caller is on the job* through an `admin.JobParties` port — one statement in
+`cmd/api` joining `jobs` to the accepted bid — and refuses when the answer is nobody. Four callers
+are tested and all four are refused: a provider who bid and lost, a customer of another job, an
+account with no connection at all, and a job that does not exist. All four get the same `404`, so
+none of them confirms anything about the others.
+
+#### Two partial unique indexes, and they are two different promises
+
+|  | What it refuses | What it is for |
+|---|---|---|
+| `uq_disputes_idempotency` | a second row for `(job_id, idempotency_key)` | a **retry** gets the dispute it already raised, permanently — after Redis has forgotten the response |
+| `uq_disputes_open_per_job` | a second row for `job_id` while `resolved_at IS NULL` | a **second raise**, including by the other party, is refused: a job is frozen once, and SHIP-164 unfreezes it by resolving one dispute |
+
+The two are told apart by which index the insert conflicts on. `ON CONFLICT` names the idempotency
+index as its arbiter, so PostgreSQL checks that one first and abandons the insert without reaching
+the other — a retry is absorbed, and a fresh key against a frozen job reaches
+`uq_disputes_open_per_job` and gets `admin_dispute_already_open`. `make verify` demonstrates both by
+deleting the Redis entry, exactly as SHIP-111's section does.
+
+**There is no dispute status column.** `Docs/04` §7 names three stages and SHIP-164 owns the workflow
+that moves through them; a vocabulary invented at intake for a workflow that does not exist is one
+that ticket would have to work around. `resolved_at` is the one distinction intake genuinely makes,
+and it is what the open-per-job predicate needs.
+
+#### Two smaller things worth finding later
+
+**A `CHECK` constraint may not contain a subquery**, which is how the per-item evidence bound was
+first written and why the migration failed on its first application. What replaced it bounds the
+list, refuses a NULL or empty entry, and bounds the total with array operators; Go bounds each item
+at 500 characters, where it can name which one was wrong.
+
+**The `make verify` fixture phone numbers are a shared namespace.** The database is not reset between
+runs, so `04180` — the outbox section's — collided with this section's first choice and failed at its
+very first registration with `identity_phone_taken`, which is a confusing way to be told that two
+files disagree about a number. `0419x` is admin's, and the prefixes are now written down in the
+section header.
+
+**No new domain event.** The transition already emits `job.status_changed` with `to: Disputed`, which
+is what a consumer needs. A `dispute.raised` event would need a fourth aggregate in
+`internal/events` and a fourth topic in `cmd/topics`, both shared surfaces, and it belongs to
+SHIP-136 rather than here.
+
+#### How it is demonstrated
+
+`scripts/verify/90-admin.sh` grew from 3 checks to 25, across three `ticket` sections, against the
+built binary — which is the only place the composition root's half of the ticket runs at all, since
+`internal/admin`'s own tests supply their own copies of the two ports. The intake fields are asserted
+off the row rather than off the response, the response's key set is held closed so that SHIP-162's
+internal notes cannot reach a complainant by accident, and the retry is exercised through both
+mechanisms in turn.
 
 ## 4. Partly done — do not treat these as finished
 

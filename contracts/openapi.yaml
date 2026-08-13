@@ -119,6 +119,18 @@ tags:
       The assigned driver never holds a session. Their portal is link-authenticated, and the
       job-scoped token they carry is a separate system that grants exactly one job and cannot be
       exchanged for a user token in either direction (Docs/10 §5).
+  - name: Disputes
+    description: |
+      Reporting that a delivery went wrong (Docs/04 §7).
+
+      Intake is called by a party to the job — the customer who owns it, or the provider whose bid
+      was accepted — and by nobody else. Raising a dispute freezes the job, which is what stops the
+      72-hour auto-complete running through an unresolved complaint; an administrator resolving it
+      is what unfreezes it.
+
+      The investigation and outcome stages are administrative and sit behind a separate credential
+      that a user token can never reach. Internal support notes are never user-visible and appear
+      in no shape here.
   - name: Identity
     description: |
       Registration, verification, credentials and sessions.
@@ -194,6 +206,8 @@ paths:
     $ref: './paths/jobs.yaml#/JobByID'
   /v1/jobs/{id}/cancel:
     $ref: './paths/jobs.yaml#/CancelJob'
+  /v1/jobs/{id}/disputes:
+    $ref: './paths/admin.yaml#/Disputes'
   /v1/jobs/{id}/driver:
     $ref: './paths/delivery.yaml#/AssignDriver'
   /v1/jobs/{id}/extend:

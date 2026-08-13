@@ -48,6 +48,8 @@ them where the call is made, beside the thing the user was trying to do.
 
 | Code | Meaning |
 |---|---|
+| `admin_dispute_already_open` | This job already has a dispute waiting on an outcome. Open it rather than raising another — one job is disputed once at a time. |
+| `admin_job_not_disputable` | A dispute can only be raised on a job that has been awarded and has not yet been completed or cancelled. Reload the job to see its current status. |
 | `delivery_driver_already_assigned` | This job already has a driver. Reload it to see who is carrying it. |
 | `delivery_job_not_assignable` | A driver can only be assigned to a job that has been awarded and has not yet set off. Reload the job to see its current status. |
 | `delivery_milestone_not_permitted` | This milestone cannot be recorded from the job's current status. Reload the delivery to see what it is, and keep the update — a late one will be absorbed rather than refused once SHIP-112 lands. |

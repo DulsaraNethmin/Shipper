@@ -1,0 +1,350 @@
+# Admin — support, moderation, disputes and the audit trail.
+#
+# The counterpart of cmd/api/routes_admin.go. Docs/10 §8.1 keeps the two in step: a domain adds one
+# route file and one fragment, and edits neither this file's siblings nor the middle of a shared
+# document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence for
+# the contract to describe less than the service returns.
+#
+# # The one operation here today is called by a customer or a provider, not by an administrator
+#
+# Worth stating first, because the domain's name invites the opposite assumption. Docs/04 §7 has
+# three stages — intake, investigation, outcome — and only the first belongs to the parties. Intake
+# takes the ordinary mobile access token and is somebody reporting that their own delivery went
+# wrong.
+#
+# Administrator sign-in is a separate system that a user token can never reach (SHIP-147), and the
+# administrative stages arrive with it at SHIP-164. Nothing in this fragment can be reached with an
+# administrator's credential, and nothing an administrator writes appears in any shape below —
+# internal notes (SHIP-162) are never user-visible, and every field here is read straight back to the
+# complainant.
+#
+# # There is no field for whose job and none for who is complaining
+#
+# The job is named in the path and the complainant is whoever the token says is calling. Which side
+# of the job they were on is resolved by the platform from the job and its accepted bid; a
+# `complainant` in a request body would be an authorisation decision made from client input, which
+# Docs/07 §3 puts on the platform.
+
+Disputes:
+  post:
+    operationId: raiseDispute
+    summary: Raise a dispute about a job
+    tags: [Disputes]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Records what went wrong on a delivery and freezes the job while it is looked at (SHIP-163).
+      This is the intake stage of Docs/04 §7.
+
+      Only a party to the job may call it: the customer who owns it, or the provider whose bid was
+      accepted. Everybody else — a provider who bid and lost, a customer looking at somebody else's
+      job, an account with no connection to it at all — gets the same `404` a job that does not
+      exist gets. Which jobs exist, who won them, and what is going wrong on them is commercial
+      information nobody published.
+
+      ## Raising a dispute freezes the job
+
+      The job moves to `disputed` in the same transaction, which is what stops the 72-hour
+      auto-complete running through the middle of an unresolved complaint (Docs/02 §3, §6.1). It is
+      the only thing that does: there is no separate "pause" and no client-side hold.
+
+      A dispute can therefore only be raised while there is a delivery to dispute — from `awarded`
+      through `delivered`. A job still open for bids is cancelled rather than disputed, and a job
+      that has completed or been cancelled has left the lifecycle; both answer
+      `admin_job_not_disputable`.
+
+      The job is unfrozen by an administrator resolving the dispute, which is not yet built.
+
+      ## What to send
+
+      ```json
+      {
+        "category": "goods_damaged_or_missing",
+        "description": "Two of the four crates arrived with the sides staved in.",
+        "desired_outcome": "A record of the damage, and the provider contacted about it.",
+        "occurred_at": "2026-08-11T15:40:00Z",
+        "evidence": ["Photographed the crates at the depot", "The driver's message of 11/08"]
+      }
+      ```
+
+      **`occurred_at` is when the problem happened, not when you are reporting it**, and it is
+      required for that reason. The platform records the filing time itself; if this defaulted, a
+      complaint filed on Thursday about Tuesday's delivery would be stored as having happened on
+      Thursday, and nothing afterwards could tell that value from one somebody meant. Send the
+      incident's time even when it is the same as now.
+
+      A time in the past is accepted however far back it goes. A time in the future is refused.
+
+      ## One open dispute per job
+
+      A job is frozen once. While a dispute is waiting on an outcome, a second one — including one
+      raised by the *other* party to the same delivery — is refused with `admin_dispute_already_open`
+      rather than queued behind it. Once it is resolved the job can be disputed again, so a job may
+      accumulate disputes over its life while never having two open at once.
+
+      ## Retrying
+
+      **A retry** reuses its `Idempotency-Key`. It answers `200` with the dispute the first attempt
+      raised, and writes nothing — whether the retry arrives a second later or a day later, because
+      the guarantee is a unique index in the database rather than a cached response. Retry as often
+      as a dropped connection requires.
+
+      Reusing one key for a *different* complaint is refused with `idempotency_key_reused`. One key
+      per action.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/DisputeIntake'
+    responses:
+      '201':
+        description: |
+          The dispute is recorded and the job is now `disputed`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Dispute'
+      '200':
+        description: |
+          This `Idempotency-Key` had already raised this dispute. Nothing was written and the
+          original is returned — the same shape as `201`, so a client that does not care which
+          happened parses one type.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Dispute'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          One of four, and they lead to four different places:
+
+          | `error.code` | What happened |
+          |---|---|
+          | `admin_job_not_disputable` | The job has not been awarded yet, or has already completed or been cancelled. Reload it |
+          | `admin_dispute_already_open` | Somebody has already raised a dispute on this job and it is waiting on an outcome. Show that one |
+          | `idempotency_key_reused` | This key already raised a *different* dispute on this job. Generate a new one |
+          | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field, with the JSON path the client sent — including `evidence.0` for the offending
+          entry in the list.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- schemas ---------------------------------------------------------------------------------
+
+DisputeIntake:
+  type: object
+  additionalProperties: false
+  required: [category, description, desired_outcome, occurred_at]
+  description: |
+    Docs/04 §7's intake fields, minus the two the platform supplies. The job is in the path and the
+    complainant is the token. Unknown fields are refused, so a client typo fails loudly rather than
+    being silently ignored.
+  properties:
+    category:
+      type: string
+      enum:
+        - provider_fails_to_arrive
+        - goods_differ_from_listing
+        - customer_unavailable
+        - delivery_is_late
+        - goods_damaged_or_missing
+        - other
+      description: |
+        What the dispute is about. The list is derived from Docs/02 §5's exception scenarios — the
+        things that actually go wrong on a delivery — with `other` for everything nobody
+        anticipated. Filing under `other` with a good description is better than filing under the
+        nearest wrong heading; an administrator triages from this field.
+      example: goods_damaged_or_missing
+    description:
+      type: string
+      minLength: 1
+      maxLength: 4000
+      description: |
+        What happened, in your own words. Generous in length because this is somebody describing an
+        incident that may have cost them a day, not a note attached to a milestone.
+      example: Two of the four crates arrived with the sides staved in.
+    desired_outcome:
+      type: string
+      minLength: 1
+      maxLength: 1000
+      description: |
+        What you want done about it. Shipper records outcomes and supports resolution; for the MVP
+        it does not promise compensation or adjudicate liability (Docs/04 §7), so this is what the
+        administrator works towards rather than what they are obliged to deliver.
+      example: A record of the damage, and the provider contacted about it.
+    occurred_at:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339. **When the problem happened**, not when you are reporting it — the platform
+        records the filing time itself, and the two are frequently days apart.
+
+        Required. A default would put the report's time in the incident's field on every request
+        that omitted it, and nothing afterwards could tell that value from one somebody meant.
+
+        Not bounded backwards: a complaint about a delivery a month ago is still a complaint. A time
+        in the future is refused.
+      example: '2026-08-11T15:40:00Z'
+    evidence:
+      type: array
+      maxItems: 20
+      items:
+        type: string
+        minLength: 1
+        maxLength: 500
+      description: |
+        What you have that supports this, described in your own words — "photographed the crates at
+        the depot", "the driver's message of 11/08".
+
+        **These are references, not uploads.** Attaching a file is not built: verification evidence
+        and delivery proof both upload to private object storage through short-lived pre-signed URLs
+        (Docs/04 §3.1), and neither path exists yet. The platform stores what you write here and
+        does not resolve it. When uploads arrive they will be attachments alongside this list rather
+        than a change to it.
+
+        Optional, and an empty list is the same as omitting it.
+      example:
+        - Photographed the crates at the depot
+        - The driver's message of 11/08
+
+Dispute:
+  type: object
+  additionalProperties: false
+  required:
+    [id, job_id, raised_by, category, description, desired_outcome, evidence, occurred_at, raised_at]
+  description: |
+    One dispute, as its complainant sees it.
+
+    **The job's status is deliberately not here.** A successful response means the job is `disputed`
+    and nothing else; repeating the status would be a second copy of a vocabulary the jobs endpoints
+    own.
+
+    **Nothing an administrator writes appears here, and nothing ever will.** Internal support notes
+    are never user-visible (SHIP-162), and the administrative view of a dispute is a shape of its own
+    rather than this one reached by another route.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: The dispute's identifier, and what the administrative workflow refers to it by.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e3
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    raised_by:
+      type: string
+      enum: [customer, provider]
+      description: |
+        Which side of the job the platform decided you were on, not who you are. It is resolved from
+        the job and its accepted bid rather than from the role on your account — being the customer
+        who owns *this* job is a different fact from having a customer account.
+      example: customer
+    category:
+      type: string
+      enum:
+        - provider_fails_to_arrive
+        - goods_differ_from_listing
+        - customer_unavailable
+        - delivery_is_late
+        - goods_damaged_or_missing
+        - other
+      example: goods_damaged_or_missing
+    description:
+      type: string
+      example: Two of the four crates arrived with the sides staved in.
+    desired_outcome:
+      type: string
+      example: A record of the damage, and the provider contacted about it.
+    evidence:
+      type: array
+      items:
+        type: string
+      description: |
+        What was described at intake, in the order it was sent. Always present; an empty list rather
+        than `null` when nothing was described.
+      example:
+        - Photographed the crates at the depot
+    occurred_at:
+      type: string
+      format: date-time
+      description: |
+        When the complainant says the problem happened, in UTC. Exactly what was sent, uncorrected.
+      example: '2026-08-11T15:40:00.000Z'
+    raised_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform received the report, in UTC, on the platform's clock. A client that
+        renders only this is showing a filing time as though it were the incident.
+      example: '2026-08-13T02:15:30.000Z'
+
+# --- parameters ------------------------------------------------------------------------------
+
+JobID:
+  name: id
+  in: path
+  required: true
+  description: The job's identifier.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a phone that retries
+    after a dropped connection must not raise the same complaint twice.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
