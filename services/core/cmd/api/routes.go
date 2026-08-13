@@ -22,6 +22,45 @@ const apiVersion = "v1"
 // apiPrefix is where the versioned public API is mounted.
 const apiPrefix = "/" + apiVersion
 
+// guardsFor builds the auth-class map the version group is served with (SHIP-15m).
+//
+// # This function is the seam, and the seam is the whole of what SHIP-15m delivers
+//
+// `cmd/api/routes.go` is a shared surface (Docs/10 §9.2), so the delivery track cannot add its own
+// entry to this map — which made SHIP-108 unbuildable from a domain branch, because the class it
+// enforces has to be mapped *here*. The map is therefore built from an argument rather than from a
+// literal: whoever supplies the guard supplies it at startup, and this file is not edited again.
+//
+// SHIP-108 fills it by writing the verifier behind newDriverTokenGuard (driverauth.go) and nothing
+// in this file, manifest.go or Deps.
+//
+// # Absent is not the same as refusing, and the difference is the property worth keeping
+//
+// A nil guard leaves the class **out of the map**, and attach panics at startup for any route
+// declaring it. That is deliberate and it is the reason this is not simply
+// `guards{RequireDriverToken: refuseEverything}`: an entry that refuses everything is a route that
+// answers 401 forever, indistinguishable from an expired credential to every client and to
+// whoever gets asked about it. A process that will not start is the loudest possible version of
+// "this route's auth class is not implemented yet", and it cannot reach production.
+//
+// RequireAdmin is still absent from every branch of this function. SHIP-147 gets the same
+// treatment — a second parameter here and a second constructor beside newDriverTokenGuard — and
+// until then a route declaring it stops the process rather than being served open.
+func guardsFor(driverToken Guard) guards {
+	g := guards{
+		// The mobile access token, resolved group-wide by ResolveSubject and required per
+		// route here (SHIP-44).
+		RequireUser: httpx.RequireSubject(),
+	}
+
+	// Absent rather than permissive, and absent rather than refusing. See above.
+	if driverToken != nil {
+		g[RequireDriverToken] = driverToken
+	}
+
+	return g
+}
+
 // newRouter wires the HTTP surface.
 //
 // There are two groups, and the split is deliberate:
@@ -36,13 +75,15 @@ const apiPrefix = "/" + apiVersion
 // Which routes exist is not decided here. Each domain declares its own in routes_<domain>.go
 // and they arrive through the manifest, so adding a domain does not edit this file — see
 // manifest.go for why that matters.
-func newRouter(deps Deps, idempotencyStore httpx.IdempotencyStore, authenticate httpx.Authenticator) http.Handler {
+func newRouter(
+	deps Deps,
+	idempotencyStore httpx.IdempotencyStore,
+	authenticate httpx.Authenticator,
+	driverToken Guard,
+) http.Handler {
 	// Which middleware enforces which auth class. A class absent from this map cannot be
-	// served at all — see attach. RequireDriverToken arrives with SHIP-108 and RequireAdmin
-	// with SHIP-147; both are deliberately missing rather than mapped to something permissive.
-	protected := guards{
-		RequireUser: httpx.RequireSubject(),
-	}
+	// served at all — see attach and guardsFor.
+	protected := guardsFor(driverToken)
 
 	root := http.NewServeMux()
 

@@ -239,6 +239,16 @@ func manifest() string {
 	return b.String()
 }
 
+// Guard is the middleware that enforces one auth class.
+//
+// Named so that a guard can be carried through a signature without the shape being retyped at
+// each hop — newDriverTokenGuard returns one, main.go passes it to newRouter, and guardsFor puts
+// it in the map. It is deliberately cmd/api's type rather than one in internal/httpx: httpx
+// already exports the middleware that satisfies it, and a second name for
+// func(http.Handler) http.Handler in a package every domain imports would be a shared surface
+// nothing needs.
+type Guard func(http.Handler) http.Handler
+
 // guards maps an auth class to the middleware that enforces it.
 //
 // A class with no entry is not served. That is the whole design: RequireDriverToken and
@@ -246,7 +256,12 @@ func manifest() string {
 // the middleware behind each arrives with SHIP-108 and SHIP-147. Until then a route declaring one
 // stops the process at startup rather than being served open, which is the only acceptable
 // direction for that mistake to fail in.
-type guards map[Auth]func(http.Handler) http.Handler
+//
+// **A class mapped to something that refuses everything is not the same thing and is not
+// acceptable.** It turns a startup panic — loud, immediate, and impossible to deploy past — into a
+// route that answers 401 forever, which looks like a credential problem to every client and to
+// whoever is asked about it. Absent means absent (see guardsFor).
+type guards map[Auth]Guard
 
 // attach registers every route of a group onto a mux, wrapped in whatever its auth class requires
 // (SHIP-44).

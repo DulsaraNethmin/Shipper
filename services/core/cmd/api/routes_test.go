@@ -85,7 +85,7 @@ func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sess
 }
 
 func testRouter() http.Handler {
-	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator())
+	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), nil)
 }
 
 // SHIP-6's acceptance criterion: GET /health returns 200 with version and commit.
