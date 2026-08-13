@@ -797,3 +797,578 @@ func TestTheWireFormsAreStableAndDistinct(t *testing.T) {
 		seen[wire] = status
 	}
 }
+
+// --- SHIP-85: revising an offer -------------------------------------------------------------------
+
+// SHIP-85's *Done when*: "A provider can revise their own active bid."
+//
+// Three claims, and each has a test that fails if it stops holding:
+//
+//	a provider can revise   TestAProviderRevisesTheirOwnActiveBid
+//	their own               TestOnlyTheBidsOwnerCanReviseIt, and the wrong-job pairing beside it
+//	active                  TestAnAcceptedBidCannotBeRevised, TestAClosedOfferCannotBeRevised
+//
+// The fourth claim is not in the sentence and follows from the row being shared with SHIP-84:
+// **a revision must not consume the key the offer was placed under**.
+// TestARevisionDoesNotConsumeThePlacementsKey is that, and it is the test a `SET … idempotency_key = $n`
+// fails.
+
+// TestAProviderRevisesTheirOwnActiveBid is the acceptance criterion, read back out of the table.
+//
+// The positive half comes first for the reason SHIP-84's does: an implementation that refused
+// everything would satisfy every refusal below and be entirely broken.
+//
+// **Four things are asserted to have changed and four to have stayed**, because a revision is defined
+// as much by what it leaves alone. The identifier, the status, the placement key and the job are what
+// make this the same offer at a new number rather than a second offer.
+func TestAProviderRevisesTheirOwnActiveBid(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-revise-placed"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+	before := m.row(t, placed.ID)
+
+	pickup := testInstant.Add(72 * time.Hour)
+	deliver := testInstant.Add(80 * time.Hour)
+
+	revised, err := m.revise(t, m.provider, m.job, placed.ID, Revision{
+		AmountCents: ptr(int64(39900)),
+		PickupAt:    &pickup,
+		DeliverBy:   &deliver,
+		Message:     ptr("Two people and a tail lift."),
+	})
+	if err != nil {
+		t.Fatalf("ReviseBid() = %v, want the revised offer", err)
+	}
+
+	if revised.AmountCents != 39900 {
+		t.Errorf("the revised amount is %d, want 39900", revised.AmountCents)
+	}
+	if !revised.PickupAt.Equal(pickup) {
+		t.Errorf("pickup_at is %s, want %s", revised.PickupAt, pickup)
+	}
+	if !revised.DeliverBy.Equal(deliver) {
+		t.Errorf("deliver_by is %s, want %s", revised.DeliverBy, deliver)
+	}
+	if revised.Message != "Two people and a tail lift." {
+		t.Errorf("the message is %q", revised.Message)
+	}
+
+	// What must not have moved. The status in particular: a revised bid is the same live offer, and
+	// moving it out of Submitted would leave uq_bids_one_submitted_per_provider_per_job's predicate
+	// and open a window in which a second offer would be accepted.
+	if revised.ID != placed.ID {
+		t.Errorf("the revision produced a new row (%s, was %s) — a revision is not a counter-offer",
+			revised.ID, placed.ID)
+	}
+	if revised.Status != StatusSubmitted {
+		t.Errorf("the revised bid is %q, want Submitted", revised.Status)
+	}
+	if revised.JobID != m.job {
+		t.Errorf("the revised bid is against %s, want %s", revised.JobID, m.job)
+	}
+	if n := m.bids(t, m.provider, m.job); n != 1 {
+		t.Errorf("the job carries %d rows from this provider, want 1 — a revision writes no second row", n)
+	}
+
+	// The row, which is where a conversion applied in one direction only would show.
+	after := m.row(t, placed.ID)
+	if after.amount != 399.00 {
+		t.Errorf("the column holds %v, want 399.00 — cents and dollars have parted company", after.amount)
+	}
+	if after.status != "Submitted" {
+		t.Errorf("the stored status is %q, want Submitted", after.status)
+	}
+	if after.key != before.key {
+		t.Errorf("the stored key changed from %q to %q", before.key, after.key)
+	}
+	if !after.updatedAt.After(before.updatedAt) {
+		t.Errorf("updated_at did not move (%s to %s) — bids_set_updated_at should have run",
+			before.updatedAt, after.updatedAt)
+	}
+}
+
+// TestARevisionChangesOnlyWhatItNames is the pointer semantics, which is the whole reason [Revision]
+// has a different shape from [Offer].
+//
+// A provider dropping their price names the price. Restating two timestamps they are not changing is
+// how a client eventually sends one of them wrong.
+func TestARevisionChangesOnlyWhatItNames(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-revise-partial"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	revised, err := m.revise(t, m.provider, m.job, placed.ID, Revision{AmountCents: ptr(int64(41000))})
+	if err != nil {
+		t.Fatalf("ReviseBid() = %v", err)
+	}
+
+	if revised.AmountCents != 41000 {
+		t.Errorf("the amount is %d, want 41000", revised.AmountCents)
+	}
+	if !revised.PickupAt.Equal(placed.PickupAt) {
+		t.Errorf("pickup_at moved to %s from %s without being named", revised.PickupAt, placed.PickupAt)
+	}
+	if !revised.DeliverBy.Equal(placed.DeliverBy) {
+		t.Errorf("deliver_by moved to %s from %s without being named", revised.DeliverBy, placed.DeliverBy)
+	}
+	if revised.Message != placed.Message {
+		t.Errorf("the message became %q without being named", revised.Message)
+	}
+}
+
+// TestARevisionCanClearTheMessage is the one field with a third state, and the state is expressed by
+// the value rather than by a second flag.
+//
+// ck_bids_message refuses an empty string, so "" and NULL cannot be confused in either direction —
+// which is only true if the write converts one to the other rather than relying on it. The same
+// property SHIP-84 pinned for a placement, asserted again on the path that can *remove* a message.
+func TestARevisionCanClearTheMessage(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-revise-clear"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+	if placed.Message == "" {
+		t.Fatal("the fixture placed no message, so clearing one proves nothing")
+	}
+
+	revised, err := m.revise(t, m.provider, m.job, placed.ID, Revision{Message: ptr("   ")})
+	if err != nil {
+		t.Fatalf("ReviseBid() = %v", err)
+	}
+	if revised.Message != "" {
+		t.Errorf("the message came back as %q, want empty", revised.Message)
+	}
+
+	var stored *string
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT message FROM bids WHERE id = $1`, placed.ID).Scan(&stored); err != nil {
+		t.Fatalf("reading the stored message: %v", err)
+	}
+	if stored != nil {
+		t.Errorf("the column holds %q, want NULL", *stored)
+	}
+}
+
+// TestARevisionDoesNotConsumeThePlacementsKey is the trap this ticket had to walk around, and it is
+// the test a `SET … idempotency_key = $n` fails.
+//
+// `bids.idempotency_key` holds the key the offer was **placed** under, and 000501 added it so that a
+// placement retried after the middleware has forgotten it is answered from its own row. Writing a
+// revision's key over it would leave that retry finding nothing, meeting
+// uq_bids_one_submitted_per_provider_per_job instead, and being told the provider already had a live
+// offer — a `409` for a request that succeeded, which is precisely the failure the column exists to
+// prevent.
+//
+// So the sequence is the one a bad phone actually produces: place, revise, and then the *placement*
+// arrives again because the first attempt's response never got home.
+func TestARevisionDoesNotConsumeThePlacementsKey(t *testing.T) {
+	m := newMarket(t)
+
+	const placementKey = "key-placed-then-revised"
+
+	placed, _, err := m.place(t, m.provider, m.job, offer(placementKey))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	if _, err := m.revise(t, m.provider, m.job, placed.ID,
+		Revision{AmountCents: ptr(int64(38000))}); err != nil {
+		t.Fatalf("revising: %v", err)
+	}
+
+	again, created, err := m.place(t, m.provider, m.job, offer(placementKey))
+	if err != nil {
+		t.Fatalf("retrying the placement after a revision = %v.\n"+
+			"  The revision must not write bids.idempotency_key: the placement's key is how a "+
+			"retry that outlived the middleware's cache is matched back to its own row, and "+
+			"without it this request meets uq_bids_one_submitted_per_provider_per_job and is "+
+			"refused as a second offer.", err)
+	}
+	if created {
+		t.Error("the retried placement reports itself as a new offer")
+	}
+	if again.ID != placed.ID {
+		t.Errorf("the retry answered with %s, want the original %s", again.ID, placed.ID)
+	}
+	if again.AmountCents != 38000 {
+		t.Errorf("the retry answered %d cents, want the revised 38000 — a retry is answered from "+
+			"the row as it now stands", again.AmountCents)
+	}
+	if n := m.bids(t, m.provider, m.job); n != 1 {
+		t.Errorf("the sequence left %d rows, want 1", n)
+	}
+}
+
+// TestOnlyTheBidsOwnerCanReviseIt is "their own", and it is the half with the worst failure.
+//
+// SHIP-84 proved the same rule for the placement's lookup by deleting `provider_id` from one `WHERE`.
+// The equivalent mutation here is deleting either comparison in [Service.ownBid], and there is a case
+// below for each: another provider's bid, and this provider's bid addressed under the wrong job.
+//
+// **Both are refused explicitly rather than scoped away.** The read takes the row by its identifier
+// and compares afterwards, so the domain can tell "the stranger was refused" from "the row is not
+// there" even though the wire cannot.
+func TestOnlyTheBidsOwnerCanReviseIt(t *testing.T) {
+	m := newMarket(t)
+
+	mine, _, err := m.place(t, m.provider, m.job, offer("key-mine-to-revise"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+	before := m.row(t, mine.ID)
+
+	competitor := newVerifiedProvider(t, m.pool, "bid-revise-rival@example.com", "+61400000850")
+	declare(t, m.pool, competitor, "VIC")
+	addVehicle(t, m.pool, competitor, "BID010")
+
+	otherJob := m.publish(t)
+
+	for name, tc := range map[string]struct {
+		caller uuid.UUID
+		job    uuid.UUID
+		want   error
+	}{
+		"another provider":       {caller: competitor, job: m.job, want: ErrNotBidOwner},
+		"the job's own customer": {caller: m.customer, job: m.job, want: ErrNotBidOwner},
+		"the owner, wrong job":   {caller: m.provider, job: otherJob, want: ErrBidNotFound},
+		"the owner, no such bid": {caller: m.provider, job: m.job, want: ErrBidNotFound},
+
+		// Ownership is compared before the job, so this is ErrNotBidOwner rather than
+		// ErrBidNotFound — the stronger statement, and the one worth having in a log line. The
+		// two are one 404 on the wire either way.
+		"another provider, wrong job too": {caller: competitor, job: otherJob, want: ErrNotBidOwner},
+	} {
+		t.Run(name, func(t *testing.T) {
+			target := mine.ID
+			if name == "the owner, no such bid" {
+				target = uuid.Must(uuid.NewV7())
+			}
+
+			_, err := m.revise(t, tc.caller, tc.job, target, Revision{AmountCents: ptr(int64(1))})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("%s revised the bid: %v, want %v", name, err, tc.want)
+			}
+		})
+	}
+
+	if after := m.row(t, mine.ID); after.amount != before.amount || after.status != before.status {
+		t.Errorf("a refused revision changed the row: %+v, was %+v", after, before)
+	}
+}
+
+// TestAnAcceptedBidCannotBeRevised is the sharpest of the status refusals.
+//
+// CLAUDE.md's one accepted bid per job is a commitment two parties are holding, and
+// uq_bids_one_accepted_per_job is what makes it true. Repricing an awarded offer would change what the
+// customer agreed to after they agreed to it, which is the one thing an award has to be safe from.
+//
+// Docs/01 §4.2 draws the same line in the sentence this ticket is built on: "place, update, and
+// withdraw a bid **until it is accepted or expires**".
+func TestAnAcceptedBidCannotBeRevised(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-accepted-revise"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+	m.setStatus(t, placed.ID, StatusAccepted)
+
+	if _, err := m.revise(t, m.provider, m.job, placed.ID,
+		Revision{AmountCents: ptr(int64(1))}); !errors.Is(err, ErrBidAccepted) {
+		t.Fatalf("revising an accepted bid = %v, want ErrBidAccepted", err)
+	}
+
+	after := m.row(t, placed.ID)
+	if after.status != "Accepted" || after.amount != 450.00 {
+		t.Errorf("the accepted bid is now %s at %v, want Accepted at 450.00", after.status, after.amount)
+	}
+}
+
+// TestAClosedOfferCannotBeRevised bounds [Status.live] in the other direction.
+//
+// None of these four is reachable through an endpoint yet — Rejected is SHIP-93's, Expired is
+// SHIP-89's, Superseded is SHIP-88's and Withdrawn arrives with this branch's other ticket — which is
+// exactly why they are written now: a predicate that said "anything but Accepted" would pass every
+// other test in this file and let a provider re-price an offer the customer had already declined.
+func TestAClosedOfferCannotBeRevised(t *testing.T) {
+	for _, status := range []Status{StatusRejected, StatusExpired, StatusSuperseded, StatusWithdrawn} {
+		t.Run(status.String(), func(t *testing.T) {
+			m := newMarket(t)
+
+			placed, _, err := m.place(t, m.provider, m.job, offer("key-closed-"+status.String()))
+			if err != nil {
+				t.Fatalf("placing the offer: %v", err)
+			}
+			m.setStatus(t, placed.ID, status)
+
+			if _, err := m.revise(t, m.provider, m.job, placed.ID,
+				Revision{AmountCents: ptr(int64(1))}); !errors.Is(err, ErrBidClosed) {
+				t.Fatalf("revising a %s offer = %v, want ErrBidClosed", status, err)
+			}
+		})
+	}
+}
+
+// TestARevisionIsValidatedAsAWholeOffer is [Revision.applyTo]'s consequence, asserted rather than
+// assumed.
+//
+// The merged offer meets the same validator a placement meets, so an offer that could not be placed
+// today is not reachable by revising one that could be placed yesterday. The second case is the one
+// that surprises and is the reason this test exists: a provider re-pricing a stale bid is told about
+// `pickup_at`, a field they did not send, because what they are asking the platform to keep live is an
+// offer to collect in the past.
+func TestARevisionIsValidatedAsAWholeOffer(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		code  httpx.Code
+		setup func(t *testing.T, m market, bid uuid.UUID)
+		rev   Revision
+	}{
+		{
+			name: "a price below zero", field: "amount_cents", code: validate.CodeRequired,
+			rev: Revision{AmountCents: ptr(int64(-1))},
+		},
+		{
+			name: "a price above the bound", field: "amount_cents", code: validate.CodeOutOfRange,
+			rev: Revision{AmountCents: ptr(int64(maxOfferCents + 1))},
+		},
+		{
+			name: "delivery brought before collection", field: "deliver_by", code: validate.CodeOutOfRange,
+			rev: Revision{DeliverBy: ptr(testInstant.Add(time.Hour))},
+		},
+		{
+			name: "a message longer than the column", field: "message", code: validate.CodeTooLong,
+			rev: Revision{Message: ptr(strings.Repeat("a", maxMessageLen+1))},
+		},
+		{
+			name: "a re-price of an offer whose collection time has passed", field: "pickup_at",
+			code: validate.CodeOutOfRange,
+			setup: func(t *testing.T, m market, bid uuid.UUID) {
+				exec(t, m.pool, `UPDATE bids SET pickup_at = $2, deliver_by = $3 WHERE id = $1`,
+					bid, testInstant.Add(-48*time.Hour), testInstant.Add(-40*time.Hour))
+			},
+			rev: Revision{AmountCents: ptr(int64(41000))},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := newMarket(t)
+
+			placed, _, err := m.place(t, m.provider, m.job, offer("key-invalid-revision"))
+			if err != nil {
+				t.Fatalf("placing the offer: %v", err)
+			}
+			if c.setup != nil {
+				c.setup(t, m, placed.ID)
+			}
+			before := m.row(t, placed.ID)
+
+			_, err = m.revise(t, m.provider, m.job, placed.ID, c.rev)
+			if err == nil {
+				t.Fatalf("%s was accepted", c.name)
+			}
+
+			var apiErr *httpx.Error
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("ReviseBid() = %v, want a field error", err)
+			}
+
+			var found bool
+			for _, problem := range apiErr.Details {
+				if problem.Field == c.field {
+					found = true
+					if problem.Code != c.code {
+						t.Errorf("%s is reported as %q, want %q", c.field, problem.Code, c.code)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("no detail names %q: %+v", c.field, apiErr.Details)
+			}
+
+			if after := m.row(t, placed.ID); after.amount != before.amount {
+				t.Errorf("a refused revision wrote %v over %v", after.amount, before.amount)
+			}
+		})
+	}
+}
+
+// TestARevisionThatNamesNothingIsRefused keeps a client defect from arriving as a success.
+//
+// The same reading fleet gives an edit naming no field: answering `200` with the unchanged bid would
+// hide it behind a response that looks right.
+func TestARevisionThatNamesNothingIsRefused(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-empty-revision"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	if _, err := m.revise(t, m.provider, m.job, placed.ID, Revision{}); !errors.Is(err, ErrNothingToRevise) {
+		t.Fatalf("an empty revision = %v, want ErrNothingToRevise", err)
+	}
+}
+
+// TestARevisionNeedsTheProviderToStillBeEligible is the asymmetry with a withdrawal, and the half that
+// would look like over-reach without a reason.
+//
+// **A revision produces a live offer at a new number, and the customer may accept it the moment it
+// lands.** So it is checked by the same filter a placement is checked by, through the same port —
+// Docs/07 §3 puts that decision server-side in exactly one place, and a provider whose only vehicle
+// left service must not be able to re-price work they can no longer do.
+//
+// The job cases matter as much as the fleet ones: nothing closes a bid when its job is cancelled or
+// awarded elsewhere today (SHIP-93 is that ticket), so without this check a provider could re-price an
+// offer against work that is over.
+func TestARevisionNeedsTheProviderToStillBeEligible(t *testing.T) {
+	cases := map[string]func(t *testing.T, m market){
+		"the provider's only vehicle left service": func(t *testing.T, m market) {
+			exec(t, m.pool, `UPDATE vehicles SET deactivated_at = now() WHERE provider_id = $1`, m.provider)
+		},
+		"the provider's verification lapsed": func(t *testing.T, m market) {
+			exec(t, m.pool, `UPDATE users SET phone_verified_at = NULL WHERE id = $1`, m.provider)
+		},
+		"the job was cancelled": func(t *testing.T, m market) {
+			transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+		},
+		"the job was awarded to somebody else": func(t *testing.T, m market) {
+			transition(t, m.pool, m.job, m.customer, "Open", "Awarded")
+		},
+	}
+
+	for name, breakIt := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := newMarket(t)
+
+			placed, _, err := m.place(t, m.provider, m.job, offer("key-eligible-revision"))
+			if err != nil {
+				t.Fatalf("placing the offer: %v", err)
+			}
+			breakIt(t, m)
+
+			if _, err := m.revise(t, m.provider, m.job, placed.ID,
+				Revision{AmountCents: ptr(int64(41000))}); !errors.Is(err, ErrJobNotOffered) {
+				t.Fatalf("%s: the revision was not refused (%v)", name, err)
+			}
+			if after := m.row(t, placed.ID); after.amount != 450.00 {
+				t.Errorf("the refused revision wrote %v", after.amount)
+			}
+		})
+	}
+}
+
+// TestRepeatingARevisionReachesTheSameState is why this endpoint stores no idempotency key.
+//
+// A revision is an `UPDATE` of a row that already exists, so applying it twice reaches the state
+// applying it once reaches — the natural idempotency `PATCH /v1/jobs/{id}` and
+// `PATCH /v1/fleet/vehicles/{id}` already rely on. There is no second row for a repeat to create and
+// no constraint for it to trip, which is why 000501's stored-key mechanism is a placement's and not
+// this one's.
+func TestRepeatingARevisionReachesTheSameState(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-repeat-revision"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	rev := Revision{AmountCents: ptr(int64(42500)), Message: ptr("Same request, sent twice.")}
+
+	first, err := m.revise(t, m.provider, m.job, placed.ID, rev)
+	if err != nil {
+		t.Fatalf("the first revision: %v", err)
+	}
+	second, err := m.revise(t, m.provider, m.job, placed.ID, rev)
+	if err != nil {
+		t.Fatalf("the second revision = %v, want the same outcome", err)
+	}
+
+	if first.ID != second.ID || first.AmountCents != second.AmountCents || first.Message != second.Message {
+		t.Errorf("repeating one revision reached two states:\n  first:  %+v\n  second: %+v", first, second)
+	}
+	if n := m.bids(t, m.provider, m.job); n != 1 {
+		t.Errorf("two identical revisions left %d rows, want 1", n)
+	}
+}
+
+// --- what a revision does not do ------------------------------------------------------------------------
+
+// TestARevisionDoesNotMoveTheJob is SHIP-90's ticket, asserted here so that it stays SHIP-90's.
+//
+// Docs/02 §2 has `Open → Negotiating` on "first bid or counter-offer submitted" and `Negotiating →
+// Open` on bids being withdrawn or rejected. Both belong to **SHIP-90**, which owns that presentation
+// status in either direction — and job status is never a settable field in any case: a move passes one
+// guarded function and leaves a `job_status_history` row in the same transaction (Docs/02 §2,
+// CLAUDE.md). Doing half of that here would be doing the half without the record.
+//
+// Both halves are asserted, as SHIP-84's twin does: the job is where it was, and its history is
+// unchanged. The second is what would catch a move made through some other path.
+func TestARevisionDoesNotMoveTheJob(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-nomove-revision"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	var before int
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM job_status_history WHERE job_id = $1`, m.job).Scan(&before); err != nil {
+		t.Fatalf("counting history: %v", err)
+	}
+
+	if _, err := m.revise(t, m.provider, m.job, placed.ID, Revision{AmountCents: ptr(int64(41000))}); err != nil {
+		t.Fatalf("revising: %v", err)
+	}
+
+	var (
+		status string
+		after  int
+	)
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT j.status, (SELECT count(*) FROM job_status_history WHERE job_id = j.id)
+		   FROM jobs j WHERE j.id = $1`, m.job).Scan(&status, &after); err != nil {
+		t.Fatalf("reading the job: %v", err)
+	}
+	if status != "Open" {
+		t.Errorf("the job is %q, want Open — Negotiating in either direction is SHIP-90's", status)
+	}
+	if after != before {
+		t.Errorf("revising wrote %d job_status_history rows", after-before)
+	}
+}
+
+// TestRevisingRefusesAConnectionPool is the guard [ErrNotInTransaction] exists for.
+//
+// The method reads a status, decides against it and writes, and that is only one decision while
+// lockBid's `FOR UPDATE` is held — which outside a transaction is released the instant the SELECT
+// returns. An award committing in that window would leave a revision repricing a bid
+// uq_bids_one_accepted_per_job says two parties are committed to, with nothing to report afterwards.
+func TestRevisingRefusesAConnectionPool(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-no-transaction"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	if _, err := m.svc.ReviseBid(t.Context(), m.pool, m.provider, m.job, placed.ID,
+		Revision{AmountCents: ptr(int64(1))}); !errors.Is(err, ErrNotInTransaction) {
+		t.Errorf("ReviseBid() on a pool = %v, want ErrNotInTransaction", err)
+	}
+
+	if after := m.row(t, placed.ID); after.status != "Submitted" || after.amount != 450.00 {
+		t.Errorf("a refused call wrote to the row: %+v", after)
+	}
+}

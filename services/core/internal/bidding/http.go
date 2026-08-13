@@ -309,6 +309,147 @@ func (h *Handler) Place() http.Handler {
 	})
 }
 
+// reviseRequest is the body of PATCH /v1/jobs/{id}/bids/{bid_id} (SHIP-85).
+//
+// **Every field is a pointer, which is the shape [bidRequest] said this one would need.** A placement
+// is made whole and a revision is not: a provider dropping their price by fifty dollars names the
+// price and nothing else, and a client made to restate two timestamps it is not changing is a client
+// that can get them wrong. Absent means "leave this alone".
+//
+// There is still no `job_id`, no `provider_id` and no `status`, for the reasons [bidRequest] gives.
+// httpx.DecodeJSON refuses unknown fields, so a client sending one of them is told it does not exist.
+type reviseRequest struct {
+	AmountCents *int64 `json:"amount_cents"`
+
+	// PickupAt and DeliverBy are RFC 3339 strings, parsed by hand for the reason [bidRequest]'s are.
+	PickupAt  *string `json:"pickup_at"`
+	DeliverBy *string `json:"deliver_by"`
+
+	// Message is the conditions accompanying the offer. Sending it blank clears it, which is how a
+	// provider takes a condition back — the alternative would be a second field meaning "and now
+	// remove the note", for a value the column already expresses as NULL.
+	Message *string `json:"message"`
+}
+
+// revision turns the request into the domain's command, reporting anything it could not parse.
+//
+// **Unlike [bidRequest.offer], a parse failure is answered on its own rather than merged with the
+// domain's complaints**, and that is a consequence of what a revision is judged against. A placement
+// is validated against nothing but itself, so the handler can run the domain's validator early and
+// report both halves at once. A revision is validated against the *stored* offer — the fields it does
+// not name come from the row — and reading that row means finding the bid, which is behind the
+// ownership check. Reaching for the value rules here would mean judging a bid before establishing it
+// is the caller's, which is the wrong order for a reason that has nothing to do with error messages.
+//
+// Both timestamps are still reported together, which is the part a provider notices.
+func (b reviseRequest) revision() (Revision, error) {
+	var e validate.Errors
+
+	rev := Revision{AmountCents: b.AmountCents, Message: b.Message}
+	if b.PickupAt != nil {
+		at := instant("pickup_at", *b.PickupAt, &e)
+		rev.PickupAt = &at
+	}
+	if b.DeliverBy != nil {
+		by := instant("deliver_by", *b.DeliverBy, &e)
+		rev.DeliverBy = &by
+	}
+
+	if err := e.Err(); err != nil {
+		return Revision{}, err
+	}
+	return rev, nil
+}
+
+// Revise handles PATCH /v1/jobs/{id}/bids/{bid_id} (SHIP-85).
+//
+// Protected, and the reviser is whoever the token says is calling. **"Their own" is the whole of the
+// authorisation**: another provider's bid is a 404, byte-identical to a bid that does not exist, and
+// so is a bid paired with the wrong job.
+//
+// A `PATCH` on the bid rather than a second `POST` under the job, because a revision is a change to
+// the offer that is already there: it keeps the bid's identifier, its status, and the key it was
+// placed under, and the customer sees one offer at a new number rather than two. **A counter-offer is
+// the thing that makes a new row** — Docs/02 §4, SHIP-87 — and giving a revision the same shape here
+// would settle that ticket's design by accident.
+//
+// 200 always. There is no 201 to answer with: nothing is created, and a revision that changes a field
+// to the value it already held is still the state the caller asked for.
+//
+// State-changing, so it carries an Idempotency-Key like every other mutating route (SHIP-15) and is
+// refused without one by the middleware. **Unlike [Handler.Place] the key is not read here**, because
+// there is no column for it and no failure for one to prevent: applying one `UPDATE` twice reaches the
+// state applying it once reaches. See [Revision] for the trap that would be introduced by storing it.
+func (h *Handler) Revise() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, bidID, err := pathIDs(r)
+		if err != nil {
+			return err
+		}
+
+		var req reviseRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		rev, err := req.revision()
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var bid Bid
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			bid, err = h.svc.ReviseBid(ctx, runner, providerID, jobID, bidID, rev)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, bidFrom(bid))
+		return nil
+	})
+}
+
+// pathIDs reads both identifiers a bid is addressed by.
+//
+// One function rather than two calls in each handler, so that a malformed job id and a malformed bid
+// id produce one answer apiece and a client has two cases rather than four. The job is reported first
+// because it is the first segment a reader of the URL meets.
+func pathIDs(r *http.Request) (jobID, bidID uuid.UUID, err error) {
+	if jobID, err = jobIDFrom(r); err != nil {
+		return uuid.Nil, uuid.Nil, err
+	}
+	if bidID, err = bidIDFrom(r); err != nil {
+		return uuid.Nil, uuid.Nil, err
+	}
+	return jobID, bidID, nil
+}
+
+// bidIDFrom reads and parses the {bid_id} path parameter.
+//
+// bad_request rather than not_found, exactly as [jobIDFrom] has it: a value that is not an identifier
+// is not a bid that is missing, and the answer is the same whether or not any bid exists.
+func bidIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("bid_id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The bid id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
+}
+
 // jobIDFrom reads and parses the {id} path parameter.
 //
 // A path parameter of the wrong shape is bad_request rather than not_found, which is the httpx
@@ -391,6 +532,30 @@ func apiError(err error) error {
 		// for. The client already has the feed to show what this provider may bid on.
 		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
 			"No such job.").WithCause(err)
+
+	case errors.Is(err, ErrBidNotFound), errors.Is(err, ErrNotBidOwner):
+		// One answer for both, and the domain keeps them apart behind it. A provider told "that bid
+		// is not yours" has been told the bid exists, which is a competitor's offer confirmed by
+		// anybody willing to try identifiers — and the two rows in Docs/01 §4.3 are the budget and
+		// exactly this. The domain distinguishes them so a test can tell "the stranger was refused"
+		// from "the row vanished"; the wire does not.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such bid.").WithCause(err)
+
+	case errors.Is(err, ErrBidAccepted):
+		// 409 rather than 422: the request is well formed and contradicts the state the bid is in.
+		// Its own code, because the app's next screen is the job this provider has just won.
+		return httpx.NewError(http.StatusConflict, CodeBidAccepted,
+			"That offer has been accepted. An accepted bid can be neither revised nor "+
+				"withdrawn.").WithCause(err)
+
+	case errors.Is(err, ErrBidClosed):
+		return httpx.NewError(http.StatusConflict, CodeBidClosed,
+			"That offer is no longer live, so it cannot be revised or withdrawn.").WithCause(err)
+
+	case errors.Is(err, ErrNothingToRevise):
+		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The request changes nothing. Send at least one field to revise.").WithCause(err)
 
 	case errors.Is(err, ErrAlreadyBid):
 		// 409 rather than 422: the values are well formed and the request contradicts the state the

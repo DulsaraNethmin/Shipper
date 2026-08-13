@@ -181,3 +181,76 @@ func (postgresStore) bidPlacedUnder(
 	}
 	return bid, true, nil
 }
+
+// lockBid takes one bid by its identifier and holds it for the rest of the transaction (SHIP-85).
+//
+// **Scoped by the identifier alone, and nothing else — which is the opposite of
+// [postgresStore.bidPlacedUnder] and is deliberate.** That read is a *lookup*: it answers "what did
+// this key place", a question only the caller who sent the key may ask, so scoping it by provider is
+// the privacy rule. This one is an *addressed* read: the caller named a row, and the platform has to
+// say what is wrong with reaching it. A `WHERE id = $1 AND provider_id = $2` that returned nothing
+// could not tell a bid belonging to somebody else from a bid that does not exist, and only one of
+// those is a caller probing for another provider's offers. [Service.ownBid] makes the comparison in Go
+// and raises [ErrNotBidOwner]; both become the same 404 on the wire, so the distinction costs the
+// caller nothing and buys the platform a fact it can act on.
+//
+// **FOR UPDATE, and it is load-bearing rather than defensive.** The caller reads a status, decides
+// against it, and writes — and the decision is "is this offer still the provider's to change".
+// Without the lock, an award committing in the window between the SELECT and the UPDATE leaves a
+// revision repricing a bid uq_bids_one_accepted_per_job says two parties are committed to. The lock
+// is only held inside a transaction, which is why [ErrNotInTransaction] exists.
+func (postgresStore) lockBid(ctx context.Context, r db.Runner, id uuid.UUID) (Bid, error) {
+	const q = `
+		SELECT ` + bidColumns + `
+		FROM bids
+		WHERE id = $1
+		FOR UPDATE`
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Bid{}, fmt.Errorf("bidding: %s: %w", id, ErrBidNotFound)
+	case err != nil:
+		return Bid{}, fmt.Errorf("bidding: reading bid %s: %w", id, err)
+	}
+	return bid, nil
+}
+
+// reviseOffer writes a revised price, timing and message (SHIP-85).
+//
+// # Three columns are absent from the SET list and each absence is a decision
+//
+// **`idempotency_key` is not written, and must never be.** It holds the key the offer was *placed*
+// under, and that is how a placement retried after the middleware has forgotten it is matched back to
+// its own row. Overwriting it with a revision's key would leave that retry unable to find anything,
+// meeting uq_bids_one_submitted_per_provider_per_job instead and being told the provider already had a
+// live offer — a 409 for a request that succeeded, which is the exact failure 000501 added the column
+// to prevent. See [Revision].
+//
+// **`status` is not written**, because a revision does not move an offer: a revised bid is the same
+// live offer at a different number. Leaving it out also leaves
+// uq_bids_one_submitted_per_provider_per_job undisturbed — the row stays inside the index's predicate
+// throughout, so a revision cannot open a window in which a second offer would be accepted.
+//
+// **`updated_at` is not written**, because `bids_set_updated_at` in 000500 does it. A statement setting
+// it by hand would be a second answer to what "changed" means.
+//
+// No ON CONFLICT and no arbiter. The only unique indexes on this table are partial on statuses this
+// statement does not touch, so there is nothing here to conflict with — which is a property of the two
+// omissions above rather than a coincidence.
+func (postgresStore) reviseOffer(ctx context.Context, r db.Runner, id uuid.UUID, o Offer) (Bid, error) {
+	const q = `
+		UPDATE bids
+		SET amount     = ($2::bigint)::numeric / 100,
+		    pickup_at  = $3,
+		    deliver_by = $4,
+		    message    = nullif($5, '')
+		WHERE id = $1
+		RETURNING ` + bidColumns
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id, o.AmountCents, o.PickupAt, o.DeliverBy, o.Message))
+	if err != nil {
+		return Bid{}, fmt.Errorf("bidding: revising bid %s: %w", id, err)
+	}
+	return bid, nil
+}

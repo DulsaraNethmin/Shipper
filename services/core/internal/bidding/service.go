@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
@@ -171,6 +172,142 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 			"bidding: %s conflicted on %s and then could not be read back", offer.Key, jobID)
 	}
 	return existing, false, nil
+}
+
+// ReviseBid changes a provider's own live offer (SHIP-85).
+//
+// Docs/01 §4.2 gives the provider "place, update, and withdraw a bid until it is accepted or expires",
+// and this is the middle verb. A revised bid is the *same* offer at a different price, timing or set
+// of conditions — the row keeps its identifier, its status and the key it was placed under.
+//
+// r must be a transaction, and unlike [Service.PlaceBid] that is checked rather than documented. The
+// difference is the mechanism each rests on: a placement's correctness is `ON CONFLICT`'s and holds
+// statement by statement, while this reads a status, decides against it and writes — which is only one
+// decision if [postgresStore.lockBid]'s `FOR UPDATE` is still held when the write lands.
+//
+// # The order of the four refusals, and why eligibility comes last
+//
+//  1. **A revision that changes nothing** is [ErrNothingToRevise], before the database is touched at
+//     all. Almost always a client defect, and a `200` carrying the unchanged bid would hide it.
+//  2. **A bid that is not this provider's** is refused before anything about it is read back —
+//     ownership and the job it hangs under, both in [Service.ownBid]. On the wire the two are one
+//     404, byte-identical to a bid that does not exist.
+//  3. **A bid that is no longer the provider's to change** is [ErrBidAccepted] or [ErrBidClosed].
+//     Before validation, deliberately: telling somebody their price is out of range on an offer that
+//     was accepted an hour ago answers a question they did not ask.
+//  4. **Eligibility**, which is `fleet`'s answer and not this domain's, exactly as it is for a
+//     placement.
+//
+// # Why a revision is checked for eligibility and a withdrawal is not
+//
+// This is the one asymmetry in the pair and it is deliberate. **A revision produces a live offer at a
+// new number, and the customer may accept it the moment it lands** — so the platform must not accept
+// one on a job it would refuse a first offer on. Docs/07 §3 puts that decision server-side in exactly
+// one place, and SHIP-81's filter is that place; a provider whose only vehicle left service must not
+// be able to re-price work they can no longer do, and a job that has been cancelled, awarded or
+// expired must not acquire a fresh price. The endpoint that offers a provider a job and the endpoint
+// that lets them change their bid on it agreeing is the same property SHIP-84 was built around.
+//
+// **SHIP-86's withdrawal is the opposite act and will take no such check**: a provider must always
+// be able to take back their own offer, and refusing on eligibility would strand a live offer they
+// could no longer retract.
+//
+// The refusal is [ErrJobNotOffered], which is the 404 a placement gets, byte-identically. It reads
+// oddly to a caller who plainly knows the job exists, and it is still the right answer: what the
+// platform must not do is tell one provider that a job was awarded, cancelled or expired, because that
+// is what became of work somebody else was given.
+func (s *Service) ReviseBid(
+	ctx context.Context,
+	r db.Runner,
+	providerID, jobID, bidID uuid.UUID,
+	rev Revision,
+) (Bid, error) {
+	if _, inTx := r.(pgx.Tx); !inTx {
+		return Bid{}, fmt.Errorf("bidding: revising %s: %w", bidID, ErrNotInTransaction)
+	}
+	if rev.IsEmpty() {
+		return Bid{}, fmt.Errorf("bidding: revising %s: %w", bidID, ErrNothingToRevise)
+	}
+
+	bid, err := s.ownBid(ctx, r, providerID, jobID, bidID)
+	if err != nil {
+		return Bid{}, err
+	}
+	if err := changeable(bid); err != nil {
+		return Bid{}, err
+	}
+
+	offer := rev.applyTo(bid)
+	if err := offer.validate(s.clock.Now()); err != nil {
+		return Bid{}, err
+	}
+
+	permitted, err := s.eligibility.EligibleFor(ctx, r, providerID, bid.JobID)
+	if err != nil {
+		return Bid{}, fmt.Errorf("bidding: deciding whether %s may still bid on %s: %w",
+			providerID, bid.JobID, err)
+	}
+	if !permitted {
+		return Bid{}, ErrJobNotOffered
+	}
+
+	return s.store.reviseOffer(ctx, r, bid.ID, offer)
+}
+
+// ownBid reads the bid a caller has named and refuses anything that is not theirs.
+//
+// One function rather than the same three checks in two methods, because the alternative is two places
+// for the ownership comparison to be forgotten — and a forgotten one here is another provider's price,
+// which Docs/01 §4.3 makes private from competitors. The same arrangement fleet.Service.owned takes.
+//
+// **Both comparisons are made in Go against a row read by its identifier**, rather than being folded
+// into the `WHERE` clause. A query scoped to the caller that returns nothing cannot say whether the
+// bid was somebody else's or nobody's, and the two are different facts even though they are one answer
+// on the wire. TestOneProvidersKeyCannotReachAnothersBid proved the same rule for the placement's
+// lookup by deleting `provider_id` from its `WHERE`; the equivalent mutation here is deleting one of
+// the two comparisons below, and there is a test for each.
+//
+// The job identifier is compared as well as the provider, because the bid is addressed under a job:
+// a client pairing a real bid with the wrong job is naming something that does not exist, and
+// answering it from the bid alone would make the path's first half decorative.
+func (s *Service) ownBid(ctx context.Context, r db.Runner, providerID, jobID, bidID uuid.UUID) (Bid, error) {
+	if bidID == uuid.Nil || jobID == uuid.Nil {
+		return Bid{}, fmt.Errorf("bidding: %s on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	bid, err := s.store.lockBid(ctx, r, bidID)
+	if err != nil {
+		return Bid{}, err
+	}
+	if bid.ProviderID != providerID {
+		return Bid{}, fmt.Errorf("bidding: %s does not belong to %s: %w", bidID, providerID, ErrNotBidOwner)
+	}
+	if bid.JobID != jobID {
+		return Bid{}, fmt.Errorf("bidding: %s is not on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+	return bid, nil
+}
+
+// changeable refuses an offer that has left the provider's hands (SHIP-85, SHIP-86).
+//
+// Docs/01 §4.2 bounds both verbs identically — "until it is accepted or expires" — so both ask this
+// one question, and [Status.live] is where the answer lives.
+//
+// **Accepted is answered separately from everything else**, because the two lead a client somewhere
+// different: an accepted offer is a job this provider has won and the app should show it, while a
+// rejected, expired or superseded one is over and the app should show the feed. It is also the case
+// with a rule behind it rather than a state — CLAUDE.md's one accepted bid per job, held by
+// uq_bids_one_accepted_per_job — and Docs/02 §6.2 makes stepping away from an awarded job a provider
+// cancellation with consequences rather than a withdrawal, which is a different endpoint nobody has
+// built.
+func changeable(b Bid) error {
+	switch {
+	case b.Status == StatusAccepted:
+		return fmt.Errorf("bidding: %s: %w", b.ID, ErrBidAccepted)
+	case !b.Status.live():
+		return fmt.Errorf("bidding: %s is %s: %w", b.ID, b.Status, ErrBidClosed)
+	}
+	return nil
 }
 
 // validate is what an offer has to be before the platform will carry it.

@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **378 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **388 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -279,6 +279,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-82** | M3 | `GET /v1/jobs/open` — the provider's feed, keyset-paged. **Declared in `routes_fleet.go`, not `routes_jobs.go`**: routes follow the domain that answers them, not the first segment of the path. It also deletes SHIP-81's SQL mirror from `make verify` in favour of real HTTP checks — *see below* |
 | **SHIP-83** | M3 | `GET /v1/jobs/open/{id}` — one job as a provider sees it, and **the fourth budget proof §8 recorded as still owed**: the serialised response, obtained over HTTP, held to a *closed set of keys* so that a budget renamed `max_price` fails too. The street line and the coordinate are confirmed withheld — *see below* |
 | **SHIP-84** | M3 | `POST /v1/jobs/{id}/bids` — a verified, eligible provider offers a price and two timing commitments. **Opens the `bidding` domain**, and reaches `fleet`'s eligibility answer through a port with no adapter behind it. "Bid once per job" and "a retry is not a second bid" are two partial unique indexes rather than two checks — *see below* |
+| **SHIP-85** | M3 | `PATCH /v1/jobs/{id}/bids/{bid_id}` — a provider revises their own live offer **in place**: same row, same status, same key. That last one is the point — writing a revision's key over the placement's would turn a late retry into a `409` for a request that succeeded — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -2938,9 +2939,117 @@ to be undone.
 One `$ref` pair and one `tags:` entry in `contracts/openapi.yaml`, one line in `routes_golden.txt` and
 one in `Docs/10-api-error-codes.md` (both regenerated, not typed), and §3's check count (written by
 `make verify-update`). No `internal/boundaries` edit, no `Deps` field, no shared-block migration, and
-`internal/bidding` imports no domain. `make verify` went from 355 checks across 12 sections to the
-figure at the top of this section — twenty-three checks in a new `scripts/verify/61-bidding.sh`, which
-takes the reserved 60–69 range's upper half beside `60-fleet.sh`.
+`internal/bidding` imports no domain. `make verify` went from 355 checks across 12 sections to 378
+across 13 — twenty-three checks in a new `scripts/verify/61-bidding.sh`, which takes the reserved
+60–69 range's upper half beside `60-fleet.sh`.
+
+### SHIP-85 — a revision is an `UPDATE`, and the key it must not touch
+
+`PATCH /v1/jobs/{id}/bids/{bid_id}`. A provider changes the price, timing or conditions of an offer
+they have already placed. **The row keeps its identifier, its `Submitted` status and the key it was
+placed under**, which is what makes this the same offer at a new number rather than a second offer.
+
+Docs/01 §4.2 gives the provider three verbs — "place, update, and withdraw a bid until it is accepted
+or expires" — and this is the second of them, on top of SHIP-84's first. SHIP-86 is the third.
+
+#### It is an in-place edit, and the alternative would have settled SHIP-87's design
+
+The tempting shape is the one SHIP-87 will need: write a new row and move the old one to `Superseded`.
+It is rejected, and for the reason 000500 and 000501 both give for declining to guess — **a
+counter-offer is what makes a new row** (Docs/02 §4: "a customer counter-offer supersedes the prior
+provider offer"), the link between rows is SHIP-88's supersede chain, and there is no column for one.
+Building half of that chain here would hand SHIP-87 a design it did not choose and a migration to undo.
+
+Docs/02 §4 also never says a provider revising their *own* offer supersedes anything. There is no
+counter from the other party to supersede: the customer has not answered yet, which is what
+`Submitted` means.
+
+**What this does cost is that the intermediate prices are not retained.** Docs/01 §4.3 requires the
+platform to "record all offers, counter-offers, withdrawals, and acceptances", and a revision is
+none of those three named things — it is an edit to an offer nobody has answered. If SHIP-88 decides
+the chain should record revisions too, that is an additive change: a new row plus a link column,
+against a table where nothing has to be undone first.
+
+#### The key the revision must not write, and the mutation that proves it
+
+`bids.idempotency_key` holds the key the offer was **placed** under. 000501 added it so that a
+placement retried after Redis has forgotten it is answered from its own row rather than meeting
+`uq_bids_one_submitted_per_provider_per_job` and being told the provider already has a live offer.
+
+**Writing a revision's key over it reintroduces exactly that failure**, and it is the kind of defect
+that looks like tidiness. `postgresStore.reviseOffer` names four columns and that is deliberate;
+`TestARevisionDoesNotConsumeThePlacementsKey` places under one key, revises, and then sends the
+*placement* again. Verified by mutation: adding `idempotency_key = $6` to the `SET` list makes that
+test fail with `bidding_already_bid` — a `409` for a request that had succeeded — and nothing else in
+the suite notices.
+
+**So this endpoint stores no key at all**, which is the second half of the same finding. A revision is
+an `UPDATE` of a row that already exists: applying it twice reaches the state applying it once
+reaches, there is no second row for a repeat to create, and no constraint for it to trip. That is the
+natural idempotency `PATCH /v1/jobs/{id}` and `PATCH /v1/fleet/vehicles/{id}` already rely on, and
+neither of those stores a key either. **Redis makes the retry cheap and the `UPDATE` makes it
+correct** — the same division SHIP-84 drew, reaching the opposite conclusion about whether a column is
+needed, which is what makes it a division rather than a habit.
+
+#### The whole offer is validated, not only the fields that changed
+
+`Revision.applyTo` merges the request over the stored bid and produces an `Offer`, so the *same*
+validator runs. An offer that could not be placed today is therefore not reachable by revising one
+that could be placed yesterday.
+
+The consequence is worth stating because it surprises: a provider re-pricing a three-day-old bid whose
+`pickup_at` has since passed is refused, **naming a field they did not send**. That is the honest
+answer — what they are asking the platform to keep live is an offer to collect in the past, and the
+customer could accept it — and validating only what arrived would make the stored offer's coherence
+depend on the order somebody edited it in.
+
+#### Eligibility is checked again here, and deliberately will not be on SHIP-86's withdrawal
+
+The one asymmetry in the pair. **A revision produces a live offer at a new number that the customer may
+accept the moment it lands**, so it goes through SHIP-81's filter exactly as a placement does: a
+provider whose only vehicle left service must not be able to re-price work they can no longer do, and a
+job that has been cancelled or awarded elsewhere must not acquire a fresh price. Docs/07 §3 puts that
+decision server-side in one place, and there is only one.
+
+That matters more than it looks, because **nothing closes a bid when its job ends** — SHIP-93 is the
+ticket that rejects competing bids on award, and it does not exist. Without this check a provider could
+re-price an offer against work that is over.
+
+The refusal is the same `404` a placement gets, byte-identically. It reads oddly to a caller who
+plainly knows the job exists, and it is still right: the platform must not tell one provider that a job
+was awarded, cancelled or expired, because that is what became of work somebody else was given.
+
+#### "Their own" is the whole of the authorisation, and it is two comparisons
+
+`Service.ownBid` reads the row **by its identifier** and then compares `provider_id` and `job_id` in
+Go. A `WHERE … AND provider_id = $2` returning nothing could not tell a competitor's bid from a bid
+that does not exist, and only one of those is somebody probing — the arrangement `fleet.Service.owned`
+takes, and the discipline SHIP-84 established by deleting `provider_id` from a `WHERE` and watching one
+test fail.
+
+Both comparisons were mutation-tested. Deleting the ownership check fails
+`TestOnlyTheBidsOwnerCanReviseIt` and `TestAnotherProvidersBidIsUnreachable`; deleting the job
+comparison fails `TestABidIsAddressedUnderItsOwnJob`. **The second is the one that is easy to leave
+out**, and without
+it `/v1/jobs/{id}/bids/{bid_id}` would be one resource reachable at as many addresses as there are
+jobs — the shape where a rule gets enforced at one address and forgotten at the rest.
+
+#### The budget rule now has three responses rather than two
+
+`TestTheBidResponseCarriesNothingOfTheCustomers` held the `201` and the `200` replay to a closed set of
+keys at every depth. It now holds three: the revision answers with the same shape from a third code
+path, and **a shape that is safe on one path and not another is the failure several paths invite**.
+Verified by mutation, as SHIP-83 asks: a `max_price` field carrying `432199` fails on every subtest, on
+the key set and on the value search. `make verify` runs the same closed-set assertion from outside Go
+against the new response too.
+
+#### Shared surfaces
+
+One `$ref` entry in `contracts/openapi.yaml`, one line in `routes_golden.txt` and two in
+`Docs/10-api-error-codes.md` — all regenerated rather than typed — and §3's check count, written by
+`make verify-update`. **No migration**: a revision writes columns 000501 already added, so block
+500–599 is untouched and the out-of-order guard never fires. No `internal/boundaries` edit, no `Deps`
+field, and `internal/bidding` still imports no domain.
 
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 

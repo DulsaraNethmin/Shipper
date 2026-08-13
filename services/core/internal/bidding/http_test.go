@@ -19,7 +19,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
-// The wire contract of SHIP-84.
+// The wire contract of SHIP-84 and SHIP-85.
 //
 // These drive the handler on a mux of their own rather than through cmd/api's router, because what
 // is being checked here is the domain's own half: what it accepts, what it refuses, and what shape
@@ -37,6 +37,11 @@ import (
 //     bid price as private from competing providers" — and its failure mode is a WHERE clause rather
 //     than a response field. It is the test that would catch a store read scoped by job and key but
 //     not by provider.
+//
+// SHIP-85 gives the second rule a second failure mode, and [TestAnotherProvidersBidIsUnreachable] is
+// for that one. Its endpoint reaches a bid by *naming* it rather than by looking one up, so what
+// would break the rule there is a missing ownership comparison rather than a missing scope — the same
+// rule, a different line of code, and therefore a different test.
 
 // newTestRouter mounts the handler on the pattern cmd/api registers it under.
 //
@@ -57,6 +62,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs/{id}/bids", handler.Place())
+	mux.Handle("PATCH /v1/jobs/{id}/bids/{bid_id}", handler.Revise())
 	return mux
 }
 
@@ -73,13 +79,23 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 // eligibility filter, not by the claim.
 func as(t *testing.T, h http.Handler, caller uuid.UUID, key, target, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return send(t, h, http.MethodPost, caller, key, target, body)
+}
+
+// send is [as] with the method named, for SHIP-85's PATCH.
+//
+// The two are one function with a default rather than two, because every request in this file has to
+// carry the same subject and the same header handling — and a second copy is where one of them
+// eventually stops.
+func send(t *testing.T, h http.Handler, method string, caller uuid.UUID, key, target, body string) *httptest.ResponseRecorder {
+	t.Helper()
 
 	var reader io.Reader
 	if body != "" {
 		reader = strings.NewReader(body)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, target, reader)
+	req := httptest.NewRequest(method, target, reader)
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -114,6 +130,35 @@ func newWire(t *testing.T) wire {
 func (w wire) bid(t *testing.T, caller uuid.UUID, key, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	return as(t, w.router, caller, key, "/v1/jobs/"+w.job.String()+"/bids", body)
+}
+
+// revise sends one PATCH against a bid addressed under a job (SHIP-85).
+//
+// The job is a parameter rather than the fixture's, because "the bid is on the job in the path" is
+// itself a rule under test — a helper that always supplied the right one could not exercise it.
+func (w wire) revise(t *testing.T, caller uuid.UUID, job, bid uuid.UUID, key, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	return send(t, w.router, http.MethodPatch, caller, key,
+		"/v1/jobs/"+job.String()+"/bids/"+bid.String(), body)
+}
+
+// placed is one offer on the fixture job, over the wire, with its identifier read back out.
+//
+// Every test below starts from a bid that exists, and reading the id out of the response rather than
+// out of the database is deliberate: it is the identifier a client would actually hold.
+func (w wire) placed(t *testing.T, key string) uuid.UUID {
+	t.Helper()
+
+	rec := w.bid(t, w.provider, key, validBody())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("placing the offer = %d (%s)", rec.Code, rec.Body)
+	}
+
+	id, err := uuid.Parse(decode[map[string]any](t, rec)["id"].(string))
+	if err != nil {
+		t.Fatalf("the placed bid has no usable id: %v (%s)", err, rec.Body)
+	}
+	return id
 }
 
 // validBody is a complete offer, in the wire's own vocabulary.
@@ -277,8 +322,10 @@ var providerBidKeys = map[string]bool{
 // `jobs.budget` back out of the row. A privacy test whose fixture has nothing to leak passes forever
 // and proves nothing, which is the specific way this could rot without anybody noticing.
 //
-// Both responses are covered — the 201 and the 200 replay — because a shape that is safe on one and
-// not the other is the failure two code paths invite.
+// **Every response that carries a bid is covered**, which at SHIP-84 was the 201 and the 200 replay
+// and is now three: SHIP-85's revision answers with the same shape from a third code path. A shape
+// that is safe on one path and not another is exactly the failure several paths invite, and the list
+// below is what stops a fourth being added without being added here.
 func TestTheBidResponseCarriesNothingOfTheCustomers(t *testing.T) {
 	w := newWire(t)
 
@@ -309,6 +356,17 @@ func TestTheBidResponseCarriesNothingOfTheCustomers(t *testing.T) {
 		t.Fatalf("the replay = %d (%s)", replayed.Code, replayed.Body)
 	}
 	responses["the replay, 200"] = replayed.Body.Bytes()
+
+	bidID, err := uuid.Parse(decode[map[string]any](t, created)["id"].(string))
+	if err != nil {
+		t.Fatalf("the placed bid has no usable id: %v", err)
+	}
+
+	revised := w.revise(t, w.provider, w.job, bidID, "wire-privacy-revise", `{"amount_cents": 41000}`)
+	if revised.Code != http.StatusOK {
+		t.Fatalf("the revision = %d (%s)", revised.Code, revised.Body)
+	}
+	responses["the revision, 200"] = revised.Body.Bytes()
 
 	for how, body := range responses {
 		t.Run(how, func(t *testing.T) {
@@ -646,5 +704,241 @@ func TestTheJobIDInThePathMustBeAnIdentifier(t *testing.T) {
 	rec := as(t, w.router, w.provider, "wire-badid", "/v1/jobs/not-a-uuid/bids", validBody())
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("= %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+}
+
+// --- SHIP-85 at the wire ---------------------------------------------------------------
+
+// TestRevisingABidOverTheWire is SHIP-85's *Done when* at the wire.
+//
+// 200 and the same shape a placement answers with, so a client that has just revised holds exactly the
+// object it held before — same identifier, same status, new number.
+func TestRevisingABidOverTheWire(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-revise-place")
+
+	rec := w.revise(t, w.provider, w.job, bid, "wire-revise", `{
+		"amount_cents": 39900,
+		"message": "Two people and a tail lift."
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	body := decode[map[string]any](t, rec)
+	if body["id"] != bid.String() {
+		t.Errorf("the revision answered with %v, want the same bid %s — a revision is not a new offer",
+			body["id"], bid)
+	}
+	if body["amount_cents"] != float64(39900) {
+		t.Errorf("amount_cents is %v, want 39900", body["amount_cents"])
+	}
+	if body["status"] != "submitted" {
+		t.Errorf("status is %v, want submitted — a revised offer is still live", body["status"])
+	}
+	if body["message"] != "Two people and a tail lift." {
+		t.Errorf("message is %v", body["message"])
+	}
+}
+
+// TestAnotherProvidersBidIsUnreachable is Docs/01 §4.3's second privacy rule on the two endpoints that
+// take a bid identifier.
+//
+// SHIP-84's version of this rule was about a *lookup* — a store read scoped by job and key but not by
+// provider. These two endpoints are reached by naming a bid outright, so the same rule has a second
+// failure mode: an ownership comparison that is missing or is folded into a `WHERE` that quietly
+// matches nothing useful.
+//
+// **The competitor is a real, eligible provider with a bid of their own**, so nothing about them is
+// what makes the refusal happen. And the answer is byte-identical to a bid that does not exist,
+// because "that is not yours" would confirm a competitor's offer to anybody willing to try
+// identifiers.
+func TestAnotherProvidersBidIsUnreachable(t *testing.T) {
+	w := newWire(t)
+	mine := w.placed(t, "wire-owned")
+
+	competitor := newVerifiedProvider(t, w.pool, "bid-wire-rival@example.com", "+61400000852")
+	declare(t, w.pool, competitor, "VIC")
+	addVehicle(t, w.pool, competitor, "BID012")
+
+	missing := uuid.Must(uuid.NewV7())
+
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"revising somebody else's bid": w.revise(t, competitor, w.job, mine, "wire-x1", `{"amount_cents": 1}`),
+		"revising a bid that is not there": w.revise(t, competitor, w.job, missing, "wire-x3",
+			`{"amount_cents": 1}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s = %d, want 404 (%s)", name, rec.Code, rec.Body)
+			}
+			if got := decode[errorEnvelope](t, rec).Error.Code; got != string(httpx.CodeNotFound) {
+				t.Errorf("the code is %q, want not_found", got)
+			}
+		})
+	}
+
+	// Byte-identical, asserted rather than assumed: a refusal that explained itself would disclose
+	// what the status code is withholding.
+	taken := w.revise(t, competitor, w.job, mine, "wire-x5", `{"amount_cents": 1}`)
+	nothing := w.revise(t, competitor, w.job, missing, "wire-x6", `{"amount_cents": 1}`)
+	if taken.Body.String() != nothing.Body.String() {
+		t.Errorf("somebody else's bid answers differently from one that is not there:\n"+
+			"  theirs:  %s\n  missing: %s", taken.Body, nothing.Body)
+	}
+
+	// And nothing happened to the bid they were reaching for.
+	still := w.revise(t, w.provider, w.job, mine, "wire-still", `{"message": "unchanged"}`)
+	if still.Code != http.StatusOK {
+		t.Fatalf("the owner's own revision = %d (%s)", still.Code, still.Body)
+	}
+	if body := decode[map[string]any](t, still); body["status"] != "submitted" ||
+		body["amount_cents"] != float64(45000) {
+		t.Errorf("the competitor's attempts changed the bid: %v", body)
+	}
+}
+
+// TestABidIsAddressedUnderItsOwnJob is the check that stops the first half of the URL being
+// decorative.
+//
+// The bid is real and the caller owns it; only the job it is paired with is wrong. Without the
+// comparison in [Service.ownBid] this would succeed, and `/v1/jobs/{id}/bids/{bid_id}` would be one
+// resource reachable at as many addresses as there are jobs — the shape where a permission check gets
+// added to one address and forgotten on the rest.
+func TestABidIsAddressedUnderItsOwnJob(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-wrongjob-place")
+
+	other := w.publish(t)
+
+	if rec := w.revise(t, w.provider, other, bid, "wire-wj1", `{"amount_cents": 1}`); rec.Code != http.StatusNotFound {
+		t.Errorf("revising under the wrong job = %d, want 404 (%s)", rec.Code, rec.Body)
+	}
+}
+
+// TestAnAcceptedBidAnswersItsOwnCode is the refusal a client acts on rather than reports.
+//
+// An accepted offer is a job this provider has won, so the app's next screen is that job — which is
+// why it is not folded into `bidding_bid_closed` with the rejected and expired ones.
+func TestAnAcceptedBidAnswersItsOwnCode(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-accepted-place")
+
+	// Awarding is SHIP-92's endpoint and does not exist. Unlike a job, a bid's status has no trigger
+	// guarding it (000500 says why), so this is the statement the award itself will run.
+	exec(t, w.pool, `UPDATE bids SET status = 'Accepted' WHERE id = $1`, bid)
+
+	rec := w.revise(t, w.provider, w.job, bid, "wire-acc1", `{"amount_cents": 1}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("revising an accepted bid = %d, want 409 (%s)", rec.Code, rec.Body)
+	}
+	if got := decode[errorEnvelope](t, rec).Error.Code; got != string(CodeBidAccepted) {
+		t.Errorf("the code is %q, want %q", got, CodeBidAccepted)
+	}
+}
+
+// TestAClosedOfferAnswersItsOwnCode is the other half of the status refusal.
+//
+// One code for four statuses, because the client does the same thing with all of them: the offer is
+// over and what to show is the feed. Which of the four it was belongs to the provider's own bid
+// history (SHIP-101), not to an error code.
+func TestAClosedOfferAnswersItsOwnCode(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-closed-place")
+
+	// SHIP-86 builds the withdrawal endpoint; until it does, the status is set directly. Unlike a
+	// job, a bid's status has no trigger guarding it — 000500 says why.
+	exec(t, w.pool, `UPDATE bids SET status = 'Withdrawn' WHERE id = $1`, bid)
+
+	rec := w.revise(t, w.provider, w.job, bid, "wire-closed-revise", `{"amount_cents": 1}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("revising a withdrawn offer = %d, want 409 (%s)", rec.Code, rec.Body)
+	}
+	if got := decode[errorEnvelope](t, rec).Error.Code; got != string(CodeBidClosed) {
+		t.Errorf("the code is %q, want %q", got, CodeBidClosed)
+	}
+}
+
+// TestARevisionCannotSetTheStatus is the invariant at the layer a client can reach, on the endpoint
+// most likely to tempt somebody into allowing it.
+//
+// A `PATCH` carrying `"status": "withdrawn"` is the obvious way to write the withdrawal endpoint, and
+// it is refused: a bid's status is the platform's, and httpx.DecodeJSON reports the unknown field
+// rather than ignoring it. `POST …/withdraw` exists because the client names an intent and the
+// platform decides what the state becomes.
+func TestARevisionCannotSetTheStatus(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-setstatus-place")
+
+	for _, field := range []string{
+		`"status":"withdrawn"`,
+		`"status":"accepted"`,
+		`"provider_id":"x"`,
+		`"job_id":"x"`,
+		`"id":"x"`,
+	} {
+		rec := w.revise(t, w.provider, w.job, bid, "wire-set-"+field, `{`+field+`}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("a revision carrying %s = %d, want 400 (%s)", field, rec.Code, rec.Body)
+		}
+	}
+}
+
+// TestARevisionThatNamesNothingIsRefusedAtTheWire keeps a client defect from arriving as a success.
+func TestARevisionThatNamesNothingIsRefusedAtTheWire(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-nofields-place")
+
+	rec := w.revise(t, w.provider, w.job, bid, "wire-nofields", `{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("an empty revision = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := decode[errorEnvelope](t, rec).Error.Code; got != string(httpx.CodeBadRequest) {
+		t.Errorf("the code is %q, want bad_request", got)
+	}
+}
+
+// TestABadTimestampInARevisionNamesTheField is [bidRequest]'s reasoning applied to the second request
+// shape: encoding/json reports a bad timestamp as an ordinary error with no type of its own, so a
+// `time.Time` field would make the whole body "not valid JSON".
+//
+// Both timestamps are reported together, which is the half a provider notices. What is *not* attempted
+// is merging these with the domain's value rules — see [reviseRequest.revision] for why that ordering
+// is a security property rather than a message-quality one.
+func TestABadTimestampInARevisionNamesTheField(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-badtime-place")
+
+	rec := w.revise(t, w.provider, w.job, bid, "wire-badtime", `{
+		"pickup_at": "next tuesday",
+		"deliver_by": "the day after"
+	}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("a bad timestamp = %d, want 422 (%s)", rec.Code, rec.Body)
+	}
+
+	seen := map[string]int{}
+	for _, d := range decode[errorEnvelope](t, rec).Error.Details {
+		seen[d.Field]++
+		if d.Code != "invalid_format" {
+			t.Errorf("%s is reported as %q, want invalid_format", d.Field, d.Code)
+		}
+	}
+	if seen["pickup_at"] != 1 || seen["deliver_by"] != 1 {
+		t.Errorf("the details are %v, want each field named exactly once", seen)
+	}
+}
+
+// TestTheBidIDInThePathMustBeAnIdentifier keeps a malformed path out of the store.
+//
+// bad_request rather than not_found, exactly as the job id is: a value that is not an identifier is
+// not a bid that is missing, and the answer discloses nothing either way.
+func TestTheBidIDInThePathMustBeAnIdentifier(t *testing.T) {
+	w := newWire(t)
+
+	if rec := send(t, w.router, http.MethodPatch, w.provider, "wire-badbid1",
+		"/v1/jobs/"+w.job.String()+"/bids/not-a-uuid",
+		`{"amount_cents": 1}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("a malformed bid id = %d, want 400 (%s)", rec.Code, rec.Body)
 	}
 }

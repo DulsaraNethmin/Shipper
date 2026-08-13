@@ -206,6 +206,8 @@ paths:
     $ref: './paths/jobs.yaml#/JobByID'
   /v1/jobs/{id}/bids:
     $ref: './paths/bidding.yaml#/Bids'
+  /v1/jobs/{id}/bids/{bid_id}:
+    $ref: './paths/bidding.yaml#/BidByID'
   /v1/jobs/{id}/cancel:
     $ref: './paths/jobs.yaml#/CancelJob'
   /v1/jobs/{id}/driver:

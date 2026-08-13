@@ -163,6 +163,81 @@ func (m market) place(t *testing.T, provider, job uuid.UUID, o Offer) (Bid, bool
 	return bid, created, err
 }
 
+// revise runs one revision in a transaction, which is what [Service.ReviseBid] requires.
+func (m market) revise(t *testing.T, provider, job, bid uuid.UUID, rev Revision) (Bid, error) {
+	t.Helper()
+
+	var revised Bid
+	err := db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		revised, err = m.svc.ReviseBid(ctx, r, provider, job, bid, rev)
+		return err
+	})
+	return revised, err
+}
+
+// row is the stored bid, read straight out of the table rather than off whatever the service said
+// about itself.
+//
+// Every assertion about what a revision or a withdrawal *wrote* goes through this: a method returning
+// the value it meant to store would satisfy a test comparing against its own return value even if the
+// `UPDATE` had touched nothing.
+func (m market) row(t *testing.T, bid uuid.UUID) storedBid {
+	t.Helper()
+
+	var (
+		s         storedBid
+		message   *string
+		key       *string
+		pickupAt  *time.Time
+		deliverBy *time.Time
+	)
+	if err := m.pool.QueryRow(t.Context(), `
+		SELECT status, amount, pickup_at, deliver_by, message, idempotency_key, updated_at
+		FROM bids WHERE id = $1`, bid).
+		Scan(&s.status, &s.amount, &pickupAt, &deliverBy, &message, &key, &s.updatedAt); err != nil {
+		t.Fatalf("reading bid %s: %v", bid, err)
+	}
+	if pickupAt != nil {
+		s.pickupAt = *pickupAt
+	}
+	if deliverBy != nil {
+		s.deliverBy = *deliverBy
+	}
+	if message != nil {
+		s.message = *message
+	}
+	if key != nil {
+		s.key = *key
+	}
+	return s
+}
+
+// storedBid is one row of the `bids` table, as the tests read it.
+type storedBid struct {
+	status    string
+	amount    float64
+	pickupAt  time.Time
+	deliverBy time.Time
+	message   string
+	key       string
+	updatedAt time.Time
+}
+
+// setStatus moves a bid directly, for the statuses no endpoint can reach yet.
+//
+// Accepted is SHIP-92's, Rejected is SHIP-93's, Expired is SHIP-89's and Superseded is SHIP-88's, so a
+// test that needs one of them writes it. Unlike a job, a bid's status has no trigger guarding it
+// (000500 says why), so this is the same statement the platform itself would run — not a back door
+// around a guard.
+func (m market) setStatus(t *testing.T, bid uuid.UUID, status Status) {
+	t.Helper()
+	exec(t, m.pool, `UPDATE bids SET status = $2 WHERE id = $1`, bid, string(status))
+}
+
+// ptr is a pointer to a literal, which [Revision]'s optional fields need at every call site.
+func ptr[T any](v T) *T { return &v }
+
 // bids is how many rows this provider has on this job, whatever their status.
 func (m market) bids(t *testing.T, provider, job uuid.UUID) int {
 	t.Helper()

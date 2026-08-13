@@ -78,6 +78,26 @@ var Statuses = []Status{
 	StatusSuperseded,
 }
 
+// live reports whether an offer is still the provider's to change (SHIP-85, SHIP-86).
+//
+// **One status, named rather than guessed at.** That is migration 000501's reading of
+// uq_bids_one_submitted_per_provider_per_job, taken here for the same reason: 'Submitted' is the only
+// status this platform writes and the only one that today means "a live offer from this provider that
+// the other party has not answered". A predicate written against the *word* "active" would be a guess
+// at a design SHIP-87 has not made.
+//
+// **SHIP-86's withdrawal will gate on this too, because Docs/01 §4.2 bounds the two identically** —
+// "place, update, and withdraw a bid until it is accepted or expires". Two predicates that have to
+// agree are one predicate; the two endpoints differ in what they do about a status that fails it, not
+// in which statuses fail.
+//
+// It is deliberately not widened to 'Countered'. A provider answering a customer's counter is making a
+// counter-offer, which supersedes the prior offer (Docs/02 §4) and is SHIP-87's ticket with SHIP-88's
+// chain behind it; treating that as an in-place revision would settle their design by accident. If
+// SHIP-87 finds the set should be wider, adding a status here is one line — the same additive
+// direction 000501 deliberately left its index in.
+func (s Status) live() bool { return s == StatusSubmitted }
+
 // Valid reports whether s is one of the eight.
 func (s Status) Valid() bool {
 	for _, known := range Statuses {
@@ -194,6 +214,98 @@ type Offer struct {
 	// Key is the caller's idempotency key, which becomes the row's. Required: see
 	// [ErrNoIdempotencyKey].
 	Key string
+}
+
+// Revision is the change a provider is making to an offer they have already placed (SHIP-85).
+//
+// **Pointers throughout, where [Offer]'s fields are values**, which is what http.go's note on
+// bidRequest predicted: "an offer is placed whole … SHIP-85's revision is a different request with a
+// different shape and will need the pointers this one does not." A revision names what changes and
+// says nothing about the rest, because a provider dropping their price by fifty dollars should not
+// have to restate two timestamps they are not touching — and a client that restates them is a client
+// that can get them wrong.
+//
+// **There is no status field and no provider field**, for the two reasons [Offer] has neither: a bid's
+// status is the platform's (Docs/02 §2's rule for jobs is the same rule here), and the provider is
+// whoever the token says is calling.
+//
+// # There is no key either, and that is the whole difference from a placement
+//
+// [Offer.Key] is on that type because it is a *column*. A placement retried after the idempotency
+// middleware has forgotten it is answered from the row it wrote, and without the stored key that
+// request would meet uq_bids_one_submitted_per_provider_per_job and be told the provider already had a
+// live offer — a 409 for a request that succeeded.
+//
+// A revision has no such failure mode. It is an `UPDATE` of one row that already exists, so applying
+// it twice reaches the state applying it once reaches; there is no second row for a repeat to create
+// and nothing for a constraint to refuse. That is the natural idempotency `PATCH /v1/jobs/{id}` and
+// `PATCH /v1/fleet/vehicles/{id}` already rely on, and neither of those stores a key either.
+//
+// **What matters instead is that the placement's key survives a revision**, and that is the trap worth
+// naming rather than discovering. Writing this request's key over `bids.idempotency_key` would leave a
+// late retry of the *placement* unable to find its row, and it would then be refused as a second
+// offer — reintroducing exactly the failure the column was added to prevent.
+// [postgresStore.reviseOffer] does not name that column and
+// TestARevisionDoesNotConsumeThePlacementsKey is what says so.
+type Revision struct {
+	AmountCents *int64
+	PickupAt    *time.Time
+	DeliverBy   *time.Time
+
+	// Message is the conditions accompanying the offer. Present and blank clears it, which is the
+	// same treatment a placement gives a blank message: `nullif` puts NULL in the column, so ""
+	// and "not given" cannot part company.
+	Message *string
+}
+
+// IsEmpty reports whether the caller named no field at all.
+//
+// A revision that changes nothing is refused rather than answered, exactly as fleet refuses an edit
+// naming no field: it is almost always a client defect, and answering `200` with the unchanged bid
+// would hide it behind a success.
+func (r Revision) IsEmpty() bool {
+	return r.AmountCents == nil && r.PickupAt == nil && r.DeliverBy == nil && r.Message == nil
+}
+
+// applyTo is the offer that would stand if this revision were accepted.
+//
+// **It produces an [Offer], so that the same validator runs over a revised offer as over a placed
+// one.** There is deliberately no second set of rules: an offer that could not be placed today must
+// not be reachable by revising one that could be placed yesterday, and a rule stated twice is a rule
+// that will eventually be stated differently.
+//
+// The key is left empty. A revision writes no key, and [Offer.validate] does not read one — the
+// requirement that a *placement* carry one is [Service.PlaceBid]'s, checked there because the column
+// is what a later retry is matched against.
+//
+// # The whole offer is validated, not only the fields that changed
+//
+// Worth stating because it can surprise. A provider re-pricing a three-day-old bid whose collection
+// time has since passed is refused, naming `pickup_at` — a field they did not send. That is the honest
+// answer rather than an awkward one: what they are asking the platform to keep live is an offer to
+// collect in the past, and the customer could accept it. Validating only the fields that arrived would
+// make the stored offer's coherence depend on the order somebody edited it in.
+func (r Revision) applyTo(b Bid) Offer {
+	o := Offer{
+		AmountCents: b.AmountCents,
+		PickupAt:    b.PickupAt,
+		DeliverBy:   b.DeliverBy,
+		Message:     b.Message,
+	}
+
+	if r.AmountCents != nil {
+		o.AmountCents = *r.AmountCents
+	}
+	if r.PickupAt != nil {
+		o.PickupAt = *r.PickupAt
+	}
+	if r.DeliverBy != nil {
+		o.DeliverBy = *r.DeliverBy
+	}
+	if r.Message != nil {
+		o.Message = *r.Message
+	}
+	return o.normalise()
 }
 
 // normalise collapses whitespace and moves both instants to UTC.

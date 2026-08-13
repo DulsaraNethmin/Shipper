@@ -430,3 +430,154 @@ status="$(bid_post "$bid_provider_token" "verify-bid-status-$$" "/v1/jobs/$secon
 [[ "$status" == "400" ]] || { cat "$WORKDIR/bid-setstatus.json"; fail "a body naming a status returned $status, want 400"; }
 grep -q 'status' "$WORKDIR/bid-setstatus.json" || fail "the refusal does not name the field"
 ok "a bid's status is not a settable field; the unknown field is reported, not ignored"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-85  PATCH /v1/jobs/{id}/bids/{bid_id} — a provider revises their own active bid"
+
+# $retry_job carries this provider's offer from the retry section above, and $bid_job_id was cancelled
+# by the disclosure section, so a fresh job is published for the two tickets below to work against.
+status="$(bid_post "$bid_customer_token" "verify-bid-job4-$$" /v1/jobs \
+  '{"pickup":{"line":"88 Bridge Road","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"7 Little Malop Street","suburb":"Geelong","state":"VIC","postcode":"3220"},
+    "goods_description":"Flat-packed shelving","weight_kg":60,"budget_cents":432199}' job4)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-job4.json"; fail "creating the revision job returned $status"; }
+revise_job="$(json "$WORKDIR/bid-job4.json" '["id"]')"
+move_job "$revise_job" Draft Open
+
+status="$(bid_post "$bid_provider_token" "verify-bid-revbase-$$" "/v1/jobs/$revise_job/bids" "$bid_body" revbase)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-revbase.json"; fail "placing the offer to revise returned $status"; }
+revise_bid="$(json "$WORKDIR/bid-revbase.json" '["id"]')"
+
+# bid_patch <token> <key> <path> <body> <name> — the same shape as bid_post, for SHIP-85's verb.
+bid_patch() {
+  curl -s -X PATCH -o "$WORKDIR/bid-$5.json" -D "$WORKDIR/bid-$5.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT$3"
+}
+
+status="$(curl -s -X PATCH -o "$WORKDIR/bid-rev-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-bid-rev-anon-$$" -H 'Content-Type: application/json' \
+  -d '{"amount_cents":39900}' "http://localhost:$VERIFY_PORT/v1/jobs/$revise_job/bids/$revise_bid")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-rev-anon.json"; fail "an unauthenticated revision returned $status, want 401"; }
+
+status="$(curl -s -X PATCH -o "$WORKDIR/bid-rev-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" -H 'Content-Type: application/json' \
+  -d '{"amount_cents":39900}' "http://localhost:$VERIFY_PORT/v1/jobs/$revise_job/bids/$revise_bid")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-rev-nokey.json"; fail "a revision with no Idempotency-Key returned $status, want 400"; }
+ok "it needs a credential and an Idempotency-Key, like every other state-changing route"
+
+status="$(bid_patch "$bid_provider_token" "verify-bid-revise-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  '{"amount_cents":39900,"message":"Two people and a tail lift."}' revise)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-revise.json"; fail "revising returned $status, want 200"; }
+[[ "$(json "$WORKDIR/bid-revise.json" '["amount_cents"]')" == "39900" ]] || fail "the revised price did not come back"
+[[ "$(json "$WORKDIR/bid-revise.json" '["id"]')" == "$revise_bid" ]] \
+  || fail "the revision answered with a different bid — a revision is not a counter-offer"
+[[ "$(json "$WORKDIR/bid-revise.json" '["status"]')" == "submitted" ]] \
+  || fail "the revised offer is $(json "$WORKDIR/bid-revise.json" '["status"]'), want submitted"
+ok "a provider revises their own active bid, and it stays the same live offer at a new number"
+
+# The row. `idempotency_key` is the one worth reading: it holds the key the offer was PLACED under,
+# and a revision that overwrote it would leave a late placement retry meeting
+# uq_bids_one_submitted_per_provider_per_job instead of its own row — a 409 for a request that
+# succeeded. The count is the other half: a revision writes no second row.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || amount::text || ' ' || idempotency_key
+     from bids where id = '$revise_bid';")"
+[[ "$stored" == "Submitted 399.00 verify-bid-revbase-$$" ]] \
+  || fail "the revised row is '$stored', want 'Submitted 399.00 verify-bid-revbase-$$' — the placement's key must survive"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where provider_id = '$bid_provider_id' and job_id = '$revise_job';")" == "1" ]] \
+  || fail "the revision wrote a second row"
+ok "the row holds the new price, the same status, and still the key the offer was placed under"
+
+# Only what was named. The timing was not sent above, so it must be exactly what was placed.
+[[ "$(json "$WORKDIR/bid-revise.json" '["pickup_at"]')" == "$(json "$WORKDIR/bid-revbase.json" '["pickup_at"]')" ]] \
+  || fail "pickup_at moved without being named"
+[[ "$(json "$WORKDIR/bid-revise.json" '["deliver_by"]')" == "$(json "$WORKDIR/bid-revbase.json" '["deliver_by"]')" ]] \
+  || fail "deliver_by moved without being named"
+ok "a revision changes only the fields it names"
+
+python3 - "$WORKDIR/bid-revise.json" <<'PY' || fail "the revision response carries something of the customer's"
+import json, re, sys
+
+# The same closed set the placement is held to, asserted again because this is a second code path
+# answering with the shape — which is exactly where a field safe on one path and not the other lands.
+allowed = {
+    "id", "job_id", "status", "amount_cents",
+    "pickup_at", "deliver_by", "message",
+    "created_at", "updated_at",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the revision response is the same closed set of keys, and carries nothing of the customer's"
+
+status="$(bid_patch "$bid_provider_token" "verify-bid-revempty-$$" "/v1/jobs/$revise_job/bids/$revise_bid" '{}' revempty)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-revempty.json"; fail "a revision naming no field returned $status, want 400"; }
+
+status="$(bid_patch "$bid_provider_token" "verify-bid-revstatus-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  '{"status":"withdrawn"}' revstatus)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-revstatus.json"; fail "a revision naming a status returned $status, want 400"; }
+ok "a revision that names nothing is refused, and a bid's status is still not a settable field"
+
+status="$(bid_patch "$bid_provider_token" "verify-bid-revbad-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  "{\"amount_cents\":45000,\"deliver_by\":\"2020-01-01T09:00:00Z\"}" revbad)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-revbad.json"; fail "delivery before collection returned $status, want 422"; }
+grep -q 'deliver_by' "$WORKDIR/bid-revbad.json" || fail "the refusal does not name deliver_by"
+ok "the merged offer meets the same validator a placement meets, naming the field"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-85  \"their own\" is the whole of the authorisation, and a refusal discloses nothing"
+
+status="$(bid_patch "$bid_rival_token" "verify-bid-revrival-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  '{"amount_cents":1}' revrival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-revrival.json"; fail "a competitor revised somebody else's bid: $status"; }
+
+status="$(bid_patch "$bid_rival_token" "verify-bid-revnothing-$$" \
+  "/v1/jobs/$revise_job/bids/00000000-0000-7000-8000-000000000085" '{"amount_cents":1}' revnothing)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-revnothing.json"; fail "a bid that does not exist returned $status"; }
+
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/bid-revrival.json" "$WORKDIR/bid-revnothing.json" \
+  || fail "somebody else's bid answers differently from one that does not exist"
+ok "another provider's bid answers exactly what a bid that is not there answers"
+
+# The bid is real and the caller owns it; only the job it is paired with is wrong. Without that
+# comparison the first half of the URL would be decorative.
+status="$(bid_patch "$bid_provider_token" "verify-bid-revwrongjob-$$" "/v1/jobs/$retry_job/bids/$revise_bid" \
+  '{"amount_cents":1}' revwrongjob)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-revwrongjob.json"; fail "a bid was reachable under the wrong job: $status"; }
+ok "and a bid paired with the wrong job is not found either — one resource, one address"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select amount::text from bids where id = '$revise_bid';")" == "399.00" ]] \
+  || fail "a refused revision changed the row"
+ok "and none of the refusals touched the offer"
+

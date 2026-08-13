@@ -40,6 +40,20 @@ import (
 // It is also what makes the route safe under SHIP-44's scoped idempotency: keys land in
 // idem:v1:user:<subject>:<key> rather than the shared anonymous namespace, which is the gate
 // CLAUDE.md holds authenticated state-changing endpoints behind and which SHIP-44 closed.
+//
+// # A bid is addressed under the job it was placed on, and that is one address rather than two
+//
+// SHIP-85 and SHIP-86 need a *member* of the collection above, and the alternative was a flat
+// `/v1/bids/{id}`. It is rejected because SHIP-102's customer comparison is a `GET` on
+// `/v1/jobs/{id}/bids` — so the collection is already under the job, and a member addressed anywhere
+// else would be one resource with two URLs. That is the shape where a permission check gets added to
+// one address and forgotten on the other.
+//
+// The cost is that both handlers compare the bid's `job_id` to the path and refuse a mismatch, which
+// is a real check rather than a formality: without it the first half of the URL would be decorative
+// and a client pairing a real bid with any job at all would succeed.
+//
+// SHIP-86's withdrawal takes the same address with a verb under it, for the same reason.
 func init() {
 	register(
 		Route{
@@ -48,6 +62,13 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Place() },
+		},
+		Route{
+			Method:  http.MethodPatch,
+			Pattern: "/jobs/{id}/bids/{bid_id}",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).Revise() },
 		},
 	)
 }
