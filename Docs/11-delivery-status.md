@@ -285,6 +285,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
+| **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
@@ -3638,6 +3639,137 @@ transition, which is `Docs/02` §5's failed attempt and the case 000601 has no u
 **The delivery block moved to `000602`** — one column, one check, one partial unique index. It is the
 first migration in this repository written to hold a guarantee that a piece of infrastructure was
 already believed to provide.
+
+### SHIP-124 — the queue, and what a client does with an operation it can never send
+
+`core/queue` stops being a folder with a note in it. `Docs/07` §4 calls the durable queue the single
+most important client capability, and its *Done when* has two halves that are not the same size:
+"queued operations survive app restart" is a storage question, and "are never silently dropped" is
+an invariant over everything the class can do.
+
+**The first half is one paragraph.** Drift over SQLite, which `Docs/10` §8.3 and `Docs/07` §9 closed
+long before this ticket, and the argument they closed it on is the one that held up: the requirement
+is transactional rather than about storage. An operation, its idempotency key, the time the user
+acted and the path to its proof image either all commit or none of them do. `enqueue` returns only
+after its transaction commits, which is what makes it safe for a screen to confirm at that point —
+`Docs/07` §4's "the UI confirms immediately, marked clearly as pending". Every test runs against a
+real file and the restart is a genuine close-and-reopen over the same bytes; an in-memory database
+would have made all of them pass while proving nothing about the sentence being demonstrated.
+
+#### The six ways an operation could vanish, and what stops each
+
+This is the ticket. A test showing the happy path surviving a relaunch does not demonstrate "never
+silently dropped" at all, so the failure modes were enumerated first and
+`queued_operations_are_never_silently_dropped_test.dart` is one group per mode.
+
+| Way it could vanish | What stops it |
+|---|---|
+| A crash between enqueue and commit | One transaction. Nothing partial can exist, and the confirmation is lost with the operation rather than surviving it |
+| A crash mid-drain | The claimed row stays in the table `in_flight`; `recover()` returns it at the next launch, under **the key it was created with**. There is no lease and no timeout — a handset runs one app process, so the next launch is the only other party there is |
+| A row this build cannot read | **Quarantined, not skipped.** Skipping is the drop; throwing stalls everything behind it. It becomes `blocked` with a recorded reason, still counted and still listed |
+| A queue that grows without bound | A cap that **refuses the new operation rather than evicting the oldest**. Eviction is precisely a silent drop, and it drops the operation that has waited longest |
+| Two writers racing | Every state change is a conditional `UPDATE`/`DELETE` whose affected-row count is checked, and the capacity check runs inside the insert's own transaction |
+| A removal nobody asked for | Exactly three paths remove a row — `complete`, `acknowledge`, `clear` — and a test drives every other public method against a populated queue and asserts the count does not move |
+
+All three of the mechanisms worth doubting were confirmed by mutation rather than believed: making
+`snapshot` skip an unreadable row fails four tests, ignoring the claim's affected-row count fails
+two, and dropping the per-key head rule fails three.
+
+#### The poison item: SHIP-135's move, taken as far as it goes, and then not
+
+§9 recorded the same question answered on the platform side, and SHIP-135's answer was better than a
+dead-letter path: **a permanently unpublishable outbox row is now unwritable**, because all three of
+its failure classes are decided inside the transaction that makes the state change. The client takes
+that move and then has to stop, and the reason it has to stop is worth writing down because it is
+structural rather than a shortfall.
+
+**Taken.** An operation of a kind that does not exist cannot be written at all — `OperationKind`'s
+constructor is private, so the set is closed by the compiler and `enqueue` needs no check for it. A
+body over the bound is refused by `enqueue`. A duplicate idempotency key is refused by `enqueue` and
+by a `UNIQUE` constraint behind it, which is the same shape as `uq_bids_one_accepted_per_job`.
+
+**Not available.** The platform has one deployment; a handset has whatever build was installed last
+week. A row written by *another build of this app* — a kind since removed, a body shape since
+changed — is a case no enqueue-time check can reach, because the check that would have caught it was
+not in the build that wrote the row. Nor can the client know in advance that the platform will refuse
+an operation: that answer arrives hours later, being offline being the entire point.
+
+**So for those two: quarantine and escalate, never delete.** The row moves to `blocked` with the
+reason recorded, and what stops it being quiet is not this package but `Docs/02` §3.1's ladder that
+`Docs/09` already schedules — the indicator immediately (SHIP-126), the provider nudge at four hours
+(SHIP-127), the operations alert at 24 (SHIP-128). Nothing removes it after N attempts; a person
+acknowledging it does (SHIP-132). **A dead-letter path was rejected for the same reason SHIP-135
+rejected one**: it is a place things go to stop being anybody's problem, and the queue's whole promise
+is the opposite.
+
+**The one that would be a silent drop if it were not deliberate: an unrecognised `state`.** Reading
+treats *anything* that is not `pending` or `in_flight` as blocked, rather than matching a known list.
+The alternative reads as harmless and is not — a state written by a later build would be a row present
+in the table and absent from every list, which is a silent drop wearing a database row as a disguise.
+Blocked is the default bucket, and `total` is counted in SQL so it depends on nothing decoding.
+
+#### Ordering: FIFO within an ordering key, and nothing between keys
+
+A decision, and it was taken on this queue's own terms rather than on SHIP-112's — that ticket was
+being built in the same wave and nothing here depends on it.
+
+**Not global FIFO**: one job's stuck operation would hold up every other job's, which turns one
+problem into a stalled queue and is how a driver discovers at six in the evening that the morning
+never left the handset. **Not unordered**: `Docs/02` §3.1 has the platform absorb a milestone that
+arrives after a later one, and SHIP-112 builds that — but it is a safety net, and sending a driver's
+recorded sequence in an arbitrary order would make every reconnection depend on it. **Per key, then**,
+conventionally `job:<id>`: one job's sequence arrives in the order it was recorded, and one job's
+problem stalls nothing else.
+
+A blocked operation **does** hold its own key, and that is the deliberate half. Releasing what is
+behind it past it would silently reorder exactly the sequence the key exists to preserve. It is
+head-of-line blocking confined to one job, and it is visible — the pending indicator and the
+escalation ladder are counting it, which is what separates "held" from "dropped".
+
+#### Two smaller decisions worth finding later
+
+**The capacity and the body bound are values the queue is given, not constants it holds.**
+`CLAUDE.md` keeps anything that changes under operational pressure server-side, and a queue cannot
+wait for the platform to tell it how large it may be — being unreachable is the situation it exists
+for. So a compiled-in default is unavoidable, and what is available is that it is a default rather
+than a constant: `QueuePolicy` is a constructor argument, and a server-supplied bound needs no change
+in `core/queue`. Neither number is tuned; their job is to make unbounded growth and an unsendable
+body impossible, which is the reasoning SHIP-135 records for the outbox's 16 KiB bound.
+
+**Sign-out does not clear the queue yet, and that is recorded rather than missed.** `Docs/07` §3
+requires it and `OperationQueue.clear` exists, returning how many operations it discarded so that
+even the one bulk removal is something a user can be told about. What is missing is a queue anything
+writes to: **SHIP-125** opens the database at start-up and calls `recover()`, and **SHIP-129** is the
+first screen that puts anything in it. Wiring `SessionController.signOut` today would have every
+widget test open a platform directory in order to clear a store that is always empty.
+`session_controller.dart` carries the same note beside the method.
+
+#### The seam left for SHIP-125, deliberately unbuilt
+
+No sync worker, no backoff, no drain, and no connectivity listener. What is there for it:
+`recover()` for start-up and resume; `claim()` which takes the next sendable operation and counts the
+attempt; `release(id, nextAttemptAt:)` which stores the delay **durably**, because a backoff reset by
+every app launch is no backoff on a handset; `complete(id)` for an accepted one; and
+`block(id, reason: refused)` for one the platform would not take, which is the state SHIP-132 renders
+from. `QueueSnapshot.unsynced` counts pending and in-flight work and deliberately excludes blocked
+work — a number that never falls however long the driver stands in the open is not the number
+`Docs/02` §3.1's indicator is asking for. `OperationKind` has two members, `delivery.milestone` and
+`delivery.proof`, both named by `Docs/01` §4.4 and `Docs/07` §4 rather than invented here; the proof
+is separate because §4 uploads it as a local file and not as part of the milestone request.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **534 host tests** (up from 495), the analyzer clean, and the environment
+test per build flavour. `make verify` does not cover this ticket and its count does not move — that
+script exercises HTTP endpoints and this one adds none, which is the same position SHIP-80, SHIP-105
+and SHIP-110 are in.
+
+**One thing this ticket cannot verify from a Linux CI runner or a macOS host, and it should be
+watched on the first device build.** `sqlite3` 3.x supplies its native library through a build hook
+rather than through `sqlite3_flutter_libs`, which now resolves to an empty `0.6.0+eol` marker
+version. Host tests exercise the hook and pass; `make flutter-build` was not run, because iOS and
+Android builds are not part of `flutter-check` and SHIP-24…27 are where they get a runner. Whoever
+first builds for a device confirms the library arrives in the bundle.
 
 ## 4. Partly done — do not treat these as finished
 

@@ -136,8 +136,14 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
   /// Ends the session on this device.
   ///
   /// `Docs/07` §3 also clears the offline queue, cached job data and the push registration at
-  /// sign-out. Those arrive with SHIP-124, SHIP-143 and the caching work, and each clears its
-  /// own store; this method is the point they will be called from.
+  /// sign-out. Each clears its own store; this method is the point they are called from.
+  ///
+  /// **The queue's half exists and is deliberately not called from here yet.** SHIP-124 built
+  /// `OperationQueue.clear`, which reports how many operations it discarded so that even a bulk
+  /// removal is something a user can be told about. What is missing is a queue anything writes
+  /// to: SHIP-125 opens the database at start-up and recovers it, and SHIP-129 is the first
+  /// screen that puts anything in it. Wiring it now would have every widget test open a platform
+  /// directory in order to clear a store that is always empty. `Docs/11` §3, SHIP-124.
   ///
   /// The state changes even when clearing throws, and the failure is not rethrown. A sign-out
   /// that leaves the user in the signed-in shell because a delete failed is the worst of both

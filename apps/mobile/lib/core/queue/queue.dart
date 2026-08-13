@@ -1,19 +1,40 @@
 /// The durable local operation queue (`Docs/07` §4, SHIP-124).
 ///
-/// **Structure only. There is no queue here yet**, and SHIP-17 deliberately did not build
-/// one — this folder exists so that when SHIP-124 arrives it has an obvious home and no
-/// argument about where.
+/// `Docs/07` §4 calls this the single most important client capability and the one most often
+/// underestimated. Its principle is one sentence — **the user records what happened and moves
+/// on; syncing is the platform's problem** — and its hard requirement is one more: an operation
+/// is **never silently dropped**.
 ///
-/// The decision that shapes it is already made: **Drift over SQLite**, in `Docs/10` §8.3 and
-/// `Docs/07` §9. The reason is transactional rather than about storage. An operation, its
-/// client-generated idempotency key, the time the user acted, and the local path to its proof
-/// image either all commit or none of them do, and the sync worker has to mark an item in
-/// flight and recover cleanly when the process dies mid-upload. A key-value store cannot
-/// express that, and the first time it half-writes an entry the client has quietly dropped
-/// precisely what `Docs/07` §4 promises it will not.
+/// ## What is here
 ///
-/// The Drift dependency is not in `pubspec.yaml` yet. It pulls a native SQLite library into
-/// both platform builds, and adding that ahead of the code that uses it buys nothing —
-/// `flutter analyze` cannot tell an unused dependency from a missing one. It arrives with
-/// SHIP-124.
+/// - `queued_operation.dart` — what a queued operation is, the kinds there are, and the two
+///   shapes a stored row can be read back as.
+/// - `queue_database.dart` — the Drift table and database. One table, `queued_operations`.
+/// - `operation_queue.dart` — the queue itself: enqueue, the snapshot a counter and a
+///   reconciliation screen read, and the claim/release/complete seam the sync worker drains
+///   through.
+///
+/// ## What is deliberately not here
+///
+/// **The sync worker is SHIP-125.** Nothing in this folder decides when to send, how long to
+/// wait after a failure, or what a particular platform refusal means. What it does is make those
+/// decisions safe to take: every attempt reuses the idempotency key minted when the user acted,
+/// a claim that never came back is recovered rather than stranded, and an item nothing can be
+/// done with is quarantined where it stays visible instead of vanishing.
+///
+/// ## Storage: Drift over SQLite
+///
+/// Decided before this ticket, in `Docs/10` §8.3 and `Docs/07` §9, and the reason is
+/// transactional rather than about storage. An operation, its idempotency key, the time the user
+/// acted and the local path to its proof image either all commit or none of them do; and the
+/// worker has to mark an item in flight and recover cleanly when the process dies mid-upload. A
+/// key-value store cannot express either, and the first time it half-writes an entry the client
+/// has dropped exactly what `Docs/07` §4 promises it will not.
+///
+/// ## Sign-out
+///
+/// `Docs/07` §3 clears the queue at sign-out. [OperationQueue.clear] is that call and reports how
+/// many operations it discarded, so a bulk removal is still something a person can be told about.
+/// It is not yet wired into `SessionController.signOut` — see `Docs/11` §3, SHIP-124, for why
+/// that waits for the ticket that opens the database at start-up.
 library;
