@@ -137,6 +137,29 @@ func testDriverGuard() Guard {
 	return guard
 }
 
+// testAdminGuard is the administrator half of the same seam (SHIP-15r), and it exists ahead of the
+// guard for a reason that is about this package's *tests* rather than about the guard.
+//
+// SHIP-108's measured cost is on record in Docs/11 §9: filling the driver seam changed 15 `nil`
+// call sites across five test files, because newRouter takes the guard as an argument and every
+// test that builds a router passes one. That churn is mechanical, it is unreviewable in a diff that
+// also contains a token verifier, and it belongs to nobody — so SHIP-15r absorbs it here instead of
+// leaving it in SHIP-147's diff. Every caller in this package already says `testAdminGuard()`, and
+// SHIP-147 changes the body of this function and of newAdminGuard, and nothing else.
+//
+// It returns nil today, which is correct rather than a placeholder: no route declares RequireAdmin,
+// so the class stays out of the guard map and a router built from this is exactly the router
+// main.go builds. When a route does declare it, a nil guard makes the router panic at startup
+// naming the class — which is how the driver half announced itself, and is the failure this helper
+// converts from fifteen edits into one.
+func testAdminGuard() Guard {
+	guard, err := newAdminGuard(testDeps().Config, nil, clock.System{})
+	if err != nil {
+		panic("cmd/api test: building the admin guard: " + err.Error())
+	}
+	return guard
+}
+
 // testAccessToken mints a token the test router will accept.
 func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sessionID uuid.UUID) {
 	t.Helper()
@@ -159,7 +182,7 @@ func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sess
 }
 
 func testRouter() http.Handler {
-	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
+	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard())
 }
 
 // SHIP-6's acceptance criterion: GET /health returns 200 with version and commit.
