@@ -170,6 +170,19 @@ ok "an event whose transaction rolled back is not in the outbox to be published"
 
 # --- the worker ---------------------------------------------------------------------------
 
+# SHIP-136's rows, captured **before** the worker starts and by identifier.
+#
+# 61-bidding.sh and 70-delivery.sh emit bid and delivery events through the served endpoints and
+# deliberately leave them unpublished; this worker run is what puts them on their topics, and the
+# section after this one reads them off the wire. Taken as a list of ids rather than as a count or a
+# timestamp window, because `shipper.bid` and `shipper.delivery` are **not** emptied by this file and
+# are shared with every other worktree on this machine — see the SHIP-135 section's note on why a
+# fence over a Kafka topic has to be an id.
+ship136_ids="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select id from outbox
+     where aggregate_type in ('bid', 'delivery') and published_at is null
+     order by id;" | tr -d ' ' | grep . || true)"
+
 pushd "$ROOT/services/core" >/dev/null
 go build -o "$WORKDIR/shipper-worker" ./cmd/worker
 popd >/dev/null
@@ -189,12 +202,23 @@ worker_pid=$!
 # Four: the three fixtures and the cancellation the endpoint emitted. Counted on the two
 # aggregates this section owns rather than on the outbox as a whole, because what else is in
 # there is another section's business — the same fencing the comparison below needs.
+#
+# It also waits on SHIP-136's bid and delivery rows, because the section below reads them off their
+# topics and this is the only worker run in the harness — a poll that stopped at four could kill the
+# worker mid-pass and leave them undrained. `is null` rather than a comparison against
+# `$ship136_ids`, which is the same query the other way round and shorter: this database is per
+# worktree, so an unpublished bid or delivery row is this run's or an earlier run's on this tree, and
+# draining either is right.
 published=0
+ship136_remaining=1
 for _ in $(seq 1 100); do
   published="$("$PSQL" "$DATABASE_URL" -tAc \
     "select count(*) from outbox
       where aggregate_id in ('$committed_job', '$emitted_job') and published_at is not null;")"
-  if [[ "$published" == "4" ]]; then break; fi
+  ship136_remaining="$("$PSQL" "$DATABASE_URL" -tAc \
+    "select count(*) from outbox
+      where aggregate_type in ('bid', 'delivery') and published_at is null;")"
+  if [[ "$published" == "4" && "$ship136_remaining" == "0" ]]; then break; fi
   sleep 0.2
 done
 
@@ -328,6 +352,130 @@ for line in open(sys.argv[1]):
   || fail "the first fixture came off the topic as [$consumed_payload], want job.published/1"
 ok "each message carries its event id, its type and the payload the domain wrote"
 
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-136  bid and delivery events reach their own topics, keyed on their aggregate"
+
+# The last leg of SHIP-136: the events 61-bidding.sh and 70-delivery.sh emitted through the served
+# endpoints, taken off `shipper.bid` and `shipper.delivery` by a consumer that is not this codebase.
+#
+# Those two sections assert the outbox rows, which is where the transactional guarantee lives.
+# internal/bidding/events_test.go and internal/delivery/events_test.go assert the payloads, the retry
+# paths and the rolled-back transaction. **What only this can show is that the rows the domains wrote
+# publish to the right topic and are readable off it** — which before this ticket was true of
+# `shipper.job` alone, and was the reason the SHIP-135 section below could break `shipper.delivery`
+# freely.
+#
+# # It sits between SHIP-134's section and SHIP-135's on purpose
+#
+# The section below **deletes `shipper.delivery`** to demonstrate that a topic somebody created by
+# hand with the wrong partition count is reported rather than repaired. That was free while nothing
+# published to it. It is not free now, so this reads the topic first, and the note in that section
+# has been corrected to say what it is now destroying.
+#
+# # Everything here is fenced by event id, and nothing here empties a topic
+#
+# `shipper.bid` and `shipper.delivery` are shared with every other worktree on this machine —
+# `COMPOSE_PROJECT_NAME` is pinned, so there is one broker — and unlike `shipper.job` above, this
+# file does not wipe them. So the assertion is a **subset**: every id this run published is on the
+# topic. A count, or an equality against everything on the topic, would be a statement about whatever
+# else the machine is doing. Docs/11 §3's SHIP-135 entry has the run that proved it.
+
+if [[ -z "$ship136_ids" ]]; then
+  fail "no bid or delivery events were waiting to be published; 61-bidding.sh and 70-delivery.sh emit them, so this check is proving nothing"
+fi
+
+# consume_topic <topic> <file> — everything on a topic, one JSON message per line.
+#
+# Far more asked for than this run wrote, because the topic is shared and not emptied: the point is
+# to read past other worktrees' messages rather than stop at a cut. The consumer therefore always
+# ends on its no-more-messages timeout, which is a non-zero exit and not a failure.
+consume_topic() {
+  "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-consumer.sh" \
+    --bootstrap-server localhost:9092 --topic "$1" --from-beginning \
+    --max-messages 500 --timeout-ms 8000 2>/dev/null | tr -d '\r' >"$2" || true
+}
+
+consume_topic shipper.bid "$WORKDIR/bid-consumed.json"
+consume_topic shipper.delivery "$WORKDIR/delivery-consumed.json"
+cat "$WORKDIR/bid-consumed.json" "$WORKDIR/delivery-consumed.json" >"$WORKDIR/ship136-consumed.json"
+
+printf '%s\n' "$ship136_ids" >"$WORKDIR/ship136-ids.txt"
+
+# Every id this run published, on the topic its aggregate names — and on that topic rather than
+# merely somewhere. An event routed to the wrong topic is read by nobody and reports nothing.
+python3 - "$WORKDIR/ship136-ids.txt" "$WORKDIR/bid-consumed.json" "$WORKDIR/delivery-consumed.json" <<'PY' \
+  || fail "an event a domain emitted is not on the topic its aggregate names"
+import json, sys
+
+wanted = {line.strip() for line in open(sys.argv[1]) if line.strip()}
+
+on = {}
+for path, topic in ((sys.argv[2], "shipper.bid"), (sys.argv[3], "shipper.delivery")):
+    for line in open(path):
+        if not line.strip():
+            continue
+        e = json.loads(line)
+        on[e["id"]] = (topic, e)
+
+missing = sorted(wanted - set(on))
+if missing:
+    sys.exit("%d of %d events are on neither topic: %s" % (len(missing), len(wanted), " ".join(missing[:5])))
+
+wrong = [
+    "%s is a %s event on %s" % (i, on[i][1]["aggregate_type"], on[i][0])
+    for i in wanted
+    if on[i][0] != "shipper." + on[i][1]["aggregate_type"]
+]
+if wrong:
+    sys.exit("; ".join(wrong[:5]))
+
+PY
+ok "every bid and delivery event this run emitted is on shipper.bid or shipper.delivery, on the topic its aggregate names"
+
+# The type and the version, off the wire. Both halves matter: a consumer branches on `type`, and
+# `schema_version` is what lets it refuse a shape it was not built for. The types are listed rather
+# than counted, so a section that quietly stopped exercising one is reported.
+python3 - "$WORKDIR/ship136-ids.txt" "$WORKDIR/ship136-consumed.json" <<'PY' \
+  || fail "the events on the topic are not the ones SHIP-136 says this platform emits"
+import json, sys
+
+wanted = {line.strip() for line in open(sys.argv[1]) if line.strip()}
+seen = {}
+for line in open(sys.argv[2]):
+    if not line.strip():
+        continue
+    e = json.loads(line)
+    if e["id"] in wanted:
+        seen[e["type"]] = e
+
+expected = {
+    "bid.placed", "bid.revised", "bid.withdrawn",
+    "bid.countered", "bid.accepted", "bid.rejected",
+    "delivery.driver_assigned", "delivery.milestone_recorded", "delivery.proof_recorded",
+}
+absent = sorted(expected - set(seen))
+if absent:
+    sys.exit("nothing on the topic for: %s" % " ".join(absent))
+
+for name, e in sorted(seen.items()):
+    if e.get("schema_version") != 1 or e["payload"].get("schema_version") != 1:
+        sys.exit("%s is on the wire at envelope %s / payload %s, want 1 / 1"
+                 % (name, e.get("schema_version"), e["payload"].get("schema_version")))
+
+PY
+ok "all nine bid and delivery event types reach a consumer, each carrying its schema version in the envelope and in the payload"
+
+# The budget, one last time, on the bytes a consumer actually receives. The tripwire exists in three
+# places now — the catalogue test in cmd/api, the closed key sets in the two domains' tests, and here
+# — because this is the only one that reads what left the building.
+if grep -qi 'budget' "$WORKDIR/ship136-consumed.json"; then
+  fail "a message on shipper.bid or shipper.delivery mentions a budget"
+fi
+ok "and nothing on either topic mentions a budget, which is the last point at which it could have been redacted"
+
+unset -f consume_topic
+
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-135  topics exist with a versioned schema for each domain event"
 
@@ -351,9 +499,15 @@ ticket "SHIP-135  topics exist with a versioned schema for each domain event"
 # # Fencing
 #
 # It asserts on shipper.job only through $WORKDIR/outbox-consumed.json, which the section above
-# produced from a topic it had just emptied. The one topic it manipulates is **shipper.delivery**,
-# which no code publishes to yet — deliberately, so that breaking a topic on purpose cannot cost
-# another section anything.
+# produced from a topic it had just emptied. The one topic it manipulates is **shipper.delivery**.
+#
+# **That used to be free and is not any more.** The original note read "which no code publishes to
+# yet — deliberately, so that breaking a topic on purpose cannot cost another section anything", and
+# SHIP-136 ended it: `internal/delivery` now emits three events onto that topic. So the SHIP-136
+# section is placed **above** this one rather than below, and has already read what it needs off
+# shipper.delivery before the deletion here destroys it. Whoever adds the next Kafka assertion should
+# read that ordering as load-bearing: there is no longer a topic in the set that nothing publishes
+# to, so a section that breaks one has to run after every section that reads it.
 
 topics_apply() {
   KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
@@ -401,7 +555,8 @@ ok "applying the set again creates nothing and still exits zero — safe on ever
 
 # --- a topic that drifted is refused, not corrected ---------------------------------------------
 
-# Staged on shipper.delivery, which nothing publishes to yet. This is the failure the command
+# Staged on shipper.delivery, whose messages the SHIP-136 section above has already read — see this
+# section's header for why the ordering matters now. This is the failure the command
 # exists to catch: somebody creates a topic by hand to unblock something, with the default one
 # partition, and every consumer's ordering guarantee quietly goes with it.
 "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
@@ -514,11 +669,16 @@ ok "the version is a Kafka header on the event a domain emitted, and on none of 
 # payload that changes shape moves a line; a line that moved without its `v` moving is the defect
 # the file exists to make visible in review.
 events_golden="$ROOT/services/core/cmd/api/events_golden.txt"
-for event in job.status_changed job.expiry_warned job.expiry_extended; do
-  grep -qE "^shipper\.job +$event +v[0-9]+ +[0-9]+ +[a-z_]+:" "$events_golden" \
-    || fail "$event has no schema recorded in cmd/api/events_golden.txt"
+for event in \
+  job:job.status_changed job:job.expiry_warned job:job.expiry_extended \
+  bid:bid.placed bid:bid.revised bid:bid.withdrawn \
+  bid:bid.countered bid:bid.accepted bid:bid.rejected \
+  delivery:delivery.driver_assigned delivery:delivery.milestone_recorded \
+  delivery:delivery.proof_recorded; do
+  grep -qE "^shipper\.${event%%:*} +${event#*:} +v[0-9]+ +[0-9]+ +[a-z_]+:" "$events_golden" \
+    || fail "${event#*:} has no schema recorded in cmd/api/events_golden.txt"
 done
-ok "each of the three domain events has a recorded schema: topic, version, bound and field set"
+ok "each of the twelve domain events has a recorded schema: topic, version, bound and field set"
 
 # The budget-privacy invariant, applied to the catalogue rather than to one payload. An event is
 # the worst place for it to appear, because it travels past every point a response body could have
@@ -529,7 +689,7 @@ fi
 ok "and no event in the catalogue declares a budget field, in this domain or any later one"
 
 unset consumed consumed_ids consumed_sorted outbox_sorted ours_in_order emitted_type consumed_payload
-unset published worker_pid outbox_fence outbox_token emitted_job emitted_rows
+unset published ship136_remaining ship136_ids worker_pid outbox_fence outbox_token emitted_job emitted_rows
 unset committed_job rolled_back_job rolled_back_rows outbox_topic
 unset event_ids
 unset described retention_stated stored_version wire_version headers events_golden event topic
