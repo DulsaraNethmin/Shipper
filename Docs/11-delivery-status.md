@@ -5573,14 +5573,17 @@ this application discusses the credential header and `localStorage` at length �
 the page copy that reads "there is no account to sign in to", which is the page saying the right
 thing, and the rule was narrowed from a phrase search to a file set in response.
 
-**`make web-check` does not run those tests, and that is a one-line ask rather than a gap this lane
-could close.** The target is `web-lint web-build web-typecheck` in `mk/web.mk`, and both that file
-and `.github/workflows/web-driver-portal.yml` are outside this lane's ownership. `pnpm -r run test`
-skips packages with no `test` script, so **`web-check: web-lint web-build web-typecheck web-test`
-plus a three-line `web-test` target is the whole change**, and it would pick up the admin panel's
-tests for free when it grows some. Until it lands the tests are run by hand, and a test that quietly
-does not run is the thing this repository is most careful about — which is why it is stated here, in
-the README, and in this paragraph rather than assumed.
+~~**`make web-check` does not run those tests, and that is a one-line ask rather than a gap this lane
+could close.**~~ **Closed by the follow-up run below.** `web-check` is now
+`web-lint web-test web-build web-typecheck`, `web-test` exists, and CI runs it because both web
+workflows run `web-check`. The original reasoning stood: the target was
+`web-lint web-build web-typecheck` in `mk/web.mk`, both that file and
+`.github/workflows/web-driver-portal.yml` were outside SHIP-120's ownership, and `pnpm -r run test`
+skips a package with no `test` script — which was confirmed rather than assumed before the target
+was written, and the admin panel is untouched until it grows one. The point it was making is the one
+worth keeping: **a test that quietly does not run is the thing this repository is most careful
+about**, which is `CLAUDE.md`'s position on integration tests that skip, applied to a surface where
+nothing enforced it.
 
 **Demonstrated in a real browser against a real running service, not asserted.** Headless Chrome
 against the built portal on 3002 and the API on 8093, over two awarded jobs each with a real driver
@@ -5600,8 +5603,10 @@ deriving the job identifier from the token instead of from the path makes the wr
 *succeed*, and every test in the application still passes.** That is the tautology described at the
 top of this entry, made concrete: the platform's one-job check is only worth anything while the
 client states its intention independently of the credential, and no test on either side of the wire
-catches a client that stops doing so. It is recorded because it is the thing SHIP-121, SHIP-122 and
-SHIP-123 are most likely to do by accident while making the code tidier.
+catches a client that stops doing so. ~~It is recorded because it is the thing SHIP-121, SHIP-122 and
+SHIP-123 are most likely to do by accident while making the code tidier.~~ **It is now caught —
+`lib/one-job.test.ts`, in the follow-up below.** The finding stands exactly as written; what has
+changed is that a test fails when somebody makes it true.
 
 **What SHIP-121's endpoint should look like, which this ticket makes obvious and builds none of.**
 §9 already carries the correction — the driver's idempotency scope was booked against SHIP-112 and
@@ -5644,6 +5649,87 @@ delivery page is credential-gated and would index as a refusal.
 
 No new dependency, no lockfile change, no Go, no route, no contract, no migration, and no
 `make verify` section — this ticket adds no HTTP endpoint to the platform.
+
+### The two gaps SHIP-120 recorded, closed — and this claims no ticket
+
+A follow-up run on the same branch, holding no ticket of its own: SHIP-120 is delivered and both
+findings above are now closed rather than only found. Nothing here builds SHIP-121, SHIP-122 or
+SHIP-123, and nothing here touches Go.
+
+**The surviving mutation is caught, and it is caught on the wire.** `lib/one-job.test.ts` opens a
+link whose *URL* names one job and whose *token* grants another, and asserts on **the requests the
+portal actually issues**. Both hops are real: `openLink` is what the page calls, its `fetch` is
+answered by the application's own route handler — the same `GET` Next serves — and that handler's
+outbound call is what the test records. Only the platform is a stand-in, and the stand-in
+*implements* SHIP-108's check rather than asserting about it, so the wrong-job case is refused there
+for the same reason it is refused in production.
+
+**It is deliberately not a source scan**, and the reason is two scars in this file: §7a's budget
+guard was satisfied by a rename, and §9 records the client-side one carrying the same blind spot. A
+scan for "does anything decode the token" would be a third of those. Asking instead what path left
+the process cannot be renamed past.
+
+**Demonstrated in both directions, at all three places the mutation could be made**, each applied,
+run, and reverted to a byte-identical file:
+
+| The job identifier derived from the token in | Result |
+|---|---|
+| `lib/open.ts` — what the page calls | 23 pass, **2 fail**: the upstream path is the token's job, and the wrong-job case returns a delivery instead of the refusal |
+| `lib/delivery.ts` — the browser's fetch | 23 pass, **2 fail**, identically |
+| `app/api/driver/jobs/[jobId]/route.ts` — the outbound hop | 22 pass, **3 fail**: the two above plus `surface.test.ts`'s single-path assertion |
+| nothing mutated | **25 pass** |
+
+The first row is the one to read against the original finding. **Under that same mutation, all five
+of `surface.test.ts`'s tests still pass** — the guard that was in place kept passing, exactly as
+recorded, and the two that fail are the new ones.
+
+**One structural change made the test possible, and it is worth naming as a cost.** Reading the link
+— `tokenForThisView` and `openLink` — moved out of `components/delivery-link.tsx` into
+`lib/open.ts`. **Node 22 strips types but not JSX**, so nothing inside a `.tsx` file can be reached
+by `node --test`, and the chain had to be somewhere a test could call it. The component is left
+holding state and markup, which is the half a test could not check anyway. `lib/alias-hooks.mts` is
+the other piece: fifteen lines resolving `@/` the way `tsconfig.json` does, registered by the one
+test that imports the route handler, so no other test file's runtime changes.
+
+**`make web-check` runs the tests.** `web-check` is now `web-lint web-test web-build web-typecheck`
+— 25 tests where it ran none, and green in a worktree. **The tests sit second rather than last on
+purpose**: they cost a tenth of a second against the build's thirty, so a failing guard is reported
+before the slow part, and they depend on nothing the build produces. The lint → build → typecheck
+order SHIP-15e established is untouched, because that dependency is the type-check's alone.
+`pnpm -r run test` skipping a package with no `test` script was **confirmed, not assumed** — the
+target exits 0 and never names the admin panel — so the admin surface is unaffected until it grows
+a script. Both workflows' job names now read `lint, test, build, typecheck`, because a job name
+claiming three checks while the target ran four is the same drift in miniature.
+
+**The path filter was re-demonstrated rather than trusted to have survived**, by evaluating every
+workflow's `paths:` block against this run's own changed files:
+
+| A change to | Go | Flutter | Admin | Driver portal |
+|---|---|---|---|---|
+| `apps/driver-portal/lib/one-job.test.ts` | — | — | — | runs |
+| `apps/driver-portal/.gitignore` | — | — | — | runs |
+| `apps/admin/.gitignore` | — | — | runs | — |
+| `.github/workflows/web-driver-portal.yml` | — | — | — | runs |
+| `mk/web.mk` | **runs** | — | runs | runs |
+| `services/core/**` | runs | — | — | — |
+| `apps/mobile/**` | — | runs | — | — |
+| `Docs/**` | — | — | — | — |
+
+A driver-portal change starts the driver-portal workflow and nothing else, which is the line that
+mattered. **The `mk/web.mk` row is a finding and it is not this run's to fix**: `go.yml` filters on
+`mk/**`, so a change to the *web* make targets starts the **Go** workflow. `flutter.yml` narrowed
+that glob deliberately and says so in its header — "it deliberately does not list `mk/**` the way
+the Go workflow does" — and the Go workflow did not follow. It is one line in a file this run does
+not own, it costs a Linux run rather than a macOS one, and it is reported here rather than changed.
+
+**`next dev` writes `AGENTS.md` and `CLAUDE.md` into the application it serves**, on every start.
+They were in no `.gitignore`, so `git add -A` collected them — a generated file arriving in a commit
+that has nothing to do with it. The rules are **app-local**, one file per web surface, rather than in
+the root `.gitignore`: the root file is shared with every lane and these are not, so the change
+lands with no chance of a conflict — and a path-scoped `/CLAUDE.md` in `apps/<app>/` cannot reach
+the repository's own `CLAUDE.md`, which a `**/CLAUDE.md` in the shared file very nearly could.
+Verified by running `next dev` for **both** surfaces, stopping it, and reading `git status` clean
+with `git check-ignore -v` naming the rule.
 
 ## 4. Partly done — do not treat these as finished
 

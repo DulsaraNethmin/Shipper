@@ -14,7 +14,7 @@ in the MVP (`Docs/08` Step 0).
 
 ```
 make web-dev app=driver-portal    run it at http://localhost:3002
-make web-check                    lint, build and type-check every web application
+make web-check                    lint, test, build and type-check every web application
 ```
 
 ## The link
@@ -75,19 +75,29 @@ pnpm --filter ./apps/driver-portal test
 ```
 
 `node --test` over `lib/`. **There is no test framework in this application's dependencies and that
-is deliberate**: Node 22 strips TypeScript types itself, so twenty tests cost no dependency, no
+is deliberate**: Node 22 strips TypeScript types itself, so twenty-five tests cost no dependency, no
 lockfile change and no build step. `tsconfig.json` sets `allowImportingTsExtensions` so a test can
 import `./link.ts` by its real name.
 
-`lib/surface.test.ts` is the one worth knowing about. **The driver's token goes to one endpoint, and
-adding a second place it could go is a failing test rather than a review comment**: the set of files
-that may make a request, name a credential, or hold one is closed, and the test names the file when
-it grows. It reads code with the comments stripped, because every doc comment here discusses
-the credential header and `localStorage` at length.
+**`make web-check` runs them**, second in `web-lint web-test web-build web-typecheck` — before the
+build rather than after the type-check, because they cost a tenth of a second and depend on nothing
+the build produces.
 
-**`make web-check` does not run it yet.** That target is `web-lint web-build web-typecheck` in
-`mk/web.mk`, and both are shared surfaces this ticket may not edit — see `Docs/11` §3's SHIP-120
-entry, which records the one-line change being asked for.
+Two are worth knowing about.
+
+`lib/one-job.test.ts` holds the property the whole surface rests on: **what leaves this portal names
+the job in the URL, never the job in the token**. It opens a link whose path names one job and whose
+credential grants another, and asserts on the requests that actually go out — through the route
+handler, to a stand-in platform that performs SHIP-108's comparison itself. Deriving the identifier
+from the token, anywhere in that chain, fails it. That mutation passed every test this application
+had when SHIP-120 shipped, which is why the test exists; `Docs/11` §3 records it.
+
+`lib/surface.test.ts` is the other. **The driver's token goes to one endpoint, and adding a second
+place it could go is a failing test rather than a review comment**: the set of files that may make a
+request, name a credential, or hold one is closed, and the test names the file when it grows. It
+reads code with the comments stripped, because every doc comment here discusses the credential
+header and `localStorage` at length. It reads *source*, which is a weaker kind of guard — the reason
+`one-job.test.ts` asks what went out on the wire instead.
 
 ## The invariant that defines this surface
 
