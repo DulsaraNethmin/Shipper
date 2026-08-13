@@ -58,6 +58,27 @@ import (
 // controller election in progress can take seconds; anything past this is a broker problem.
 const applyTimeout = 30 * time.Second
 
+// replicationFlag is the operator's override of KAFKA_REPLICATION_FACTOR.
+const replicationFlag = "replication"
+
+// chosenReplication picks the flag when the operator gave one and the configuration otherwise
+// (SHIP-15m).
+//
+// It asks which flags were **set** rather than which are non-zero, and that distinction is the
+// whole function. A flag's default cannot be the configured value — the flag set is built before
+// config.Load runs — so "was it given" has to come from fs.Visit. Treating zero as "not given"
+// instead would make `-replication 0` silently apply the configured factor, when an operator who
+// typed a number meant it and is owed the refusal that follows.
+func chosenReplication(fs *flag.FlagSet, flagValue, configured int) int {
+	chosen := configured
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == replicationFlag {
+			chosen = flagValue
+		}
+	})
+	return chosen
+}
+
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "shipper-topics: %v\n", err)
@@ -69,10 +90,17 @@ func run(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("topics", flag.ContinueOnError)
 	fs.SetOutput(out)
 
-	// The one genuinely environment-dependent number in the topic set, and a flag rather than
-	// an entry in internal/config — see events.DefaultReplicationFactor for why.
-	replication := fs.Int("replication", events.DefaultReplicationFactor,
-		"replication factor for created topics; a deployed cluster wants 3")
+	// The one genuinely environment-dependent number in the topic set. It is configuration —
+	// KAFKA_REPLICATION_FACTOR, folded in at SHIP-15m — and this flag overrides it.
+	//
+	// **Both, rather than one.** A deployment sets the variable once and runs the step with no
+	// arguments, the same way it runs cmd/migrate; an operator applying the set to one cluster
+	// by hand types the number and needs nothing else in their environment. The flag declares no
+	// default of its own because the default is the configuration, which is not loaded yet when
+	// the flag set is built — see chosenReplication.
+	replication := fs.Int(replicationFlag, 0,
+		"replication factor for created topics, overriding KAFKA_REPLICATION_FACTOR; "+
+			"a deployed cluster wants 3")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -84,8 +112,13 @@ func run(args []string, out io.Writer) error {
 	if len(cfg.Kafka.Brokers) == 0 {
 		return errors.New("KAFKA_BROKERS is empty, so there is no cluster to apply the topic set to")
 	}
-	if *replication < 1 {
-		return fmt.Errorf("-replication is %d; a topic needs at least one replica", *replication)
+
+	factor := chosenReplication(fs, *replication, cfg.Kafka.ReplicationFactor)
+
+	// Only reachable from the flag: config.Load refuses a variable below one, with the variable
+	// named. So the message names the flag.
+	if factor < 1 {
+		return fmt.Errorf("-replication is %d; a topic needs at least one replica", factor)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
@@ -96,14 +129,14 @@ func run(args []string, out io.Writer) error {
 	fmt.Fprintf(out, "applying %d topic(s) to %s\n",
 		len(events.Topics()), strings.Join(cfg.Kafka.Brokers, ","))
 
-	created, err := create(ctx, client, plan(*replication))
+	created, err := create(ctx, client, plan(factor))
 	if err != nil {
 		return err
 	}
 	for _, topic := range events.Topics() {
 		if created[topic] {
 			fmt.Fprintf(out, "  %-20s created  (%d partitions, replication %d, retention %s)\n",
-				topic, events.TopicPartitions, *replication, events.TopicRetention)
+				topic, events.TopicPartitions, factor, events.TopicRetention)
 		} else {
 			fmt.Fprintf(out, "  %-20s exists\n", topic)
 		}

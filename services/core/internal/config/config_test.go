@@ -16,7 +16,7 @@ var allKeys = []string{
 	"LOG_LEVEL", "LOG_FORMAT",
 	"DATABASE_URL", "DATABASE_MAX_OPEN_CONNS", "DATABASE_MAX_IDLE_CONNS", "DATABASE_CONN_MAX_LIFETIME",
 	"REDIS_URL",
-	"KAFKA_BROKERS",
+	"KAFKA_BROKERS", "KAFKA_REPLICATION_FACTOR",
 	"IDENTITY_ARGON2_MEMORY_KIB", "IDENTITY_ARGON2_ITERATIONS", "IDENTITY_ARGON2_PARALLELISM",
 	"IDENTITY_ACCESS_TOKEN_TTL", "IDENTITY_ACCESS_TOKEN_KEYS", "IDENTITY_ACCESS_TOKEN_ACTIVE_KID",
 	"GEOCODING_BASE_URL", "GEOCODING_API_KEY",
@@ -65,6 +65,12 @@ func TestLoadAppliesDocumentedDefaults(t *testing.T) {
 	}
 	if len(cfg.Kafka.Brokers) != 1 || cfg.Kafka.Brokers[0] != "localhost:29092" {
 		t.Errorf("Kafka.Brokers = %v, want [localhost:29092]", cfg.Kafka.Brokers)
+	}
+	// One replica, which is all a single-broker compose stack can do. cmd/topics holds this
+	// against the event catalogue's own constant.
+	if cfg.Kafka.ReplicationFactor != DefaultKafkaReplicationFactor {
+		t.Errorf("Kafka.ReplicationFactor = %d, want %d",
+			cfg.Kafka.ReplicationFactor, DefaultKafkaReplicationFactor)
 	}
 }
 
@@ -169,6 +175,10 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{"idle exceeds open", map[string]string{
 			"DATABASE_MAX_OPEN_CONNS": "5", "DATABASE_MAX_IDLE_CONNS": "10",
 		}, "cannot exceed"},
+		// A topic needs at least one replica, and 30 typed for 3 is refused before a
+		// connection is opened rather than by the broker.
+		{"no replicas", map[string]string{"KAFKA_REPLICATION_FACTOR": "0"}, "between 1 and 10"},
+		{"absurd replication", map[string]string{"KAFKA_REPLICATION_FACTOR": "30"}, "between 1 and 10"},
 	}
 
 	for _, tc := range tests {

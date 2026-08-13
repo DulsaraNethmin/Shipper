@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**206 tickets, 639 points.**
+**207 tickets, 642 points.**
 
 ## How to read this
 
@@ -24,7 +24,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 
 **Depends on** lists real blockers only, not merely earlier tickets. Where a ticket has no dependency it can genuinely be pulled forward if you want a change of pace.
 
-**Dependencies point backwards, with exactly two exceptions — do not write a parser that assumes otherwise.** `SHIP-15c` depends on `SHIP-17a` and `SHIP-15e` depends on `SHIP-44`, both because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Both targets are long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
+**Dependencies point backwards, with exactly three exceptions — do not write a parser that assumes otherwise.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, and `SHIP-15m` depends on `SHIP-44` and `SHIP-135` — all because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Every one of those targets is long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
 
 **The two totals above are maintained by hand and the rows are the truth.** `scripts/delivery-status.sh` parses the rows, so `make status` is unaffected by a stale header — which is precisely why one drifted unnoticed after SHIP-15e was added. If the two disagree, correct the header.
 
@@ -35,7 +35,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 35 | 95 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 36 | 98 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 26 | 78 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 27 | 95 |
@@ -43,7 +43,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 13 | 45 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 20 | 65 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 19 | 56 |
-| | | **206** | **639** |
+| | | **207** | **642** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -67,7 +67,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 35 tickets, 95 points
+**Size:** 36 tickets, 98 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -92,6 +92,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-15e | Wave-3 shared surfaces: the verify script, the handler helpers, the done list | 5 | A domain adds a verify section by adding a file and editing none; httpx.H and httpx.DecodeJSON exist and internal/identity uses them; the done list is merge=union; make web-check type-checks after the build | SHIP-15c, SHIP-44 |
 | SHIP-15g | Wave-4 shared surfaces: geocoding and pagination configuration, the out-of-order migration guard, a shutdown hook for scheduled tasks | 5 | Two tracks can start a wave without either needing an internal/config edit; a migration numbered below the current version can no longer be skipped silently; a scheduled task that owns a resource can release it | SHIP-15e |
 | SHIP-15i | Wave-5 shared surfaces: the measured verify count, the tracker index check, the cause of an unmapped 500 | 3 | Two tracks can start wave 5 without either needing an edit to a file the other owns | SHIP-15g |
+| SHIP-15m | Wave-6 shared surfaces: the driver-token guard seam, the Kafka replication factor, three parallel-working rules | 3 | SHIP-108 can supply the RequireDriverToken middleware without editing cmd/api/routes.go, manifest.go or Deps, and a route declaring the class still refuses to start while nothing supplies one; the replication factor is configuration with the flag kept as an override | SHIP-44, SHIP-135 |
 | SHIP-16 | Flutter project scaffold for iOS and Android | 2 | App builds and runs on both simulators | SHIP-1 |
 | SHIP-17 | Flutter feature-folder structure and state management choice | 3 | Structure matches Docs 07 §2 and the state approach is documented | SHIP-16 |
 | SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |

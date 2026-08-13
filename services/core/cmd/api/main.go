@@ -172,9 +172,22 @@ func run() error {
 		return err
 	}
 
+	// The driver portal's job-scoped verifier (SHIP-107, SHIP-108), and the second collaborator
+	// of the router rather than a field on Deps — the reasoning is identical to the paragraph
+	// above and driverauth.go states it in full.
+	//
+	// It returns nil today, which leaves RequireDriverToken **out** of the guard map rather than
+	// mapped to something that refuses: a route declaring the class stops the process at startup
+	// instead of answering 401 forever (see guardsFor). This line is written now so that SHIP-108
+	// fills in driverauth.go and edits nothing shared.
+	driverToken, err := newDriverTokenGuard(cfg, deps.Clock)
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr:    cfg.HTTP.Addr(),
-		Handler: newRouter(deps, idempotencyStore, authenticate),
+		Handler: newRouter(deps, idempotencyStore, authenticate, driverToken),
 
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,

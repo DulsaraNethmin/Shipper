@@ -153,10 +153,18 @@ const (
 // acknowledges anything at all.
 //
 // **A deployed cluster needs three, and this is the one number in the topic set that is genuinely
-// environment-dependent.** internal/config is a shared surface a domain branch may not edit
-// (Docs/10 §9.2), so rather than add KAFKA_REPLICATION_FACTOR here, cmd/topics takes it as a
-// flag defaulting to this — a deployment passes -replication 3 and needs no configuration change.
-// Whoever next owns internal/config should fold it in.
+// environment-dependent.**
+//
+// It was a `cmd/topics -replication` flag alone until SHIP-15m, because internal/config is a shared
+// surface a domain branch may not edit (Docs/10 §9.2) and the track that needed it was one. It is
+// now `KAFKA_REPLICATION_FACTOR` as well, with the flag kept as an operator override — a deployment
+// sets the variable and runs the step with no arguments.
+//
+// This constant remains the catalogue's statement of what the default *is*.
+// config.DefaultKafkaReplicationFactor is a second copy of the number rather than an import,
+// because internal/config has no internal dependencies and importing this package would pull the
+// database driver into every binary's configuration. cmd/topics imports both and
+// TestConfigurationCarriesTheCatalogueDefault fails if they diverge.
 const DefaultReplicationFactor = 1
 
 // BrokerMessageLimitBytes is Kafka's default max.message.bytes, and the ceiling every payload

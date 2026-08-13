@@ -394,6 +394,8 @@ After resolving any conflict: re-run `make check` **and** read `routes_golden.tx
 
 `COMPOSE_PROJECT_NAME` is pinned to `shipper`. Compose otherwise names a project after its directory, so each git worktree would start its own stack and they would fight over ports 5432, 6379 and 29092.
 
+**A single non-reproducing `curl` exit 7 while several tracks are running is the expected cost of that design, not a race in the section that reported it.** One Postgres, one Redis and one broker serve every worktree, and four concurrent `make verify` runs against them will occasionally fail to connect. Wave 5 saw three such exits in three different sections and not one of them reproduced. **Re-run once before investigating, and do not go looking for a race until the stack is quiet** — the conclusion here is a negative one, and it is worth writing down precisely because a flake in somebody else's section reads like a defect in your own.
+
 Dependencies are added deliberately, not opportunistically. If a change genuinely needs a new module, that is a request, not a commit — it takes five minutes and avoids a `go.sum` conflict. Never hand-merge `go.sum`: delete it and run `go mod tidy`.
 
 ### 9.3 Australian English

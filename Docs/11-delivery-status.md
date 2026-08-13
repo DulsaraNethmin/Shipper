@@ -10,7 +10,9 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-13, at the **wave-5 reconciliation pass** — the arithmetic and the narrative brought back into line after eleven tickets landed across four tracks. It corrects §1, §2 and §6, writes wave 5 up as the new §7 with the four earlier waves renumbered behind it, closes the §9 items wave 5 settled, and opens the seven it found. **It is not a backlog ticket**: like `ship-15d`, `ship-15f`, `ship-15h` and `ship-15j` before it, a reconciliation branch names no ticket in its subject and appears in neither `Docs/09` nor `Docs/11-done.txt`.
+**Last updated:** 2026-08-13, at **SHIP-15m — the wave-6 pre-step**, which sits on top of the wave-5 reconciliation pass and is cut from it rather than from `develop`, so that adding a ticket to the backlog moves the arithmetic once instead of twice. It adds §1's and §3's SHIP-15m entries and strikes the four §9 items it closes.
+
+The pass beneath it was the **wave-5 reconciliation** — the arithmetic and the narrative brought back into line after eleven tickets landed across four tracks. It corrects §1, §2 and §6, writes wave 5 up as the new §7 with the four earlier waves renumbered behind it, closes the §9 items wave 5 settled, and opens the seven it found. **That pass is not a backlog ticket**: like `ship-15d`, `ship-15f`, `ship-15h` and `ship-15j` before it, a reconciliation branch names no ticket in its subject and appears in neither `Docs/09` nor `Docs/11-done.txt`. SHIP-15m is the other kind and appears in both.
 
 ---
 
@@ -18,9 +20,9 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 94 | 269 |
+| **Done** | 95 | 272 |
 | Remaining | 112 | 370 |
-| **Total** | 206 | 639 |
+| **Total** | 207 | 642 |
 
 The totals grew by two tickets rather than shrinking: SHIP-15c and SHIP-23a were added to `Docs/09` during wave 2, both work the plan assumed and no ticket owned.
 
@@ -30,14 +32,14 @@ And once more before wave 4: **SHIP-15g** (M0, 5 points), which took 205 tickets
 
 **Wave 5's is SHIP-15i** (M0, 3 points), taking the totals to 206 tickets and 639 points — and it is the first of the five to be *smaller* than the wave before it. Two mechanisms rather than four, because the surfaces wave 5's tracks would meet in are now known well enough to name precisely: the `make verify` count and §3's index, both of which conflicted or were forgotten in wave 4. `internal/money` was considered and deliberately left unwritten; the reasoning is in §3.
 
-**The totals have stood at 206 and 639 since SHIP-15i, and this reconciliation adds nothing to them.** Wave 5's four tracks needed no ticket the plan had missed, and there is **no wave-6 prep ticket yet**. That is not evidence the pattern has ended: a prep ticket gets written in §9 one paragraph at a time by whoever hits the surface first, and wave 5 put five such paragraphs there — the Kafka worktree isolation, two rules `CLAUDE.md` should carry, `KAFKA_REPLICATION_FACTOR`, and a cross-block index. §6 adds a sixth candidate in object storage, which SHIP-114 has now been struck for through four consecutive waves.
+**Wave 6's is SHIP-15m** (M0, 3 points), taking the totals to 207 tickets and 642 points — the sixth prep ticket, and the second in a row to be three rather than five. The wave-5 reconciliation said there was no wave-6 prep ticket *yet*, and that a prep ticket gets written into §9 one paragraph at a time by whoever hits the surface first. That is exactly what happened: **four of the five paragraphs wave 5 left in §9 are struck by this ticket** — the Kafka worktree isolation, the two rules `CLAUDE.md` should carry, and `KAFKA_REPLICATION_FACTOR` — and only the cross-block index is left, which §9 itself calls not urgent. The ticket's *blocking* item came from somewhere else again: §8's `RequireDriverToken` gate, which is a shared-surface edit no domain branch may make and which SHIP-108 is unbuildable without. §6 adds a further candidate in object storage, which SHIP-114 has now been struck for through four consecutive waves.
 
 **One of the 94 was closed by a ruling rather than by work.** SHIP-91 was declared delivered by the owner on 12 August 2026, met by SHIP-80's partial unique index rather than built separately — see §3 and §6. It is why `make status` reports it, along with SHIP-57a, as declared done with no commit subject naming it; both are correct and neither is wishful.
 
 | Milestone | Done | Points |
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
-| **M0** Foundation | 31 / 35 | 81 / 95 |
+| **M0** Foundation | 32 / 36 | 84 / 98 |
 | **M1** Identity | 28 / 28 | 78 / 78 |
 | **M2** Jobs | 18 / 26 | 54 / 78 |
 | **M3** Bidding and award | 8 / 27 | 29 / 95 |
@@ -46,7 +48,7 @@ And once more before wave 4: **SHIP-15g** (M0, 5 points), which took 205 tickets
 | **M6** Admin | 1 / 20 | 3 / 65 |
 | **M7** Hardening | 2 / 19 | 3 / 56 |
 
-**M0 has four tickets left and not one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3 — unchanged through wave 5, because nothing in this repository can move them. Every buildable M0 ticket is done, and **SHIP-15i** is still the last one added — like SHIP-23a, SHIP-15e and SHIP-15g before it, it was a recommendation in §9 and §3 before it was a ticket. That is four of the five lettered M0 tickets, which is worth reading as a mechanism rather than a coincidence: this file's §9 is where the next prep ticket is written, one paragraph at a time, by whoever hits the surface first.
+**M0 still has four tickets left and not one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3 — unchanged through wave 5, because nothing in this repository can move them. Every buildable M0 ticket is done, and **SHIP-15m** is now the last one added — like SHIP-23a, SHIP-15e, SHIP-15g and SHIP-15i before it, it was a recommendation in §9 and §3 before it was a ticket. That is five of the six lettered M0 tickets, which is worth reading as a mechanism rather than a coincidence: this file's §9 is where the next prep ticket is written, one paragraph at a time, by whoever hits the surface first.
 
 **Wave 5 has landed in full.** Four tracks, eleven tickets, **thirty-seven points**, nine agent runs, **no trim taken**. `internal/delivery` stopped being a vocabulary and started serving endpoints, the client took its first steps into the provider half of the product, and the wave found that a guard written to catch a *spelling* is not a guard at all. §7 has the detail.
 
@@ -220,7 +222,7 @@ out of `CHECKS` deliberately — it needs a device, and the Flutter CI job is a 
 until SHIP-24…27 — so it is a check a person invokes when the storage or the session changes.
 The file's own header says which invocation demonstrates which claim.
 
-### M0 — Foundation (31 of 35)
+### M0 — Foundation (32 of 36)
 
 | Ticket | What |
 |---|---|
@@ -237,6 +239,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-15e** | Wave-3 shared surfaces: `scripts/verify/` split out, `httpx.H` and `httpx.DecodeJSON` promoted, the done list moved and union-merged — *see below* |
 | **SHIP-15g** | Wave-4 shared surfaces: `GEOCODING_*` and `PAGINATION_*` configuration, the out-of-order migration guard, and `Task.Close` — *see below* |
 | **SHIP-15i** | Wave-5 shared surfaces: the `make verify` count checked against this file, a §3 row required of every done ticket, and the cause of an unmapped 500 logged — *see below* |
+| **SHIP-15m** | Wave-6 shared surfaces: the `RequireDriverToken` guard seam SHIP-108 fills without editing `routes.go`, `KAFKA_REPLICATION_FACTOR` as configuration, and three parallel-working rules `CLAUDE.md` and `Docs/10` now carry — *see below* |
 | **SHIP-16** | Flutter scaffold — iOS and Android only, floors at iOS 14.0 and Android API 24 |
 | **SHIP-17** | Feature folders per `Docs/07` §2, Riverpod and `go_router`, and a boundary test |
 | **SHIP-17a** | `contracts/openapi.yaml` from per-domain fragments, and three tests holding it to the service |
@@ -3543,6 +3546,102 @@ transition, which is `Docs/02` §5's failed attempt and the case 000601 has no u
 first migration in this repository written to hold a guarantee that a piece of infrastructure was
 already believed to provide.
 
+### SHIP-15m — the wave-6 pre-step, and the seam that is deliberately empty
+
+The sixth prep ticket, and the second at three points rather than five. Three items, and only the
+first of them is why the ticket had to exist before the wave rather than during it.
+
+| Surface | Before | After |
+|---|---|---|
+| `RequireDriverToken` | Declarable in the manifest, enforced by nothing, and **only addable from `cmd/api/routes.go`** — a shared surface the delivery track may not edit, which made SHIP-108 unbuildable from a domain branch | `newRouter` takes the guard as an argument. SHIP-108 fills in `cmd/api/driverauth.go` and edits neither `routes.go`, `manifest.go` nor `Deps` |
+| The Kafka replication factor | `cmd/topics -replication`, defaulting to `events.DefaultReplicationFactor`. The third setting in three waves parked against `internal/config` | `KAFKA_REPLICATION_FACTOR`, bounded 1..10 at load, **with the flag kept as an operator override** |
+| Three rules found in wave 5 | Recorded in §9 by a pass that could not edit `CLAUDE.md` or `Docs/10` | In `CLAUDE.md`'s worktree table and merge instructions, and in `Docs/10` §9.2 |
+
+**The seam is the deliverable, and the mechanism is deliberately absent.** `newDriverTokenGuard`
+returns `nil` today. SHIP-107 signs the job-scoped token and SHIP-108 verifies it; nothing here
+signs, expires or verifies anything, and a reviewer who finds token logic in this ticket has found
+a defect.
+
+**`nil` means the class is *absent* from the guard map, and that distinction is the whole design.**
+A route declaring `RequireDriverToken` still panics at startup, naming the class, exactly as it did
+before — §8 has called that "the failure direction is safe" since SHIP-44 and it is unchanged. The
+tempting alternative is an entry that refuses every request, and it is strictly worse: it turns a
+process that will not start into a route that answers `401` forever, which is indistinguishable from
+an expired credential to every client and to whoever gets asked about it. `guardsFor` says so in
+place, and two tests fail if somebody makes the map permissive.
+
+**Demonstrated by mutation in both directions rather than asserted.** Mapping the class to a guard
+that refuses everything fails `TestWithNoDriverGuardTheClassIsAbsentAndTheRouteRefusesToStart` and
+`TestTheClassIsServedExactlyWhenTheConstructorSuppliesAGuard`; dropping a supplied guard on the floor
+fails `TestASuppliedDriverGuardServesAndGuardsTheRoute`. The third of those is the one written to
+survive SHIP-108 unchanged: it asserts the *rule* — the class is served exactly when
+`newDriverTokenGuard` supplies a verifier — rather than today's answer to it. No route is registered
+from a `_test.go` `init`, for the reason `auth_test.go` gives, so `routes_golden.txt` is untouched.
+
+**The guard is built in `main.go` and passed alongside `Deps`, not added to it.** The precedent is
+`authenticate`, and the argument is the one the note above `type Deps struct` makes: `Deps` is what a
+*handler* is built from, and a collaborator of the router is not one. It returns an error rather than
+panicking for `newAccessTokenAuthenticator`'s reason too — a keyset that cannot be built is a
+configuration error that will still be there after the next restart, and a service that came up
+unable to verify any driver token would answer `401` to every driver while reporting itself healthy.
+The unused `*config.Config` and `clock.Clock` parameters are there so that the call in `main.go` is
+written once: a signature that changed when the body was filled in would put a shared file back in
+SHIP-108's diff.
+
+**A decision was taken about where the job-scoped grant lives, and the answer is `internal/delivery`
+— but the seam does not name it, which is why it could be taken cheaply.** A guard is an ordinary
+`func(http.Handler) http.Handler`, so nothing in `cmd/api` or `internal/httpx` has to know what a
+verified driver token puts on the context. Three candidates and the reasoning against two of them:
+
+- **Not `internal/authctx`.** That package holds the mobile session's `Subject`. A job-scoped grant
+  sitting beside it is one helper function away from the exchange `Docs/10` §5 forbids — and the
+  conversion would be invisible, because every domain already reads that package. `identity` refuses
+  the driver audience today with a test; the other direction is SHIP-108's, and it is much easier to
+  keep if the two types never share a package.
+- **Not `internal/httpx`.** Infrastructure imports neither a domain nor an adapter (SHIP-15c), and
+  `httpx` needs nothing here — unlike `httpx.Authenticator`, which exists because the middleware
+  itself had to name the subject type. Declaring a grant type there would hand every domain the
+  ability to read one when exactly one domain will ever serve a driver-token route.
+- **`internal/delivery`, which is the consuming domain** (`Docs/06` §4.1). The guard supplied from
+  `cmd/api` may import it, because `cmd/api` is where a domain and its collaborators meet. The rule
+  SHIP-108 inherits is written into `driverauth.go`: **do not resolve a driver token into an
+  `authctx.Subject`.** A test route in `driverauth_test.go` asserts the negative — a driver-token
+  route that reaches its handler with a subject on the context fails.
+
+**`RequireAdmin` is untouched and still absent from every branch.** SHIP-147 gets the same treatment
+— a second parameter and a second constructor beside `newDriverTokenGuard` — and until then a route
+declaring it stops the process rather than being served open. Generalising the seam to cover both was
+considered and not done: one caller is not a pattern, and the shape SHIP-147 wants is knowable only
+once it exists.
+
+**One thing the seam does not carry, recorded rather than fixed: a driver-token request scopes its
+idempotency key to `anonymous`.** `httpx.SubjectScope` keys on the subject, a driver token
+deliberately produces none, and the scope is computed group-wide *outside* `Idempotent` — so no
+per-route guard can influence it, whatever it puts on the context. The posture is the same one §6
+already accepts for public routes: `replayOrRefuse` fingerprints method, path and body, so reading
+somebody else's stored response means reproducing their exact request, and on a driver route that
+means already holding the job identifier. It is defensible and it is not free, so it is in §9 for
+whoever writes SHIP-112 rather than left for them to discover.
+
+**`KAFKA_REPLICATION_FACTOR` keeps the flag, and that is the interesting half.** The flag is not a
+workaround to be tidied away now that configuration exists: an operator applying the topic set to one
+cluster by hand should type the number, not set an environment variable. So configuration is the
+default and the flag overrides it — which needs `flag.FlagSet.Visit` rather than a zero check,
+because a flag's default cannot be a value `config.Load` has not produced yet, and treating `0` as
+"not given" would make `-replication 0` silently apply the configured factor instead of being
+refused. `internal/config` declares its own copy of the default rather than importing
+`internal/events`: config has **no internal dependencies at all** and every binary loads it, so the
+import would pull the event catalogue and the database driver into the configuration of processes
+that publish nothing. `cmd/topics` imports both and holds the two copies together in a test.
+
+**The three rules are wave 5's findings, moved to where somebody will read them.** The Kafka one is
+the sharpest: the worktree table isolates the test database and the ports and pins
+`COMPOSE_PROJECT_NAME` so every tree shares one stack, which is safe for PostgreSQL because each tree
+gets its own database — and has no equivalent for a topic. **On a Kafka topic a fence must be an id,
+not a timestamp.** `scripts/verify/80-notifications.sh` fences on `published_at` and has been correct
+by luck; it is another domain's file and this ticket deliberately did not touch it, so the rule is
+stated and the instance is left where §9 recorded it.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -3940,6 +4039,8 @@ Kept here rather than deleted, because the shape recurs: this was described only
 
 **One thing SHIP-44 did not do: `RequireDriverToken` and `RequireAdmin` are declarable and unenforced.** A route declaring either now panics at startup rather than being served open, so the failure direction is safe. SHIP-108 and SHIP-147 supply the middleware.
 
+**Half of that is no longer a gate on the wave, and the half that remains is the interesting one (SHIP-15m).** The *shared-surface* obstacle is gone: `newRouter` takes the driver guard as an argument, so SHIP-108 supplies it by filling in `cmd/api/driverauth.go` and edits neither `routes.go`, `manifest.go` nor `Deps` (§3). **The guard is still `nil`, the class is still absent from the map, and a route declaring it still panics at startup** — nothing about the failure direction changed, and that was the point. What is left is the part that was always SHIP-108's: a second verifier, written by the owner who writes the first direction of the exchange test. `RequireAdmin` is untouched and SHIP-147 gets the same treatment when it arrives.
+
 **SHIP-92…95 never parallelise.** Own branch, nothing else on it. The lock ordering, the idempotency interaction and the race tests are one design; two people produce two lock orderings, which is a deadlock or a lost update. Consider using a second agent adversarially instead — one implements 92–94, another writes SHIP-95 from `Docs/02` §3 and `Docs/08`'s four named races *without reading the implementation*.
 
 **SHIP-91 is out of that branch entirely, and this is settled rather than open.** The partial unique index was built by SHIP-80 (`uq_bids_one_accepted_per_job` — see §3), which is exactly what `Docs/09`'s note beside SHIP-91 asks for, since it is the one piece far cheaper before the endpoint than after it; the owner declared the ticket delivered on 12 August 2026 and it is in `Docs/11-done.txt`. **The branch starts against a constraint that already exists.** Confirm the index is the one §3 describes and move on — do not write a migration for it, and do not treat its absence as possible.
@@ -4114,9 +4215,12 @@ change to `shipper.<aggregate_type>` as predicted, and it moved as well as chang
 
 ---
 
-**The seven below were all found in wave 5, and none of them is owned by a ticket.** Five want a
-shared surface a domain branch may not edit, which is what a prep ticket is for; two want an
-ordinary lettered ticket in the milestone they belong to.
+**The seven below were all found in wave 5, and none of them was owned by a ticket when it was
+written.** Five wanted a shared surface a domain branch may not edit, which is what a prep ticket is
+for; two want an ordinary lettered ticket in the milestone they belong to. **Four of the five were
+taken by SHIP-15m** and are struck below — which is the mechanism §1 describes working end to end:
+paragraphs accumulate here during a wave and become the next wave's pre-step. An eighth, found while
+building that pre-step, is at the end.
 
 **No endpoint serves a job's status history to a customer, and no ticket in the backlog adds one.**
 `job_status_history` has recorded the actor, the reason and both clocks since SHIP-57a,
@@ -4145,7 +4249,10 @@ seen an empty fleet, an Add button, a form to fill in, and a `403` at the very e
 SHIP-98 gated the surface on the device instead, which is the right call for that ticket and is a
 workaround for a platform gap rather than a fix for it. **SHIP-78's gap; it wants a ticket.**
 
-**Kafka has no per-worktree isolation, unlike the database and the ports.** `CLAUDE.md`'s worktree
+**~~Kafka has no per-worktree isolation, unlike the database and the ports.~~ Written down where it
+will be read, at SHIP-15m — see §3.** The rule is now a row in `CLAUDE.md`'s worktree table and the
+reasoning below is kept, because a rule whose evidence is deleted is a rule somebody will argue with.
+`CLAUDE.md`'s worktree
 table isolates `TEST_TEMPLATE_DB` and `HTTP_PORT`/`VERIFY_PORT` per tree and pins
 `COMPOSE_PROJECT_NAME` so that all the trees share one stack — which is safe for PostgreSQL because
 each tree gets its own database on the shared cluster. **For Kafka there is no equivalent: one
@@ -4157,31 +4264,36 @@ is SHIP-47's, with one addition that is the actual finding: **on a Kafka topic a
 rather than a timestamp**, because a concurrent run in another worktree is not ordered against this
 one. Wave 4's `scripts/verify/80-notifications.sh` fences its SHIP-134 comparison on
 `published_at > $outbox_fence`, which is a timestamp — it has been correct by luck rather than by
-design, and it is the pattern the next section will copy. **This wants a row in `CLAUDE.md`'s
-worktree table and a line in `Docs/10` §9.2**, neither of which a documentation-only pass may edit,
-so it is recorded here.
+design, and it is the pattern the next section will copy. **That script is still unfixed and that is
+deliberate**: it is another domain's file, and SHIP-15m stated the rule rather than reaching into it.
+Whoever next opens `scripts/verify/80-notifications.sh` should fence on the ids it created, the way
+SHIP-135's own section already does.
 
-**`routes_golden.txt`'s `merge=union` prevents a *lost* route and guarantees a *reordered* one.** The
-attribute does the job it was added for. What nobody had written down is its other half: a union
+**~~`routes_golden.txt`'s `merge=union` prevents a *lost* route and guarantees a *reordered* one.~~
+Decided and written into `CLAUDE.md` at SHIP-15m — see §3.** The recipe sits beside the existing
+instruction to read the golden file after resolving a conflict, which is where somebody meets the
+failure. The attribute does the job it was added for. What nobody had written down is its other half: a union
 appends both sides in merge order while the generator emits them sorted, so a union-resolved
 manifest is right in content and wrong in order, and the test fails on a tree where nothing is
 missing. **The recipe is: confirm the sorted set is unchanged, and only then run
 `go test ./cmd/api -run TestRouteTableMatchesGolden -update`.** Confirming first is the part that
 matters — `-update` will just as happily bless a genuinely missing endpoint, which is the one
-failure the golden file exists to catch. **Wants a line in `CLAUDE.md`**, next to the existing
-instruction to look at the golden files after resolving any conflict, which this pass may not edit.
+failure the golden file exists to catch. It is `CLAUDE.md`'s line now, in exactly that place.
 
-**Never commit or merge while a gate is running.** One session in wave 5 produced both a **false
+**~~Never commit or merge while a gate is running.~~ Decided and written into `CLAUDE.md` at
+SHIP-15m — see §3.** It reads as one line — run the gate, wait for it, then commit — with the two
+failures below as the reason, beside the merge instructions. One session in wave 5 produced both a **false
 failure** — a `make verify` overlapping a merge reported a SHIP-79 failure and four phantom "no
 commit names them" tickets on a tree where nothing was wrong — and a **false pass**, where a merge
 committed while its gates ran captured the tree before the resolutions landed and published a
 `develop` carrying a stale check count of 299 against a true 355 and a union-ordered route table.
 The second is much the worse: a false failure costs an hour, a false pass ships, and
-`ship-15j-wave-5-merge-repair` exists only to undo it. **Wants a line in `CLAUDE.md`** beside the
-merge instructions, which this pass may not edit. §7 has the full account.
+`ship-15j-wave-5-merge-repair` exists only to undo it. §7 has the full account.
 
-**`KAFKA_REPLICATION_FACTOR` is a flag rather than configuration, and the pattern is the finding
-rather than the field.** Track B needed a replication factor — one is correct for a single-broker
+**~~`KAFKA_REPLICATION_FACTOR` is a flag rather than configuration, and the pattern is the finding
+rather than the field.~~ The **field** is folded into `internal/config` at SHIP-15m — see §3, and
+the flag was kept as an operator override. The **pattern** is not closed and is restated at the end
+of this entry.** Track B needed a replication factor — one is correct for a single-broker
 compose stack and wrong for a cluster, which wants three — and could not add it, because
 `internal/config` is a shared surface a domain branch may not edit. So it became
 `go run ./cmd/topics -replication 3`, defaulting to `events.DefaultReplicationFactor`, which a
@@ -4193,12 +4305,38 @@ ticket should ask each track up front what configuration it will want**, rather 
 third round of parked requests after the fact. Ask the question at dispatch, when the answer is
 cheap.
 
+**SHIP-15m did not ask it either, so that half stands open.** It absorbed a parked request for the
+third time in three prep tickets, which is the outcome the paragraph above predicted and not the one
+it recommended. **Whoever dispatches wave 7 should ask each track, before it starts, what it expects
+to need from `internal/config`** — the answer costs a sentence at dispatch and a field in the prep
+ticket, against a wave of a track working around its absence.
+
 **A cross-block index request, and it is genuinely not urgent.** The provider feed wants
 `(created_at DESC, id DESC) WHERE status IN ('Open','Negotiating')` on `jobs` — which is migration
 block 400–499, and not `fleet`'s to draw from. It seq-scans under a `LIMIT` today, which is entirely
 fine at hundreds of jobs and stops being fine at some volume nobody can currently name. Recorded so
 that whoever sees the first slow feed does not rediscover it: **the index is known, the block is
 known, and the only open question is when.**
+
+---
+
+**One more, found at SHIP-15m while building the `RequireDriverToken` seam.**
+
+**A driver-token request will scope its idempotency key to `anonymous`, and nothing a guard does can
+change that.** `httpx.SubjectScope` keys on the `authctx.Subject`, a driver token deliberately
+produces none (§3), and the scope is computed group-wide **outside** `Idempotent` — while an auth
+guard runs per route, inside it. So the ordering that makes SHIP-44's fix work is the same ordering
+that puts the driver's scope out of a guard's reach, whatever the guard puts on the context.
+
+**This is the posture §6 already accepts for public routes, not a new hole**: `replayOrRefuse`
+fingerprints method, path and body, so reading somebody else's stored response means reproducing
+their exact request — which on `POST /v1/jobs/{id}/milestones` means already holding the job
+identifier. It is defensible, and it is worth deciding rather than inheriting, because the driver
+half of M4 is entirely idempotent writes from a phone with a bad connection. **The two shapes
+available**: a second group-wide resolver beside `ResolveSubject` that a driver grant can also
+populate, with `SubjectScope` widened to read either; or an explicit decision that a job-scoped
+grant scopes on the job identifier already in the path, which costs nothing and is weaker. **Decide
+with SHIP-112**, which is the first ticket whose retries are a driver's rather than a provider's.
 
 ## 10. The done list, in a form a script can read
 

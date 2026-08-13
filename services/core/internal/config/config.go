@@ -274,7 +274,45 @@ type Redis struct {
 // Kafka is the event backbone for notifications, reporting, and background processing.
 type Kafka struct {
 	Brokers []string
+
+	// ReplicationFactor is how many copies of each partition the topic set is created with
+	// (SHIP-135, folded in at SHIP-15m).
+	//
+	// **One is correct for the single-broker compose stack and wrong everywhere else**; a
+	// deployed cluster wants three. It is the only number in the topic set that genuinely
+	// differs between environments — the partition count and the retention are properties of
+	// the catalogue and are the same on every broker.
+	//
+	// It arrived as a `cmd/topics -replication` flag rather than as a field, because
+	// internal/config is a shared surface a domain branch may not edit (Docs/10 §9.2) and the
+	// track that needed it was a domain branch. **The flag is still there and still wins**: an
+	// operator applying the topic set to one cluster by hand should not have to set an
+	// environment variable to do it. This is its default, which is what makes the deployment
+	// that runs the step need no arguments.
+	//
+	// Read only by cmd/topics. cmd/api and cmd/worker load it and never look at it, which is
+	// ordinary — Load reads the whole environment for every binary rather than a subset per
+	// command, so that one misconfiguration is refused everywhere rather than in one place.
+	ReplicationFactor int
 }
+
+// DefaultKafkaReplicationFactor is one, matching internal/events.DefaultReplicationFactor.
+//
+// Two constants rather than one shared, for the same reason [minimumSigningKeyBytes] is duplicated:
+// internal/config has no internal dependencies at all, and it is loaded by every binary. Importing
+// the event catalogue to read a `1` would pull internal/events and internal/db — and with them the
+// database driver — into the configuration of processes that publish nothing.
+//
+// The drift that buys is closed where the two meet: cmd/topics imports both, and
+// TestConfigurationCarriesTheCatalogueDefault fails there if they stop agreeing.
+const DefaultKafkaReplicationFactor = 1
+
+// maxKafkaReplicationFactor is a typo guard rather than a limit anybody should reach.
+//
+// A factor larger than the cluster is refused by the broker at create time, so the real bound is
+// the number of brokers and this cannot know it. What it does catch is 30 typed for 3, before a
+// connection is opened and with the variable named in the message.
+const maxKafkaReplicationFactor = 10
 
 // Idempotency configures how long the platform remembers what it answered a
 // state-changing request, so that a retry replays rather than repeats it (SHIP-15).
@@ -356,6 +394,8 @@ func Load() (*Config, error) {
 		},
 		Kafka: Kafka{
 			Brokers: l.csv("KAFKA_BROKERS", []string{"localhost:29092"}),
+			ReplicationFactor: l.boundedInt("KAFKA_REPLICATION_FACTOR",
+				DefaultKafkaReplicationFactor, 1, maxKafkaReplicationFactor),
 		},
 		Idempotency: Idempotency{
 			TTL:         l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
@@ -424,6 +464,10 @@ func (c Config) LogValue() slog.Value {
 		slog.String("database_url", redactURL(c.Database.URL)),
 		slog.String("redis_url", redactURL(c.Redis.URL)),
 		slog.String("kafka_brokers", strings.Join(c.Kafka.Brokers, ",")),
+		// Worth a line for the same reason the argon2 cost is: a deployment that has
+		// silently fallen back to a single replica is otherwise invisible until a broker
+		// is lost.
+		slog.Int("kafka_replication_factor", c.Kafka.ReplicationFactor),
 		slog.Duration("idempotency_ttl", c.Idempotency.TTL),
 		slog.Duration("idempotency_in_flight_ttl", c.Idempotency.InFlightTTL),
 		// The cost is worth having in the startup line: a deployment that has silently
