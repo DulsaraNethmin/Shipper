@@ -1,9 +1,12 @@
 package main
 
 import (
+	"flag"
+	"io"
 	"strings"
 	"testing"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 )
 
@@ -52,8 +55,8 @@ func TestThePlanIsTheCatalogueTopicSet(t *testing.T) {
 }
 
 // The replication factor is the one number here that differs between a compose stack and a
-// cluster, and it is a flag rather than an entry in internal/config — see
-// events.DefaultReplicationFactor for why.
+// cluster. It is KAFKA_REPLICATION_FACTOR, with the -replication flag as an operator override
+// (SHIP-15m); whichever supplies it, it is what the plan asks the broker for.
 func TestTheReplicationFactorIsWhatTheOperatorAsksFor(t *testing.T) {
 	for _, replication := range []int{1, 3} {
 		for _, topic := range plan(replication) {
@@ -72,5 +75,71 @@ func TestARunWithNoReplicasIsRefusedBeforeItReachesTheBroker(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "at least one replica") {
 		t.Errorf("refused with %q", err)
+	}
+}
+
+// KAFKA_REPLICATION_FACTOR supplies the number and the flag overrides it (SHIP-15m).
+//
+// The three cases are the whole of the contract, and the third is the one a "zero means unset"
+// implementation would get wrong: an explicit -replication 0 must reach the refusal above rather
+// than silently applying the configured factor.
+func TestTheFlagOverridesConfigurationAndConfigurationIsTheDefault(t *testing.T) {
+	parse := func(t *testing.T, args ...string) (*flag.FlagSet, int) {
+		t.Helper()
+		fs := flag.NewFlagSet("topics", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		value := fs.Int(replicationFlag, 0, "")
+		if err := fs.Parse(args); err != nil {
+			t.Fatalf("parsing %v: %v", args, err)
+		}
+		return fs, *value
+	}
+
+	const configured = 3
+
+	t.Run("no flag takes the configured factor", func(t *testing.T) {
+		fs, value := parse(t)
+		if got := chosenReplication(fs, value, configured); got != configured {
+			t.Errorf("chose %d, want the configured %d", got, configured)
+		}
+	})
+
+	t.Run("the flag wins", func(t *testing.T) {
+		fs, value := parse(t, "-replication", "5")
+		if got := chosenReplication(fs, value, configured); got != 5 {
+			t.Errorf("chose %d, want the flag's 5", got)
+		}
+	})
+
+	t.Run("an explicit zero is not mistaken for an absent flag", func(t *testing.T) {
+		fs, value := parse(t, "-replication", "0")
+		if got := chosenReplication(fs, value, configured); got != 0 {
+			t.Errorf("chose %d, want 0 so that the run is refused rather than silently "+
+				"applying the configured %d", got, configured)
+		}
+	})
+}
+
+// The two constants that hold the same number, checked where they meet.
+//
+// internal/config declares its own default rather than importing this package — config has no
+// internal dependencies and every binary loads it, so importing the catalogue would pull the
+// database driver into the configuration of processes that publish nothing. cmd/topics is the one
+// place that imports both, which makes it the one place the copies can be held together.
+func TestConfigurationCarriesTheCatalogueDefault(t *testing.T) {
+	// Blanked rather than unset, which loader.lookup treats the same way, so a value in the
+	// developer's environment cannot decide the outcome.
+	t.Setenv("KAFKA_REPLICATION_FACTOR", "")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("loading configuration: %v", err)
+	}
+
+	if cfg.Kafka.ReplicationFactor != events.DefaultReplicationFactor {
+		t.Errorf("KAFKA_REPLICATION_FACTOR defaults to %d and the catalogue says %d.\n"+
+			"config.DefaultKafkaReplicationFactor and events.DefaultReplicationFactor are two "+
+			"copies of one number and have drifted.",
+			cfg.Kafka.ReplicationFactor, events.DefaultReplicationFactor)
 	}
 }
