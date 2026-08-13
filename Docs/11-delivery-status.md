@@ -259,7 +259,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **555 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **560 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -7775,6 +7775,27 @@ writes into `CLAUDE.md` — and confirmed with `git diff` **and** a checksum aga
 of the six were aimed at mechanisms this ticket had just written tests for, which is close to
 checking that a test tests itself. The third is the exception and is the one worth reading: it was
 aimed at a binding whose guard did not exist until the mutation demonstrated it was needed.
+
+#### `make verify` went from 555 checks to 560 across the same 13 sections
+
+**Five checks, in two existing files rather than a new one**, because neither half of what this
+ticket can demonstrate end to end is a domain of its own. Three are in
+`scripts/verify/20-boundaries.sh`: no package under `internal/` except `passwords` derives an argon2
+key, `passwords` is registered as infrastructure, and the throwaway fixture module gains a
+`internal/passwords` that imports a domain and is refused — the same *show it failing* principle the
+two rules beside it already use.
+
+Two are in `scripts/verify/70-delivery.sh`, and they are the wire-level half: the download URL
+carries its own signed `X-Amz-Expires` window, and that window is **strictly shorter** than the
+upload URL's, measured in the same run. **Neither number is typed into the script.** `internal/config`
+owns both, and a check that hard-coded five minutes and fifteen would keep passing after somebody
+stopped reading them — which is the same reasoning SHIP-114's upload-window check already carries,
+and whose measured figure this one compares against.
+
+**What could not be demonstrated there is the `RequireAdmin` seam**, and the reason is the seam
+working: nothing declares the class, so there is no route to call, and a section that registered one
+to prove the point would have to start a service that refuses to start. `adminauth_test.go` is where
+that claim lives, and `attachRoutes` panicking with the class named is the demonstration.
 
 ## 4. Partly done — do not treat these as finished
 
