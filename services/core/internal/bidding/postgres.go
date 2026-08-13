@@ -182,7 +182,8 @@ func (postgresStore) bidPlacedUnder(
 	return bid, true, nil
 }
 
-// lockBid takes one bid by its identifier and holds it for the rest of the transaction (SHIP-85).
+// lockBid takes one bid by its identifier and holds it for the rest of the transaction (SHIP-85,
+// SHIP-86).
 //
 // **Scoped by the identifier alone, and nothing else — which is the opposite of
 // [postgresStore.bidPlacedUnder] and is deliberate.** That read is a *lookup*: it answers "what did
@@ -194,11 +195,11 @@ func (postgresStore) bidPlacedUnder(
 // and raises [ErrNotBidOwner]; both become the same 404 on the wire, so the distinction costs the
 // caller nothing and buys the platform a fact it can act on.
 //
-// **FOR UPDATE, and it is load-bearing rather than defensive.** The caller reads a status, decides
-// against it, and writes — and the decision is "is this offer still the provider's to change".
-// Without the lock, an award committing in the window between the SELECT and the UPDATE leaves a
-// revision repricing a bid uq_bids_one_accepted_per_job says two parties are committed to. The lock
-// is only held inside a transaction, which is why [ErrNotInTransaction] exists.
+// **FOR UPDATE, and it is load-bearing rather than defensive.** Both callers read a status, decide
+// against it, and write — and the decision is "is this offer still the provider's to change". Without
+// the lock, an award committing in the window between the SELECT and the UPDATE leaves a withdrawal
+// unpicking a bid uq_bids_one_accepted_per_job says two parties are committed to. The lock is only
+// held inside a transaction, which is why [ErrNotInTransaction] exists.
 func (postgresStore) lockBid(ctx context.Context, r db.Runner, id uuid.UUID) (Bid, error) {
 	const q = `
 		SELECT ` + bidColumns + `
@@ -251,6 +252,39 @@ func (postgresStore) reviseOffer(ctx context.Context, r db.Runner, id uuid.UUID,
 	bid, err := scanBid(r.QueryRow(ctx, q, id, o.AmountCents, o.PickupAt, o.DeliverBy, o.Message))
 	if err != nil {
 		return Bid{}, fmt.Errorf("bidding: revising bid %s: %w", id, err)
+	}
+	return bid, nil
+}
+
+// withdrawBid moves an offer to Withdrawn (SHIP-86).
+//
+// A plain `UPDATE`, and the contrast with a job's status is worth stating rather than leaving to be
+// noticed. Docs/02 §2 gives the *job* lifecycle one entry point, and 000402 has a trigger refusing any
+// status write that did not come through it. Docs/02 §4 says no such thing about bids, and 000500
+// declined to invent the mechanism: "a provider who fills the form in and sends it has legitimately
+// created a row at 'Submitted', and a customer's counter-offer arrives as a new row that was never a
+// draft". So a bid's status is written directly, and what makes it safe is that the row is already
+// locked by [postgresStore.lockBid] and the caller has decided against the status it read.
+//
+// The status is a parameter rather than a literal so that the value comes from [StatusWithdrawn] —
+// Docs/02 §4's own string, held to `ck_bids_status` by
+// TestEveryBidStatusConstraintMatchesTheGoConstants — rather than from a second spelling of it in SQL.
+//
+// **The row survives, and that is the point of a withdrawal rather than a delete.** Docs/01 §4.3
+// requires the platform to "record all offers, counter-offers, withdrawals, and acceptances", and
+// Docs/02 §4 keeps bid history visible to the customer, the bidding provider and administrators. The
+// same reading fleet gives a deactivated vehicle: there is no delete on this table and there is not
+// going to be one.
+func (postgresStore) withdrawBid(ctx context.Context, r db.Runner, id uuid.UUID) (Bid, error) {
+	const q = `
+		UPDATE bids
+		SET status = $2
+		WHERE id = $1
+		RETURNING ` + bidColumns
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id, string(StatusWithdrawn)))
+	if err != nil {
+		return Bid{}, fmt.Errorf("bidding: withdrawing bid %s: %w", id, err)
 	}
 	return bid, nil
 }

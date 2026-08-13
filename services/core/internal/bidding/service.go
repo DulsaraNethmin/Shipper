@@ -208,9 +208,7 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 // expired must not acquire a fresh price. The endpoint that offers a provider a job and the endpoint
 // that lets them change their bid on it agreeing is the same property SHIP-84 was built around.
 //
-// **SHIP-86's withdrawal is the opposite act and will take no such check**: a provider must always
-// be able to take back their own offer, and refusing on eligibility would strand a live offer they
-// could no longer retract.
+// **A withdrawal is the opposite act and takes no such check** — see [Service.WithdrawBid].
 //
 // The refusal is [ErrJobNotOffered], which is the 404 a placement gets, byte-identically. It reads
 // oddly to a caller who plainly knows the job exists, and it is still the right answer: what the
@@ -252,6 +250,65 @@ func (s *Service) ReviseBid(
 	}
 
 	return s.store.reviseOffer(ctx, r, bid.ID, offer)
+}
+
+// WithdrawBid takes a provider's own offer back before it is accepted (SHIP-86).
+//
+// The last of Docs/01 §4.2's three verbs. The offer becomes [StatusWithdrawn] and the row survives:
+// Docs/01 §4.3 requires the platform to record every withdrawal, and Docs/02 §4 keeps the history
+// readable to the customer, the bidding provider and administrators. There is no delete on this table.
+//
+// r must be a transaction, for the reason [Service.ReviseBid] gives.
+//
+// # Withdrawing an offer that is already Withdrawn succeeds
+//
+// It answers with the bid and writes nothing further. **This is what makes a retry of a withdrawal
+// safe when it does not reuse its key**, and a withdrawal is exactly the request a phone retries after
+// a dropped connection, a restart, and a freshly generated key. The idempotency middleware absorbs the
+// retry that reuses its key; this absorbs the one that does not — the same reading `jobs` gives a
+// repeated cancellation and `fleet` gives a repeated deactivation, and the reason those two say
+// "the caller asked for an outcome that holds".
+//
+// It is also why there is no key column for this endpoint. A withdrawal is idempotent by its *state*
+// rather than by its key, which is a stronger guarantee than a stored key gives: two different clients
+// with two different keys still cannot withdraw one offer twice.
+//
+// # No eligibility check, and that is the asymmetry with a revision
+//
+// **A provider must always be able to take back their own offer.** Refusing a withdrawal because the
+// provider's only vehicle left service, or their verification lapsed, would strand a live offer the
+// customer can still accept and the provider can no longer retract — which is the worst of both
+// answers. SHIP-81's filter governs what a provider may *offer*; it has no business governing what
+// they may stop offering.
+//
+// # It does not move the job
+//
+// Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", and
+// nothing reaches Negotiating until **SHIP-90**, which owns that presentation status in both
+// directions. Job status is never a settable field in any case (Docs/02 §2, CLAUDE.md): a move passes
+// one guarded function and leaves a `job_status_history` row in the same transaction, and inventing
+// half of that here would be inventing the half without the record.
+func (s *Service) WithdrawBid(
+	ctx context.Context,
+	r db.Runner,
+	providerID, jobID, bidID uuid.UUID,
+) (Bid, error) {
+	if _, inTx := r.(pgx.Tx); !inTx {
+		return Bid{}, fmt.Errorf("bidding: withdrawing %s: %w", bidID, ErrNotInTransaction)
+	}
+
+	bid, err := s.ownBid(ctx, r, providerID, jobID, bidID)
+	if err != nil {
+		return Bid{}, err
+	}
+	if bid.Status == StatusWithdrawn {
+		return bid, nil
+	}
+	if err := changeable(bid); err != nil {
+		return Bid{}, err
+	}
+
+	return s.store.withdrawBid(ctx, r, bid.ID)
 }
 
 // ownBid reads the bid a caller has named and refuses anything that is not theirs.

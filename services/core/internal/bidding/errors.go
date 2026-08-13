@@ -80,9 +80,9 @@ var (
 
 	// ErrBidClosed means the offer is no longer live, so there is nothing to revise or withdraw.
 	//
-	// Rejected, Expired or Superseded — and, for a revision, Withdrawn. SHIP-86's withdrawal will
-	// need a different answer for the last of those: withdrawing an already-withdrawn offer is a
-	// caller asking for an outcome that holds, which is absorbed rather than refused.
+	// Rejected, Expired or Superseded — and, for a revision, Withdrawn. A *withdrawal* of a withdrawn
+	// offer is not this: the caller asked for an outcome that already holds, and
+	// [Service.WithdrawBid] absorbs it.
 	ErrBidClosed = errors.New("bidding: that offer is no longer live")
 
 	// ErrNothingToRevise means a revision named no field at all.
@@ -91,12 +91,13 @@ var (
 	// ErrNotInTransaction means a method that reads a row, decides against it and writes it was handed
 	// a connection pool rather than a transaction.
 	//
-	// Checked by [Service.ReviseBid] and deliberately not by [Service.PlaceBid], because the two do
-	// not rest on the same mechanism. A placement's correctness is `ON CONFLICT`'s, which holds
-	// statement by statement; a revision's is [postgresStore.lockBid]'s `FOR UPDATE`, and outside a
-	// transaction that lock is released the instant the SELECT returns — leaving the status this code
-	// decided against free to change before the UPDATE lands, with nothing to report afterwards. The
-	// same sentinel fleet has, for the same reason.
+	// Checked by [Service.ReviseBid] and [Service.WithdrawBid] and deliberately not by
+	// [Service.PlaceBid], because the three do not rest on the same mechanism. A placement's
+	// correctness is `ON CONFLICT`'s, which holds statement by statement; a revision's and a
+	// withdrawal's is [postgresStore.lockBid]'s `FOR UPDATE`, and outside a transaction that lock is
+	// released the instant the SELECT returns — leaving the status this code decided against free to
+	// change before the UPDATE lands, with nothing to report afterwards. The same sentinel fleet has,
+	// for the same reason.
 	ErrNotInTransaction = errors.New("bidding: this must run inside a transaction")
 )
 

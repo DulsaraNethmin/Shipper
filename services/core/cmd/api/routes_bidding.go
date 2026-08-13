@@ -53,7 +53,10 @@ import (
 // is a real check rather than a formality: without it the first half of the URL would be decorative
 // and a client pairing a real bid with any job at all would succeed.
 //
-// SHIP-86's withdrawal takes the same address with a verb under it, for the same reason.
+// **Withdrawal is a verb and not a `DELETE`**, for the reason `POST /v1/fleet/vehicles/{id}/deactivate`
+// is one: nothing is deleted. Docs/01 §4.3 requires every withdrawal to be recorded and Docs/02 §4
+// keeps the chain readable, so the row survives at `Withdrawn`. It is not a `PATCH` writing a status
+// either — a bid's status is the platform's, and a request naming one is refused by the decoder.
 func init() {
 	register(
 		Route{
@@ -69,6 +72,13 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Revise() },
+		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/bids/{bid_id}/withdraw",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).Withdraw() },
 		},
 	)
 }

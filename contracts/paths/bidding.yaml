@@ -21,15 +21,15 @@
 # A bid is visible to the provider who made it, to the customer who received it, and to
 # administrators (Docs/02 §4) — never to a competitor. Every endpoint below answers with the calling
 # provider's own offer and nothing else; the idempotency key that identifies a retry of a placement is
-# scoped to the caller as well as to the job, and the endpoint that takes a bid identifier refuses one
-# that is not the caller's with the answer a bid that does not exist gets.
+# scoped to the caller as well as to the job, and the two endpoints that take a bid identifier refuse
+# one that is not the caller's with the answer a bid that does not exist gets.
 #
-# # Two endpoints and one shape
+# # Three endpoints and one shape
 #
 # Docs/01 §4.2 gives the provider three verbs — "place, update, and withdraw a bid until it is accepted
-# or expires" — and each gets its own path here as it is built. Both endpoints so far answer with the
-# same `Bid`, so a client holds one type throughout: place it, revise it, and what comes back is the
-# same object.
+# or expires" — and each has its own path here. All three answer with the same `Bid`, so a client holds
+# one type throughout: place it, revise it, take it back, and what comes back is the same object each
+# time.
 
 Bids:
   post:
@@ -78,7 +78,8 @@ Bids:
       ## One live offer per job
 
       A second bid on a job you already have a live offer on is refused with `bidding_already_bid`.
-      Revise it with `PATCH /v1/jobs/{id}/bids/{bid_id}` instead — a live offer is one the customer may
+      Revise it with `PATCH /v1/jobs/{id}/bids/{bid_id}`, or take it back with
+      `POST /v1/jobs/{id}/bids/{bid_id}/withdraw` and bid again — a live offer is one the customer may
       accept at any moment, and two from one provider is two prices for one job.
 
       This is not what a **retry** produces. See below.
@@ -298,6 +299,107 @@ BidByID:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+WithdrawBid:
+  post:
+    operationId: withdrawBid
+    summary: Withdraw your own bid before it is accepted
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Takes an offer back. Its status becomes `withdrawn` and the customer can no longer accept it
+      (SHIP-86).
+
+      A verb rather than a `DELETE`, because **nothing is deleted**. Every offer and every withdrawal
+      is recorded, and the bid stays readable to you, to the customer and to administrators — the row
+      survives with its price intact. It is not a `PATCH` writing a status either: a bid's status is
+      the platform's, and a body naming one is refused.
+
+      The request body is `{}`.
+
+      ## Before acceptance
+
+      Once the customer has awarded your bid it is no longer yours to take back, and this answers
+      `bidding_bid_accepted`. Stepping away from work you have been awarded is a different
+      conversation with different consequences, and it is not this endpoint.
+
+      ## Withdrawing twice succeeds
+
+      A second withdrawal answers `200` with the same bid and writes nothing. That is deliberate: a
+      phone that lost its connection, was restarted and generated a **fresh** `Idempotency-Key` for
+      the same intent must not be told its withdrawal failed when it succeeded. You asked for an
+      outcome, and the outcome holds.
+
+      ## You may bid again afterwards
+
+      Withdrawing leaves you free to place a new offer on the same job. A mistyped price is not a job
+      you can never bid on again.
+
+      ## The job does not move
+
+      Withdrawing your offer does not change the job's status, and it does not withdraw anybody
+      else's.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/BidID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/BidWithdrawal'
+    responses:
+      '200':
+        description: |
+          The offer is withdrawn, and answers `withdrawn`. The same `200` is returned when it was
+          already withdrawn, in which case nothing further was recorded.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '400':
+        description: |
+          A malformed identifier in the path, an unknown field in the body, or a missing
+          `Idempotency-Key` (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such bid — or one that is not yours, or not on the job in the path. These are one
+          answer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        $ref: '#/BidNoLongerYours'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- shared responses -------------------------------------------------------------------------
 
 BidNoLongerYours:
@@ -307,7 +409,7 @@ BidNoLongerYours:
     | `error.code` | What happened |
     |---|---|
     | `bidding_bid_accepted` | The customer awarded this bid. Show them the job they have won |
-    | `bidding_bid_closed` | The offer is rejected, expired, superseded or withdrawn. Show the feed |
+    | `bidding_bid_closed` | The offer is rejected, expired, superseded — or, for a revision, already withdrawn. Show the feed |
     | `idempotency_key_reused` | This key was used for a *different* request. Generate a new one |
   headers:
     X-Request-Id:
@@ -402,6 +504,20 @@ BidRevision:
         Replaces the conditions accompanying the offer. Send it blank to remove them.
       example: Two people and a tail lift; the price includes both.
 
+BidWithdrawal:
+  type: object
+  additionalProperties: false
+  description: |
+    Empty. `{}` is the whole request.
+
+    You name the intent and the platform decides what the state becomes, which is why there is no
+    `status` field here — a client that sends one is told it does not exist rather than having it
+    ignored. A body is required all the same, so that every endpoint in this API answers the same way
+    to a request with none.
+
+    There is no reason field either. No ticket asks a provider *why* they withdrew, and a free-text
+    reason nobody reads is a field the customer would eventually be shown.
+
 Bid:
   type: object
   additionalProperties: false
@@ -435,9 +551,9 @@ Bid:
         Docs/02 §4's eight bid statuses, in lower snake case. A bid you place is `submitted`: a live
         offer awaiting the customer, and revising it leaves it there.
 
-        The other seven are reachable through endpoints still being built — withdrawal, counter-offers,
-        expiry and the award — and are listed because they are the vocabulary a client is being written
-        against.
+        `withdrawn` is what you get back from `POST /v1/jobs/{id}/bids/{bid_id}/withdraw`. The
+        remaining six are reachable through endpoints still being built — counter-offers, expiry and
+        the award — and are listed because they are the vocabulary a client is being written against.
       example: submitted
     amount_cents:
       type: integer

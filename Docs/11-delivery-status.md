@@ -153,7 +153,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **388 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **400 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -280,6 +280,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-83** | M3 | `GET /v1/jobs/open/{id}` — one job as a provider sees it, and **the fourth budget proof §8 recorded as still owed**: the serialised response, obtained over HTTP, held to a *closed set of keys* so that a budget renamed `max_price` fails too. The street line and the coordinate are confirmed withheld — *see below* |
 | **SHIP-84** | M3 | `POST /v1/jobs/{id}/bids` — a verified, eligible provider offers a price and two timing commitments. **Opens the `bidding` domain**, and reaches `fleet`'s eligibility answer through a port with no adapter behind it. "Bid once per job" and "a retry is not a second bid" are two partial unique indexes rather than two checks — *see below* |
 | **SHIP-85** | M3 | `PATCH /v1/jobs/{id}/bids/{bid_id}` — a provider revises their own live offer **in place**: same row, same status, same key. That last one is the point — writing a revision's key over the placement's would turn a late retry into a `409` for a request that succeeded — *see below* |
+| **SHIP-86** | M3 | `POST /v1/jobs/{id}/bids/{bid_id}/withdraw` — the offer becomes `Withdrawn` and the row survives as record. **Idempotent by state rather than by key**, which is stronger than a stored key and is why this endpoint needed neither a column nor a migration — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -2950,7 +2951,7 @@ they have already placed. **The row keeps its identifier, its `Submitted` status
 placed under**, which is what makes this the same offer at a new number rather than a second offer.
 
 Docs/01 §4.2 gives the provider three verbs — "place, update, and withdraw a bid until it is accepted
-or expires" — and this is the second of them, on top of SHIP-84's first. SHIP-86 is the third.
+or expires" — and this branch built the second and third of them on top of SHIP-84's first.
 
 #### It is an in-place edit, and the alternative would have settled SHIP-87's design
 
@@ -3003,7 +3004,7 @@ answer — what they are asking the platform to keep live is an offer to collect
 customer could accept it — and validating only what arrived would make the stored offer's coherence
 depend on the order somebody edited it in.
 
-#### Eligibility is checked again here, and deliberately will not be on SHIP-86's withdrawal
+#### Eligibility is checked again here and deliberately not on the withdrawal
 
 The one asymmetry in the pair. **A revision produces a live offer at a new number that the customer may
 accept the moment it lands**, so it goes through SHIP-81's filter exactly as a placement does: a
@@ -3028,28 +3029,120 @@ takes, and the discipline SHIP-84 established by deleting `provider_id` from a `
 test fail.
 
 Both comparisons were mutation-tested. Deleting the ownership check fails
-`TestOnlyTheBidsOwnerCanReviseIt` and `TestAnotherProvidersBidIsUnreachable`; deleting the job
-comparison fails `TestABidIsAddressedUnderItsOwnJob`. **The second is the one that is easy to leave
-out**, and without
+`TestOnlyTheBidsOwnerCanReviseIt`, `TestOnlyTheBidsOwnerCanWithdrawIt` and
+`TestAnotherProvidersBidIsUnreachable`; deleting the job comparison fails
+`TestABidIsAddressedUnderItsOwnJob`. **The second is the one that is easy to leave out**, and without
 it `/v1/jobs/{id}/bids/{bid_id}` would be one resource reachable at as many addresses as there are
 jobs — the shape where a rule gets enforced at one address and forgotten at the rest.
 
-#### The budget rule now has three responses rather than two
+#### Shared surfaces, for both tickets on this branch
+
+Two `$ref` entries in `contracts/openapi.yaml` (one per new path), two lines in `routes_golden.txt` and
+two in `Docs/10-api-error-codes.md` — all four regenerated rather than typed — and §3's check count,
+written by `make verify-update`. **No migration**: a revision writes columns 000501 already added and a
+withdrawal writes a status `ck_bids_status` has held since 000500, so block 500–599 is untouched and
+the out-of-order guard never fires. No `internal/boundaries` edit, no `Deps` field, and
+`internal/bidding` still imports no domain.
+
+### SHIP-86 — withdrawal is idempotent by state, which is stronger than by key
+
+`POST /v1/jobs/{id}/bids/{bid_id}/withdraw`. The offer becomes `Withdrawn`, the customer can no longer
+accept it, and **the row survives with its price intact**. Docs/01 §4.3 requires every withdrawal to be
+recorded and Docs/02 §4 keeps bid history readable to the customer, the bidding provider and
+administrators — so there is no delete on this table and there is not going to be one. The same reading
+`fleet` gives a deactivated vehicle.
+
+A verb rather than a `DELETE`, and not a `PATCH` writing `"status": "withdrawn"`: a bid's status is the
+platform's, the client names an intent, and `httpx.DecodeJSON` refuses the field outright. The shape
+`POST /v1/jobs/{id}/cancel` and `POST /v1/fleet/vehicles/{id}/deactivate` already use.
+
+#### Withdrawing twice succeeds, and that is what makes a retry safe
+
+The question the ticket turns on is what a *retry* of a withdrawal means. The idempotency middleware
+absorbs the one that reuses its key; it cannot absorb the one that does not — a phone that lost its
+connection, was restarted, and generated a **fresh** key for the same intent, which is the ordinary
+shape rather than an exotic one. Refusing that with "this offer is no longer live" would tell a
+provider their withdrawal failed when it succeeded.
+
+So a second withdrawal answers `200` with the bid and **writes nothing further**. `jobs` makes the same
+call for a repeated cancellation and `fleet` for a repeated deactivation, and both say why: the caller
+asked for an outcome, and the outcome holds.
+
+**This is a stronger guarantee than a stored key gives, and it is why no column was needed.** A key
+scopes idempotency to one client's one request; state scopes it to the outcome, so two different
+clients with two different keys still cannot withdraw one offer twice. `make verify` asserts the row's
+`updated_at` across all three repeats — status alone could not tell an absorbed request from one that
+rewrote `Withdrawn` over `Withdrawn`.
+
+Verified by mutation: removing the three-line absorption makes the second withdrawal `409
+bidding_bid_closed`, failing both the service test and the wire test.
+
+#### Before acceptance, and what happens after is a different ticket
+
+An accepted offer answers `bidding_bid_accepted` and is neither revised nor withdrawn. Docs/01 §4.2
+draws the line in the sentence this branch is built on — "until it is accepted or expires" — and
+CLAUDE.md's one-accepted-bid invariant is what stands behind it: `uq_bids_one_accepted_per_job` means
+an award is a commitment two parties hold, not a state one of them leaves unilaterally.
+
+**Withdrawal after acceptance is a different thing entirely.** Docs/02 §6.2 makes a provider stepping
+away from awarded work a *provider cancellation*: the job moves back to Open, every bid closes, and the
+cancellation is recorded against the provider. Allowing it here would be that flow with none of its
+consequences, and it would break the award silently — the job still `Awarded`, to a bid nobody could
+see.
+
+#### `bidding_bid_accepted` and `bidding_bid_closed` are two codes because they are two screens
+
+`bidding_bid_accepted` is good news: the provider won the job, and the app's next screen is that job.
+`bidding_bid_closed` covers `Rejected`, `Expired`, `Superseded` — and `Withdrawn`, for a revision —
+where the offer is over and the app shows the feed. One code for four statuses, because the client does
+the same thing with all four; which of them it was belongs to the provider's own bid list (SHIP-101),
+not to an error code.
+
+Docs/10 §4.4's test still applies: a domain code earns its place only where a client would otherwise
+parse a message to know what to do. `bidding` had one code at SHIP-84 and has three.
+
+#### No eligibility check, which is the deliberate half of the asymmetry
+
+**A provider must always be able to take back their own offer.** Refusing a withdrawal because their
+only vehicle left service, or their verification lapsed, or the job was cancelled underneath them,
+would strand a live offer the customer can still accept and the provider can no longer retract — the
+worst of both answers. SHIP-81's filter governs what a provider may *offer*; it has no business
+governing what they may stop offering. `TestAWithdrawalNeedsNoEligibility` breaks four different
+filters and expects a withdrawal through each.
+
+#### Neither verb moves the job, and one of them looks like it should
+
+Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", which
+reads like an instruction to this ticket. It is **SHIP-90's**, in both directions — nothing reaches
+`Negotiating` until that ticket exists, so there is nothing to move back from. And job status is never
+a settable field in any case: a transition passes one guarded function and leaves a
+`job_status_history` row in the same transaction, so doing it here would mean doing the half without
+the record. Both the test and a `make verify` check assert the job's status *and* its history count,
+because the second is what would catch a move made through some other path.
+
+**SHIP-84 left this ticket a property to confirm rather than to build.** It wrote
+`TestAWithdrawnOfferCanBeReplaced` against a hand-set status with the note "SHIP-86 should find this
+already true"; it did, and the hand-set status is now `Service.WithdrawBid`. A provider who withdraws
+leaves `uq_bids_one_submitted_per_provider_per_job`'s predicate and may bid again — a fat-fingered
+price is not a job lost forever.
+
+#### The transaction, and the lock that is the reason for it
+
+`ReviseBid` and `WithdrawBid` both refuse a connection pool. `PlaceBid` does not, and the difference is
+the mechanism: a placement's correctness is `ON CONFLICT`'s and holds statement by statement, while
+these two read a status, decide against it, and write. `postgresStore.lockBid`'s `FOR UPDATE` is what
+makes that one decision, and outside a transaction the lock is released the instant the `SELECT`
+returns — leaving an award free to commit in the window, and a withdrawal to unpick a bid
+`uq_bids_one_accepted_per_job` says two parties are committed to, with nothing to report afterwards.
+
+#### The budget rule now has four responses rather than two
 
 `TestTheBidResponseCarriesNothingOfTheCustomers` held the `201` and the `200` replay to a closed set of
-keys at every depth. It now holds three: the revision answers with the same shape from a third code
-path, and **a shape that is safe on one path and not another is the failure several paths invite**.
-Verified by mutation, as SHIP-83 asks: a `max_price` field carrying `432199` fails on every subtest, on
-the key set and on the value search. `make verify` runs the same closed-set assertion from outside Go
-against the new response too.
-
-#### Shared surfaces
-
-One `$ref` entry in `contracts/openapi.yaml`, one line in `routes_golden.txt` and two in
-`Docs/10-api-error-codes.md` — all regenerated rather than typed — and §3's check count, written by
-`make verify-update`. **No migration**: a revision writes columns 000501 already added, so block
-500–599 is untouched and the out-of-order guard never fires. No `internal/boundaries` edit, no `Deps`
-field, and `internal/bidding` still imports no domain.
+keys at every depth. It now holds four: the revision and the withdrawal answer with the same shape from
+two more code paths, and **a shape that is safe on one path and not another is the failure several
+paths invite**. Verified by mutation, as SHIP-83 asks: a `max_price` field carrying `432199` fails on
+all four subtests, on the key set and on the value search. `make verify` runs the same closed-set
+assertion from outside Go against both new responses.
 
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 

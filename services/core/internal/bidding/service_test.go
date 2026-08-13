@@ -360,8 +360,10 @@ func TestTheRuleIsPerProviderAndPerJob(t *testing.T) {
 // accepted or expires" and forbids nothing about what follows a withdrawal; refusing the second bid
 // would mean a fat-fingered price is a job the provider can never bid on again.
 //
-// SHIP-86 builds the withdrawal endpoint. The status is moved here directly because that endpoint
-// does not exist yet, and the property is worth pinning now: SHIP-86 should find this already true.
+// SHIP-84 wrote this against a hand-set status, because the withdrawal endpoint did not exist and the
+// property was worth pinning early: "SHIP-86 should find this already true." **It did**, and the
+// hand-set status is now [Service.WithdrawBid] — which turns this from a claim about a partial index
+// into a claim about the sequence a provider actually performs.
 func TestAWithdrawnOfferCanBeReplaced(t *testing.T) {
 	m := newMarket(t)
 
@@ -369,7 +371,9 @@ func TestAWithdrawnOfferCanBeReplaced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the first offer: %v", err)
 	}
-	exec(t, m.pool, `UPDATE bids SET status = 'Withdrawn' WHERE id = $1`, first.ID)
+	if _, err := m.withdraw(t, m.provider, m.job, first.ID); err != nil {
+		t.Fatalf("withdrawing the first offer: %v", err)
+	}
 
 	second, created, err := m.place(t, m.provider, m.job, offer("key-replacement"))
 	if err != nil {
@@ -1302,19 +1306,234 @@ func TestRepeatingARevisionReachesTheSameState(t *testing.T) {
 	}
 }
 
-// --- what a revision does not do ------------------------------------------------------------------------
+// --- SHIP-86: withdrawing an offer -----------------------------------------------------------------
 
-// TestARevisionDoesNotMoveTheJob is SHIP-90's ticket, asserted here so that it stays SHIP-90's.
+// SHIP-86's *Done when*: "A provider can withdraw before acceptance; status becomes Withdrawn."
 //
-// Docs/02 §2 has `Open → Negotiating` on "first bid or counter-offer submitted" and `Negotiating →
-// Open` on bids being withdrawn or rejected. Both belong to **SHIP-90**, which owns that presentation
-// status in either direction — and job status is never a settable field in any case: a move passes one
-// guarded function and leaves a `job_status_history` row in the same transaction (Docs/02 §2,
-// CLAUDE.md). Doing half of that here would be doing the half without the record.
+//	a provider can withdraw   TestAProviderWithdrawsTheirOwnOfferBeforeAcceptance
+//	before acceptance         TestAnAcceptedBidCannotBeWithdrawn
+//	status becomes Withdrawn  the same test, read out of the row rather than off the return value
+//
+// And the claim that is in the ticket rather than the sentence: **a retry of a withdrawal must not
+// fail because the first one succeeded**. TestWithdrawingAnOfferThatIsAlreadyWithdrawnSucceeds is
+// that, and it is why this endpoint needs no key column either.
+
+// TestAProviderWithdrawsTheirOwnOfferBeforeAcceptance is the acceptance criterion.
+//
+// **The row survives.** Docs/01 §4.3 requires the platform to record every withdrawal and Docs/02 §4
+// keeps bid history readable to the customer, the bidding provider and administrators, so there is no
+// delete on this table — the same reading fleet gives a deactivated vehicle.
+func TestAProviderWithdrawsTheirOwnOfferBeforeAcceptance(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-withdraw-happy"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	withdrawn, err := m.withdraw(t, m.provider, m.job, placed.ID)
+	if err != nil {
+		t.Fatalf("WithdrawBid() = %v, want the withdrawn offer", err)
+	}
+	if withdrawn.Status != StatusWithdrawn {
+		t.Errorf("the offer is %q, want Withdrawn", withdrawn.Status)
+	}
+	if withdrawn.ID != placed.ID {
+		t.Errorf("the withdrawal produced a new row (%s, was %s)", withdrawn.ID, placed.ID)
+	}
+
+	// The row, not the answer the service gave about itself — and the price is still there, because
+	// what a withdrawal removes is the offer's standing rather than its record.
+	after := m.row(t, placed.ID)
+	if after.status != "Withdrawn" {
+		t.Errorf("the stored status is %q, want Withdrawn", after.status)
+	}
+	if after.amount != 450.00 {
+		t.Errorf("the withdrawal changed the recorded price to %v", after.amount)
+	}
+	if n := m.bids(t, m.provider, m.job); n != 1 {
+		t.Errorf("the job carries %d rows, want 1 — a withdrawal is not a delete", n)
+	}
+}
+
+// TestWithdrawingAnOfferThatIsAlreadyWithdrawnSucceeds is what makes a retry safe when it does not
+// reuse its key.
+//
+// The idempotency middleware absorbs the retry that carries the same key; this absorbs the one that
+// does not, which is the ordinary shape of a phone that lost its connection, was restarted, and
+// generated a fresh value for the same intent. `jobs` makes the same call for a repeated cancellation
+// and `fleet` for a repeated deactivation.
+//
+// **`updated_at` is the assertion that the second call wrote nothing.** A second `UPDATE` reaching the
+// row would move it through bids_set_updated_at, and a test comparing only the status could not tell
+// an absorbed request from one that rewrote Withdrawn over Withdrawn.
+func TestWithdrawingAnOfferThatIsAlreadyWithdrawnSucceeds(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-withdraw-twice"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	if _, err := m.withdraw(t, m.provider, m.job, placed.ID); err != nil {
+		t.Fatalf("the first withdrawal: %v", err)
+	}
+	after := m.row(t, placed.ID)
+
+	again, err := m.withdraw(t, m.provider, m.job, placed.ID)
+	if err != nil {
+		t.Fatalf("withdrawing twice = %v.\n"+
+			"  A retry that generated a fresh idempotency key must not be told its withdrawal "+
+			"failed when it succeeded. The caller asked for an outcome that already holds.", err)
+	}
+	if again.Status != StatusWithdrawn {
+		t.Errorf("the second withdrawal answered %q", again.Status)
+	}
+
+	if second := m.row(t, placed.ID); !second.updatedAt.Equal(after.updatedAt) {
+		t.Errorf("the second withdrawal wrote to the row (updated_at moved %s to %s)",
+			after.updatedAt, second.updatedAt)
+	}
+}
+
+// TestAnAcceptedBidCannotBeWithdrawn is the "before acceptance" half of the *Done when*.
+//
+// **Withdrawal after acceptance is a different thing entirely and is not this endpoint.** Docs/02
+// §6.2 makes a provider stepping away from awarded work a provider cancellation, with the job moving
+// back to Open, every bid closed, and the cancellation recorded against the provider. Allowing it here
+// would be that flow with none of its consequences, and it would break the award silently: the job
+// would still be Awarded, to a bid nobody could see.
+func TestAnAcceptedBidCannotBeWithdrawn(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-accepted-withdraw"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+	m.setStatus(t, placed.ID, StatusAccepted)
+
+	if _, err := m.withdraw(t, m.provider, m.job, placed.ID); !errors.Is(err, ErrBidAccepted) {
+		t.Fatalf("withdrawing an accepted bid = %v, want ErrBidAccepted", err)
+	}
+	if after := m.row(t, placed.ID); after.status != "Accepted" {
+		t.Errorf("the bid is now %s, want Accepted", after.status)
+	}
+}
+
+// TestAClosedOfferCannotBeWithdrawn is the rest of [Status.live], minus the case above it.
+//
+// Withdrawn is deliberately absent: that one is absorbed rather than refused, and
+// TestWithdrawingAnOfferThatIsAlreadyWithdrawnSucceeds is where it lives.
+func TestAClosedOfferCannotBeWithdrawn(t *testing.T) {
+	for _, status := range []Status{StatusRejected, StatusExpired, StatusSuperseded} {
+		t.Run(status.String(), func(t *testing.T) {
+			m := newMarket(t)
+
+			placed, _, err := m.place(t, m.provider, m.job, offer("key-closed-withdraw-"+status.String()))
+			if err != nil {
+				t.Fatalf("placing the offer: %v", err)
+			}
+			m.setStatus(t, placed.ID, status)
+
+			if _, err := m.withdraw(t, m.provider, m.job, placed.ID); !errors.Is(err, ErrBidClosed) {
+				t.Fatalf("withdrawing a %s offer = %v, want ErrBidClosed", status, err)
+			}
+		})
+	}
+}
+
+// TestOnlyTheBidsOwnerCanWithdrawIt is the same rule [Service.ownBid] applies to a revision, driven
+// through the other verb.
+//
+// Both endpoints go through one function precisely so this cannot hold on one and not the other — but
+// "one function" is a claim about today's code, and this is the assertion that survives somebody
+// inlining it.
+func TestOnlyTheBidsOwnerCanWithdrawIt(t *testing.T) {
+	m := newMarket(t)
+
+	mine, _, err := m.place(t, m.provider, m.job, offer("key-mine-to-withdraw"))
+	if err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+
+	competitor := newVerifiedProvider(t, m.pool, "bid-withdraw-rival@example.com", "+61400000851")
+	declare(t, m.pool, competitor, "VIC")
+	addVehicle(t, m.pool, competitor, "BID011")
+	otherJob := m.publish(t)
+
+	if _, err := m.withdraw(t, competitor, m.job, mine.ID); !errors.Is(err, ErrNotBidOwner) {
+		t.Fatalf("a competitor withdrew somebody else's offer: %v, want ErrNotBidOwner", err)
+	}
+	if _, err := m.withdraw(t, m.provider, otherJob, mine.ID); !errors.Is(err, ErrBidNotFound) {
+		t.Fatalf("the bid was reachable under the wrong job: %v, want ErrBidNotFound", err)
+	}
+
+	if after := m.row(t, mine.ID); after.status != "Submitted" {
+		t.Errorf("the offer is %s after two refused withdrawals, want Submitted", after.status)
+	}
+}
+
+// TestAWithdrawalNeedsNoEligibility is the other half of the asymmetry [Service.ReviseBid] documents.
+//
+// **A provider must always be able to take back their own offer.** Refusing because their only vehicle
+// left service, or their verification lapsed, would strand a live offer the customer can still accept
+// and the provider can no longer retract — the worst of both answers. SHIP-81's filter governs what a
+// provider may *offer*; it has no business governing what they may stop offering.
+func TestAWithdrawalNeedsNoEligibility(t *testing.T) {
+	cases := map[string]func(t *testing.T, m market){
+		"the provider's only vehicle left service": func(t *testing.T, m market) {
+			exec(t, m.pool, `UPDATE vehicles SET deactivated_at = now() WHERE provider_id = $1`, m.provider)
+		},
+		"the provider's verification lapsed": func(t *testing.T, m market) {
+			exec(t, m.pool, `UPDATE users SET phone_verified_at = NULL WHERE id = $1`, m.provider)
+		},
+		"the provider withdrew from the state the job picks up in": func(t *testing.T, m market) {
+			declare(t, m.pool, m.provider, "NSW")
+		},
+		"the job was cancelled underneath the offer": func(t *testing.T, m market) {
+			transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+		},
+	}
+
+	for name, breakIt := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := newMarket(t)
+
+			placed, _, err := m.place(t, m.provider, m.job, offer("key-withdraw-ineligible"))
+			if err != nil {
+				t.Fatalf("placing the offer: %v", err)
+			}
+			breakIt(t, m)
+
+			withdrawn, err := m.withdraw(t, m.provider, m.job, placed.ID)
+			if err != nil {
+				t.Fatalf("%s: the withdrawal was refused (%v).\n"+
+					"  A provider must always be able to take back their own offer — refusing "+
+					"leaves a live offer the customer can accept and the provider cannot retract.",
+					name, err)
+			}
+			if withdrawn.Status != StatusWithdrawn {
+				t.Errorf("the offer is %q, want Withdrawn", withdrawn.Status)
+			}
+		})
+	}
+}
+
+// --- what neither verb does ------------------------------------------------------------------------
+
+// TestNeitherRevisingNorWithdrawingMovesTheJob is SHIP-90's ticket, asserted here so that it stays
+// SHIP-90's.
+//
+// Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", and
+// it is tempting to read a withdrawal as the trigger for it. Nothing reaches Negotiating until SHIP-90,
+// which owns that presentation status in both directions — and job status is never a settable field in
+// any case: a move passes one guarded function and leaves a `job_status_history` row in the same
+// transaction (Docs/02 §2, CLAUDE.md). Doing half of that here would be doing the half without the
+// record.
 //
 // Both halves are asserted, as SHIP-84's twin does: the job is where it was, and its history is
 // unchanged. The second is what would catch a move made through some other path.
-func TestARevisionDoesNotMoveTheJob(t *testing.T) {
+func TestNeitherRevisingNorWithdrawingMovesTheJob(t *testing.T) {
 	m := newMarket(t)
 
 	placed, _, err := m.place(t, m.provider, m.job, offer("key-nomove-revision"))
@@ -1331,6 +1550,9 @@ func TestARevisionDoesNotMoveTheJob(t *testing.T) {
 	if _, err := m.revise(t, m.provider, m.job, placed.ID, Revision{AmountCents: ptr(int64(41000))}); err != nil {
 		t.Fatalf("revising: %v", err)
 	}
+	if _, err := m.withdraw(t, m.provider, m.job, placed.ID); err != nil {
+		t.Fatalf("withdrawing: %v", err)
+	}
 
 	var (
 		status string
@@ -1345,17 +1567,17 @@ func TestARevisionDoesNotMoveTheJob(t *testing.T) {
 		t.Errorf("the job is %q, want Open — Negotiating in either direction is SHIP-90's", status)
 	}
 	if after != before {
-		t.Errorf("revising wrote %d job_status_history rows", after-before)
+		t.Errorf("revising and withdrawing wrote %d job_status_history rows", after-before)
 	}
 }
 
-// TestRevisingRefusesAConnectionPool is the guard [ErrNotInTransaction] exists for.
+// TestRevisingAndWithdrawingRefuseAConnectionPool is the guard [ErrNotInTransaction] exists for.
 //
-// The method reads a status, decides against it and writes, and that is only one decision while
+// Both methods read a status, decide against it and write, and the decision is only one decision while
 // lockBid's `FOR UPDATE` is held — which outside a transaction is released the instant the SELECT
-// returns. An award committing in that window would leave a revision repricing a bid
+// returns. An award committing in that window would leave a withdrawal unpicking a bid
 // uq_bids_one_accepted_per_job says two parties are committed to, with nothing to report afterwards.
-func TestRevisingRefusesAConnectionPool(t *testing.T) {
+func TestRevisingAndWithdrawingRefuseAConnectionPool(t *testing.T) {
 	m := newMarket(t)
 
 	placed, _, err := m.place(t, m.provider, m.job, offer("key-no-transaction"))
@@ -1366,6 +1588,9 @@ func TestRevisingRefusesAConnectionPool(t *testing.T) {
 	if _, err := m.svc.ReviseBid(t.Context(), m.pool, m.provider, m.job, placed.ID,
 		Revision{AmountCents: ptr(int64(1))}); !errors.Is(err, ErrNotInTransaction) {
 		t.Errorf("ReviseBid() on a pool = %v, want ErrNotInTransaction", err)
+	}
+	if _, err := m.svc.WithdrawBid(t.Context(), m.pool, m.provider, m.job, placed.ID); !errors.Is(err, ErrNotInTransaction) {
+		t.Errorf("WithdrawBid() on a pool = %v, want ErrNotInTransaction", err)
 	}
 
 	if after := m.row(t, placed.ID); after.status != "Submitted" || after.amount != 450.00 {

@@ -176,6 +176,19 @@ func (m market) revise(t *testing.T, provider, job, bid uuid.UUID, rev Revision)
 	return revised, err
 }
 
+// withdraw runs one withdrawal in a transaction, which is what [Service.WithdrawBid] requires.
+func (m market) withdraw(t *testing.T, provider, job, bid uuid.UUID) (Bid, error) {
+	t.Helper()
+
+	var withdrawn Bid
+	err := db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		withdrawn, err = m.svc.WithdrawBid(ctx, r, provider, job, bid)
+		return err
+	})
+	return withdrawn, err
+}
+
 // row is the stored bid, read straight out of the table rather than off whatever the service said
 // about itself.
 //

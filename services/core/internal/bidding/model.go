@@ -86,7 +86,7 @@ var Statuses = []Status{
 // the other party has not answered". A predicate written against the *word* "active" would be a guess
 // at a design SHIP-87 has not made.
 //
-// **SHIP-86's withdrawal will gate on this too, because Docs/01 §4.2 bounds the two identically** —
+// **Both revision and withdrawal gate on this, because Docs/01 §4.2 bounds them identically** —
 // "place, update, and withdraw a bid until it is accepted or expires". Two predicates that have to
 // agree are one predicate; the two endpoints differ in what they do about a status that fails it, not
 // in which statuses fail.

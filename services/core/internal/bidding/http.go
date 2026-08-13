@@ -361,6 +361,19 @@ func (b reviseRequest) revision() (Revision, error) {
 	return rev, nil
 }
 
+// withdrawRequest is the body of POST /v1/jobs/{id}/bids/{bid_id}/withdraw, and it has no fields at
+// all (SHIP-86).
+//
+// **The client names an intent and the platform decides what the state becomes**, which is the same
+// shape `POST /v1/jobs/{id}/cancel` and `POST /v1/fleet/vehicles/{id}/deactivate` take. A `PATCH`
+// writing `"status": "withdrawn"` would make a bid's status a settable field, which it is not.
+//
+// A body is still required, on the reasoning jobs' extendRequest gives: httpx.DecodeJSON refuses an
+// empty body, and an endpoint excepted from that would be a second answer to what a request looks
+// like. `{}` is the whole request, and because the decoder refuses unknown fields a client that sends
+// `{"status": "withdrawn"}` is told the field does not exist rather than having it ignored.
+type withdrawRequest struct{}
+
 // Revise handles PATCH /v1/jobs/{id}/bids/{bid_id} (SHIP-85).
 //
 // Protected, and the reviser is whoever the token says is calling. **"Their own" is the whole of the
@@ -411,6 +424,57 @@ func (h *Handler) Revise() http.Handler {
 		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
 			var err error
 			bid, err = h.svc.ReviseBid(ctx, runner, providerID, jobID, bidID, rev)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, bidFrom(bid))
+		return nil
+	})
+}
+
+// Withdraw handles POST /v1/jobs/{id}/bids/{bid_id}/withdraw (SHIP-86).
+//
+// Protected, and the same two rules as [Handler.Revise] decide who may reach a bid: it has to be the
+// caller's own, and it has to be on the job in the path.
+//
+// A verb under the bid rather than a `DELETE`, because nothing is deleted. Docs/01 §4.3 requires the
+// platform to record every withdrawal and Docs/02 §4 keeps the history readable, so the row survives
+// at [StatusWithdrawn] — the same reading behind `POST /v1/fleet/vehicles/{id}/deactivate`, where a
+// vehicle named by a bid and a delivery is likewise never removed.
+//
+// **200, including when the offer was already withdrawn.** A withdrawal is idempotent by state rather
+// than by key: the caller asked for an outcome, and answering "you already did that" with a 409 would
+// mean a phone that retried with a fresh key after a restart is told its withdrawal failed when it
+// succeeded. See [Service.WithdrawBid].
+func (h *Handler) Withdraw() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, bidID, err := pathIDs(r)
+		if err != nil {
+			return err
+		}
+
+		var req withdrawRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var bid Bid
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			bid, err = h.svc.WithdrawBid(ctx, runner, providerID, jobID, bidID)
 			return err
 		})
 		if err != nil {

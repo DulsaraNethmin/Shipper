@@ -581,3 +581,139 @@ ok "and a bid paired with the wrong job is not found either — one resource, on
   || fail "a refused revision changed the row"
 ok "and none of the refusals touched the offer"
 
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-86  POST /v1/jobs/{id}/bids/{bid_id}/withdraw — withdrawn before acceptance"
+
+withdraw_path="/v1/jobs/$revise_job/bids/$revise_bid/withdraw"
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-wd-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-bid-wd-anon-$$" -H 'Content-Type: application/json' -d '{}' \
+  "http://localhost:$VERIFY_PORT$withdraw_path")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-wd-anon.json"; fail "an unauthenticated withdrawal returned $status, want 401"; }
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-wd-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" -H 'Content-Type: application/json' -d '{}' \
+  "http://localhost:$VERIFY_PORT$withdraw_path")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-wd-nokey.json"; fail "a withdrawal with no Idempotency-Key returned $status, want 400"; }
+
+status="$(bid_post "$bid_rival_token" "verify-bid-wdrival-$$" "$withdraw_path" '{}' wdrival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-wdrival.json"; fail "a competitor withdrew somebody else's bid: $status"; }
+ok "it needs a credential and a key, and another provider cannot reach the bid at all"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-withdraw-$$" "$withdraw_path" '{}' withdraw)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-withdraw.json"; fail "withdrawing returned $status, want 200"; }
+[[ "$(json "$WORKDIR/bid-withdraw.json" '["status"]')" == "withdrawn" ]] \
+  || fail "the offer came back as $(json "$WORKDIR/bid-withdraw.json" '["status"]'), want withdrawn"
+[[ "$(json "$WORKDIR/bid-withdraw.json" '["id"]')" == "$revise_bid" ]] || fail "the withdrawal names a different bid"
+ok "a provider withdraws their own offer before acceptance, and the status becomes Withdrawn"
+
+# The row survives with its price. Docs/01 §4.3 requires every withdrawal to be recorded and Docs/02
+# §4 keeps the history readable — there is no delete on this table.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || amount::text from bids where id = '$revise_bid';")"
+[[ "$stored" == "Withdrawn 399.00" ]] \
+  || fail "the stored bid is '$stored', want 'Withdrawn 399.00' — a withdrawal is not a delete"
+ok "the row survives as record, at Withdrawn, with the price it was withdrawn at"
+
+python3 - "$WORKDIR/bid-withdraw.json" <<'PY' || fail "the withdrawal response carries something of the customer's"
+import json, re, sys
+
+allowed = {
+    "id", "job_id", "status", "amount_cents",
+    "pickup_at", "deliver_by", "message",
+    "created_at", "updated_at",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the withdrawal response is the same closed set of keys, and carries nothing of the customer's"
+
+# A revision after a withdrawal is refused, which is the code a client acts on rather than reports.
+status="$(bid_patch "$bid_provider_token" "verify-bid-revclosed-$$" "/v1/jobs/$revise_job/bids/$revise_bid" \
+  '{"amount_cents":1}' revclosed)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-revclosed.json"; fail "revising a withdrawn offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-revclosed.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-revclosed.json"; fail "expected code=bidding_bid_closed"; }
+ok "a withdrawn offer can no longer be revised, with a code the app can act on"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-86  a retry of a withdrawal is not a failure, whichever key it carries"
+
+# **Two mechanisms again, and this section tells them apart the way the placement's does.** The
+# middleware replays a response while its Redis entry lives. Delete the entry and the request runs all
+# the way to the row — where, unlike a placement, there is no stored key to match it. What answers is
+# the state: the caller asked for an outcome that already holds.
+status="$(bid_post "$bid_provider_token" "verify-bid-withdraw-$$" "$withdraw_path" '{}' wd2)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-wd2.json"; fail "the cached retry returned $status, want the stored 200"; }
+replayed_from_redis wd2 || fail "the second withdrawal was not replayed by the middleware"
+diff -q "$WORKDIR/bid-withdraw.json" "$WORKDIR/bid-wd2.json" >/dev/null \
+  || fail "the replayed response is not byte-identical to the original"
+ok "a retry inside the cache is replayed by the middleware, byte for byte"
+
+forget_the_cached_response "$bid_provider_id" "verify-bid-withdraw-$$"
+before_updated="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$revise_bid';")"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-withdraw-$$" "$withdraw_path" '{}' wd3)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/bid-wd3.json"; fail "a withdrawal retried after the cache forgot it returned $status, want 200"; }
+replayed_from_redis wd3 && fail "the third request was still answered from the cache"
+ok "and a retry the cache has forgotten is still 200 — answered by the state, not by a stored key"
+
+# A *fresh* key for the same intent, which is what a phone that restarted actually sends. This is the
+# case no idempotency mechanism can absorb, and the reason withdrawing twice has to succeed.
+status="$(bid_post "$bid_provider_token" "verify-bid-withdraw-again-$$" "$withdraw_path" '{}' wd4)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/bid-wd4.json"; fail "a withdrawal under a FRESH key returned $status, want 200 — a retry must not fail because the first one succeeded"; }
+[[ "$(json "$WORKDIR/bid-wd4.json" '["status"]')" == "withdrawn" ]] || fail "the repeat answered with the wrong status"
+ok "a repeat under a brand new key succeeds too — the outcome the caller asked for holds"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$revise_bid';")" == "$before_updated" ]] \
+  || fail "an absorbed withdrawal wrote to the row"
+ok "and none of the repeats wrote to the row"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-86  a withdrawn offer frees the provider to bid again, and moves no job"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-replace-$$" "/v1/jobs/$revise_job/bids" "$bid_body" replace)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/bid-replace.json"; fail "bidding again after withdrawing returned $status, want 201"; }
+[[ "$(json "$WORKDIR/bid-replace.json" '["id"]')" != "$revise_bid" ]] || fail "the replacement is not a new row"
+ok "a provider who withdrew may place a new offer — a fat-fingered price is not a job lost forever"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where provider_id = '$bid_provider_id' and job_id = '$revise_job';")" == "2" ]] \
+  || fail "the withdrawn offer did not survive alongside the replacement"
+ok "and both rows stand — the withdrawn one as record, the new one as the live offer"
+
+# Neither verb is a job transition. Docs/02 §2 has `Negotiating → Open` on bids being withdrawn, and
+# that is SHIP-90's in both directions; the history count is the half that would catch a move made
+# through some other path.
+after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$revise_job';")"
+[[ "$after" == "Open 1" ]] \
+  || fail "the job reads '$after' (status, history rows), want 'Open 1' — revising and withdrawing move no job"
+ok "the job is still Open with only the row that published it — Negotiating is SHIP-90's, both ways"

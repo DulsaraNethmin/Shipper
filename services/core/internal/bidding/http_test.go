@@ -19,7 +19,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
-// The wire contract of SHIP-84 and SHIP-85.
+// The wire contract of SHIP-84, SHIP-85 and SHIP-86.
 //
 // These drive the handler on a mux of their own rather than through cmd/api's router, because what
 // is being checked here is the domain's own half: what it accepts, what it refuses, and what shape
@@ -38,10 +38,11 @@ import (
 //     than a response field. It is the test that would catch a store read scoped by job and key but
 //     not by provider.
 //
-// SHIP-85 gives the second rule a second failure mode, and [TestAnotherProvidersBidIsUnreachable] is
-// for that one. Its endpoint reaches a bid by *naming* it rather than by looking one up, so what
-// would break the rule there is a missing ownership comparison rather than a missing scope — the same
-// rule, a different line of code, and therefore a different test.
+// SHIP-85 and SHIP-86 give the second rule a second failure mode, and
+// [TestAnotherProvidersBidIsUnreachable] is for that one. Their endpoints reach a bid by *naming* it
+// rather than by looking one up, so what would break the rule there is a missing ownership comparison
+// rather than a missing scope — the same rule, a different line of code, and therefore a different
+// test.
 
 // newTestRouter mounts the handler on the pattern cmd/api registers it under.
 //
@@ -63,6 +64,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs/{id}/bids", handler.Place())
 	mux.Handle("PATCH /v1/jobs/{id}/bids/{bid_id}", handler.Revise())
+	mux.Handle("POST /v1/jobs/{id}/bids/{bid_id}/withdraw", handler.Withdraw())
 	return mux
 }
 
@@ -140,6 +142,13 @@ func (w wire) revise(t *testing.T, caller uuid.UUID, job, bid uuid.UUID, key, bo
 	t.Helper()
 	return send(t, w.router, http.MethodPatch, caller, key,
 		"/v1/jobs/"+job.String()+"/bids/"+bid.String(), body)
+}
+
+// withdraw sends one POST against a bid's withdraw verb (SHIP-86).
+func (w wire) withdraw(t *testing.T, caller uuid.UUID, job, bid uuid.UUID, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	return as(t, w.router, caller, key,
+		"/v1/jobs/"+job.String()+"/bids/"+bid.String()+"/withdraw", `{}`)
 }
 
 // placed is one offer on the fixture job, over the wire, with its identifier read back out.
@@ -323,9 +332,9 @@ var providerBidKeys = map[string]bool{
 // and proves nothing, which is the specific way this could rot without anybody noticing.
 //
 // **Every response that carries a bid is covered**, which at SHIP-84 was the 201 and the 200 replay
-// and is now three: SHIP-85's revision answers with the same shape from a third code path. A shape
-// that is safe on one path and not another is exactly the failure several paths invite, and the list
-// below is what stops a fourth being added without being added here.
+// and is now four: SHIP-85's revision and SHIP-86's withdrawal answer with the same shape from two
+// more code paths. A shape that is safe on one path and not another is exactly the failure several
+// paths invite, and the list below is what stops a fifth being added without being added here.
 func TestTheBidResponseCarriesNothingOfTheCustomers(t *testing.T) {
 	w := newWire(t)
 
@@ -367,6 +376,12 @@ func TestTheBidResponseCarriesNothingOfTheCustomers(t *testing.T) {
 		t.Fatalf("the revision = %d (%s)", revised.Code, revised.Body)
 	}
 	responses["the revision, 200"] = revised.Body.Bytes()
+
+	withdrawn := w.withdraw(t, w.provider, w.job, bidID, "wire-privacy-withdraw")
+	if withdrawn.Code != http.StatusOK {
+		t.Fatalf("the withdrawal = %d (%s)", withdrawn.Code, withdrawn.Body)
+	}
+	responses["the withdrawal, 200"] = withdrawn.Body.Bytes()
 
 	for how, body := range responses {
 		t.Run(how, func(t *testing.T) {
@@ -707,7 +722,7 @@ func TestTheJobIDInThePathMustBeAnIdentifier(t *testing.T) {
 	}
 }
 
-// --- SHIP-85 at the wire ---------------------------------------------------------------
+// --- SHIP-85 and SHIP-86 at the wire ---------------------------------------------------------------
 
 // TestRevisingABidOverTheWire is SHIP-85's *Done when* at the wire.
 //
@@ -741,6 +756,58 @@ func TestRevisingABidOverTheWire(t *testing.T) {
 	}
 }
 
+// TestWithdrawingABidOverTheWire is SHIP-86's *Done when* at the wire, including the exact string.
+//
+// `withdrawn` is the lower snake case wire form of Docs/02 §4's `Withdrawn`, and it is a published
+// string a client is already branching on — TestTheWireFormsAreStableAndDistinct is what stops it
+// being renamed, and this is what stops the endpoint answering with something else entirely.
+func TestWithdrawingABidOverTheWire(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-withdraw-place")
+
+	rec := w.withdraw(t, w.provider, w.job, bid, "wire-withdraw")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST withdraw = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	body := decode[map[string]any](t, rec)
+	if body["status"] != "withdrawn" {
+		t.Errorf("status is %v, want withdrawn", body["status"])
+	}
+	if body["id"] != bid.String() {
+		t.Errorf("the withdrawal answered with %v, want %s", body["id"], bid)
+	}
+	if body["amount_cents"] != float64(45000) {
+		t.Errorf("the withdrawal changed the recorded price to %v — the row survives as record",
+			body["amount_cents"])
+	}
+}
+
+// TestARetriedWithdrawalUnderAFreshKeyIsStillTwoHundred is the retry this endpoint has to survive.
+//
+// The idempotency middleware is not in front of this handler here, which is the point: what is being
+// exercised is the case the middleware cannot cover — a phone that lost its connection, was restarted,
+// and generated a *new* key for the same intent. A 409 there would tell a provider their withdrawal
+// failed when it succeeded.
+func TestARetriedWithdrawalUnderAFreshKeyIsStillTwoHundred(t *testing.T) {
+	w := newWire(t)
+	bid := w.placed(t, "wire-withdraw-twice-place")
+
+	first := w.withdraw(t, w.provider, w.job, bid, "wire-withdraw-1")
+	if first.Code != http.StatusOK {
+		t.Fatalf("the first withdrawal = %d (%s)", first.Code, first.Body)
+	}
+
+	again := w.withdraw(t, w.provider, w.job, bid, "wire-withdraw-2")
+	if again.Code != http.StatusOK {
+		t.Fatalf("a second withdrawal under a fresh key = %d, want 200 (%s)", again.Code, again.Body)
+	}
+	if again.Body.String() != first.Body.String() {
+		t.Errorf("the second withdrawal answered differently:\n  first: %s\n  again: %s",
+			first.Body, again.Body)
+	}
+}
+
 // TestAnotherProvidersBidIsUnreachable is Docs/01 §4.3's second privacy rule on the two endpoints that
 // take a bid identifier.
 //
@@ -764,9 +831,11 @@ func TestAnotherProvidersBidIsUnreachable(t *testing.T) {
 	missing := uuid.Must(uuid.NewV7())
 
 	for name, rec := range map[string]*httptest.ResponseRecorder{
-		"revising somebody else's bid": w.revise(t, competitor, w.job, mine, "wire-x1", `{"amount_cents": 1}`),
+		"revising somebody else's bid":    w.revise(t, competitor, w.job, mine, "wire-x1", `{"amount_cents": 1}`),
+		"withdrawing somebody else's bid": w.withdraw(t, competitor, w.job, mine, "wire-x2"),
 		"revising a bid that is not there": w.revise(t, competitor, w.job, missing, "wire-x3",
 			`{"amount_cents": 1}`),
+		"withdrawing a bid that is not there": w.withdraw(t, competitor, w.job, missing, "wire-x4"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if rec.Code != http.StatusNotFound {
@@ -811,16 +880,22 @@ func TestABidIsAddressedUnderItsOwnJob(t *testing.T) {
 
 	other := w.publish(t)
 
-	if rec := w.revise(t, w.provider, other, bid, "wire-wj1", `{"amount_cents": 1}`); rec.Code != http.StatusNotFound {
-		t.Errorf("revising under the wrong job = %d, want 404 (%s)", rec.Code, rec.Body)
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"revising":    w.revise(t, w.provider, other, bid, "wire-wj1", `{"amount_cents": 1}`),
+		"withdrawing": w.withdraw(t, w.provider, other, bid, "wire-wj2"),
+	} {
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s under the wrong job = %d, want 404 (%s)", name, rec.Code, rec.Body)
+		}
 	}
 }
 
-// TestAnAcceptedBidAnswersItsOwnCode is the refusal a client acts on rather than reports.
+// TestAnAcceptedBidAnswersItsOwnCodeOnBothEndpoints is the refusal a client acts on rather than
+// reports.
 //
 // An accepted offer is a job this provider has won, so the app's next screen is that job — which is
 // why it is not folded into `bidding_bid_closed` with the rejected and expired ones.
-func TestAnAcceptedBidAnswersItsOwnCode(t *testing.T) {
+func TestAnAcceptedBidAnswersItsOwnCodeOnBothEndpoints(t *testing.T) {
 	w := newWire(t)
 	bid := w.placed(t, "wire-accepted-place")
 
@@ -828,12 +903,18 @@ func TestAnAcceptedBidAnswersItsOwnCode(t *testing.T) {
 	// guarding it (000500 says why), so this is the statement the award itself will run.
 	exec(t, w.pool, `UPDATE bids SET status = 'Accepted' WHERE id = $1`, bid)
 
-	rec := w.revise(t, w.provider, w.job, bid, "wire-acc1", `{"amount_cents": 1}`)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("revising an accepted bid = %d, want 409 (%s)", rec.Code, rec.Body)
-	}
-	if got := decode[errorEnvelope](t, rec).Error.Code; got != string(CodeBidAccepted) {
-		t.Errorf("the code is %q, want %q", got, CodeBidAccepted)
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"revising":    w.revise(t, w.provider, w.job, bid, "wire-acc1", `{"amount_cents": 1}`),
+		"withdrawing": w.withdraw(t, w.provider, w.job, bid, "wire-acc2"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("%s an accepted bid = %d, want 409 (%s)", name, rec.Code, rec.Body)
+			}
+			if got := decode[errorEnvelope](t, rec).Error.Code; got != string(CodeBidAccepted) {
+				t.Errorf("the code is %q, want %q", got, CodeBidAccepted)
+			}
+		})
 	}
 }
 
@@ -846,9 +927,9 @@ func TestAClosedOfferAnswersItsOwnCode(t *testing.T) {
 	w := newWire(t)
 	bid := w.placed(t, "wire-closed-place")
 
-	// SHIP-86 builds the withdrawal endpoint; until it does, the status is set directly. Unlike a
-	// job, a bid's status has no trigger guarding it — 000500 says why.
-	exec(t, w.pool, `UPDATE bids SET status = 'Withdrawn' WHERE id = $1`, bid)
+	if rec := w.withdraw(t, w.provider, w.job, bid, "wire-closed-withdraw"); rec.Code != http.StatusOK {
+		t.Fatalf("withdrawing = %d (%s)", rec.Code, rec.Body)
+	}
 
 	rec := w.revise(t, w.provider, w.job, bid, "wire-closed-revise", `{"amount_cents": 1}`)
 	if rec.Code != http.StatusConflict {
@@ -881,6 +962,13 @@ func TestARevisionCannotSetTheStatus(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("a revision carrying %s = %d, want 400 (%s)", field, rec.Code, rec.Body)
 		}
+	}
+
+	// And likewise on the verb, where a body is required but empty.
+	if rec := send(t, w.router, http.MethodPost, w.provider, "wire-set-withdraw",
+		"/v1/jobs/"+w.job.String()+"/bids/"+bid.String()+"/withdraw",
+		`{"status":"accepted"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("a withdrawal carrying a status = %d, want 400 (%s)", rec.Code, rec.Body)
 	}
 }
 
@@ -936,9 +1024,14 @@ func TestABadTimestampInARevisionNamesTheField(t *testing.T) {
 func TestTheBidIDInThePathMustBeAnIdentifier(t *testing.T) {
 	w := newWire(t)
 
-	if rec := send(t, w.router, http.MethodPatch, w.provider, "wire-badbid1",
-		"/v1/jobs/"+w.job.String()+"/bids/not-a-uuid",
-		`{"amount_cents": 1}`); rec.Code != http.StatusBadRequest {
-		t.Errorf("a malformed bid id = %d, want 400 (%s)", rec.Code, rec.Body)
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"revising": send(t, w.router, http.MethodPatch, w.provider, "wire-badbid1",
+			"/v1/jobs/"+w.job.String()+"/bids/not-a-uuid", `{"amount_cents": 1}`),
+		"withdrawing": send(t, w.router, http.MethodPost, w.provider, "wire-badbid2",
+			"/v1/jobs/"+w.job.String()+"/bids/not-a-uuid/withdraw", `{}`),
+	} {
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s with a malformed bid id = %d, want 400 (%s)", name, rec.Code, rec.Body)
+		}
 	}
 }
