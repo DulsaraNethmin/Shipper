@@ -251,7 +251,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **555 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **570 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -411,6 +411,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
+| **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -7550,6 +7551,145 @@ written, the same row is refused in raw SQL at `COMMIT`, a delivery evidenced by
 is accepted and moves the job through the transition guard leaving one history row, the
 exception-completed job is findable by the join SHIP-117 and X-6 both start from, and a delivery
 evidenced by a photograph is accepted the same way.
+
+### SHIP-136 — the seam SHIP-135 left, used as intended, and the two lines of §4.5 that could not be met
+
+Five points, and the ticket that gates all thirteen of M5. It opens `jobs`, `bidding` and `delivery`
+at once, which is why it had been deferred three times and why it ran alone.
+
+**Nine events, and `internal/events` was not edited to add one of them.** `internal/bidding/events.go`
+and `internal/delivery/events.go` are files exactly like `internal/jobs/events.go`: one `init` calling
+`events.Register`, the payload struct as the schema, the emit helpers beside it. That is SHIP-135's
+prediction holding to the letter — "SHIP-136 adds bidding's and delivery's from files exactly like
+it" — and it is the second mechanism in this repository to be demonstrated rather than asserted
+(`internal/boundaries`' pre-seeded infrastructure list was the first). `shipper.bid` and
+`shipper.delivery` carry traffic for the first time; the topic set was already right.
+
+| Aggregate | Event | Emitted from |
+|---|---|---|
+| `bid` | `bid.placed` | `PlaceBid`, on the branch that created a row — a retry answered from the record emits nothing |
+| `bid` | `bid.revised` | `ReviseBid` |
+| `bid` | `bid.withdrawn` | `WithdrawBid`, and **not** on a withdrawal of something already withdrawn |
+| `bid` | `bid.countered` | `CounterOffer`, on the counter, naming the offer it displaced |
+| `bid` | `bid.accepted` | `AwardBid`, after the transition — an award is not an award until the job has moved |
+| `bid` | `bid.rejected` | one per offer the SHIP-93 sweep closed |
+| `delivery` | `delivery.driver_assigned` | `AssignDriver`, from `granted`, only when a row was written |
+| `delivery` | `delivery.milestone_recorded` | `RecordMilestone`, from `recorded`, **whether or not the job moved** |
+| `delivery` | `delivery.proof_recorded` | the evidence, photograph and reasoned exception alike |
+
+**`Docs/01` §4.5 has six lines and two of them cannot be met, which is stated rather than quietly
+dropped.** Enumerating the section against what the platform actually does was the first hour of the
+ticket and is most of its value.
+
+- *Account verification completed or rejected* — **not emittable.** `internal/profiles` holds
+  `doc.go` and nothing else; there is no verification state change in the service to emit from.
+  Whichever ticket writes it writes its event, from its own `events.go`.
+- *Job published* — already emitted, as `job.status_changed` `Draft → Open`, since SHIP-57.
+- *New bid, counter-offer, withdrawal* — the three new bid events above.
+- *…or bid expiry* — **not emittable.** `bidding.StatusExpired` is declared, `ck_bids_status` accepts
+  it, and **nothing writes it**. **SHIP-89** is the ticket that starts, and its *Done when* already
+  reads "bids expire on their own terms and emit an event". Registering a schema for it here would
+  have put a line in `events_golden.txt` describing a payload no code marshals, which reads as
+  covered; instead `scripts/verify/61-bidding.sh` asserts that no bid is `Expired`, so the day one is
+  the day that check fails and names SHIP-89.
+- *Bid accepted or job cancelled* — `bid.accepted`, plus `bid.rejected` for every offer the same
+  transaction closed, plus `job.status_changed` for the cancellation.
+- *Delivery status changes* — see below.
+- *Dispute opened or resolved* — **half met, and by the job rather than by a dispute event.**
+  `admin.RaiseDispute` (SHIP-163) moves the job to `Disputed` through the guard, so
+  `job.status_changed` fires. There is no `dispute` aggregate and a fourth aggregate is a decision
+  recorded in `internal/events` rather than something a domain track does; `internal/admin` was also
+  outside this ticket's ownership. *Resolved* is SHIP-164 and does not exist. **Whoever writes
+  SHIP-164 should decide whether a dispute is a fourth aggregate**, because that is a topic and a
+  partition count, and partitions cannot be reduced.
+
+**The delivery events exist because the job's status does not carry what `Docs/01` §4.4 asks an actor
+to record, and the absorbed milestone is the sharp case.** Every milestone that *moves* the job
+already emitted `job.status_changed`, from `jobs`, inside this domain's transaction. What emitted
+nothing at all was everything that writes a row and moves nothing — the repeated pickup attempt of
+`Docs/02` §5, and **SHIP-112's absorbed late milestone**, which `Docs/02` §3.1 requires to be
+"accepted… without moving the job backwards" and which therefore leaves no `job_status_history` row
+and no status event. A driver's queued `Picked up` syncing after `In transit` was invisible to
+everything downstream. `delivery.milestone_recorded` carries `job_moved`, which is the one fact a
+consumer cannot derive: when it is false there is no `job.status_changed` to correlate with, and a
+consumer waiting for one would wait for ever.
+
+**Three things are deliberately not in a payload, and each is a rule rather than a preference.** The
+**driver's name and mobile number** (`Docs/01` §5.1 — an event travels onto a topic with seven days
+of retention and into every consumer there will ever be; a consumer with a reason to know who is
+driving reads the row). The **object key of a photograph** (who may look at it is
+`Service.ProofFor`'s decision, made after an authorisation check and issued as a short-lived signed
+URL — not a decision a consumer of a topic is in a position to make). And **anything of the job
+beyond its identifier**, which keeps `Docs/01` §4.3's budget rule structurally out of reach.
+`amount_cents` is not an exception to the last: it is the provider's own number, or on a counter an
+amount the customer deliberately offered to that provider, which
+`GET /v1/jobs/{id}/bids/{bid_id}/chain` has served since SHIP-88.
+
+**The half of the *Done when* that says "from the domain, not the API layer" now has a test, and it
+had none.** `cmd/api/events_domain_test.go` parses every non-test Go file in the service and refuses
+an `events.New` or an `Emit` outside a domain — **or inside a domain's `http.go`**, which is the
+shape the rule is really about: `Docs/10` §4 puts handlers in the domain, so an emit written there is
+inside the domain package and is still the API layer. It lives in `cmd/api` for the reason
+`events_golden.txt` does, and a second test holds its allow-list against `internal/boundaries.Domains`
+so that infrastructure cannot be added to it to unblock something. Nothing else in the build checks
+this: an event emitted from a handler writes the right row, with the right payload, onto the right
+topic, and passes every other test in the ticket.
+
+**One store method changed shape and the reason is worth keeping.** `rejectCompeting` returned
+nothing and now returns the rows it closed, via `RETURNING`. Each closed offer is a different provider
+to tell, so the award emits one `bid.rejected` per row — and the rows have to come from the statement
+that closed them. A second `SELECT ... WHERE status = 'Rejected'` would read whatever is rejected
+*now*, including offers closed by some earlier act, and attribute them all to this transaction. That
+is the mutation that survived, below.
+
+#### Mutation testing: nine mutations, eight caught and one survivor that produced a test
+
+Each was applied to a file copied aside first, reverted from the copy rather than with
+`git checkout`, and confirmed with `git diff` **and** `shasum`.
+
+| Mutation | Result |
+|---|---|
+| Delete the `bid.placed` emit | **Caught** — seven tests in `internal/bidding/events_test.go`, six of them about other verbs, because every fixture places before it revises |
+| Move the withdrawal emit into `internal/bidding/http.go` (compiling) | **Caught** — `TestOnlyADomainEmitsADomainEvent`, and nothing else in the build. The row, the payload and the topic are all correct under this mutation |
+| Emit the evidence where the `proofs` row is written, before the milestone event | **Caught** — two tests. Both events key on the job, so they share a partition and the order is a guarantee; the mutation puts `delivery.proof_recorded` ahead of the milestone it names |
+| `budget_cents` on a provider-visible payload | **Caught three ways** — `TestEventCatalogueMatchesGolden`, SHIP-135's `TestNoDomainEventCarriesABudget`, and the domain's own closed key set. The second is the one that mattered: it was written a wave before this domain had an event |
+| Delete the `bid.rejected` sweep loop | **Caught** — three tests, one of which refuses to pass vacuously (`the exchange emitted no bid.rejected, so this test proves nothing`) |
+| `job_moved` hard-coded true | **Caught** — `TestAnAbsorbedMilestoneEmitsWithJobMovedFalse`, which exists only because of `Docs/02` §3.1 |
+| Drop the `created` guard, so a repeated nomination emits again | **Caught** — the assignment test's second half |
+| Move `bid.accepted` from step 5 to step 3 of the award | **Survived, and it is not a defect.** Both positions are inside one transaction, which either commits whole or rolls back whole, so no consumer can tell. **The finding is the general one**: within a transaction the position of an emit is unobservable, so the ordering comments in these files are documentation rather than tested properties — *except* between two events on the same aggregate, where outbox order is partition order, which the evidence mutation above shows is tested |
+| `rejectCompeting` reports its rows from a second `SELECT` instead of `RETURNING` | **Survived**, and it produced `TestTheAwardEmitsOnlyForTheOffersItItselfClosed`. It survived because nothing but the sweep writes `Rejected` today and a job is awarded once, so the two queries agree on every fixture — they stop agreeing the first time anything else closes an offer, and `Rejected` is `Docs/02` §4's "an offer the customer declined". The new test inserts an already-closed offer directly and asserts the award emits nothing about it. Re-run with the test in place: **caught** |
+
+**A note on "emit outside the transaction", which the brief asked for and which turns out to be
+unconstructible from a domain.** Neither `bidding.Service` nor `delivery.Service` holds a connection —
+every method takes the caller's `db.Runner`, which is the shape `Docs/10` §3.2 asks for — so there is
+no second runner in scope to emit through. The only place the mistake can be made is the composition
+root or a handler, and that is what the source guard above and the existing `ErrNotInTransaction`
+checks cover between them. The rollback property itself is held by a test in each domain that fails a
+transaction after the state change and asserts the outbox is empty.
+
+**`make verify` went from 555 checks across 13 sections to 570**, in three files. Six in
+`scripts/verify/61-bidding.sh` (all six bid events from real endpoints, `bid.expired` absent for a
+stated reason, every event keyed on the bid its payload names, the award's three events across two
+domains, and no budget on a job that has one); seven in `scripts/verify/70-delivery.sh` (the
+assignment with neither the driver's name nor their number, a milestone event reporting
+`job_moved: false`, one event per milestone row, both kinds of evidence, no object key, and the
+evidence after the claim); and two in `scripts/verify/80-notifications.sh`, which takes them off
+`shipper.bid` and `shipper.delivery` with Kafka's own console consumer — every id this run published,
+on the topic its aggregate names, all nine types at schema version 1, and no budget in the bytes a
+consumer receives.
+
+**That section moved, and the reason is a hazard the next Kafka assertion will meet.** The SHIP-135
+section **deletes `shipper.delivery`** to demonstrate that a topic somebody created by hand with the
+wrong partition count is reported rather than repaired, and its own header said that was free
+"because no code publishes to it yet". **This ticket ended that.** So the SHIP-136 section sits
+*above* SHIP-135's rather than below it, and reads the topic before the deletion destroys it. There
+is no longer a topic in the set that nothing publishes to: **a section that breaks a topic now has to
+run after every section that reads it**, and both headers say so.
+
+The topic assertions are fenced **by event id**, taken from the outbox before the worker starts, and
+compared as a **subset** — `shipper.bid` and `shipper.delivery` are not emptied by the harness and are
+shared with every worktree on the machine. That is SHIP-135's lesson applied without having to
+rediscover it.
 
 ## 4. Partly done — do not treat these as finished
 

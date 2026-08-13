@@ -168,6 +168,7 @@ SHIP-129
 # M5 — Notifications
 SHIP-134
 SHIP-135
+SHIP-136
 
 # M6 — Admin
 SHIP-149
