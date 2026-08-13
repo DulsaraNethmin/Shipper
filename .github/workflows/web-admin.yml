@@ -48,7 +48,10 @@ permissions:
 
 jobs:
   check:
-    name: lint, typecheck, build
+    # Both workflows run `make web-check` over the whole workspace, so this one runs the driver
+    # portal's tests too even though the admin panel has none of its own yet. The name follows the
+    # target rather than the surface, for the same reason it does in web-driver-portal.yml.
+    name: lint, test, build, typecheck
     runs-on: ubuntu-latest
 
     steps:

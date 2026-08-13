@@ -43,7 +43,10 @@ permissions:
 
 jobs:
   check:
-    name: lint, typecheck, build
+    # The name is the target's contents in the target's order, because the two drifting apart is
+    # how a check goes unnoticed: `make web-check` ran no test at all for the whole of SHIP-120
+    # while this line claimed three of them.
+    name: lint, test, build, typecheck
     runs-on: ubuntu-latest
 
     steps:
