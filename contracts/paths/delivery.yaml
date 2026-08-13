@@ -8,24 +8,27 @@
 # tolerate fields they do not recognise, which is a rule about client behaviour and not a licence for
 # the contract to describe less than the service returns.
 #
-# # These operations are called by the provider, not by the driver
+# # Two callers, two credentials, and they are never the same credential
 #
-# The assigned driver never holds a session. Their portal is link-authenticated (Docs/07 §3) and the
-# job-scoped token they carry is a separate system with its own key material and its own audience,
-# which grants exactly one job and cannot be exchanged for a user token in either direction
-# (Docs/10 §5). Every operation here takes the ordinary mobile access token and is the awarded
-# provider acting on their own work.
+# `AssignDriver` and `Milestones` are the awarded provider, holding an ordinary mobile access token
+# (`BearerAccessToken`) and acting on their own work.
 #
-# **`AssignDriver` returns that token and still does not accept one** (SHIP-107): the provider is
-# handed the link to forward, because Shipper sends no SMS in the MVP (Docs/01 §4.5). No operation
-# in this document is authenticated by a driver token, and the middleware that would verify one
-# arrives with SHIP-108.
+# `DriverJob` is the driver, holding the job-scoped link the provider forwarded
+# (`BearerDriverToken`). The assigned driver never holds a session: their portal is
+# link-authenticated (Docs/07 §3) and their token is a separate system with its own key material and
+# its own audience, granting exactly one job (Docs/10 §5).
+#
+# **Neither credential works on the other's operations, and both directions answer `401`.** That is
+# not a convention this document is describing — it is checked by the platform in both directions,
+# demonstrated over HTTP by `scripts/verify/70-delivery.sh`, and it is why `AssignDriver` can hand a
+# provider a credential (SHIP-107) without that credential being any use to them.
 #
 # # There is no field for whose job and none for who is assigning
 #
-# The job is named in the path and the provider is whoever the token says is calling — the platform
-# checks that pair against the job's accepted bid. A `provider_id` in a request body would be an
-# authorisation decision made from client input, which Docs/07 §3 puts on the platform.
+# The job is named in the path and the caller is whoever the credential says they are — the platform
+# checks that pair against the job's accepted bid, or, on the driver route, against the job inside
+# the link. A `provider_id` in a request body would be an authorisation decision made from client
+# input, which Docs/07 §3 puts on the platform.
 
 AssignDriver:
   post:
@@ -519,3 +522,146 @@ Milestone:
         support reason about, and it is later than `recorded_at` by however long the device was out
         of signal.
       example: '2026-08-12T09:15:02.481Z'
+
+# --- the driver's own surface -----------------------------------------------------------------
+
+DriverJob:
+  get:
+    operationId: driverJob
+    summary: Open the delivery a driver's link grants
+    tags: [Delivery]
+    security:
+      - BearerDriverToken: []
+    description: |
+      The delivery behind a driver's job-scoped link (SHIP-108). It is the first operation in the
+      service authenticated by something other than a mobile session, and the only one a driver can
+      reach at all.
+
+      ## The link grants this job and nothing else
+
+      The token names one job, inside its signature. Presenting it on any other job answers `404` —
+      the same answer a job that does not exist gives, because telling the two apart would confirm
+      that somebody else's delivery exists. The platform compares the job in the path with the job
+      in the token before this operation runs, so there is no request shape that widens the grant.
+
+      The `id` in the path is therefore redundant with the token and deliberately so: it is what
+      makes "exactly one job" checkable from outside, and it is what lets a driver carrying two
+      deliveries hold two links their browser can tell apart.
+
+      ## What it does not return, yet
+
+      The addresses, the goods and who to call are **not** here. That is the driver portal's job
+      view and it is built separately; this answers which job the link opens, which assignment it
+      belongs to, and how long it lasts. Fields will be added to this shape rather than moved to
+      another operation.
+
+      The driver's mobile is deliberately absent, unlike the provider's view of the same
+      assignment: a link travels through whatever channel the provider already uses, so it can be
+      forwarded again, and whoever ends up holding it should learn as little as possible.
+
+      ## Nothing here can be exchanged for a session
+
+      This token names no account, no role and no session, so there is nothing to sign in as. A
+      mobile access token presented here answers `401`, and this token presented on any
+      `BearerAccessToken` operation answers `401`. Neither direction is a special case in a
+      handler; both are what the audience check does.
+    parameters:
+      - $ref: '#/JobID'
+    responses:
+      '200':
+        description: |
+          The assignment this link grants.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DriverAssignment'
+      '401':
+        description: |
+          The link was missing, unreadable, or has run out.
+
+          | `error.code` | What happened |
+          |---|---|
+          | `unauthenticated` | No link was presented, or the one presented is not valid here. Which check refused it is deliberately not said — it is information only somebody probing has a use for, and a mobile access token presented here is one of the cases |
+          | `delivery_driver_link_expired` | The link was genuine and its window has closed. **There is nothing to refresh** — a driver holds no second credential — so ask the transport provider to send a new one |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          This link does not open this job (`not_found`) — either it grants a different one, or the
+          assignment behind it is no longer the live one on the job. Both answer exactly what a job
+          that does not exist answers.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+DriverAssignment:
+  type: object
+  additionalProperties: false
+  required: [job_id, assignment_id, driver_name, assigned_at, link_expires_at]
+  description: |
+    What a driver's link opens: the one job it grants and the assignment it belongs to.
+
+    Smaller than the provider's view of the same row on purpose — see the operation above.
+  properties:
+    job_id:
+      type: string
+      format: uuid
+      description: The one job this link grants. It is the same value that is in the path.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    assignment_id:
+      type: string
+      format: uuid
+      description: |
+        The assignment this link belongs to. A driver has no account, so this record is their
+        identity for the length of one job, and it is what their milestones are attributed to.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    driver_name:
+      type: string
+      description: |
+        The name the transport provider wrote down. It is here so a driver carrying more than one
+        job can tell that this link is theirs.
+      example: Sam Patel
+    assigned_at:
+      type: string
+      format: date-time
+      description: When the driver was put on the job, on the platform's clock, in UTC.
+      example: '2026-08-12T04:15:30.000Z'
+    link_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When this link stops working, in UTC — the same instant the transport provider was shown
+        when they created the assignment.
+
+        It is returned rather than left to be decoded out of the credential, which is a thing a
+        client should never do.
+      example: '2026-08-19T04:15:30.000Z'

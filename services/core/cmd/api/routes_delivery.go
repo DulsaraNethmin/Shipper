@@ -48,11 +48,9 @@ func init() {
 			// separate system that grants exactly one job and cannot be exchanged for a
 			// session in either direction (Docs/10 §5).
 			//
-			// **This route now mints one (SHIP-107) and still does not accept one**, which is
+			// **This route mints one (SHIP-107) and still does not accept one**, which is
 			// exactly the right pair: the provider is handed the link to forward, and the
-			// class that would verify it has no middleware behind it until SHIP-108. A route
-			// declaring RequireDriverToken today panics at startup rather than being served
-			// open, which is the outcome the seam was built to keep (SHIP-15m).
+			// route that spends it is the third one below (SHIP-108).
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).AssignDriver() },
 		},
@@ -63,13 +61,43 @@ func init() {
 
 			// RequireUser again, and the reason bears repeating because this is the route
 			// whose name most invites the other answer. A driver records milestones from a
-			// link-authenticated portal; SHIP-107 signs that portal's token and SHIP-108 is
-			// what verifies one. RequireDriverToken is declarable with no middleware behind
-			// it: a route declaring it panics at startup rather than being served open, which
-			// is the right outcome and not one to work around. The caller here is the awarded
-			// provider, and the platform checks that against the accepted bid.
+			// link-authenticated portal — but **that route is SHIP-121's, not this one**.
+			// This is the awarded provider recording their own delivery, checked against the
+			// accepted bid. When the driver's own milestone route arrives it will declare
+			// RequireDriverToken and sit under /driver, beside the read below.
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordMilestone() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/driver/jobs/{id}",
+			Group:   GroupV1,
+
+			// **The first route in the service served on the driver's credential**
+			// (SHIP-108), and the one that closes SHIP-15m's seam: filling in
+			// newDriverTokenGuard maps this class, and until something did, declaring it
+			// here would have stopped the process at startup rather than serving the route
+			// open. That failure direction is unchanged — it is what a route declaring
+			// RequireAdmin still gets today.
+			//
+			// # Why /driver/jobs/{id} rather than a second method on /jobs/{id}
+			//
+			// The manifest allows one auth class per method, so `GET /jobs/{id}` under a
+			// driver token was available and is the wrong shape twice over. It would put two
+			// credential systems on one path, where a client that presented the wrong one
+			// gets an answer that reads as a permissions problem; and it would claim a URL
+			// the customer's and the provider's own job view already own (SHIP-65).
+			// `/driver/...` says whose surface this is, which is what SHIP-120 and SHIP-121
+			// extend rather than negotiate with.
+			//
+			// # The {id} is checked, not decorative
+			//
+			// delivery.RequireDriverToken compares it with the job inside the token and
+			// refuses a mismatch before the handler runs. That comparison is the auth class,
+			// so a route declaring the class cannot skip it — see internal/delivery's
+			// driverauth.go for why that is the design rather than a convenience.
+			Auth:    RequireDriverToken,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DriverJob() },
 		},
 	)
 }

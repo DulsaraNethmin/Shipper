@@ -23,7 +23,7 @@ func routerWithApp(t *testing.T, app config.App) http.Handler {
 		Identity: testIdentityConfig(),
 		Delivery: testDeliveryConfig(),
 	}
-	return newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), nil)
+	return newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
 }
 
 func getMinimumVersion(t *testing.T, router http.Handler) (int, minimumVersionResponse) {

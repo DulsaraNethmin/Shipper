@@ -147,6 +147,58 @@ var (
 	// because the alternative — treating an unrecognised answer as success — would leave an
 	// assignment on a job whose status nobody moved.
 	ErrJobMoveUnrecognised = errors.New("delivery: the job lifecycle answered with an outcome this domain does not recognise")
+
+	// The four ways a driver's link fails to open a delivery (SHIP-108).
+	//
+	// They are four sentinels rather than one because the first three lead the driver somewhere
+	// different — wait, ask for a new link, or check they opened the right message — and because
+	// the fourth is not an authentication failure at all. What reaches the wire is deliberately
+	// narrower than what is distinguished here; see [refuseDriverLink].
+
+	// ErrNoDriverToken means a driver-token route was reached with no bearer credential.
+	//
+	// Distinct from [ErrDriverTokenRejected] so that "you have not opened the link" and "the link
+	// you opened is not good" are not one answer. It is the same split httpx makes between
+	// `authNone` and `authRejected`, and for the same reason: a driver who pasted a URL without
+	// its token should be told to open the message they were sent.
+	ErrNoDriverToken = errors.New("delivery: no driver token was presented")
+
+	// ErrDriverTokenExpired means the link was genuine and its window has closed.
+	//
+	// The one refusal a driver can act on, and it gets a code of its own for that reason
+	// ([CodeDriverLinkExpired]). **It is not httpx.CodeTokenExpired**, which tells a client to
+	// refresh and retry: a driver holds no second credential and has nothing to refresh with, so
+	// the mobile code's advice would send the portal into a loop it cannot leave (Docs/10 §5).
+	ErrDriverTokenExpired = errors.New("delivery: the driver token has expired")
+
+	// ErrDriverTokenRejected means the token did not verify, and the reason is deliberately not
+	// carried any further.
+	//
+	// A bad signature, an unknown key identifier, `alg: none`, a mobile session token presented
+	// here — every one of them arrives as this. Which check refused a credential is free help to
+	// somebody probing and there is nothing a legitimate driver could do differently, which is the
+	// call httpx.ResolveSubject already makes with `authRejected`.
+	ErrDriverTokenRejected = errors.New("delivery: the driver token was not accepted")
+
+	// ErrDriverTokenWrongJob means a perfectly valid link was presented on a job it does not grant.
+	//
+	// **This is the sentinel the *Done when* rests on** — "grants access to exactly one job and
+	// nothing else" — and it is not an authentication failure: the credential is genuine and the
+	// holder is who they say they are. It answers 404 rather than 403 for the reason [apiError]
+	// gives about another provider's job: a 403 would confirm that the other job exists.
+	ErrDriverTokenWrongJob = errors.New("delivery: the driver token does not grant this job")
+
+	// ErrDriverLinkSuperseded means the token names an assignment that is no longer the live one on
+	// its job.
+	//
+	// A driver stood down keeps their link — the token is stateless and cannot be recalled — so the
+	// row is what says the grant has lapsed. That is the lookup [Service.Driver] was written for,
+	// and it is what makes SHIP-109's revocation a read rather than a denylist.
+	//
+	// Nothing writes `unassigned_at` today, so this is unreachable through any endpoint. It is
+	// checked anyway, because the alternative is a link that keeps working after the assignment
+	// behind it has ended, which is the whole of what SHIP-109 will be asked to prevent.
+	ErrDriverLinkSuperseded = errors.New("delivery: the assignment this driver token names is no longer live")
 )
 
 // The error codes this domain's endpoints answer with (Docs/10 §4.4).
@@ -155,13 +207,18 @@ var (
 // describes them and cmd/api's uniqueness test can see them. Named <domain>_<condition>, which is
 // what stops two domains meaning different things by one string.
 //
-// There are deliberately four, and the list is short for a reason. A malformed mobile number is
+// There are deliberately five, and the list is short for a reason. A malformed mobile number is
 // `validation_failed` with details, a job that is not the caller's is `not_found`, and a repeated
 // idempotency key is the protocol's own `idempotency_key_reused` rather than a delivery code — the
 // database enforces it here (000602) and the middleware enforces it in Redis, and a client that had
 // to tell the two apart would be branching on where the platform happened to catch it. A domain code
 // earns its place only where a client would otherwise parse a message to know what to do, and each
-// of these four leads to a different screen.
+// of these five leads to a different screen.
+//
+// **The fifth arrived with SHIP-108 and is the only one on an authentication failure.** Every other
+// refusal a driver's link can meet is `unauthenticated` or `not_found`, which is deliberate: what
+// the driver portal must do about a bad link is the same whatever was wrong with it, except when it
+// has simply run out.
 var (
 	// CodeJobNotAssignable is returned when the job is in no status a driver can be assigned
 	// from.
@@ -207,4 +264,18 @@ var (
 	CodeProofRequired = httpx.RegisterCode("delivery_proof_required",
 		"A delivery is recorded with photo proof, or with a reason why there is none. Capturing "+
 			"either is not built yet, so 'delivered' cannot be recorded through this endpoint.")
+
+	// CodeDriverLinkExpired is returned when a driver's job-scoped link has run out (SHIP-108).
+	//
+	// 401, and **not** `token_expired`. That code exists for the mobile session and its whole
+	// meaning is "refresh and retry, do not sign the user out" — advice a driver portal cannot
+	// take, because there is no refresh behind a driver's link and no account to sign back into
+	// (Docs/10 §5). A portal that branched on `token_expired` would loop; this tells it to say
+	// so and stop.
+	//
+	// It is the only refusal in this domain that names what was wrong with a credential. Every
+	// other one is `unauthenticated`, deliberately undifferentiated — see [ErrDriverTokenRejected].
+	CodeDriverLinkExpired = httpx.RegisterCode("delivery_driver_link_expired",
+		"This delivery link has expired. There is nothing to refresh — ask the transport provider "+
+			"to send a new one.")
 )

@@ -90,6 +90,26 @@ func testAuthenticator() httpx.Authenticator {
 	return authenticate
 }
 
+// testDriverGuard builds the real driver-token middleware, for the reason [testAuthenticator] gives
+// about the real authenticator (SHIP-108).
+//
+// **It is not optional any more, and that is the change SHIP-108 made to every caller of newRouter
+// in this package.** While nothing declared RequireDriverToken, passing nil was correct: the class
+// stayed out of the guard map and no route wanted it. `GET /v1/driver/jobs/{id}` declares it, so a
+// router built with nil now panics at startup, naming the class — which is the seam behaving exactly
+// as SHIP-15m designed it, met from the other side.
+//
+// A stub would satisfy the panic and prove nothing. The real guard is what puts internal/delivery's
+// verifier, the configured keyset and the manifest's auth class in one process, which is the only
+// place they meet.
+func testDriverGuard() Guard {
+	guard, err := newDriverTokenGuard(testDeps().Config, clock.System{})
+	if err != nil {
+		panic("cmd/api test: building the driver token guard: " + err.Error())
+	}
+	return guard
+}
+
 // testAccessToken mints a token the test router will accept.
 func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sessionID uuid.UUID) {
 	t.Helper()
@@ -112,7 +132,7 @@ func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sess
 }
 
 func testRouter() http.Handler {
-	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), nil)
+	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
 }
 
 // SHIP-6's acceptance criterion: GET /health returns 200 with version and commit.

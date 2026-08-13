@@ -5,23 +5,29 @@
 // domains be built at once without touching a shared file. A domain importing internal/httpx is
 // sitting on infrastructure, not crossing a boundary, and the import lint permits it.
 //
-// # These endpoints are called by the provider, not by the driver
+// # Two callers, two credentials, and they are never the same credential
 //
-// Worth stating first, because the domain's name invites the opposite assumption. The driver has no
-// account and no session — the portal is link-authenticated (Docs/07 §3) — and the job-scoped token
-// they hold is a separate system that cannot be exchanged for a user token in either direction
-// (Docs/10 §5). The caller of every route below is the awarded provider, authenticated the ordinary
-// way, and each declares RequireUser like every other product endpoint in the service.
+// Worth stating first, because the domain's name invites the assumption that the driver calls all of
+// this. Almost all of it is the awarded provider, authenticated the ordinary way, and every route
+// under `/jobs/{id}` below declares RequireUser like every other product endpoint in the service.
 //
-// **The assignment response now carries a driver token, and that does not change the sentence
-// above** (SHIP-107). The provider is handed the link to forward (Docs/01 §4.5); nothing here reads
-// one, no route accepts one, and the middleware that would is SHIP-108's.
+// **One route is the driver's, and it is served under a different auth class entirely** (SHIP-108).
+// `GET /v1/driver/jobs/{id}` is reached with the job-scoped link the provider forwarded, verified by
+// [RequireDriverToken] rather than by httpx.RequireSubject. The driver has no account and no session
+// — the portal is link-authenticated (Docs/07 §3) — and the two token systems cannot be exchanged in
+// either direction (Docs/10 §5): the mobile token is refused on the driver route and the driver token
+// is refused on all the others, both over HTTP.
+//
+// The split is visible in the code rather than remembered: a provider route reads its caller with
+// [callerID], which reads an authctx.Subject; the driver route reads a [DriverGrant], which has no
+// subject in it and cannot be turned into one.
 //
 // # There is no field for whose job, and no field for who is assigning
 //
 // The provider is whoever the token says is calling. A provider id in the request would be an
 // authorisation decision made from client input, which Docs/07 §3 puts on the platform. The job is
-// named in the path and the platform checks it against the accepted bid.
+// named in the path and the platform checks it against the accepted bid — or, on the driver route,
+// against the job inside the link.
 //
 // The blank line below keeps this a file note rather than a second package comment.
 
@@ -383,6 +389,114 @@ func (h *Handler) RecordMilestone() http.Handler {
 	})
 }
 
+// driverJobResponse is what a driver's link opens (SHIP-108).
+//
+// # It is the assignment, and deliberately not the delivery
+//
+// A driver opening their link wants the addresses, the goods and who to call, and **none of that is
+// here**. That is SHIP-120's — "opening the link shows only that job's delivery detail" — and it
+// needs a port into `jobs` that this domain has no reason to declare for a middleware ticket. What
+// this answers is the smallest true thing: which job the link grants, which assignment it belongs
+// to, and how long it lasts. SHIP-120 adds fields to this shape, which is an additive change
+// (Docs/07 §6) and does not move the route.
+//
+// # The driver's mobile is not here, and that is a decision rather than an omission
+//
+// [assignmentResponse] returns it, because the provider typed it and needs to see it was read
+// correctly. The driver already knows their own number, so returning it would buy nothing and cost
+// something: a link travels through whatever channel the provider uses (Docs/01 §4.5), so it lands
+// in a message thread and can be forwarded again. Whoever ends up holding it should learn as little
+// as the endpoint can manage.
+//
+// The driver's *name* stays, because it is what tells them the link is theirs rather than the other
+// driver's on the next job.
+//
+// The job's status is not echoed, for the reason [assignmentResponse] gives: it is `jobs`'
+// vocabulary and a copy here would be a second list to keep in step.
+type driverJobResponse struct {
+	JobID        string `json:"job_id"`
+	AssignmentID string `json:"assignment_id"`
+
+	DriverName string `json:"driver_name"`
+
+	AssignedAt string `json:"assigned_at"`
+
+	// LinkExpiresAt is when this link stops working, in UTC.
+	//
+	// The same instant the provider was shown as `driver_token_expires_at`, named for what the
+	// person reading it holds: the provider forwards a token, and the driver opens a link
+	// (Docs/01 §4.5 calls it a link throughout). It is returned rather than left to be decoded out
+	// of the credential, which is what the contract already tells clients not to do.
+	LinkExpiresAt string `json:"link_expires_at"`
+}
+
+func driverJobFrom(a Assignment, grant DriverGrant) driverJobResponse {
+	return driverJobResponse{
+		JobID:        a.JobID.String(),
+		AssignmentID: a.ID.String(),
+
+		DriverName: a.DriverName,
+
+		AssignedAt:    timestamp(a.CreatedAt),
+		LinkExpiresAt: timestamp(grant.ExpiresAt),
+	}
+}
+
+// DriverJob handles GET /v1/driver/jobs/{id} (SHIP-108).
+//
+// # This is the route that makes the *Done when* demonstrable, and it is deliberately the smallest
+//
+// SHIP-108 is a middleware ticket: it needs one route declaring RequireDriverToken so that "grants
+// exactly one job" and "cannot be exchanged for a user session" can be shown over HTTP rather than
+// only in Go. A read is the right size for that — it needs no idempotency scope (Docs/11 §9 records
+// that a driver-token request scopes its key to `anonymous`, which bites a write and not a read) —
+// and the delivery detail behind it belongs to SHIP-120.
+//
+// # Why the job is in the path when the token already names it
+//
+// It looks redundant and it is the mechanism. The path is the client's statement of what it means to
+// act on; the token is the platform's statement of what the caller may act on; comparing them is what
+// makes "exactly one job" **observable from outside** rather than merely true inside. Drop the id and
+// a grant that had silently widened would be undetectable — there would be no other job to ask for.
+//
+// It is also what the driver half of M4 needs anyway: SHIP-121 records milestones per job, a driver
+// carrying two deliveries holds two links, and two links that resolved to one URL would be
+// indistinguishable in a browser's history.
+//
+// # The handler never reads the path, and that is the other half
+//
+// The job comes from the grant, which the guard has already checked against the path. There is no
+// call to [jobIDFrom] here and there must not be: the two would agree today and a handler that read
+// the path directly is one refactor away from being the only thing deciding.
+func (h *Handler) DriverJob() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, ok := driverGrantFrom(r.Context())
+		if !ok {
+			// The route declares RequireDriverToken, so the guard has run and a grant is
+			// guaranteed by the time this executes. Reaching here means the route was declared
+			// with the wrong auth class — a wiring defect the caller can do nothing about, and
+			// the same call [callerID] makes about a missing subject.
+			return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+				"Something went wrong at our end.").WithCause(errors.New(
+				"delivery: a driver route was reached with no verified grant on the context; " +
+					"its Auth class is not RequireDriverToken"))
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		assignment, err := h.svc.AssignmentFor(r.Context(), pool, grant)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, driverJobFrom(assignment, grant))
+		return nil
+	})
+}
+
 // recordingFrom turns the request body and the idempotency header into what the domain takes.
 //
 // Both failures it reports are failures to *read* the request rather than to validate it, which is
@@ -518,6 +632,16 @@ func apiError(err error) error {
 	case errors.Is(err, ErrJobNotFound), errors.Is(err, ErrNotAwardedProvider):
 		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
 			"No such job.").WithCause(err)
+
+	case errors.Is(err, ErrDriverLinkSuperseded):
+		// 404 rather than 401, and the distinction is not pedantic: the credential is fine, and
+		// what has gone is the assignment behind it. Telling a stood-down driver "your link is
+		// invalid" would send them back to the provider for a *new link*, which is not what they
+		// need. The same answer a job that never existed gets, for the reason apiError gives
+		// above — and SHIP-109, which is the ticket that makes this reachable, is the right place
+		// to decide whether a reissued link deserves a code of its own.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such delivery.").WithCause(err)
 
 	case errors.Is(err, ErrJobNotAssignable):
 		return httpx.NewError(http.StatusConflict, CodeJobNotAssignable,

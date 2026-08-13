@@ -525,6 +525,49 @@ func (s *Service) moveFor(
 // ([DriverClaims.AssignmentID]), so SHIP-108 does not need this lookup to *identify* a driver —
 // what it needs it for is the question the claim cannot answer, which is whether that assignment
 // is still live. A token outlives a stand-down; the row is what says so.
+//
+// **SHIP-108 uses it for exactly that, through [Service.AssignmentFor] rather than directly**, and
+// the indirection is the point rather than ceremony: this method takes a bare job id, so anybody
+// holding one can ask it anything. The method a driver route calls takes a [DriverGrant], and a
+// grant is obtainable only from a verified token.
 func (s *Service) Driver(ctx context.Context, r db.Runner, jobID uuid.UUID) (Assignment, bool, error) {
 	return s.store.liveAssignment(ctx, r, jobID)
+}
+
+// AssignmentFor is the delivery a driver's own link opens (SHIP-108).
+//
+// # It takes a grant rather than a job id, and that is the whole signature
+//
+// There is no way to ask this question about an arbitrary job: a [DriverGrant] is produced by
+// [DriverTokenVerifier.Verify] and by nothing else, and the middleware that produces one has already
+// checked that the job in the request path is the job inside the token. A handler therefore cannot
+// widen the scope by passing the wrong identifier, because it has no identifier to pass.
+//
+// # What it checks that the token cannot say
+//
+// A token is stateless and cannot be recalled, so it keeps verifying after the assignment behind it
+// has ended. The row is what knows: if the job's live assignment is not the one the grant names, the
+// link has been superseded and opens nothing ([ErrDriverLinkSuperseded]). That is the lookup
+// [Service.Driver]'s comment reserved for this ticket, and it is the mechanism SHIP-109 will reissue
+// against — revocation as a read rather than a denylist.
+//
+// Nothing writes `unassigned_at` today, so a superseded link is unreachable through any endpoint;
+// the check is here because the alternative is a link that outlives its assignment in silence.
+//
+// One statement and no transaction: a single read is atomic on its own.
+func (s *Service) AssignmentFor(ctx context.Context, r db.Runner, grant DriverGrant) (Assignment, error) {
+	live, hasDriver, err := s.Driver(ctx, r, grant.JobID)
+	if err != nil {
+		return Assignment{}, err
+	}
+
+	// One answer for two states, deliberately: a job with no live driver and a job whose live
+	// driver is somebody else both mean this link no longer opens anything, and telling them apart
+	// would say something about the job to a holder who is no longer on it.
+	if !hasDriver || live.ID != grant.AssignmentID {
+		return Assignment{}, fmt.Errorf("delivery: %s is not the live assignment on %s: %w",
+			grant.AssignmentID, grant.JobID, ErrDriverLinkSuperseded)
+	}
+
+	return live, nil
 }

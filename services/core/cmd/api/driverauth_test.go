@@ -6,19 +6,33 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
 )
 
-// The RequireDriverToken seam (SHIP-15m).
+// The RequireDriverToken seam (SHIP-15m), and the ticket that filled it in (SHIP-108).
 //
-// SHIP-108 supplies the guard by filling in newDriverTokenGuard and editing nothing shared. These
-// tests hold the two halves of that arrangement — that the class is unserved while nothing supplies
-// one, and that supplying one is what serves *and* guards it — so neither can be quietly lost.
+// SHIP-108 supplies the guard by filling in newDriverTokenGuard and editing nothing shared. The
+// first four tests hold the two halves of that arrangement — that the class is unserved while
+// nothing supplies one, and that supplying one is what serves *and* guards it — so neither can be
+// quietly lost. **They are unchanged by SHIP-108**, which is what they were written for: the last of
+// them asserts the rule rather than today's answer to it, so it kept passing on the day the nil
+// stopped being nil.
 //
-// Every route here is built locally and handed to attachRoutes, for the reason auth_test.go states:
-// registering one from a _test.go init would put it in the real registry for every other test in
-// this package, which breaks TestRouteTableMatchesGolden and TestEveryRouteIsInTheContract.
+// The two at the bottom are SHIP-108's own, and they are in this package rather than in
+// internal/delivery because what they exercise is the wiring — the guard the constructor builds,
+// attached by attach to the route the manifest declares, behind the real middleware chain.
+//
+// Every route in the first group is built locally and handed to attachRoutes, for the reason
+// auth_test.go states: registering one from a _test.go init would put it in the real registry for
+// every other test in this package, which breaks TestRouteTableMatchesGolden and
+// TestEveryRouteIsInTheContract. The two at the bottom need no such thing — they call the route
+// delivery declares in routes_delivery.go, which is in the registry because it is real.
 
 // driverRoute is a route in the shape SHIP-108's will be: declared RequireDriverToken, with a
 // handler that reports whether the platform decided anybody is calling.
@@ -165,5 +179,117 @@ func TestTheClassIsServedExactlyWhenTheConstructorSuppliesAGuard(t *testing.T) {
 			"These must agree — a class enforced with no verifier behind it is a route that "+
 			"refuses forever, and a verifier that never reaches the map is a route that panics "+
 			"at startup for no reason.", driverToken != nil, enforced)
+	}
+}
+
+// --- SHIP-108: the class is now filled in, and these run against the real router ----------------
+
+// driverJobPath is the one route in the service served on a driver's credential.
+const driverJobPath = "/v1/driver/jobs/"
+
+// testDriverLink mints a real job-scoped link from the configured driver keyset.
+//
+// The real issuer over testDeliveryConfig's keyset, which is the same material testDriverGuard
+// verifies against — so what the two tests below exercise is the wiring, not a fixture agreeing with
+// itself.
+func testDriverLink(t *testing.T, jobID uuid.UUID) string {
+	t.Helper()
+
+	cfg := testDeliveryConfig()
+	keys, err := delivery.NewKeyset(cfg.DriverTokenKeys, cfg.DriverTokenActiveKID)
+	if err != nil {
+		t.Fatalf("building the driver keyset: %v", err)
+	}
+	issuer, err := delivery.NewDriverTokenIssuer(keys, cfg.DriverTokenTTL, clock.System{})
+	if err != nil {
+		t.Fatalf("building the driver token issuer: %v", err)
+	}
+
+	link, err := issuer.Issue(jobID, uuid.New())
+	if err != nil {
+		t.Fatalf("issuing a driver link: %v", err)
+	}
+	return link.Value
+}
+
+// TestNeitherTokenSystemOpensTheOthersRoutes is CLAUDE.md's invariant through the real router, in
+// both directions (SHIP-108).
+//
+// internal/delivery proves both directions of the *parser* and internal/identity proves its own
+// half; what only this package can show is that the two are wired to the routes that way — that
+// ResolveSubject, the manifest's auth classes and the driver guard end up refusing each other's
+// credentials on the endpoints a client actually calls.
+//
+// **The driver direction could not be tested at all before this ticket**, because no route accepted
+// a driver token. That was the gap SHIP-107 recorded and this is what closes it in Go;
+// scripts/verify/70-delivery.sh does the same pair against the running binary.
+//
+// Neither case needs a database: both are refused by a guard, in front of the handler that would
+// have wanted one.
+func TestNeitherTokenSystemOpensTheOthersRoutes(t *testing.T) {
+	router := testRouter()
+	jobID := uuid.New()
+
+	access, _, _ := testAccessToken(t, identity.RoleProvider)
+	link := testDriverLink(t, jobID)
+
+	for name, tc := range map[string]struct {
+		method     string
+		path       string
+		credential string
+	}{
+		"a mobile session on the driver's route": {
+			method: http.MethodGet, path: driverJobPath + jobID.String(), credential: access,
+		},
+		"a driver link on a user route": {
+			method: http.MethodGet, path: "/v1/jobs", credential: link,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set(httpx.HeaderAuthorization, "Bearer "+tc.credential)
+
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401 — one token system was accepted by the "+
+					"other (Docs/10 §5, CLAUDE.md)\n  body: %s", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+// TestTheDriverRouteIsServedAndScopedThroughTheRealRouter checks the half of SHIP-108 that only the
+// composition root can show: that the guard newDriverTokenGuard builds is the one attached to the
+// route the manifest declares, and that it is scoped to the job in the path.
+//
+// A link presented on another job is refused with 404 here, exactly as it is in internal/delivery's
+// own tests — the point of repeating it is that this one goes through guardsFor, attach and the real
+// middleware chain rather than through a mux a test built.
+//
+// The granted job answers 503 rather than 200, and that is correct: testDeps carries no pool, so the
+// handler behind the guard has no database. What matters is that it *reached* the handler, which is
+// what tells the two refusals apart from a route that refuses everything.
+func TestTheDriverRouteIsServedAndScopedThroughTheRealRouter(t *testing.T) {
+	router := testRouter()
+	granted, other := uuid.New(), uuid.New()
+	link := testDriverLink(t, granted)
+
+	open := func(job uuid.UUID) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, driverJobPath+job.String(), nil)
+		req.Header.Set(httpx.HeaderAuthorization, "Bearer "+link)
+
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := open(granted); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("the link's own job answered %d, want 503 from a handler with no database "+
+			"— anything else means the guard did not let it through (%s)", rec.Code, rec.Body)
+	}
+	if rec := open(other); rec.Code != http.StatusNotFound {
+		t.Errorf("the same link opened another job with status %d, want 404 (%s)", rec.Code, rec.Body)
 	}
 }

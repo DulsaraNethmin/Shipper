@@ -108,7 +108,7 @@ func TestTheRouterBuildsWithoutADatabaseOrACache(t *testing.T) {
 	deps := testDeps()
 	deps.Pool, deps.Redis = nil, nil
 
-	router := newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), nil)
+	router := newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))

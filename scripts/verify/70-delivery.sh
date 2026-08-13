@@ -265,9 +265,9 @@ ticket "SHIP-107  a signed, time-limited, single-job driver token is generated o
 # real driver token presented as a mobile credential to a running instance is refused. Both are
 # properties of the wiring, and the wiring is what this file exists to exercise.
 #
-# Nothing below verifies a driver token against an endpoint, because no endpoint accepts one:
-# SHIP-108 supplies that middleware and a route declaring RequireDriverToken would stop the process
-# at startup until it does.
+# Nothing in *this* section presents a driver token to a route that accepts one. That is SHIP-108's
+# section further down, and the split is deliberate: these checks are about what the token *is*, and
+# those are about what happens when it meets a request.
 
 # jwt_segment <token> <0|1> <outfile> — decode a token's header (0) or payload (1) into a JSON file.
 #
@@ -349,10 +349,10 @@ ok "the signature verifies under the driver token's own key"
   || fail "the driver token was signed with identity's access token key — the two systems share key material"
 ok "and not under the mobile session's — two keysets, which is what stops either verifier ever accepting the other's tokens"
 
-# The separation, over HTTP, in the direction that can be proved today. `GET /v1/jobs` declares
-# RequireUser, so this is a real driver token presented to a real authenticated endpoint on the
-# running binary. The other direction — a mobile token presented to a driver route — needs a route
-# that accepts one, which is SHIP-108.
+# The separation, over HTTP. `GET /v1/jobs` declares RequireUser, so this is a real driver token
+# presented to a real authenticated endpoint on the running binary. The other direction — a mobile
+# token presented to a driver route — is in SHIP-108's section, which is the ticket that created a
+# route able to refuse one.
 status="$(curl -s -o "$WORKDIR/delivery-token-as-session.json" -w '%{http_code}' \
   -H "$auth_header: Bearer $delivery_driver_token" \
   "http://localhost:$VERIFY_PORT/v1/jobs")"
@@ -600,3 +600,142 @@ status="$(milestone_request "$delivery_provider_token" "$milestone_key-assigned"
 [[ "$(json "$WORKDIR/ms-assigned.json" '["error"]["details"][0]["field"]')" == "milestone" ]] \
   || { cat "$WORKDIR/ms-assigned.json"; fail "the refusal does not name the milestone field"; }
 ok "driver_assigned is refused here — it has an endpoint of its own, and nothing writes it to this table"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-108  a driver token grants exactly one job and cannot be exchanged for a user session"
+
+# # What only this section can show
+#
+# internal/delivery drives the guard on a mux of its own and cmd/api drives it through the real
+# router, but both build their key material from constants. What neither can show is the running
+# service, configured from deploy/.env, refusing and accepting the right things — and, more to the
+# point, **both directions of the exchange invariant against one binary**. SHIP-107 could only prove
+# one of them here, because no route accepted a driver token; the route below is what closes it.
+#
+# Everything runs against the two assignments the SHIP-107 section already made, so no fixture is
+# repeated: $delivery_driver_token grants $delivery_job, $delivery_second_token grants
+# $delivery_second_job, and $delivery_forged is that first token repointed at the second job with
+# its signature left alone.
+#
+# The route is a GET, so nothing here needs an Idempotency-Key — and that is not an accident.
+# Docs/11 §9 records that a driver-token request scopes its idempotency key to `anonymous`, because
+# the scope is computed group-wide outside the middleware while a guard runs per route inside it. A
+# read does not meet that; SHIP-121's milestone controls will.
+
+# open_delivery <token> <job-id> <name> — one driver-portal read, answering with the status code.
+#
+# The credential and the job are separate arguments on purpose: every check below is some pairing of
+# the two, and a helper that derived one from the other could not express the pairing that matters.
+open_delivery() {
+  curl -s -o "$WORKDIR/driver-$3.json" -D "$WORKDIR/driver-$3.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$2"
+}
+
+status="$(open_delivery "$delivery_driver_token" "$delivery_job" own)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/driver-own.json"; fail "the driver's own link returned $status, want 200"; }
+[[ "$(json "$WORKDIR/driver-own.json" '["job_id"]')" == "$delivery_job" ]] \
+  || fail "the link opened $(json "$WORKDIR/driver-own.json" '["job_id"]'), want $delivery_job"
+[[ "$(json "$WORKDIR/driver-own.json" '["assignment_id"]')" == "$delivery_assignment_id" ]] \
+  || fail "the link named assignment $(json "$WORKDIR/driver-own.json" '["assignment_id"]'), want $delivery_assignment_id"
+[[ "$(json "$WORKDIR/driver-own.json" '["driver_name"]')" == "Sam Patel" ]] \
+  || fail "driver_name is $(json "$WORKDIR/driver-own.json" '["driver_name"]')"
+ok "the driver's link opens the one delivery it names — the first route in the service served on a credential that is not a mobile session"
+
+# json_keys <file> — the top-level keys of a JSON object, sorted and comma-separated.
+#
+# The same shape as jwt_claim_names and deliberately a second function: that one is about a token's
+# claims and this is about a response body, and one helper doing both would read as though a response
+# were a token.
+json_keys() { python3 -c 'import json,sys; print(",".join(sorted(json.load(open(sys.argv[1])))))' "$1"; }
+
+# The response held to a closed set of keys rather than searched for the field it must not carry,
+# which is SHIP-83's argument: a search for driver_mobile catches driver_mobile and misses `phone`.
+driver_response_keys="$(json_keys "$WORKDIR/driver-own.json")"
+[[ "$driver_response_keys" == "assigned_at,assignment_id,driver_name,job_id,link_expires_at" ]] \
+  || fail "the driver's view carries '$driver_response_keys', want exactly assigned_at,assignment_id,driver_name,job_id,link_expires_at"
+ok "and answers with five fields and no sixth — no mobile number, and no delivery detail, which is SHIP-120's"
+
+# --- exactly one job, and this is the check the *Done when* rests on ---------------------------
+
+status="$(open_delivery "$delivery_driver_token" "$delivery_second_job" wrong)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/driver-wrong.json"; fail "a link for $delivery_job opened $delivery_second_job with status $status, want 404"; }
+[[ "$(json "$WORKDIR/driver-wrong.json" '["error"]["code"]')" == "not_found" ]] \
+  || { cat "$WORKDIR/driver-wrong.json"; fail "expected code=not_found; a 403 would confirm the other job exists"; }
+ok "the same link presented on another job gets exactly what a job that does not exist gets"
+
+status="$(open_delivery "$delivery_second_token" "$delivery_job" wrong-back)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/driver-wrong-back.json"; fail "the second link opened the first job: $status"; }
+status="$(open_delivery "$delivery_second_token" "$delivery_second_job" second-own)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/driver-second-own.json"; fail "the second link did not open its own job: $status"; }
+ok "and the refusal is symmetric — each link opens its own delivery and neither opens the other's"
+
+# --- the exchange, over HTTP, in both directions at once ---------------------------------------
+
+status="$(open_delivery "$delivery_provider_token" "$delivery_job" as-session)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-as-session.json"; fail "a mobile session token opened the driver's route: $status"; }
+[[ "$(json "$WORKDIR/driver-as-session.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || { cat "$WORKDIR/driver-as-session.json"; fail "expected code=unauthenticated"; }
+ok "a mobile session token is refused on the driver's route — the direction SHIP-107 could not test, because no route accepted a driver token"
+
+status="$(curl -s -o "$WORKDIR/driver-on-user-route.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_driver_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-on-user-route.json"; fail "a driver token was accepted as a mobile session: $status"; }
+ok "and the driver's link is still refused on a user route — both directions, one binary, one run"
+
+# --- the ways a link fails to be one -----------------------------------------------------------
+
+status="$(curl -s -o "$WORKDIR/driver-none.json" -D "$WORKDIR/driver-none.headers" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/driver/jobs/$delivery_job")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-none.json"; fail "the driver route was reachable with no credential: $status"; }
+grep -qi '^www-authenticate: *Bearer' "$WORKDIR/driver-none.headers" \
+  || { cat "$WORKDIR/driver-none.headers"; fail "the 401 carries no WWW-Authenticate challenge, which RFC 9110 requires"; }
+ok "it cannot be reached with no link at all, and the refusal says what scheme it wanted"
+
+# The forgery from the SHIP-107 section: the first job's token with its `job_id` rewritten to the
+# second job and its signature untouched. Presented on the job it now *claims*, so a service that
+# read the claim before checking the signature would answer 200.
+status="$(open_delivery "$delivery_forged" "$delivery_second_job" forged)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-forged.json"; fail "a repointed token opened the job it was repointed at: $status, want 401"; }
+[[ "$(json "$WORKDIR/driver-forged.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || { cat "$WORKDIR/driver-forged.json"; fail "expected code=unauthenticated"; }
+ok "a token repointed at the job it is presented on is refused by the signature, before the job is ever compared"
+
+# An expired link, built by hand from the development key rather than by waiting seven days. The
+# header names the same kid the service signs with, so everything about it verifies except `exp`.
+driver_expired_header="$(printf '{"alg":"HS256","kid":"driver-dev","typ":"JWT"}' | b64url)"
+driver_expired_claims="$(python3 - "$delivery_job" "$delivery_assignment_id" <<'PY'
+import base64, json, sys, time, uuid
+
+issued = int(time.time()) - 8 * 24 * 3600
+claims = {
+    "job_id": sys.argv[1],
+    "assignment_id": sys.argv[2],
+    "iat": issued,
+    "exp": issued + 7 * 24 * 3600,
+    "jti": str(uuid.uuid4()),
+    "iss": "shipper",
+    "aud": "shipper-driver",
+}
+raw = json.dumps(claims, separators=(',', ':')).encode()
+print(base64.urlsafe_b64encode(raw).rstrip(b'=').decode())
+PY
+)"
+driver_expired_input="$driver_expired_header.$driver_expired_claims"
+driver_expired="$driver_expired_input.$(hs256 "$driver_expired_input" "$delivery_driver_dev_key")"
+
+status="$(open_delivery "$driver_expired" "$delivery_job" expired)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-expired.json"; fail "an expired link returned $status, want 401"; }
+[[ "$(json "$WORKDIR/driver-expired.json" '["error"]["code"]')" == "delivery_driver_link_expired" ]] \
+  || { cat "$WORKDIR/driver-expired.json"; fail "expected code=delivery_driver_link_expired, got $(json "$WORKDIR/driver-expired.json" '["error"]["code"]')"; }
+ok "a link that has run out is refused with a code of its own — a driver has nothing to refresh, so token_expired's 'refresh and retry' would be a loop"
+
+# The same claims signed with identity's key instead. Two keysets is what makes this a 401 rather
+# than a working link, and it is the running service's answer rather than a struct's.
+driver_wrong_key="$driver_expired_input.$(hs256 "$driver_expired_input" "$delivery_mobile_dev_key")"
+status="$(open_delivery "$driver_wrong_key" "$delivery_job" wrong-key)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-wrong-key.json"; fail "a link signed with identity's key was accepted: $status"; }
+[[ "$(json "$WORKDIR/driver-wrong-key.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || { cat "$WORKDIR/driver-wrong-key.json"; fail "expected code=unauthenticated"; }
+ok "and one signed with the mobile session's key is refused too — separate key material, checked by the service that is running"
