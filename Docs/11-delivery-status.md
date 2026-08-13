@@ -219,7 +219,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **507 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **514 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -365,6 +365,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
 | **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
 | **SHIP-115** | M4 | `proofs` and `GET /v1/jobs/{id}/delivery/proof` — an uploaded object becomes evidence for **one recorded milestone**, and the customer and the awarded provider read it back through short-lived signed URLs issued *after* an authorisation check. Because the platform is not in the upload path it **asks the store whether the object arrived** rather than believing the client, and records what the store reports — which is also what finally puts SHIP-114's upload limits under a guard inside the domain — *see below* |
+| **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
@@ -5829,6 +5830,129 @@ reported, the composite key refuses a forged pair **in raw SQL**, the customer r
 at the store rather than at this API, it fetches the bytes, the same object is refused unsigned, the
 awarded provider reads the same record, a stranger gets what a missing job gets, an anonymous read
 is refused, one object cannot be proof twice, and another job's key is refused with the field named.
+
+### SHIP-116 — the exception is evidence, not a hole in the rule
+
+`proofs` gains `exception_reason` and loses four `NOT NULL`s (migration `000604`), and the milestone
+request's `proof` object gains a second field. A milestone may now be evidenced by a photograph
+**or** by one of `Docs/01` §4.4's three reasons there is none — and never by both, and never by
+neither.
+
+#### One table, because "never both" is expressible in no other shape
+
+The obvious design is a second table beside `proofs`, and `000603`'s own header had already rejected
+it: "exception_reason, and object_key becoming nullable with a CHECK that exactly one of the two is
+present". The reason is that **no constraint spans two tables.** A photograph and a reason are
+alternatives, so the interesting rule is not that either may exist but that exactly one does, and
+with two tables that rule can only ever be application logic — which is precisely what `CLAUDE.md`
+says an invariant must not only be.
+
+```sql
+CHECK ((num_nonnulls(object_key, content_type, content_length, etag) = 4 AND exception_reason IS NULL)
+    OR (num_nonnulls(object_key, content_type, content_length, etag) = 0 AND exception_reason IS NOT NULL))
+```
+
+`num_nonnulls` rather than four `IS NOT NULL` conjunctions because the failure it guards is a
+*partial* photograph — a key with no entity tag reads as evidence to every query that only selects
+`object_key`, and `000603`'s four `NOT NULL`s were the only thing refusing it. Dropping them without
+counting would have been the one regression this migration could have introduced silently.
+
+It is also **not** the whole of `CLAUDE.md`'s invariant and does not pretend to be. This makes an
+evidence row coherent; a delivered milestone requiring one is a rule about milestones, and that is
+SHIP-118.
+
+#### The vocabulary is closed, and there is deliberately no `other`
+
+`recipient_objected`, `camera_unavailable`, `location_unsafe` — `Docs/01` §4.4's own three,
+paired with the `CHECK` in both directions by
+`TestProofExceptionConstraintMatchesTheGoConstants` (`Docs/10` §3.4). A free-text reason nobody
+can group is a moderation queue nobody can triage (`Docs/04` §5), and the driver's own words are not
+lost by leaving it out: `milestones.reason` is optional, five hundred characters and one row away.
+"The recipient asked me not to photograph their door" goes there, *beside* a selection rather than
+instead of one.
+
+The stored form is the wire form, which is `ActorType`'s arrangement rather than `Milestone`'s.
+Milestones store `Docs/02` §1's exact strings because a document fixes them; no document fixes
+these, so a second spelling would be a translation table with nothing on the other side of it.
+
+#### An exception may stand behind any milestone, and the narrower rule is wrong
+
+The first design restricted it to `Delivered`, on the reasoning that a photograph is only *required*
+there. It was reversed before anything was written. `Docs/01` §4.4's three reasons are about
+**capture** — a camera, a recipient, a place — and not one of them knows which milestone is being
+recorded. A driver who cannot photograph a pickup is in exactly the position the paragraph is about,
+and refusing the exception there leaves them choosing between recording nothing and claiming
+something they do not have.
+
+What is specific to `Delivered` is that evidence is required at all. That is SHIP-118's rule, and
+keeping the two apart is what let this ticket be demonstrated on an ordinary milestone — exactly as
+SHIP-115 demonstrated a photograph on `en_route_to_pickup`.
+
+#### Nothing is asked of the object store, and nothing is signed for a reader
+
+An exception has no object, so the recording path never calls `Stored` and the read path never calls
+`PresignDownload`. Both are **assertions about a call rather than about an answer**, so both tests
+read what the stub was asked rather than what came back — `recordingObjects.lookups` and
+`.downloads`. That shape is SHIP-115's finding reused: `internal/platform/storage` will sign a URL
+for any key it is handed and says so, so a service that asked it about an exception would receive a
+perfectly good credential naming an object that does not exist, and a response assertion could pass
+while that happened.
+
+The consequence for a client is one field: a record carries `exception_reason` **or** the
+photograph's five, and `download_url` is absent rather than empty. A zero `content_length` is a
+statement about a photograph that does not exist; an absent field says nothing.
+
+#### What was assumed about SHIP-117 and X-6, neither of which is this ticket's
+
+| Ticket | What it needs from here | What was built for it |
+|---|---|---|
+| **SHIP-117** — an exception-completed job enters the moderation queue | To ask which jobs carry one | `idx_proofs_exception`, partial on `exception_reason IS NOT NULL`. **The flag itself is deliberately not here**: whether a job is queued for review is a fact about the *job* and belongs with the queue, which is what `000603` already said. The queue's own question is a join to the `Delivered` milestone, which SHIP-118 makes recordable |
+| **X-6** — may an exception-completed job auto-complete under `Docs/02` §6.1? | Not to have been decided | Nothing here presumes an answer. The exception is a durable fact joined to the milestone that carries it, so SHIP-119 can branch either way and no column changes in either direction |
+
+Until SHIP-117 exists the only trace an exception leaves outside the table is a **warning** log line
+from the handler — the one place in it that is about operations rather than reconciliation. A
+delivery with no photograph is exactly what somebody should be able to find in a log while the queue
+is being written.
+
+#### What was needed of `internal/config`: nothing, and run 2's request stands
+
+No new setting. The exception path touches no limit, no lifetime and no bucket — which is itself the
+argument for having put the reason vocabulary in a `CHECK` rather than in configuration: it is
+paired with a Go constant list by a test, and `Docs/10` §3.4 is explicit that this is how an
+enumeration is held.
+
+**The `STORAGE_DOWNLOAD_TTL` SHIP-115 asked for is still the right request**, and this ticket
+narrows what it is for rather than widening it: an exception is now one of the records a customer's
+tracking screen renders, and it needs no URL at all, so the population of long-lived read links is
+smaller than it was but no shorter-lived.
+
+**One request that is not `internal/config`'s and is recorded because somebody will reach for it.**
+The three reasons a driver *picks from* are a vocabulary; the **words shown beside them** in the
+picker are copy, and `Docs/06` §5.3 puts copy server-side because Flutter has no over-the-air update
+path. No endpoint serves them, and SHIP-131 — the camera-permission fallback, which depends on this
+ticket — is the first screen that needs them. Compiling three English strings into Dart is the
+cheap answer and the one that needs a store review to correct.
+
+#### Mutation testing: seven mutations, seven caught
+
+Each was reverted immediately, by copy rather than by `git checkout`, and confirmed with `git diff`
+and a checksum.
+
+| Mutation | Result |
+|---|---|
+| Make `ck_proofs_photograph_or_exception` always true, so a row may carry both or neither | **Caught** — `TestEvidenceIsAPhotographOrAReasonAndNeverBothOrNeither`. `70-delivery.sh` asserts the same rule in raw SQL against the running database |
+| Write `num_nonnulls(...) > 0` in place of `= 4`, so half a photograph is a photograph | **Caught** — that test's `half a photograph is refused` subtest, and **nothing else**. It is the mutation this migration could most easily have shipped with: every ordinary path writes four columns, so no Go test and no verify check can reach it |
+| `ProofExceptionReason.Valid` always true, so any string is a reason | **Caught** — three tests, and the interesting part is *how*. The domain test now fails with `ck_proofs_exception_reason` in the message rather than a validation error, which is the two layers behaving exactly as `Docs/10` §4.6 describes: the database still refuses the row, and what the Go check buys is a 422 naming the field instead of a constraint name in a 500 |
+| Remove **both** Go refusals of a photograph-and-a-reason together | **Caught** — but by one test rather than three, and this is the mutation worth reading. `TestEvidenceThatIsNotOneOrTheOtherIsRefusedInsideThePackage` fails. `TestAPhotographAndAReasonTogetherAreRefused` and the wire table both keep passing, because `ck_proofs_photograph_or_exception` refuses the row on the way past. The rule holds; what is lost is the ability to say which field was wrong |
+| Treat `"proof": {}` as no evidence rather than as a refusal | **Caught** — the wire table's `neither` case and SHIP-115's `TestProofOnTheWireIsRefusedByTheCasesAClientCanCause`. The failure it prevents is the quiet one: a client that meant to send a photograph, silently recorded as having none |
+| Sign a download URL for an exception row | **Caught** — `TestAnExceptionIsReadBackWithNoDownloadURLAndNothingIsSignedForIt` by the assertion that counts what the signer was asked, plus both wire tests. The signer-call assertion is the one that would still fail if the URL were minted and then discarded |
+| Ask the store about the object an exception does not name (`req.Proof != nil` in place of `proofKey != ""`) | **Caught** — both wire tests, and note that the *domain* `lookups` assertion does not fail, because the mutation is in the handler and the domain test calls the service directly. That is the division working: the handler owns the ordering, so the handler's tests are what hold it |
+
+`make verify` went from 507 checks to 514 across the same 13 sections, all seven in
+`scripts/verify/70-delivery.sh`: an exception is recorded against a real MinIO with no bucket
+interaction at all, the row holds the reason and four NULLs, the table refuses both-and-neither in
+raw SQL, the customer and the awarded provider each read the reason with no URL, and both-together,
+neither and an unpublished reason are each refused with the field named and the three published.
 
 ## 4. Partly done — do not treat these as finished
 

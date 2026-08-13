@@ -85,15 +85,31 @@ var (
 	// ErrProofRequired means a delivery was recorded with nothing to show for it.
 	//
 	// CLAUDE.md states the invariant and Docs/01 §4.4 decides it: "a job cannot be recorded as
-	// Delivered without photo proof, except through the exception path". Neither the proof
-	// (SHIP-114, SHIP-115) nor the exception (SHIP-116) can be captured yet, so **every**
-	// 'Delivered' is refused here for now — which is the only answer that does not leave a job at
-	// Delivered with neither.
+	// Delivered without photo proof, except through the exception path". **Both halves can now be
+	// captured** — the photograph at SHIP-115 and the reasoned exception at SHIP-116 — and
+	// 'Delivered' is still refused unconditionally here, because whether a delivery may be
+	// recorded at all is a rule about milestones rather than about evidence, and that rule is
+	// SHIP-118's.
 	//
-	// **SHIP-118 is the ticket that narrows this**, from "always" to "when the job has neither
-	// proof nor a recorded exception". The sentinel, the code and the message already say what
-	// that ticket needs to say; what changes is the condition in front of them.
+	// **SHIP-118 is the ticket that narrows this**, from "always" to "when the recording carries
+	// neither". The sentinel, the code and the message already say what that ticket needs to say;
+	// what changes is the condition in front of them.
 	ErrProofRequired = errors.New("delivery: a delivery needs photo proof or a recorded exception")
+
+	// ErrEvidenceNotCoherent means a [Recording] reached the insert carrying evidence that is not
+	// one photograph or one reasoned exception (SHIP-116).
+	//
+	// Both shapes it refuses — a recording carrying both, and one naming a reason that is not one
+	// of Docs/01 §4.4's three — are caught by [Recording.problems] and answered as
+	// `validation_failed` with `proof.exception_reason` named, so **this is unreachable through
+	// any endpoint**. It exists for the same reason [ErrProofNotVerified] does: the guard against a
+	// future caller *inside* this package assembling a recording by hand, where the next line of
+	// defence is ck_proofs_photograph_or_exception and a constraint name explains nothing
+	// (Docs/10 §4.6).
+	//
+	// It maps to no code and becomes an opaque 500 with its cause logged, which is the right
+	// treatment: the client did nothing wrong and there is nothing it could usefully be told.
+	ErrEvidenceNotCoherent = errors.New("delivery: a milestone's evidence must be one photograph or one reasoned exception")
 
 	// ErrProofNotUploaded means the object the client named is not in the store (SHIP-115).
 	//

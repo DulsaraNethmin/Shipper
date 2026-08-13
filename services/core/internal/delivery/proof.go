@@ -504,24 +504,160 @@ func keyBelongsToJob(key string, jobID uuid.UUID) bool {
 	return err == nil
 }
 
-// recordProof writes the row that makes an object evidence, inside the caller's transaction.
+// Proof of delivery, part three: the delivery that could not be photographed (SHIP-116).
+//
+// # The exception is not a hole in the rule. It is the other half of it
+//
+// Docs/01 §4.4 decides that photo proof is mandatory **and**, in the same paragraph, that "the
+// exception path is part of the same feature and must be built with it, not after". The reason it
+// gives is operational rather than generous: proof can be genuinely impossible — a recipient who
+// objects to being photographed, a camera permission denied, a delivery point unlit or unsafe — and
+// "what must never happen is a driver standing at a delivery point unable to finish the job — that
+// converts a UI constraint into an operational failure and a support call".
+//
+// So an exception is **evidence, not the absence of it**: a reason, chosen by the actor from a
+// closed list, recorded in the same transaction and the same table as the photographs. That is why
+// [ProofExceptionReason] is a vocabulary rather than a free-text field and why 000604 widened
+// `proofs` rather than adding a table beside it — "never both, never neither" is expressible as one
+// CHECK on one row and expressible in no way at all across two tables.
+//
+// # An exception may stand behind any milestone, not only 'Delivered'
+//
+// The narrower rule was considered and is wrong in the direction that costs a driver something.
+// Docs/01 §4.4's three reasons are about **capture** — a camera, a recipient, a place — and none of
+// them knows which milestone is being recorded. A driver who cannot photograph a pickup is in
+// exactly the position the paragraph describes, and refusing the exception there would leave them
+// choosing between recording nothing and lying about what they have.
+//
+// What is specific to 'Delivered' is that evidence is *required* at all, and that is SHIP-118's
+// rule about milestones rather than this file's rule about proof.
+//
+// # SHIP-117 reads this, and X-6 is deliberately not decided here
+//
+// An exception-completed job enters the moderation queue (Docs/04 §5's fourth: "failed proof of
+// delivery"), and what that ticket needs from here is the ability to ask which jobs have one —
+// `idx_proofs_exception` is that answer, and the flag itself is a fact about the job that belongs
+// with the queue. X-6 is the open decision about whether such a job may auto-complete under
+// Docs/02 §6.1 at all; **nothing here presumes either answer**, and SHIP-119 can branch on the row
+// in whichever direction operations settles it.
+
+// ProofExceptionReason is why a recorded milestone carries no photograph (SHIP-116).
+//
+// # A closed list, and Docs/01 §4.4 wrote it
+//
+// The three below are that paragraph's own three, and there is deliberately no `other`. A reason
+// nobody can group is a moderation queue nobody can triage (Docs/04 §5), and a driver's own words
+// are not lost by leaving them out: `milestones.reason` is optional, 500 characters, and one row
+// away — "the recipient asked me not to photograph their door" goes there, beside a selected
+// reason rather than instead of one.
+//
+// The values are lower snake case and the stored form is the wire form, which is [ActorType]'s
+// arrangement rather than [Milestone]'s. Milestones store Docs/02 §1's exact strings because a
+// document fixes them (Docs/10 §3.4); no document fixes these, so a second spelling would be a
+// translation table with nothing on the other side of it.
+//
+// Paired with ck_proofs_exception_reason by TestProofExceptionConstraintMatchesTheGoConstants, in
+// both directions, which is what Docs/10 §3.4 asks of every enumeration.
+type ProofExceptionReason string
+
+const (
+	// ExceptionRecipientObjected is Docs/01 §4.4's first: "the recipient objects to being
+	// photographed".
+	ExceptionRecipientObjected ProofExceptionReason = "recipient_objected"
+
+	// ExceptionCameraUnavailable is its second: "the camera permission is denied or the hardware
+	// is unavailable".
+	//
+	// **This is the one SHIP-131 exists for** — "a denied permission offers the exception path
+	// instead of a dead end" — and it is why that ticket depends on this one.
+	ExceptionCameraUnavailable ProofExceptionReason = "camera_unavailable"
+
+	// ExceptionLocationUnsafe is its third: "the delivery point is unlit or unsafe to
+	// photograph".
+	ExceptionLocationUnsafe ProofExceptionReason = "location_unsafe"
+)
+
+// ProofExceptionReasons is every reason a photograph may be missing.
+//
+// Ordered as Docs/01 §4.4 lists them, which is also the order a client should offer them in: the
+// first is the one a driver meets most often and the third is the one they meet in the dark.
+var ProofExceptionReasons = []ProofExceptionReason{
+	ExceptionRecipientObjected,
+	ExceptionCameraUnavailable,
+	ExceptionLocationUnsafe,
+}
+
+// Valid reports whether r is one of the three.
+func (r ProofExceptionReason) Valid() bool {
+	return slices.Contains(ProofExceptionReasons, r)
+}
+
+func (r ProofExceptionReason) String() string { return string(r) }
+
+// proofExceptionWire is every accepted reason, for the message a client is refused with.
+//
+// Derived from [ProofExceptionReasons] rather than written out beside it, for the reason
+// [recordableWire] is derived: a hand-written list in a message eventually offers a value the
+// handler then rejects.
+func proofExceptionWire() []string {
+	wire := make([]string, 0, len(ProofExceptionReasons))
+	for _, r := range ProofExceptionReasons {
+		wire = append(wire, string(r))
+	}
+	return wire
+}
+
+// recordEvidence writes the row that stands behind a recorded claim, inside the caller's
+// transaction.
 //
 // It is called from [Service.RecordMilestone] and from nowhere else, which is what keeps the
-// proof and the milestone one act: there is no path that records a photograph against a milestone
-// recorded earlier, because a milestone that has been committed without proof is a state SHIP-118
-// will have to refuse and this domain therefore never produces.
+// evidence and the milestone one act: there is no path that attaches a photograph or a reason to a
+// milestone recorded earlier, because a milestone committed without either is precisely the state
+// SHIP-118 refuses and this domain therefore never produces.
+//
+// # It takes both and writes one, and the switch is the guard rather than a formality
+//
+// A recording carrying both a photograph and a reason is incoherent — Docs/01 §4.4's exception is
+// "in place of" the photograph — and one carrying an unknown reason is a value the database would
+// refuse with a constraint name. Both are caught by [Recording.problems] before this is reached,
+// and both are checked again here for the reason [VerifiedProof.complete] is checked: this is the
+// guard against a future caller **inside this package** assembling a [Recording] by hand.
+// ck_proofs_photograph_or_exception is the third layer and the only one that survives a rewrite of
+// the first two.
+//
+// **SHIP-115 called this `recordProof` and SHIP-116 renamed it.** With one kind of evidence the
+// specific name was clearer; with two, "proof" would have been the name of the branch this
+// function no longer always takes.
 //
 // r must be the transaction the milestone was written in. Not asserted here — [Service.RecordMilestone]
 // checks it once at the top, and a second check would suggest this is reachable on its own.
-func (s *Service) recordProof(
+func (s *Service) recordEvidence(
 	ctx context.Context,
 	r db.Runner,
 	jobID, milestoneID uuid.UUID,
 	proof VerifiedProof,
+	exception ProofExceptionReason,
 ) (Proof, error) {
-	if !proof.complete() {
-		return Proof{}, fmt.Errorf("delivery: %q was not checked against the store: %w",
-			proof.objectKey, ErrProofNotVerified)
+	switch {
+	case proof.present() && exception != "":
+		return Proof{}, fmt.Errorf("delivery: %s carries a photograph and the reason %q: %w",
+			milestoneID, exception, ErrEvidenceNotCoherent)
+
+	case exception != "":
+		if !exception.Valid() {
+			return Proof{}, fmt.Errorf("delivery: %q is not one of %s: %w",
+				exception, strings.Join(proofExceptionWire(), ", "), ErrEvidenceNotCoherent)
+		}
+
+	case proof.present():
+		if !proof.complete() {
+			return Proof{}, fmt.Errorf("delivery: %q was not checked against the store: %w",
+				proof.objectKey, ErrProofNotVerified)
+		}
+
+	default:
+		return Proof{}, fmt.Errorf("delivery: %s has nothing behind it: %w",
+			milestoneID, ErrEvidenceNotCoherent)
 	}
 
 	id, err := uuid.NewV7()
@@ -538,10 +674,25 @@ func (s *Service) recordProof(
 		ContentType:   proof.contentType,
 		ContentLength: proof.contentLength,
 		ETag:          proof.etag,
+
+		ExceptionReason: exception,
 	})
 }
 
-// Proof is one photograph, and the recorded claim it is evidence for.
+// Proof is the evidence for one recorded claim: a photograph, or the reason there is none.
+//
+// # One type for both, because they answer one question
+//
+// SHIP-116 widened this from "one photograph" and did not add a second type beside it. A reader
+// assembling a delivery's evidence — the customer's tracking screen (SHIP-133), an administrator in
+// a dispute (Docs/04 §7) — is asking what stands behind each milestone, and "a photograph" and "a
+// reason there is none" are two answers to that one question rather than two questions. The
+// alternative was a second collection a client would have to merge and order itself, from two
+// endpoints, against the same milestones.
+//
+// **[Proof.IsException] is how the two are told apart**, and the fields make it safe: 000604's
+// ck_proofs_photograph_or_exception means a row carries all four photograph facts or a reason, and
+// never a mixture, so a caller that checks one field has checked all of them.
 //
 // # It is attached to a milestone, and through the milestone to a job
 //
@@ -563,10 +714,20 @@ type Proof struct {
 
 	Milestone Milestone
 
+	// ObjectKey, ContentType, ContentLength and ETag are the photograph, and are empty together
+	// when this row is a reasoned exception. The database refuses any mixture of the two states
+	// (000604), so [Proof.IsException] reading one of them is reading all four.
 	ObjectKey string
 
 	ContentType   string
 	ContentLength int64
+
+	// ExceptionReason is why there is no photograph, and is empty when there is one (SHIP-116).
+	//
+	// It is what SHIP-117 queries to flag an exception-completed job into the moderation queue,
+	// and what X-6 will be decided about — whether such a job may auto-complete under
+	// Docs/02 §6.1. Neither is decided here.
+	ExceptionReason ProofExceptionReason
 
 	// ETag is the store's tag for the bytes at the moment they became proof.
 	//
@@ -580,7 +741,13 @@ type Proof struct {
 	AcceptedAt time.Time
 }
 
-// ProofLink is a [Proof] with somewhere to actually look at it.
+// IsException reports whether this row is a reasoned exception rather than a photograph.
+//
+// One reader rather than a comparison at each call site, because the two states are total: 000604
+// permits no row that is neither and no row that is both.
+func (p Proof) IsException() bool { return p.ExceptionReason != "" }
+
+// ProofLink is a [Proof] with somewhere to actually look at it, when there is anything to look at.
 //
 // The URL is issued **after** the authorisation check in [Service.ProofFor] and never before —
 // internal/platform/storage will sign one for any key it is handed and says so, so the decision
@@ -589,6 +756,10 @@ type Proof struct {
 // It is short-lived on the same reasoning as the upload URL: nothing can revoke a pre-signed URL, so
 // its lifetime is the whole of the control. A rendered image URL that leaks out of a customer's
 // browser history reaches a photograph of somebody's front door until it expires.
+//
+// **URL and ExpiresAt are empty on an exception, and nothing is signed for one** (SHIP-116). There
+// is no object, so a URL would either name an empty key or name somebody else's — and the signer
+// will sign whatever it is handed, which is exactly why the decision not to ask it lives here.
 type ProofLink struct {
 	Proof
 
@@ -660,6 +831,15 @@ func (s *Service) ProofFor(
 
 	links := make([]ProofLink, 0, len(stored))
 	for _, p := range stored {
+		// A reasoned exception has no object, so nothing is asked of the signer (SHIP-116). The
+		// store would sign a URL for the empty key without complaint — it authorises nothing by
+		// itself and says so — and what came back would be a credential naming an object that
+		// does not exist, handed to a client that would then render a broken image.
+		if p.IsException() {
+			links = append(links, ProofLink{Proof: p})
+			continue
+		}
+
 		url, expiresAt, err := s.proof.objects.PresignDownload(ctx, p.ObjectKey, s.proof.policy.URLTTL)
 		if err != nil {
 			return nil, fmt.Errorf("delivery: signing a download for %s on %s: %w", p.ObjectKey, jobID, err)

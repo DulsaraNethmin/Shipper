@@ -312,8 +312,16 @@ Milestones:
       and a delivery that runs to plan produces both. **The response does not echo the job's
       status** — read the job if you need it.
 
-      `driver_assigned` is recorded by `POST /v1/jobs/{id}/driver` rather than here, and `delivered`
-      needs proof, which cannot be captured yet — see the responses below.
+      `driver_assigned` is recorded by `POST /v1/jobs/{id}/driver` rather than here. `delivered` is
+      still refused: both kinds of evidence can now be captured — a photograph and a reasoned
+      exception — and whether a delivery may be recorded at all is a separate rule that is not built
+      yet. See the responses below.
+
+      ## Evidence, on any milestone
+
+      Any milestone may carry `proof`: the photograph you uploaded, or one of three reasons there is
+      none. A driver whose camera permission is denied at a pickup is in the same position as one at
+      a delivery, so the exception is not reserved for the last milestone. See `ProofAttachment`.
 
       ## Two clocks, and you must send the first one when they differ
 
@@ -413,7 +421,7 @@ Milestones:
           | `error.code` | What happened |
           |---|---|
           | `delivery_milestone_not_permitted` | The delivery has not reached this milestone yet. Keep the update and retry it once it has — see above. A milestone the job has already *passed* is recorded rather than refused |
-          | `delivery_proof_required` | `delivered` needs photo proof or a recorded exception, and capturing either is not built yet |
+          | `delivery_proof_required` | `delivered` needs photo proof or a recorded exception. Both can now be captured; recording a delivery at all is not built yet |
           | `idempotency_key_reused` | This key already recorded a *different* milestone on this job. Generate a new one |
           | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
         headers:
@@ -462,9 +470,9 @@ MilestoneRecording:
         Which milestone. `driver_assigned` is deliberately absent: a driver is put on a job through
         `POST /v1/jobs/{id}/driver`, which is a different act with a record of its own.
 
-        `delivered` is accepted by the schema and refused by the platform until proof can be
-        captured (SHIP-114 to SHIP-118). It is listed because it is a real milestone and the client
-        that will send it is being built against this document.
+        `delivered` is accepted by the schema and refused by the platform until SHIP-118 decides
+        what a delivery must carry. It is listed because it is a real milestone and the client that
+        will send it is being built against this document.
       example: picked_up
     recorded_at:
       type: string
@@ -492,9 +500,15 @@ MilestoneRecording:
 ProofAttachment:
   type: object
   additionalProperties: false
-  required: [object_key]
   description: |
-    The photograph this milestone is evidenced by (SHIP-115).
+    The evidence for this milestone: the photograph you uploaded, or the reason there is none
+    (SHIP-115, SHIP-116).
+
+    **Send exactly one of `object_key` and `exception_reason`.** Sending both is refused with
+    `validation_failed` naming `proof.exception_reason`; sending an empty object is refused naming
+    `proof.object_key`. Omit `proof` altogether when the milestone carries no evidence.
+
+    ## The photograph
 
     Upload it first with `POST /v1/jobs/{id}/proof-uploads`, PUT the bytes to the URL you are given,
     and then send that response's `object_key` here. The platform **asks the object store whether
@@ -510,6 +524,17 @@ ProofAttachment:
     `validation_failed` naming `proof.object_key`, and an object that is already the proof of
     another milestone is refused with `delivery_proof_already_recorded` — ask for a new upload URL,
     which always names a new object.
+
+    ## The reason there is none
+
+    A photograph can be genuinely impossible, and a driver standing at a delivery point must never
+    be left unable to finish the job. Select one of the three reasons below and send it in place of
+    the key: nothing is uploaded, the object store is not contacted, and the reason is recorded as
+    the evidence for this milestone.
+
+    It is read back beside the photographs on `GET /v1/jobs/{id}/delivery/proof`, as a record with
+    an `exception_reason` and no `download_url`. Your own words go in this request's `reason` field
+    beside the selection rather than instead of it.
   properties:
     object_key:
       type: string
@@ -517,6 +542,19 @@ ProofAttachment:
         The `object_key` from the upload URL you were given. Not a name you choose: the platform
         picks every key, and one it did not issue for this job is refused.
       example: proof/6f1c9d2e-0f3b-7a51-9b6e-1f2a3b4c5d6e/019bd7a1-2c44-7f10-9a2c-3d4e5f607182
+    exception_reason:
+      type: string
+      enum: [recipient_objected, camera_unavailable, location_unsafe]
+      description: |
+        Why this milestone carries no photograph. Case-sensitive, and one of exactly these three —
+        there is deliberately no free-text option.
+
+        | Value | When |
+        |---|---|
+        | `recipient_objected` | The recipient does not want to be photographed |
+        | `camera_unavailable` | The camera permission is denied, or the hardware is not there |
+        | `location_unsafe` | The delivery point is unlit or unsafe to photograph |
+      example: recipient_objected
 
 Milestone:
   type: object
@@ -881,18 +919,22 @@ Proof:
     - job_id
     - milestone_id
     - milestone
-    - object_key
-    - content_type
-    - content_length
-    - download_url
-    - download_expires_at
     - recorded_at
     - accepted_at
   description: |
-    One photograph, and the recorded milestone it is evidence for.
+    The evidence for one recorded milestone: a photograph, or the reason there is none.
 
-    Proof is attached to a **milestone** rather than to the job, so a late milestone the platform
-    absorbed without moving the job still carries its photograph — at the time the driver acted.
+    Evidence is attached to a **milestone** rather than to the job, so a late milestone the platform
+    absorbed without moving the job still carries it — at the time the driver acted.
+
+    ## Two shapes, and `exception_reason` is how you tell them apart (SHIP-116)
+
+    A photograph carries `object_key`, `content_type`, `content_length`, `download_url` and
+    `download_expires_at`. A reasoned exception carries **none of them** — there is no object, so
+    there is nothing to sign a URL for — and carries `exception_reason` instead.
+
+    Branch on `exception_reason`. Branching on a missing `download_url` would work today and would
+    be reading the absence of a credential as a fact about the delivery.
   properties:
     id:
       type: string
@@ -938,12 +980,21 @@ Proof:
         When `download_url` stops working. Read it rather than assuming a lifetime: it is
         configuration and may be shortened without notice.
       example: '2026-08-13T04:45:00.000Z'
+    exception_reason:
+      type: string
+      enum: [recipient_objected, camera_unavailable, location_unsafe]
+      description: |
+        Present when this milestone has no photograph, and absent when it has one. It is why —
+        the recipient objected, the camera was unavailable, or the place was unsafe to photograph.
+
+        A record carrying this has no `object_key` and no `download_url`: there is nothing to fetch.
+      example: recipient_objected
     recorded_at:
       type: string
       format: date-time
       description: |
         The **actor's** clock, carried through from the milestone: when the driver says they took
-        the photograph. This is what to show a customer.
+        the photograph, or recorded that there would not be one. This is what to show a customer.
       example: '2026-08-12T06:40:11.000Z'
     accepted_at:
       type: string

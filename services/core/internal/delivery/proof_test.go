@@ -119,6 +119,12 @@ type recordingObjects struct {
 	// refused reader got nothing reads this rather than the response, because a response can be
 	// empty for the wrong reason.
 	downloads []string
+
+	// lookups is every key the store was asked about, in order (SHIP-116). A recording that
+	// carries a reasoned exception must ask the store nothing at all — there is no object to ask
+	// about — and that is a claim about a call rather than about an answer, so a test reads it
+	// here rather than inferring it from a refusal.
+	lookups []string
 }
 
 func newRecordingObjects() *recordingObjects {
@@ -132,6 +138,7 @@ func (o *recordingObjects) holding(key string, obj storedObject) string {
 }
 
 func (o *recordingObjects) Stored(_ context.Context, key string) (string, int64, string, bool, error) {
+	o.lookups = append(o.lookups, key)
 	if o.storedErr != nil {
 		return "", 0, "", false, o.storedErr
 	}
@@ -1209,6 +1216,8 @@ type proofBody struct {
 
 	DownloadURL       string `json:"download_url"`
 	DownloadExpiresAt string `json:"download_expires_at"`
+
+	ExceptionReason string `json:"exception_reason"`
 
 	RecordedAt string `json:"recorded_at"`
 	AcceptedAt string `json:"accepted_at"`

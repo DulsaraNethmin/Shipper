@@ -141,14 +141,35 @@ const maxMilestoneReason = 500
 // **The field is a [VerifiedProof] and not a string**, which is the whole of the guarantee: the only
 // value another package can construct is the zero one, so nothing outside `delivery` can put a
 // photograph here that the platform has not looked at. [Service.VerifyProof] is what produces one.
+//
+// # Exception is the other half of the same field, and exactly one of the two is ever set (SHIP-116)
+//
+// Docs/01 §4.4 makes the exception path "part of the same feature", and this is where the two meet:
+// a recording carries a photograph, or a reason there is none, and never both. [Recording.problems]
+// refuses the pair and 000604's ck_proofs_photograph_or_exception refuses the row.
+//
+// **It is an ordinary exported string type and not a [VerifiedProof]**, and the asymmetry is
+// deliberate rather than an oversight. A photograph is a claim about the world that the platform
+// must check — the object either exists in the bucket or it does not — so the type is what makes it
+// uncheckable-by-accident. A reason is a *selection* the actor made from three the platform
+// published; there is nothing to verify it against, and the only thing that can be wrong with it is
+// that it is not one of the three, which [ProofExceptionReason.Valid] answers.
 type Recording struct {
 	Milestone  Milestone
 	RecordedAt time.Time
 	Reason     string
 	Key        string
 
-	Proof VerifiedProof
+	Proof     VerifiedProof
+	Exception ProofExceptionReason
 }
+
+// hasEvidence reports whether this recording carries a photograph or a reasoned exception.
+//
+// One reader rather than the disjunction written out at each call site, because the two are one
+// concept — what stands behind this claim — and SHIP-118 turns that concept into the condition
+// 'Delivered' is accepted on.
+func (rec Recording) hasEvidence() bool { return rec.Proof.present() || rec.Exception != "" }
 
 // normalise trims what the client sent into what the columns should hold.
 func (rec Recording) normalise() Recording {
@@ -183,6 +204,27 @@ func (rec Recording) problems() validate.Errors {
 
 	if rec.Reason != "" {
 		e.Length("reason", rec.Reason, 1, maxMilestoneReason)
+	}
+
+	// The evidence, checked here as well as at the wire (SHIP-116).
+	//
+	// [recordingFrom] refuses both of these before a [Recording] is built, so neither is reachable
+	// through the endpoint — and they are checked in the domain anyway, because the alternative is
+	// a rule that holds only for callers that came in through one decoder. The field names are the
+	// wire's, because that is what a client is being told about.
+	switch {
+	case rec.Proof.present() && rec.Exception != "":
+		e.Add("proof.exception_reason", validate.CodeNotAllowed,
+			"Send the photograph you uploaded or a reason there is none, not both.")
+
+	case rec.Exception != "" && !rec.Exception.Valid():
+		// Named rather than left to validate.OneOf, whose message is "that is not one of the
+		// available options". Docs/01 §4.4 has the driver *select* a reason, so the refusal is
+		// where a client learns which three there are — the same call [UploadRequest.problems]
+		// makes about the accepted media types.
+		e.Add("proof.exception_reason", validate.CodeInvalid,
+			"That is not a reason a photograph can be missing. Use one of %s.",
+			strings.Join(proofExceptionWire(), ", "))
 	}
 
 	return e

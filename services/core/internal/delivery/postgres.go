@@ -229,21 +229,61 @@ func (postgresStore) milestoneRecordedBy(
 // one row away and a second copy is a second thing that can be wrong.
 const proofColumns = `
 	p.id, p.job_id, p.milestone_id, m.milestone, p.object_key,
-	p.content_type, p.content_length, p.etag, m.actor_recorded_at, p.created_at`
+	p.content_type, p.content_length, p.etag, p.exception_reason,
+	m.actor_recorded_at, p.created_at`
 
 // scanProof reads one row of [proofColumns].
+//
+// Five nullable columns since SHIP-116, and they are nullable in one group or the other: a row is a
+// photograph the store confirmed or a reasoned exception, and ck_proofs_photograph_or_exception
+// refuses every mixture. The zero value says the same thing in Go — an empty object key is what
+// [Proof.IsException] reads — so no pointer survives past this function.
 func scanProof(row pgx.Row) (Proof, error) {
-	var p Proof
+	var (
+		p             Proof
+		objectKey     *string
+		contentType   *string
+		contentLength *int64
+		etag          *string
+		exception     *string
+	)
+
 	if err := row.Scan(
-		&p.ID, &p.JobID, &p.MilestoneID, &p.Milestone, &p.ObjectKey,
-		&p.ContentType, &p.ContentLength, &p.ETag, &p.RecordedAt, &p.AcceptedAt,
+		&p.ID, &p.JobID, &p.MilestoneID, &p.Milestone, &objectKey,
+		&contentType, &contentLength, &etag, &exception, &p.RecordedAt, &p.AcceptedAt,
 	); err != nil {
 		return Proof{}, err
+	}
+
+	if objectKey != nil {
+		p.ObjectKey = *objectKey
+	}
+	if contentType != nil {
+		p.ContentType = *contentType
+	}
+	if contentLength != nil {
+		p.ContentLength = *contentLength
+	}
+	if etag != nil {
+		p.ETag = *etag
+	}
+	if exception != nil {
+		p.ExceptionReason = ProofExceptionReason(*exception)
 	}
 	return p, nil
 }
 
-// insertProof records one object as the proof of one milestone (SHIP-115).
+// insertProof records the evidence for one milestone — an object, or the reason there is none
+// (SHIP-115, SHIP-116).
+//
+// # `nullif` on all five, because the domain speaks zero values and the table speaks NULL
+//
+// A [Proof] built for an exception carries an empty object key and a zero length, and 000604's
+// ck_proofs_photograph_or_exception counts NULLs rather than reading empty strings — which is the
+// right way round: `''` is a perfectly good object key as far as `text` is concerned, and a CHECK
+// written against it would be a second spelling of "absent" for the database to disagree with the
+// domain about. The cast on the length is what stops PostgreSQL inferring `nullif($6, 0)` as
+// something other than bigint.
 //
 // # ON CONFLICT on the object key, for the reason [postgresStore.insertMilestone] gives
 //
@@ -266,28 +306,38 @@ func (postgresStore) insertProof(ctx context.Context, r db.Runner, p Proof) (Pro
 	const q = `
 		WITH inserted AS (
 			INSERT INTO proofs
-				(id, job_id, milestone_id, object_key, content_type, content_length, etag)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+				(id, job_id, milestone_id, object_key, content_type, content_length, etag,
+				 exception_reason)
+			VALUES ($1, $2, $3, nullif($4, ''), nullif($5, ''), nullif($6::bigint, 0),
+			        nullif($7, ''), nullif($8, ''))
 			ON CONFLICT (object_key) DO NOTHING
-			RETURNING id, job_id, milestone_id, object_key, content_type, content_length, etag, created_at
+			RETURNING id, job_id, milestone_id, object_key, content_type, content_length, etag,
+			          exception_reason, created_at
 		)
 		SELECT ` + proofColumns + `
 		FROM inserted p
 		JOIN milestones m ON m.id = p.milestone_id`
 
 	stored, err := scanProof(r.QueryRow(ctx, q,
-		p.ID, p.JobID, p.MilestoneID, p.ObjectKey, p.ContentType, p.ContentLength, p.ETag))
+		p.ID, p.JobID, p.MilestoneID, p.ObjectKey, p.ContentType, p.ContentLength, p.ETag,
+		string(p.ExceptionReason)))
 	switch {
 	case errors.Is(err, db.ErrNoRows):
+		// Only a photograph can reach this. A NULL object key conflicts with nothing —
+		// uq_proofs_object_key is a btree and NULLs are distinct — so an exception either
+		// inserts or fails loudly on uq_proofs_milestone, which would be a defect rather than
+		// a race (see above) and must not be absorbed into "already recorded".
 		return Proof{}, fmt.Errorf("delivery: %s is already proof of something: %w",
 			p.ObjectKey, ErrProofAlreadyRecorded)
 	case err != nil:
-		return Proof{}, fmt.Errorf("delivery: recording %s as proof on %s: %w", p.ObjectKey, p.JobID, err)
+		return Proof{}, fmt.Errorf("delivery: recording the evidence for %s on %s: %w",
+			p.MilestoneID, p.JobID, err)
 	}
 	return stored, nil
 }
 
-// proofOn is every photograph recorded against one job, most recently acted first.
+// proofOn is every piece of evidence recorded against one job — photographs and reasoned
+// exceptions alike — most recently acted first.
 //
 // # Ordered by the actor's clock rather than by arrival
 //

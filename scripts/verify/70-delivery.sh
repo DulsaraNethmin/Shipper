@@ -1160,3 +1160,101 @@ ok "and a key issued against another job is refused on the string alone, before 
    mc rm --force "local/'"$STORAGE_BUCKET/$proof115_key"'" >/dev/null 2>&1 || true' \
   || fail "could not remove the object this section uploaded"
 ok "the object this run uploaded was removed from $STORAGE_BUCKET"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-116  a reasoned exception is recorded in place of a photograph"
+
+# # What only this section can show
+#
+# The Go tests stub the object store, so "nothing was uploaded and nothing was asked of the store"
+# is asserted there against a stub. Here it is the real MinIO from SHIP-15p, the real signer, and
+# the running binary: an exception is recorded with **no bucket interaction at all**, and the row
+# the running service wrote is read back out of PostgreSQL rather than out of its own response.
+#
+# The composition root's half is the same half every section in this file exists for. The exception
+# takes cmd/api's `jobLifecycle` and `acceptedBids` exactly as a photograph does, and a wiring that
+# only worked for one of the two would pass every Go test in internal/delivery.
+
+exc_job="$(delivery_awarded_job exception)"
+
+# --- the delivery that could not be photographed ------------------------------------------------
+
+status="$(record_milestone_on "$exc_job" "verify-p116-record-$$" \
+  '{"milestone":"en_route_to_pickup","reason":"the recipient asked me not to photograph their door","proof":{"exception_reason":"recipient_objected"}}' \
+  exc-record)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/p115-exc-record.json"; fail "recording a milestone with a reasoned exception answered $status, want 201"; }
+exc_milestone="$(json "$WORKDIR/p115-exc-record.json" '["id"]')"
+ok "a milestone whose photograph was impossible is accepted with a reason in its place — Docs/01 §4.4's exception path, which must never leave a driver unable to finish"
+
+# The *Done when*, read out of the table rather than out of the response: a reason, and no object.
+# `is null` on all four rather than an emptiness test, because 000604's CHECK counts NULLs and a row
+# holding empty strings would pass it by looking like a photograph.
+exc_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select p.exception_reason || ' ' || (p.object_key is null) || ' ' || (p.content_type is null)
+        || ' ' || (p.content_length is null) || ' ' || (p.etag is null)
+        || ' ' || (p.milestone_id = '$exc_milestone')
+     from proofs p where p.job_id = '$exc_job';")"
+[[ "$exc_row" == "recipient_objected true true true true true" ]] \
+  || fail "the exception row is '$exc_row', want 'recipient_objected true true true true true'"
+ok "the row holds the reason, names the milestone it stands behind, and carries no object at all"
+
+# --- what the database refuses whoever is asking ------------------------------------------------
+
+# The invariant as a CHECK, from outside Go. Neither of these rows is reachable through any endpoint
+# — the service refuses both before the insert — and that is exactly why they are exercised here.
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
+INSERT INTO proofs (id, job_id, milestone_id) VALUES (gen_random_uuid(), '$exc_job', '$exc_milestone');
+SQL
+then
+  fail "a proofs row was written with neither a photograph nor a reason"
+fi
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
+INSERT INTO proofs (id, job_id, milestone_id, object_key, content_type, content_length, etag, exception_reason)
+VALUES (gen_random_uuid(), '$exc_job', '$exc_milestone', 'proof/x/both', 'image/jpeg', 1, 'e', 'camera_unavailable');
+SQL
+then
+  fail "a photograph was recorded alongside a reason there is none"
+fi
+ok "and in raw SQL the table refuses evidence that is neither and evidence that is both — the reason it is one table rather than two"
+
+# --- both parties read it, and no URL is signed for it ------------------------------------------
+
+status="$(read_proof "$delivery_customer_token" "$exc_job" exc-customer)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/p115-read-exc-customer.json"; fail "the customer reading an exception answered $status"; }
+[[ "$(json "$WORKDIR/p115-read-exc-customer.json" '["data"][0]["exception_reason"]')" == "recipient_objected" ]] \
+  || { cat "$WORKDIR/p115-read-exc-customer.json"; fail "the customer's read does not carry the reason"; }
+[[ "$(json "$WORKDIR/p115-read-exc-customer.json" '["data"][0].get("download_url")')" == "None" ]] \
+  || { cat "$WORKDIR/p115-read-exc-customer.json"; fail "a download URL was minted for a delivery with no photograph"; }
+ok "the customer is shown why there is no photograph, and no signed URL is minted for an object that does not exist"
+
+status="$(read_proof "$delivery_provider_token" "$exc_job" exc-provider)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/p115-read-exc-provider.json"; fail "the awarded provider reading an exception answered $status"; }
+[[ "$(json "$WORKDIR/p115-read-exc-provider.json" '["data"][0]["exception_reason"]')" == "recipient_objected" ]] \
+  || fail "the provider's read does not carry the reason they recorded"
+ok "and the provider sees the same record, on the same reasoning a photograph is not redacted for one party"
+
+# --- what a client can get wrong ----------------------------------------------------------------
+
+status="$(record_milestone_on "$exc_job" "verify-p116-both-$$" \
+  "{\"milestone\":\"picked_up\",\"proof\":{\"object_key\":\"$proof115_key\",\"exception_reason\":\"camera_unavailable\"}}" exc-both)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/p115-exc-both.json"; fail "a photograph and a reason together answered $status, want 422"; }
+[[ "$(json "$WORKDIR/p115-exc-both.json" '["error"]["details"][0]["field"]')" == "proof.exception_reason" ]] \
+  || { cat "$WORKDIR/p115-exc-both.json"; fail "the refusal does not name proof.exception_reason"; }
+
+status="$(record_milestone_on "$exc_job" "verify-p116-neither-$$" \
+  '{"milestone":"picked_up","proof":{}}' exc-neither)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/p115-exc-neither.json"; fail "an empty proof object answered $status, want 422"; }
+[[ "$(json "$WORKDIR/p115-exc-neither.json" '["error"]["details"][0]["field"]')" == "proof.object_key" ]] \
+  || { cat "$WORKDIR/p115-exc-neither.json"; fail "the refusal does not name proof.object_key"; }
+
+status="$(record_milestone_on "$exc_job" "verify-p116-unknown-$$" \
+  '{"milestone":"picked_up","proof":{"exception_reason":"it was raining"}}' exc-unknown)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/p115-exc-unknown.json"; fail "an unpublished reason answered $status, want 422"; }
+[[ "$(json "$WORKDIR/p115-exc-unknown.json" '["error"]["details"][0]["message"]')" == *"recipient_objected, camera_unavailable, location_unsafe"* ]] \
+  || { cat "$WORKDIR/p115-exc-unknown.json"; fail "the refusal does not tell the client which three reasons there are"; }
+ok "both together, neither, and a reason nobody published are each refused with the field named and the three published"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from proofs where job_id = '$exc_job';")" == "1" ]] \
+  || fail "a refused request left evidence behind on the job"
+ok "and none of the three refusals wrote anything"

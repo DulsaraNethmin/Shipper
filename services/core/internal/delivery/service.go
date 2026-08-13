@@ -544,14 +544,18 @@ func (s *Service) RecordMilestone(
 		return s.alreadyRecorded(ctx, r, jobID, recording)
 	}
 
-	// The photograph, in the same transaction as the claim it proves (SHIP-115).
+	// The evidence, in the same transaction as the claim it stands behind (SHIP-115, SHIP-116).
 	//
 	// Written after the milestone because it points at it, and before the move because the move
 	// is the one step that can *commit* on a refusal: SHIP-112's absorption keeps the row and
 	// leaves the job alone, and a delivery whose absorbed milestone lost its photograph on the way
 	// through would be the record growing and the evidence not.
-	if recording.Proof.present() {
-		if _, err := s.recordProof(ctx, r, jobID, stored.ID, recording.Proof); err != nil {
+	//
+	// A photograph and a reasoned exception take the identical path, which is what makes the
+	// absorption argument above true of both: a driver who could not photograph a pickup in a yard
+	// with no signal keeps their reason when the queued milestone finally syncs.
+	if recording.hasEvidence() {
+		if _, err := s.recordEvidence(ctx, r, jobID, stored.ID, recording.Proof, recording.Exception); err != nil {
 			return notRecorded(err)
 		}
 	}

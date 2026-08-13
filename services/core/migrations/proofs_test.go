@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -253,4 +254,192 @@ func TestProofForeignKeyIsIndexed(t *testing.T) {
 // TestProofTimestampCarriesItsZone is Docs/10 §3.3's "timestamptz always".
 func TestProofTimestampCarriesItsZone(t *testing.T) {
 	assertTimestamptz(t, "proofs", "created_at")
+}
+
+// --- SHIP-116, the reasoned exception ------------------------------------------------------------
+
+// storeException writes one exception row and returns the error, so a caller can assert either way.
+func storeException(t *testing.T, pool *pgxpool.Pool, job, milestone uuid.UUID, reason string) error {
+	t.Helper()
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("generating an id: %v", err)
+	}
+	_, err = pool.Exec(t.Context(), `
+		INSERT INTO proofs (id, job_id, milestone_id, exception_reason)
+		VALUES ($1, $2, $3, $4)`, id, job, milestone, reason)
+	return err
+}
+
+// TestProofExceptionConstraintMatchesTheGoConstants is Docs/10 §3.4's pairing, in both directions.
+//
+// A reason the database accepts and Go has no constant for is a value nothing can display; one Go
+// has and the database refuses is a reason a driver can select and never record. The three
+// literals are named as well as compared, because both lists could drift together if somebody
+// renamed one and made the other match — Docs/01 §4.4 is the authority for what they mean.
+func TestProofExceptionConstraintMatchesTheGoConstants(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	if len(delivery.ProofExceptionReasons) != 3 {
+		t.Errorf("delivery.ProofExceptionReasons holds %d values; Docs/01 §4.4 lists three",
+			len(delivery.ProofExceptionReasons))
+	}
+
+	inGo := map[string]bool{}
+	for _, r := range delivery.ProofExceptionReasons {
+		inGo[string(r)] = true
+	}
+	if len(inGo) != len(delivery.ProofExceptionReasons) {
+		t.Errorf("delivery.ProofExceptionReasons contains a duplicate: %d constants, %d distinct",
+			len(delivery.ProofExceptionReasons), len(inGo))
+	}
+
+	inDatabase := constraintLiterals(t, pool, "ck_proofs_exception_reason")
+
+	for r := range inGo {
+		if !inDatabase[r] {
+			t.Errorf("Go has the exception reason %q and ck_proofs_exception_reason does not "+
+				"permit it; a driver could select it and never record it", r)
+		}
+	}
+	for r := range inDatabase {
+		if !inGo[r] {
+			t.Errorf("ck_proofs_exception_reason permits %q and Go has no constant for it", r)
+		}
+	}
+
+	for _, want := range []string{"recipient_objected", "camera_unavailable", "location_unsafe"} {
+		if !inDatabase[want] {
+			t.Errorf("ck_proofs_exception_reason does not permit %q", want)
+		}
+	}
+
+	// There is deliberately no catch-all. A reason nobody can group is a moderation queue nobody
+	// can triage (Docs/04 §5), and the driver's own words go in milestones.reason.
+	for _, notAReason := range []string{"other", "unknown", ""} {
+		if inDatabase[notAReason] {
+			t.Errorf("ck_proofs_exception_reason permits %q, which is not one of Docs/01 §4.4's "+
+				"three", notAReason)
+		}
+	}
+}
+
+// TestEvidenceIsAPhotographOrAReasonAndNeverBothOrNeither is ck_proofs_photograph_or_exception, and
+// it is the row-level half of CLAUDE.md's invariant.
+//
+// It is written here rather than in internal/delivery because **no Go path in this service can
+// produce three of the four rows below**. Service.RecordMilestone refuses both-at-once before the
+// insert and never assembles a partial photograph, which is exactly the point Docs/06 §4.1 makes:
+// a rule that holds because one function is careful stops holding when a second function is
+// written. What is asserted here is what the database refuses whoever is asking.
+func TestEvidenceIsAPhotographOrAReasonAndNeverBothOrNeither(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	job, milestone := aRecordedMilestone(t, pool, "proof-xor@example.com", "+61400002116")
+
+	t.Run("a reasoned exception with no photograph is accepted", func(t *testing.T) {
+		if err := storeException(t, pool, job, milestone, "recipient_objected"); err != nil {
+			t.Fatalf("an exception row was refused: %v", err)
+		}
+	})
+
+	// A second milestone, because uq_proofs_milestone would refuse the rows below for the wrong
+	// reason on the one above.
+	other, otherMilestone := aRecordedMilestone(t, pool, "proof-xor-b@example.com", "+61400002118")
+
+	t.Run("a row with neither is refused", func(t *testing.T) {
+		id, _ := uuid.NewV7()
+		if _, err := pool.Exec(t.Context(), `
+			INSERT INTO proofs (id, job_id, milestone_id) VALUES ($1, $2, $3)`,
+			id, other, otherMilestone); err == nil {
+			t.Fatal("a proof row was written with neither a photograph nor a reason; a milestone " +
+				"can carry evidence that is nothing at all")
+		}
+	})
+
+	t.Run("a row with both is refused", func(t *testing.T) {
+		id, _ := uuid.NewV7()
+		if _, err := pool.Exec(t.Context(), `
+			INSERT INTO proofs
+				(id, job_id, milestone_id, object_key, content_type, content_length, etag,
+				 exception_reason)
+			VALUES ($1, $2, $3, 'proof/x/both', 'image/jpeg', 137402, '9f86d081', 'camera_unavailable')`,
+			id, other, otherMilestone); err == nil {
+			t.Fatal("a photograph was recorded alongside a reason there is none; Docs/01 §4.4's " +
+				"exception is in place of the photograph, not beside it")
+		}
+	})
+
+	t.Run("half a photograph is refused", func(t *testing.T) {
+		// The failure 000603's four NOT NULLs used to refuse and 000604 had to keep refusing:
+		// a key with no entity tag is a photograph the platform recorded half of, and it would
+		// read as evidence in every query that only selects object_key.
+		id, _ := uuid.NewV7()
+		if _, err := pool.Exec(t.Context(), `
+			INSERT INTO proofs (id, job_id, milestone_id, object_key, content_type, content_length)
+			VALUES ($1, $2, $3, 'proof/x/half', 'image/jpeg', 137402)`,
+			id, other, otherMilestone); err == nil {
+			t.Fatal("a proof row was written with a key and no entity tag")
+		}
+	})
+}
+
+// TestTwoJobsMayRecordTheSameExceptionReason is the uniqueness that must *not* have been added.
+//
+// uq_proofs_object_key makes one object evidence for one claim. A *reason* is a selection from
+// three, so every delivery in the country can honestly carry the same one, and an index that made
+// it unique would refuse the second driver whose recipient objected.
+func TestTwoJobsMayRecordTheSameExceptionReason(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	first, firstMilestone := aRecordedMilestone(t, pool, "proof-dup-a@example.com", "+61400002120")
+	second, secondMilestone := aRecordedMilestone(t, pool, "proof-dup-b@example.com", "+61400002122")
+
+	if err := storeException(t, pool, first, firstMilestone, "location_unsafe"); err != nil {
+		t.Fatalf("the first exception: %v", err)
+	}
+	if err := storeException(t, pool, second, secondMilestone, "location_unsafe"); err != nil {
+		t.Fatalf("a second delivery could not record the same reason: %v", err)
+	}
+}
+
+// TestAnExceptionIsAppendOnlyToo, because it is evidence exactly as a photograph is.
+//
+// Docs/04 §7 has an administrator reviewing it in a dispute, and a reason that can be edited after
+// somebody complains is a reason worth nothing.
+func TestAnExceptionIsAppendOnlyToo(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	job, milestone := aRecordedMilestone(t, pool, "proof-ao-x@example.com", "+61400002124")
+	if err := storeException(t, pool, job, milestone, "camera_unavailable"); err != nil {
+		t.Fatalf("recording an exception: %v", err)
+	}
+
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE proofs SET exception_reason = 'recipient_objected' WHERE milestone_id = $1`,
+		milestone); err == nil {
+		t.Fatal("a recorded reason was rewritten in place")
+	}
+}
+
+// TestTheExceptionQueueIndexExists is what SHIP-117 and X-6 both start from.
+//
+// "Which jobs completed through the exception path" is the moderation queue's question (Docs/04 §5)
+// and the one X-6 will be decided about. Partial, because the rows it selects are the rare ones.
+func TestTheExceptionQueueIndexExists(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	var partial bool
+	if err := pool.QueryRow(t.Context(), `
+		SELECT i.indpred IS NOT NULL
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE c.relname = 'idx_proofs_exception'`).Scan(&partial); err != nil {
+		t.Fatalf("idx_proofs_exception is not there: %v", err)
+	}
+	if !partial {
+		t.Error("idx_proofs_exception covers every row; almost every delivery is photographed and " +
+			"an index over all of them is mostly rows nobody is asking about")
+	}
 }

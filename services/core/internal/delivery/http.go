@@ -286,7 +286,7 @@ type recordMilestoneRequest struct {
 	Proof *proofRequest `json:"proof"`
 }
 
-// proofRequest is what a client says it uploaded.
+// proofRequest is the evidence for this milestone: what the client uploaded, or why it could not.
 //
 // A pointer on [recordMilestoneRequest] so that "no proof" and "proof with nothing in it" are
 // different requests: the first is every milestone recorded today, and the second is a client that
@@ -297,8 +297,18 @@ type recordMilestoneRequest struct {
 // URL, and what is recorded is what the **store** reports — see delivery.VerifyProof. Accepting them
 // here would be accepting the client's word for the thing this ticket exists to stop taking on
 // trust.
+//
+// # `exception_reason` is the second field SHIP-115 said this object would grow (SHIP-116)
+//
+//	{"milestone": "picked_up", "proof": {"exception_reason": "recipient_objected"}}
+//
+// Exactly one of the two, which is the shape [recordMilestoneRequest] chose an object for: Docs/01
+// §4.4's exception is "in place of" the photograph, so the two are alternatives to one question
+// rather than two independent fields a client could send together or omit together by accident.
+// Sending both is refused, and so is sending an object with neither — see [recordingFrom].
 type proofRequest struct {
-	ObjectKey string `json:"object_key"`
+	ObjectKey       string `json:"object_key"`
+	ExceptionReason string `json:"exception_reason"`
 }
 
 // milestoneResponse is one recorded milestone.
@@ -443,6 +453,20 @@ func (h *Handler) RecordMilestone() http.Handler {
 				slog.String("milestone_id", record.ID.String()),
 				slog.String("milestone", record.Milestone.Wire()),
 				slog.String("object_key", recording.Proof.ObjectKey()))
+		}
+
+		// Logged at warning rather than info, and it is the one line in this handler that is
+		// about operations rather than about reconciliation (SHIP-116). Docs/04 §5 puts "failed
+		// proof of delivery" in a moderation queue and **SHIP-117 is the ticket that builds
+		// one**; until it does, this line is the only trace an exception leaves anywhere outside
+		// the `proofs` table, and a delivery with no photograph is exactly what somebody should
+		// be able to find in a log while the queue is being written.
+		if recording.Exception != "" && outcome != OutcomeAlreadyRecorded {
+			httpx.LoggerFrom(r.Context()).Warn("a milestone was recorded with a reasoned exception instead of a photograph",
+				slog.String("job_id", jobID.String()),
+				slog.String("milestone_id", record.ID.String()),
+				slog.String("milestone", record.Milestone.Wire()),
+				slog.String("exception_reason", recording.Exception.String()))
 		}
 
 		switch outcome {
@@ -653,6 +677,19 @@ func (h *Handler) PresignProofUpload() http.Handler {
 // `recorded_at` is the **actor's** clock, carried through from the milestone — when the driver says
 // they took the photograph — and `accepted_at` is when the platform recorded it. The pair is
 // Docs/02 §3.1's and it is the same pair [milestoneResponse] carries, named the same way on purpose.
+//
+// # Two shapes in one, and `exception_reason` is how a client tells them apart (SHIP-116)
+//
+// A reasoned exception carries no object, so it carries no key, no media type, no size and **no
+// download URL** — none of them is signed, and there is nothing to sign one for. Every one of those
+// fields is `omitempty`, so what a client receives is the six fields every row has plus either the
+// photograph's five or `exception_reason`. Branching on `exception_reason` is the supported test;
+// branching on a missing `download_url` would also work today and would be reading the absence of a
+// credential as a fact about the delivery.
+//
+// The alternative — always present, `"object_key": ""`, `"content_length": 0` — was rejected because
+// a zero length is a statement about a photograph that does not exist. An absent field says nothing;
+// a zero says something false.
 type proofResponse struct {
 	ID          string `json:"id"`
 	JobID       string `json:"job_id"`
@@ -660,13 +697,19 @@ type proofResponse struct {
 
 	Milestone string `json:"milestone"`
 
-	ObjectKey string `json:"object_key"`
+	ObjectKey string `json:"object_key,omitempty"`
 
-	ContentType   string `json:"content_type"`
-	ContentLength int64  `json:"content_length"`
+	ContentType   string `json:"content_type,omitempty"`
+	ContentLength int64  `json:"content_length,omitempty"`
 
-	DownloadURL       string `json:"download_url"`
-	DownloadExpiresAt string `json:"download_expires_at"`
+	DownloadURL       string `json:"download_url,omitempty"`
+	DownloadExpiresAt string `json:"download_expires_at,omitempty"`
+
+	// ExceptionReason is why this milestone has no photograph, from Docs/01 §4.4's three.
+	//
+	// It is the wire form of delivery.ProofExceptionReason and the stored form is the same
+	// string, so there is no translation here — see that type for why it has none.
+	ExceptionReason string `json:"exception_reason,omitempty"`
 
 	RecordedAt string `json:"recorded_at"`
 	AcceptedAt string `json:"accepted_at"`
@@ -704,6 +747,8 @@ func proofListFrom(links []ProofLink) proofListResponse {
 
 			DownloadURL:       link.URL,
 			DownloadExpiresAt: timestamp(link.ExpiresAt),
+
+			ExceptionReason: string(link.ExceptionReason),
 
 			RecordedAt: timestamp(link.RecordedAt),
 			AcceptedAt: timestamp(link.AcceptedAt),
@@ -923,16 +968,51 @@ func recordingFrom(req recordMilestoneRequest, key string) (Recording, string, e
 		}
 	}
 
+	// The evidence: one object key, or one reason there is none, and never both (SHIP-116).
+	//
 	// The object key is read and checked for being *there*, and nothing else is decided here
 	// (SHIP-115). Whether it names this job, whether the object exists and whether the platform
 	// will accept what it holds are all [Service.VerifyProof]'s, because two of the three need a
 	// database and a store and the third belongs beside them rather than split off.
-	var proofKey string
+	//
+	// The reason **is** decided here, and the asymmetry is the point: there is nothing to look it
+	// up against. It is a selection from three values the platform published, so the only thing
+	// that can be wrong with it is that it is not one of them, and that is answerable from the
+	// string alone.
+	var (
+		proofKey  string
+		exception ProofExceptionReason
+	)
 	if req.Proof != nil {
 		proofKey = strings.TrimSpace(req.Proof.ObjectKey)
-		if proofKey == "" {
+		reason := strings.TrimSpace(req.Proof.ExceptionReason)
+
+		switch {
+		case proofKey != "" && reason != "":
+			problems.Add("proof.exception_reason", validate.CodeNotAllowed,
+				"Send the photograph you uploaded or a reason there is none, not both.")
+
+		case proofKey == "" && reason == "":
+			// Reported against `object_key`, because a client that sent `"proof": {}` was
+			// almost certainly trying to send a photograph and lost the key on the way. The
+			// message names the other door.
 			problems.Add("proof.object_key", validate.CodeRequired,
-				"Send the object_key you were given when you asked for an upload URL.")
+				"Send the object_key you were given when you asked for an upload URL, or an "+
+					"exception_reason if there is no photograph.")
+
+		case reason != "":
+			// Case-sensitive, which is [MilestoneFromWire]'s call and made here for the same
+			// reason: a client sending `Recipient_Objected` has misread the contract, and
+			// accepting a second spelling would make two forms interchangeable in one
+			// direction and not the other. The domain checks it again — see
+			// [Recording.problems] — because a rule that holds only for callers who came in
+			// through this decoder is not a rule.
+			exception = ProofExceptionReason(reason)
+			if !exception.Valid() {
+				problems.Add("proof.exception_reason", validate.CodeInvalid,
+					"That is not a reason a photograph can be missing. Use one of %s.",
+					strings.Join(proofExceptionWire(), ", "))
+			}
 		}
 	}
 
@@ -945,6 +1025,7 @@ func recordingFrom(req recordMilestoneRequest, key string) (Recording, string, e
 		RecordedAt: recordedAt,
 		Reason:     req.Reason,
 		Key:        key,
+		Exception:  exception,
 	}, proofKey, nil
 }
 
