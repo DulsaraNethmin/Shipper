@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -96,6 +97,63 @@ func TestRoleAndStatusAreConstrained(t *testing.T) {
 			id, "deleted")
 		if err == nil {
 			t.Fatal("'deleted' was accepted as a status; deletion pseudonymises (Docs/05 §3.1)")
+		}
+	})
+}
+
+// TestRoleIsImmutable is SHIP-45's second half, checked where it is actually enforced.
+//
+// The first half — the role is chosen at registration — lives in internal/identity. This is the
+// "and immutable thereafter" part, and it is a trigger rather than application logic for the
+// same reason audit_log's append-only rule is: a rule the application keeps does not apply to a
+// support query typed at a psql prompt, which is exactly the path that would be used to change
+// somebody's role "just this once".
+func TestRoleIsImmutable(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	id := newUser(t, pool, "immutable@example.com", "+61400000020", "customer")
+
+	t.Run("changing the role is refused", func(t *testing.T) {
+		_, err := pool.Exec(t.Context(),
+			`UPDATE users SET role = 'provider' WHERE id = $1`, id)
+		if err == nil {
+			t.Fatal("a customer became a provider, which silently rewrites the meaning of " +
+				"every job already attached to the account")
+		}
+		if !strings.Contains(err.Error(), "immutable") {
+			t.Errorf("expected the users_role_is_immutable trigger to refuse it, got: %v", err)
+		}
+	})
+
+	t.Run("the role survived", func(t *testing.T) {
+		var role string
+		if err := pool.QueryRow(t.Context(),
+			`SELECT role FROM users WHERE id = $1`, id).Scan(&role); err != nil {
+			t.Fatalf("reading it back: %v", err)
+		}
+		if role != "customer" {
+			t.Errorf("role = %q, want customer", role)
+		}
+	})
+
+	// The trigger has a WHEN clause so it does not fire on the writes that happen constantly —
+	// verification timestamps, account standing. If it were unconditional, every one of those
+	// would raise, and the failure would look like the endpoint being broken rather than like
+	// the trigger being wrong.
+	t.Run("other columns still update", func(t *testing.T) {
+		if _, err := pool.Exec(t.Context(),
+			`UPDATE users SET status = 'restricted', email_verified_at = now() WHERE id = $1`,
+			id); err != nil {
+			t.Fatalf("an unrelated update was refused by the role trigger: %v", err)
+		}
+	})
+
+	// Writing the same role is not a change, and refusing it would break any UPDATE that names
+	// every column — which is what an ORM or a hand-written "save the whole row" does.
+	t.Run("writing the same role is not a change", func(t *testing.T) {
+		if _, err := pool.Exec(t.Context(),
+			`UPDATE users SET role = 'customer' WHERE id = $1`, id); err != nil {
+			t.Errorf("rewriting the same role was refused: %v", err)
 		}
 	})
 }
@@ -270,7 +328,10 @@ func TestOutboxAcceptsAnEvent(t *testing.T) {
 	jobID, _ := uuid.NewV7()
 	occurred := time.Now().UTC().Truncate(time.Millisecond)
 
-	event, err := events.New("job", jobID, "job.published", occurred, map[string]any{
+	// A registered event type, because since SHIP-135 there is no other kind: internal/events
+	// refuses to write one the catalogue does not know, which is what makes a row the publisher
+	// can never drain impossible to create.
+	event, err := events.New(jobs.EventStatusChanged, jobID, occurred, map[string]any{
 		"job_id": jobID.String(),
 	})
 	if err != nil {
@@ -292,8 +353,10 @@ func TestOutboxAcceptsAnEvent(t *testing.T) {
 		t.Fatalf("reading it back: %v", err)
 	}
 
-	if aggregateType != "job" || eventType != "job.published" {
-		t.Errorf("stored %s/%s, want job/job.published", aggregateType, eventType)
+	// The aggregate type is the catalogue's rather than the caller's — events.New takes no
+	// aggregate argument, so an event cannot be emitted onto a topic it does not belong to.
+	if aggregateType != "job" || eventType != jobs.EventStatusChanged {
+		t.Errorf("stored %s/%s, want job/%s", aggregateType, eventType, jobs.EventStatusChanged)
 	}
 	if published != nil {
 		t.Error("a freshly written event is already marked published")
@@ -309,9 +372,21 @@ func TestOutboxRefusesAnIncompleteEvent(t *testing.T) {
 	id, _ := uuid.NewV7()
 
 	cases := map[string]events.Event{
-		"no id":      {AggregateType: "job", AggregateID: id, Type: "job.published", Payload: []byte(`{}`)},
+		"no id":      {AggregateType: "job", AggregateID: id, Type: jobs.EventStatusChanged, Payload: []byte(`{}`)},
 		"no type":    {ID: id, AggregateType: "job", AggregateID: id, Payload: []byte(`{}`)},
-		"no payload": {ID: id, AggregateType: "job", AggregateID: id, Type: "job.published"},
+		"no payload": {ID: id, AggregateType: "job", AggregateID: id, Type: jobs.EventStatusChanged},
+
+		// SHIP-135's addition: an event type in no catalogue has no topic and no
+		// version, so a row carrying one is a row the publisher could never drain.
+		// Refused here, inside the caller's transaction, rather than left to block a
+		// batch — which is why the outbox needs no dead-letter path.
+		"a type nothing registered": {ID: id, AggregateType: "job", AggregateID: id,
+			Type: "job.invented_here", Payload: []byte(`{}`)},
+
+		// And an event on the wrong aggregate would publish to shipper.bid and be read
+		// by nobody.
+		"the wrong aggregate": {ID: id, AggregateType: "bid", AggregateID: id,
+			Type: jobs.EventStatusChanged, Payload: []byte(`{}`)},
 	}
 
 	for name, event := range cases {

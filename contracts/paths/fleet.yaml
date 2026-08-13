@@ -1,0 +1,1273 @@
+# Fleet — the vehicles a provider maintains.
+#
+# The counterpart of cmd/api/routes_fleet.go. Docs/10 §8.1 keeps the two in step: a domain adds one
+# route file and one fragment, and edits neither this file's siblings nor the middle of a shared
+# document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence
+# for the contract to describe less than the service returns.
+#
+# # This is the provider's own fleet and nobody else's
+#
+# There is no parameter for whose vehicles to list, and no field for naming an owner. The provider
+# is whoever the token says is calling, so there is nothing here to widen. A vehicle belonging to
+# another provider answers `404`, byte-identically to one that does not exist: which vehicles a
+# competitor runs is commercial information they never published.
+#
+# The customer's view of a vehicle — Docs/01 §4.3 lets them compare "provider profile, vehicle, and
+# declared capability" alongside the bids on their job — is a separate schema arriving with SHIP-96,
+# not this one reached by another route.
+#
+# # Active is returned and is never accepted
+#
+# A vehicle leaves and re-enters service through its own operations. No request schema below has an
+# `active` or a `deactivated_at` field and every request schema is `additionalProperties: false`, so
+# a client that sends `"active": false` is told the field does not exist rather than having it
+# quietly ignored — the failure worth preventing, because a provider who believes they took a truck
+# off the road and did not will keep receiving work for it.
+
+Vehicles:
+  get:
+    operationId: listVehicles
+    summary: List the provider's own vehicles
+    tags: [Fleet]
+    description: |
+      The authenticated provider's fleet, newest first (SHIP-78).
+
+      **The default is every vehicle, active and retired alike.** That is the less obvious of the
+      two choices and the deliberate one: a fleet screen that silently hid retired vehicles would
+      leave a provider unable to find the one they need to bring back. Pass `active=true` for the
+      screen that shows only what can be offered on a job.
+
+      Each entry is the same `Vehicle` schema the detail operation returns, whole rather than
+      summarised.
+
+      ## Paging
+
+      Keyset, not offset (Docs/10 §4.5). Pass `cursor` back exactly as it was received; it is
+      opaque and this endpoint is the only thing that can read it.
+
+      `has_more` says whether asking again would return anything. A `limit` above the maximum is
+      narrowed to it rather than refused, so raising the maximum later cannot break a client.
+    parameters:
+      - $ref: '#/ActiveFilter'
+      - $ref: '#/Limit'
+      - $ref: '#/CursorParameter'
+    responses:
+      '200':
+        description: |
+          One page of vehicles. `data` is an empty array when the provider has none — never `null`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/VehiclePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+  post:
+    operationId: addVehicle
+    summary: Add a vehicle to the fleet
+    tags: [Fleet]
+    description: |
+      Adds a vehicle to the authenticated provider's fleet, in service (SHIP-78).
+
+      **The owner is whoever the token says is calling.** There is no field for naming a provider,
+      because that would be an authorisation decision made from client input, which Docs/07 §3 puts
+      on the platform.
+
+      **`registration` and `vehicle_type` are required; everything else is optional.** Docs/01 §4.2's
+      acceptance measure is that a provider can maintain a fleet, and a provider standing in a truck
+      yard has the plate to hand and may not know the load height — a form that insisted would be
+      filled in with guesses.
+
+      Only a provider account may keep a fleet. A customer presenting a valid token is refused with
+      `fleet_provider_only` — the rule is enforced against the account's stored role, not against
+      the role claim in the token.
+
+      ## One live vehicle per plate
+
+      A registration the provider already has **in service** is refused with
+      `fleet_duplicate_registration` and a `409`. A plate that was retired can be added again: the
+      rule covers only vehicles still in service, so a truck sold and a replacement given the same
+      personalised plate is an ordinary thing to record.
+
+      The registration is stored upper case with its spaces removed, so `abc 123` and `ABC123` are
+      one vehicle rather than two.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/VehicleInput'
+    responses:
+      '201':
+        description: The vehicle was added, and is in service.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Vehicle'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The account is not a provider account (`fleet_provider_only`). Customers publish jobs;
+          they do not run vehicles.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          A vehicle with that registration is already in service in this fleet
+          (`fleet_duplicate_registration`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per offending field.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`). Unlike
+          `internal_error` it means try again.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+VehicleByID:
+  get:
+    operationId: getVehicle
+    summary: Read a vehicle
+    tags: [Fleet]
+    description: |
+      Returns one vehicle in full, to the provider who owns it (SHIP-78).
+
+      **The same schema the writing operations answer with.** A client parses one type whatever it
+      did to obtain the vehicle.
+
+      **A vehicle belonging to another provider answers `404`, not `403`**, byte-identically to one
+      that does not exist.
+    parameters:
+      - $ref: '#/VehicleID'
+    responses:
+      '200':
+        description: The vehicle, in full.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Vehicle'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+  patch:
+    operationId: updateVehicle
+    summary: Edit a vehicle
+    tags: [Fleet]
+    description: |
+      Applies a partial edit to a vehicle the caller owns (SHIP-78).
+
+      `PATCH` rather than `PUT`, because a provider correcting one field should not have to send
+      every field they are not changing — which is how a client that has not been updated for a new
+      field silently clears it.
+
+      ## Absent, null and empty are three different things
+
+      | The client sends | The platform does |
+      |---|---|
+      | the field omitted, or `null` | leaves it as it was |
+      | an empty value — `0` | clears it |
+      | a value | sets it |
+
+      The middle row is not decoration: without it a provider could state a load height and never
+      correct it back to "unstated", because `0` would be indistinguishable from not mentioning it.
+
+      **`registration` and `vehicle_type` are the exception.** Neither may be cleared, on either
+      operation: a row with a blank plate identifies nothing and a row with no type describes
+      nothing. Sending either as `""` is rejected with `required`.
+
+      **A vehicle that is out of service can still be edited**, and editing it does not bring it
+      back. Correcting the plate on a truck that is off the road for a month is ordinary; returning
+      it to service is a separate operation, because that is the one that can collide with a
+      replacement on the same plate.
+
+      A request that names no field at all is refused with `bad_request`.
+    parameters:
+      - $ref: '#/VehicleID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/VehicleInput'
+    responses:
+      '200':
+        description: The vehicle was updated, and is returned in full.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Vehicle'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          Another vehicle in this fleet is already in service on that registration
+          (`fleet_duplicate_registration`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per offending field.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+DeactivateVehicle:
+  post:
+    operationId: deactivateVehicle
+    summary: Take a vehicle out of service
+    tags: [Fleet]
+    description: |
+      Stops a vehicle making its provider eligible for new work (SHIP-78).
+
+      **There is no `DELETE` for a vehicle, and there will not be one.** A vehicle is named by the
+      bid that won a job and by the delivery that followed it, so removing the row would remove part
+      of a commercial record Docs/05 §3.1 requires retaining. Deactivation is what Docs/01 §4.2 gives
+      the provider, and it changes nothing about deliveries already under way.
+
+      A verb under the resource rather than a field on the vehicle: a client names an intent and the
+      platform decides what the state becomes.
+
+      **The request takes no body.** There is nothing to say that is not already in the URL.
+
+      ## Deactivating an already-deactivated vehicle succeeds
+
+      It answers `200` with the vehicle and changes nothing. Retrying with the *same*
+      `Idempotency-Key` replays the original response; this covers the other case, where a phone
+      lost its connection, was restarted, and generated a fresh key for the same intent.
+    parameters:
+      - $ref: '#/VehicleID'
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '200':
+        description: |
+          The vehicle is out of service, and is returned in full. Also the answer when it already
+          was.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Vehicle'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ReactivateVehicle:
+  post:
+    operationId: reactivateVehicle
+    summary: Return a vehicle to service
+    tags: [Fleet]
+    description: |
+      Brings a vehicle back into service (SHIP-78).
+
+      The counterpart of deactivating one, and the operation that can be refused: the provider may
+      have added a replacement on the same registration while this vehicle was out of service, and
+      only one vehicle per plate may be in service at a time. That answers `409` with
+      `fleet_duplicate_registration` rather than `422`, because the value is well formed and it is
+      the state of the fleet that contradicts the request.
+
+      **The request takes no body.**
+
+      A vehicle that is already in service answers `200`, unchanged.
+    parameters:
+      - $ref: '#/VehicleID'
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '200':
+        description: |
+          The vehicle is in service, and is returned in full. Also the answer when it already was.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Vehicle'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          Another vehicle in this fleet is already in service on that registration
+          (`fleet_duplicate_registration`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+Profile:
+  get:
+    operationId: getProviderProfile
+    summary: Read the provider's declared service area and specialties
+    tags: [Fleet]
+    description: |
+      What the authenticated provider has declared about the work they take (SHIP-79): where they
+      will carry freight, and what kind of freight they carry.
+
+      **There is no parameter for whose.** What a competitor covers and specialises in is
+      commercial information; the customer's view of a provider is a separate schema arriving with
+      SHIP-96.
+
+      **This never answers `404`.** A provider who has declared nothing has an empty profile rather
+      than a missing one, so the first time a client opens the screen it gets three empty arrays.
+      For the same reason a customer account is not refused here: their declaration is empty
+      because they have never made one, and refusing a read that discloses nothing would make the
+      client special-case a screen it never shows.
+    responses:
+      '200':
+        description: The declaration, in full. Every list is present, and empty rather than absent.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ProviderProfile'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+  patch:
+    operationId: declareProviderProfile
+    summary: Declare service area and specialties
+    tags: [Fleet]
+    description: |
+      Replaces the parts of the declaration the request names (SHIP-79). Docs/01 §4.2 calls this
+      "nominate service area and specialties", and Docs/04 §3 requires it of a verified provider.
+
+      **The owner is whoever the token says is calling.** There is no field for naming a provider.
+      Only a provider account may declare one; a customer presenting a valid token is refused with
+      `fleet_provider_only`, read from the account's stored role rather than from the role claim in
+      the token.
+
+      ## Absent, empty, and the difference between them
+
+      Each of the three lists moves independently:
+
+      | The request | What happens |
+      |---|---|
+      | the list is omitted or `null` | it is left exactly as it is |
+      | the list is `[]` | it is cleared |
+      | the list has entries | it is replaced by exactly those entries |
+
+      The empty list is not decoration: without it a provider who withdrew from every single
+      postcode and now covers whole states only could not say so.
+
+      A named list **replaces** its predecessor rather than being merged into it. There is no
+      add-one or remove-one operation, deliberately — the screen renders the declaration as a set
+      of chips and sends the set back, and two operations over one collection is where a client and
+      a server stop agreeing about what is in it.
+
+      A request naming no list at all is refused with `400`, for the reason an edit to a vehicle
+      that changes nothing is.
+
+      ## What is stored
+
+      Duplicates within a request are one entry: a declaration is a set, and `["NSW", "nsw"]` names
+      New South Wales once. Re-declaring an entry the provider already held changes nothing about
+      it — the stored set is amended rather than rewritten, so the entry keeps the date it was
+      first declared.
+
+      A state is accepted in any case and spelled out in full (`Victoria`, `VIC`, `vic`), and is
+      always returned as the abbreviation. A postcode may be sent with spaces and is stored without
+      them.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/ProviderProfileInput'
+    responses:
+      '200':
+        description: The declaration after the change, in full.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ProviderProfile'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The account is not a provider account (`fleet_provider_only`). Customers publish jobs;
+          they do not nominate a service area.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more entries were rejected (`validation_failed`). `error.details` carries one entry
+          per offending value, and its `field` names the position — `service_area.postcodes.2` —
+          because the client renders each entry as its own control.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+OpenJobs:
+  get:
+    operationId: listOpenJobs
+    summary: List the jobs this provider may bid on
+    tags: [Jobs]
+    description: |
+      The marketplace as the calling provider may bid on it, newest first (SHIP-82).
+
+      A job appears here only when all four of `Docs/01` §4.3's filters accept it: the provider's
+      declared service area covers where it is picked up, a vehicle they have in service can carry
+      it, their account has met the verification baseline, and the job is still open to bids.
+
+      **There is no parameter that widens this and none that narrows it** — no state, no vehicle,
+      no goods type. Eligibility is the platform's decision, not a filter a client composes
+      (`Docs/07` §3), and a provider narrowing their own feed further is the client's business.
+
+      **A provider who is eligible for nothing gets an empty page rather than an error.** That
+      covers an unverified account, one that has declared no service area, one with no vehicle in
+      service, and a customer who followed a link meant for the other role. None of the four is a
+      failure of the request; they are the truthful answer to it, and the client can send the
+      provider to onboarding from an empty list and the profile it already holds.
+
+      **`Negotiating` jobs are here as well as `Open` ones.** `Docs/02` §1: a job with bids on it
+      "remains open to eligible bids unless the customer closes it or awards a bid". The status is
+      carried so a provider knows they are bidding against company.
+
+      ## Paging
+
+      Keyset, not offset (`Docs/10` §4.5). Pass `cursor` back exactly as it was received. The
+      ordering is stable across pages even when several jobs were published in the same
+      millisecond, so following the cursor to the end reaches every job exactly once.
+    parameters:
+      - $ref: '#/Limit'
+      - $ref: '#/CursorParameter'
+    responses:
+      '200':
+        description: |
+          One page of jobs this provider may bid on. `data` is an empty array when there are none —
+          never `null`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/OpenJobPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+OpenJobByID:
+  get:
+    operationId: getOpenJob
+    summary: Read one job this provider may bid on
+    tags: [Jobs]
+    description: |
+      One job out of `/v1/jobs/open`, in the same shape the feed gave it (SHIP-83).
+
+      **This is a member of that collection and not a second view of `GET /v1/jobs/{id}`.** That
+      operation is the *customer's* own job and is the one shape in this API that carries
+      `budget_cents`; this one has no field it could go in. `Docs/01` §4.3 keeps the customer's
+      maximum private from providers in every form, and two shapes are far easier to keep that rule
+      with than one shape and a redaction step somebody has to remember.
+
+      **A job this provider may not bid on answers `404`, byte-identically to a job that does not
+      exist.** Which jobs exist, and which of them a competitor is eligible for, is information
+      nobody published. The authorisation is the same predicate the feed runs, so a job served here
+      is a job the feed would have carried, and a job refused here is one a bid would be refused on.
+    parameters:
+      - $ref: '#/OpenJobID'
+    responses:
+      '200':
+        description: The job, as a provider deciding whether to bid sees it.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/OpenJob'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- parameters --------------------------------------------------------------------------------
+
+OpenJobID:
+  name: id
+  in: path
+  required: true
+  description: The job's identifier, as carried by an entry in `/v1/jobs/open`.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+
+VehicleID:
+  name: id
+  in: path
+  required: true
+  description: The vehicle's identifier, as returned by the operation that added it.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+
+ActiveFilter:
+  name: active
+  in: query
+  required: false
+  description: |
+    Narrow the list to vehicles in service (`true`) or out of it (`false`). Absent means both,
+    which is the default because a provider looking for the vehicle they want to bring back has to
+    be able to see it.
+  schema:
+    type: boolean
+  example: true
+
+Limit:
+  name: limit
+  in: query
+  required: false
+  description: |
+    How many entries to return — vehicles or jobs, depending on the operation. Absent is 20;
+    anything above 100 is narrowed to 100 rather than refused, so raising the maximum later cannot
+    break a client. A value that is not a whole number of at least 1 is refused, because that is a
+    client defect rather than a request.
+  schema:
+    type: integer
+    minimum: 1
+    maximum: 100
+    default: 20
+  example: 20
+
+CursorParameter:
+  name: cursor
+  in: query
+  required: false
+  description: |
+    A position in the list, from the `next_cursor` of a previous page. **Opaque** — pass back
+    exactly what was received. Its contents are this endpoint's business and its encoding may
+    change; a cursor from an encoding no longer served is refused rather than misread.
+  schema:
+    type: string
+  example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a phone that retries
+    after a dropped connection must not end up with two vehicles.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
+
+# --- request schemas ---------------------------------------------------------------------------
+
+VehicleInput:
+  type: object
+  additionalProperties: false
+  description: |
+    The fields of a vehicle. Used by both writing operations: a field a provider can set when adding
+    a vehicle is a field they can change afterwards, and two schemas would be two places for that
+    list to drift.
+
+    `registration` and `vehicle_type` are required when adding and optional when editing, and
+    neither may be cleared. Everything else is optional on both.
+
+    There is no `active` field and there will not be one. A vehicle leaves and re-enters service
+    through its own operations.
+  properties:
+    registration:
+      type: string
+      minLength: 1
+      maxLength: 12
+      description: |
+        The registration plate. Stored upper case with its spaces removed, so `abc 123` and
+        `ABC123` are one vehicle rather than two — which is what stops the same truck being
+        recorded twice.
+
+        No format is enforced. The six states and two territories issue different shapes and
+        personalised plates exist in all of them, so a pattern here would be wrong within a year.
+      example: ABC123
+    vehicle_type:
+      $ref: '#/VehicleType'
+    make:
+      type: string
+      maxLength: 60
+      description: Who made it. Accepted in any case and stored as typed, with whitespace collapsed.
+      example: Mercedes-Benz
+    model:
+      type: string
+      maxLength: 60
+      example: Sprinter 314 CDI MWB
+    max_weight_kg:
+      type: number
+      minimum: 0
+      maximum: 100000
+      description: |
+        The most the vehicle can carry, in kilograms. `0` clears the value.
+
+        The bound is the same one a job's weight takes: a vehicle whose stated capacity exceeds the
+        largest load this marketplace accepts is describing a slipped decimal point.
+      example: 1200
+    load_length_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: |
+        The **load space**, in centimetres — not the vehicle's own length. A customer's 190 cm sofa
+        has to fit inside, not alongside. `0` clears the value.
+      example: 320
+    load_width_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: Centimetres. `0` clears the value.
+      example: 175
+    load_height_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: Centimetres. `0` clears the value.
+      example: 190
+
+ProviderProfileInput:
+  type: object
+  additionalProperties: false
+  description: |
+    A partial declaration. A list that is omitted is left alone; a list that is present replaces its
+    predecessor, including when it is empty.
+
+    A request naming no list at all is refused: it changes nothing, and answering it with the
+    unchanged declaration would tell a client its edit was applied.
+  properties:
+    service_area:
+      $ref: '#/ServiceAreaInput'
+    specialties:
+      type: array
+      maxItems: 12
+      description: |
+        What kind of work the provider takes. Duplicates collapse. `[]` clears the list.
+      items:
+        $ref: '#/Specialty'
+      example: [general_freight, refrigerated]
+
+ServiceAreaInput:
+  type: object
+  additionalProperties: false
+  description: |
+    Where the provider will carry freight, in two grains that move independently: naming `states`
+    leaves `postcodes` alone and the reverse.
+
+    **A service area is a set of named regions and not a radius**, which SHIP-79 settled rather than
+    leaving to the eligibility filter. A job's coordinate is best-effort — an address the platform
+    could not resolve is stored exactly as typed — while its state and postcode are always present,
+    so a radius would filter the job feed on a field that may not be there and show a provider
+    nothing, with no error to explain it. Providers also price by postcode zone and by state rather
+    than by kilometres from a depot.
+
+    **An entry names one grain and never both.** There is no postcode qualified by a state, because
+    a postcode is deliberately not validated against one: the allocations have exceptions — 2600 is
+    ACT inside the NSW range — and move when Australia Post says so.
+  properties:
+    states:
+      type: array
+      maxItems: 8
+      description: |
+        States and territories served in full. Accepted in any case and spelled out (`Victoria`,
+        `VIC`, `vic`); always returned as the abbreviation. `[]` clears the list.
+      items:
+        $ref: '#/StateOrTerritory'
+      example: [NSW, VIC]
+    postcodes:
+      type: array
+      maxItems: 1000
+      description: |
+        Single postcodes served, for a provider whose area is narrower than a state. Four digits;
+        spaces are removed. `[]` clears the list.
+
+        The bound is generous rather than a policy: Australia has about 2,600 allocated postcodes,
+        and a provider naming more than a thousand of them is describing a state — which one entry
+        in `states` says instead.
+      items:
+        type: string
+        pattern: '^[0-9]{4}$'
+      example: ['3000', '3121']
+
+# --- response schemas --------------------------------------------------------------------------
+
+ProviderProfile:
+  type: object
+  required: [service_area, specialties]
+  additionalProperties: false
+  description: |
+    What a provider has declared about the work they take.
+
+    **Every list is always present and never `null`**, which is the opposite of the rule `Vehicle`
+    follows and right for the opposite reason: an omitted capacity means the provider has not said,
+    whereas an omitted list would mean the same thing as an empty one — and here that distinction is
+    exactly what the client is editing.
+  properties:
+    service_area:
+      $ref: '#/ServiceArea'
+    specialties:
+      type: array
+      description: |
+        What the provider carries, in the platform's own order — general freight first, dangerous
+        goods last — rather than in the order they were declared, so two providers with the same
+        specialties present them identically.
+      items:
+        $ref: '#/Specialty'
+      example: [general_freight, refrigerated]
+
+ServiceArea:
+  type: object
+  required: [states, postcodes]
+  additionalProperties: false
+  description: |
+    Where the provider will carry freight. The two lists are separate claims and neither narrows the
+    other: a postcode named inside a state already declared is harmless duplication rather than a
+    contradiction.
+
+    **An empty declaration matches no job rather than every job.** Eligibility is opt-in, or the
+    provider who has not finished onboarding would be the widest-reaching provider on the platform.
+  properties:
+    states:
+      type: array
+      description: States and territories served in full, ascending.
+      items:
+        $ref: '#/StateOrTerritory'
+      example: [NSW, VIC]
+    postcodes:
+      type: array
+      description: Single postcodes served, ascending.
+      items:
+        type: string
+        pattern: '^[0-9]{4}$'
+      example: ['3000', '3121']
+
+StateOrTerritory:
+  type: string
+  description: |
+    An Australian state or territory, as the upper-case abbreviation Australia Post uses. This is
+    Docs/10 §4.7's one deliberate exception to lower snake case on the wire: a client prints it
+    rather than branching on it, and the snake case form would have every client upper-casing it
+    back.
+  enum: [ACT, NSW, NT, QLD, SA, TAS, VIC, WA]
+  example: NSW
+
+Specialty:
+  type: string
+  description: |
+    A kind of work a provider takes, in lower snake case (Docs/10 §4.7). Accepted in any case on
+    input and always returned in this form.
+
+    **A declaration, and never a permission.** Naming `dangerous_goods` claims a capability; what a
+    provider is licensed and insured to carry is decided by verification (Docs/04 §3), and what may
+    not be carried at all is the prohibited-goods list. It is what a customer reads when comparing
+    bids — Docs/01 §4.3's "declared capability".
+
+    **This is not `vehicle_type`.** That says what a vehicle is; this says what its owner does.
+  enum:
+    - general_freight
+    - courier
+    - furniture_removals
+    - refrigerated
+    - fragile_and_high_value
+    - oversized
+    - heavy_haulage
+    - construction_materials
+    - bulk_materials
+    - vehicle_transport
+    - livestock
+    - dangerous_goods
+  example: general_freight
+
+Vehicle:
+  type: object
+  required: [id, registration, vehicle_type, active, created_at, updated_at]
+  additionalProperties: false
+  description: |
+    A vehicle as its owning provider sees it.
+
+    Everything optional is **omitted rather than sent empty**, because a vehicle added in a truck
+    yard carries a plate and a type and often nothing else, and a response full of `""` and `0` says
+    nothing about which fields the provider has actually filled in.
+
+    `active` is the exception and is always present: it is the field every fleet screen branches on,
+    and a boolean that is absent when false is a boolean every client has to remember to default.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    registration:
+      type: string
+      example: ABC123
+    vehicle_type:
+      $ref: '#/VehicleType'
+    make:
+      type: string
+      example: Mercedes-Benz
+    model:
+      type: string
+      example: Sprinter 314 CDI MWB
+    max_weight_kg:
+      type: number
+      example: 1200
+    load_length_cm:
+      type: integer
+      example: 320
+    load_width_cm:
+      type: integer
+      example: 175
+    load_height_cm:
+      type: integer
+      example: 190
+    active:
+      type: boolean
+      description: |
+        Whether the vehicle is in service. A vehicle out of service makes its provider eligible for
+        no new work, and is undisturbed on work already under way.
+      example: true
+    deactivated_at:
+      type: string
+      format: date-time
+      description: |
+        When the provider took it out of service. **Absent while it is in service**, rather than
+        null — so a client showing "off the road since 3 August" has the date and one that only
+        cares whether the vehicle can be offered reads `active`.
+      example: '2026-08-11T03:34:12.000Z'
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T03:30:00.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T03:34:12.000Z'
+
+VehiclePage:
+  type: object
+  required: [data, has_more]
+  additionalProperties: false
+  description: |
+    One page of a collection, in the envelope Docs/10 §4.5 gives every list in this API. A single
+    resource is returned as a bare object, so a client can tell the two apart without knowing the
+    endpoint.
+  properties:
+    data:
+      type: array
+      description: |
+        The vehicles, newest first. An **empty array** when there are none — never `null`, so a
+        client can iterate it without checking.
+      items:
+        $ref: '#/Vehicle'
+    next_cursor:
+      type: string
+      description: Pass as `cursor` to fetch the next page. Absent on the last page.
+      example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
+    has_more:
+      type: boolean
+      description: |
+        Whether asking again with `next_cursor` would return anything. Always present, and carried
+        rather than inferred from the cursor's absence — which is also what the first request looks
+        like.
+      example: false
+
+VehicleType:
+  type: string
+  description: |
+    What kind of vehicle it is, in lower snake case (Docs/10 §4.7). Accepted in any case on input
+    and always returned in this form.
+
+    **This is not the capability vocabulary a job's `vehicle_requirement` will be validated
+    against.** That list belongs to SHIP-79 and describes what a provider specialises in; this
+    answers the narrower question of what the vehicle is. Nothing in the jobs domain is checked
+    against these values.
+  enum:
+    - motorcycle
+    - car
+    - ute
+    - van
+    - tray_truck
+    - box_truck
+    - refrigerated_truck
+    - flatbed
+    - tipper
+    - prime_mover
+    - trailer
+  example: van
+
+OpenJob:
+  type: object
+  required: [id, status, created_at]
+  additionalProperties: false
+  description: |
+    A job as a provider deciding whether to bid on it sees it (SHIP-82, SHIP-83).
+
+    **There is no budget field, and there is no form one could take here.** `Docs/01` §4.3 keeps the
+    customer's maximum private from a provider — not as an amount, not as a band, not as a
+    "budget supplied" flag — and this schema is `additionalProperties: false`, so a service that
+    started sending one would fail the contract test rather than quietly disclose it. The customer's
+    own `Job` schema is the only shape in this API that carries `budget_cents`.
+
+    **One schema for the feed and for the single job**, so a client parses one type whatever it did
+    to obtain the job — and, more to the point, so there is one shape to keep the budget out of
+    rather than two.
+
+    **The pickup and dropoff carry suburb, state and postcode, and not the street line or the
+    coordinate.** No document takes a position on when a provider learns the exact door, so this
+    takes the reversible direction: a provider prices on the locality and the distance, and the
+    doorstep is needed by whoever drives to it, after the award. The coordinate is withheld for the
+    same reason and not a different one — the platform geocodes the whole address, so sending it
+    would be sending the street line as two numbers.
+
+    Everything optional is **omitted rather than sent empty**, because a customer publishes without
+    measuring the sofa more often than not, and a response full of `""` and `0` says nothing about
+    which fields they actually filled in.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    status:
+      $ref: '#/BiddableJobStatus'
+    pickup:
+      $ref: '#/JobRegion'
+    dropoff:
+      $ref: '#/JobRegion'
+    goods_description:
+      type: string
+      example: Two-seater sofa, wrapped, no legs attached
+    length_cm:
+      type: integer
+      example: 190
+    width_cm:
+      type: integer
+      example: 90
+    height_cm:
+      type: integer
+      example: 85
+    weight_kg:
+      type: number
+      example: 45.5
+    vehicle_requirement:
+      type: string
+      description: |
+        What the customer believes the job needs, in their own words. Free text, and deliberately
+        not matched against any vocabulary: matching "ute with a tailgate lifter" against an
+        enumeration would hide jobs on a spelling.
+      example: Ute with a tailgate lifter
+    handling_notes:
+      type: string
+      description: |
+        Access constraints and anything else the customer thought a carrier should know. Carried in
+        full rather than summarised — `Docs/01` §4.3 names this among the detail that makes a bid
+        accurate, and it is the platform's answer to a provider who would rather have the budget.
+      example: Second-floor walk-up, no lift.
+    pickup_window:
+      $ref: '#/JobTimeWindow'
+    dropoff_window:
+      $ref: '#/JobTimeWindow'
+    expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the job stops being offered (SHIP-68). A provider deciding whether to price it today
+        can see whether it will still be there tomorrow.
+      example: '2026-08-25T03:30:00.000Z'
+    created_at:
+      type: string
+      format: date-time
+      description: When the customer created the job. The feed is ordered by this, newest first.
+      example: '2026-08-11T03:30:00.000Z'
+
+OpenJobPage:
+  type: object
+  required: [data, has_more]
+  additionalProperties: false
+  description: |
+    One page of a collection, in the envelope `Docs/10` §4.5 gives every list in this API.
+  properties:
+    data:
+      type: array
+      description: |
+        The jobs this provider may bid on, newest first. An **empty array** when there are none —
+        never `null`, and never an error: a provider who has declared no service area or has no
+        vehicle in service is eligible for nothing, which is an answer rather than a failure.
+      items:
+        $ref: '#/OpenJob'
+    next_cursor:
+      type: string
+      description: Pass as `cursor` to fetch the next page. Absent on the last page.
+      example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
+    has_more:
+      type: boolean
+      description: |
+        Whether asking again with `next_cursor` would return anything. Always present, and carried
+        rather than inferred from the cursor's absence — which is also what the first request looks
+        like.
+      example: false
+
+JobRegion:
+  type: object
+  additionalProperties: false
+  description: |
+    Where one end of a job is, at the grain a provider is given it before they bid.
+
+    **Three parts and no fourth.** There is no street line and no coordinate here; see `OpenJob`
+    for the decision and what would reopen it. A part the customer has not supplied is omitted, so
+    a job published with only a state and a postcode does not claim a blank suburb.
+
+    Distinct from the provider's own `ServiceArea`, which is a region they have *declared*. This is
+    a place a job is at.
+  properties:
+    suburb:
+      type: string
+      example: Richmond
+    state:
+      $ref: '#/StateOrTerritory'
+    postcode:
+      type: string
+      pattern: '^[0-9]{4}$'
+      example: '3121'
+
+JobTimeWindow:
+  type: object
+  additionalProperties: false
+  description: |
+    A period the pickup or the delivery has to happen in, with either end omitted when the customer
+    only cared about the other one. The whole window is omitted when they stated neither.
+  properties:
+    start:
+      type: string
+      format: date-time
+      example: '2026-08-14T09:00:00.000Z'
+    end:
+      type: string
+      format: date-time
+      example: '2026-08-15T17:00:00.000Z'
+
+BiddableJobStatus:
+  type: string
+  description: |
+    The status of a job that is open to bids, in the wire form `Docs/10` §4.7 requires and
+    `Docs/02` §1 names.
+
+    **Two values, not one.** `Docs/02` §1 defines Negotiating as a job that has bids or
+    counter-offers on it and "remains open to eligible bids unless the customer closes it or awards
+    a bid" — so it is still biddable, and it is carried rather than hidden because a provider
+    bidding against company is in a different position from one bidding alone.
+
+    This is a subset of the twelve statuses in the `Job` schema, and it is a subset by construction:
+    nothing else can satisfy the eligibility filter, so no other value can appear here.
+  enum:
+    - open
+    - negotiating
+  example: open

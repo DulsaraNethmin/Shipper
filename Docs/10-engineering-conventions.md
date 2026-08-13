@@ -159,9 +159,11 @@ The ordering in `newRouter` is deliberate and documented in place: `RequestID` o
 
 Handlers have the signature `func(http.ResponseWriter, *http.Request) error`, adapted by `httpx.H`, which writes any returned error through `WriteError`. Returning an error rather than writing one removes the "forgot to return after writing" defect, which otherwise emits two response bodies.
 
-Request bodies are decoded by `httpx.DecodeJSON` with `DisallowUnknownFields` and a **1 MiB** limit. That limit must stay equal to `maxIdempotentRequestBody`; if they diverge, the fingerprint is computed over a body the handler never saw.
+Request bodies are decoded by `httpx.DecodeJSON` with `DisallowUnknownFields` and a **1 MiB** limit. **That limit and the idempotency middleware's are one constant, `maxRequestBody`, not two that agree.** The middleware reads and fingerprints the body before the handler sees it, so a handler permitted the larger body would be replayed against a fingerprint computed over bytes it never read. Two constants can drift and a test can only notice afterwards; one cannot drift at all.
 
 Unknown fields are rejected on requests, to catch client typos. Responses stay additive per `Docs/07` §6 — add fields, never repurpose or remove them, and clients tolerate fields they do not know.
+
+This section, like §4.4 below it, described a mechanism that did not exist. `httpx.H` and `httpx.DecodeJSON` were specified here at SHIP-15a and neither was in `internal/httpx` until **SHIP-15e**. SHIP-30 needed both, could not edit a shared surface mid-wave, and wrote them unexported in `internal/identity` as `apiHandler` and `decodeJSON` — with the 1 MiB limit as a second literal beside a comment asking the first not to move. They were promoted before a second domain copied them, which is the point at which the cost stops being notional: two domains with two decoders is two answers to what happens to an unknown field, and two limits is the divergence the paragraph above forbids.
 
 ### 4.4 Error codes
 
@@ -199,6 +201,8 @@ Hand-written validators returning `[]httpx.FieldError`, in `internal/validate`. 
 ### 4.7 Wire format
 
 `snake_case` JSON throughout, matching `built_at` and `request_id` in the endpoints that already exist. Enum values are lower snake case on the wire even where the stored form has spaces. A single resource is returned as a bare object; a collection is returned in the envelope above.
+
+**One exception, taken deliberately at SHIP-60: the Australian state is returned as its upper-case abbreviation** (`NSW`, `VIC`), because a client prints it rather than branching on it, and the lower snake case form would have every client upper-casing it back. Any case, and the spelled-out name, are accepted on input. This is narrow on purpose and does not loosen the rule for enums a client *does* branch on — job status in particular stays lower snake case on the wire, through `Status.Wire()`.
 
 ## 5. Identity and tokens
 
@@ -291,9 +295,22 @@ The existing Redis tests skip themselves when Redis is absent, which the CI note
 
 ### 7.3 Demonstrating "done"
 
-`scripts/verify-foundation.sh` demonstrates the acceptance criterion of every foundation ticket end to end, against a running stack. It grows a section per milestone.
+`scripts/verify-foundation.sh` demonstrates the acceptance criterion of every ticket that reaches an HTTP endpoint or a database constraint, end to end, against a running stack.
 
 **A ticket is not done until its section exists and passes.** `Docs/09` makes *Done when* the acceptance criterion; this is the mechanism that keeps it demonstrable rather than believed.
+
+**A section is a file, and a track adds one without editing anything shared** (SHIP-15e). `scripts/verify-foundation.sh` is the harness — `ticket`, `ok`, `fail`, `json`, `post_json`, `mint_token`, the service lifecycle, the count and the summary — and the checks live in `scripts/verify/NN-<name>.sh`, sourced in lexical order, exactly as the root `Makefile` includes `mk/*.mk`. The number decides when a section runs and the ranges are reserved per milestone or domain, the same way migration numbers are; the table is in the runner's header. Sections are *sourced*, so a section may use every helper and variable the runner set, and everything before it left behind.
+
+Two rules the split depends on:
+
+- **A file not named `NN-<name>.sh` is refused, not skipped.** A section that silently does not run is the same defect as a route dropped in a merge — no error, no failure, and an acceptance criterion that has quietly stopped being demonstrated.
+- **The summary is collected from the `ticket` calls, not written down.** The list of demonstrated tickets used to be a literal on the last line, which is a line every track would edit and which said `SHIP-1..SHIP-15` long after it had stopped being true.
+
+It was one 1148-line file until wave 3, which is the first wave with two tracks adding endpoints. One client can append to a single file; two cannot.
+
+**The check count is measured, and the run checks that `Docs/11` §3 says what was measured** (SHIP-15i). A successful run reads the bolded `**N checks across M sections**` out of the tracker, compares it, and **fails with the true figure printed** when they differ; `make verify-update` rewrites it. Every track adds checks, so the figure moves every wave, and as a hand-typed scalar in prose it conflicted in four consecutive merges with the correct value present in only one of them. Never resolve that line by choosing a side — re-run `make verify` on the merged tree and write what it says. Historical counts elsewhere in the file are written without the bold, and the run refuses to proceed if it finds the bold form twice.
+
+**A ticket that is done needs a row in a `Docs/11` §3 summary table, and `make status` fails without one** (SHIP-15i). The prose subsection explains what the ticket built; the row above it is what says the ticket exists at all, and it is the half agents forget — three of wave 4's four tracks did, and seven tickets were found in that state going back to wave 3. The table is checked and deliberately not generated: its "What" column is one hand-written sentence per ticket.
 
 ## 8. Clients
 
@@ -339,7 +356,9 @@ The import lint is what makes this safe on the Go side: two domains physically c
 
 These belong to whoever is doing shared-platform work in a given cycle, and are not edited from a domain branch:
 
-`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `CLAUDE.md` and `Docs/**`
+`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `scripts/verify-foundation.sh` · `CLAUDE.md` and `Docs/**`
+
+**`scripts/verify-foundation.sh` is on that list and `scripts/verify/<your-domain>.sh` is not**, which is the whole point of splitting it (§7.3). The same asymmetry as `mk/*.mk` and `cmd/api/routes_<domain>.go`: the shared file is the mechanism, and a track's contribution is a file of its own.
 
 **`Deps` is pre-seeded so that no domain has a reason to edit it.** It carries the configuration, the logger, the clock, the PostgreSQL pool and the Redis client, and a domain builds everything else — a keyset, a hasher, a token issuer, a repository — inside its own `Handler` closure, from those. All of them are pure functions of a pool, a client and configuration, so the field a domain wants almost always is not one.
 
@@ -355,13 +374,17 @@ The root `Makefile` ends with `-include mk/*.mk`, so a track adds `mk/<track>.mk
 
 #### Resolving a conflict in a file with no context
 
-Three files in this repository carry one independent line per endpoint and no surrounding syntax to make a bad resolution obvious. Each has its own recipe, and none of them is "read the hunk and pick the right side".
+Four files in this repository carry one independent line per entry and no surrounding syntax to make a bad resolution obvious. Each has its own recipe, and none of them is "read the hunk and pick the right side".
 
 | File | Mechanism | Recipe |
 |---|---|---|
 | `cmd/api/routes_golden.txt` | `merge=union` in `.gitattributes` | Never conflicts. The union is a superset in the wrong order, which fails `TestRouteTableMatchesGolden` — regenerate with `-update` and read the diff |
+| `Docs/11-done.txt` | `merge=union` in `.gitattributes` | Never conflicts. A superset is caught by `make status`, which fails on a ticket git has never seen. One ticket per line, because a union resolves line by line |
 | `Docs/10-api-error-codes.md` | Generated from the registry | **Regenerate, never hand-merge.** `go test ./cmd/api -run TestErrorCodeDocumentIsCurrent -update` |
 | `contracts/openapi.yaml` `paths:` | Sorted, one `$ref` pair per path | **Take both sides and re-sort.** Then `make test` — `TestPathsBlockIsSortedAndComplete` checks the result |
+| `Docs/11` §3's check count | Measured by `make verify`, which checks the figure the file states | **Never take a side; both are usually wrong.** Re-run `make verify` on the merged tree — it fails with the true figure — then `make verify-update` (SHIP-15i) |
+
+`Docs/11-done.txt` is a file rather than the fenced block it was inside `Docs/11` §10 for exactly this reason: a git attribute applies to a whole file, and `Docs/11` §3 is prose that must never be union-merged. Separating them was the only way to treat them differently (SHIP-15e).
 
 `openapi.yaml` is deliberately **not** union-merged, and the asymmetry is the point: a union-merged YAML document is either invalid or valid and subtly wrong — two keys interleaved, a `$ref` orphaned from its entry — and the second is harder to notice than a conflict. A conflict there is ugly and obvious, which is what you want in a file that parses.
 
@@ -370,6 +393,8 @@ Three files in this repository carry one independent line per endpoint and no su
 After resolving any conflict: re-run `make check` **and** read `routes_golden.txt`. That is the file that catches a silently dropped endpoint.
 
 `COMPOSE_PROJECT_NAME` is pinned to `shipper`. Compose otherwise names a project after its directory, so each git worktree would start its own stack and they would fight over ports 5432, 6379 and 29092.
+
+**A single non-reproducing `curl` exit 7 while several tracks are running is the expected cost of that design, not a race in the section that reported it.** One Postgres, one Redis and one broker serve every worktree, and four concurrent `make verify` runs against them will occasionally fail to connect. Wave 5 saw three such exits in three different sections and not one of them reproduced. **Re-run once before investigating, and do not go looking for a race until the stack is quiet** — the conclusion here is a negative one, and it is worth writing down precisely because a flake in somebody else's section reads like a defect in your own.
 
 Dependencies are added deliberately, not opportunistically. If a change genuinely needs a new module, that is a request, not a commit — it takes five minutes and avoids a `go.sum` conflict. Never hand-merge `go.sum`: delete it and run `go mod tidy`.
 

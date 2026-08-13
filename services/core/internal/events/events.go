@@ -22,6 +22,7 @@
 package events
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -52,11 +53,14 @@ type Event struct {
 	AggregateID   uuid.UUID
 
 	// Type is the event name, `<aggregate>.<past-tense>` — "job.published",
-	// "bid.accepted", "delivery.milestone_recorded". Versioning belongs to the schema in
-	// SHIP-135, not to this string.
+	// "bid.accepted", "delivery.milestone_recorded". It is the key into the catalogue, and
+	// the version belongs to its [Schema] rather than to this string. See catalogue.go for
+	// why the version is in neither the name nor the topic.
 	Type string
 
-	// Payload is the event body. It is stored as jsonb.
+	// Payload is the event body. It is stored as jsonb, and [New] writes
+	// [SchemaVersionField] into it from the catalogue — so the row records the version it
+	// was written under rather than whichever the catalogue holds when it is published.
 	Payload json.RawMessage
 
 	// OccurredAt is when the state change happened, from the injected clock rather than
@@ -96,6 +100,9 @@ func (o *Outbox) Emit(ctx context.Context, r db.Runner, e Event) error {
 		// syntax error from PostgreSQL.
 		return fmt.Errorf("events: %s has an empty payload", e.Type)
 	}
+	if err := checkAgainstCatalogue(e); err != nil {
+		return err
+	}
 
 	const q = `
 		INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
@@ -113,7 +120,29 @@ func (o *Outbox) Emit(ctx context.Context, r db.Runner, e Event) error {
 //
 // occurredAt comes from the caller's clock rather than from time.Now, so that the four
 // scheduled tasks that emit events remain testable (Docs/10 §6.3).
-func New(aggregateType string, aggregateID uuid.UUID, eventType string, occurredAt time.Time, payload any) (Event, error) {
+//
+// # The aggregate type is not a parameter, and that is the point
+//
+// It used to be, and a caller could therefore emit "job.status_changed" on the "bid" aggregate.
+// Nothing would have complained: the row is valid, the publisher would route it to shipper.bid,
+// and the notification nobody received would be the only symptom. The catalogue knows which
+// aggregate an event belongs to, so it supplies it and the mistake is unavailable (SHIP-135).
+//
+// # What this refuses, and why it refuses it here
+//
+// An unregistered event type, a payload that is not a JSON object, and a payload over the
+// schema's bound. All three are permanent conditions rather than transient ones, and catalogue.go
+// sets out why every permanent condition is checked at this end: this runs inside the transaction
+// making the state change, so refusing rolls the change back and tells the caller, rather than
+// leaving a row the publisher can never drain.
+func New(eventType string, aggregateID uuid.UUID, occurredAt time.Time, payload any) (Event, error) {
+	schema, ok := Lookup(eventType)
+	if !ok {
+		return Event{}, fmt.Errorf("events: %s is not in the catalogue; register it from an "+
+			"init in the domain that emits it, so that it has a topic, a version and a "+
+			"recorded shape", eventType)
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return Event{}, fmt.Errorf("events: generate id for %s: %w", eventType, err)
@@ -124,12 +153,112 @@ func New(aggregateType string, aggregateID uuid.UUID, eventType string, occurred
 		return Event{}, fmt.Errorf("events: marshal %s payload: %w", eventType, err)
 	}
 
+	versioned, err := withSchemaVersion(body, schema.Version)
+	if err != nil {
+		return Event{}, fmt.Errorf("events: %s: %w", eventType, err)
+	}
+	if len(versioned) > schema.PayloadLimit() {
+		return Event{}, fmt.Errorf("events: %s has a %d byte payload and its schema permits "+
+			"%d; an event large enough to argue about belongs in object storage with the "+
+			"event carrying its key", eventType, len(versioned), schema.PayloadLimit())
+	}
+
 	return Event{
 		ID:            id,
-		AggregateType: aggregateType,
+		AggregateType: string(schema.Aggregate),
 		AggregateID:   aggregateID,
 		Type:          eventType,
-		Payload:       body,
+		Payload:       versioned,
 		OccurredAt:    occurredAt.UTC(),
 	}, nil
+}
+
+// checkAgainstCatalogue is [Outbox.Emit]'s half of the same guard.
+//
+// [New] has already made all three of these true of anything it built. This is for an Event
+// assembled by hand — which is legal, since Event has no unexported field — and it is the check
+// that actually reaches the database, so it is the one that decides what can be in the table.
+func checkAgainstCatalogue(e Event) error {
+	schema, ok := Lookup(e.Type)
+	if !ok {
+		return fmt.Errorf("events: %s is not in the catalogue and cannot be written to the "+
+			"outbox; a row the publisher has no schema for is a row it can never drain",
+			e.Type)
+	}
+	if e.AggregateType != string(schema.Aggregate) {
+		return fmt.Errorf("events: %s is an event about a %s and was emitted on aggregate "+
+			"%q, so it would publish to %s and be read by nobody",
+			e.Type, schema.Aggregate, e.AggregateType, TopicFor(e.AggregateType))
+	}
+	if len(e.Payload) > schema.PayloadLimit() {
+		return fmt.Errorf("events: %s has a %d byte payload and its schema permits %d",
+			e.Type, len(e.Payload), schema.PayloadLimit())
+	}
+	return nil
+}
+
+// withSchemaVersion writes the schema version into a marshalled payload.
+//
+// Spliced onto the front rather than round-tripped through a map, so the domain's field order
+// survives and the version is the first thing anybody reading the row sees. A payload that is not
+// a JSON object is refused rather than wrapped: an event body is an object in every schema in the
+// catalogue, [Register] enforces that the struct behind it is one, and a caller passing an array
+// or a bare string has made a mistake that is better reported than accommodated.
+func withSchemaVersion(body []byte, version int) ([]byte, error) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return nil, fmt.Errorf("its payload marshalled to %s, and an event payload is a JSON "+
+			"object", firstBytes(trimmed))
+	}
+
+	prefix := fmt.Sprintf(`{%q:%d`, SchemaVersionField, version)
+	if bytes.Equal(trimmed, []byte("{}")) {
+		return []byte(prefix + "}"), nil
+	}
+
+	// A struct that already declared the field would produce a duplicate key, which most JSON
+	// readers resolve silently and differently from each other. Register refuses such a struct,
+	// so reaching this means a map payload built by hand.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
+		return nil, fmt.Errorf("its payload is not readable as a JSON object: %w", err)
+	}
+	if _, taken := probe[SchemaVersionField]; taken {
+		return nil, fmt.Errorf("its payload already carries %s, and the catalogue is the only "+
+			"thing that may set it", SchemaVersionField)
+	}
+
+	out := make([]byte, 0, len(prefix)+len(trimmed))
+	out = append(out, prefix...)
+	out = append(out, ',')
+	return append(out, trimmed[1:]...), nil
+}
+
+// SchemaVersionOf reads the version back out of a stored payload, or zero if it has none.
+//
+// The publisher uses it to put the version on the wire. Zero is a real answer rather than a
+// failure: a row written by hand — which is how the acceptance harness arranges a transaction
+// that rolls back — has no version, and saying so is better than inventing one from the
+// catalogue, which would be the catalogue's answer today rather than the row's answer when it
+// was written.
+func SchemaVersionOf(payload json.RawMessage) int {
+	var probe struct {
+		Version int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return 0
+	}
+	return probe.Version
+}
+
+// firstBytes is a short, safe rendering of a payload for an error message.
+func firstBytes(b []byte) string {
+	const limit = 40
+	if len(b) == 0 {
+		return "nothing"
+	}
+	if len(b) > limit {
+		return string(b[:limit]) + "…"
+	}
+	return string(b)
 }

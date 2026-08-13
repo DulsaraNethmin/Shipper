@@ -89,6 +89,15 @@ func TestNothingIsDocumentedThatIsNotRead(t *testing.T) {
 		"KAFKA_PORT":        true,
 		"KAFKA_CLUSTER_ID":  true,
 
+		// The object store's container (SHIP-15p). The service reaches it through
+		// STORAGE_ENDPOINT and the STORAGE_* credentials, which config.go does read; these
+		// four configure the container those values have to agree with, exactly as
+		// POSTGRES_USER and POSTGRES_PASSWORD sit behind DATABASE_URL.
+		"MINIO_PORT":          true,
+		"MINIO_CONSOLE_PORT":  true,
+		"MINIO_ROOT_USER":     true,
+		"MINIO_ROOT_PASSWORD": true,
+
 		// Read by the test harness in internal/testsupport, not by config.
 		"TEST_DATABASE_URL": true,
 		"TEST_REDIS_URL":    true,

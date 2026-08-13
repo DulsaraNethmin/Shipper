@@ -99,10 +99,12 @@ Not "might one exist someday" — that question always answers yes and justifies
 | Email | Console in development, provider in staging and production |
 | SMS | Console in development, provider in staging and production |
 | Push | Firebase Cloud Messaging, plus a no-op used in tests |
-| Object storage | Local storage in development, S3 deployed |
+| Object storage | **The store, not the code** — one S3 client, run against MinIO locally and S3 deployed. See below |
 | Maps and geocoding | Provider-backed, with a stub for tests |
 
 Payments and third-party identity verification have no implementation yet, but both are named commitments for later phases (§6). Their interfaces are defined when the domain that needs them is built, so the seam exists before the vendor does.
+
+**Object storage is the one row whose second implementation is the store rather than a second Go type, and that is a decision rather than an omission (SHIP-114).** A local filesystem implementation was specified here and then deliberately not built: once the local stack ran a real S3-compatible store, writing one so that the answer to *"does a second implementation exist today?"* became yes would have inverted this section's own test. The same client is exercised locally against MinIO and deployed against S3, which is the arrangement this document already insists on for PostgreSQL — test against the real thing rather than a stand-in. **The seam survives on a different argument**: `delivery` declares the interface it needs and may not import the adapter, so the port exists because of the boundary rule below rather than because of a vendor swap. A filesystem version would additionally have needed a second signing scheme and a route serving the bytes, which contradicts §5.2's rule that files are never proxied through the API.
 
 #### Adapters are not used over PostgreSQL
 

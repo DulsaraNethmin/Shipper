@@ -1,0 +1,179 @@
+# The done list. Docs/11 §10 is about this file; this file is the list.
+#
+# Authoritative. `make status` reads it, counts it against the backlog in Docs/09, and
+# cross-checks it against what commit subjects claim. A ticket belongs here only when its
+# *Done when* line in Docs/09 is demonstrable.
+#
+# Docs/11 §4 lists the partly-finished tickets, and they are NOT all absent from this list.
+# Every ticket §4 names is here. SHIP-149 is its only live row, and it is here as well as there
+# because it landed and is named by a commit subject, while one clause of its *Done when* — the
+# Go write helper — belongs to work that does not exist yet. SHIP-65 was the other such entry
+# until SHIP-67 closed it, and SHIP-134 until its publisher landed, which is how this shape is
+# meant to end. Do not "tidy" any of them out: `make status` exits 1 when git shows a ticket this
+# file does not declare, so removing one breaks the build rather than making it more honest.
+# Docs/11 §10 carries the full reasoning.
+#
+# This paragraph was itself duplicated and self-contradictory until the wave-4 reconciliation —
+# a merge=union artefact, and the reason the attribute is confined to a file whose content lines
+# are independent tokens. Prose in a union-merged file is the one thing to keep short.
+#
+# Add a ticket in the same change that finishes it, in the same commit as the Docs/11 §3 entry
+# that says what it built.
+#
+# # Why this is a file of its own, and not a fenced block in Docs/11
+#
+# It is `merge=union` in .gitattributes, which no Markdown document could be. Every track in a
+# wave appends to the done list, so the last merge of a wave always conflicted here — twice in
+# wave 2, and both resolutions were unions. A union is safe for *this* content and for very
+# little else: the lines are independent tokens with no syntax to break, a union is always a
+# superset, and `make status` **fails** when the list claims a ticket git has never seen. So a
+# bad union is caught by a check rather than passing quietly. That is the same argument
+# .gitattributes already makes for routes_golden.txt.
+#
+# Docs/11 §3 is prose and is deliberately *not* union-merged: a union there interleaves two
+# narratives, which is worse than a conflict because it is harder to notice. Since a git
+# attribute applies to a whole file, the list had to move out of the document for the two to be
+# treated differently. That move is the whole of the decision (SHIP-15e).
+#
+# # One ticket per line, and that part is load-bearing
+#
+# merge=union resolves line by line. The list used to be grouped several tickets to a line, and
+# two tracks appending to the same line would still have conflicted — the union would have had
+# nothing to keep both of. Order does not matter: the reader sorts.
+
+# M0 — Foundation
+SHIP-1
+SHIP-2
+SHIP-3
+SHIP-4
+SHIP-5
+SHIP-6
+SHIP-7
+SHIP-8
+SHIP-9
+SHIP-10
+SHIP-11
+SHIP-12
+SHIP-13
+SHIP-14
+SHIP-15
+SHIP-15a
+SHIP-15b
+SHIP-15c
+SHIP-15e
+SHIP-15g
+SHIP-15i
+SHIP-15m
+SHIP-15p
+SHIP-16
+SHIP-17
+SHIP-17a
+SHIP-18
+SHIP-19
+SHIP-20
+SHIP-21
+SHIP-22
+SHIP-23
+SHIP-23a
+
+# M1 — Identity and access
+SHIP-28
+SHIP-29
+SHIP-30
+SHIP-31
+SHIP-32
+SHIP-33
+SHIP-34
+SHIP-35
+SHIP-36
+SHIP-37
+SHIP-38
+SHIP-39
+SHIP-40
+SHIP-41
+SHIP-42
+SHIP-43
+SHIP-44
+SHIP-45
+SHIP-46
+SHIP-47
+SHIP-48
+SHIP-49
+SHIP-50
+SHIP-51
+SHIP-52
+SHIP-53
+SHIP-54
+SHIP-55
+
+# M2 — Jobs
+SHIP-56
+SHIP-57
+SHIP-57a
+SHIP-59a
+SHIP-60
+SHIP-61
+SHIP-62
+SHIP-64
+SHIP-65
+SHIP-66
+SHIP-67
+SHIP-67a
+SHIP-68
+SHIP-69
+SHIP-70
+SHIP-71
+SHIP-76
+SHIP-77
+
+# M3 — Bidding and award
+SHIP-78
+SHIP-79
+SHIP-80
+SHIP-81
+SHIP-82
+SHIP-83
+SHIP-84
+SHIP-85
+SHIP-86
+SHIP-87
+SHIP-88
+SHIP-91
+SHIP-92
+SHIP-93
+SHIP-94
+SHIP-95
+SHIP-98
+SHIP-99
+SHIP-100
+
+# M4 — Delivery execution
+SHIP-105
+SHIP-106
+SHIP-107
+SHIP-108
+SHIP-110
+SHIP-111
+SHIP-112
+SHIP-120
+SHIP-114
+SHIP-115
+SHIP-116
+SHIP-118
+SHIP-124
+SHIP-125
+SHIP-126
+SHIP-129
+
+# M5 — Notifications
+SHIP-134
+SHIP-135
+
+# M6 — Admin
+SHIP-149
+SHIP-163
+
+# M7 — Hardening
+SHIP-167
+SHIP-168
+SHIP-179

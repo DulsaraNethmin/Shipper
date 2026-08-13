@@ -9,5 +9,30 @@
 /// The driver portal's signed single-job link token is a **separate system**. Neither token
 /// can be exchanged for the other, and nothing here should acquire a code path that tries.
 ///
-/// Empty until SHIP-48.
+/// The files, in the order a cold start uses them:
+///
+/// - `token_store.dart` — the Keychain and Keystore wrapper (SHIP-48).
+/// - `session_state.dart` — restoring, signed out, signed in (SHIP-49).
+/// - `session_controller.dart` — the restore, the refresh, sign-in and sign-out (SHIP-49,
+///   SHIP-50, SHIP-55).
+/// - `token_pair.dart` — the credentials sign-in and refresh both answer with (SHIP-41,
+///   SHIP-42).
+/// - `session_refresher.dart` — `POST /v1/auth/refresh`. The session's own call, not a
+///   screen's, which is why it is not on `IdentityRepository` (SHIP-50).
+/// - `access_token.dart` — the `role` claim, read for presentation and never for authorisation.
+/// - `provider_only.dart` — draws a provider surface to a provider and an explanation to
+///   everybody else (SHIP-98, moved here at SHIP-100 when a second feature needed it). It
+///   **hides**; it decides nothing, and its own note is where that line is drawn.
+///
+/// **Nothing here decides what an account may do.** Signed in means this device holds a
+/// refresh token, which is a navigation fact; the platform decides the rest, on every request.
+///
+/// **Nothing in this folder may import `dart:io`**, and `token_store_is_not_preferences_test.dart`
+/// enforces it: the application documents directory is the third location `Docs/07` §3 rules
+/// out, and the shortest route there is a token written to a cache "just while it syncs". That
+/// is why the device label a sign-in sends lives in `core/device/` — it reads `Platform`.
+///
+/// The interceptor that reacts to a `401` is `core/api/auth_interceptor.dart`, because it is a
+/// `dio` interceptor. It takes the two-member interface it needs from the session rather than
+/// importing this folder's controller — the same rule `CLAUDE.md` applies to `internal/httpx`.
 library;

@@ -1,7 +1,9 @@
 package httpx
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -161,10 +163,16 @@ func (e *Error) Unwrap() error { return e.cause }
 // A *[Error] is written as itself. Anything else becomes an opaque 500: an error that has
 // not been given a status and a code has not been considered, and guessing on its behalf
 // is how an internal message reaches a client.
+//
+// The unmapped error is logged on its way to that 500 (SHIP-15i). The *response* is
+// unchanged and deliberately says nothing — but until this existed the service said nothing
+// either, recording `status 500` and no cause at all, which is how a sign-in against a stale
+// local database cost an afternoon with the handler as the only route to the answer.
 func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 	apiErr, ok := err.(*Error)
 	if !ok {
 		apiErr = StatusError(http.StatusInternalServerError)
+		logUnmapped(r, err)
 	}
 
 	body := errorEnvelope{Error: errorBody{
@@ -177,6 +185,34 @@ func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 	}
 
 	WriteJSON(w, apiErr.Status, body)
+}
+
+// logUnmapped records the cause of a fallback 500, which is the one path where the platform
+// has no more idea than the client does about what went wrong.
+//
+// It logs through [LoggerFrom], so the record carries the request ID the middleware bound
+// (SHIP-14) and a support ticket quoting that ID finds the cause rather than only the status.
+// A handler that builds its error with [NewError] and [Error.WithCause] is already saying what
+// happened; this is for the errors nobody considered, which are exactly the ones worth seeing.
+//
+// r may be nil — [WriteError] already guards its request ID for that, and a caller writing an
+// error outside a request must not lose the cause as well as the correlation. With no request
+// there is no request-scoped logger either, so the record goes to slog.Default.
+func logUnmapped(r *http.Request, err error) {
+	ctx := context.Background()
+
+	attrs := []slog.Attr{slog.Any("error", err)}
+	if r != nil {
+		ctx = r.Context()
+		attrs = append(attrs, slog.String("method", r.Method))
+		if r.URL != nil {
+			// The path only. The query string is left out for the reason Logger gives:
+			// it is the part of a URL most likely to carry a token or an address.
+			attrs = append(attrs, slog.String("path", r.URL.Path))
+		}
+	}
+
+	LoggerFrom(ctx).LogAttrs(ctx, slog.LevelError, "unmapped error written as 500", attrs...)
 }
 
 // StatusError builds the default error for a status code, for the cases where there is

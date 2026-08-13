@@ -50,6 +50,37 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+
+            <!-- SHIP-53. Hands an incoming URL to Flutter, which turns its path and query into
+                 a route for go_router to match. Without it the intent arrives and nothing reads
+                 it. It applies to App Links too, so the signing work in SHIP-26 will not have to
+                 come back and turn it on. -->
+            <meta-data
+                android:name="flutter_deeplinking_enabled"
+                android:value="true" />
+
+            <!-- SHIP-53 chose the verification deep link, because
+                 internal/identity/verification.go deliberately left the scheme to this ticket
+                 and sends a bare code meanwhile:
+
+                     shipper:///verify-email?token=TOKEN
+
+                 Three slashes, so the host is empty and the path is what go_router matches. A
+                 custom scheme needs no registered domain, no assetlinks.json and no Play Console
+                 account — X-1 and X-3 block all three, and the alternative was leaving "or
+                 deep-link a code" undemonstrable for the whole of the pilot build-out.
+
+                 It is not the production form. An HTTPS App Link is, because a custom scheme can
+                 be claimed by any other app on the device, and because a link in an email has to
+                 do something sensible for somebody who has not installed this one. That needs
+                 SHIP-26 and a registered domain. No Dart changes when it arrives: a link of
+                 either kind resolves to the same route with the same query parameter. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="shipper"/>
+            </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

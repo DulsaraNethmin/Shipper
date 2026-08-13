@@ -52,6 +52,24 @@ flutter-test-defines: ## Prove --dart-define selects each environment (SHIP-18)
 .PHONY: flutter-check
 flutter-check: flutter-analyze flutter-test flutter-test-defines ## What CI runs for the client (SHIP-21)
 
+# On a device, against the real Keychain and the real Keystore (SHIP-48).
+#
+# Deliberately *not* a prerequisite of flutter-check, and not added to CHECKS. It needs a booted
+# simulator, and the Flutter CI job runs on Linux — Docs/08 Step 1 puts macOS runners at roughly
+# ten times the cost, and nothing else in this track needs one. Adding it to `make check` would
+# make `make check` fail on every machine with no simulator attached, which is how a check gets
+# commented out rather than fixed.
+#
+#   make flutter-integration d=emulator-5554
+#   make flutter-integration d=<ios-simulator-udid> only="survives into the next launch"
+#
+# `only` filters by test name, which is how the seeding test is run on its own before launching
+# the installed app by hand for a genuine cross-process cold start.
+.PHONY: flutter-integration
+flutter-integration: ## On-device tests: the real Keychain and Keystore. Needs d=<device>
+	@test -n "$(d)" || { echo "usage: make flutter-integration d=<device> [only=<test name>]"; exit 1; }
+	cd $(MOBILE) && $(FLUTTER) test integration_test -d $(d) $(if $(only),--plain-name "$(only)",)
+
 # The build flavour, and the port the API is on. HTTP_PORT comes from deploy/.env, which is
 # per-worktree — so `make flutter-run` points at *this* checkout's API without anybody editing
 # Dart. The Android emulator's 10.0.2.2 is handled inside ApiEnvironment; only the port varies

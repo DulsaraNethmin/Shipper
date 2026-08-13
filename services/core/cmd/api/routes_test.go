@@ -27,15 +27,76 @@ const testKID = "test"
 
 func testIdentityConfig() config.Identity {
 	return config.Identity{
+		// The cheapest profile internal/identity will run. It has to be a real one: the
+		// identity handler is built during attach, from every test in this package that
+		// constructs a router, and a zero profile stops the process at startup rather than
+		// producing a hasher nothing can verify against. 64 MiB per hash across parallel
+		// packages would thrash a laptop (Docs/10 §5), and no test here hashes anything.
+		Argon2: config.Argon2{MemoryKiB: 1024, Iterations: 1, Parallelism: 1},
+
 		AccessTokenTTL:       15 * time.Minute,
 		AccessTokenKeys:      map[string][]byte{testKID: testSigningKey},
 		AccessTokenActiveKID: testKID,
 	}
 }
 
+// testDriverSigningKey is the driver token's throwaway, and it is deliberately **not**
+// testSigningKey (SHIP-107).
+//
+// Docs/10 §5 requires the two token systems to have separate signing key material, config.Load
+// refuses a configuration in which they share a secret, and a test fixture that shared one would be
+// the only place in the repository where they did.
+var testDriverSigningKey = []byte("cmd-api-test-driver-token-key-012")
+
+const testDriverKID = "test-driver"
+
+// testDeliveryConfig is the driver token keyset the delivery handler is built from.
+//
+// It has to be a real one for the reason [testIdentityConfig]'s argon2 profile does: the delivery
+// handler is built during attach, from every test in this package that constructs a router, and a
+// keyset that cannot sign stops the process at startup rather than producing a service that quietly
+// hands out no link.
+func testDeliveryConfig() config.Delivery {
+	return config.Delivery{
+		DriverTokenTTL:       7 * 24 * time.Hour,
+		DriverTokenKeys:      map[string][]byte{testDriverKID: testDriverSigningKey},
+		DriverTokenActiveKID: testDriverKID,
+	}
+}
+
+// testStorageConfig is the object store the proof-upload signer is built from (SHIP-114).
+//
+// It is here for the third time in this file's history and for the third identical reason, after
+// the argon2 profile and the driver keyset above: the delivery handler is built during attach, from
+// every test in this package that constructs a router, and a signer that cannot sign stops the
+// process at startup. `config.Storage{}` has an empty endpoint, and an empty endpoint is not a URL
+// — internal/config refuses one at load for exactly the same reason.
+//
+// **Nothing here reaches the store.** Signing is an HMAC over a few hundred bytes and touches no
+// I/O, so these values need to be well-formed rather than real: no test in this package uploads
+// anything, and the URLs the signer produces are exercised against a live bucket in
+// internal/platform/storage instead.
+func testStorageConfig() config.Storage {
+	return config.Storage{
+		Endpoint:             "http://localhost:9000",
+		Bucket:               "cmd-api-test",
+		Region:               "ap-southeast-2",
+		AccessKeyID:          "cmd-api-test-key",
+		SecretAccessKey:      "cmd-api-test-secret",
+		UsePathStyle:         true,
+		PresignTTL:           15 * time.Minute,
+		MaxUploadBytes:       5 << 20,
+		AcceptedContentTypes: []string{"image/jpeg", "image/heic"},
+	}
+}
+
 func testDeps() Deps {
 	return Deps{
-		Config:    &config.Config{Identity: testIdentityConfig()},
+		Config: &config.Config{
+			Identity: testIdentityConfig(),
+			Delivery: testDeliveryConfig(),
+			Storage:  testStorageConfig(),
+		},
 		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		Clock:     clock.System{},
 		StartedAt: time.Now(),
@@ -54,6 +115,26 @@ func testAuthenticator() httpx.Authenticator {
 		panic("cmd/api test: building the authenticator: " + err.Error())
 	}
 	return authenticate
+}
+
+// testDriverGuard builds the real driver-token middleware, for the reason [testAuthenticator] gives
+// about the real authenticator (SHIP-108).
+//
+// **It is not optional any more, and that is the change SHIP-108 made to every caller of newRouter
+// in this package.** While nothing declared RequireDriverToken, passing nil was correct: the class
+// stayed out of the guard map and no route wanted it. `GET /v1/driver/jobs/{id}` declares it, so a
+// router built with nil now panics at startup, naming the class — which is the seam behaving exactly
+// as SHIP-15m designed it, met from the other side.
+//
+// A stub would satisfy the panic and prove nothing. The real guard is what puts internal/delivery's
+// verifier, the configured keyset and the manifest's auth class in one process, which is the only
+// place they meet.
+func testDriverGuard() Guard {
+	guard, err := newDriverTokenGuard(testDeps().Config, clock.System{})
+	if err != nil {
+		panic("cmd/api test: building the driver token guard: " + err.Error())
+	}
+	return guard
 }
 
 // testAccessToken mints a token the test router will accept.
@@ -78,7 +159,7 @@ func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sess
 }
 
 func testRouter() http.Handler {
-	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator())
+	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
 }
 
 // SHIP-6's acceptance criterion: GET /health returns 200 with version and commit.
@@ -170,9 +251,17 @@ func TestRouterAttachesRequestID(t *testing.T) {
 	}
 }
 
+// unroutedPath is a path inside /v1 that no route serves and none is planned to.
+//
+// It was `/v1/jobs` until SHIP-61 made that a real endpoint, at which point both tests below
+// started asserting the 405 the router correctly produces for the wrong method. A stand-in for
+// "unknown" has to be a path nobody will implement, and naming it once means the next endpoint to
+// collide with it changes one line rather than finding two failures that look unrelated.
+const unroutedPath = "/v1/no-such-endpoint"
+
 func TestUnknownRouteIsNotFound(t *testing.T) {
 	rec := httptest.NewRecorder()
-	testRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/jobs", nil))
+	testRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, unroutedPath, nil))
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
@@ -231,7 +320,7 @@ func TestVersionedRoutesAreNotServedAtTheRoot(t *testing.T) {
 // contract, because that is the response a client meets first while it is being written.
 func TestRouterErrorsUseTheStandardContract(t *testing.T) {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v1/jobs", nil)
+	req := httptest.NewRequest(http.MethodGet, unroutedPath, nil)
 	req.Header.Set(httpx.HeaderRequestID, "known-request-id")
 	testRouter().ServeHTTP(rec, req)
 

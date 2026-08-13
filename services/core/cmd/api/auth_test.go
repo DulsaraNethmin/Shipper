@@ -222,7 +222,7 @@ func TestOperationalRoutesArePublic(t *testing.T) {
 // only thing that separates these two requests.** With the nil scope this shipped with, the
 // second caller is handed the first caller's stored response body; with SubjectScope it is not.
 func TestOneCallersIdempotencyKeyCannotReadAnothers(t *testing.T) {
-	router := newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator())
+	router := newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
 
 	alice, _, _ := testAccessToken(t, identity.RoleCustomer)
 	bob, _, _ := testAccessToken(t, identity.RoleProvider)
@@ -269,7 +269,7 @@ func TestOneCallersIdempotencyKeyCannotReadAnothers(t *testing.T) {
 // is safe: the fingerprint covers the body, so reading a stranger's response means already
 // holding the secret material in their request.
 func TestAnonymousCallersStillGetIdempotency(t *testing.T) {
-	router := newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator())
+	router := newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
 
 	post := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/not-a-real-endpoint", strings.NewReader("{}"))

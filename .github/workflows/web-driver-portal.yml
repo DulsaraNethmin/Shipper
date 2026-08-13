@@ -1,0 +1,80 @@
+# SHIP-23a — lint, type-check and build for the driver portal (SHIP-23).
+#
+# The mirror of web-admin.yml, and the two are deliberately near-identical: one workflow per
+# web surface, each triggered only by its own directory. The point is what *does not* start
+# them — a change under services/core/ or apps/mobile/ starts neither, and Docs/08 Step 1 makes
+# that a requirement rather than an optimisation.
+#
+# The driver portal is the surface with the tighter security story (Docs/07 §3: a job-scoped
+# link token, no account, and no exchange with the mobile token), so it keeps its own workflow
+# rather than sharing the admin panel's. When it grows checks the admin panel does not need,
+# they belong here and nowhere else.
+#
+# The filter includes this file, and the workspace files that decide what it resolves to.
+name: Driver portal
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "apps/driver-portal/**"
+      - ".github/workflows/web-driver-portal.yml"
+      - "mk/web.mk"
+      - "Makefile"
+      - "package.json"
+      - "pnpm-workspace.yaml"
+      - "pnpm-lock.yaml"
+  pull_request:
+    paths:
+      - "apps/driver-portal/**"
+      - ".github/workflows/web-driver-portal.yml"
+      - "mk/web.mk"
+      - "Makefile"
+      - "package.json"
+      - "pnpm-workspace.yaml"
+      - "pnpm-lock.yaml"
+
+concurrency:
+  group: web-driver-portal-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # The name is the target's contents in the target's order, because the two drifting apart is
+    # how a check goes unnoticed: `make web-check` ran no test at all for the whole of SHIP-120
+    # while this line claimed three of them.
+    name: lint, test, build, typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Corepack reads `packageManager` from the root package.json. See web-admin.yml.
+      - name: pnpm, at the version package.json pins
+        run: corepack enable
+
+      - name: locate the pnpm store
+        id: store
+        run: echo "path=$(corepack pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: install exactly what the lockfile pins
+        run: make web-install
+
+      - name: make web-check
+        run: make web-check
+
+      - name: Australian English
+        run: ./scripts/check-spelling.sh

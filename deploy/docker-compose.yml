@@ -1,4 +1,4 @@
-# Local development stack: PostgreSQL, Redis, Kafka.
+# Local development stack: PostgreSQL, Redis, Kafka, object storage.
 #
 # This is a development convenience, not a deployment artefact. Production runs on managed
 # AWS services (Docs/06 §2). Nothing here should acquire production responsibilities —
@@ -119,7 +119,75 @@ services:
       retries: 15
       start_period: 20s
 
+  # --- SHIP-15p -----------------------------------------------------------------------
+  # Object storage for proof-of-delivery photographs and provider verification documents
+  # (Docs/06 §4.1, §5.2). MinIO speaks the S3 API, so the deployed implementation is the one
+  # exercised locally — against real SigV4 pre-signed URLs rather than against a stub, which
+  # is the same argument §4.1 makes for testing against a real PostgreSQL.
+  #
+  # It is here, in a prep ticket, rather than inside SHIP-114 which consumes it: a service in
+  # this file, a published port, a bucket and an internal/config section are all shared
+  # surfaces a domain branch may not edit (Docs/10 §9.2), and SHIP-114's "a client receives a
+  # short-lived pre-signed URL and uploads directly" cannot be demonstrated without them.
+  # Docs/11 §6 struck SHIP-114 for five consecutive waves for exactly this reason.
+  #
+  # Two ports, both published because the Go service runs on the host:
+  #
+  #   9000  the S3 API — what the service and every pre-signed URL talk to
+  #   9001  the browser console — nothing depends on it, and it is what you want the first
+  #         time an upload lands somewhere unexpected
+  #
+  # 9000 is a crowded port on a developer machine — Portainer, SonarQube and php-fpm all
+  # want it — which is what MINIO_PORT is for. POSTGRES_PORT exists for the same reason.
+  #
+  # MINIO_REGION has to agree with what the client signs with. SigV4 puts the region in the
+  # credential scope, so a mismatch is refused as SignatureDoesNotMatch — an error that says
+  # nothing about the region being wrong. It is the same value as STORAGE_REGION for that
+  # reason, and Sydney is where the deployed bucket will be.
+  #
+  # # The bucket is created by `make up`, not by an init container here
+  #
+  # The usual shape is a one-shot `mc` container with `depends_on: service_healthy`. It was
+  # written, run, and rejected on two measured counts:
+  #
+  #   - `make up` is `docker compose up -d --wait`, and --wait fails when *any* service
+  #     exits, including one that exits 0 having done its job: "container shipper-minio-init
+  #     exited (0)", and `up` returns 1. Waiting for the stack is what `make up` is for.
+  #   - The bucket is per-worktree (CLAUDE.md's worktree table) and this stack is shared,
+  #     because COMPOSE_PROJECT_NAME is pinned so that it is. An init container runs when
+  #     its container is created, so the first worktree to bring the stack up would create
+  #     its own bucket and the next four would find nothing. The bucket has to be made on
+  #     every `make up` in every tree, which is a make step and not a compose service.
+  #
+  # `mc` ships inside this image, so that step needs no second image and no second pull.
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: shipper-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-shipper}
+      # Eight characters is MinIO's own minimum, which is why this is not `shipper` twice
+      # over the way the database credentials are.
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-shipperminio}
+      MINIO_REGION: ${STORAGE_REGION:-ap-southeast-2}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      # curl is in the image, so this needs nothing the container does not already have.
+      # /minio/health/live is the liveness probe MinIO documents; it answers 200 only once
+      # the drive has been validated, which is the state `make up` is waiting for.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
 volumes:
   postgres-data:
   redis-data:
   kafka-data:
+  minio-data:

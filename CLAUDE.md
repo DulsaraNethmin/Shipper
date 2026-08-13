@@ -41,6 +41,7 @@ If something contradicts a document, the document wins — or the document needs
 | Database | PostgreSQL |
 | Cache / tokens / idempotency | Redis |
 | Events | Kafka |
+| Object storage | S3 — proof photographs and verification documents, private, reached only by short-lived pre-signed URL. MinIO in development, which speaks the same API |
 | Push | Firebase Cloud Messaging |
 | Cloud / observability | AWS / Datadog |
 
@@ -156,9 +157,19 @@ The flow:
 
 Catch up to `develop` before requesting a merge, and never request one with failing CI.
 
+**Never commit or merge while a gate is running. Run the gate, wait for it, then commit.** `make verify` and `make check` do not only read the tree, they *rewrite* parts of it — the check count in `Docs/11` §3 and `routes_golden.txt` are both files a gate produces — so a commit that races one captures a half-finished tree, and a gate that races a merge reads a half-finished one. Wave 5 paid in both directions in a single session: a gate overlapping a merge produced a **false failure** — a SHIP-79 verify failure and four phantom "declared done with no commit" tickets, on a tree where nothing was wrong — and a merge committed while its gates were still running produced a **false pass**, publishing a `develop` that carried a stale check count of 299 against a true 355 and a union-ordered route table. `ship-15j-wave-5-merge-repair` exists only to undo the second. A false failure costs an hour; a false pass ships.
+
 **Prefer `git merge develop` into the ticket branch over `git rebase` when the branch has touched a shared file.** Resolving a conflict in the route manifest or the error registry is exactly where a route or a code gets dropped, and a rebase rewrites history so the loss leaves no trace. A merge commit keeps the resolution reviewable. `git log --first-parent develop` still gives the one-line-per-ticket view either way.
 
 After resolving any conflict, re-run `make check` **and** look at the golden files — `services/core/cmd/api/routes_golden.txt` is the one that catches a silently dropped endpoint.
+
+**Expect that file to come back reordered rather than conflicted, and do not read a reorder as damage.** It is `merge=union`, which is what prevents a lost route: a union appends both sides in merge order, while the generator emits them sorted. So after a multi-branch wave the content is right and the order is wrong, and `TestRouteTableMatchesGolden` fails on a tree where nothing is missing. **Confirm the sorted set is unchanged, and only then regenerate:**
+
+```
+go test ./cmd/api -run TestRouteTableMatchesGolden -update
+```
+
+Confirming first is the part that matters. `-update` will just as happily bless a genuinely missing endpoint, which is the single failure this file exists to catch.
 
 ### Working in more than one branch at once
 
@@ -169,8 +180,10 @@ Each concurrent piece of work gets its own git worktree, never the primary tree.
 | Test database | **Leave `TEST_TEMPLATE_DB` unset.** The `Makefile` derives it from the directory name, and that is the whole isolation mechanism — `CREATE DATABASE … TEMPLATE` resolves at cluster scope, and every worktree shares one cluster. Two worktrees with the same template name are one database: `make test` in either drops it mid-clone in the other. `TEST_DATABASE_URL` does **not** isolate on a shared cluster, whatever an older version of this table said |
 | Ports | `HTTP_PORT` and `VERIFY_PORT` per worktree, likewise |
 | Compose | One shared stack. `COMPOSE_PROJECT_NAME` is pinned in the `Makefile` so worktrees do not each start their own and fight over 5432, 6379 and 29092 |
+| **Kafka** | **There is no isolation, and there is no equivalent to add.** One broker, one `shipper.job`, and **every worktree publishes into the same topics** — the shared stack is safe for PostgreSQL only because each tree gets its own database on the cluster, and a topic has no such split. So **on a Kafka topic a fence must be an id, not a timestamp**: a concurrent run in another worktree is not ordered against this one, and a `published_at > $fence` window contains that run's events as readily as your own. Wave 5 lost a run proving it — a count over a topic failed on a tree where nothing was wrong, and the count was right about what it saw |
+| **Object storage** | **`STORAGE_BUCKET` in `deploy/.env`, one per worktree — and this is the one shared service that genuinely can be split, which is why the row exists rather than repeating the Kafka one.** A bucket is a namespace the store makes on demand, so five trees get five buckets on one MinIO and never see each other's objects; a topic is created from the event catalogue, shared by every tree, and has no per-tree equivalent. `make up` creates whatever `STORAGE_BUCKET` names, so a tree that sets the line has isolation from its next `make up` and needs nothing else. **Unlike `TEST_TEMPLATE_DB` it is not derived from the directory**, so a tree that leaves it alone shares `shipper-dev` with every other tree that did — which is safe for keyed reads and writes and is not safe for a count or a listing. Set it, or fence on an id |
 | **`git stash`** | **Never.** The stash is shared across worktrees through one `.git`, and this repository already carries the scar — `CLAUDE.md` was committed with `Stashed changes` conflict markers in it |
-| Shared files | Do not edit from a domain branch: `cmd/api/routes.go`, `internal/boundaries/boundaries.go`, `internal/httpx/**`, `go.mod`, the root `Makefile`, migrations in the shared block, `CLAUDE.md`, `Docs/**`. See `Docs/10` §9.2 |
+| Shared files | Do not edit from a domain branch: `cmd/api/routes.go`, `internal/boundaries/boundaries.go`, `internal/httpx/**`, `go.mod`, the root `Makefile`, migrations in the shared block, `scripts/verify-foundation.sh`, `CLAUDE.md`, `Docs/**`. A domain's own `scripts/verify/<n>-<domain>.sh` is not shared — that is what the split is for. See `Docs/10` §9.2 |
 
 Because history is not squashed, `git log --oneline` shows every individual commit. For the one-line-per-ticket view, use:
 
@@ -203,10 +216,13 @@ Read the diff at the first gate, not the second — by the time work reaches a `
 All run from the repository root. `make` with no target lists them.
 
 ```
-make up             Start Postgres, Redis and Kafka, waiting until each is healthy
+make up             Start Postgres, Redis, Kafka and the object store, waiting until each
+                    is healthy, then create this worktree's bucket
 make down           Stop the stack, keeping data
 make reset          Stop the stack and destroy all data
 make ps / logs      Stack status; follow stack logs
+make storage-bucket Create this worktree's object-storage bucket, private. Idempotent, and
+                    already run by `make up`
 
 make migrate-up     Apply all pending migrations
 make migrate-down   Reverse the last migration (make migrate-down n=all for everything)
@@ -279,22 +295,29 @@ services/core/        Go — the versioned public API and domain
   internal/testsupport/ pgtest and redistest — real infrastructure for tests
   internal/validate/  field-level validation in the error contract's shape
   migrations/         SQL schema history, in reserved per-domain blocks
-deploy/               docker-compose for local Postgres, Redis, Kafka
-scripts/              verify-foundation.sh, check-spelling.sh
+deploy/               docker-compose for local Postgres, Redis, Kafka, MinIO
+scripts/              verify-foundation.sh — the acceptance harness; the checks are
+                      one file per milestone or domain in scripts/verify/, so a track
+                      adds a file and edits none. Also check-spelling.sh and
+                      delivery-status.sh
 mk/                   per-track make targets, glob-included by the root Makefile
 .github/workflows/    go.yml (SHIP-20); Flutter and the store pipelines follow
 ```
 
-The eight domain packages hold documentation and nothing else: no domain logic has been
-written. Their boundaries are enforced from now rather than from when they fill up, because
-`Docs/08` is right that they are almost impossible to reintroduce later.
+Two of the eight domain packages now hold logic — `identity` (passwords, tokens, sessions,
+rate limiting) and `jobs` (locations, the store, the handlers) — and the other six hold
+documentation and nothing else. Their boundaries were enforced from before they filled up,
+because `Docs/08` is right that they are almost impossible to reintroduce later, and the
+first two domains to fill have not needed to cross one.
 
 Adding a package directly under `internal/` fails the lint until it is classified as a
 domain or as infrastructure in `internal/boundaries/boundaries.go`. That is deliberate —
 it makes a ninth domain a decision someone recorded rather than something that happened.
 
-The infrastructure list is **seeded ahead of the code**: `pagination`, `ratelimit` and `money`
-are registered but not yet written. Whoever first needs one writes the package and edits
+The infrastructure list is **seeded ahead of the code**, and the mechanism has now been
+demonstrated rather than asserted: `ratelimit` (SHIP-47) and `pagination` (SHIP-66) were
+written in the same wave, in different lanes, **with no shared-file edit between them**. Only
+`money` remains registered and unwritten. Whoever first needs one writes the package and edits
 nothing shared. A domain that needs internal structure uses a sub-package — `internal/jobs/expiry`
 is attributed to `jobs`, may import it, and needs no registration.
 

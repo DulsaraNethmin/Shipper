@@ -203,4 +203,62 @@ void main() {
       );
     });
   });
+
+  group('a write whose answer is 204', () {
+    test('succeeds, where the JSON write would report the success as broken', () async {
+      // `POST /v1/auth/logout` answers 204 with an empty body, and the test above is what
+      // `postJson` would make of it: ApiMalformedResponse for a request that worked. Harmless
+      // while the only caller is fire-and-forget, and wrong the moment one is not.
+      final (:client, adapter: _) = _clientReturning((_) => ResponseBody.fromString('', 204));
+
+      await expectLater(
+        client.postNoContent('/v1/auth/logout', idempotencyKey: 'key-1'),
+        completes,
+      );
+    });
+
+    test("carries the caller's idempotency key and any header it was given", () async {
+      // The header is how the sign-out request carries the token it is about to discard. See
+      // `session_ender.dart`: it must not travel through the interceptor that reads the
+      // session's token, because that token is being cleared as this is sent.
+      final (:client, :adapter) = _clientReturning((_) => ResponseBody.fromString('', 204));
+
+      await client.postNoContent(
+        '/v1/auth/logout',
+        idempotencyKey: 'key-2',
+        headers: const <String, Object?>{ApiHeaders.bearer: 'Bearer abc'},
+      );
+
+      final sent = adapter.requests.single;
+      expect(sent.method, 'POST');
+      expect(sent.headers[ApiHeaders.idempotencyKey], 'key-2');
+      expect(sent.headers[ApiHeaders.bearer], 'Bearer abc');
+      expect(sent.data, isNull, reason: 'the endpoint takes no body; the token names the session');
+    });
+
+    test('is refused locally when no key was set, like every other write', () async {
+      final (:client, :adapter) = _clientReturning((_) => ResponseBody.fromString('', 204));
+
+      await expectLater(
+        client.postNoContent('/v1/auth/logout', idempotencyKey: ''),
+        throwsA(isA<StateError>()),
+      );
+      expect(adapter.requests, isEmpty);
+    });
+
+    test('maps a refusal onto the error contract rather than swallowing it', () async {
+      // What to do about a failure is the caller's decision. `SessionController` swallows this
+      // one deliberately and says why; the transport is not where that belongs.
+      final (:client, adapter: _) = _clientReturning(
+        (_) => _json({
+          'error': {'code': 'unauthenticated', 'message': 'Sign in to continue.'},
+        }, status: 401),
+      );
+
+      await expectLater(
+        client.postNoContent('/v1/auth/logout', idempotencyKey: 'key-3'),
+        throwsA(isA<ApiErrorResponse>()),
+      );
+    });
+  });
 }

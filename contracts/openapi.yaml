@@ -92,6 +92,65 @@ tags:
     description: |
       Endpoints the mobile client calls about itself rather than about a user — the upgrade
       gate, and anything else that must work before sign-in.
+  - name: Fleet
+    description: |
+      The vehicles a provider maintains. Every operation is the calling provider's own fleet —
+      there is no parameter for whose vehicles to read, and a vehicle belonging to another
+      provider is indistinguishable from one that does not exist.
+
+      Vehicles are deactivated, never deleted: one is named by the bid that won a job and by the
+      delivery that followed it.
+
+      It also holds what a provider declares about the work they take — the service area and
+      specialties an eligibility filter reads. A service area is a set of named regions, states and
+      postcodes, rather than a radius around a point.
+  - name: Jobs
+    description: |
+      The job lifecycle — drafting, publishing, tracking and closing a delivery job. Every
+      operation is authenticated, and a job is visible to its owning customer, to providers only
+      once it is published, and to the awarded provider's driver only through a job-scoped token.
+
+      The customer's maximum budget never appears in any provider-facing shape (Docs/01 §4.3).
+  - name: Bidding
+    description: |
+      What a provider offers against a job, and what the customer eventually awards.
+
+      Two privacy rules govern this surface and they are separate. The customer's maximum budget
+      never reaches a provider in any form — not an amount, not a band, not a "budget supplied"
+      indicator (Docs/01 §4.3). And one provider never sees another provider's offer or its price: a
+      bid is visible to the provider who made it, the customer who received it, and administrators,
+      never to a competitor (Docs/02 §4).
+
+      Exactly one bid per job can be accepted, and that is a database constraint rather than an
+      application rule (Docs/02 §3).
+  - name: Delivery
+    description: |
+      Execution and proof, from the moment a provider names a driver through to completion. Every
+      operation here is the awarded provider's own work.
+
+      The assigned driver never holds a session. Their portal is link-authenticated, and the
+      job-scoped token they carry is a separate system that grants exactly one job and cannot be
+      exchanged for a user token in either direction (Docs/10 §5).
+  - name: Disputes
+    description: |
+      Reporting that a delivery went wrong (Docs/04 §7).
+
+      Intake is called by a party to the job — the customer who owns it, or the provider whose bid
+      was accepted — and by nobody else. Raising a dispute freezes the job, which is what stops the
+      72-hour auto-complete running through an unresolved complaint; an administrator resolving it
+      is what unfreezes it.
+
+      The investigation and outcome stages are administrative and sit behind a separate credential
+      that a user token can never reach. Internal support notes are never user-visible and appear
+      in no shape here.
+  - name: Identity
+    description: |
+      Registration, verification, credentials and sessions.
+
+      Everything up to and including sign-in is public, because each of those is how a caller
+      obtains their own credentials — an endpoint that takes a verification code sent to a
+      phone cannot require the session that verifying the phone leads to. The operations that
+      manage a session once it exists require one, and say so with a `security` block.
 
 # One $ref per domain. Adding a domain adds one line here and one file under paths/.
 #
@@ -119,6 +178,72 @@ paths:
     $ref: './paths/service.yaml#/APIRoot'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
+  /v1/auth/login:
+    $ref: './paths/identity.yaml#/Login'
+  /v1/auth/logout:
+    $ref: './paths/identity.yaml#/Logout'
+  /v1/auth/refresh:
+    $ref: './paths/identity.yaml#/Refresh'
+  /v1/auth/register:
+    $ref: './paths/identity.yaml#/Register'
+  /v1/auth/request-otp:
+    $ref: './paths/identity.yaml#/RequestOTP'
+  /v1/auth/resend-verify:
+    $ref: './paths/identity.yaml#/ResendVerify'
+  /v1/auth/sessions:
+    $ref: './paths/identity.yaml#/Sessions'
+  /v1/auth/sessions/{id}:
+    $ref: './paths/identity.yaml#/SessionByID'
+  /v1/auth/verify-email:
+    $ref: './paths/identity.yaml#/VerifyEmail'
+  /v1/auth/verify-phone:
+    $ref: './paths/identity.yaml#/VerifyPhone'
+  /v1/driver/jobs/{id}:
+    $ref: './paths/delivery.yaml#/DriverJob'
+  /v1/fleet/profile:
+    $ref: './paths/fleet.yaml#/Profile'
+  /v1/fleet/vehicles:
+    $ref: './paths/fleet.yaml#/Vehicles'
+  /v1/fleet/vehicles/{id}:
+    $ref: './paths/fleet.yaml#/VehicleByID'
+  /v1/fleet/vehicles/{id}/deactivate:
+    $ref: './paths/fleet.yaml#/DeactivateVehicle'
+  /v1/fleet/vehicles/{id}/reactivate:
+    $ref: './paths/fleet.yaml#/ReactivateVehicle'
+  /v1/jobs:
+    $ref: './paths/jobs.yaml#/Jobs'
+  /v1/jobs/open:
+    $ref: './paths/fleet.yaml#/OpenJobs'
+  /v1/jobs/open/{id}:
+    $ref: './paths/fleet.yaml#/OpenJobByID'
+  /v1/jobs/{id}:
+    $ref: './paths/jobs.yaml#/JobByID'
+  /v1/jobs/{id}/award:
+    $ref: './paths/bidding.yaml#/AwardJob'
+  /v1/jobs/{id}/bids:
+    $ref: './paths/bidding.yaml#/Bids'
+  /v1/jobs/{id}/bids/{bid_id}:
+    $ref: './paths/bidding.yaml#/BidByID'
+  /v1/jobs/{id}/bids/{bid_id}/counter:
+    $ref: './paths/bidding.yaml#/CounterOffer'
+  /v1/jobs/{id}/bids/{bid_id}/history:
+    $ref: './paths/bidding.yaml#/BidHistory'
+  /v1/jobs/{id}/bids/{bid_id}/withdraw:
+    $ref: './paths/bidding.yaml#/WithdrawBid'
+  /v1/jobs/{id}/cancel:
+    $ref: './paths/jobs.yaml#/CancelJob'
+  /v1/jobs/{id}/delivery/proof:
+    $ref: './paths/delivery.yaml#/ProofOnJob'
+  /v1/jobs/{id}/disputes:
+    $ref: './paths/admin.yaml#/Disputes'
+  /v1/jobs/{id}/driver:
+    $ref: './paths/delivery.yaml#/AssignDriver'
+  /v1/jobs/{id}/extend:
+    $ref: './paths/jobs.yaml#/ExtendJob'
+  /v1/jobs/{id}/milestones:
+    $ref: './paths/delivery.yaml#/Milestones'
+  /v1/jobs/{id}/proof-uploads:
+    $ref: './paths/delivery.yaml#/ProofUploads'
 
 components:
   schemas:
@@ -149,6 +274,24 @@ components:
         **The driver portal's token is a different system and is never accepted here.** It
         carries its own audience and its own key material, and neither can be exchanged for the
         other (`Docs/10` §5).
+
+    BearerDriverToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        The driver's job-scoped link (SHIP-107, SHIP-108). HS256 under **its own signing keys**,
+        `aud=shipper-driver`, seven days, and it names exactly one job.
+
+        It is issued by `POST /v1/jobs/{id}/driver` and obtainable nowhere else — the awarded
+        provider forwards it, because Shipper sends no SMS in the MVP (`Docs/01` §4.5). There is no
+        refresh and no account behind it: a driver has neither, so this is the whole of their
+        access, and when it expires the provider issues another.
+
+        **It grants one job and nothing else.** Presenting it on any other job answers `404`, the
+        same as a job that does not exist. Presenting it on an operation secured with
+        `BearerAccessToken` answers `401`, and presenting a mobile access token here answers `401`
+        too — the two systems cannot be exchanged in either direction (`Docs/10` §5).
 
   responses:
     BadRequest:

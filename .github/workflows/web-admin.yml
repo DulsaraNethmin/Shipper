@@ -1,0 +1,104 @@
+# SHIP-23a — lint, type-check and build for the admin panel (SHIP-22).
+#
+# One workflow per web surface, as .github/workflows/README.md anticipated. The split is the
+# ticket: a change under apps/admin/ starts this and nothing else, a change under
+# apps/driver-portal/ starts the other one, and **a change under services/core/ starts neither**
+# — which is the whole reason the filters exist. Docs/08 Step 1 puts macOS runners at roughly
+# ten times Linux minutes, and every workflow that runs when it did not need to is paying
+# somewhere.
+#
+# The filter includes this file, because a workflow that ignores its own definition will not
+# re-run when that definition is fixed. It includes the workspace files as well: pnpm-lock.yaml,
+# pnpm-workspace.yaml and the root package.json decide what every surface resolves to, so a
+# change to one of them is a change to this application whether or not its own directory moved.
+#
+# It does **not** list `mk/**` the way the Go workflow does. That glob covers mk/flutter.mk, and
+# a change to the Flutter client's make targets has no bearing on a Next.js build.
+name: Admin panel
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "apps/admin/**"
+      - ".github/workflows/web-admin.yml"
+      - "mk/web.mk"
+      - "Makefile"
+      - "package.json"
+      - "pnpm-workspace.yaml"
+      - "pnpm-lock.yaml"
+  pull_request:
+    paths:
+      - "apps/admin/**"
+      - ".github/workflows/web-admin.yml"
+      - "mk/web.mk"
+      - "Makefile"
+      - "package.json"
+      - "pnpm-workspace.yaml"
+      - "pnpm-lock.yaml"
+
+# A second push to the same branch supersedes the first, matching the Go and Flutter workflows.
+# Cancelling saves minutes and stops a stale red run sitting next to a fresh green one.
+concurrency:
+  group: web-admin-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # Both workflows run `make web-check` over the whole workspace, so this one runs the driver
+    # portal's tests too even though the admin panel has none of its own yet. The name follows the
+    # target rather than the surface, for the same reason it does in web-driver-portal.yml.
+    name: lint, test, build, typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the major the root package.json's `engines` field requires. "latest" would
+      # move the runtime under the applications on a day nobody chose.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # pnpm is never installed as a version of its own. Corepack ships with Node and reads
+      # `packageManager` from the root package.json, so this runner uses exactly the pnpm every
+      # developer uses — the reasoning is in mk/web.mk, and duplicating a version number here
+      # would be a second place for it to be wrong.
+      - name: pnpm, at the version package.json pins
+        run: corepack enable
+
+      - name: locate the pnpm store
+        id: store
+        run: echo "path=$(corepack pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      # --frozen-lockfile, so an install that would change the lockfile fails instead. Two
+      # branches that each add a dependency must resolve that deliberately, which is the same
+      # argument Docs/10 §9.2 makes on the Go side.
+      - name: install exactly what the lockfile pins
+        run: make web-install
+
+      # `make web-check` rather than a list of steps, for the reason
+      # .github/workflows/README.md gives about the Go workflow: a workflow that reimplements
+      # what a make target already does drifts from it, and the check that gets dropped is
+      # always the one only CI was running.
+      #
+      # It covers both web surfaces, because mk/web.mk drives pnpm with `-r` across the
+      # workspace and names no application — deliberately, so that a third surface is a line in
+      # pnpm-workspace.yaml and no edit anywhere else. So a change here also checks the driver
+      # portal. That is redundancy rather than a gap, and narrowing it would need an `app=`
+      # aware target in mk/web.mk; the saving worth having is against Go and Flutter changes,
+      # and the `paths:` filter above already collects it.
+      - name: make web-check
+        run: make web-check
+
+      - name: Australian English
+        run: ./scripts/check-spelling.sh

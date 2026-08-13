@@ -1,0 +1,949 @@
+# Jobs — creating and editing a delivery job, and everything else in the job lifecycle.
+#
+# The counterpart of cmd/api/routes_jobs.go. Docs/10 §8.1 keeps the two in step: a domain adds one
+# route file and one fragment, and edits neither this file's siblings nor the middle of a shared
+# document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence
+# for the contract to describe less than the service returns.
+#
+# # The budget is here, and it is here because every operation in this document is owner-only
+#
+# Docs/01 §4.3 keeps the customer's maximum private from providers — not as an amount, not as a
+# band, and not as a "budget supplied" indicator. Every path below requires a credential and
+# answers only about the caller's own jobs, so `budget_cents` is safe on these specifically
+# (SHIP-67).
+#
+# **A provider-facing operation must not describe it.** SHIP-82's job feed and SHIP-83's provider
+# job detail get schemas of their own rather than a variant of `Job` with one field removed,
+# because a shape with a redaction step somebody has to remember is the arrangement this rule is
+# hardest to keep with. TestOnlyTheOwnersResponseCarriesTheBudget refuses the field on any Go type
+# but the owner's response; this document is the same statement in the other language.
+#
+# # Status is returned and is never accepted
+#
+# Job status is not a settable field (Docs/02 §2). No request schema below has one, and every
+# request schema is `additionalProperties: false`, so a client that sends `"status": "open"` is
+# told the field does not exist rather than having it quietly ignored.
+
+Jobs:
+  get:
+    operationId: listJobs
+    summary: List the customer's own jobs
+    tags: [Jobs]
+    description: |
+      The authenticated customer's jobs, newest first (SHIP-66).
+
+      **There is no parameter for whose jobs to list.** The owner is whoever the token says is
+      calling, so there is no filter here to forget and no way to widen the query by asking.
+
+      Each entry is the same `Job` schema the detail operation returns, whole rather than
+      summarised — a summary shape would be a second thing to keep in step, and the fields it
+      would drop are the ones a draft usually has none of and that are already omitted when
+      empty.
+
+      ## Paging
+
+      Keyset, not offset (Docs/10 §4.5). Pass `cursor` back exactly as it was received; it is
+      opaque and this endpoint is the only thing that can read it. Offset paging duplicates and
+      skips rows when the set changes between pages, and a customer creating a job while paging
+      through their list is not hypothetical.
+
+      `has_more` says whether asking again would return anything. A `limit` above the maximum is
+      narrowed to it rather than refused, so raising the maximum later cannot break a client.
+    parameters:
+      - $ref: '#/StatusFilter'
+      - $ref: '#/Limit'
+      - $ref: '#/CursorParameter'
+    responses:
+      '200':
+        description: |
+          One page of jobs. `data` is an empty array when the customer has none — never `null`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/JobPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+  post:
+    operationId: createJob
+    summary: Create a job draft
+    tags: [Jobs]
+    description: |
+      Creates a job in `draft`, owned by the authenticated customer (SHIP-61).
+
+      **The owner is whoever the token says is calling.** There is no field for naming a
+      customer, because that would be an authorisation decision made from client input, which
+      Docs/07 §3 puts on the platform.
+
+      **Every field is optional.** Docs/01 §4.1 lets a customer save a draft and come back to
+      it, and the app captures a job over several steps (SHIP-71…75), so an empty body is a
+      legitimate "start a job for me". What is checked is that whatever *was* supplied is well
+      formed. Completeness is decided at publication (SHIP-63).
+
+      Only a customer account may create a job. A provider presenting a valid token is refused
+      with `jobs_customer_only` — the rule is enforced against the account's stored role, not
+      against the role claim in the token.
+
+      ## Addresses
+
+      A supplied address is validated and normalised, and then resolved to a coordinate where
+      the platform can. **A failed lookup does not fail the job** (SHIP-59a): the address is
+      stored exactly as typed, `coordinate` is absent from the response, and publication is
+      unaffected. Clients must not treat a missing coordinate as an error.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobDraft'
+    responses:
+      '201':
+        description: The draft was created.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The account is not a customer account (`jobs_customer_only`). Providers bid on jobs;
+          they do not publish them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one
+          entry per offending field, with a dotted path such as `pickup.postcode`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`). Unlike
+          `internal_error` it means try again.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+JobByID:
+  get:
+    operationId: getJob
+    summary: Read a job
+    tags: [Jobs]
+    description: |
+      Returns a job in full, to the customer who owns it (SHIP-65).
+
+      **The same schema the create and edit operations answer with.** A client parses one type
+      whatever it did to obtain the job; a "detail" shape carrying a field or two more would
+      make those responses a subset every client has to special-case.
+
+      **A job belonging to another customer answers `404`, not `403`**, byte-identically to a
+      job that does not exist. A draft is visible to nobody but its owner, and a published job
+      reaches a provider through a shape of its own (SHIP-82, SHIP-83) rather than through this
+      one.
+
+      This is the customer's view, so it carries everything the customer supplied — the budget
+      included (SHIP-67), which no provider-facing shape may repeat.
+    parameters:
+      - $ref: '#/JobID'
+    responses:
+      '200':
+        description: The job, in full.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+  patch:
+    operationId: updateJobDraft
+    summary: Edit a job draft
+    tags: [Jobs]
+    description: |
+      Applies a partial edit to a draft the caller owns (SHIP-62).
+
+      `PATCH` rather than `PUT`, because the app edits one step of the job wizard at a time and
+      a `PUT` would require it to send every field it is not changing — which is how a client
+      that has not been updated for a new field silently clears it.
+
+      ## Absent, null and empty are three different things
+
+      | The client sends | The platform does |
+      |---|---|
+      | the field omitted, or `null` | leaves it as it was |
+      | an empty value — `""`, `0`, `{}` | clears it |
+      | a value | sets it |
+
+      The middle row is not decoration: without it a customer could add a handling note and
+      never remove it, because `""` would be indistinguishable from not mentioning it.
+
+      An address is replaced as a whole rather than merged part by part, so
+      `{"pickup": {"suburb": "Newtown"}}` is an incomplete address and is rejected. Merging
+      would let an edit produce an address made of two different places with no error reported.
+      **A replaced address discards its coordinate and is resolved again**, because a
+      coordinate belonging to a previous address would send a driver to the previous place.
+
+      A request that names no field at all is refused with `bad_request`.
+
+      ## What is refused
+
+      **Only a draft can be edited.** A job that has been published carries bids made against
+      the details as they were, so an edit is refused with `jobs_not_a_draft` and a `409`. The
+      client's correct response is to reload the job and show its real status.
+
+      **A job belonging to another customer answers `404`, not `403`.** A draft is visible to
+      nobody but its owner, so confirming that a job with that id exists would disclose
+      something the caller had no way to obtain. `not_found` and "none of your business" are
+      deliberately indistinguishable.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobDraft'
+    responses:
+      '200':
+        description: The draft was updated, and is returned in full.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          The job has left `draft` and can no longer be edited (`jobs_not_a_draft`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one
+          entry per offending field.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+CancelJob:
+  post:
+    operationId: cancelJob
+    summary: Cancel a job
+    tags: [Jobs]
+    description: |
+      Ends a job the caller owns, before it has been awarded (SHIP-64).
+
+      **A verb under the resource rather than a field on the job.** Job status is not settable
+      (Docs/02 §2): a client names an intent and the platform decides what the state becomes.
+      No request schema in this document has a `status` field and none ever will.
+
+      ## What can be cancelled
+
+      A job in `draft`, `open` or `negotiating`. Docs/02 §2 permits nothing else towards
+      `cancelled` from a customer, so once a bid has been awarded the answer is
+      `jobs_not_cancellable` and a `409` — ending the job is then a support matter, and after
+      pickup it is a dispute (Docs/02 §6.2).
+
+      ## Cancelling an already-cancelled job succeeds
+
+      It answers `200` with the job and records nothing further: no second transition, no
+      second event. Retrying with the *same* `Idempotency-Key` replays the original response;
+      this covers the other case, where a phone lost its connection, was restarted, and
+      generated a fresh key for the same intent. Docs/02 §3.1 asks for a queued update that has
+      been overtaken to be absorbed rather than reported as an error.
+
+      **A job belonging to another customer answers `404`, not `403`** — see the note on
+      editing a draft.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      description: |
+        Required, though every field in it is optional: send `{}` when there is nothing to say.
+        The API takes a JSON body on every state-changing request, and one endpoint excepted
+        from that is a second answer to what a request looks like.
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobCancellation'
+    responses:
+      '200':
+        description: |
+          The job is cancelled, and is returned in full. Also the answer when it already was.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          Docs/02 §2 has no route from this job's status to `cancelled`
+          (`jobs_not_cancellable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The reason was rejected (`validation_failed`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ExtendJob:
+  post:
+    operationId: extendJob
+    summary: Extend an expiring job
+    tags: [Jobs]
+    description: |
+      Gives a job that is about to stop being offered more time on the market (SHIP-70).
+
+      Docs/02 §6.3 warns the customer forty-eight hours before a job expires and lets them
+      "extend in one action". This is that action, and it is a single call with an empty body.
+
+      ## The client does not say how long
+
+      `JobExtension` has no fields, and that is deliberate rather than unfinished. The new
+      deadline is the platform's to compute, on the same rule that set the original one: **the
+      earlier of fourteen days from now and the job's pickup window ending.** A client that could
+      name its own deadline could keep a listing alive for a decade, which is the stale-listing
+      problem Docs/02 §6.3 exists to prevent, arriving by another route.
+
+      A field this endpoint does not accept is reported rather than ignored, so a client that
+      sends `{"days": 30}` is told. A client that believed it had bought thirty days and silently
+      received fourteen would have no way to tell from a successful response.
+
+      ## Extending is not a status change
+
+      The job is `open` before and `open` after. Nothing is written to its status history, and
+      Docs/02 §2 has no transition for it; only `expires_at` moves. The warning is re-armed with
+      it, so the customer is told again forty-eight hours before the new deadline (SHIP-69).
+
+      ## When it cannot be extended
+
+      Two conditions answer `409` with `jobs_not_extendable`, and they share a code because the
+      client's response to both is the same — reload and offer what is actually available:
+
+      - the job is not `open`, so no deadline is ending it;
+      - the job's **pickup date** is what ends it rather than the listing period. Docs/02 §6.3
+        makes the pickup date the operative rule: "a job whose pickup window has gone is dead
+        regardless of how recently it was posted", and extra listing time in front of providers
+        advertising a collection date that has passed is worse than letting the job expire.
+
+      There is no limit on how many times a job may be extended. Every job with a pickup window
+      is bounded by it; a job without one is the distant-date case the fourteen-day backstop
+      exists for.
+
+      **A job belonging to another customer answers `404`, not `403`** — see the note on
+      editing a draft.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      description: |
+        Required, and empty: send `{}`. The API takes a JSON body on every state-changing
+        request, and one endpoint excepted from that is a second answer to what a request looks
+        like.
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobExtension'
+    responses:
+      '200':
+        description: |
+          The job is extended, and is returned in full with its new `expires_at`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          The job is not being offered, or its pickup date rather than its listing period is
+          what ends it (`jobs_not_extendable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- parameters --------------------------------------------------------------------------------
+
+JobID:
+  name: id
+  in: path
+  required: true
+  description: The job's identifier, as returned by the endpoint that created it.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+
+StatusFilter:
+  name: status
+  in: query
+  required: false
+  description: |
+    Narrow the list to one status. Absent means every status.
+
+    One value rather than several, because a client that wants the whole picture — the app
+    groups the customer's jobs by status — is better served by reading the list once than by one
+    request per group.
+  schema:
+    $ref: '#/JobStatus'
+
+Limit:
+  name: limit
+  in: query
+  required: false
+  description: |
+    How many jobs to return. Absent is 20; anything above 100 is narrowed to 100 rather than
+    refused, so raising the maximum later cannot break a client. A value that is not a whole
+    number of at least 1 is refused, because that is a client defect rather than a request.
+  schema:
+    type: integer
+    minimum: 1
+    maximum: 100
+    default: 20
+  example: 20
+
+CursorParameter:
+  name: cursor
+  in: query
+  required: false
+  description: |
+    A position in the list, from the `next_cursor` of a previous page. **Opaque** — pass back
+    exactly what was received. Its contents are this endpoint's business and its encoding may
+    change; a cursor from an encoding no longer served is refused rather than misread.
+  schema:
+    type: string
+  example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a phone that
+    retries after a dropped connection must not end up with two jobs.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
+
+# --- request schemas ---------------------------------------------------------------------------
+
+JobDraft:
+  type: object
+  additionalProperties: false
+  description: |
+    The fields of a job draft. Used by both operations: a field a customer can set at creation
+    is a field they can change afterwards, and two schemas would be two places for that list to
+    drift.
+
+    There is no `status` field and there will not be one. Job status is not settable; it moves
+    only through the transitions in Docs/02 §2.
+  properties:
+    pickup:
+      $ref: '#/Address'
+    dropoff:
+      $ref: '#/Address'
+    goods_description:
+      type: string
+      maxLength: 2000
+      description: What is being moved, in the customer's own words.
+      example: Two-seater sofa, wrapped, no legs attached
+    length_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: Centimetres. `0` clears the value.
+      example: 190
+    width_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: Centimetres. `0` clears the value.
+      example: 90
+    height_cm:
+      type: integer
+      minimum: 0
+      maximum: 3000
+      description: Centimetres. `0` clears the value.
+      example: 85
+    weight_kg:
+      type: number
+      minimum: 0
+      maximum: 100000
+      description: Kilograms, to two decimal places. `0` clears the value.
+      example: 45.5
+    vehicle_requirement:
+      type: string
+      maxLength: 200
+      description: |
+        What the customer believes the job needs, in their own words — "van", "ute with a
+        tailgate lifter". Free text today; the capability vocabulary belongs to the fleet
+        domain (SHIP-79) and this field is validated against it when that list exists.
+      example: Ute with a tailgate lifter
+    handling_notes:
+      type: string
+      maxLength: 2000
+      description: |
+        Anything the driver needs to know — access constraints, stairs, gate codes, "ring
+        ahead". Docs/01 §4.3 notes that detail of this kind does more for bid accuracy than a
+        budget signal would.
+      example: |
+        Second-floor walk-up, no lift. Buzzer 4B, ring ahead.
+    pickup_window:
+      $ref: '#/TimeWindow'
+    dropoff_window:
+      $ref: '#/TimeWindow'
+    budget_cents:
+      type: integer
+      minimum: 0
+      maximum: 100000000
+      description: |
+        The customer's own maximum, in **cents**, AUD. Optional; `0` clears it (SHIP-67).
+
+        Minor units as a whole number rather than dollars as a decimal, because money is never
+        a float in this platform (Docs/10 §3.3) and a JSON number written as `1500.50` is one.
+        The name carries the unit, because a field called `budget` holding `150000` is a field
+        somebody eventually reads as dollars.
+
+        **Never disclosed to a provider, in any form** — not as an amount, not as a band, and
+        not as a "budget supplied" indicator (Docs/01 §4.3). It is used on the customer's own
+        side, to compare the bids they receive. Providers judge a job by its detail: the
+        dimensions, the access constraints and the handling notes do more for bid accuracy than
+        a budget signal would.
+      example: 150000
+
+JobCancellation:
+  type: object
+  additionalProperties: false
+  description: |
+    Why the customer is cancelling. Every field is optional — `{}` is a complete request.
+  properties:
+    reason:
+      type: string
+      maxLength: 500
+      description: |
+        Free text, recorded against the transition in the job's history and read by support
+        rather than by a driver. A customer abandoning their own draft owes nobody an
+        explanation, so this is never required of them; Docs/01 §3 requires one only of an
+        administrator changing a commercial record.
+      example: Found a cheaper option elsewhere.
+
+JobExtension:
+  type: object
+  additionalProperties: false
+  description: |
+    Nothing. `{}` is the whole request.
+
+    An extension takes no period, because the new deadline is the platform's to compute — see the
+    operation's description. The empty object is still required: `additionalProperties: false`
+    means a client that sends a period is told the field does not exist rather than having it
+    quietly ignored, which is the failure worth reporting here.
+  properties: {}
+
+Address:
+  type: object
+  additionalProperties: false
+  description: |
+    An Australian address in the four parts a form collects. Replaced as a whole on `PATCH`,
+    never merged part by part.
+
+    Supply all four or none. A partly filled address is rejected with one `required` entry per
+    missing part; an entirely absent one is fine, because a draft is allowed to be incomplete.
+  properties:
+    line:
+      type: string
+      maxLength: 200
+      description: |
+        The street part, freeform. Unit numbers, level numbers, lot numbers, PO boxes and
+        roadside mail boxes are all legitimate and none is parsed.
+      example: 12 Smith Street
+    suburb:
+      type: string
+      maxLength: 100
+      example: Newtown
+    state:
+      type: string
+      description: |
+        An Australian state or territory. Accepted in any case and as the spelled-out name —
+        `nsw`, `NSW` and `New South Wales` are the same value — and always returned as the
+        upper-case abbreviation, which is its canonical form.
+
+        This is the one enum in the API that is not lower snake case on the wire (Docs/10
+        §4.7). A client does not branch on the state, it prints it, and `nsw` would have every
+        client upper-casing it back.
+      example: NSW
+    postcode:
+      type: string
+      pattern: '^[0-9]{4}$'
+      description: |
+        Four digits, leading zero kept — `0800` is Darwin. Whether the postcode belongs to the
+        state is deliberately not checked: the allocations have exceptions and change when
+        Australia Post says they do.
+      example: '2042'
+
+TimeWindow:
+  type: object
+  additionalProperties: false
+  description: |
+    When something may happen. A window rather than an instant, because road transport is not
+    scheduled to the minute and a customer who says "Tuesday or Wednesday" gets more bids than
+    one who says "10:15".
+
+    Either end may be given on its own. `end` must not be before `start`.
+  properties:
+    start:
+      type: string
+      format: date-time
+      description: RFC 3339. An empty string clears it.
+      example: '2026-08-14T09:00:00+10:00'
+    end:
+      type: string
+      format: date-time
+      description: RFC 3339. An empty string clears it.
+      example: '2026-08-15T17:00:00+10:00'
+
+# --- response schemas --------------------------------------------------------------------------
+
+Job:
+  type: object
+  required: [id, status, created_at, updated_at]
+  additionalProperties: false
+  description: |
+    A job as its owner sees it.
+
+    Everything optional is **omitted rather than sent empty**, because a draft is mostly empty
+    for most of its life and a response full of `""` and `0` says nothing about which fields the
+    customer has actually filled in.
+
+    This is the customer's view, and since SHIP-67 it is the one shape in this API that carries
+    `budget_cents`. There is no provider view of a job yet; when one arrives (SHIP-82, SHIP-83)
+    it is a separate schema rather than this one with a field hidden, because Docs/01 §4.3's
+    budget rule is much easier to keep with two shapes than with one and a redaction step
+    somebody has to remember.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    status:
+      $ref: '#/JobStatus'
+    pickup:
+      $ref: '#/Location'
+    dropoff:
+      $ref: '#/Location'
+    goods_description:
+      type: string
+      example: Two-seater sofa, wrapped, no legs attached
+    length_cm:
+      type: integer
+      example: 190
+    width_cm:
+      type: integer
+      example: 90
+    height_cm:
+      type: integer
+      example: 85
+    weight_kg:
+      type: number
+      example: 45.5
+    vehicle_requirement:
+      type: string
+      example: Ute with a tailgate lifter
+    handling_notes:
+      type: string
+      example: Second-floor walk-up, no lift.
+    pickup_window:
+      $ref: '#/TimeWindowResponse'
+    dropoff_window:
+      $ref: '#/TimeWindowResponse'
+    budget_cents:
+      type: integer
+      description: |
+        The customer's own maximum, in cents, AUD. Omitted when none was supplied (SHIP-67).
+
+        **This schema is the customer's view of their own job, and it is the only shape in this
+        API that carries the budget.** Docs/01 §4.3 keeps it private from providers in every
+        form; SHIP-82's feed and SHIP-83's provider job detail describe a job without it.
+      example: 150000
+    expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the job stops being offered: the earlier of fourteen days after publication and its
+        pickup window ending (Docs/02 §6.3, SHIP-68). **Omitted while the job is a draft** —
+        the clock starts at publication, and a draft may be saved and returned to indefinitely.
+
+        A job that reaches this instant while still `open` is moved to `cancelled` by the
+        platform, with the transition recorded like any other. The customer is warned forty-eight
+        hours ahead (SHIP-69) and can extend it in one call (SHIP-70).
+      example: '2026-08-25T03:30:00.000Z'
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T03:30:00.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T03:34:12.000Z'
+
+JobPage:
+  type: object
+  required: [data, has_more]
+  additionalProperties: false
+  description: |
+    One page of a collection, in the envelope Docs/10 §4.5 gives every list in this API. A single
+    resource is returned as a bare object, so a client can tell the two apart without knowing the
+    endpoint.
+  properties:
+    data:
+      type: array
+      description: |
+        The jobs, newest first. An **empty array** when there are none — never `null`, so a
+        client can iterate it without checking.
+      items:
+        $ref: '#/Job'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` to fetch the next page. Absent on the last page.
+      example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
+    has_more:
+      type: boolean
+      description: |
+        Whether asking again with `next_cursor` would return anything. Always present, and
+        carried rather than inferred from the cursor's absence — which is also what the first
+        request looks like.
+      example: false
+
+JobStatus:
+  type: string
+  description: |
+    One of the twelve statuses in Docs/02 §1, in lower snake case (Docs/10 §4.7). The stored
+    form has spaces and sentence case; this is the wire form, and it is what clients branch on.
+
+    A job is created as `draft` and reaches every other status through a guarded transition. It
+    is never a settable field.
+  enum:
+    - draft
+    - open
+    - negotiating
+    - awarded
+    - driver_assigned
+    - en_route_to_pickup
+    - picked_up
+    - in_transit
+    - delivered
+    - completed
+    - cancelled
+    - disputed
+  example: draft
+
+Location:
+  type: object
+  required: [line, suburb, state, postcode]
+  additionalProperties: false
+  description: An address and, where the platform could resolve it, where it is.
+  properties:
+    line:
+      type: string
+      example: 12 Smith Street
+    suburb:
+      type: string
+      example: Newtown
+    state:
+      type: string
+      example: NSW
+    postcode:
+      type: string
+      example: '2042'
+    coordinate:
+      $ref: '#/Coordinate'
+
+Coordinate:
+  type: object
+  required: [latitude, longitude]
+  additionalProperties: false
+  description: |
+    Where the address resolved to.
+
+    **Absent when it did not resolve**, rather than zeroed. A client cannot then mistake
+    (0, 0) — a real point in the Gulf of Guinea — for a place, and does not have to carry a
+    `resolved` flag beside two numbers it must remember to ignore. A missing coordinate is an
+    ordinary outcome and never an error (SHIP-59a).
+  properties:
+    latitude:
+      type: number
+      example: -33.896
+    longitude:
+      type: number
+      example: 151.179
+    formatted:
+      type: string
+      description: |
+        The geocoder's own rendering of the place it matched, which is not always what the
+        customer typed. Useful for confirming the platform understood the address; omitted when
+        the provider supplied none.
+      example: 12 Smith Street, Newtown NSW 2042
+
+TimeWindowResponse:
+  type: object
+  additionalProperties: false
+  description: A date window, with either end omitted when it was not given.
+  properties:
+    start:
+      type: string
+      format: date-time
+      example: '2026-08-14T09:00:00.000Z'
+    end:
+      type: string
+      format: date-time
+      example: '2026-08-15T17:00:00.000Z'

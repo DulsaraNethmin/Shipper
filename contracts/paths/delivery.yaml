@@ -1,0 +1,1152 @@
+# Delivery — putting a driver on an awarded job, and everything that follows it.
+#
+# The counterpart of cmd/api/routes_delivery.go. Docs/10 §8.1 keeps the two in step: a domain adds
+# one route file and one fragment, and edits neither this file's siblings nor the middle of a shared
+# document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence for
+# the contract to describe less than the service returns.
+#
+# # Two callers, two credentials, and they are never the same credential
+#
+# `AssignDriver` and `Milestones` are the awarded provider, holding an ordinary mobile access token
+# (`BearerAccessToken`) and acting on their own work.
+#
+# `DriverJob` is the driver, holding the job-scoped link the provider forwarded
+# (`BearerDriverToken`). The assigned driver never holds a session: their portal is
+# link-authenticated (Docs/07 §3) and their token is a separate system with its own key material and
+# its own audience, granting exactly one job (Docs/10 §5).
+#
+# **Neither credential works on the other's operations, and both directions answer `401`.** That is
+# not a convention this document is describing — it is checked by the platform in both directions,
+# demonstrated over HTTP by `scripts/verify/70-delivery.sh`, and it is why `AssignDriver` can hand a
+# provider a credential (SHIP-107) without that credential being any use to them.
+#
+# # There is no field for whose job and none for who is assigning
+#
+# The job is named in the path and the caller is whoever the credential says they are — the platform
+# checks that pair against the job's accepted bid, or, on the driver route, against the job inside
+# the link. A `provider_id` in a request body would be an authorisation decision made from client
+# input, which Docs/07 §3 puts on the platform.
+
+AssignDriver:
+  post:
+    operationId: assignDriver
+    summary: Put a driver on an awarded job
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Names the driver carrying the job and moves the job to `driver_assigned` (SHIP-106).
+
+      Only the provider whose bid the customer accepted may call it. A job awarded to somebody
+      else, and a job that does not exist, answer `404` identically — which jobs a competitor won
+      is commercial information they never published.
+
+      ## Nominating somebody, or driving it yourself
+
+      Docs/02 §1 has one status for both — "provider has nominated a driver or self-assigned" — and
+      they are one request:
+
+      ```json
+      { "driver_name": "Sam Patel", "driver_mobile": "0412 345 678" }
+      { "driver_name": "Ravi Chandra", "self": true }
+      ```
+
+      `self` fills the mobile from the number on your account, which the platform has verified.
+      It does not fill in the name: no account carries one yet. Sending `self` *and* a
+      `driver_mobile` is refused rather than resolved either way, because a self-assignment that
+      quietly ignored the number supplied would send the driver's link somewhere unexpected.
+
+      The number may be written the way a person writes it — `0412 345 678`, `+61 412 345 678` —
+      and is stored in E.164. A number with no country code is read as Australian.
+
+      ## The driver has no account, and this is where that becomes concrete
+
+      What the platform holds about a driver is what you type here: a name and a mobile. There is
+      nothing to look them up by and nothing to invite. Neither field can be edited afterwards —
+      milestones and status history are attributed to this record, so changing the name would
+      re-attribute work somebody else did.
+
+      ## Assigning twice
+
+      Nominating the *same* driver again succeeds, answers `200`, and writes nothing. Retrying with
+      the same `Idempotency-Key` replays the original response; this covers the other case, where a
+      phone lost its connection, was restarted, and generated a fresh key for the same intent.
+
+      Nominating a *different* driver is refused with `delivery_driver_already_assigned`. Replacing
+      a driver is a separate intent and is not yet built.
+
+      ## Driver assigned is skippable, so this endpoint is optional
+
+      Docs/02 §2 permits `awarded → en_route_to_pickup` directly, because a provider driving the job
+      themselves has nobody to nominate. A provider who sets off without calling this cannot call it
+      afterwards: there is no route back to `driver_assigned`, and the answer is
+      `delivery_job_not_assignable`.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/DriverNomination'
+    responses:
+      '201':
+        description: |
+          The driver is on the job and the job is now `driver_assigned`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Assignment'
+      '200':
+        description: |
+          This driver was already on this job. Nothing was written and the existing assignment is
+          returned — the same shape as `201`, so a client that does not care which happened parses
+          one type.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Assignment'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          Either the job has a different driver already (`delivery_driver_already_assigned`), or it
+          is in no status a driver can be assigned from (`delivery_job_not_assignable`). Both are
+          resolved by reloading the job: the two lead to different screens, which is why they are
+          two codes rather than one.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field, with the JSON path the client sent.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- schemas ---------------------------------------------------------------------------------
+
+DriverNomination:
+  type: object
+  additionalProperties: false
+  required: [driver_name]
+  description: |
+    Who is driving. Unknown fields are refused, so a client typo fails loudly rather than being
+    silently ignored.
+  properties:
+    driver_name:
+      type: string
+      minLength: 1
+      maxLength: 120
+      description: |
+        The driver's name, as the customer and support will see it. Generous in length because a
+        driver is frequently identified by a name and a company beside it.
+      example: Sam Patel
+    driver_mobile:
+      type: string
+      description: |
+        How the driver is reached, and where their job link will be sent. Written however a person
+        writes it — spaces, brackets and dashes are all accepted — and stored in E.164. A number
+        with no country code is read as Australian.
+
+        The bound is the standard's rather than ours: once normalised it must be a `+` and between
+        eight and fifteen digits, the first of which is not a zero.
+
+        Required unless `self` is true, and refused when it is.
+      example: 0412 345 678
+    self:
+      type: boolean
+      description: |
+        You are driving the job yourself. The mobile is taken from your account; the name is not,
+        because no account carries one yet.
+      default: false
+      example: false
+
+Assignment:
+  type: object
+  additionalProperties: false
+  required:
+    [id, job_id, driver_name, driver_mobile, assigned_at, driver_token, driver_token_expires_at]
+  description: |
+    The driver on one job, and the link to give them.
+
+    **The job's status is deliberately not here.** A successful response means the job is
+    `driver_assigned` and nothing else; repeating the status would be a second copy of a vocabulary
+    the jobs endpoints own.
+
+    **This response carries a credential.** `driver_token` is the driver's whole access to the
+    platform, so treat it as one: do not log it, do not put it in analytics, and hand it only to the
+    driver it was minted for.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: |
+        The assignment's identifier. It is what a milestone recorded by this driver is attributed
+        to, and what the job-scoped link is issued against.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    driver_name:
+      type: string
+      example: Sam Patel
+    driver_mobile:
+      type: string
+      description: In E.164, whatever form it was submitted in.
+      example: '+61412345678'
+    assigned_at:
+      type: string
+      format: date-time
+      description: When the driver was put on the job, on the platform's clock, in UTC.
+      example: '2026-08-12T04:15:30.000Z'
+    driver_token:
+      type: string
+      description: |
+        The driver's job-scoped credential (SHIP-107). **Forward it to them — Shipper does not.**
+
+        Shipper sends no SMS in the MVP, so this response is the only place a link comes from and
+        you are the one who has to pass it on. It grants exactly this job: it names no account, no
+        role and no session, and it cannot be exchanged for a mobile session in either direction.
+
+        A signed JWT, and its contents are the platform's business rather than a client's. Do not
+        decode it and do not branch on anything inside it — `driver_token_expires_at` is beside it
+        precisely so that you never have to.
+
+        Assigning the same driver again returns a **new** token and the previous one keeps working
+        until it expires. Reissuing a link that invalidates the last one is a separate action and is
+        not built yet.
+      example: eyJhbGciOiJIUzI1NiIsImtpZCI6ImRyaXZlci0yMDI2LTA4IiwidHlwIjoiSldUIn0.…
+    driver_token_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the link stops working, in UTC. Seven days after it was issued by default.
+
+        There is nothing to refresh: the driver holds no other credential, so this is the whole life
+        of their access. Show it to them, and reissue when it has passed.
+      example: '2026-08-19T04:15:30.000Z'
+
+# --- parameters ------------------------------------------------------------------------------
+
+JobID:
+  name: id
+  in: path
+  required: true
+  description: The job's identifier.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a phone that retries
+    after a dropped connection must not end up with two drivers on one job.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
+
+Milestones:
+  post:
+    operationId: recordMilestone
+    summary: Record a delivery milestone
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Records what happened on a delivery — that the driver has set off, collected the goods, or
+      begun the journey — and moves the job when the lifecycle has a transition for it
+      (SHIP-111, SHIP-112).
+
+      Only the provider whose bid the customer accepted may call it. The customer of the job may
+      not: they are shown milestones and confirm the delivery at the end, and neither of those is
+      recording one. A job awarded to somebody else, a job that does not exist, and a job that is
+      the caller's own to watch rather than to drive all answer `404` identically.
+
+      ## The milestone and the job's status are not the same thing
+
+      Four of the five milestone names match a job status and they are still two vocabularies. A
+      milestone is a claim that somebody did something; it is kept whether or not it moves the job,
+      and a delivery that runs to plan produces both. **The response does not echo the job's
+      status** — read the job if you need it.
+
+      `driver_assigned` is recorded by `POST /v1/jobs/{id}/driver` rather than here.
+
+      ## Evidence, on any milestone — and required on one
+
+      Any milestone may carry `proof`: the photograph you uploaded, or one of three reasons there is
+      none. A driver whose camera permission is denied at a pickup is in the same position as one at
+      a delivery, so the exception is not reserved for the last milestone. See `ProofAttachment`.
+
+      **`delivered` is the one that requires it.** A delivery recorded with neither a photograph nor
+      a reason there is none is refused with `409 delivery_proof_required`, nothing is written, and
+      the job does not move. There is no retry that helps: send one or the other.
+
+      This is the platform's oldest promise about a delivery and it is enforced twice — once here,
+      so you are told which of the two to send, and once in the database, so it holds whatever writes
+      the record.
+
+      ## Two clocks, and you must send the first one when they differ
+
+      ```json
+      { "milestone": "picked_up" }
+      { "milestone": "picked_up", "recorded_at": "2026-08-12T06:40:11Z" }
+      ```
+
+      `recorded_at` is **when you acted**, not when you sent this. A device that records a milestone
+      in a yard with no signal and syncs an hour later must send the earlier time: it is what the
+      customer is shown, and the platform does not correct it or refuse it for being implausible.
+      Omitting it means "now", which is right only when you are online at the moment you record.
+
+      The response carries both — `recorded_at` as you sent it, and `accepted_at` as the platform's
+      own clock. They are what makes an offline delivery reconstructable afterwards, so a client
+      that renders only `accepted_at` is showing a sync time as though it were a delivery event.
+
+      ## Recording the same thing twice
+
+      Two different requests, and they are answered differently.
+
+      **A retry** reuses its `Idempotency-Key`. It answers `200` with the milestone the first
+      attempt recorded, and records nothing further — whether the retry arrives a second later or a
+      day later, because the guarantee is a unique index in the database rather than a cached
+      response. Retry as often as a dropped connection requires.
+
+      **A second recording** is a new action with a new key: a driver who reaches a pickup, finds
+      nobody there, and sets off again records `en_route_to_pickup` twice. Both are kept. The job
+      moves once, because after the first it is already there.
+
+      Reusing one key for two *different* milestones is refused with `idempotency_key_reused`. One
+      key per action.
+
+      ## A milestone that arrives late, and one that arrives early
+
+      These are different answers, and which one you get depends on where the delivery is rather
+      than on how long you held the update.
+
+      **Late — the job has already moved past this point.** A queued `picked_up` that syncs after
+      `in_transit` is already recorded answers `201` and is kept, with your `recorded_at` exactly as
+      you sent it. The job is **not** moved backwards: what you have added is a historical fact, not
+      the delivery's current state. Send late updates whenever you have them; the platform is where
+      they belong, not the phone.
+
+      **Early — the delivery has not reached this point.** An `in_transit` recorded while the job is
+      still on its way to the pickup answers `409 delivery_milestone_not_permitted` and writes
+      nothing. **Hold the update and retry it** — with the same key, unchanged — once the delivery
+      catches up. This one is worth retrying; there is no state in which a late milestone becomes
+      recordable a second time, and none in which an early one stays refused forever.
+
+      The response is the same shape either way and says nothing about the job's status, so a client
+      that needs to know where the delivery now stands reads the job.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/MilestoneRecording'
+    responses:
+      '201':
+        description: |
+          The milestone is recorded. The job has moved too, unless it was already where this
+          milestone would have put it, or has already moved past it — see "a milestone that arrives
+          late, and one that arrives early" above.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Milestone'
+      '200':
+        description: |
+          This `Idempotency-Key` had already recorded this milestone. Nothing was written and the
+          original is returned — the same shape as `201`, so a client that does not care which
+          happened parses one type.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Milestone'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          One of four, and they lead to four different places:
+
+          | `error.code` | What happened |
+          |---|---|
+          | `delivery_milestone_not_permitted` | The delivery has not reached this milestone yet. Keep the update and retry it once it has — see above. A milestone the job has already *passed* is recorded rather than refused |
+          | `delivery_proof_required` | `delivered` was sent with neither a photograph nor a reason there is none. Send one of the two in `proof`; retrying unchanged will not help |
+          | `idempotency_key_reused` | This key already recorded a *different* milestone on this job. Generate a new one |
+          | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field, with the JSON path the client sent.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+MilestoneRecording:
+  type: object
+  additionalProperties: false
+  required: [milestone]
+  description: |
+    What you did, and when you did it. Unknown fields are refused, so a client typo fails loudly
+    rather than being silently ignored.
+  properties:
+    milestone:
+      type: string
+      enum: [en_route_to_pickup, picked_up, in_transit, delivered]
+      description: |
+        Which milestone. `driver_assigned` is deliberately absent: a driver is put on a job through
+        `POST /v1/jobs/{id}/driver`, which is a different act with a record of its own.
+
+        `delivered` requires `proof` — a photograph or a reasoned exception — and is refused with
+        `409 delivery_proof_required` without one. The other three accept it and do not require it.
+      example: picked_up
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339, and **your** clock: the moment you acted, not the moment you sent this. Send it
+        whenever the two differ, which is every milestone recorded out of signal. Omit it and the
+        platform uses its own clock, which is correct only when you are online as you record.
+
+        It is not bounded against the present. A device with a wrong clock still recorded something
+        true about work that was done, and discarding the record would lose more than the wrong
+        timestamp costs.
+      example: '2026-08-12T06:40:11Z'
+    reason:
+      type: string
+      maxLength: 500
+      description: |
+        Optional. What a person should know about this milestone that the milestone itself does not
+        say — "nobody at the gate, returning at four". It is kept with the record and shown to
+        support.
+      example: nobody at the gate, returning at four
+    proof:
+      $ref: '#/ProofAttachment'
+
+ProofAttachment:
+  type: object
+  additionalProperties: false
+  description: |
+    The evidence for this milestone: the photograph you uploaded, or the reason there is none
+    (SHIP-115, SHIP-116).
+
+    **Send exactly one of `object_key` and `exception_reason`.** Sending both is refused with
+    `validation_failed` naming `proof.exception_reason`; sending an empty object is refused naming
+    `proof.object_key`. Omit `proof` altogether when the milestone carries no evidence.
+
+    ## The photograph
+
+    Upload it first with `POST /v1/jobs/{id}/proof-uploads`, PUT the bytes to the URL you are given,
+    and then send that response's `object_key` here. The platform **asks the object store whether
+    the object is actually there** before it records anything, so a milestone naming a key that was
+    never uploaded to is refused with `delivery_proof_not_uploaded` rather than recorded on trust —
+    finish the upload and send the request again.
+
+    There is no `content_type` and no `content_length`. You stated both when you asked for the URL;
+    what is recorded is what the store reports it is holding, which is the copy that is still right
+    if the two ever differ.
+
+    The key must be one issued for **this** job. A key from another job is refused with
+    `validation_failed` naming `proof.object_key`, and an object that is already the proof of
+    another milestone is refused with `delivery_proof_already_recorded` — ask for a new upload URL,
+    which always names a new object.
+
+    ## The reason there is none
+
+    A photograph can be genuinely impossible, and a driver standing at a delivery point must never
+    be left unable to finish the job. Select one of the three reasons below and send it in place of
+    the key: nothing is uploaded, the object store is not contacted, and the reason is recorded as
+    the evidence for this milestone.
+
+    It is read back beside the photographs on `GET /v1/jobs/{id}/delivery/proof`, as a record with
+    an `exception_reason` and no `download_url`. Your own words go in this request's `reason` field
+    beside the selection rather than instead of it.
+  properties:
+    object_key:
+      type: string
+      description: |
+        The `object_key` from the upload URL you were given. Not a name you choose: the platform
+        picks every key, and one it did not issue for this job is refused.
+      example: proof/6f1c9d2e-0f3b-7a51-9b6e-1f2a3b4c5d6e/019bd7a1-2c44-7f10-9a2c-3d4e5f607182
+    exception_reason:
+      type: string
+      enum: [recipient_objected, camera_unavailable, location_unsafe]
+      description: |
+        Why this milestone carries no photograph. Case-sensitive, and one of exactly these three —
+        there is deliberately no free-text option.
+
+        | Value | When |
+        |---|---|
+        | `recipient_objected` | The recipient does not want to be photographed |
+        | `camera_unavailable` | The camera permission is denied, or the hardware is not there |
+        | `location_unsafe` | The delivery point is unlit or unsafe to photograph |
+      example: recipient_objected
+
+Milestone:
+  type: object
+  additionalProperties: false
+  required: [id, job_id, milestone, recorded_by, recorded_at, accepted_at]
+  description: |
+    One recorded milestone.
+
+    **The job's status is not here.** A milestone may deliberately move nothing — a second
+    `en_route_to_pickup` after a failed pickup attempt is kept and moves the job nowhere — so a
+    client that read a status from this response would be reading something it does not say.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    milestone:
+      type: string
+      enum: [driver_assigned, en_route_to_pickup, picked_up, in_transit, delivered]
+      example: picked_up
+    recorded_by:
+      type: string
+      enum: [provider, driver, admin, system]
+      description: |
+        What kind of actor recorded it, not who they are. It is `provider` for everything recorded
+        through this endpoint today; the other three arrive with the driver portal, administrative
+        action, and the automatic `picked_up → in_transit` presentation change.
+      example: provider
+    reason:
+      type: string
+      description: Present only when one was given.
+      example: nobody at the gate, returning at four
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        When the actor says they acted, in UTC. **This is what a customer is shown.** It is what was
+        sent, uncorrected.
+      example: '2026-08-12T06:40:11.000Z'
+    accepted_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform received it, in UTC, on the platform's clock. This is what audit and
+        support reason about, and it is later than `recorded_at` by however long the device was out
+        of signal.
+      example: '2026-08-12T09:15:02.481Z'
+
+# --- proof of delivery ---------------------------------------------------------------------------
+
+ProofUploads:
+  post:
+    operationId: presignProofUpload
+    summary: Get somewhere to upload a proof photograph
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Answers with a short-lived, pre-signed URL you PUT one photograph to — **directly to object
+      storage, not to this API** (SHIP-114). The platform never sees the bytes (Docs/06 §5.2): a
+      driver on a poor connection uploading through the API would hold a request open for the length
+      of the upload, and this service is sized for JSON.
+
+      Only the provider whose bid the customer accepted may call it. A job awarded to somebody else,
+      and a job that does not exist, answer `404` identically.
+
+      ## What to do with the response
+
+      One request:
+
+      ```http
+      PUT {upload_url}
+      Content-Type: {content_type}
+      Content-Length: {content_length}
+
+      <the photograph>
+      ```
+
+      Send **exactly** the `content_type` and `content_length` you were given. Both are inside the
+      signature, so an upload that changes either is refused by the store with
+      `403 SignatureDoesNotMatch` — an error that says nothing about which part was wrong. That is
+      deliberate: it is what makes the platform's size limit and format list enforceable on the
+      request that actually carries the bytes.
+
+      `content_type` may come back spelled differently from what you sent — it is lower-cased and
+      trimmed before it is signed. Use what you were given.
+
+      A successful PUT answers `200` with an empty body. Keep the `object_key`: it is how you will
+      tell the platform which object holds the proof (SHIP-115).
+
+      ## The URL is short-lived, and nothing can revoke it
+
+      `expires_at` is when the store stops honouring it. It is a credential — anybody holding it can
+      write that object until then — so treat it like one and do not log it or put it in a URL bar.
+      Its lifetime is configuration and may be shortened without notice; read `expires_at` rather
+      than assuming a number.
+
+      ## What a retry gets
+
+      Retrying with the same `Idempotency-Key` returns the identical URL and the identical
+      `expires_at`, already running down. One intent buys one upload slot, and a retry does not
+      extend a credential's life. If you genuinely want a second slot — because the first expired
+      before the upload finished — send a **new** key, and you will get a new URL and a new
+      `object_key`.
+
+      ## What this does not do
+
+      It records nothing. An object in the store is not proof of anything until it is linked to a
+      job and a milestone (SHIP-115), and until then `delivered` cannot be recorded at all —
+      `POST /v1/jobs/{id}/milestones` answers `409 delivery_proof_required`.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/ProofUploadRequest'
+    responses:
+      '200':
+        description: |
+          A URL you may upload one photograph to.
+
+          `200` rather than `201` because nothing was created: the platform holds no record of this
+          URL and the store holds no object until you PUT one. The record that turns an uploaded
+          object into proof is a different request (SHIP-115).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ProofUpload'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          An identical request is still being handled (`idempotency_request_in_progress`). Retry in
+          a moment.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The upload was refused before anything was signed (`validation_failed`). `error.details`
+          names `content_type` when the format is not one the platform accepts, and `content_length`
+          when the photograph is larger than it allows — and the message carries the current limit,
+          which is the only place a client can learn it. Compress and ask again.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ProofUploadRequest:
+  type: object
+  additionalProperties: false
+  required: [content_type, content_length]
+  description: |
+    What you are about to upload. Unknown fields are refused — in particular there is no
+    `object_key`: where a photograph goes is the platform's decision, because a client that could
+    name the object it writes to could name one that already holds somebody's proof.
+  properties:
+    content_type:
+      type: string
+      maxLength: 128
+      description: |
+        The photograph's media type. The accepted set is server-side and may change without an app
+        release; a value outside it answers `422` with the current list in the message.
+
+        It is matched case-insensitively and **signed in lower case** — send back whatever the
+        response gives you, not what you sent here.
+      example: image/jpeg
+    content_length:
+      type: integer
+      format: int64
+      minimum: 1
+      description: |
+        The photograph's exact size in bytes — not an estimate and not a maximum. It is signed, so
+        the store accepts a body of exactly this length and no other.
+
+        The platform's limit is server-side and moves; a larger value answers `422` with the current
+        limit in the message. Compress before you ask (Docs/01 §5.2).
+      example: 1874233
+
+ProofUpload:
+  type: object
+  additionalProperties: false
+  required: [object_key, upload_url, method, content_type, content_length, expires_at]
+  description: |
+    One place to put one photograph.
+
+    **`upload_url` is a credential.** It is the whole of the authorisation to write that object, it
+    reaches nobody but you, and nothing can revoke it before `expires_at`.
+  properties:
+    object_key:
+      type: string
+      description: |
+        Where the photograph will live in the store. Keep it: it is what you will send when you link
+        the upload to a job and a milestone (SHIP-115), and it cannot be recovered from `upload_url`
+        without parsing one.
+
+        A fresh key every time, even for the same job. It is not derived from your idempotency key,
+        so a URL issued today can never overwrite an object that already holds proof.
+      example: proof/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1/0198f2c1-7a30-7b52-8d41-3e8b5c62a9f4
+    upload_url:
+      type: string
+      format: uri
+      description: |
+        PUT the photograph here. It is not a route on this API and must never be treated as one.
+      example: https://store.example.com/shipper/proof/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1/0198f2c1-7a30-7b52-8d41-3e8b5c62a9f4?X-Amz-Algorithm=AWS4-HMAC-SHA256
+    method:
+      type: string
+      enum: [PUT]
+      description: The HTTP method the URL was signed for.
+      example: PUT
+    content_type:
+      type: string
+      description: |
+        Send exactly this as the `Content-Type` header. It is inside the signature.
+      example: image/jpeg
+    content_length:
+      type: integer
+      format: int64
+      description: |
+        Send exactly this many bytes. It is inside the signature, and it is the only bound the store
+        has on the size of what you upload.
+      example: 1874233
+    expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the store stops honouring the URL, in UTC. Minutes rather than hours, deliberately.
+      example: '2026-08-13T04:45:00.000Z'
+
+ProofOnJob:
+  get:
+    operationId: proofOnJob
+    summary: The proof recorded on a delivery
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Every photograph recorded against this job, most recently acted first, each with a short-lived
+      signed URL to fetch it with (SHIP-115).
+
+      ## Who may call it
+
+      Two parties, and being either is decided from the job rather than from your role: **the
+      customer who owns the job**, and **the provider whose bid they accepted**. Both see exactly
+      the same thing — a photograph is not a field that can be redacted, and the two of you are
+      looking at the same object if you ever disagree about a delivery.
+
+      Anybody else gets `404`, identical to a job that does not exist. The job's assigned driver is
+      not a reader yet: their portal cannot capture proof either, and both arrive together
+      (SHIP-122).
+
+      ## `download_url` is a credential
+
+      There is no public path to a proof photograph anywhere in this platform — it identifies an
+      address and a recipient. What you get is a URL signed for you *after* this request checked who
+      you are, and **anybody holding it can fetch the image until `download_expires_at`**; nothing
+      can revoke one. Render it, and do not store it, log it, or pass it on. A cached response is a
+      cache of expiring links.
+
+      The URLs are minted per request, so calling this again gives you fresh ones.
+
+      ## Ordering, and why it is not arrival order
+
+      Sorted by the actor's clock — when the driver says they took the photograph — newest first.
+      That is deliberately not the order the platform received them in: a milestone recorded at dawn
+      in a yard with no signal arrives after ones recorded later in the day, and showing a customer
+      the sync order would show them a delivery that ran backwards.
+
+      ## It does not page
+
+      A delivery has at most five recordable milestones and at most one photograph each, so
+      `has_more` is always `false` and `next_cursor` always `null`. The collection envelope is here
+      so a client can tell a collection from a single resource without knowing the endpoint.
+    parameters:
+      - $ref: '#/JobID'
+    responses:
+      '200':
+        description: |
+          The proof on this delivery, which may be empty — a job nothing has been photographed on
+          yet answers `data: []` rather than `404`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ProofList'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ProofList:
+  type: object
+  additionalProperties: false
+  required: [data, next_cursor, has_more]
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/Proof'
+    next_cursor:
+      type: string
+      nullable: true
+      description: Always null. This collection is bounded by the delivery rather than by a page.
+    has_more:
+      type: boolean
+      description: Always false, for the same reason.
+
+Proof:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - job_id
+    - milestone_id
+    - milestone
+    - recorded_at
+    - accepted_at
+  description: |
+    The evidence for one recorded milestone: a photograph, or the reason there is none.
+
+    Evidence is attached to a **milestone** rather than to the job, so a late milestone the platform
+    absorbed without moving the job still carries it — at the time the driver acted.
+
+    ## Two shapes, and `exception_reason` is how you tell them apart (SHIP-116)
+
+    A photograph carries `object_key`, `content_type`, `content_length`, `download_url` and
+    `download_expires_at`. A reasoned exception carries **none of them** — there is no object, so
+    there is nothing to sign a URL for — and carries `exception_reason` instead.
+
+    Branch on `exception_reason`. Branching on a missing `download_url` would work today and would
+    be reading the absence of a credential as a fact about the delivery.
+  properties:
+    id:
+      type: string
+      format: uuid
+    job_id:
+      type: string
+      format: uuid
+    milestone_id:
+      type: string
+      format: uuid
+      description: The milestone this photograph proves. It is on this job by construction.
+    milestone:
+      type: string
+      enum: [driver_assigned, en_route_to_pickup, picked_up, in_transit, delivered]
+      description: Which milestone was recorded, in the wire vocabulary.
+      example: picked_up
+    object_key:
+      type: string
+      description: |
+        Where the photograph lives in private storage. Useful to support and to a client
+        reconciling a list; it is not a URL, and there is no unsigned way to fetch it.
+      example: proof/6f1c9d2e-0f3b-7a51-9b6e-1f2a3b4c5d6e/019bd7a1-2c44-7f10-9a2c-3d4e5f607182
+    content_type:
+      type: string
+      description: What the object store reports it is holding — not what the client said it sent.
+      example: image/jpeg
+    content_length:
+      type: integer
+      format: int64
+      description: The size the store reports, in bytes.
+      example: 137402
+    download_url:
+      type: string
+      format: uri
+      description: |
+        A signed URL at the object store, good until `download_expires_at`. **It is a credential.**
+        Anybody holding it can fetch the image until it expires, and nothing can revoke it.
+      example: https://store.example.com/shipper/proof/6f1c9d2e-0f3b-7a51-9b6e-1f2a3b4c5d6e/019bd7a1-2c44-7f10-9a2c-3d4e5f607182?X-Amz-Algorithm=AWS4-HMAC-SHA256
+    download_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When `download_url` stops working. Read it rather than assuming a lifetime: it is
+        configuration and may be shortened without notice.
+      example: '2026-08-13T04:45:00.000Z'
+    exception_reason:
+      type: string
+      enum: [recipient_objected, camera_unavailable, location_unsafe]
+      description: |
+        Present when this milestone has no photograph, and absent when it has one. It is why —
+        the recipient objected, the camera was unavailable, or the place was unsafe to photograph.
+
+        A record carrying this has no `object_key` and no `download_url`: there is nothing to fetch.
+      example: recipient_objected
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        The **actor's** clock, carried through from the milestone: when the driver says they took
+        the photograph, or recorded that there would not be one. This is what to show a customer.
+      example: '2026-08-12T06:40:11.000Z'
+    accepted_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform recorded it. What support reasons about, and not what to display beside a
+        delivery event.
+      example: '2026-08-12T09:15:02.000Z'
+
+# --- the driver's own surface -----------------------------------------------------------------
+
+DriverJob:
+  get:
+    operationId: driverJob
+    summary: Open the delivery a driver's link grants
+    tags: [Delivery]
+    security:
+      - BearerDriverToken: []
+    description: |
+      The delivery behind a driver's job-scoped link (SHIP-108). It is the first operation in the
+      service authenticated by something other than a mobile session, and the only one a driver can
+      reach at all.
+
+      ## The link grants this job and nothing else
+
+      The token names one job, inside its signature. Presenting it on any other job answers `404` —
+      the same answer a job that does not exist gives, because telling the two apart would confirm
+      that somebody else's delivery exists. The platform compares the job in the path with the job
+      in the token before this operation runs, so there is no request shape that widens the grant.
+
+      The `id` in the path is therefore redundant with the token and deliberately so: it is what
+      makes "exactly one job" checkable from outside, and it is what lets a driver carrying two
+      deliveries hold two links their browser can tell apart.
+
+      ## What it does not return, yet
+
+      The addresses, the goods and who to call are **not** here. That is the driver portal's job
+      view and it is built separately; this answers which job the link opens, which assignment it
+      belongs to, and how long it lasts. Fields will be added to this shape rather than moved to
+      another operation.
+
+      The driver's mobile is deliberately absent, unlike the provider's view of the same
+      assignment: a link travels through whatever channel the provider already uses, so it can be
+      forwarded again, and whoever ends up holding it should learn as little as possible.
+
+      ## Nothing here can be exchanged for a session
+
+      This token names no account, no role and no session, so there is nothing to sign in as. A
+      mobile access token presented here answers `401`, and this token presented on any
+      `BearerAccessToken` operation answers `401`. Neither direction is a special case in a
+      handler; both are what the audience check does.
+    parameters:
+      - $ref: '#/JobID'
+    responses:
+      '200':
+        description: |
+          The assignment this link grants.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DriverAssignment'
+      '401':
+        description: |
+          The link was missing, unreadable, or has run out.
+
+          | `error.code` | What happened |
+          |---|---|
+          | `unauthenticated` | No link was presented, or the one presented is not valid here. Which check refused it is deliberately not said — it is information only somebody probing has a use for, and a mobile access token presented here is one of the cases |
+          | `delivery_driver_link_expired` | The link was genuine and its window has closed. **There is nothing to refresh** — a driver holds no second credential — so ask the transport provider to send a new one |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          This link does not open this job (`not_found`) — either it grants a different one, or the
+          assignment behind it is no longer the live one on the job. Both answer exactly what a job
+          that does not exist answers.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+DriverAssignment:
+  type: object
+  additionalProperties: false
+  required: [job_id, assignment_id, driver_name, assigned_at, link_expires_at]
+  description: |
+    What a driver's link opens: the one job it grants and the assignment it belongs to.
+
+    Smaller than the provider's view of the same row on purpose — see the operation above.
+  properties:
+    job_id:
+      type: string
+      format: uuid
+      description: The one job this link grants. It is the same value that is in the path.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    assignment_id:
+      type: string
+      format: uuid
+      description: |
+        The assignment this link belongs to. A driver has no account, so this record is their
+        identity for the length of one job, and it is what their milestones are attributed to.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    driver_name:
+      type: string
+      description: |
+        The name the transport provider wrote down. It is here so a driver carrying more than one
+        job can tell that this link is theirs.
+      example: Sam Patel
+    assigned_at:
+      type: string
+      format: date-time
+      description: When the driver was put on the job, on the platform's clock, in UTC.
+      example: '2026-08-12T04:15:30.000Z'
+    link_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When this link stops working, in UTC — the same instant the transport provider was shown
+        when they created the assignment.
+
+        It is returned rather than left to be decoded out of the credential, which is a thing a
+        client should never do.
+      example: '2026-08-19T04:15:30.000Z'

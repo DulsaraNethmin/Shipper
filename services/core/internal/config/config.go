@@ -14,6 +14,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -56,7 +57,185 @@ type Config struct {
 	Kafka       Kafka
 	Idempotency Idempotency
 	Identity    Identity
+	Delivery    Delivery
+	Email       Email
+	SMS         SMS
+	Geocoding   Geocoding
+	Pagination  Pagination
+	Storage     Storage
 	App         App
+}
+
+// Storage configures the private object store that holds proof-of-delivery photographs and
+// provider verification documents (SHIP-114).
+//
+// Added at SHIP-15p rather than at SHIP-114, and for once that is not the usual story of a
+// domain branch parking a request against a shared surface after the fact. Docs/11 §9 records
+// that three prep tickets in a row absorbed a parked internal/config request, and that the
+// conclusion was to **ask each track at dispatch what configuration it expects to need**. Wave 7
+// asked, Track B answered with the nine fields below, and this is that answer written down
+// before the track opened rather than a wave later.
+//
+// # Nothing here is an adapter decision
+//
+// internal/platform/storage/doc.go names two implementations — the filesystem in development and
+// S3 for staging and production — and choosing between them is cmd/api's job, from Env, exactly
+// as it is for email, SMS and geocoding. These values describe the *store*, not the choice.
+//
+// # Why the last two fields are here at all
+//
+// MaxUploadBytes and AcceptedContentTypes are policy rather than plumbing, and a limit compiled
+// into the client is a limit that needs an app release to change. Docs/06 §5.3 is explicit:
+// Flutter has no over-the-air path for Dart code, so anything expected to move under operational
+// pressure lives server-side. A proof photograph that a driver cannot upload is a delivery that
+// cannot be completed, which is the failure Docs/01 §4.4 spends a whole section avoiding.
+type Storage struct {
+	// Endpoint is the S3 API's base URL, and it is always explicit.
+	//
+	// **The host in it is signed.** SigV4 covers the `host` header, so a pre-signed URL minted
+	// against one address and fetched at another is refused as SignatureDoesNotMatch — an error
+	// that names neither the address nor the cause. In development that means the *published*
+	// port on the host, not `minio:9000` inside the compose network, because whatever resolves
+	// the URL is on the host.
+	//
+	// There is no "leave it empty and let the SDK pick the regional endpoint" state, and that is
+	// a decision rather than an oversight: [loader.lookup] treats an empty variable as absent, so
+	// an empty value would silently become this field's development default — an object store on
+	// somebody's loopback, configured in production, reported as nothing. AWS's own regional
+	// endpoint is `https://s3.<region>.amazonaws.com` and is perfectly typeable, so a deployment
+	// types it and [loader.validate] refuses a loopback host outside development.
+	Endpoint string
+
+	// Bucket holds every object the platform stores. One bucket, prefixed by concern — there is
+	// no second bucket for verification documents, because both kinds of object are private
+	// evidence under the same access rules and a second bucket is a second set of them.
+	//
+	// **It is per-worktree in development** (CLAUDE.md's worktree table). A bucket is a cheap
+	// namespace, which is precisely what a Kafka topic is not, so the one shared service that
+	// can be split per tree is this one.
+	Bucket string
+
+	// Region is the S3 region the bucket lives in, and it is signed as part of the credential
+	// scope rather than merely routed on. The local MinIO is started with the same value for
+	// that reason; a mismatch is a signature failure, not a redirect.
+	Region string
+
+	// AccessKeyID and SecretAccessKey authenticate to the store.
+	//
+	// Static credentials, because the MVP has one deployment shape and no instance-role story
+	// yet. Whoever moves the service onto an IAM role deletes these two and the SDK finds its
+	// own; nothing else in the section changes.
+	AccessKeyID     string
+	SecretAccessKey string
+
+	// UsePathStyle addresses a bucket as `endpoint/bucket/key` rather than
+	// `bucket.endpoint/key`.
+	//
+	// True by default because the development store is MinIO on localhost, where the
+	// virtual-host form would need `shipper-dev.localhost` to resolve and does not. A
+	// deployment against AWS sets it false.
+	UsePathStyle bool
+
+	// PresignTTL is how long an issued pre-signed URL works for.
+	//
+	// Short, and bounded at load, for the reason the driver token is: **nothing can revoke one
+	// once it is signed.** The URL is the whole of the authorisation — Docs/06 §5.2 puts the
+	// bytes outside the API entirely — so its lifetime is the window in which a copied link
+	// reaches a photograph of somebody's front door. Fifteen minutes is long enough for a
+	// phone on a poor connection to finish an upload it has already started, which is the only
+	// thing it has to outlast.
+	PresignTTL time.Duration
+
+	// MaxUploadBytes is the largest object the platform will issue an upload URL for.
+	//
+	// Docs/01 §5.2 requires the client to compress before uploading, so this is a bound on a
+	// mistake rather than on ordinary use: a phone photograph compressed for a metered
+	// connection is one or two megabytes.
+	MaxUploadBytes int64
+
+	// AcceptedContentTypes is the set of media types an upload URL may be issued for, lower
+	// case, one `type/subtype` per entry.
+	//
+	// Server-side because the answer changes: HEIC arrived on iOS without an app release
+	// anywhere, and a client-side list would have needed one. It is a list rather than a
+	// prefix match so that `image/svg+xml` — a script container that browsers execute — cannot
+	// arrive by being an image.
+	AcceptedContentTypes []string
+}
+
+// Geocoding configures the address-lookup adapter (SHIP-35), first consumed by SHIP-60's
+// location value object.
+//
+// Added at SHIP-15g rather than at SHIP-60, and the delay is the point: internal/config is a
+// shared surface a domain branch must not edit, so the jobs lane wrote a documented constant and
+// filed a request instead. The same wall was hit twice in one wave — see [Pagination] — which is
+// what turned two parked requests into a prep ticket.
+//
+// # Why a missing base URL is not an error
+//
+// Empty means no provider is configured, and cmd/api then builds the console stub in development
+// and nil outside it. Nil is a supported state, not a degraded one: jobs.NewService documents it
+// as "addresses are stored unresolved", and every path copes because Docs/01 §4.4's SHIP-59a
+// requires a failed lookup not to fail the job.
+//
+// Falling back to the stub in staging was considered and rejected. The stub returns stable,
+// plausible, entirely fictional coordinates, and a staging environment quietly full of those is
+// worse than one with no coordinates at all — the first looks like it works.
+// The field names match [Email] and [SMS] deliberately: all three are the same shape of
+// adapter — a base URL, a credential, and an implementation chosen from Env — and naming the
+// third one differently would invite the reader to look for a difference that is not there.
+type Geocoding struct {
+	// ProviderBaseURL is the provider's HTTP endpoint. Empty disables lookup entirely.
+	ProviderBaseURL string
+
+	// ProviderAPIKey authenticates to it. Empty is allowed even when the base URL is set,
+	// because a local or self-hosted geocoder may need no credential.
+	ProviderAPIKey string
+}
+
+// Pagination carries the page sizes Docs/10 §4.5 requires to be configurable.
+//
+// They lived as constants in internal/pagination from SHIP-66, with a comment saying that section
+// requires configuration and that a domain branch could not provide it. This is that move. No
+// caller changes: callers ask pagination.Limit, which now reads what cmd/api installed at startup.
+//
+// # Why these are bounded rather than merely positive
+//
+// A maximum page size is a bound on the work one request can ask the database for, so a
+// misconfigured value is a denial-of-service switch rather than a preference. The ceiling is
+// enforced here, at load, where it fails on startup rather than on the first large request.
+type Pagination struct {
+	// DefaultPageSize applies when a request names no ?limit=.
+	DefaultPageSize int
+
+	// MaxPageSize is the ceiling a larger ?limit= is narrowed to, never an error.
+	MaxPageSize int
+}
+
+// Email configures the transactional email adapter (SHIP-32), first consumed by the
+// verification message SHIP-31 sends.
+//
+// Which implementation is built is decided from Env and not from here: development logs to the
+// console and sends nothing; staging and production hand the message to the provider. These
+// three values are all the provider needs, because the adapter speaks a generic HTTP contract
+// rather than a vendor's SDK — so naming a vendor is setting them and changing no code
+// (Docs/11 §7).
+//
+// They are deliberately not validated here. An empty base URL is correct in development, and in
+// staging it is caught where the adapter is constructed, which is at startup and with a message
+// that says which variable is missing.
+type Email struct {
+	// ProviderBaseURL is the root of the vendor's API. Empty in development, where nothing
+	// reaches it.
+	ProviderBaseURL string
+
+	// ProviderAPIKey is presented as a bearer credential and is never logged.
+	ProviderAPIKey string
+
+	// Sender is the From address every message is dispatched with. One address for the whole
+	// service in the MVP; per-domain senders are a deliverability decision nobody has needed
+	// to make yet.
+	Sender string
 }
 
 // Identity configures credentials and sessions (SHIP-29, SHIP-37).
@@ -89,6 +268,77 @@ type Identity struct {
 	// in each token's `kid` header, which is how a verifier knows which key to use before it
 	// can trust anything else in the token.
 	AccessTokenActiveKID string
+}
+
+// Delivery configures the driver's job-scoped token (SHIP-107).
+//
+// # Why a second keyset rather than a second audience over the first
+//
+// Docs/10 §5 requires the driver token to have "separate signing key material **and**
+// `aud=shipper-driver`", and both halves are here because either alone is weaker than the pair. The
+// audience is what refuses a mobile token presented to a driver route and a driver token presented
+// to a mobile one; separate key material is what makes that refusal survive a mistake in the
+// audience check, because neither verifier can even produce a valid signature over the other's
+// tokens. [loader.validate] refuses a configuration in which the two sets share a secret, so a
+// deployment cannot arrive at one keyset by copying a value.
+//
+// The shape mirrors [Identity]'s three access-token fields deliberately: it is the same rotation
+// mechanism, read the same way, so an operator rotating one already knows how to rotate the other.
+type Delivery struct {
+	// DriverTokenTTL is how long a job-scoped link works for.
+	//
+	// **Seven days, and it is the one number here that is a product judgement rather than a
+	// mechanism.** The reasoning, because the obvious comparison — identity's fifteen minutes —
+	// is the wrong one:
+	//
+	//   - There is no refresh. A driver has no account and holds no second credential, so this
+	//     TTL is the entire life of their access rather than the short leg of a pair. Fifteen
+	//     minutes would mean a link that expires before the provider has finished forwarding it.
+	//   - It has to outlast a delivery. Australian road freight is quoted in days across the
+	//     long-haul corridors, and a token that lapsed mid-run would strand the driver with
+	//     milestones they cannot record — which Docs/02 §3.1 treats as work that must not be
+	//     lost.
+	//   - It does not have to outlast the *job*. The 72-hour auto-complete (Docs/02 §6.1) runs
+	//     after delivery and the driver plays no part in it, so nothing needs the link past the
+	//     drop-off.
+	//   - Longer is a real cost. The link is forwarded by whatever channel the provider uses, so
+	//     it lands in a message thread and stays there; a week means a forwarded link stops
+	//     working within a week rather than for the life of the handset.
+	//
+	// A driver who needs one after it lapses gets a fresh link from the provider, which is
+	// SHIP-109 — and that ticket, rather than a longer TTL, is the answer to "it expired".
+	DriverTokenTTL time.Duration
+
+	// DriverTokenKeys is the HMAC signing keyset for driver tokens, by key identifier.
+	//
+	// Rotated exactly as the access-token keyset is, with one difference worth knowing before
+	// doing it: an access token lives fifteen minutes, so an outgoing key can be dropped within
+	// the hour. A driver token lives a week, and dropping its key sooner breaks every link
+	// already forwarded — with nothing at the other end that can refresh.
+	DriverTokenKeys map[string][]byte
+
+	// DriverTokenActiveKID names the key in DriverTokenKeys that signs new tokens.
+	DriverTokenActiveKID string
+}
+
+// SMS configures the text-message adapter (SHIP-35), first consumed by the phone verification
+// code SHIP-34 sends.
+//
+// The same shape as [Email] and chosen the same way — from Env, not from here. It matters more
+// here than it does for email: a message costs money and reaches a real handset, so an
+// environment that dispatched by accident would be a bill as well as a nuisance to whoever last
+// used that number for testing.
+type SMS struct {
+	// ProviderBaseURL is the root of the gateway's API. Empty in development.
+	ProviderBaseURL string
+
+	// ProviderAPIKey is presented as a bearer credential and is never logged.
+	ProviderAPIKey string
+
+	// Sender is what the message appears to come from — an alphanumeric sender ID or an
+	// originating number, depending on what the gateway and the destination country permit.
+	// Australia allows both; the choice is made with the vendor.
+	Sender string
 }
 
 // Argon2 is the password hashing cost.
@@ -175,7 +425,45 @@ type Redis struct {
 // Kafka is the event backbone for notifications, reporting, and background processing.
 type Kafka struct {
 	Brokers []string
+
+	// ReplicationFactor is how many copies of each partition the topic set is created with
+	// (SHIP-135, folded in at SHIP-15m).
+	//
+	// **One is correct for the single-broker compose stack and wrong everywhere else**; a
+	// deployed cluster wants three. It is the only number in the topic set that genuinely
+	// differs between environments — the partition count and the retention are properties of
+	// the catalogue and are the same on every broker.
+	//
+	// It arrived as a `cmd/topics -replication` flag rather than as a field, because
+	// internal/config is a shared surface a domain branch may not edit (Docs/10 §9.2) and the
+	// track that needed it was a domain branch. **The flag is still there and still wins**: an
+	// operator applying the topic set to one cluster by hand should not have to set an
+	// environment variable to do it. This is its default, which is what makes the deployment
+	// that runs the step need no arguments.
+	//
+	// Read only by cmd/topics. cmd/api and cmd/worker load it and never look at it, which is
+	// ordinary — Load reads the whole environment for every binary rather than a subset per
+	// command, so that one misconfiguration is refused everywhere rather than in one place.
+	ReplicationFactor int
 }
+
+// DefaultKafkaReplicationFactor is one, matching internal/events.DefaultReplicationFactor.
+//
+// Two constants rather than one shared, for the same reason [minimumSigningKeyBytes] is duplicated:
+// internal/config has no internal dependencies at all, and it is loaded by every binary. Importing
+// the event catalogue to read a `1` would pull internal/events and internal/db — and with them the
+// database driver — into the configuration of processes that publish nothing.
+//
+// The drift that buys is closed where the two meet: cmd/topics imports both, and
+// TestConfigurationCarriesTheCatalogueDefault fails there if they stop agreeing.
+const DefaultKafkaReplicationFactor = 1
+
+// maxKafkaReplicationFactor is a typo guard rather than a limit anybody should reach.
+//
+// A factor larger than the cluster is refused by the broker at create time, so the real bound is
+// the number of brokers and this cannot know it. What it does catch is 30 typed for 3, before a
+// connection is opened and with the variable named in the message.
+const maxKafkaReplicationFactor = 10
 
 // Idempotency configures how long the platform remembers what it answered a
 // state-changing request, so that a retry replays rather than repeats it (SHIP-15).
@@ -197,7 +485,17 @@ type Idempotency struct {
 // credentialBearingDefaults are variables whose built-in defaults embed a local
 // throwaway credential. They make a fresh clone work against docker-compose and are
 // refused outside development — see loader.validate.
-var credentialBearingDefaults = []string{"DATABASE_URL", "REDIS_URL", "IDENTITY_ACCESS_TOKEN_KEYS"}
+var credentialBearingDefaults = []string{
+	"DATABASE_URL",
+	"REDIS_URL",
+	"IDENTITY_ACCESS_TOKEN_KEYS",
+	"DELIVERY_DRIVER_TOKEN_KEYS",
+	// Both halves, unlike DATABASE_URL which carries user and password in one variable. A
+	// deployment that set the secret and left the identifier as the local throwaway would
+	// authenticate as nobody, and the symptom would be the first upload rather than the start-up.
+	"STORAGE_ACCESS_KEY_ID",
+	"STORAGE_SECRET_ACCESS_KEY",
+}
 
 // The development signing key, which is in the repository and therefore public.
 //
@@ -208,6 +506,20 @@ var credentialBearingDefaults = []string{"DATABASE_URL", "REDIS_URL", "IDENTITY_
 const (
 	developmentActiveKID  = "dev"
 	developmentSigningKey = "shipper-local-development-signing-key-not-a-secret"
+
+	// The driver token's development key, and it is a **different string** rather than the same
+	// one under a second variable (SHIP-107).
+	//
+	// That is the whole of Docs/10 §5's "separate signing key material", made true in the
+	// environment a developer actually runs. Sharing the development key would leave the two
+	// token systems separated by the audience alone on every machine anybody works on, which is
+	// precisely the configuration the tests deliberately construct to prove the audience is
+	// enough — and it should not be the default, because then nothing would be testing the pair.
+	//
+	// The identifier differs too, so a decoded header says which system signed a token without
+	// anybody having to check the key.
+	developmentDriverActiveKID  = "driver-dev"
+	developmentDriverSigningKey = "shipper-local-development-driver-token-key-not-a-secret"
 )
 
 // developmentSigningKeys builds a fresh map each time rather than sharing one package-level
@@ -217,6 +529,11 @@ func developmentSigningKeys() map[string][]byte {
 	return map[string][]byte{developmentActiveKID: []byte(developmentSigningKey)}
 }
 
+// developmentDriverSigningKeys is the same, for the driver token's own keyset.
+func developmentDriverSigningKeys() map[string][]byte {
+	return map[string][]byte{developmentDriverActiveKID: []byte(developmentDriverSigningKey)}
+}
+
 // minimumSigningKeyBytes mirrors the same constant in internal/identity, which is where the
 // keyset enforces it.
 //
@@ -224,6 +541,47 @@ func developmentSigningKeys() map[string][]byte {
 // and the domain does not import configuration (Docs/06 §4.1). Checking it here as well means a
 // short key is refused at startup rather than at the first sign-in.
 const minimumSigningKeyBytes = 32
+
+// The development object-store credential, on exactly the terms the signing keys above are on:
+// it is in this repository and therefore public, it exists so that a fresh clone runs without
+// setup, and validate refuses it outside development.
+//
+// It matches MINIO_ROOT_USER and MINIO_ROOT_PASSWORD in deploy/docker-compose.yml, the way
+// DATABASE_URL matches POSTGRES_USER and POSTGRES_PASSWORD. The password is not `shipper` twice
+// over because MinIO refuses a root password shorter than eight characters.
+const (
+	developmentStorageAccessKeyID     = "shipper"
+	developmentStorageSecretAccessKey = "shipperminio"
+)
+
+// maxPresignTTL bounds the one credential in this file that is a URL.
+//
+// Nothing revokes a pre-signed URL once it is signed — Docs/06 §5.2 puts the bytes outside the
+// API entirely, so the signature *is* the authorisation and no server-side check runs when it is
+// redeemed. The cap is an hour rather than a number close to the fifteen-minute default, for the
+// same reason maxDriverTokenTTL is thirty days: the default is a judgement operations may
+// legitimately move, and this only refuses the values that would defeat the design.
+const maxPresignTTL = time.Hour
+
+// The upload-size bounds, and the range is deliberately wide.
+//
+// A phone photograph compressed for a metered connection (Docs/01 §5.2) is one or two megabytes,
+// so ten is generous. The floor exists because a value below it refuses every real photograph —
+// a configuration mistake that presents as a driver unable to finish a delivery — and the ceiling
+// because past it the number has stopped describing a photograph and started describing how much
+// of somebody's data allowance a single upload may consume.
+const (
+	defaultMaxUploadBytes  = 10 << 20 // 10 MiB
+	smallestMaxUploadBytes = 64 << 10 // 64 KiB
+	largestMaxUploadBytes  = 64 << 20 // 64 MiB
+)
+
+// maxDriverTokenTTL is a typo guard on the one TTL nothing can shorten once issued.
+//
+// Thirty days rather than a number close to the seven-day default, because the default is a product
+// judgement that operations may legitimately move and this is only refusing the values that would
+// defeat the design — `720h` typed for `72h`, or a duration somebody meant as "no expiry".
+const maxDriverTokenTTL = 30 * 24 * time.Hour
 
 // Load reads configuration from the process environment.
 //
@@ -257,6 +615,8 @@ func Load() (*Config, error) {
 		},
 		Kafka: Kafka{
 			Brokers: l.csv("KAFKA_BROKERS", []string{"localhost:29092"}),
+			ReplicationFactor: l.boundedInt("KAFKA_REPLICATION_FACTOR",
+				DefaultKafkaReplicationFactor, 1, maxKafkaReplicationFactor),
 		},
 		Idempotency: Idempotency{
 			TTL:         l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
@@ -274,6 +634,51 @@ func Load() (*Config, error) {
 			AccessTokenTTL:       l.duration("IDENTITY_ACCESS_TOKEN_TTL", 15*time.Minute),
 			AccessTokenKeys:      l.signingKeys("IDENTITY_ACCESS_TOKEN_KEYS", developmentSigningKeys()),
 			AccessTokenActiveKID: l.str("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", developmentActiveKID),
+		},
+		Delivery: Delivery{
+			// Seven days — see [Delivery.DriverTokenTTL] for why it is measured against a
+			// delivery rather than against a session.
+			DriverTokenTTL:  l.duration("DELIVERY_DRIVER_TOKEN_TTL", 7*24*time.Hour),
+			DriverTokenKeys: l.signingKeys("DELIVERY_DRIVER_TOKEN_KEYS", developmentDriverSigningKeys()),
+			DriverTokenActiveKID: l.str("DELIVERY_DRIVER_TOKEN_ACTIVE_KID",
+				developmentDriverActiveKID),
+		},
+		Email: Email{
+			ProviderBaseURL: l.str("EMAIL_PROVIDER_BASE_URL", ""),
+			ProviderAPIKey:  l.str("EMAIL_PROVIDER_API_KEY", ""),
+			Sender:          l.str("EMAIL_SENDER", "no-reply@shipper.com.au"),
+		},
+		SMS: SMS{
+			ProviderBaseURL: l.str("SMS_PROVIDER_BASE_URL", ""),
+			ProviderAPIKey:  l.str("SMS_PROVIDER_API_KEY", ""),
+			Sender:          l.str("SMS_SENDER", "Shipper"),
+		},
+		Geocoding: Geocoding{
+			ProviderBaseURL: l.str("GEOCODING_BASE_URL", ""),
+			ProviderAPIKey:  l.str("GEOCODING_API_KEY", ""),
+		},
+		Pagination: Pagination{
+			// The bounds are the range the pagination package will run, not taste. One
+			// row per page is legal and useless; the ceiling stops a configuration
+			// mistake becoming an unbounded query.
+			DefaultPageSize: l.boundedInt("PAGINATION_DEFAULT_PAGE_SIZE", 20, 1, 500),
+			MaxPageSize:     l.boundedInt("PAGINATION_MAX_PAGE_SIZE", 100, 1, 500),
+		},
+		Storage: Storage{
+			// The published host port, not the compose-internal name — see [Storage.Endpoint].
+			// It matches the Makefile's STORAGE_ENDPOINT, which derives the port rather than
+			// assuming it.
+			Endpoint:        l.str("STORAGE_ENDPOINT", "http://localhost:9000"),
+			Bucket:          l.str("STORAGE_BUCKET", "shipper-dev"),
+			Region:          l.str("STORAGE_REGION", "ap-southeast-2"),
+			AccessKeyID:     l.str("STORAGE_ACCESS_KEY_ID", developmentStorageAccessKeyID),
+			SecretAccessKey: l.str("STORAGE_SECRET_ACCESS_KEY", developmentStorageSecretAccessKey),
+			UsePathStyle:    l.boolean("STORAGE_USE_PATH_STYLE", true),
+			PresignTTL:      l.duration("STORAGE_PRESIGN_TTL", 15*time.Minute),
+			MaxUploadBytes: int64(l.boundedInt("STORAGE_MAX_UPLOAD_BYTES",
+				defaultMaxUploadBytes, smallestMaxUploadBytes, largestMaxUploadBytes)),
+			AcceptedContentTypes: l.csv("STORAGE_ACCEPTED_CONTENT_TYPES",
+				[]string{"image/jpeg", "image/png", "image/heic"}),
 		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
@@ -304,6 +709,10 @@ func (c Config) LogValue() slog.Value {
 		slog.String("database_url", redactURL(c.Database.URL)),
 		slog.String("redis_url", redactURL(c.Redis.URL)),
 		slog.String("kafka_brokers", strings.Join(c.Kafka.Brokers, ",")),
+		// Worth a line for the same reason the argon2 cost is: a deployment that has
+		// silently fallen back to a single replica is otherwise invisible until a broker
+		// is lost.
+		slog.Int("kafka_replication_factor", c.Kafka.ReplicationFactor),
 		slog.Duration("idempotency_ttl", c.Idempotency.TTL),
 		slog.Duration("idempotency_in_flight_ttl", c.Idempotency.InFlightTTL),
 		// The cost is worth having in the startup line: a deployment that has silently
@@ -316,6 +725,27 @@ func (c Config) LogValue() slog.Value {
 		// neither says anything an attacker can sign with.
 		slog.String("access_token_active_kid", c.Identity.AccessTokenActiveKID),
 		slog.Int("access_token_keys", len(c.Identity.AccessTokenKeys)),
+		// The second keyset, on the same terms. Two identifiers in one startup line is also the
+		// cheapest confirmation that the two token systems are configured separately.
+		slog.Duration("driver_token_ttl", c.Delivery.DriverTokenTTL),
+		slog.String("driver_token_active_kid", c.Delivery.DriverTokenActiveKID),
+		slog.Int("driver_token_keys", len(c.Delivery.DriverTokenKeys)),
+		// Whether a base URL is set, not what it is, and never the key. "Email is going to
+		// the console" is the line somebody needs when a verification message has not
+		// arrived, and it is the one thing a hostname would not tell them.
+		slog.Bool("email_provider_configured", c.Email.ProviderBaseURL != ""),
+		slog.String("email_sender", c.Email.Sender),
+		slog.Bool("sms_provider_configured", c.SMS.ProviderBaseURL != ""),
+		slog.String("sms_sender", c.SMS.Sender),
+		// The bucket and the endpoint, never the credential. The bucket is the one worth
+		// insisting on: it is per-worktree in development, and a process writing into the
+		// wrong one succeeds at everything and puts the objects where nobody looks.
+		slog.String("storage_endpoint", redactURL(c.Storage.Endpoint)),
+		slog.String("storage_bucket", c.Storage.Bucket),
+		slog.String("storage_region", c.Storage.Region),
+		slog.Bool("storage_path_style", c.Storage.UsePathStyle),
+		slog.Duration("storage_presign_ttl", c.Storage.PresignTTL),
+		slog.Int64("storage_max_upload_bytes", c.Storage.MaxUploadBytes),
 	)
 }
 
@@ -476,6 +906,26 @@ func (l *loader) boundedInt(key string, def, low, high int) int {
 	return n
 }
 
+// boolean reads a flag, accepting everything strconv.ParseBool does — 1/0, t/f, true/false,
+// TRUE/FALSE — and refusing everything it does not.
+//
+// Refusing rather than treating an unrecognised value as false, because the values people
+// actually type are "yes" and "on", and silently reading either as false would turn a switch
+// somebody deliberately set into one they did not. The one setting this reads today decides
+// whether a bucket is addressed by path, and getting it wrong is an upload URL that 404s.
+func (l *loader) boolean(key string, def bool) bool {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		l.errf("%s: %q is not true or false", key, v)
+		return def
+	}
+	return b
+}
+
 func (l *loader) port(key string, def int) int {
 	v, ok := l.lookup(key)
 	if !ok {
@@ -574,6 +1024,110 @@ func (l *loader) validate(cfg *Config) {
 			"cannot be revoked before it expires", cfg.Identity.AccessTokenTTL)
 	}
 
+	// The same rule as the access token's active identifier, for the same reason: a signature
+	// nobody can produce is not a token anybody can use, and the failure is otherwise the first
+	// assignment after a deploy — which is a provider being told the platform is broken.
+	if _, ok := cfg.Delivery.DriverTokenKeys[cfg.Delivery.DriverTokenActiveKID]; !ok {
+		l.errf("DELIVERY_DRIVER_TOKEN_ACTIVE_KID: %q names no key in DELIVERY_DRIVER_TOKEN_KEYS",
+			cfg.Delivery.DriverTokenActiveKID)
+	}
+
+	// **The two token systems may not share a secret, in any environment.**
+	//
+	// Docs/10 §5 requires separate signing key material, and CLAUDE.md makes "neither can be
+	// exchanged for the other" an invariant. The audience check enforces it either way — both
+	// verifiers pin their own and a test proves each refuses the other's tokens with the keys
+	// deliberately shared — so this is the second lock rather than the first. It is worth having
+	// because it is the one failure that would leave the invariant resting on a single check
+	// while looking entirely correct in every log line and every response.
+	//
+	// Checked in development too, unlike the rules below it: this is not a deployment-hardening
+	// rule but a structural one, and a developer who set the two variables to the same value
+	// should be told immediately rather than at their first staging deploy.
+	for driverKID, driverSecret := range cfg.Delivery.DriverTokenKeys {
+		for accessKID, accessSecret := range cfg.Identity.AccessTokenKeys {
+			if bytes.Equal(driverSecret, accessSecret) {
+				l.errf("DELIVERY_DRIVER_TOKEN_KEYS: key %q is the same secret as "+
+					"IDENTITY_ACCESS_TOKEN_KEYS key %q; the driver token and the mobile "+
+					"session token must have separate signing key material (Docs/10 §5)",
+					driverKID, accessKID)
+			}
+		}
+	}
+
+	// A driver token cannot be revoked before it expires either — there is nothing to check it
+	// against until SHIP-109 — so an over-long TTL is a standing grant to one job's delivery
+	// detail sitting in whatever message thread the link was forwarded through. The cap is
+	// generous rather than exact: Docs/10 §5 and [Delivery.DriverTokenTTL] settle on seven days,
+	// and this refuses only the values that would defeat the design.
+	if cfg.Delivery.DriverTokenTTL > maxDriverTokenTTL {
+		l.errf("DELIVERY_DRIVER_TOKEN_TTL (%s) is longer than %s; an issued driver token cannot "+
+			"be revoked before it expires, so a link forwarded to a driver would outlive the job",
+			cfg.Delivery.DriverTokenTTL, maxDriverTokenTTL)
+	}
+
+	// A default larger than the ceiling would mean a request that named no ?limit= got a
+	// bigger page than one that asked for the maximum, which is the sort of inversion that is
+	// obvious in a sentence and invisible in two environment variables.
+	if cfg.Pagination.DefaultPageSize > cfg.Pagination.MaxPageSize {
+		l.errf("PAGINATION_DEFAULT_PAGE_SIZE (%d) cannot exceed PAGINATION_MAX_PAGE_SIZE (%d)",
+			cfg.Pagination.DefaultPageSize, cfg.Pagination.MaxPageSize)
+	}
+
+	// An endpoint that is not an absolute http(s) URL cannot be signed against, and the SDK's
+	// own complaint about it arrives at the first upload rather than at startup.
+	if endpoint, err := url.Parse(cfg.Storage.Endpoint); err != nil {
+		l.errf("STORAGE_ENDPOINT: %q is not a URL", cfg.Storage.Endpoint)
+	} else if endpoint.Host == "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {
+		l.errf("STORAGE_ENDPOINT: %q is not an absolute http or https URL "+
+			"(AWS S3's own is https://s3.%s.amazonaws.com)", cfg.Storage.Endpoint, cfg.Storage.Region)
+	}
+
+	// A bucket name S3 will not accept is a startup problem rather than an upload problem, and
+	// the difference matters here more than it usually would: the name is per-worktree in
+	// development (CLAUDE.md), so it is a value a person types, and the first thing that would
+	// otherwise notice is a driver's proof upload.
+	//
+	// The subset checked is the one the full rule is made of — length, character set, and both
+	// ends alphanumeric. AWS also refuses dotted names that parse as an IP address and names
+	// with consecutive dots, which are not worth encoding here: neither is a mistake anybody
+	// makes by hand, and the store refuses them anyway.
+	if err := checkBucketName(cfg.Storage.Bucket); err != nil {
+		l.errf("STORAGE_BUCKET: %q %s", cfg.Storage.Bucket, err)
+	}
+
+	// A media type that is not `type/subtype` cannot match anything an upload declares, so the
+	// list would silently accept nothing. Checked lower case because HTTP media types are
+	// case-insensitive and a comparison somewhere downstream will not be.
+	for _, mediaType := range cfg.Storage.AcceptedContentTypes {
+		kind, sub, separated := strings.Cut(mediaType, "/")
+		if !separated || kind == "" || sub == "" {
+			l.errf("STORAGE_ACCEPTED_CONTENT_TYPES: %q is not a type/subtype media type", mediaType)
+			continue
+		}
+		if mediaType != strings.ToLower(mediaType) {
+			l.errf("STORAGE_ACCEPTED_CONTENT_TYPES: %q must be lower case", mediaType)
+		}
+	}
+
+	// See [maxPresignTTL]: a pre-signed URL is the whole of the authorisation and nothing
+	// revokes one, so an over-long window is a standing grant to a photograph of somebody's
+	// front door for whoever the link reaches.
+	if cfg.Storage.PresignTTL > maxPresignTTL {
+		l.errf("STORAGE_PRESIGN_TTL (%s) is longer than %s; a pre-signed URL cannot be revoked "+
+			"once it is signed, so the window is the whole of the exposure",
+			cfg.Storage.PresignTTL, maxPresignTTL)
+	}
+
+	// A credential with nowhere to go is the shape of a half-finished configuration, and the
+	// symptom is silence: cmd/api builds no geocoder, addresses are stored unresolved, and the
+	// key sitting in the environment suggests the opposite. The reverse — a base URL with no
+	// key — is legitimate and not checked, because a self-hosted geocoder needs no credential.
+	if cfg.Geocoding.ProviderAPIKey != "" && cfg.Geocoding.ProviderBaseURL == "" {
+		l.errf("GEOCODING_API_KEY is set but GEOCODING_BASE_URL is not; " +
+			"no geocoder is built, so addresses would be stored unresolved")
+	}
+
 	// Everything below this point is a deployment-safety rule. Development is exempt by
 	// design: the whole point of the defaults is that a fresh clone runs without setup.
 	if cfg.Env.IsDevelopment() || !cfg.Env.valid() {
@@ -597,6 +1151,19 @@ func (l *loader) validate(cfg *Config) {
 		l.errf("DATABASE_URL: sslmode=disable is not permitted when SHIPPER_ENV is %s", cfg.Env)
 	}
 
+	// The same shape for the object store, and it is needed here rather than covered by the
+	// credential rule above: STORAGE_ENDPOINT carries no credential, so nothing else notices a
+	// deployment left pointing at the development container. The symptom would be a proof
+	// photograph the platform believes it stored and nobody can ever retrieve.
+	if endpoint, err := url.Parse(cfg.Storage.Endpoint); err == nil {
+		switch endpoint.Hostname() {
+		case "localhost", "127.0.0.1", "::1":
+			l.errf("STORAGE_ENDPOINT: %q is a loopback address and cannot be right when "+
+				"SHIPPER_ENV is %s (AWS S3's own is https://s3.%s.amazonaws.com)",
+				cfg.Storage.Endpoint, cfg.Env, cfg.Storage.Region)
+		}
+	}
+
 	// The credential-default rule above catches a variable that was never set. This catches
 	// the other way in: the development key copied out of deploy/.env.example into a real
 	// environment, which is a signing key published in this repository.
@@ -612,4 +1179,48 @@ func (l *loader) validate(cfg *Config) {
 			}
 		}
 	}
+
+	if !l.defaulted["DELIVERY_DRIVER_TOKEN_KEYS"] {
+		for kid, secret := range cfg.Delivery.DriverTokenKeys {
+			if string(secret) == developmentDriverSigningKey {
+				l.errf("DELIVERY_DRIVER_TOKEN_KEYS: key %q is the development key from "+
+					"deploy/.env.example, which is public; it may not be used when "+
+					"SHIPPER_ENV is %s", kid, cfg.Env)
+			}
+		}
+	}
+
+	// The same second door, for the object store. The rule above catches a variable nobody set;
+	// this catches the local throwaway copied out of deploy/.env.example into a real
+	// environment, which would be a published credential against a bucket of private evidence.
+	if !l.defaulted["STORAGE_SECRET_ACCESS_KEY"] &&
+		cfg.Storage.SecretAccessKey == developmentStorageSecretAccessKey {
+		l.errf("STORAGE_SECRET_ACCESS_KEY: this is the development credential from "+
+			"deploy/.env.example, which is public; it may not be used when SHIPPER_ENV is %s",
+			cfg.Env)
+	}
+}
+
+// checkBucketName reports why a name is not one S3 will accept, or nil.
+//
+// The message completes the sentence "STORAGE_BUCKET: %q …", so it reads as a description of the
+// name rather than as an instruction.
+func checkBucketName(name string) error {
+	if len(name) < 3 || len(name) > 63 {
+		return fmt.Errorf("is %d characters; a bucket name is between 3 and 63", len(name))
+	}
+
+	alphanumeric := func(c byte) bool {
+		return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+	}
+	if !alphanumeric(name[0]) || !alphanumeric(name[len(name)-1]) {
+		return errors.New("must start and end with a lower-case letter or a digit")
+	}
+	for i := 0; i < len(name); i++ {
+		if !alphanumeric(name[i]) && name[i] != '-' && name[i] != '.' {
+			return fmt.Errorf("contains %q; a bucket name holds only lower-case letters, "+
+				"digits, hyphens and dots", name[i])
+		}
+	}
+	return nil
 }

@@ -29,8 +29,36 @@ web-lint: ## Run ESLint across the web applications
 web-typecheck: ## Type-check the web applications with TypeScript in strict mode
 	$(PNPM) -r run typecheck
 
+# `pnpm -r run test` skips a package with no `test` script — confirmed rather than assumed: the
+# admin panel has none, and the target exits 0 without naming it. So a surface opts in by adding
+# the script, and no application is named here any more than it is above.
+#
+# The driver portal's tests are `node --test` over lib/, which needs no framework, no build and
+# no install: Node 22 strips the types itself. That is why this is $(PNPM) -r rather than
+# anything cleverer.
+.PHONY: web-test
+web-test: ## Run the web applications' unit tests
+	$(PNPM) -r run test
+
+# The build sits between the lint and the type-check, and the order is load-bearing rather
+# than arbitrary (SHIP-15e, from the defect SHIP-23a found).
+#
+# Next.js 16 generates LayoutProps and the route types into .next/types during a build, so on a
+# checkout that has never been built `tsc --noEmit` has nothing to resolve them against and
+# fails. It is invisible locally, because a developer has always built at least once; CI on a
+# fresh clone was the first thing ever to run the target on an empty tree. Both web workflows
+# carried a `make web-build` step to work around it until this line was reordered.
+#
+# The tests come second, before the build rather than after the type-check, for one reason: they
+# cost a tenth of a second and the build costs thirty, so a failing guard is reported before the
+# slow part rather than behind it. They depend on nothing the build produces — that dependency is
+# the type-check's alone, and its position relative to the build is unchanged.
+#
+# They were missing from this line until after SHIP-120, which had written twenty of them. A test
+# nobody runs is worse than one that does not exist, because it is counted — the same position
+# CLAUDE.md takes on integration tests that silently skip.
 .PHONY: web-check
-web-check: web-lint web-typecheck web-build ## Everything CI should run for the web surfaces
+web-check: web-lint web-test web-build web-typecheck ## Everything CI should run for the web surfaces
 
 # One target rather than one per application, so adding a surface needs no edit here.
 #
