@@ -16,11 +16,11 @@
 ///
 /// ## What is deliberately not here
 ///
-/// **The sync worker is SHIP-125.** Nothing in this folder decides when to send, how long to
-/// wait after a failure, or what a particular platform refusal means. What it does is make those
-/// decisions safe to take: every attempt reuses the idempotency key minted when the user acted,
-/// a claim that never came back is recovered rather than stranded, and an item nothing can be
-/// done with is quarantined where it stays visible instead of vanishing.
+/// **The sync worker is SHIP-125, in `core/sync`.** Nothing in this folder decides when to send,
+/// how long to wait after a failure, or what a particular platform refusal means. What it does is
+/// make those decisions safe to take: every attempt reuses the idempotency key minted when the
+/// user acted, a claim that never came back is recovered rather than stranded, and an item nothing
+/// can be done with is quarantined where it stays visible instead of vanishing.
 ///
 /// ## Storage: Drift over SQLite
 ///
@@ -35,6 +35,7 @@
 ///
 /// `Docs/07` §3 clears the queue at sign-out. [OperationQueue.clear] is that call and reports how
 /// many operations it discarded, so a bulk removal is still something a person can be told about.
-/// It is not yet wired into `SessionController.signOut` — see `Docs/11` §3, SHIP-124, for why
-/// that waits for the ticket that opens the database at start-up.
+/// SHIP-125 wires it: `syncWorkerProvider` watches the session and clears the queue when it
+/// becomes signed out, rather than `SessionController.signOut` calling in here. See `Docs/11` §3,
+/// SHIP-125.
 library;
