@@ -60,6 +60,34 @@ dependencies:
   drift: ^2.34.3
   drift_flutter: ^0.3.1
 
+  # SHIP-168, and the two packages the launch-time version gate cannot be built without.
+  #
+  # `package_info_plus` reads the **native build number** — `CFBundleVersion` on iOS,
+  # `versionCode` on Android — which is the integer `GET /v1/app/minimum-version` publishes a
+  # floor against. Docs/07 §8 requires every build to carry one, and Flutter's tooling already
+  # writes it: `ios/Runner/Info.plist` holds `$(FLUTTER_BUILD_NUMBER)` and
+  # `android/app/build.gradle.kts` holds `flutter.versionCode`, both set by `--build-number`.
+  #
+  # **The alternative was a `--dart-define`, which needs no package at all**, and it was rejected
+  # for one reason: it is a second place the build number lives, and nothing keeps the two in
+  # step. The release pipeline at SHIP-24…27 would have to pass `--build-number=N` and a matching
+  # define forever, and the first build that passes only one compares the wrong integer — locking
+  # out a supported build, or admitting the exact build the floor was raised to retire, with no
+  # test failure and no log line either way.
+  #
+  # `url_launcher` is what makes "linking to the store" a link rather than a printed URL.
+  #
+  # **The native footprint, since Docs/11 §9 raises this about packages with native
+  # integrations.** Both are published by flutter.dev, and neither reads a device identifier, a
+  # contact, a location or an advertising id — so unlike `device_info_plus`, which §9 declines for
+  # precisely that reason, neither the Apple privacy labels nor the Play data-safety declaration
+  # moves. `package_info_plus` reads this application's own bundle metadata; `url_launcher` opens
+  # a URL. Both compile against `flutter.compileSdkVersion` with minSdk 19 and 24, so the API 24
+  # floor this project holds for `flutter_secure_storage` does not move either — which was the
+  # question worth asking, because that floor is the reason that package is pinned at 10.x.
+  package_info_plus: ^10.2.1
+  url_launcher: ^6.3.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

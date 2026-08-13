@@ -10,10 +10,14 @@
 /// `/v1/fleet/vehicles` serves, and nothing else. `fleet_repository.dart` names all six and says
 /// what is deliberately absent.
 ///
-/// **This is the first provider-only surface in the app.** `provider_only.dart` is where that is
-/// decided, and it is worth reading before adding a second one: it draws the line between hiding a
+/// **This was the first provider-only surface in the app**, and `ProviderOnly` is where that was
+/// decided. It is worth reading before adding another one: it draws the line between hiding a
 /// surface, which the device may do, and deciding what an account may do, which only the platform
 /// may.
+///
+/// **It has moved to `core/auth/provider_only.dart`** (SHIP-100). It was written here while the
+/// fleet was its only caller; the provider's job detail is its second, and features do not import
+/// one another (`Docs/07` §2, `architecture_test.dart`). Nothing it does changed in the move.
 ///
 /// ## What is not here
 ///

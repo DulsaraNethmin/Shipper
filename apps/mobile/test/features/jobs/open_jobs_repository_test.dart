@@ -16,6 +16,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/api/idempotency_interceptor.dart';
+import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/features/jobs/job_status.dart';
 import 'package:shipper/features/jobs/open_jobs_repository.dart';
 
@@ -189,6 +190,78 @@ void main() {
       ]);
       expect(adapter.requests.first.queryParameters, isEmpty);
       expect(adapter.requests.last.queryParameters, <String, Object?>{'cursor': _cursor});
+    });
+  });
+
+  group('reading one job', () {
+    test('reads /v1/jobs/open/{id}, which is not the owner’s /v1/jobs/{id}', () async {
+      // The path is the whole of this test. `GET /v1/jobs/{id}` is the *owner's* view and is the one
+      // shape in this API that carries the budget; a provider calling it gets `404`, and a client
+      // that reached for it would be asking for the response Docs/01 §4.3 exists to keep away from
+      // this half of the marketplace.
+      final (:repo, :adapter) = _repoReturning(_job);
+
+      final job = await repo.openJob(jobId: '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0');
+
+      expect(adapter.requests.single.method, 'GET');
+      expect(adapter.requests.single.path, '/v1/jobs/open/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0');
+      expect(job.status, JobStatus.open);
+      expect(job.pickup?.state, 'NSW');
+    });
+
+    test('carries no idempotency key and no query', () async {
+      final (:repo, :adapter) = _repoReturning(_job);
+
+      await repo.openJob(jobId: 'a');
+
+      expect(adapter.requests.single.headers.containsKey(ApiHeaders.idempotencyKey), isFalse);
+      expect(adapter.requests.single.queryParameters, isEmpty);
+    });
+
+    test('parses the same type the feed does', () async {
+      // SHIP-83 asserts on the platform's side that the detail response is byte-identical to the
+      // feed entry, and this is the client's half: one type, whatever the client did to obtain the
+      // job. Two shapes would be two places a budget field could be added.
+      final page = await _repoOnlyReturning(<String, Object?>{
+        'data': <Object?>[_job],
+        'has_more': false,
+      }).openJobs();
+      final single = await _repoOnlyReturning(_job).openJob(jobId: 'a');
+
+      expect(single.toJson(), page.data.single.toJson());
+    });
+
+    test('a job this provider may not bid on is a 404 like any other', () async {
+      // Nine cases on the platform answer identically, the owning customer among them. The client
+      // must not try to be more specific than the platform was — the indistinguishability is the
+      // privacy control.
+      final repo = _repoOnlyReturning(
+        <String, Object?>{
+          'error': <String, Object?>{'code': 'not_found', 'message': 'No such job.'},
+        },
+        status: 404,
+      );
+
+      await expectLater(
+        repo.openJob(jobId: 'a'),
+        throwsA(isA<ApiErrorResponse>().having((f) => f.statusCode, 'statusCode', 404)),
+      );
+    });
+
+    test('a budget arriving anyway has nowhere to land', () async {
+      // The platform holds its response to a closed set of keys, so this can never happen. The
+      // client's own type is held to the same standard from the other direction — whatever the key
+      // is called, there is no field for it and `toJson` cannot produce one.
+      final job = await _repoOnlyReturning(<String, Object?>{
+        ..._job,
+        'budget_cents': 150000,
+        'max_price': 150000,
+      }).openJob(jobId: 'a');
+
+      expect(job.toJson().values, isNot(contains(150000)));
+      for (final key in job.toJson().keys) {
+        expect(key, isNot(anyOf(contains('budget'), contains('price'), contains('maximum'))));
+      }
     });
   });
 }

@@ -20,6 +20,9 @@
 /// - `session_refresher.dart` — `POST /v1/auth/refresh`. The session's own call, not a
 ///   screen's, which is why it is not on `IdentityRepository` (SHIP-50).
 /// - `access_token.dart` — the `role` claim, read for presentation and never for authorisation.
+/// - `provider_only.dart` — draws a provider surface to a provider and an explanation to
+///   everybody else (SHIP-98, moved here at SHIP-100 when a second feature needed it). It
+///   **hides**; it decides nothing, and its own note is where that line is drawn.
 ///
 /// **Nothing here decides what an account may do.** Signed in means this device holds a
 /// refresh token, which is a navigation fact; the platform decides the rest, on every request.

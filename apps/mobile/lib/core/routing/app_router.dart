@@ -7,6 +7,8 @@ import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
+import 'package:shipper/features/bidding/place_bid_panel.dart';
+import 'package:shipper/features/delivery/delivery_screen.dart';
 import 'package:shipper/features/fleet/add_vehicle_screen.dart';
 import 'package:shipper/features/fleet/fleet_screen.dart';
 import 'package:shipper/features/fleet/vehicle_screen.dart';
@@ -18,6 +20,7 @@ import 'package:shipper/features/identity/role_selection_screen.dart';
 import 'package:shipper/features/identity/sign_in_screen.dart';
 import 'package:shipper/features/jobs/job_detail_screen.dart';
 import 'package:shipper/features/jobs/job_locations_screen.dart';
+import 'package:shipper/features/jobs/open_job_screen.dart';
 
 /// Route paths, named once.
 ///
@@ -92,6 +95,42 @@ abstract final class Routes {
 
   /// [jobDetail] for one job.
   static String jobDetailFor(String jobId) => '/jobs/$jobId';
+
+  /// One open job as a **provider** sees it, and the offer they make on it (SHIP-100).
+  ///
+  /// A separate route from [jobDetail] rather than one screen that branches on the role, and that
+  /// is the same decision the platform made twice: `GET /v1/jobs/{id}` and `GET /v1/jobs/open/{id}`
+  /// are two endpoints answering with two response shapes, because one shape carrying the budget
+  /// "when the caller owns it" is the arrangement `Docs/01` §4.3 is hardest to keep. Two routes,
+  /// two screens, two types, and no flag anywhere that decides which half of the marketplace is
+  /// looking.
+  ///
+  /// It does not collide with [jobDetail]: `/jobs/:id` matches exactly one segment, and this has
+  /// two. `/jobs/open` on its own would be read as a job whose id is the word "open", and there is
+  /// deliberately no such route — the feed is the provider half of [home] rather than a location.
+  static const openJobDetail = '/jobs/open/:id';
+
+  /// [openJobDetail] for one job.
+  static String openJobDetailFor(String jobId) => '/jobs/open/$jobId';
+
+  /// Recording the milestones of one delivery, as the awarded **provider** (SHIP-129).
+  ///
+  /// A third route under `/jobs/` rather than a tab on either of the two above, and for the reason
+  /// that made those two separate: they are three readers of three different things. [jobDetail] is
+  /// the customer's own job, [openJobDetail] is a job a provider may bid on — and stops answering
+  /// the moment they win it — and this is the delivery of a job already awarded.
+  ///
+  /// **It is reached by deep link today and by nothing else, which is recorded rather than hidden.**
+  /// `Docs/07` §5 makes that a first-class way in: SHIP-145 tells an awarded provider they have won
+  /// by push, and the payload opens the job it concerns. What does not exist is a *list* — the
+  /// provider half of the shell shows open work to bid on (SHIP-99), and no endpoint serves a
+  /// provider the jobs they have been awarded. `Docs/11` §3 names what would close it.
+  ///
+  /// It does not collide with [jobDetail], which matches exactly one segment.
+  static const delivery = '/jobs/:id/delivery';
+
+  /// [delivery] for one job.
+  static String deliveryFor(String jobId) => '/jobs/$jobId/delivery';
 
   /// The provider's own fleet (SHIP-98).
   ///
@@ -186,6 +225,19 @@ const _signedInLocations = <String>{
 final _signedInPatterns = <RegExp>[
   // `/jobs/new` is matched by the set above first, so the wizard is never read as a job id.
   RegExp(r'^/jobs/[^/]+$'),
+
+  // The provider's view of one open job (SHIP-100). A second pattern rather than a widening of the
+  // one above, because `[^/]+` is one segment on purpose: a pattern loose enough to cover both
+  // would also admit every path under `/jobs/` that anybody adds later, and this collection decides
+  // where the app is willing to *draw* — the looser it is, the less it says.
+  RegExp(r'^/jobs/open/[^/]+$'),
+
+  // The awarded provider recording one delivery's milestones (SHIP-129). A third pattern for the
+  // same reason as the second: the segment after the id is fixed, so this admits exactly one more
+  // location rather than everything under `/jobs/{id}/`. The route is deep-link only today, which
+  // makes forgetting this line a link that silently lands on the home shell rather than a card that
+  // does nothing.
+  RegExp(r'^/jobs/[^/]+/delivery$'),
 
   // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
   // route reachable only through an identifier looks, from the outside, like a card that does
@@ -345,6 +397,31 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.newJob,
         builder: (context, state) => const JobLocationsScreen(),
+      ),
+      // Before `jobDetail`, in the same spirit as `newJob`. It does not actually collide —
+      // `/jobs/:id` matches one segment and this has two — and it is declared first anyway, so that
+      // the reading "everything more specific under /jobs comes before /jobs/:id" holds for the next
+      // person to add one.
+      //
+      // **This is where the two features that make up SHIP-100 meet, and nowhere else.** `Docs/07`
+      // §2 forbids `features/jobs` and `features/bidding` importing one another, so the job detail
+      // declares that it needs a panel and the router — which is `core` — supplies the one from
+      // `bidding`. The Go side calls this the composition root and puts it in `cmd/api`.
+      GoRoute(
+        path: Routes.openJobDetail,
+        builder: (context, state) {
+          final id = state.pathParameters['id'] ?? '';
+          return OpenJobScreen(jobId: id, bidPanel: PlaceBidPanel(jobId: id));
+        },
+      ),
+      // Before `jobDetail` as well, and it does not collide either — `/jobs/:id` is one segment
+      // and this is two. Declared here so that "everything more specific under /jobs comes before
+      // /jobs/:id" keeps holding for whoever adds the next one.
+      GoRoute(
+        path: Routes.delivery,
+        builder: (context, state) => DeliveryScreen(
+          jobId: state.pathParameters['id'] ?? '',
+        ),
       ),
       // After `newJob`, deliberately. go_router takes the first route that matches, so declaring
       // `/jobs/:id` first would make `/jobs/new` a job whose id is the word "new".

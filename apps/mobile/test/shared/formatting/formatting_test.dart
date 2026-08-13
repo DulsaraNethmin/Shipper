@@ -62,4 +62,111 @@ void main() {
       expect(audFromCents(999999), r'$9,999.99');
     });
   });
+
+  group('a date and a time, for a commitment rather than a day', () {
+    test('renders day-first with a twelve-hour clock', () {
+      // A bid says "I will be there at nine" (SHIP-84). A screen that rendered only the day would
+      // drop the half of the offer the customer is comparing.
+      final morning = DateTime(2026, 8, 20, 9, 5);
+      final afternoon = DateTime(2026, 8, 20, 17);
+
+      expect(dayFirstDateTime(morning.toIso8601String()), '20 Aug 2026, 9:05 am');
+      expect(dayFirstDateTime(afternoon.toIso8601String()), '20 Aug 2026, 5:00 pm');
+    });
+
+    test('midnight and midday are 12, not 0', () {
+      // `hour % 12` is 0 at both ends, and "0:00 am" is the bug that reads as plausible.
+      expect(dayFirstDateTime(DateTime(2026, 8, 20).toIso8601String()), '20 Aug 2026, 12:00 am');
+      expect(dayFirstDateTime(DateTime(2026, 8, 20, 12).toIso8601String()), '20 Aug 2026, 12:00 pm');
+    });
+
+    test('a missing or unparseable timestamp is nothing, not an error', () {
+      expect(dayFirstDateTime(null), isNull);
+      expect(dayFirstDateTime(''), isNull);
+      expect(dayFirstDateTime('next tuesday'), isNull);
+    });
+  });
+
+  group('an instant on its way to the platform carries an offset', () {
+    test('is RFC 3339, with the zone and not without it', () {
+      // The trap this function exists for: DateTime.toIso8601String() on a local value produces
+      // `2026-08-20T09:00:00.000` with **no offset at all**, which time.Parse(time.RFC3339, …)
+      // refuses — reaching the provider as "that is not a date" about a date they picked from a
+      // calendar.
+      final sent = rfc3339(DateTime(2026, 8, 20, 9, 30));
+
+      expect(sent, startsWith('2026-08-20T09:30:00'));
+      expect(
+        sent,
+        matches(RegExp(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$')),
+        reason: 'the platform parses RFC 3339, which requires an offset',
+      );
+      expect(sent, isNot(contains('.')), reason: 'no fractional seconds, which nothing needs here');
+    });
+
+    test('pads every part, so a single-digit month is two digits', () {
+      expect(rfc3339(DateTime(2026, 1, 2, 3, 4, 5)), startsWith('2026-01-02T03:04:05'));
+    });
+
+    test('a UTC instant is rendered in the device’s own zone rather than as Z', () {
+      // Deliberate: the platform normalises to UTC itself, so converting on the device would be a
+      // second timezone conversion to keep correct. What matters is that the offset is stated.
+      final at = DateTime.utc(2026, 8, 19, 23);
+
+      expect(rfc3339(at), startsWith('${at.toLocal().year}-'));
+      expect(rfc3339(at), isNot(endsWith('Z')));
+    });
+  });
+
+  group('what somebody typed into a price box, as cents', () {
+    test('whole dollars and cents both read straight in', () {
+      expect(centsFromAud('450'), 45000);
+      expect(centsFromAud('450.50'), 45050);
+      expect(centsFromAud('0.99'), 99);
+    });
+
+    test('the fraction is padded on the right, not the left', () {
+      // `.5` is fifty cents and not five. This is the direction it is easy to get backwards, and
+      // getting it backwards is a bid ten times too small with nothing that looks like a mistake.
+      expect(centsFromAud('450.5'), 45050);
+      expect(centsFromAud('.5'), 50);
+      expect(centsFromAud('.05'), 5);
+    });
+
+    test('accepts what people actually type into a price box', () {
+      expect(centsFromAud(r'$450'), 45000);
+      expect(centsFromAud('1,500'), 150000);
+      expect(centsFromAud('  450.50  '), 45050);
+    });
+
+    test('refuses more than two decimal places rather than rounding them', () {
+      // 45.005 is a price the platform cannot store, and rounding it quietly would be this client
+      // deciding what the offer was.
+      expect(centsFromAud('45.005'), isNull);
+    });
+
+    test('refuses anything that is not an amount', () {
+      expect(centsFromAud(null), isNull);
+      expect(centsFromAud(''), isNull);
+      expect(centsFromAud('.'), isNull);
+      expect(centsFromAud('four fifty'), isNull);
+      expect(centsFromAud('450.50.25'), isNull);
+      expect(centsFromAud('-450'), isNull);
+      expect(centsFromAud('45e2'), isNull);
+    });
+
+    test('round-trips through the renderer', () {
+      // The two conventions live in one file so they cannot drift, and this is what says so.
+      for (final typed in <String>['450', '450.50', '1,000', '0.01']) {
+        final cents = centsFromAud(typed)!;
+        expect(centsFromAud(audFromCents(cents)), cents);
+      }
+    });
+
+    test('a large amount is not turned into a double on the way through', () {
+      // Docs/10 §3.3: money is never a float. `(double.parse('99999999.99') * 100).round()` is the
+      // implementation this refuses to be, and it is wrong here by a cent.
+      expect(centsFromAud('99999999.99'), 9999999999);
+    });
+  });
 }

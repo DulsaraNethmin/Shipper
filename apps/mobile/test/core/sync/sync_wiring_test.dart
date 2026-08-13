@@ -10,6 +10,7 @@
 // `await` otherwise, and a test that races it proves whichever side it happened to win.
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -22,6 +23,7 @@ import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/core/queue/operation_queue.dart';
 import 'package:shipper/core/queue/queue_database.dart';
 import 'package:shipper/core/sync/operation_sender.dart';
+import 'package:shipper/core/sync/queue_watch.dart';
 import 'package:shipper/core/sync/sync_signals.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 
@@ -159,6 +161,35 @@ void main() {
     expect(
       harness.container.read(syncWorkerProvider).queue,
       same(harness.container.read(operationQueueProvider)),
+    );
+  });
+
+  test('nothing watches the queue until something supplies the worker (SHIP-126)', () {
+    // `queueWatchProvider` is empty by default so that `PendingUpdatesIndicator` — which lives
+    // inside `ShipperApp`, and therefore inside every widget test in this suite — opens no
+    // database. That default is what makes the widget safe to mount there, and it is also the way
+    // it can be silently wrong in production, so both halves are held: the default is null here,
+    // and `main.dart` supplies it, below.
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+
+    expect(container.read(queueWatchProvider), isNull);
+  });
+
+  test('main.dart supplies it, which is the whole of the production wiring (SHIP-126)', () {
+    // A source assertion rather than a call, because `main()` calls `runApp` and constructs the
+    // real queue in the platform's application-support directory — the two things a host test
+    // cannot do. What can be checked is that the override is there at all, and its absence is a
+    // build that runs with an indicator which never appears however full the queue gets: no test
+    // fails, nothing is logged, and the failure is a driver being left to guess.
+    final source = File('lib/main.dart').readAsStringSync();
+
+    expect(
+      source,
+      contains('queueWatchProvider.overrideWith'),
+      reason: 'lib/main.dart no longer supplies queueWatchProvider. The pending-updates indicator '
+          'reads it and would draw nothing at all — see Docs/02 §3.1 and the note on '
+          'queue_watch.dart.',
     );
   });
 }

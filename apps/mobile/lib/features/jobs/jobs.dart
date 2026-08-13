@@ -19,12 +19,20 @@
 /// - `open_jobs_filter.dart` — the narrowing a provider applies to their own feed, which the
 ///   endpoint deliberately accepts no parameter for.
 /// - `provider_job_feed.dart` and its controller — the provider half of the shell (SHIP-99).
+/// - `open_job_screen.dart` and its controller — one job as a provider deciding whether to bid
+///   sees it (SHIP-100), over `GET /v1/jobs/open/{id}`.
 ///
 /// **Both halves of the marketplace are in this package, and they meet nowhere.** `Docs/07` §2
-/// puts *discovery* in `jobs` and the feed is discovery, so the provider's screen lives beside the
+/// puts *discovery* in `jobs` and the feed is discovery, so the provider's screens live beside the
 /// customer's rather than in `fleet` — where the endpoint's own domain is, or in `bidding`, where
-/// the bid it leads to will be. What keeps them apart is that they share no type and no widget:
-/// two response shapes, two cards, two controllers, and the rule below is why.
+/// the bid they lead to lives. What keeps them apart is that they share no type and no widget: two
+/// response shapes, two cards, two controllers, two detail screens, and the rule below is why.
+///
+/// **The bid form is not in this package and is not imported by it.** Reviewing a job and offering
+/// to carry it is one thing a provider does and two features' work, and features do not import one
+/// another. `open_job_screen.dart` declares that it needs a panel; `core/routing/app_router.dart`
+/// supplies `features/bidding`'s. That is the composition-root arrangement the Go side uses for a
+/// domain and its adapters, which meet in `cmd/api` and nowhere else.
 ///
 /// ## Three rules this package is held to
 ///

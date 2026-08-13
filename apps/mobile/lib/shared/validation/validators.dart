@@ -29,6 +29,8 @@
 /// release.** Nothing else here encodes a limit.
 library;
 
+import 'package:shipper/shared/formatting/money.dart';
+
 /// Australian English throughout — this is copy a customer reads (`CLAUDE.md`).
 abstract final class Validators {
   /// The contract's minimum (`contracts/paths/identity.yaml`). See the library note above for
@@ -149,6 +151,24 @@ abstract final class Validators {
     final input = value?.trim() ?? '';
     if (input.isEmpty) return null;
     return int.tryParse(input) == null ? 'Enter a whole number.' : null;
+  }
+
+  /// A price a provider is asking, as they typed it (SHIP-100).
+  ///
+  /// **Presence and shape, and no bound**, which is the split this file exists to keep. A provider
+  /// bidding in a truck yard should not spend a round trip to be told they left the price blank, or
+  /// that `four fifty` is not a number — those are things this device can see without asking. What
+  /// the maximum is remains a rule `internal/bidding` holds (`maxOfferCents`) and `Docs/06` §5.3
+  /// keeps server-side: a copy compiled in here could not be corrected without a store release, and
+  /// `out_of_range` arrives with the real number in it, under the input that caused it.
+  ///
+  /// The shape it checks is [centsFromAud]'s, which refuses more than two decimal places rather than
+  /// rounding them — `45.005` is a price the platform cannot store, and rounding it quietly would be
+  /// the client deciding what the offer was.
+  static String? audAmount(String? value) {
+    final input = value?.trim() ?? '';
+    if (input.isEmpty) return 'Enter what you are asking for this job.';
+    return centsFromAud(input) == null ? 'Enter an amount, like 450 or 450.50.' : null;
   }
 
   /// The token from a verification email (SHIP-53).

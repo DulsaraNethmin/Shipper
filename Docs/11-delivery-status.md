@@ -356,6 +356,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
+| **SHIP-100** | M3 | Flutter provider job detail and bid placement — one job over `GET /v1/jobs/open/{id}` and an offer over `POST /v1/jobs/{id}/bids`. **The bid is sent directly and never queued**, which `Docs/07` §4 requires and SHIP-124's private `OperationKind` constructor already made impossible to get wrong; what makes a retry safe is one `ActionKey` per action against SHIP-84's stored key column. It also **closes §9's client-side budget guard** by holding every provider-facing model to a closed key set — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
@@ -365,11 +366,14 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
+| **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
+| **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
+| **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -4252,6 +4256,187 @@ running API and a hand-built fixture, so it is a check a person invokes rather t
 the same reasoning `make flutter-integration` already carries. `make verify` does not cover this
 ticket: it exercises HTTP endpoints and this one adds none.
 
+### SHIP-100 — the offer, the key that makes a retry safe, and the queue it deliberately does not use
+
+`Docs/09`'s *Done when* is one sentence — "a provider can review a job and submit a bid" — and it
+spans two of `Docs/07` §2's features. `GET /v1/jobs/open/{id}` (SHIP-83) is the review;
+`POST /v1/jobs/{id}/bids` (SHIP-84) is the offer. The feed's cards became tappable, `/jobs/open/{id}`
+became a route, and `internal/bidding`'s client half stopped being a `library;` with a note in it.
+
+#### Queue or send: `Docs/07` §4 answers it, and SHIP-124 had already made the wrong answer impossible
+
+The brief asked this to be decided and recorded, so: **the bid is sent directly.** `Docs/07` §4 names
+the exclusion in as many words — *"what is deliberately not offline: bidding, awarding, and
+negotiation. These are competitive, time-sensitive, and multi-party; a stale local decision is worse
+than an honest 'you are offline'."* A price queued at a loading dock and sent four hours later is an
+offer against a job that may have been awarded since, made by somebody who believes they have bid.
+
+**The interesting part is that this was not a rule to follow.** SHIP-124 wrote `OperationKind` with a
+**private constructor** and exactly two members, both `delivery.*`, so the set of queueable
+operations is closed by the compiler. A bid cannot be enqueued: there is no value to enqueue it as.
+That entry called this "what a client does with an operation it can never send", and the first
+ticket to meet it from the other side found that it had nothing to decide — which is the whole
+benefit of a closed set over a documented one. Nothing in `features/bidding` imports `core/queue` or
+`core/sync`.
+
+**What makes a retry safe instead is two mechanisms, and they are not the same one.** `ActionKey`
+(SHIP-51) mints one key per action and holds it in exactly one circumstance — the previous attempt
+failed **without saying whether the platform acted on it** and the request now being sent is
+identical. A dropped connection is precisely that case. SHIP-84's `uq_bids_idempotency` on
+`(job_id, provider_id, idempotency_key)` is the other half: a **stored column** rather than a cached
+response, so the retry is answered `200` with the bid the first attempt placed even after Redis has
+forgotten it. Without it the retry would meet the *one live offer* index instead and be told
+`bidding_already_bid` — a client showing a failure for a bid that is live and awaiting an answer.
+That entry drew the division and this is the client standing on the correct side of it.
+
+**Both directions are tested on the keys the repository actually received**, because getting either
+backwards is the defect. A dropped connection and then a retry sends `keys[0] == keys[1]`; a `422`,
+a corrected price, and a resend sends `keys[0] != keys[1]` — the platform fingerprints method, path
+and body, so an old key on a changed body is `idempotency_key_reused`.
+
+#### Optimistic local state, on a surface that is never offline
+
+`Docs/02` §3.1 asks the client to show optimistic local state clearly marked as pending and reconcile
+to whatever the platform returns. The first half is about the queue and does not apply here, and
+saying so is more useful than inventing a pending state: **nothing is drawn as offered until the
+platform says so.** The attempt is marked — the button disables, a spinner replaces its label — and
+`PlaceBidState.bid` is assigned from the response and never from the form.
+
+**The second half does apply, and it is not a formality.** A retry is answered with the offer the
+*first* attempt placed, so a screen that rendered what was typed would show a provider a price they
+are not standing behind. A test places `450` against a repository answering `399` and asserts the
+screen shows `$399.00`.
+
+#### Two features, one screen, and they meet in the router
+
+`Docs/07` §2 puts discovery and detail in `jobs` and bids in `bidding`, and features do not import one
+another — `architecture_test.dart` enforces it in both the `package:` and the relative form. This
+ticket is the first whose *Done when* crosses that line.
+
+**`OpenJobScreen` declares that it needs a panel and `core/routing/app_router.dart` supplies
+`PlaceBidPanel`.** That is the composition-root arrangement the Go side already uses: a domain and
+its adapters meet in `cmd/api` and nowhere else, and here the router is the only place allowed to
+know about both. `bidPanel` is a required parameter rather than a nullable one, because a job detail
+screen with no way to bid is half a ticket and a nullable parameter is how the missing half stops
+being obvious.
+
+The panel therefore knows the job's **identifier and nothing else about the job**, which turned out
+to cost nothing: SHIP-84 does not require a bid's timing to fall inside the job's windows, because
+offering a different day is a legitimate offer the customer may decline.
+
+#### `ProviderOnly` moved to `core/auth`, and the reason it had to is the same rule
+
+SHIP-99 predicted this — *"SHIP-100 is where `ProviderOnly` gets its next real client, because
+`/jobs/open/{id}` is an identifier-bearing route a notification payload can deliver somebody straight
+to"* — and predicted it correctly. What it could not predict is that the widget was in
+`features/fleet`, so the second caller could not import it. Duplicating it would have been the decay
+the boundary exists to prevent, so it moved to `core/auth/provider_only.dart`, which is what
+`Docs/07` §2 prescribes for behaviour two features need. Nothing about what it does changed, its keys
+are unchanged, and SHIP-98's own tests pass untouched.
+
+**Its copy generalised in the move**, deliberately: it named vehicles while the fleet was its only
+caller, and a sentence about vehicles in front of somebody who followed a link to a job is worse than
+the general one. Threading a per-surface sentence through four call sites buys a few words at the
+price of a parameter every future caller has to think about.
+
+**And the reason the widget is needed here is different from the fleet's, which is worth recording
+because the fleet's argument does not transfer.** `GET /v1/fleet/vehicles` does not check the
+caller's role and answers a customer `200` with an empty page — so a customer would see a form and a
+`403` at the end of it. `GET /v1/jobs/open/{id}` *does* refuse them, with `404`, byte-identically to a
+job that does not exist. That is the correct answer on the wire and a poor thing to render: "we could
+not find that job" is not what happened. **Both surfaces need the widget; only one of them needs it
+because the platform is permissive.**
+
+#### The 404 is one message, and the screen does not try to be more specific than the platform was
+
+Nine cases on the platform answer identically — outside the service area, no vehicle that can carry
+it, unverified, no longer open, never existed, and the owning customer reading their own job at the
+wrong address. SHIP-83 made that indistinguishability the control. So the screen has **one** state
+for all of them, it says "this job is not one you can bid on" rather than naming a reason, and it
+**offers no retry** — asking again cannot change the answer. A failure that is not a `404` is the
+other state, and that one does have a retry, because "there is no such job for you" and "we could not
+find out" are different things to be told.
+
+#### The budget guard: §9's client-side item is closed, and the mutations are recorded
+
+`Docs/11` §9 has carried this since wave 6: `budget_stays_on_the_customer_side_test.dart` searches
+`lib/` for the regular expression `budgetCents|budget_cents`, so it catches a rename in one direction
+and misses one in the other. **Re-run against this tree before anything was written, and both halves
+still held**: injecting `@JsonKey(name: 'max_price') int? maxPrice` into `OpenJob` **passed** that
+file, and renaming it `budget_cents` **failed** it, naming the file.
+
+**One refinement the entry did not have, found by running the whole suite rather than that file.**
+The `max_price` mutation was not undetected on today's tree — it failed **two tests in
+`open_job_test.dart`**, which SHIP-99 wrote and which holds `OpenJob.toJson()` to an exact key set.
+So the exposure was smaller than §9 stated, and its real shape was different: the closed key set
+existed for one type, in a file somebody had to remember to write. **A type with no such test —
+which is exactly what this ticket's `Bid` would have been — had no guard against a rename at all.**
+
+**Closed the way SHIP-83 did it**, in `budget_stays_on_the_customer_side_test.dart` itself, so that
+the two guards live in one place and neither can be quietly deleted alone:
+
+| Guard | What it catches | What it cannot |
+|---|---|---|
+| The source scan (kept) | A widget that renders a budget being reused on a provider screen — the failure the rule is realistically broken by | A rename |
+| A registry of provider-facing models, each held to a **closed key set** | A field added to `OpenJob`, `JobRegion` or `Bid` **whatever it is called**, and the *value* surviving a round trip under an innocuous key | A provider-facing model in a file nobody registered |
+| A source scan over the registered files for `@freezed` types | A **type** added to a registered file and not registered | The same |
+
+**Verified by mutation in three directions, and each fails exactly what it should.** `max_price` on
+`OpenJob` now fails `budget_stays_on_the_customer_side_test.dart` on both the key set and the value
+search, where before it passed. `customer_ceiling` on `Bid` — a budget under a name containing
+neither "budget" nor "price" nor "maximum" — fails the closed key set, which is the axis a spelling
+check cannot have. And a new unregistered `@freezed` type in `open_job.dart` fails the structural
+test naming the type and its file. Every mutation was reverted immediately and `git diff` confirmed
+the tree, generated files included.
+
+**What is left is named rather than argued away**: a provider-facing model in a file nobody adds to
+`_providerFacingFiles`. That is the same fail-closed-by-registration property `internal/boundaries`
+gives a ninth Go package — adding one is a decision somebody records rather than something that
+happens — and the file says so in its own header.
+
+#### Three smaller decisions worth finding later
+
+**`centsFromAud` converts on the text and never through a `double`.** This is the first screen that
+takes money *from* a person, and `(double.parse('450.55') * 100).round()` is right far more often
+than it is wrong. It refuses more than two decimal places rather than rounding them, because `45.005`
+is a price the platform cannot store and rounding it quietly would be the client deciding what the
+offer was. No upper bound is checked: `maxOfferCents` is `internal/bidding`'s and `Docs/06` §5.3 keeps
+it server-side.
+
+**`rfc3339` exists because `DateTime.toIso8601String()` carries no offset.** A local value encodes as
+`2026-08-20T09:00:00.000`, which is not RFC 3339, and `time.Parse(time.RFC3339, …)` refuses it — the
+provider is told "that is not a date" about a date they picked from a calendar. The offset is sent
+rather than the instant converted to UTC on the device, because the platform normalises anyway and a
+second timezone conversion is a second thing to keep correct.
+
+**No client-side ordering or bound check on the timing, on purpose, and there is a test that would
+fail if somebody added one.** Both instants come from the same pickers and land on the same value, so
+the form sends a delivery that is not after its collection — which `Offer.validate` refuses, with a
+message rendered under the field. Two definitions of a rule is one more than `Docs/07` §3 permits, and
+the copy on the device is the one that cannot be corrected without a store release.
+
+#### How it was demonstrated
+
+`make flutter-check` green in this worktree: **686 host tests** (up from 594), the analyzer clean,
+and the environment test per build flavour. The *Done when* is `place_bid_test.dart`'s first test,
+driven through the real app from the sign-in screen: a provider signs in, taps a job in their feed,
+reads it, prices it, chooses two instants through the pickers the screen actually uses, sends it, and
+sees the offer the platform recorded. `make verify` does not cover this ticket and its count does not
+move — that script exercises HTTP endpoints and this one adds none, the same position SHIP-98,
+SHIP-99, SHIP-124 and SHIP-125 are in.
+
+**No acceptance run against a live API was performed**, which is a step down from SHIP-99 and is
+recorded rather than glossed: that ticket ran its *Done when* on an iPhone 17 simulator against the
+API on port 8092 with a hand-built fixture. The equivalent here needs a verified provider, an
+eligible job, and a bid that must then be withdrawn before the run can be repeated — and the second
+run is where `bidding_already_bid` would be met rather than the `201`. It is worth doing before this
+reaches a device, and `make flutter-run` in this worktree already points at the right port.
+
+#### Shared surfaces
+
+`apps/mobile/**` and this file. No Go, no route file, no contract, no migration — which is why this
+branch merges first.
+
 ### SHIP-106 — the first delivery endpoint, and the question SHIP-105 left it
 
 `POST /v1/jobs/{id}/driver`. The awarded provider names who is carrying the job, and the job moves
@@ -5472,6 +5657,451 @@ bucket may be too, so the section fences on an id rather than on a count or a ti
 `CLAUDE.md`'s Kafka rule, applied to the one shared service that can be isolated but is not obliged
 to be.
 
+### SHIP-129 — the milestone screen, and the reconciliation signal a client does not have
+
+`Docs/09`'s *Done when* is one sentence — "provider records milestones with optimistic local state
+clearly marked pending" — and the interesting half is the second. Recording is a tap and a queue row;
+**"clearly marked as pending" is the claim that stops being true silently**, because a screen where a
+milestone the platform has and a milestone stuck on a phone render identically still passes every
+test that only asserts the milestone is on the list.
+
+The screen is `/jobs/{id}/delivery`: three large buttons, and a log of what this device has recorded
+with where each one has got to written beside it in a word, an icon and a sentence.
+
+#### The two seams SHIP-125 named were both taken, and one of them has a hazard in it
+
+`SyncWorker.record` is enqueue-and-drain in one call and needed nothing. `SyncWorker.snapshots` is
+where the interesting finding is: **a snapshot is read at one instant and delivered through a
+broadcast stream at a later one**, so a snapshot read before this screen's own `enqueue` committed
+can arrive after it — and it will not contain that recording, because it did not exist yet.
+
+That matters because of what a client can and cannot know. `OperationSender.send` returns `void` on
+success and the worker **deletes** the row, so **the only reconciliation signal this client has is
+the operation leaving the queue**. There is no response body to read: not the `201`, not
+`accepted_at`, not the milestone id. So "the platform has it" is derived from an absence, and an
+absence read from a stale snapshot is a screen telling a driver with no signal that Shipper has their
+work.
+
+The controller therefore treats a published snapshot as a **trigger** and re-reads
+`SyncWorker.queue` itself, and each read carries a sequence number: a read issued *before* an entry
+was created may not conclude that the entry has gone. `_applied` discards a read that comes back out
+of order. The cost is one extra `SELECT` over a handful of rows per drain; what it buys is that the
+one thing this screen says about the platform cannot be said wrongly.
+
+#### What "Recorded" claims, and the sentence it must not grow into
+
+It claims the platform took the operation. It deliberately does **not** claim the job moved, because
+an absorbed milestone is a `201` that moves nothing (SHIP-112) and — by that ticket's own decision —
+no field in the response distinguishes the two. So the screen says "Recorded"; "the job is now In
+transit" would be a client inventing a status, which is `Docs/02` §2's first rule broken by a caption.
+
+This is also why a late milestone is **not** presented as a failure. The client cannot tell an
+absorbed recording from an ordinary one and does not try: both are the row leaving the queue, and
+both read "Recorded", which is exactly what happened.
+
+#### Every button stays enabled, and that is the document rather than an oversight
+
+Recording one milestone disables nothing, and three separate rules would each be broken by a screen
+that walked the five as a chain. `Docs/02` §2 permits `Awarded → En route to pickup` with no
+assignment in between, so a provider driving the job themselves would be blocked by their own app.
+SHIP-111 records a **second** `en_route_to_pickup` as a second row when a driver reaches a pickup,
+finds nobody and sets off again. And SHIP-112 absorbs an update that arrives after a later one rather
+than refusing it, so a client that refused to record it would be discarding a driver's work to
+protect a rule the platform does not have. `Docs/07` §3 settles the general case: the device may hide
+or disable, and it decides nothing.
+
+#### `Delivered` is named and not offered
+
+`CLAUDE.md`'s invariant is that delivered requires photo proof or a recorded exception and never
+neither; `POST /v1/jobs/{id}/milestones` refuses every `delivered` with `delivery_proof_required`
+until SHIP-118; and this device can capture neither a photograph (SHIP-130) nor an exception
+(SHIP-131). A fourth button would queue an operation whose **only** possible outcome is a
+quarantined row — work the driver believes they recorded, waiting for a person. So the milestone
+stays in the vocabulary, the screen names it and says what it is waiting for, and
+`Milestone.offered` is derived from `needsProof` rather than being a second list that can disagree
+with the first. `driver_assigned` is absent from the vocabulary altogether, because it has an
+endpoint of its own and the milestone endpoint refuses it with a `422` pointing there.
+
+#### The finding: no endpoint serves an awarded job to the provider delivering it
+
+The screen shows the job's identifier and nothing else about the job, and that is a platform gap
+rather than a design choice:
+
+| Endpoint | Serves | To the awarded provider |
+|---|---|---|
+| `GET /v1/jobs/{id}` | the owning customer's own job | `404`, byte-identically to a job that does not exist |
+| `GET /v1/jobs/open/{id}` | a job while it is still biddable | stops answering the moment they win it |
+| `GET /v1/driver/jobs/{id}` | the job inside a driver link | a different token system, and it cannot be exchanged |
+
+So the addresses, the goods and the windows are reachable today by the driver the provider assigned
+and not by the provider. **Two consequences worth naming rather than absorbing**: the screen cannot
+show what is being delivered, and a milestone the platform has accepted is not readable back — the
+pending ones survive a relaunch because SHIP-124's queue is durable, and the accepted ones do not,
+because nothing on the device stored them and nothing serves them. SHIP-133 is the *customer's*
+tracking view and is not this. No ticket in `Docs/09` adds the provider's read.
+
+**The same gap is why the route is deep-link only.** `Docs/07` §5 makes that a first-class way in and
+SHIP-145 is the push that uses it, but there is no list to reach it from: the provider half of the
+shell shows open work to bid on (SHIP-99), and nothing serves the jobs a provider has been awarded.
+`_signedInPatterns` gained `^/jobs/[^/]+/delivery$` — one location rather than everything under
+`/jobs/{id}/` — and a test holds it, because forgetting it would not look like a broken button. It
+would look like a notification that opens the home shell.
+
+#### It was driven against the real API, on a simulator, and that closes SHIP-100's gap
+
+`integration_test/record_milestone_test.dart`, in the shape `sign_in_test.dart` established: the
+production widget tree, the production `dio` client with its auth and idempotency interceptors, the
+real Drift queue on the device's filesystem, the real worker started the way `main.dart` starts it,
+and real HTTP. A provider signs in, follows a link to `/jobs/{id}/delivery`, taps **En route to
+pickup**, and the entry settles on "Recorded".
+
+On an iPhone 17 simulator against this worktree's API on `8092`, `POST /v1/jobs/{id}/milestones`
+answered `201`, and the row is what `Docs/02` §3.1 asks for:
+
+```
+milestone          | En route to pickup
+actor_type         | provider
+actor_recorded_at  | 2026-08-13 12:15:28+00
+server_recorded_at | 2026-08-13 12:15:28.049833+00
+idempotency_key    | f397b7c4caeea3989305daaabafe18f2
+```
+
+Two clocks, separately, and the key the **queue** minted at the moment the user acted rather than one
+the sender invented. The job moved to `En route to pickup` in the same transaction. The awarded job
+had to be built the way `scripts/verify/70-delivery.sh` builds one — a guarded transition and one
+`Accepted` row in `bids` — because **SHIP-92's award endpoint does not exist**, which is worth
+knowing: no journey through the API alone can currently produce a job this screen can act on.
+
+The test is committed and is deliberately outside `make flutter-check` and `CHECKS`, exactly as
+SHIP-48's are: it needs a simulator and a running service, and the Flutter CI job is a Linux runner
+with neither. Its header names the invocation and the three `--dart-define`s it needs.
+
+#### Mutation testing, and the one that survived
+
+| Mutation | Result |
+|---|---|
+| `MilestoneSync.pending` given the recorded state's word and sentence | **Caught**, five tests — including the one that renders a settled and an unsettled milestone on the same screen and asserts they differ |
+| `rfc3339(at)` replaced with `at.toIso8601String()` | **Caught**, exactly one test, and it is run 1's finding still biting: the local form carries no offset and `time.Parse(time.RFC3339, …)` refuses it |
+| The ordering-key filter removed | **Caught**, one test — another job's queued work appearing on this job's screen |
+| **The read-sequence guard removed** | **Survived.** Nothing noticed |
+
+The fourth is the one worth reading. The guard is what stops a stale snapshot concluding that a
+recording has reached the platform, and **no test in the suite noticed its removal** — a real queue
+over a real file resolves too quickly for the interleaving to happen by chance, so the hazard is
+invisible to a test that waits for it.
+
+It was not tuned away and it was not left. `stale_snapshot_test.dart` arranges the interleaving
+instead of waiting for it: `GatedQueue` lets a read *complete* and holds its **answer**, which is the
+shape of the hazard exactly — a fresh read held late is harmless, a stale one held late is the bug.
+With the guard the entry stays "Pending"; with the mutation reapplied the test fails and nothing else
+does. **The honest summary is that the mutation survived the suite as written and the suite was
+wrong, not the guard.**
+
+Every mutation was reverted immediately and `git diff` confirmed the tree.
+
+#### Two smaller decisions worth finding later
+
+**The screen sends `recorded_at` on every recording, including an online one.** The field is
+optional and omitting it means "now" on the platform's clock, which is right for a request made the
+instant the user acted and wrong for every other one — and the client cannot tell which it is making,
+because whether the drain happens now or in four hours is the worker's business. Sending the actor's
+clock always is the only version with one answer.
+
+**A quarantined operation this screen never saw recorded is not listed on it.** A `BlockedOperation`
+carries no body — it is the shape a row takes when this build could not read one — so it cannot be
+named as a milestone. SHIP-132 is the screen for those and SHIP-126's indicator counts them meanwhile,
+which is the arrangement that keeps them from being invisible in the interval.
+
+#### How it was demonstrated
+
+`make flutter-check` green in this worktree: **714 host tests** (up from 686), the analyzer clean, and
+the environment test per build flavour. The *Done when* is `record_milestone_test.dart`'s first two
+tests — recorded with no signal and marked pending, recorded with signal and marked Recorded — and
+the acceptance run above, on a simulator against a live API. `make verify` does not cover this ticket
+and its count does not move: that script exercises HTTP endpoints and this one adds none, the same
+position SHIP-98, SHIP-99, SHIP-100, SHIP-124 and SHIP-125 are in.
+
+### SHIP-126 — the pending count, and what "persistent" had to be taken to mean
+
+`Docs/02` §3.1's escalation ladder has three rungs and this is the first: *"Immediately — the app
+shows a persistent indicator of how many updates are pending. The user is never left guessing whether
+their work was recorded."* The 4-hour nudge is SHIP-127 and the 24-hour operations alert is SHIP-128;
+neither is here.
+
+#### Persistent means it does not go away when the screen does, so it is mounted above the router
+
+`MaterialApp.router`'s `builder` runs below the theme and **above the navigator**, so a widget placed
+there is on every route in the application and survives every navigation. An indicator in an app
+bar would have been a smaller change and a different ticket: a driver records three milestones at a
+loading dock and walks to the next job, and the question "did that go?" travels with them. Answering
+it only on the screen where the work was recorded answers it in the one place it is not being asked.
+
+It is a **bar below the content** rather than a badge over it, so it never covers anything — a
+floating chip in the bottom corner would sit on the button that publishes a delivery on the customer
+shell. `pending_updates_persist_test.dart` is the *Done when*: record twice with no signal on
+`/jobs/{id}/delivery`, navigate to the shell, and the count is still there.
+
+#### Putting it inside `ShipperApp` is exactly the arrangement SHIP-124 objected to, so the dependency is inverted
+
+SHIP-124 refused to wire the queue into `SessionController.signOut` because every widget test builds
+that path and would open a Drift database in the platform's application-support directory, which a
+host test has no plugin behind. SHIP-125 answered the same objection by starting the worker from
+`main` and nowhere else. **This ticket puts a widget that reads the queue inside the one widget every
+test builds**, which would have undone both.
+
+So `queueWatchProvider` holds the worker and is **`null` by default**. `main.dart` overrides it;
+nothing else does. A test that has not asked for a queue gets an empty stream, a `SizedBox.shrink()`
+and no database, and the 714 tests that existed before this ticket were unchanged by it.
+
+The cost of that inversion is a wire that can be quietly missing: an application whose `main` forgot
+the override runs with an indicator that never appears however full the queue gets — no test fails,
+nothing is logged, and the symptom is a driver left guessing, which is the exact thing the ticket
+exists to prevent. So **both halves are held**: `sync_wiring_test.dart` asserts the default is `null`,
+and asserts that `lib/main.dart` supplies it. The second is a source assertion rather than a call,
+because `main()` calls `runApp` and constructs the real queue — the two things a host test cannot do.
+
+#### The number is `unsynced`, and blocked work is a second line rather than part of it
+
+`QueueSnapshot.unsynced` is **pending plus in flight**, which is the sum SHIP-125 chose and gave the
+reason for: an operation the platform has refused is not waiting for a connection, it is waiting for
+a person, and a number that never falls however long the driver stands in the open is not what
+`Docs/02` §3.1 asks for.
+
+**That reasoning leaves a hole, and this ticket closes it rather than inheriting it.** A device with
+one quarantined update and nothing pending would show no indicator at all — silence about the one
+update that most deserves attention. So the indicator appears when **either** number is above zero,
+and the blocked count is a second line in different words: *needs attention* rather than *waiting to
+sync*. Two numbers rather than three-of-which-one-is-stuck, so a driver who stands in the open
+watches the first fall to zero and the second stay put, which is true and is what tells them the
+second needs something other than patience. What lost and to what is SHIP-132's screen.
+
+**The in-flight half of the sum is held by a hand-built snapshot and by nothing else, deliberately.**
+A published snapshot almost never carries an in-flight operation — the worker publishes at the end of
+a pass, by which time each claimed operation has been completed, released or blocked — so a test
+driving the real worker cannot produce one, and the term would be untested against a real queue while
+looking well covered. That is why the arithmetic is tested over constructed snapshots and the
+persistence over the running application, rather than both being attempted in one place.
+
+#### At zero it draws nothing, and that is a decision rather than an omission
+
+A bar that is always present and usually reads zero is a bar people learn not to read, and this rung
+of the ladder is entirely about the case where the number is not zero. What answers "was my work
+recorded" in the settled case is SHIP-129's delivery screen, where each recording carries its own
+word — a per-item answer, which is the stronger one. The two halves are complementary and the tests
+say so in the same file: the indicator goes and "Recorded" stays.
+
+#### Mutation testing
+
+| Mutation | Result |
+|---|---|
+| The count reads `pending.length` instead of `unsynced` | **Caught**, one test — the constructed snapshot with one operation of each kind |
+| The indicator hidden whenever nothing is waiting, ignoring blocked work | **Caught**, two tests |
+| The `builder` removed from `MaterialApp.router`, leaving the indicator unmounted | **Caught**, one test — the journey that leaves the screen |
+| `main.dart`'s `queueWatchProvider` override removed | **Caught**, one test — the source assertion written for exactly this |
+
+Every mutation was reverted immediately and `git diff` confirmed the tree.
+
+#### How it was demonstrated
+
+`make flutter-check` green in this worktree: **726 host tests** (up from 714), the analyzer clean, and
+the environment test per build flavour. `make verify` does not cover this ticket and its count does
+not move.
+
+**And on a device, against the live API.** `integration_test/record_milestone_test.dart` — written for
+SHIP-129 and extended here — takes `main.dart`'s own override, **pauses the worker before the tap**,
+and reads both halves at once: the screen says "Pending" and the bar says "1 update waiting to sync".
+The worker is then resumed, the platform answers `201`, and both settle — "Recorded" on the entry and
+no bar at all. Pausing is what makes the pending state observable rather than raced: against a
+working API it would otherwise last a few milliseconds.
+
+That run also demonstrated something neither ticket claimed. It was the **second** recording of
+`en_route_to_pickup` against the same job, and the platform wrote a second row under a second key and
+answered `201` — SHIP-111's "a repeat that is not a retry is a second row", which is `Docs/02` §5's
+failed pickup attempt. **The app presented it as "Recorded", not as an error**, which is the behaviour
+`Docs/02` §3.1 requires of a client whose update the platform keeps without moving the job.
+
+### SHIP-168 — the gate, and the four decisions "at launch" turns out to contain
+
+`Docs/09` is one line: *a build below the floor blocks with an update prompt linking to the store.*
+SHIP-167 built the endpoint eight months of tickets early, because `Docs/08` Step 3 is right that a
+gate cannot be added retroactively to builds already on devices. This is the other half, and it is
+the client's first **self-limiting** feature: everything before it decided what the app could do,
+and this decides whether it runs at all.
+
+**The strike this ticket carried for four waves was right about the store and wrong about the
+ticket, and the wave-6 reconciliation was right to lift it.** The old reason read "its store link
+does not exist until X-2/X-3 publish listings". Building it settles the question the reconciliation
+argued from the outside: the pilot's shape — blocked, with no link — is not a degraded version of
+the feature, it is **the** version, and the platform decided it deliberately.
+`internal/config/config.go` allows an empty `IOS_STORE_URL` rather than refusing it at startup, and
+says why in its own comment. So the only thing X-2 and X-3 supply is a URL that resolves. Both
+shapes are built, both are tested, and both were driven against the running service.
+
+#### Where the build number comes from, which was the decision with a wrong answer available
+
+The floor is an integer build number per platform, and the running build's number is the **native**
+one: `CFBundleVersion` on iOS, `versionCode` on Android, read through `package_info_plus`. Flutter
+already writes it — `Info.plist` holds `$(FLUTTER_BUILD_NUMBER)`, `build.gradle.kts` holds
+`flutter.versionCode` — so what is compared is exactly what `--build-number` set and, locally,
+exactly the `+1` of `version: 1.0.0+1`.
+
+**The alternative needed no package at all and was rejected.** `ApiEnvironment` already selects the
+deployment with `--dart-define`, and a `SHIPPER_BUILD_NUMBER` define would have followed that
+pattern for nothing. It is a *second* place the build number lives, and nothing can make the two
+agree: the release pipeline at SHIP-24…27 would have to pass `--build-number=N` and a matching
+define forever, and the first build that passes only one compares the wrong integer. Too low locks
+out a supported build; too high admits exactly the build the floor was raised to retire. Neither
+produces a test failure or a log line. That is a large silent failure to buy with one avoided
+dependency, so the number is read from the place the store itself reads it.
+
+Two packages arrive with this ticket — `package_info_plus` and `url_launcher`, both
+flutter.dev-published. `pubspec.yaml` carries the reasoning and the native-footprint check §9 asks
+for: neither reads a device identifier, a contact, a location or an advertising id, so unlike
+`device_info_plus` — which §9 declines for exactly that reason — **neither the Apple privacy labels
+nor the Play data-safety declaration moves.** Both compile against `flutter.compileSdkVersion` with
+minSdk 19 and 24, so the API 24 floor that pins `flutter_secure_storage` at 10.x does not move
+either, which was the question worth asking before adding anything with a native half.
+
+The comparison is `build.number >= floor` runs, `<` blocks. **Equal to the floor runs**, because
+`internal/config` calls the field "the lowest build number still permitted" — and `<=` would lock
+out every device on the exact build the floor was just raised to, which is the largest population
+there is at that moment.
+
+#### What an unreachable API means: it does not block, and that is the ticket's real decision
+
+The check runs on the first frame, and the app draws normally while it is in flight. **A check that
+has not answered, has failed, or has thrown while decoding leaves the app running.**
+
+Three things make failing open right, and they are worth having written down because failing closed
+is the instinct:
+
+- **The gate is not a control.** `Docs/07` §3 and `CLAUDE.md` put every authorisation decision on
+  the platform, and this is the same rule wearing different clothes: the app may block, the platform
+  decides. What actually retires a build is `/v1` refusing it. This screen exists to tell somebody
+  *why*, and where to go.
+- **Failing closed brands the app on the platform's worst day.** Every device that opened the app
+  during an outage would show an update prompt for an update that does not exist, and the way out
+  would be a release — which is precisely the loop `Docs/07` §6 says mobile does not have. A gate
+  that turns a partial outage into a total one is worse than the builds it guards against.
+- **`Docs/07` §4 makes working without signal the client's most important capability.** Holding the
+  first frame behind a round trip would mean up to ten seconds of blank screen on a bad connection,
+  and an app that will not open on a loading dock.
+
+**The cost of failing open is smaller than it looks, and Riverpod is why.**
+`ProviderContainer.defaultRetry` re-runs a failed provider ten times with exponential backoff from
+200ms to a 6.4-second ceiling, so a launch that lands in a lift gets its answer about forty-five
+seconds later with nobody doing anything, and a device with no signal at all stops asking rather
+than polling for as long as the app is open. That default is **kept deliberately** rather than
+replaced: SHIP-125 already owns this application's one hand-written backoff, and its five minutes
+are for a queue that must eventually drain rather than for a courtesy at start-up.
+
+**One thing found while building it, which the next person to touch `updateVerdictProvider` has to
+know: while Riverpod is retrying, the state is `AsyncLoading` *carrying an error*, not
+`AsyncError`.** A fail-open written as "block unless the state is an error" would therefore be wrong
+in the one case it was written for. Matching on the value is the only safe form.
+
+**The limitation, stated rather than hidden:** the check runs once per process, and a handset
+process survives for days. A floor raised this morning reaches a device at its next cold start, not
+its next foreground. A resume trigger is the obvious extension — `sync_signals.dart` already listens
+to the lifecycle — and it was left out because `Docs/09` says *launch*, and because a second trigger
+wants `Docs/07` §6's soft-prompt half, which is a different ticket.
+
+#### "Blocks" was read as the strong word, so the gate replaces the app rather than covering it
+
+`VersionGate` sits inside `MaterialApp.router`'s builder, above the navigator and above SHIP-126's
+indicator, and below the floor it returns the prompt **in place of** its child. The router is
+therefore not built at all: there is no screen behind this one to reach by dismissing it, by the
+Android back gesture, or by a deep link, because there is nothing there. A dialog or a `Stack`
+overlay would have left a live application underneath, and on Android a modal barrier is dismissible
+almost by definition. There is no "later" — `Docs/07` §6 has a soft prompt for the case where
+carrying on is acceptable, and that is a different mechanism for a different situation.
+
+The queue keeps draining while the prompt is up, because the sync worker runs from `main` rather
+than from the widget tree. That is deliberate: work a driver already recorded belongs to them, and a
+blocked build should still hand it over if the platform will still take it.
+
+#### The screen with no link is the pilot's screen, not a broken one
+
+Both shapes carry the same icon, the same headline — *Update Shipper to keep going* — and the same
+explanation. The difference is the last element: a button that goes there, or a sentence saying
+where to go. *"Open the app store you installed Shipper from and install the latest version"* is
+true whether that was TestFlight, Play internal testing, or eventually a public listing, so the
+screen never has to know which. There is no spinner, no disabled button and no empty space where a
+control should be — a greyed-out "Update" is exactly the thing that reads as broken.
+
+A link that fails to open falls back to the same sentence and prints the destination, because
+`launchUrl` returns `false` when nothing on the device handles a URL and a button that appears to do
+nothing is worse than no button, on a screen with no way off it.
+
+**The destination itself remains provisional**, in the same way and for the same reason as the
+bundle identifier in §9: `IOS_STORE_URL` and `ANDROID_STORE_URL` are configuration with no correct
+value until X-2 and X-3 publish, and setting them is a deployment change rather than a release.
+
+#### Two seams, and the reason both are empty by default
+
+`runningBuildProvider` is `null` until `main.dart` supplies it, which is SHIP-126's inversion used a
+second time and for the same objection: **every widget test builds `ShipperApp`**, and a gate that
+reached the package-info channel on its own would have every one of them call a plugin with nothing
+behind it and then open a connection to whatever base URL the test binary was compiled with. With
+the seam empty there is no build number, so nothing is compared and **no request is made at all** —
+which is held as a test rather than assumed. The consequence is the same one SHIP-126 wrote down:
+an application that never overrides it is never blocked, so `version_gate_wiring_test.dart` holds
+`main`'s override with a source assertion.
+
+The launch check travels on `unauthenticatedApiClientProvider`, and that is not tidiness.
+`cmd/api/routes_app.go` made the route public because "a build old enough to be blocked may be old
+enough that its authentication no longer works" — so putting the check behind the session would
+leave exactly those builds unable to discover they must update.
+
+#### Mutation testing
+
+| Mutation | Result |
+|---|---|
+| `>=` becomes `>`, so a build equal to the floor blocks | **Caught**, two tests — the boundary case and the wiring test's supported build |
+| `verdictFor` always returns a link, blank or not | **Caught**, two tests |
+| The screen accepts a destination with no scheme as a link | **Caught**, one test |
+| The prompt drawn in a `Stack` over the app instead of in place of it | **Caught**, two tests — the shell is still in the tree |
+| The "no build number, no request" guard removed from the launch check | **Caught**, two tests |
+| `main.dart`'s `runningBuildProvider` override removed | **Caught**, one test — the source assertion |
+| **The `try/catch` removed from `RunningBuild.read`** | **SURVIVED** — see below |
+
+**The survivor is the one worth reading.** `RunningBuild.read` swallows everything and answers
+`null`, and deleting that guard broke no test in the suite — while in production `main` **awaits** it
+before `runApp`, so a `MissingPluginException` there is not an inert gate but an application that
+never draws a frame. A launch-time check that can stop the launch is the worst available version of
+this ticket, and nothing was holding it. It survived because every host test supplied a build number
+rather than reading one, and every device test had a real plugin behind the channel — so the failure
+path existed on neither side.
+
+Fixed in the suite rather than tuned away, following SHIP-129's precedent:
+`test/core/version/running_build_test.dart` now asks for the build number **with no plugin behind
+the channel** and requires `null`, then mocks the platform for the two cases it can only reach that
+way. Its tests run in declaration order and have to — `PackageInfo` caches the first answer in a
+static with no reset, so the un-mocked case can only be asked first.
+
+#### How it was demonstrated
+
+`make flutter-check` green in this worktree: **766 host tests** (up from 726), the analyzer clean,
+and the environment test per build flavour. `make verify` does not cover this ticket and its count
+does not move — SHIP-167's section already demonstrates the endpoint, and this ticket adds none.
+
+**And on a device, against the live API**, which is where the *Done when* is actually met.
+`integration_test/version_gate_test.dart` runs the production widget tree with the real
+`package_info_plus` channel and real HTTP to `GET /v1/app/minimum-version`, and the three cases are
+three **service configurations** rather than three fixtures — which is `Docs/07` §6's point that
+raising the floor is an operational act, demonstrated rather than restated. On an iPhone 17
+simulator and a Pixel emulator, against this worktree's API on port 8092:
+
+| Service configuration | What the device did |
+|---|---|
+| Default floor of 1 | Ran normally. `RunningBuild.read()` returned the real `+1` from the bundle |
+| `MIN_SUPPORTED_*_BUILD=9999`, no store URL | **Blocked**, with the instruction and no button, and no shell anywhere in the tree |
+| …and `IOS_STORE_URL` / `ANDROID_STORE_URL` set | **Blocked**, with the button carrying the platform's URL |
+
+The store link is deliberately not tapped on a device: `launchUrl` would leave the simulator's App
+Store in front of the harness, and what a live run demonstrates is that the platform's URL reached
+the screen. The tap is a host test, over a seam.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -6330,20 +6960,29 @@ just drawing buttons over an existing endpoint.
 written.** Two want a shared surface a domain branch may not edit, which is what a prep ticket is
 for; the rest want an ordinary ticket, a sentence in a document, or a decision. They are written one
 paragraph at a time, by whoever hit the surface first, which is the mechanism §1 describes: this is
-where wave 7's pre-step got drafted, and **one of the eight was taken by SHIP-15p** and is struck
-below.
+where wave 7's pre-step got drafted, and **two of the eight have since been taken** — one by
+SHIP-15p and one by SHIP-100 — and are struck below.
 
-**The client's budget guard is spelling-based and misses a rename, which is wave 5's lesson
-recurring on the other side of the wire.** `apps/mobile/test/features/jobs/budget_stays_on_the_customer_side_test.dart`
-scans `lib/` for the regular expression `budgetCents|budget_cents` and holds the matches to an
-allow-list of files. **Verified by mutation in both directions**: injecting a `max_price` field into
-`OpenJob` **passes** the test, and injecting `budgetCents` fails it naming the file. **The exposure
-is small and should not be overstated** — the platform's own guard is a closed key set at every
-depth (SHIP-83), so the field can never be *sent*, and this test's real job is to stop a widget that
-renders a budget being reused on a provider screen. But the client guard now has exactly the blind
-spot the platform guard no longer has, and the two were meant to be the same statement in two
-languages. **The fix is SHIP-83's shape**: hold the decoded response to a closed set of keys rather
-than searching the source for a spelling. It is a client-side ticket with no server dependency.
+**~~The client's budget guard is spelling-based and misses a rename.~~ Decided and closed at
+SHIP-100 — see §3.** `budget_stays_on_the_customer_side_test.dart` now carries both guards: the
+source scan it always had, for the failure the rule is realistically broken by — a widget that
+renders a budget being reused on a provider screen — and a registry holding every provider-facing
+model to a **closed set of keys**, which is SHIP-83's shape brought across the wire. A field added to
+`OpenJob`, `JobRegion` or `Bid` fails whatever it is called, and a *type* added to one of those files
+fails until somebody records its key set.
+
+**Two things the original entry had slightly wrong, and both are worth keeping.** The `max_price`
+mutation was re-run against the tree at SHIP-100 and still passed the file this entry names — so that
+half was right — but it did **not** go undetected: it failed two tests in `open_job_test.dart`, which
+SHIP-99 wrote and which already held `OpenJob` to an exact key set. So the exposure was smaller than
+stated, and its real shape was different from the one described: the closed key set existed for one
+type, in a file somebody had to remember to write, and **a type with no such test had no guard
+against a rename at all**. SHIP-100's `Bid` would have been exactly that type. The fix is therefore a
+registry with a structural check rather than one more test.
+
+**What remains is named rather than argued away**: a provider-facing model in a file nobody adds to
+`_providerFacingFiles`. That is the same fail-closed-by-registration property `internal/boundaries`
+gives a ninth Go package, and the file's own header says so.
 
 **`make verify` fixture phone numbers are an undocumented shared namespace, and a track lost twenty
 minutes to it.** Every account `make verify` registers needs a unique mobile number, sections are

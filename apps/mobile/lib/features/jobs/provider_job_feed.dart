@@ -301,9 +301,14 @@ class _FacetHeading extends StatelessWidget {
 /// is the arrangement `Docs/01` §4.3 is hardest to keep — the flag is one careless call site away
 /// from being wrong and nothing would fail.
 ///
-/// **Not tappable yet, and that is the ticket boundary rather than an oversight.** Reviewing one
-/// job and placing a bid is SHIP-100, over `GET /v1/jobs/open/{id}` and `POST /v1/jobs/{id}/bids`.
-/// A card that navigated nowhere would be worse than one that does not offer to.
+/// **Tappable from SHIP-100**, which is where reviewing one job and placing a bid arrived, over
+/// `GET /v1/jobs/open/{id}` and `POST /v1/jobs/{id}/bids`. It `push`es rather than `go`es, so the
+/// back gesture returns to the feed where it was rather than rebuilding the shell — which would
+/// re-read the feed and lose both the scroll position and the provider's narrowing.
+///
+/// **The card does not hand the job across**, and the detail screen re-reads it. The feed's copy may
+/// be minutes old, and a job that has since been awarded or cancelled is exactly the one nobody
+/// should be shown a bid form for.
 class _OpenJobCard extends StatelessWidget {
   const _OpenJobCard(this.job);
 
@@ -327,45 +332,56 @@ class _OpenJobCard extends StatelessWidget {
     return Card(
       key: Key('open-job-${job.id}'),
       margin: EdgeInsets.zero,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _leg(theme, Icons.trip_origin, job.pickup, 'Pickup region not stated'),
-            const SizedBox(height: 4),
-            _leg(theme, Icons.place_outlined, job.dropoff, 'Drop-off not added yet'),
-            if (job.goodsDescription case final goods? when goods.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(goods, style: theme.textTheme.bodyMedium),
-            ],
-            if (job.hasMeasurements && measurements.isNotEmpty) ...[
+      child: InkWell(
+        onTap: () => context.push(Routes.openJobDetailFor(job.id)),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _leg(theme, Icons.trip_origin, job.pickup, 'Pickup region not stated'),
               const SizedBox(height: 4),
-              Text(
-                measurements,
-                style:
-                    theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              _leg(theme, Icons.place_outlined, job.dropoff, 'Drop-off not added yet'),
+              if (job.goodsDescription case final goods? when goods.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(goods, style: theme.textTheme.bodyMedium),
+              ],
+              if (job.hasMeasurements && measurements.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(
+                  measurements,
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ],
+              if (job.vehicleRequirement case final requirement? when requirement.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                _Note(icon: Icons.local_shipping_outlined, text: requirement),
+              ],
+              if (job.handlingNotes case final notes? when notes.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                _Note(icon: Icons.info_outline, text: notes),
+              ],
+              if (timing.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  timing,
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ],
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(child: _StatusChip(job.status)),
+                  // Says the card leads somewhere. A card that is tappable and does not look it is
+                  // a screen most people never find.
+                  Text('Review and bid', style: theme.textTheme.labelLarge),
+                  Icon(Icons.chevron_right, color: theme.colorScheme.onSurfaceVariant),
+                ],
               ),
             ],
-            if (job.vehicleRequirement case final requirement? when requirement.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              _Note(icon: Icons.local_shipping_outlined, text: requirement),
-            ],
-            if (job.handlingNotes case final notes? when notes.isNotEmpty) ...[
-              const SizedBox(height: 4),
-              _Note(icon: Icons.info_outline, text: notes),
-            ],
-            if (timing.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(
-                timing,
-                style:
-                    theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-              ),
-            ],
-            const SizedBox(height: 8),
-            _StatusChip(job.status),
-          ],
+          ),
         ),
       ),
     );

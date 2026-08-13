@@ -36,9 +36,16 @@
 ///
 /// ## What is deliberately not here
 ///
-/// The pending indicator (SHIP-126), the four-hour nudge (SHIP-127), the milestone screen
-/// (SHIP-129) and the reconciliation UI (SHIP-132) are separate tickets. What they consume is
-/// here: `SyncWorker.snapshots` publishes a `QueueSnapshot` after every pass, `SyncWorker.record`
-/// is enqueue-and-send in one call, and a refused operation is `blocked` with its reason and its
-/// request id recorded.
+/// The pending indicator (SHIP-126), the four-hour nudge (SHIP-127) and the reconciliation UI
+/// (SHIP-132) are separate tickets. What they consume is here: `SyncWorker.snapshots` publishes a
+/// `QueueSnapshot` after every pass, `SyncWorker.record` is enqueue-and-send in one call, and a
+/// refused operation is `blocked` with its reason and its request id recorded.
+///
+/// **SHIP-129 is the first ticket to consume them and it took both**, and it found one thing worth
+/// knowing about `snapshots`: a snapshot is *read* at one instant and *delivered* through a
+/// broadcast stream at a later one, so a snapshot read before a caller's own `record` committed can
+/// arrive after it. `features/delivery` therefore treats a published snapshot as a **trigger** and
+/// re-reads `SyncWorker.queue` itself. Anything that concludes "this operation is gone, so the
+/// platform has it" from the payload alone will be right nearly always and wrong exactly when two
+/// recordings land inside one pass — see `record_milestone_controller.dart`.
 library;
