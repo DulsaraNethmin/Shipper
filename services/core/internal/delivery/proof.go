@@ -59,12 +59,12 @@ const maxProofContentType = 128
 // of object are private evidence under the same access rules.
 const proofKeyPrefix = "proof"
 
-// UploadPolicy is what the platform will issue an upload URL for, from configuration.
+// UploadPolicy is what the platform will issue a pre-signed URL for, from configuration.
 //
 // # Every field is server-side, and Docs/06 §5.3 is why
 //
 // "Anything expected to change under operational pressure lives server-side… Flutter has no
-// over-the-air update path for Dart code." All three of these move: a size limit is raised the
+// over-the-air update path for Dart code." All of these move: a size limit is raised the
 // first time a handset's camera outgrows it, a type list gained HEIC without an app release
 // anywhere, and a lifetime is tightened after an incident. A limit compiled into the client is a
 // limit that needs a store review to change, and the concrete cost of getting it wrong is stated in
@@ -83,8 +83,22 @@ type UploadPolicy struct {
 	// browsers execute — cannot arrive by being an image.
 	AcceptedContentTypes []string
 
-	// URLTTL is how long an issued URL works for.
-	URLTTL time.Duration
+	// UploadTTL is how long an issued upload URL works for.
+	//
+	// It was URLTTL and served both directions until SHIP-15r. The rename is what makes the split
+	// below reviewable: a field called URLTTL beside a DownloadTTL reads as though one of them is
+	// the general case, and the compiler cannot tell you which sites meant which.
+	UploadTTL time.Duration
+
+	// DownloadTTL is how long an issued download URL works for, and it is separate because the two
+	// requirements are different and only one of them is generous (SHIP-15r).
+	//
+	// An upload link has to outlast a phone finishing a slow PUT on a bad connection. A download
+	// link has to outlast an image rendering. Serving both from one number made every read link
+	// live for as long as an upload needed — and a read link is an unrevocable link to a
+	// photograph of somebody's front door, which is the exposure internal/config's Storage section
+	// spends a paragraph on.
+	DownloadTTL time.Duration
 }
 
 // valid reports whether this policy can issue anything at all.
@@ -92,8 +106,14 @@ type UploadPolicy struct {
 // Checked at construction rather than per request: a service built with a zero policy would refuse
 // every upload with a validation error naming the client's own perfectly good request, which is the
 // worst place for a configuration failure to surface.
+//
+// Both lifetimes are required. A zero DownloadTTL would sign a download URL that has already
+// expired, which is a broken image in a customer's tracking view rather than an error anybody sees
+// — the quietest of the failures available here, and the reason it is refused at construction
+// alongside the rest.
 func (p UploadPolicy) valid() bool {
-	return p.MaxBytes > 0 && len(p.AcceptedContentTypes) > 0 && p.URLTTL > 0
+	return p.MaxBytes > 0 && len(p.AcceptedContentTypes) > 0 &&
+		p.UploadTTL > 0 && p.DownloadTTL > 0
 }
 
 // UploadRequest is what a client says it is about to upload.
@@ -255,7 +275,7 @@ func (s *Service) PresignProofUpload(
 	}
 
 	url, expiresAt, err := s.proof.uploads.PresignUpload(
-		ctx, key, request.ContentType, request.ContentLength, s.proof.policy.URLTTL)
+		ctx, key, request.ContentType, request.ContentLength, s.proof.policy.UploadTTL)
 	if err != nil {
 		// A failure of the signer rather than of the request: the domain has already checked
 		// everything a client could get wrong, so this is a configuration or a wiring fault and
@@ -799,7 +819,7 @@ func (s *Service) ProofFor(
 			continue
 		}
 
-		url, expiresAt, err := s.proof.objects.PresignDownload(ctx, p.ObjectKey, s.proof.policy.URLTTL)
+		url, expiresAt, err := s.proof.objects.PresignDownload(ctx, p.ObjectKey, s.proof.policy.DownloadTTL)
 		if err != nil {
 			return nil, fmt.Errorf("delivery: signing a download for %s on %s: %w", p.ObjectKey, jobID, err)
 		}
