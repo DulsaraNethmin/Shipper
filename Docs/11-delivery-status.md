@@ -363,6 +363,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
+| **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
@@ -5471,6 +5472,178 @@ object is removed. **Every assertion names the key this run created.** The stack
 bucket may be too, so the section fences on an id rather than on a count or a timestamp — which is
 `CLAUDE.md`'s Kafka rule, applied to the one shared service that can be isolated but is not obliged
 to be.
+
+### SHIP-120 — the link is the credential, and the job identifier is in it twice on purpose
+
+The fourth deployable has product code in it. `apps/driver-portal` had been a placeholder shell
+since wave 1; a driver now opens a link and sees the delivery it names, authenticated by SHIP-107's
+token and refused by SHIP-108's verifier.
+
+**The link is `https://<portal>/j/<job-id>#<token>`, and the identifier being in it as well as
+inside the token is the mechanism rather than the redundancy.** This is the decision the ticket
+turned on and the one every later driver ticket inherits. SHIP-108 put the one-job comparison in the
+auth class so no handler could skip it — the path says what the client means to act on, the token
+says what the caller may act on, and comparing them is what makes "exactly one job" observable from
+outside. **A client that decoded `job_id` out of the token to build the path would make that
+comparison compare the token with itself.** It would pass for ever, on any grant, however widely
+issued: the platform would still be checking and the check would have nothing left to catch. So the
+identifier reaches the portal independently, and **nothing in this application parses a JWT**. The
+one claim a page might want is served as `link_expires_at`, which is what the contract already tells
+clients to do instead of reading a credential.
+
+**The token lives in the URL fragment on arrival and in `sessionStorage` after it, and the fragment
+is stripped from the address bar.** A fragment is the one part of a URL never sent to any server: it
+is in no request line, so it reaches no access log, no proxy, no CDN and no `Referer`. A token in
+the path or the query is in all of them, at every hop, for as long as those logs are kept — and this
+credential lasts seven days and travels through whatever messaging channel the provider already
+uses. Stripping it afterwards is the second half: the address bar is the most screenshotted and most
+shoulder-surfed surface a driver has, and once the token is in storage the URL is a job identifier
+the platform will not serve to anybody else.
+
+The alternatives, and what each costs. **`localStorage`** would leave a working credential on the
+device until something deleted it, which is wrong on a phone drivers share and hand over.
+**A cookie** would be attached to every request to the origin including ones with nothing to do with
+the delivery, and would need a scope and a lifetime decided in the client rather than by the token's
+own `exp`. **Leaving it in the URL** is what stripping gives up, and the cost is real: closing the
+tab loses the token. That is the right trade because **the message thread the link arrived in is the
+durable store** — the driver already has it, it is where they will look, and it is the only copy
+that should survive. The fragment is stripped **only once the token is somewhere a reload can
+find it**, so a browser refusing storage keeps a working link in its URL rather than a page that
+cannot survive the pull-to-refresh a driver on one bar of signal will certainly do.
+
+**An expired or revoked link says something true about the credential and nothing at all about the
+job.** Four answers, and the difference between two of them is why SHIP-108 minted a code of its
+own. `401` with `delivery_driver_link_expired` is "this link has expired, ask for a new one" —
+deliberately not `token_expired`, whose meaning is "refresh and retry" and which would put a portal
+with no refresh behind it into a loop. `401` with anything else is "this link is not valid", and the
+platform does not distinguish a bad signature from a truncated URL from a mobile token, so neither
+does the page. **`404` is one answer to two questions and it stays one**: a valid link on a
+*different* job and a *stood-down* driver render identical copy, because `404` was chosen over `403`
+precisely so a link-holder cannot confirm a competitor's job exists. A test holds the refusal copy
+against a list of disclosing phrases, and the five messages are a `Record` keyed by the refusal
+union so a new case without copy is a build failure rather than a blank screen.
+
+**The page shows five fields because five is what the endpoint serves, and it renders every one.**
+The endpoint's response *is* the platform's answer to what a driver may see, so a page that dropped
+a field would take that decision back off the platform and one that added a field would invent it.
+The two identifiers are the least interesting to look at and the most useful on a phone call, so
+they are small and at the bottom rather than absent.
+
+**And here is the honest half of the *Done when*, in the SHIP-65 and SHIP-77 shape.** "Opening the
+link shows only that job's delivery detail" — the *only that job's* is demonstrable and demonstrated
+below; the *delivery detail* is not, because **the endpoint serves no pickup, no drop-off, no goods
+and no contact**. SHIP-108 said so in place ("the delivery detail is SHIP-120's… fields are added to
+this shape") and this lane may touch no Go. So the page says the details are not carried by the link
+yet rather than leaving a blank card, and **`Docs/11` §4 wants a SHIP-120 row**: the screen exists,
+one clause of its *Done when* belongs to a Go change nobody has a ticket for. `Docs/03` §3 puts
+those fields in the driver's Prepare stage, so this is a product gap and not only a bookkeeping one.
+The shape is small — `driverJobResponse` gains the pickup and drop-off locations, the goods
+description and a contact, from a port into `jobs` that `delivery` does not yet declare — and it is
+additive, so no route moves.
+
+**There is a route handler in front of the API, and it is not a BFF tier.** `CLAUDE.md` is explicit
+that the Go platform owns the versioned public API directly. `app/api/driver/jobs/[jobId]/route.ts`
+adds nothing to it and hides nothing from it: one route, one method, one upstream path, no logic and
+no state, forwarding the platform's status and body with the request id intact. **It exists because
+the service serves no CORS headers** — a browser asked to send a bearer credential header
+cross-origin sends a preflight `OPTIONS` first, nothing in `internal/httpx` answers one, and the
+fetch is refused before the platform sees it. `Docs/10` §8.4 already allows a web surface its own
+server-side data access as "an application detail and not a shared platform tier", which is what
+this is. **If CORS is added on the Go side this file is deleted** and the browser fetches the
+platform directly — but note what would be lost: the API's location is currently a *server*
+environment variable read per request (`SHIPPER_API_BASE_URL`), where the direct-fetch shape needs a
+`NEXT_PUBLIC_` value inlined into a bundle at build time. "Anything expected to change under
+operational pressure lives server-side" is the same argument this repository makes about Dart.
+
+**The narrowness is the security property.** A `rewrites()` entry in `next.config.ts` would have
+been three lines and would have proxied everything under `/v1`, making this origin a
+credential-forwarding front door to the whole platform. This route reaches one endpoint: `GET`
+because no other export exists, a template for the path, and the one hole refused unless it is a job
+identifier. `..%2f..%2fv1%2fjobs` produces a `400` and no outbound request. **That refusal is not an
+authorisation decision** — it declines to build a URL other than the one the route exists for, and
+who may open the job is the platform's answer and the only one forwarded.
+
+**Twenty tests, and no test framework in the dependencies.** Node 22 strips TypeScript types itself,
+so `node --test` over `lib/` costs no dependency, no lockfile change and no build step —
+`tsconfig.json` sets `allowImportingTsExtensions` so a test imports `./link.ts` by its real name.
+`lib/surface.test.ts` is the one worth knowing about: **the set of files that may make a request,
+name a credential, or hold one is closed**, so a second call site is a failing test naming the file
+rather than a review comment. It reads code with comments stripped, because every doc comment in
+this application discusses the credential header and `localStorage` at length — the first draft failed on
+the page copy that reads "there is no account to sign in to", which is the page saying the right
+thing, and the rule was narrowed from a phrase search to a file set in response.
+
+**`make web-check` does not run those tests, and that is a one-line ask rather than a gap this lane
+could close.** The target is `web-lint web-build web-typecheck` in `mk/web.mk`, and both that file
+and `.github/workflows/web-driver-portal.yml` are outside this lane's ownership. `pnpm -r run test`
+skips packages with no `test` script, so **`web-check: web-lint web-build web-typecheck web-test`
+plus a three-line `web-test` target is the whole change**, and it would pick up the admin panel's
+tests for free when it grows some. Until it lands the tests are run by hand, and a test that quietly
+does not run is the thing this repository is most careful about — which is why it is stated here, in
+the README, and in this paragraph rather than assumed.
+
+**Demonstrated in a real browser against a real running service, not asserted.** Headless Chrome
+against the built portal on 3002 and the API on 8093, over two awarded jobs each with a real driver
+token minted by `POST /v1/jobs/{id}/driver`: the driver's own link renders the delivery; the *same*
+link on the *other* job renders "this link no longer opens a delivery"; the second link opens its
+own job and not the first; a link with no fragment renders "open the link you were sent"; a
+provider's mobile session token in the fragment renders "this link is not valid"; a hand-built
+expired token renders "this link has expired"; and `/j/..%2f..%2fv1%2fjobs` renders the same
+invalid-link page with no request made. The platform's raw answers behind those six were `200`,
+`404 not_found`, `401 unauthenticated`, `401 delivery_driver_link_expired` and `400 bad_request`.
+
+**Three mutations, and the one that survived is the most useful thing in this entry.** Pointing the
+page at another job while holding the first job's link renders the `404` copy — the *platform*
+refuses it, and there is no client-side branch that could have hidden it instead. Adding a second
+`fetch` to a user route fails `surface.test.ts` naming the file. **The third is the one to read:
+deriving the job identifier from the token instead of from the path makes the wrong-job case
+*succeed*, and every test in the application still passes.** That is the tautology described at the
+top of this entry, made concrete: the platform's one-job check is only worth anything while the
+client states its intention independently of the credential, and no test on either side of the wire
+catches a client that stops doing so. It is recorded because it is the thing SHIP-121, SHIP-122 and
+SHIP-123 are most likely to do by accident while making the code tidier.
+
+**What SHIP-121's endpoint should look like, which this ticket makes obvious and builds none of.**
+§9 already carries the correction — the driver's idempotency scope was booked against SHIP-112 and
+is now against SHIP-121 — and it is right that whoever picks it up is adding a route rather than
+drawing buttons over an existing one. The shape:
+
+- **`POST /v1/driver/jobs/{id}/milestones`**, `RequireDriverToken`, beside the read rather than
+  under `/jobs`. Two credential systems on one path is what SHIP-108 refused for the read and the
+  argument is unchanged; `/driver/...` says whose surface it is.
+- **It accepts what `recordMilestoneRequest` accepts** — `milestone`, `recorded_at`, `reason` — and
+  **refuses `delivered`** for the reason `jobLifecycle` has no method for it: `Docs/01` §4.4 makes
+  proof or a recorded exception the condition, and neither can be captured until SHIP-114…116.
+- **The actor is `driver`, not `provider`.** `milestones.actor_type = 'driver'` names the
+  `driver_assignments` row, and **SHIP-107 put `assignment_id` in the token for exactly this** —
+  `RecordMilestone` says in place that this is the one field which changes when a driver can present
+  a credential. Nothing has to be looked up to attribute the work.
+- **The idempotency key is the open question and it is now reachable.** §9's two shapes stand: a
+  second group-wide resolver beside `ResolveSubject` that a driver grant can populate, with
+  `SubjectScope` widened to read either; or an explicit ruling that a job-scoped grant scopes on the
+  job identifier already in the path. **A third is worth adding: scope on `assignment_id`**, which
+  is inside the token, is not in the URL, and is not guessable from anything a link-holder can see —
+  where the job identifier is in the path of every request the driver makes, so scoping on it is
+  barely stronger than `anonymous`. `anonymous` is defensible for a read and this is a write from a
+  phone with a bad connection, which is the whole reason the entry exists.
+
+**What this lane wants from `internal/config`, and it is one variable.** **`DRIVER_PORTAL_BASE_URL`,
+so the platform can assemble the link.** SHIP-107 declined to — "a base URL here would be this
+domain asserting a path in an application it does not own" — and that was right while the route did
+not exist. It exists now: `<base>/j/<job-id>#<token>`. Today the assignment response returns
+`driver_token` and the *provider's app* would have to build the URL, which puts a portal path and
+hostname inside a Flutter binary that cannot be updated over the air — precisely what `Docs/07` §1
+says belongs on the server. A `driver_link` field beside `driver_token`, built from one configuration
+value, is the fix, and it is a Go change no wave-7 lane can make. Nothing else is needed: the
+portal's own configuration is a server environment variable in its own deployment.
+
+**Two smaller things.** The placeholder `/job` route is deleted rather than kept — a route rendering
+a delivery beside no credential is the shape SHIP-23 refused to build, and keeping it once the real
+one exists would be worse than never having had it. And the whole portal is `noindex`, because a
+delivery page is credential-gated and would index as a refusal.
+
+No new dependency, no lockfile change, no Go, no route, no contract, no migration, and no
+`make verify` section — this ticket adds no HTTP endpoint to the platform.
 
 ## 4. Partly done — do not treat these as finished
 
