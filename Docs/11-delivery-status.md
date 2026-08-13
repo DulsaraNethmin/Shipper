@@ -12,6 +12,8 @@
 
 **Last updated:** 2026-08-13, at the **wave-6 reconciliation** — the arithmetic and the narrative brought back into line after thirteen tickets landed across four tracks. It corrects §1, §2 and §6, writes wave 6 up as the new §7 with the five earlier waves renumbered behind it, closes the §8 and §9 items wave 6 settled, and opens the eight it found while sharpening three that were already there.
 
+**SHIP-15p, the wave-7 pre-step, sits on top of that pass** and was cut from it rather than from `develop` — the ruling that has held for `15h`→`15i` and `15k`→`15m`, so that adding a ticket to the backlog moves §1's arithmetic once instead of twice. It adds §1's and §3's SHIP-15p entries, un-strikes SHIP-114 in §6, closes the two §9 items it settles, and moves the `make verify` count to what it measured. Everything below this line that is not marked SHIP-15p is the reconciliation's.
+
 **This pass is not a backlog ticket**: like `ship-15d`, `ship-15f`, `ship-15h`, `ship-15j` and `ship-15k` before it, a reconciliation branch names no ticket in its subject and appears in neither `Docs/09` nor `Docs/11-done.txt`. The pass beneath it is the other kind — **SHIP-15m, the wave-6 pre-step**, which sat on top of the wave-5 reconciliation and was cut from it rather than from `develop`, so that adding a ticket to the backlog moved the arithmetic once instead of twice. It adds §1's and §3's SHIP-15m entries and strikes the four §9 items it closes, and it appears in both files.
 
 ---
@@ -20,9 +22,9 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 107 | 316 |
+| **Done** | 108 | 319 |
 | Remaining | 100 | 326 |
-| **Total** | 207 | 642 |
+| **Total** | 208 | 645 |
 
 The totals grew by two tickets rather than shrinking: SHIP-15c and SHIP-23a were added to `Docs/09` during wave 2, both work the plan assumed and no ticket owned.
 
@@ -34,12 +36,14 @@ And once more before wave 4: **SHIP-15g** (M0, 5 points), which took 205 tickets
 
 **Wave 6's is SHIP-15m** (M0, 3 points), taking the totals to 207 tickets and 642 points — the sixth prep ticket, and the second in a row to be three rather than five. The wave-5 reconciliation said there was no wave-6 prep ticket *yet*, and that a prep ticket gets written into §9 one paragraph at a time by whoever hits the surface first. That is exactly what happened: **four of the five paragraphs wave 5 left in §9 are struck by this ticket** — the Kafka worktree isolation, the two rules `CLAUDE.md` should carry, and `KAFKA_REPLICATION_FACTOR` — and only the cross-block index is left, which §9 itself calls not urgent. The ticket's *blocking* item came from somewhere else again: §8's `RequireDriverToken` gate, which is a shared-surface edit no domain branch may make and which SHIP-108 is unbuildable without. §6 adds a further candidate in object storage, which SHIP-114 has now been struck for through four consecutive waves.
 
-**One of the 107 was closed by a ruling rather than by work.** SHIP-91 was declared delivered by the owner on 12 August 2026, met by SHIP-80's partial unique index rather than built separately — see §3 and §6. It is why `make status` reports it, along with SHIP-57a, as declared done with no commit subject naming it; both are correct and neither is wishful.
+**Wave 7's is SHIP-15p** (M0, 3 points), taking the totals to 208 tickets and 645 points — the seventh prep ticket, and the third in a row at three rather than five. Its blocking item is the one §6 has been naming for five waves rather than one wave 6 left behind: **there was no object store in the local stack**, so SHIP-114's "a client receives a short-lived pre-signed URL and uploads directly" could not be demonstrated, and every file that would fix it — `deploy/docker-compose.yml`, the root `Makefile`, `internal/config`, `deploy/.env.example`, the CI workflow — is one a domain branch may not edit. **It is also the first prep ticket to have asked**: §9 concluded after three waves of absorbing parked `internal/config` requests that a prep ticket should ask each track at dispatch what configuration it expects to need, SHIP-15m did not ask, and wave 7 did. The `Storage` section is that answer, written before the track opened rather than a wave after it.
+
+**One of the 108 was closed by a ruling rather than by work.** SHIP-91 was declared delivered by the owner on 12 August 2026, met by SHIP-80's partial unique index rather than built separately — see §3 and §6. It is why `make status` reports it, along with SHIP-57a, as declared done with no commit subject naming it; both are correct and neither is wishful.
 
 | Milestone | Done | Points |
 |---|---|---|
 | **X** External | 0 / 9 | 0 / 26 |
-| **M0** Foundation | 32 / 36 | 84 / 98 |
+| **M0** Foundation | 33 / 37 | 87 / 101 |
 | **M1** Identity | 28 / 28 | 78 / 78 |
 | **M2** Jobs | 18 / 26 | 54 / 78 |
 | **M3** Bidding and award | 14 / 27 | 47 / 95 |
@@ -49,7 +53,7 @@ And once more before wave 4: **SHIP-15g** (M0, 5 points), which took 205 tickets
 | **M7** Hardening | 2 / 19 | 3 / 56 |
 
 **M3's and M4's point totals were recomputed rather than carried over, and the wave-7 dispatch brief
-circulated two wrong ones** — M3 at 51 and M4 at 34, which sum to 318 against a true 316. The figures
+circulated two wrong ones** — M3 at 51 and M4 at 34, which sum to 85 against a true 83 and put the done total two points high. The figures
 above are what `Docs/09`'s rows give when counted against `Docs/11-done.txt`, and they agree with
 `make status` exactly. M3's done set is SHIP-78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 91, 98 and 99
 at 5 + 3 + 3 + 5 + 3 + 3 + 3 + 2 + 2 + 5 + 3 + 2 + 5 + 3 = 47; M4's is SHIP-105, 106, 107, 108, 110,
@@ -57,7 +61,7 @@ at 5 + 3 + 3 + 5 + 3 + 3 + 3 + 2 + 2 + 5 + 3 + 2 + 5 + 3 = 47; M4's is SHIP-105,
 milestone split is the one figure in this file `make status` prints and nobody types, so a number that
 disagrees with it came from somewhere else and is wrong.
 
-**M0 still has four tickets left and not one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3 — unchanged through wave 6, because nothing in this repository can move them. Every buildable M0 ticket is done, and **SHIP-15m** is now the last one added — like SHIP-23a, SHIP-15e, SHIP-15g and SHIP-15i before it, it was a recommendation in §9 and §3 before it was a ticket. That is five of the six lettered M0 tickets, which is worth reading as a mechanism rather than a coincidence: this file's §9 is where the next prep ticket is written, one paragraph at a time, by whoever hits the surface first.
+**M0 still has four tickets left and not one of them is code.** SHIP-24…27 are store signing and upload, blocked on X-2 and X-3 — unchanged through wave 7, because nothing in this repository can move them. Every buildable M0 ticket is done, and **SHIP-15p** is now the last one added — like SHIP-23a, SHIP-15e, SHIP-15g, SHIP-15i and SHIP-15m before it, it was a recommendation in §9 and §6 before it was a ticket. **That is six of the seven lettered M0 tickets added since the backlog was written** — SHIP-15c, 15e, 15g, 15i, 15m, 15p and 23a, of which only SHIP-15c was not a recommendation first — and the count is spelled out because an earlier version of this sentence said "five of the six" and left the reader to work out which six. It is worth reading as a mechanism rather than a coincidence: this file's §9 and §6 are where the next prep ticket is written, one paragraph at a time, by whoever hits the surface first.
 
 **Wave 6 has landed in full.** Four tracks, thirteen tickets, **forty-seven points**, twelve agent runs, **no trim taken**. `internal/bidding` went from a table with no endpoint to five, `internal/admin` opened with M6's first code, the driver's job-scoped token became a credential the service actually verifies, and the client gained a durable queue that survives a restart. It is the second largest wave by points and the largest by ticket count. §7 has the detail.
 
@@ -215,11 +219,13 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **476 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **481 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
-SHIP-68 added theirs to the jobs file.
+SHIP-68 added theirs to the jobs file. **SHIP-15p added no file**: an object store
+is stack rather than a domain, so its five checks are a section inside
+`scripts/verify/00-stack.sh`, beside SHIP-1…4 and before the service is built.
 
 **That figure is now checked by the run itself, and nobody types it (SHIP-15i).** A successful
 `make verify` reads the sentence above, compares it to what it just counted, and **fails with the
@@ -256,7 +262,7 @@ out of `CHECKS` deliberately — it needs a device, and the Flutter CI job is a 
 until SHIP-24…27 — so it is a check a person invokes when the storage or the session changes.
 The file's own header says which invocation demonstrates which claim.
 
-### M0 — Foundation (32 of 36)
+### M0 — Foundation (33 of 37)
 
 | Ticket | What |
 |---|---|
@@ -274,6 +280,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-15g** | Wave-4 shared surfaces: `GEOCODING_*` and `PAGINATION_*` configuration, the out-of-order migration guard, and `Task.Close` — *see below* |
 | **SHIP-15i** | Wave-5 shared surfaces: the `make verify` count checked against this file, a §3 row required of every done ticket, and the cause of an unmapped 500 logged — *see below* |
 | **SHIP-15m** | Wave-6 shared surfaces: the `RequireDriverToken` guard seam SHIP-108 fills without editing `routes.go`, `KAFKA_REPLICATION_FACTOR` as configuration, and three parallel-working rules `CLAUDE.md` and `Docs/10` now carry — *see below* |
+| **SHIP-15p** | Wave-7 shared surfaces: an S3-compatible object store in the local stack and in CI, the `STORAGE_*` configuration section asked for at dispatch rather than absorbed after it, and the app test fixture that every new configuration section used to break — *see below* |
 | **SHIP-16** | Flutter scaffold — iOS and Android only, floors at iOS 14.0 and Android API 24 |
 | **SHIP-17** | Feature folders per `Docs/07` §2, Riverpod and `go_router`, and a boundary test |
 | **SHIP-17a** | `contracts/openapi.yaml` from per-domain fragments, and three tests holding it to the service |
@@ -5338,6 +5345,133 @@ run by hand is `make up && make migrate-up && make run` in this worktree and `ma
 a queued milestone; that was **not** performed for this ticket, and the first device build is also
 where SHIP-124's note about `sqlite3`'s native library still wants confirming.
 
+### SHIP-15p — the wave-7 pre-step, and the first one that asked before the wave
+
+The seventh prep ticket, three points, three parts. Only the first of them had to happen before the
+wave rather than during it; the other two are things §9 had been carrying with no owner.
+
+| Surface | Before | After |
+|---|---|---|
+| Object storage | `deploy/docker-compose.yml` ran `postgres`, `redis` and `kafka` and nothing else, so **SHIP-114's *Done when* could not be demonstrated at all** — struck in §6 for five consecutive waves | A pinned MinIO in the stack, healthy under `make up`, with a private bucket made by the same command and a section in `scripts/verify/00-stack.sh` that mints a real pre-signed URL and uploads through it |
+| `internal/config` | Track B's settings would have been a domain branch's fifth parked request against a shared surface | A `Storage` section of nine fields, **asked for at dispatch** and documented in `deploy/.env.example` |
+| `routes_app_test.go` | `routerWithApp` replaced `deps.Config` wholesale, so every new configuration section broke it silently until somebody noticed | One field overwritten on a copy, and a test that fails if anybody puts the literal back |
+
+**The store is MinIO, pinned to `RELEASE.2025-09-07T16-13-09Z`, and the choice is the same one
+`Docs/06` §4.1 makes about PostgreSQL.** MinIO speaks the S3 API, so the implementation that runs in
+staging and production is the one exercised locally, against genuine SigV4 semantics rather than
+against something that accepts whatever it is given. A mock that never checks a signature would pass
+every test SHIP-114 could write and fail the first time a real bucket saw one.
+
+**The bucket is created by `make up` rather than by an init container in compose, and both halves of
+that were measured rather than assumed.** The usual shape — a one-shot `mc` container with
+`depends_on: service_healthy` — was written, run, and rejected twice over:
+
+- `make up` is `docker compose up -d --wait`, and **`--wait` fails when any service exits, including
+  one that exits `0` having done its job.** The run prints `container shipper-minio-init exited (0)`
+  and `up` returns 1. Waiting for the stack is the whole of what `make up` is for.
+- **The bucket is per-worktree and the stack is shared.** `COMPOSE_PROJECT_NAME` is pinned so that
+  every tree uses one MinIO, and an init container runs when its *container* is created — so the
+  first tree to bring the stack up would create its bucket and the next four would find nothing. The
+  bucket has to be made on every `make up` in every tree, which is a make step and not a service.
+
+`mc` ships inside the MinIO image, so the step needs no second image and no second pull.
+
+**One finding that will save SHIP-114 an afternoon: SigV4 signs the `host` header.** A pre-signed URL
+minted against `minio:9000` inside the compose network is refused with `SignatureDoesNotMatch` when
+fetched from the host — an error that names neither the address nor the cause. This was reproduced
+before the endpoint default was chosen, which is why `STORAGE_ENDPOINT` is the *published* host port
+and why the `Makefile` derives it from `MINIO_PORT` rather than assuming 9000. The same property
+covers the region, which SigV4 puts in the credential scope: the container is started with
+`MINIO_REGION` set from `STORAGE_REGION` so the two cannot drift into a signature failure.
+
+**The bucket is the one shared service that can be isolated per worktree, and `CLAUDE.md`'s worktree
+table now says so beside the row that says Kafka cannot.** That row has read "there is no isolation,
+and there is no equivalent to add" since SHIP-15m, and the contrast is the point: a topic is created
+from the event catalogue and shared by every tree, while a bucket is a namespace the store makes on
+demand. One line in `deploy/.env` per tree and five trees never see each other's objects. **It is
+deliberately not derived from the directory the way `TEST_TEMPLATE_DB` is**, which is the weaker
+half of the decision and is recorded in §9 rather than argued away: a tree that leaves it alone
+shares `shipper-dev`, which is safe for a keyed read or write and unsafe for a count or a listing.
+
+**CI runs the same image from a step rather than from `services:`, and that is a limitation of
+GitHub Actions rather than a preference.** A service container takes an image, environment, ports and
+`docker create` options and **no command**; `minio/minio`'s default command prints its usage and
+exits. Two images could have gone in the block and both are worse: `minio/minio:edge-cicd` carries
+`server /data` as its command and is an unreleased build frozen in 2021, and `bitnami/minio`, which
+starts a server unprompted and creates a bucket from an environment variable, had its public
+repository retired in 2025. Either would mean CI exercising a different object store from the one
+`make up` runs — the drift this repository avoids everywhere else, since the workflow and the compose
+stack already run the same PostgreSQL and the same Redis. The step starts the pinned release, waits
+for `/minio/health/live`, and makes the bucket with the same three `mc` commands the `Makefile` uses.
+`go.yml`'s existing comment about why both service containers are present is extended rather than
+restated, because the argument is the same one: `internal/testsupport` fails rather than skips, so a
+storage test written against a missing service turns CI red instead of quietly green.
+
+**`internal/config` gained a `Storage` section because wave 7 asked, and that is the part worth
+noticing.** §9 had concluded — after `GEOCODING_*`, the page sizes and `KAFKA_REPLICATION_FACTOR`
+were each absorbed a wave late — that "a prep ticket should ask each track up front what
+configuration it will want, rather than absorbing a third round of parked requests after the fact",
+and then recorded that SHIP-15m did not ask either. Wave 7 asked at dispatch and Track B answered:
+endpoint, bucket, region, access key, secret key, path-style flag, pre-signed URL TTL, maximum upload
+bytes, and accepted content types. The answer cost a sentence at dispatch and a section here, against
+a wave of a track working around its absence.
+
+**Two of the nine are policy rather than plumbing, and that is why they are server-side.**
+`STORAGE_MAX_UPLOAD_BYTES` and `STORAGE_ACCEPTED_CONTENT_TYPES` are limits that move under
+operational pressure, and `Docs/06` §5.3 is explicit that anything of that kind belongs in Go rather
+than compiled into the client, because Flutter has no over-the-air path for Dart code. The concrete
+version: a proof photograph a driver cannot upload is a delivery that cannot be completed
+(`Docs/01` §4.4), and a limit in the app is one that needs an app release to raise. The type list is
+a list rather than an `image/*` prefix so that `image/svg+xml` — a script container browsers execute
+— cannot arrive by being an image.
+
+**The endpoint is always typed, and there is no empty state.** `loader.lookup` treats an empty
+variable as absent, so an empty `STORAGE_ENDPOINT` would silently fall back to this field's
+development default and put a production deployment on somebody's loopback, reported as nothing at
+all. AWS's own regional endpoint is `https://s3.<region>.amazonaws.com` and is perfectly typeable, so
+a deployment types it — and `validate` refuses a loopback host outside development, which is the same
+shape as the existing `sslmode=disable` rule and exists for the same reason. Four more rules join it:
+the bucket name is checked against S3's own (it is a value a person types per worktree, and the first
+thing that would otherwise notice a bad one is a driver's upload), each media type must be a
+lower-case `type/subtype`, the pre-signed TTL is capped at an hour because **nothing revokes a URL
+once it is signed**, and both storage credentials are in `credentialBearingDefaults` so a deployment
+that set neither is refused at startup rather than at the first upload.
+
+**`routerWithApp` was the §9 item with no owner, and the fix is four lines.** It substituted a whole
+`config.Config` literal, so every domain's requirements had to be repeated in it — SHIP-107's
+delivery keyset is in there because a router built without one stops the process, not because a
+minimum-version test has any use for it — and `Storage` would have been the next section to collect
+on that. It now copies whatever configuration it was given and overwrites the one field under test.
+**`TestTheAppFixtureOverwritesNothingButApp` is the guard, and it is deliberately written not to name
+a section**: it puts a marker in one the test has no use for and compares the whole struct with `App`
+blanked on both sides, so a section added tomorrow is covered without anybody remembering. Restoring
+the literal fails it; that was demonstrated rather than assumed.
+
+**What this ticket deliberately did not do.** `internal/platform/storage/` still holds `doc.go` and
+nothing else — no `local.go`, no `s3.go`, no adapter, no port. That is SHIP-114's work, and a
+reviewer who finds an implementation in this ticket has found a defect. Nothing here is imported by a
+domain; the only Go this ticket adds is a configuration section and a test fixture.
+
+**One option is recorded rather than decided, and it belongs to SHIP-114.** `doc.go` specifies two
+implementations — `local.go` on the filesystem for development, `s3.go` for staging and production —
+and that specification was written when development had no object store. It now has one, which means
+the S3 implementation can be exercised locally against genuine pre-signed-URL semantics, and the
+filesystem one may no longer earn its place: a second implementation that exists only to be the one
+nobody deploys is the speculative seam `Docs/06` §4.1 warns about, and `local.go` would have to sign
+its own URLs, which is a second signing scheme to keep correct. **The counter-argument is real and is
+why this is not decided here**: `Docs/06` §4.1's adapter test is "does a second implementation exist
+today", storage is on that list precisely because of the filesystem one, and a developer with no
+container running is a case somebody may still want. `doc.go` is untouched. Whoever writes SHIP-114
+decides, and either answer wants a sentence in `Docs/06` §4.1 if it changes the table.
+
+**`make verify` went from 476 checks to 481 across the same 13 sections**, all five in the new
+SHIP-15p block: the store is live on the host, a pre-signed URL uploads an object directly, a
+pre-signed URL reads the same bytes back, the same object is refused without a signature, and the
+object is removed. **Every assertion names the key this run created.** The stack is shared and the
+bucket may be too, so the section fences on an id rather than on a count or a timestamp — which is
+`CLAUDE.md`'s Kafka rule, applied to the one shared service that can be isolated but is not obliged
+to be.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -5405,7 +5539,7 @@ Strict build order says the next ticket is the lowest-numbered open one, which i
 | SHIP-129 | 3 | Flutter milestone update UI — unblocked by SHIP-125, and the screen the queue was built for |
 | SHIP-136 | 5 | Emit domain events from job, bid and delivery transitions — startable and unstruck, **deferred out of wave 6 and again out of wave 7**; see below |
 | SHIP-168 | 3 | Flutter launch-time version gate — **un-struck this pass**; see below |
-| ~~SHIP-114~~ | 5 | **Dependencies met, not buildable** — `internal/platform/storage/` is still `doc.go` alone and compose still runs `postgres`, `redis` and `kafka` and nothing else; see below |
+| SHIP-114 | 5 | Pre-signed upload URLs — **un-struck by SHIP-15p**, which put an S3-compatible store in the stack and in CI and the `STORAGE_*` settings in `internal/config`. `internal/platform/storage/` is still `doc.go` alone, and that is this ticket's own work rather than a blocker; see below |
 | ~~SHIP-147~~ | 5 | Buildable, but **one shared-surface edit stands in front of it** — and that is a narrower reason than it used to be; see below |
 | ~~SHIP-169~~ | 3 | Buildable, but it touches `users`, created by `000002_users.up.sql` in the **shared migration block (1–99)** |
 | ~~SHIP-174~~ | 3 | **Not demonstrable** — no Datadog agent in compose, no `DD_*` configuration, no account. The only two occurrences of "Datadog" in the repository are comments about log format |
@@ -5415,19 +5549,19 @@ Strict build order says the next ticket is the lowest-numbered open one, which i
 
 Plus **X-1, X-3, X-4, X-5 and X-6**, none of which is code and none of which has started. X-5 and X-6 need no third party at all.
 
-**Seven of the 21 are struck, which is the useful signal in this table.** Dependencies being met is not the same as a ticket being startable: four are not demonstrable with the tooling or the accounts that exist, two are held behind a shared surface a domain branch must not edit, and one is a decision. **Every one of the reasons was re-checked against the tree in this pass rather than carried over**, which is the point of writing the reason down instead of the verdict. Two of them did not survive the check in the form they were written: SHIP-168's is gone and SHIP-147's is narrower than it was, and both are below.
+**Six of the 21 are struck, which is the useful signal in this table.** Dependencies being met is not the same as a ticket being startable: four are not demonstrable with the tooling or the accounts that exist, one is held behind a shared surface a domain branch must not edit, and one is a decision. **It was seven before SHIP-15p**, and the one that left is SHIP-114. **Every one of the reasons was re-checked against the tree in this pass rather than carried over**, which is the point of writing the reason down instead of the verdict. Two of them did not survive the check in the form they were written: SHIP-168's is gone and SHIP-147's is narrower than it was, and both are below.
 
-**The startable-and-sensible set is 14 tickets and 47 points.** Before wave 6 it was nine tickets and 34 points — SHIP-15m, 56a, 84, 99, 107, 112, 124, 136 and 163 — so the average startable ticket has come *down* from 3.8 points to 3.4, the first time that figure has fallen. The reason is worth naming: all eleven arrivals sit one hop behind something wave 6 built, and a ticket that refines a surface is smaller than the ticket that opened it.
+**The startable-and-sensible set is 15 tickets and 52 points**, SHIP-114 having joined it at SHIP-15p. Before wave 6 it was nine tickets and 34 points — SHIP-15m, 56a, 84, 99, 107, 112, 124, 136 and 163 — so the average startable ticket has come *down* from 3.8 points to 3.4, the first time that figure has fallen. The reason is worth naming: all eleven arrivals sit one hop behind something wave 6 built, and a ticket that refines a surface is smaller than the ticket that opened it.
 
 **That "nine and 34" is recomputed, and the figure this paragraph replaced said "eight tickets and 31 points" against a table listing twelve.** The prose and the table had drifted apart because two track commits added rows to §6 without touching the summary above them — which is the failure the wave rule against tracks editing §6 exists to prevent, and it is recorded in §7 rather than tidied away here.
 
 **~~An open question wave 4 raised and deliberately did not answer: is SHIP-91 already delivered?~~ Answered by the owner on 12 August 2026: yes, and it is closed.** The question is kept rather than deleted because the *way* it was handled is the reusable part. Track C found that SHIP-80's `uq_bids_one_accepted_per_job` already met SHIP-91's *Done when*, recorded the finding, and declined to claim the ticket — which was right, since `Docs/11-done.txt` names what a commit subject claimed. Leaving it visible and unanswered is what stopped it being settled implicitly by whoever picked the award branch up. **The general rule: a track that finds it has finished somebody else's ticket writes the finding down and claims nothing.**
 
-**SHIP-114 is neither ready nor blocked on a third party, which is a third category this file needed.** Its dependencies are met, but `internal/platform/storage/` is `doc.go` alone and `deploy/docker-compose.yml` has no MinIO or equivalent, so "receives a short-lived pre-signed URL and uploads directly" cannot be demonstrated. Wave 1 already paid once for counting a ticket whose acceptance criterion needed a tool nobody had installed. **It needs a lettered ticket adding object storage to the local stack first**, as shared-platform work.
+**~~SHIP-114 is neither ready nor blocked on a third party, which is a third category this file needed.~~ Un-struck at SHIP-15p — see §3.** `deploy/docker-compose.yml` now runs a pinned MinIO, `make up` brings it up healthy and creates a private bucket, `internal/config` carries the `STORAGE_*` settings, `deploy/.env.example` documents them, the CI workflow provides the same store, and `make verify` mints a real pre-signed URL and uploads through it. "Receives a short-lived pre-signed URL and uploads directly" is demonstrable today.
 
-**That is now the fifth consecutive wave SHIP-114 has been struck for the same reason, and the repetition is the signal.** A reason re-checked five times and found true five times has stopped being a note and become a finding: nothing is going to add object storage as a side effect of another ticket, because no other ticket needs it. **Four tickets depend on it directly** — SHIP-115, 122, 130 and 155 — and the proof chain SHIP-116…118 sits behind SHIP-115, so `Docs/01` §4.4's "delivered requires photo proof or a recorded exception" cannot be demonstrated end to end until something can store a photograph. **It is the clearest candidate for a lettered ticket the backlog currently has**, and unlike SHIP-24…27 nothing outside this repository is holding it up.
+**The five-wave strike is kept rather than deleted, because the way it ended is the reusable part.** It read: nothing is going to add object storage as a side effect of another ticket, because no other ticket needs it — and a reason re-checked five times and found true five times has stopped being a note and become a finding. That is exactly how it ended: not by SHIP-114 doing anything, and not by another ticket happening to need a bucket, but by a prep ticket taking the shared-platform half. **Four tickets depend on it directly** — SHIP-115, 122, 130 and 155 — and the proof chain SHIP-116…118 sits behind SHIP-115, so `Docs/01` §4.4's "delivered requires photo proof or a recorded exception" is now reachable end to end for the first time.
 
-**The strike still holds as of this commit, and wave 7's prep ticket is expected to remove exactly this reason.** Whoever reads §6 after that prep lands should expect SHIP-114 to be un-struck by it rather than by anything SHIP-114 itself did — the reason is a missing service in `deploy/docker-compose.yml` and a `doc.go`-only adapter package, and both are shared-platform work. **Re-check the tree before believing either the strike or its removal**; that is what the last five passes have done, and it is the only reason this row has stayed honest.
+**What is left of the old strike is `internal/platform/storage/` holding `doc.go` alone, and that is SHIP-114's own work rather than a blocker.** A ticket writing its own package is ordinary; a ticket unable to demonstrate its criterion against the stack is not, and only the second was ever the reason. **Re-check the tree before believing either the strike or its removal** — that is what the five passes before this one did, and it is the only reason this row stayed honest long enough to be closed properly. `doc.go` is unedited: whether the filesystem implementation it specifies still earns its place now that the S3 one can be exercised locally is a question SHIP-15p deliberately left open, and §3 states both sides of it.
 
 **SHIP-147's strike reason is narrower than it was written, and the narrower version is the useful one.** It has been struck as "shared-platform work" because `RequireAdmin` has to be mapped in `cmd/api/routes.go`, which `Docs/10` §9.2 forbids a domain branch to edit. **SHIP-15m demonstrated the way out on the other guard**: `guardsFor` takes the driver guard as an argument, `newDriverTokenGuard` sits in a file of its own, and SHIP-108 filled it while editing neither `routes.go`, `manifest.go`, `main.go` nor `Deps`. `routes.go`'s own comment already promises SHIP-147 the same treatment — "a second parameter here and a second constructor beside `newDriverTokenGuard`". So the honest strike is not that SHIP-147 *is* shared-platform work; it is that **a small shared-surface edit stands in front of it and nothing has made that edit yet**. A wave-7 prep ticket that seats the admin guard the way SHIP-15m seated the driver one un-strikes this row entirely, and what is left is an ordinary `internal/admin` ticket. §9 records the one thing such a prep ticket should also absorb.
 
@@ -6145,11 +6279,13 @@ ticket should ask each track up front what configuration it will want**, rather 
 third round of parked requests after the fact. Ask the question at dispatch, when the answer is
 cheap.
 
-**SHIP-15m did not ask it either, so that half stands open.** It absorbed a parked request for the
-third time in three prep tickets, which is the outcome the paragraph above predicted and not the one
-it recommended. **Whoever dispatches wave 7 should ask each track, before it starts, what it expects
-to need from `internal/config`** — the answer costs a sentence at dispatch and a field in the prep
-ticket, against a wave of a track working around its absence.
+**~~SHIP-15m did not ask it either, so that half stands open.~~ Closed at SHIP-15p — see §3.**
+Wave 7's dispatch asked each track what it expected to need from `internal/config`, Track B answered
+with nine fields, and the `Storage` section was written before the track opened rather than a wave
+after it. **That is the first time the pattern has been broken in four prep tickets**, and the cost
+was what the recommendation said it would be: a sentence at dispatch and a section in the prep
+ticket. Keep asking — the entry stays here, struck, because the reasoning is the argument for asking
+again next wave rather than a record of one occasion.
 
 **A cross-block index request, and it is genuinely not urgent.** The provider feed wants
 `(created_at DESC, id DESC) WHERE status IN ('Open','Negotiating')` on `jobs` — which is migration
@@ -6190,11 +6326,12 @@ just drawing buttons over an existing endpoint.
 
 ---
 
-**The eight below were all found in wave 6, and none of them is owned by a ticket.** Two want a
-shared surface a domain branch may not edit, which is what a prep ticket is for; the rest want an
-ordinary ticket, a sentence in a document, or a decision. They are written one paragraph at a time,
-by whoever hit the surface first, which is the mechanism §1 describes: this is where wave 7's
-pre-step gets drafted.
+**The eight below were all found in wave 6, and none of them was owned by a ticket when it was
+written.** Two want a shared surface a domain branch may not edit, which is what a prep ticket is
+for; the rest want an ordinary ticket, a sentence in a document, or a decision. They are written one
+paragraph at a time, by whoever hit the surface first, which is the mechanism §1 describes: this is
+where wave 7's pre-step got drafted, and **one of the eight was taken by SHIP-15p** and is struck
+below.
 
 **The client's budget guard is spelling-based and misses a rename, which is wave 5's lesson
 recurring on the other side of the wire.** `apps/mobile/test/features/jobs/budget_stays_on_the_customer_side_test.dart`
@@ -6229,12 +6366,13 @@ ways out and neither is large**: the guard's message says so, or the convention 
 uses `IF EXISTS` throughout" is written into `Docs/10` and enforced the way the block ranges are.
 The second is better, because it makes the guard's advice true rather than qualifying it.
 
-**`routes_app_test.go`'s `routerWithApp` replaces `deps.Config` wholesale rather than mutating one
-field.** Every new configuration section therefore breaks it silently until somebody adds the
-section to that literal — SHIP-107's delivery keyset is in there for exactly that reason and for no
-other, and the file's own comment says so. **The shape that does not have this problem** is taking
-`testDeps()`'s config and overwriting the one field under test. One small change in one test file,
-and it stops a class of breakage that will otherwise recur at every configuration addition.
+**~~`routes_app_test.go`'s `routerWithApp` replaces `deps.Config` wholesale rather than mutating one
+field.~~ Decided and fixed at SHIP-15p — see §3.** It now copies the configuration it was given and
+overwrites the one field under test, and `TestTheAppFixtureOverwritesNothingButApp` fails if anybody
+puts the literal back. **The guard names no configuration section on purpose**: it puts a marker in
+one it has no use for and compares the whole struct with `App` blanked, so a section added tomorrow
+is covered without anybody remembering this existed. `Storage` would have been the next section to
+collect on the old shape, which is how a recommendation with no owner came to have one.
 
 **SHIP-108 had to change 15 `nil` call sites across five test files, and SHIP-147 will meet exactly
 this again.** Filling the guard seam turned `newRouter(…, nil)` into `newRouter(…, testDriverGuard())`
@@ -6278,6 +6416,40 @@ a real file, and `make flutter-check` is green at 594 tests — but `make flutte
 run against it, and a build hook is exactly the kind of thing that resolves on a host and fails on a
 device toolchain. **The first device build should confirm it**, and it is cheap to do early: it is
 one `make flutter-build` rather than a ticket.
+
+---
+
+**Three more, found at SHIP-15p while putting the object store in the stack.**
+
+**`STORAGE_BUCKET` is not derived from the directory the way `TEST_TEMPLATE_DB` is, and that is the
+weaker half of a decision rather than an oversight.** The `Makefile`'s own comment on
+`TEST_TEMPLATE_DB` makes the argument better than this entry can: the failure mode of forgetting to
+set it is silent and lands on the *other* worktree, so it is a default that cannot be omitted rather
+than an instruction somebody follows. The bucket has the same property — a tree that leaves it alone
+shares `shipper-dev` with every other tree that did, which is safe for a keyed read or write and
+unsafe for a count or a listing, and the tree that pays is the one that set it. **It was left
+explicit because a derived name has to be derived in three places** — the `Makefile`, `config.go`'s
+default, and `scripts/verify-foundation.sh` — and three defaults that must agree is the shape this
+file spends a lot of words regretting elsewhere. **Revisit the first time two tracks in one wave both
+open `internal/platform/storage`**, which wave 7 does not.
+
+**`deploy/docker-compose.yml` is a shared surface and is not on `Docs/10` §9.2's list.** That list
+names `cmd/api/routes.go`, `internal/boundaries`, `internal/httpx/**`, `go.mod`, the root `Makefile`,
+the shared migration block, `contracts/openapi.yaml`, `scripts/verify-foundation.sh`, `CLAUDE.md` and
+`Docs/**` — and `deploy/.env.example` is discussed a paragraph later without being in the list
+either. A compose service, a published port and a named volume are exactly as collision-prone as a
+route table: two branches adding a service each merge cleanly and fail on `make up`. **It wants one
+line in `Docs/10` §9.2**, which is a shared file this ticket had no other reason to open. Whoever
+next opens `Docs/10` should add it.
+
+**`mk/topics.mk`'s header still says the replication factor is "a flag rather than an entry in
+`internal/config`", which SHIP-15m made false.** `config.Kafka.ReplicationFactor` exists, is read
+from `KAFKA_REPLICATION_FACTOR`, and the flag is now an operator override rather than the only way
+to set it — §3's SHIP-15m entry has the detail. The comment is three lines and the fix is one
+sentence; it is recorded here rather than made because `mk/topics.mk` belongs to the topics work and
+this pass had no reason to open it. **A code change that contradicts a comment is the cheapest kind
+of drift to fix and the easiest to walk past**, which is why it is written down rather than left for
+whoever is confused by it next.
 
 ## 10. The done list, in a form a script can read
 
