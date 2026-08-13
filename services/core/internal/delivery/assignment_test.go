@@ -192,8 +192,9 @@ func newTestService() *Service {
 // to rediscover four times. SHIP-114's upload signer and policy arrive the same way, and SHIP-115's
 // object reader and ownership lookup after them.
 func newTestServiceWith(lifecycle Jobs) *Service {
-	return NewService(lifecycle, testAwards{}, testJobOwners(), testDriverIssuer(testClock()),
-		&recordingUploads{}, newRecordingObjects(), testUploadPolicy(), testClock())
+	return NewService(events.NewOutbox(), lifecycle, testAwards{}, testJobOwners(),
+		testDriverIssuer(testClock()), &recordingUploads{}, newRecordingObjects(),
+		testUploadPolicy(), testClock())
 }
 
 // testJobOwners is delivery.JobOwners over jobs.Service.Job, as cmd/api reads it.
@@ -784,6 +785,7 @@ func TestAJobPastDriverAssignedIsRefused(t *testing.T) {
 
 // collaborators is everything [NewService] insists on, for the test below.
 type collaborators struct {
+	sink    EventSink
 	jobs    Jobs
 	awards  Awards
 	owners  JobOwners
@@ -803,6 +805,7 @@ type collaborators struct {
 // that is known to work makes each case a statement about one field.
 func workingCollaborators() collaborators {
 	return collaborators{
+		sink:    events.NewOutbox(),
 		jobs:    staticJobs{move: JobMoved},
 		awards:  testAwards{},
 		owners:  testJobOwners(),
@@ -823,17 +826,20 @@ func workingCollaborators() collaborators {
 // at all (SHIP-114), without an object reader the platform can only take the client's word that a
 // photograph exists (SHIP-115), and without a clock a milestone recorded with no actor-supplied
 // time has nothing to be stamped from. A service that started without any of them would fail
-// silently, in production, at the first request.
+// silently, in production, at the first request. **Without an event sink (SHIP-136) it would fail
+// most silently of all**: every row is written and every response is correct, and the only symptom
+// is a notification nobody receives.
 func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 	// The base itself must build, or every case below would "pass" for the wrong reason.
 	base := workingCollaborators()
-	NewService(base.jobs, base.awards, base.owners, base.tokens,
+	NewService(base.sink, base.jobs, base.awards, base.owners, base.tokens,
 		base.uploads, base.objects, base.policy, base.clk)
 
 	for _, tc := range []struct {
 		name   string
 		remove func(*collaborators)
 	}{
+		{"no event sink", func(c *collaborators) { c.sink = nil }},
 		{"no job lifecycle", func(c *collaborators) { c.jobs = nil }},
 		{"no award lookup", func(c *collaborators) { c.awards = nil }},
 		{"no job ownership lookup", func(c *collaborators) { c.owners = nil }},
@@ -854,7 +860,8 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 
 			c := workingCollaborators()
 			tc.remove(&c)
-			NewService(c.jobs, c.awards, c.owners, c.tokens, c.uploads, c.objects, c.policy, c.clk)
+			NewService(c.sink, c.jobs, c.awards, c.owners, c.tokens, c.uploads, c.objects,
+				c.policy, c.clk)
 		})
 	}
 }

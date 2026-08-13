@@ -73,9 +73,14 @@ var (
 // endpoint makes. SHIP-92's is sharper again: [jobAwards] takes the real `FOR UPDATE` and runs the
 // real guarded transition, so an award test that passed against a stub would prove nothing about
 // whether the job actually moved.
+//
+// **The sink is the real outbox writer too, as cmd/api passes (SHIP-136).** A stub that counted
+// emissions would prove nothing about whether the row commits with the change it describes, which is
+// the one property the outbox exists for — so events_test.go reads the table.
 func newTestService() *Service {
 	c := clock.NewFixed(testInstant)
-	return NewService(fleet.NewService(c), newTestNegotiation(c), newTestAwarding(c), c)
+	return NewService(
+		events.NewOutbox(), fleet.NewService(c), newTestNegotiation(c), newTestAwarding(c), c)
 }
 
 // newTestNegotiation is [Negotiation] over the real `jobs` service, as cmd/api wires it.

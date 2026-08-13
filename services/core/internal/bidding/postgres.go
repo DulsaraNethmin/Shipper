@@ -473,23 +473,46 @@ func (postgresStore) acceptBid(ctx context.Context, r db.Runner, id uuid.UUID) (
 // **The one position in the recorded lock ordering a single-threaded suite can hold is then held by a
 // test rather than by review**, which is the thing SHIP-92's mutation run found it was not.
 //
-// # It reports no count, and "no rows" is not a refusal here
+// # It returns the rows it closed, and "no rows" is not a refusal here
 //
 // Unlike [postgresStore.supersedeHead] and [postgresStore.acceptBid], whose `WHERE` clauses *are* the
 // check and which therefore report whether they matched, this one has nothing to compare and set. A
 // job awarded on its only offer sweeps nothing, and that is an ordinary award rather than a lost
-// update. `updated_at` is left to `bids_set_updated_at` (000500), which is what lets a test tell a
-// swept row from an untouched one even when the status it would write is the status already there.
-func (postgresStore) rejectCompeting(ctx context.Context, r db.Runner, jobID uuid.UUID) error {
+// update — an empty slice, not an error. `updated_at` is left to `bids_set_updated_at` (000500),
+// which is what lets a test tell a swept row from an untouched one even when the status it would
+// write is the status already there.
+//
+// **SHIP-136 is why it returns the rows rather than nothing.** Each closed offer is a different
+// provider to tell, so the award emits one `bid.rejected` per row — and the rows have to come from
+// the statement that closed them. A second `SELECT` afterwards would read whatever is `Rejected`
+// *now*, including offers closed by some earlier award or by whatever ticket eventually lets a
+// customer decline one by hand, and would attribute every one of them to this transaction.
+// `RETURNING` names exactly what this `UPDATE` moved and nothing else.
+func (postgresStore) rejectCompeting(ctx context.Context, r db.Runner, jobID uuid.UUID) ([]Bid, error) {
 	const q = `
 		UPDATE bids
 		SET status = $2
-		WHERE job_id = $1 AND status = $3`
+		WHERE job_id = $1 AND status = $3
+		RETURNING ` + bidColumns
 
-	if _, err := r.Exec(ctx, q, jobID, string(StatusRejected), string(StatusSubmitted)); err != nil {
-		return fmt.Errorf("bidding: closing the competing offers on %s: %w", jobID, err)
+	rows, err := r.Query(ctx, q, jobID, string(StatusRejected), string(StatusSubmitted))
+	if err != nil {
+		return nil, fmt.Errorf("bidding: closing the competing offers on %s: %w", jobID, err)
 	}
-	return nil
+	defer rows.Close()
+
+	var closed []Bid
+	for rows.Next() {
+		bid, err := scanBid(rows)
+		if err != nil {
+			return nil, fmt.Errorf("bidding: reading a closed offer on %s: %w", jobID, err)
+		}
+		closed = append(closed, bid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bidding: closing the competing offers on %s: %w", jobID, err)
+	}
+	return closed, nil
 }
 
 // linkSuccessor records which offer displaced this one, completing the chain (SHIP-88).

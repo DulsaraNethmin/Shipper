@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/fleet"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
@@ -694,6 +695,7 @@ func TestAnOfferWithNoMessageStoresNULLRatherThanEmpty(t *testing.T) {
 func TestAnEligibilityFailureIsNotARefusal(t *testing.T) {
 	m := newMarket(t)
 	m.svc = NewService(
+		events.NewOutbox(),
 		refusing{err: errors.New("the filter could not run")},
 		newTestNegotiation(m.svc.clock),
 		newTestAwarding(m.svc.clock),
@@ -2039,6 +2041,7 @@ func TestANegotiationFailureIsNotARefusal(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		brokenNegotiation{err: errors.New("the job service could not run")},
 		newTestAwarding(m.svc.clock),
@@ -3132,6 +3135,7 @@ func TestAnAwardingFailureIsNotARefusal(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lockErr: errors.New("the job service could not run")},
@@ -3166,6 +3170,7 @@ func TestAnUnrecognisedAwardAnswerIsRefused(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardUnrecognised},
@@ -3200,6 +3205,7 @@ func TestAFailedTransitionRollsTheAcceptBackWithIt(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},
@@ -3509,6 +3515,7 @@ func TestAFailedTransitionRollsTheSweepBackToo(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},

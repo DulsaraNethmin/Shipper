@@ -10,6 +10,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/bidding"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/fleet"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 )
@@ -185,6 +186,7 @@ func init() {
 // about each other.
 func biddingHandler(d Deps) *bidding.Handler {
 	svc := bidding.NewService(
+		events.NewOutbox(),
 		fleet.NewService(d.Clock),
 		negotiatedJobs{jobs: newJobService(d)},
 		awardableJobs{jobs: newJobService(d)},

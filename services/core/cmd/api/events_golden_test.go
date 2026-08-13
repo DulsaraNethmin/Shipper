@@ -161,7 +161,18 @@ func TestEveryEventIsPublishable(t *testing.T) {
 // emitted from code that forgot to register it, which fails at the first emission rather than at
 // build time.
 func TestEveryEventTypeTheServiceNamesIsRegistered(t *testing.T) {
-	want := []string{"job.status_changed", "job.expiry_warned", "job.expiry_extended"}
+	want := []string{
+		"job.status_changed", "job.expiry_warned", "job.expiry_extended",
+
+		// SHIP-136. `bid.expired` is deliberately absent: bidding.StatusExpired is declared and
+		// nothing writes it, and SHIP-89's scheduled task is the ticket that both starts writing
+		// it and emits its event. A schema registered here for an event nothing emits would put a
+		// line in the golden file describing a payload no code marshals, which reads as covered.
+		"bid.placed", "bid.revised", "bid.withdrawn",
+		"bid.countered", "bid.accepted", "bid.rejected",
+
+		"delivery.driver_assigned", "delivery.milestone_recorded", "delivery.proof_recorded",
+	}
 	sort.Strings(want)
 
 	got := make([]string, 0, len(events.Catalogue()))

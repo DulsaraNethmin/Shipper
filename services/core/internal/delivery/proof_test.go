@@ -85,7 +85,7 @@ func (u *recordingUploads) last(t *testing.T) presignCall {
 
 // serviceWithUploads is a service whose signer the test can inspect afterwards.
 func serviceWithUploads(uploads ProofUploads, policy UploadPolicy) *Service {
-	return NewService(staticJobs{move: JobMoved}, testAwards{}, testJobOwners(),
+	return NewService(events.NewOutbox(), staticJobs{move: JobMoved}, testAwards{}, testJobOwners(),
 		testDriverIssuer(testClock()), uploads, newRecordingObjects(), policy, testClock())
 }
 
@@ -172,6 +172,7 @@ func aPhotograph() storedObject {
 // than a stub's.
 func serviceReadingProofFrom(objects ProofObjects) *Service {
 	return NewService(
+		events.NewOutbox(),
 		testJobs{svc: jobs.NewService(events.NewOutbox(), testClock(), nil)},
 		testAwards{}, testJobOwners(), testDriverIssuer(testClock()),
 		&recordingUploads{}, objects, testUploadPolicy(), testClock())

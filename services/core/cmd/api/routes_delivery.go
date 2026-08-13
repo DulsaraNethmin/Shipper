@@ -189,6 +189,7 @@ func deliveryHandler(d Deps) *delivery.Handler {
 	store := proofUploads(d)
 
 	svc := delivery.NewService(
+		events.NewOutbox(),
 		jobLifecycle{jobs: newJobService(d)},
 		acceptedBids{},
 		jobCustomers{jobs: newJobService(d)},

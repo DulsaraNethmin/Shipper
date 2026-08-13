@@ -68,6 +68,7 @@ const (
 // the database is not abstracted, and the partial unique indexes this file is built against are
 // PostgreSQL's.
 type Service struct {
+	events      EventSink
 	eligibility Eligibility
 	negotiation Negotiation
 	awarding    Awarding
@@ -84,8 +85,33 @@ type Service struct {
 //
 // The clock is injected (Docs/10 §6.3) because two of the three timing rules compare against "now",
 // and a test that had to wait for wall-clock time to pass would either be slow or be flaky.
-func NewService(eligibility Eligibility, negotiation Negotiation, awarding Awarding, c clock.Clock) *Service {
-	return &Service{eligibility: eligibility, negotiation: negotiation, awarding: awarding, clock: c}
+//
+// # The sink is required and this panics without it (SHIP-136)
+//
+// The same call jobs.NewService and delivery.NewService make, and in the same spirit as
+// httpx.RegisterCode: this is called once from the composition root, a missing collaborator is a
+// programming mistake rather than a runtime condition, and the alternative is a service that starts
+// and then loses every domain event it should have emitted. Nothing downstream would report it —
+// the bid is written, the award is correct, and the only symptom is a notification nobody receives.
+func NewService(
+	sink EventSink,
+	eligibility Eligibility,
+	negotiation Negotiation,
+	awarding Awarding,
+	c clock.Clock,
+) *Service {
+	if sink == nil {
+		panic("bidding: NewService needs an EventSink; an offer, a counter or an award that " +
+			"emits no event is a state change nothing downstream will ever hear about " +
+			"(Docs/01 §4.5, Docs/10 §6.1)")
+	}
+	return &Service{
+		events:      sink,
+		eligibility: eligibility,
+		negotiation: negotiation,
+		awarding:    awarding,
+		clock:       c,
+	}
 }
 
 // PlaceBid records one provider's offer against one job (SHIP-84).
@@ -177,6 +203,12 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 	case err != nil:
 		return Bid{}, false, err
 	case created:
+		// The event, in the transaction that wrote the row (SHIP-136). Only on the branch that
+		// actually created something: a retry answered from the record below has already emitted
+		// once, and a second event would tell a customer twice about one offer.
+		if err := s.emitOffer(ctx, r, EventBidPlaced, bid, bid.CreatedAt); err != nil {
+			return Bid{}, false, err
+		}
 		return bid, true, nil
 	}
 
@@ -271,7 +303,18 @@ func (s *Service) ReviseBid(
 		return Bid{}, ErrJobNotOffered
 	}
 
-	return s.store.reviseOffer(ctx, r, bid.ID, offer)
+	revised, err := s.store.reviseOffer(ctx, r, bid.ID, offer)
+	if err != nil {
+		return Bid{}, err
+	}
+
+	// The event, in the transaction that wrote the change (SHIP-136). `updated_at` rather than
+	// `created_at`, because a revision is the second thing to happen to a row that already existed —
+	// and the two events then carry the two instants a consumer would reconcile the row against.
+	if err := s.emitOffer(ctx, r, EventBidRevised, revised, revised.UpdatedAt); err != nil {
+		return Bid{}, err
+	}
+	return revised, nil
 }
 
 // WithdrawBid takes a provider's own offer back before it is accepted (SHIP-86).
@@ -324,13 +367,23 @@ func (s *Service) WithdrawBid(
 		return Bid{}, err
 	}
 	if bid.Status == StatusWithdrawn {
+		// Already withdrawn, and nothing is written — so nothing is emitted either. The event
+		// belongs to the transition and this request made none: an offer withdrawn twice is one
+		// withdrawal, which is exactly the guarantee the header above calls stronger than a key.
 		return bid, nil
 	}
 	if err := changeable(bid); err != nil {
 		return Bid{}, err
 	}
 
-	return s.store.withdrawBid(ctx, r, bid.ID)
+	withdrawn, err := s.store.withdrawBid(ctx, r, bid.ID)
+	if err != nil {
+		return Bid{}, err
+	}
+	if err := s.emitClosed(ctx, r, EventBidWithdrawn, withdrawn); err != nil {
+		return Bid{}, err
+	}
+	return withdrawn, nil
 }
 
 // CounterOffer answers the other party's offer with different terms (SHIP-87, SHIP-88).
@@ -499,6 +552,15 @@ func (s *Service) CounterOffer(
 	if _, err := s.store.linkSuccessor(ctx, r, answered.bid.ID, counter.ID); err != nil {
 		return Bid{}, false, err
 	}
+
+	// The event, last, in the transaction all three statements share (SHIP-136). After the link
+	// rather than before it, because the payload names the offer this counter displaced and that
+	// fact is only true of the database once `superseded_by` is written — an event emitted between
+	// the insert and the link would describe a chain that had not been made yet, and would still be
+	// on the topic if the link then failed.
+	if err := s.emitCountered(ctx, r, counter, answered.bid.ID); err != nil {
+		return Bid{}, false, err
+	}
 	return counter, true, nil
 }
 
@@ -664,7 +726,8 @@ func (s *Service) AwardBid(
 	//    predicate and needs no exclusion — and a sweep moved in front of it would close the row the
 	//    statement above is about to name, which is a failure a test can see rather than one only a
 	//    race can.
-	if err := s.store.rejectCompeting(ctx, r, jobID); err != nil {
+	rejected, err := s.store.rejectCompeting(ctx, r, jobID)
+	if err != nil {
 		return Bid{}, err
 	}
 
@@ -673,6 +736,26 @@ func (s *Service) AwardBid(
 	case err != nil:
 		return Bid{}, fmt.Errorf("bidding: moving %s to Awarded: %w", jobID, err)
 	case move == JobAwarded:
+		// 6. The events, after the five steps and inside the same transaction (SHIP-136).
+		//
+		// **Emitted here rather than beside each statement, so that the lock ordering above stays
+		// readable as the five steps it is.** An `INSERT INTO outbox` takes no lock on `bids` or
+		// `jobs`, so this position is free — and it is the only position where every event is true:
+		// an award is not an award until the job has moved, and emitting at step 3 would put an
+		// acceptance on the topic that step 5 could still roll back.
+		//
+		// The winner first, then each offer the sweep closed. The order is a courtesy rather than a
+		// guarantee — the aggregate is the bid, so these land on different partitions and Kafka
+		// promises nothing between them (catalogue.go) — and it costs nothing to write them in the
+		// order somebody reading the outbox table would expect.
+		if err := s.emitAccepted(ctx, r, accepted, customerID); err != nil {
+			return Bid{}, err
+		}
+		for _, closed := range rejected {
+			if err := s.emitClosed(ctx, r, EventBidRejected, closed); err != nil {
+				return Bid{}, err
+			}
+		}
 		return accepted, nil
 	default:
 		// Unreachable: the job has been held FOR UPDATE since before the bid was read, and it was
