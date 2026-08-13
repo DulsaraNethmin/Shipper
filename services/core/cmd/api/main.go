@@ -176,18 +176,29 @@ func run() error {
 	// of the router rather than a field on Deps — the reasoning is identical to the paragraph
 	// above and driverauth.go states it in full.
 	//
-	// It returns nil today, which leaves RequireDriverToken **out** of the guard map rather than
-	// mapped to something that refuses: a route declaring the class stops the process at startup
-	// instead of answering 401 forever (see guardsFor). This line is written now so that SHIP-108
-	// fills in driverauth.go and edits nothing shared.
+	// **The seam paid**: this line was written by SHIP-15m against a body that returned nil, and
+	// SHIP-108 filled the body without editing this file. It returns a real guard now, so
+	// RequireDriverToken is in the map and `GET /v1/driver/jobs/{id}` is served.
 	driverToken, err := newDriverTokenGuard(cfg, deps.Clock)
+	if err != nil {
+		return err
+	}
+
+	// The administrator session verifier (SHIP-147), and the third collaborator of the router.
+	// Written at SHIP-15r against a body that returns nil, for exactly the reason above: SHIP-147
+	// fills adminauth.go and edits nothing shared.
+	//
+	// Nil leaves RequireAdmin **out** of the guard map rather than mapped to something that
+	// refuses, so a route declaring the class stops the process at startup instead of answering
+	// 401 forever (see guardsFor). Nothing declares it today.
+	adminSession, err := newAdminGuard(cfg, deps.Pool, deps.Clock)
 	if err != nil {
 		return err
 	}
 
 	srv := &http.Server{
 		Addr:    cfg.HTTP.Addr(),
-		Handler: newRouter(deps, idempotencyStore, authenticate, driverToken),
+		Handler: newRouter(deps, idempotencyStore, authenticate, driverToken, adminSession),
 
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,

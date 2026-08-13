@@ -43,10 +43,12 @@ const apiPrefix = "/" + apiVersion
 // whoever gets asked about it. A process that will not start is the loudest possible version of
 // "this route's auth class is not implemented yet", and it cannot reach production.
 //
-// RequireAdmin is still absent from every branch of this function. SHIP-147 gets the same
-// treatment — a second parameter here and a second constructor beside newDriverTokenGuard — and
-// until then a route declaring it stops the process rather than being served open.
-func guardsFor(driverToken Guard) guards {
+// RequireAdmin got the same treatment at SHIP-15r, before SHIP-147 rather than during it, which is
+// what the paragraph this one replaces promised: a second parameter here and newAdminGuard beside
+// newDriverTokenGuard. Both classes are now seated, and **this function is finished** — Docs/06 has
+// no fifth auth class, so the next edit to it is a class somebody has argued for rather than one a
+// track needed on a Tuesday.
+func guardsFor(driverToken, admin Guard) guards {
 	g := guards{
 		// The mobile access token, resolved group-wide by ResolveSubject and required per
 		// route here (SHIP-44).
@@ -56,6 +58,14 @@ func guardsFor(driverToken Guard) guards {
 	// Absent rather than permissive, and absent rather than refusing. See above.
 	if driverToken != nil {
 		g[RequireDriverToken] = driverToken
+	}
+
+	// Nil today: newAdminGuard returns nothing until SHIP-147 fills it, so RequireAdmin stays
+	// out of the map and `internal/admin`'s first protected route stops the process rather than
+	// being served open. That is the same state RequireDriverToken was in between SHIP-15m and
+	// SHIP-108, and it is the state this branch exists to make survivable.
+	if admin != nil {
+		g[RequireAdmin] = admin
 	}
 
 	return g
@@ -80,10 +90,11 @@ func newRouter(
 	idempotencyStore httpx.IdempotencyStore,
 	authenticate httpx.Authenticator,
 	driverToken Guard,
+	admin Guard,
 ) http.Handler {
 	// Which middleware enforces which auth class. A class absent from this map cannot be
 	// served at all — see attach and guardsFor.
-	protected := guardsFor(driverToken)
+	protected := guardsFor(driverToken, admin)
 
 	root := http.NewServeMux()
 
