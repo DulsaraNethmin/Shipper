@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/app.dart';
+import 'package:shipper/core/sync/queue_watch.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 
 /// Entry point.
@@ -32,7 +33,17 @@ void main() {
   // which is too late.
   WidgetsFlutterBinding.ensureInitialized();
 
-  final container = ProviderContainer();
+  // `queueWatchProvider` is what the pending-updates indicator reads (SHIP-126), and it is empty
+  // until it is supplied here. That inversion is deliberate and is SHIP-124's objection kept: the
+  // indicator lives inside `ShipperApp`, which every widget test builds, and a provider that reached
+  // the worker on its own would have each of them open a Drift database in the platform's
+  // application-support directory. **This override is the whole of the production wiring** — without
+  // it the app runs with an indicator that never appears, so `sync_wiring_test.dart` holds it.
+  final container = ProviderContainer(
+    overrides: [
+      queueWatchProvider.overrideWith((ref) => ref.watch(syncWorkerProvider)),
+    ],
+  );
   unawaited(container.read(syncWorkerProvider).start());
 
   runApp(UncontrolledProviderScope(container: container, child: const ShipperApp()));

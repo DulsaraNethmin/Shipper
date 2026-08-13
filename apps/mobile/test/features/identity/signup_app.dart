@@ -7,6 +7,7 @@ import 'package:shipper/core/auth/session_refresher.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/device/device_label.dart';
+import 'package:shipper/core/sync/queue_watch.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 import 'package:shipper/features/bidding/bidding_repository.dart';
 import 'package:shipper/features/fleet/fleet_repository.dart';
@@ -50,7 +51,13 @@ Widget signupApp(
       // directory, which a widget test has no plugin behind, and `main.dart` is deliberately the
       // only place the real one is constructed. A test that wants a queue hands over a
       // `SyncHarness` worker over a temporary file, which is the real queue rather than a fake.
-      if (worker != null) syncWorkerProvider.overrideWithValue(worker),
+      if (worker != null) ...[
+        syncWorkerProvider.overrideWithValue(worker),
+        // The pending-updates indicator (SHIP-126) reads this rather than the worker directly, and
+        // it is `null` by default for the same reason. Supplying both here is what makes a test
+        // that hands over a worker see the application as `main.dart` builds it.
+        queueWatchProvider.overrideWithValue(worker),
+      ],
       tokenStoreProvider.overrideWithValue(store ?? FakeTokenStore()),
       identityRepositoryProvider.overrideWithValue(identity),
       // Sign-out tells the platform the device session is over, and does not wait to be told

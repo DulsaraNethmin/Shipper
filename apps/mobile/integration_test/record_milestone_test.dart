@@ -1,4 +1,4 @@
-// SHIP-129, on a device and against a running platform.
+// SHIP-129 and SHIP-126, on a device and against a running platform.
 //
 // Everything under `test/` substitutes the sender, which is the right seam for a screen test and
 // is not the same claim as "a provider records a milestone and Shipper has it". This file makes
@@ -10,6 +10,14 @@
 // `recorded_at` in RFC 3339 with the device's offset, which `time.Parse(time.RFC3339, …)` refuses
 // without. The screen says "Recorded" only when the operation has left the queue, and an operation
 // leaves the queue on exactly one path.
+//
+// # It also demonstrates SHIP-126, and the worker is paused to make that observable
+//
+// A run against a working API would otherwise pass through the pending state in a few
+// milliseconds, which is not something a test can assert on without racing it. So the worker is
+// **paused** before the tap: the row is committed and a snapshot is published, and nothing is sent.
+// That is a driver in a pickup bay, arranged rather than waited for. The screen reads "Pending" and
+// the indicator reads "1 update waiting to sync"; the worker is then resumed and both settle.
 //
 // # Running it
 //
@@ -50,6 +58,8 @@ import 'package:integration_test/integration_test.dart';
 import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/token_store.dart';
 import 'package:shipper/core/routing/app_router.dart';
+import 'package:shipper/core/sync/queue_watch.dart';
+import 'package:shipper/core/sync/sync_signals.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 
 /// An account that already exists on the platform, and a job already awarded to it.
@@ -71,13 +81,20 @@ void main() {
     );
   });
 
-  testWidgets('a provider records a milestone and the platform takes it', (tester) async {
+  testWidgets('a provider records a milestone, sees it pending, and the platform takes it',
+      (tester) async {
     await store.clear();
 
     // The application's own wiring: one container, the worker started outside the widget tree so
     // `recover()` runs before the first frame. This is `main.dart` rather than an approximation of
     // it — a `ProviderScope` on its own would leave the worker unstarted and nothing would drain.
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      // `main.dart`'s own override, and the whole of SHIP-126's production wiring: the indicator
+      // reads `queueWatchProvider`, which is empty until something supplies the running worker.
+      overrides: [
+        queueWatchProvider.overrideWith((ref) => ref.watch(syncWorkerProvider)),
+      ],
+    );
     addTearDown(container.dispose);
 
     final worker = container.read(syncWorkerProvider);
@@ -102,11 +119,27 @@ void main() {
 
     expect(find.byKey(const Key('delivery-screen')), findsOneWidget);
 
+    // Nothing recorded yet, so the indicator says nothing at all.
+    expect(find.byKey(const Key('pending-updates')), findsNothing);
+
+    // A driver in a pickup bay, arranged rather than waited for. The row will be committed and a
+    // snapshot published; nothing will be sent.
+    worker.pause();
+
     await tester.tap(find.byKey(const Key('milestone-record-en_route_to_pickup')));
     await tester.pumpAndSettle();
+    await worker.drained;
+    await tester.pumpAndSettle();
 
-    // The drain is fire-and-forget from the tap, so the assertion waits for the pass rather than
-    // for a duration. A pass includes the HTTP request, so this is the round trip.
+    // SHIP-129's optimistic local state, clearly marked, and SHIP-126's count of it.
+    expect(find.text('Pending'), findsOneWidget);
+    expect(find.text('1 update waiting to sync'), findsOneWidget);
+
+    // Signal comes back.
+    worker.resume(SyncTrigger.resumed);
+
+    // The drain is fire-and-forget, so the assertion waits for the pass rather than for a duration.
+    // A pass includes the HTTP request, so this is the round trip.
     await worker.drained;
     await tester.pumpAndSettle();
 
@@ -115,6 +148,7 @@ void main() {
     // would read "Needs attention"; no signal would have left it "Pending".
     expect(find.text('Recorded'), findsOneWidget);
     expect(find.text('Pending'), findsNothing);
+    expect(find.byKey(const Key('pending-updates')), findsNothing);
 
     final snapshot = await worker.queue.snapshot();
     expect(snapshot.total, 0, reason: 'nothing should be left on the device');

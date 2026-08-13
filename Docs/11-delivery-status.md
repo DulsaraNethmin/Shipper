@@ -367,6 +367,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
+| **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
@@ -5818,6 +5819,105 @@ tests — recorded with no signal and marked pending, recorded with signal and m
 the acceptance run above, on a simulator against a live API. `make verify` does not cover this ticket
 and its count does not move: that script exercises HTTP endpoints and this one adds none, the same
 position SHIP-98, SHIP-99, SHIP-100, SHIP-124 and SHIP-125 are in.
+
+### SHIP-126 — the pending count, and what "persistent" had to be taken to mean
+
+`Docs/02` §3.1's escalation ladder has three rungs and this is the first: *"Immediately — the app
+shows a persistent indicator of how many updates are pending. The user is never left guessing whether
+their work was recorded."* The 4-hour nudge is SHIP-127 and the 24-hour operations alert is SHIP-128;
+neither is here.
+
+#### Persistent means it does not go away when the screen does, so it is mounted above the router
+
+`MaterialApp.router`'s `builder` runs below the theme and **above the navigator**, so a widget placed
+there is on every route in the application and survives every navigation. An indicator in an app
+bar would have been a smaller change and a different ticket: a driver records three milestones at a
+loading dock and walks to the next job, and the question "did that go?" travels with them. Answering
+it only on the screen where the work was recorded answers it in the one place it is not being asked.
+
+It is a **bar below the content** rather than a badge over it, so it never covers anything — a
+floating chip in the bottom corner would sit on the button that publishes a delivery on the customer
+shell. `pending_updates_persist_test.dart` is the *Done when*: record twice with no signal on
+`/jobs/{id}/delivery`, navigate to the shell, and the count is still there.
+
+#### Putting it inside `ShipperApp` is exactly the arrangement SHIP-124 objected to, so the dependency is inverted
+
+SHIP-124 refused to wire the queue into `SessionController.signOut` because every widget test builds
+that path and would open a Drift database in the platform's application-support directory, which a
+host test has no plugin behind. SHIP-125 answered the same objection by starting the worker from
+`main` and nowhere else. **This ticket puts a widget that reads the queue inside the one widget every
+test builds**, which would have undone both.
+
+So `queueWatchProvider` holds the worker and is **`null` by default**. `main.dart` overrides it;
+nothing else does. A test that has not asked for a queue gets an empty stream, a `SizedBox.shrink()`
+and no database, and the 714 tests that existed before this ticket were unchanged by it.
+
+The cost of that inversion is a wire that can be quietly missing: an application whose `main` forgot
+the override runs with an indicator that never appears however full the queue gets — no test fails,
+nothing is logged, and the symptom is a driver left guessing, which is the exact thing the ticket
+exists to prevent. So **both halves are held**: `sync_wiring_test.dart` asserts the default is `null`,
+and asserts that `lib/main.dart` supplies it. The second is a source assertion rather than a call,
+because `main()` calls `runApp` and constructs the real queue — the two things a host test cannot do.
+
+#### The number is `unsynced`, and blocked work is a second line rather than part of it
+
+`QueueSnapshot.unsynced` is **pending plus in flight**, which is the sum SHIP-125 chose and gave the
+reason for: an operation the platform has refused is not waiting for a connection, it is waiting for
+a person, and a number that never falls however long the driver stands in the open is not what
+`Docs/02` §3.1 asks for.
+
+**That reasoning leaves a hole, and this ticket closes it rather than inheriting it.** A device with
+one quarantined update and nothing pending would show no indicator at all — silence about the one
+update that most deserves attention. So the indicator appears when **either** number is above zero,
+and the blocked count is a second line in different words: *needs attention* rather than *waiting to
+sync*. Two numbers rather than three-of-which-one-is-stuck, so a driver who stands in the open
+watches the first fall to zero and the second stay put, which is true and is what tells them the
+second needs something other than patience. What lost and to what is SHIP-132's screen.
+
+**The in-flight half of the sum is held by a hand-built snapshot and by nothing else, deliberately.**
+A published snapshot almost never carries an in-flight operation — the worker publishes at the end of
+a pass, by which time each claimed operation has been completed, released or blocked — so a test
+driving the real worker cannot produce one, and the term would be untested against a real queue while
+looking well covered. That is why the arithmetic is tested over constructed snapshots and the
+persistence over the running application, rather than both being attempted in one place.
+
+#### At zero it draws nothing, and that is a decision rather than an omission
+
+A bar that is always present and usually reads zero is a bar people learn not to read, and this rung
+of the ladder is entirely about the case where the number is not zero. What answers "was my work
+recorded" in the settled case is SHIP-129's delivery screen, where each recording carries its own
+word — a per-item answer, which is the stronger one. The two halves are complementary and the tests
+say so in the same file: the indicator goes and "Recorded" stays.
+
+#### Mutation testing
+
+| Mutation | Result |
+|---|---|
+| The count reads `pending.length` instead of `unsynced` | **Caught**, one test — the constructed snapshot with one operation of each kind |
+| The indicator hidden whenever nothing is waiting, ignoring blocked work | **Caught**, two tests |
+| The `builder` removed from `MaterialApp.router`, leaving the indicator unmounted | **Caught**, one test — the journey that leaves the screen |
+| `main.dart`'s `queueWatchProvider` override removed | **Caught**, one test — the source assertion written for exactly this |
+
+Every mutation was reverted immediately and `git diff` confirmed the tree.
+
+#### How it was demonstrated
+
+`make flutter-check` green in this worktree: **726 host tests** (up from 714), the analyzer clean, and
+the environment test per build flavour. `make verify` does not cover this ticket and its count does
+not move.
+
+**And on a device, against the live API.** `integration_test/record_milestone_test.dart` — written for
+SHIP-129 and extended here — takes `main.dart`'s own override, **pauses the worker before the tap**,
+and reads both halves at once: the screen says "Pending" and the bar says "1 update waiting to sync".
+The worker is then resumed, the platform answers `201`, and both settle — "Recorded" on the entry and
+no bar at all. Pausing is what makes the pending state observable rather than raced: against a
+working API it would otherwise last a few milliseconds.
+
+That run also demonstrated something neither ticket claimed. It was the **second** recording of
+`en_route_to_pickup` against the same job, and the platform wrote a second row under a second key and
+answered `201` — SHIP-111's "a repeat that is not a retry is a second row", which is `Docs/02` §5's
+failed pickup attempt. **The app presented it as "Recorded", not as an error**, which is the behaviour
+`Docs/02` §3.1 requires of a client whose update the platform keeps without moving the job.
 
 ## 4. Partly done — do not treat these as finished
 
