@@ -1118,6 +1118,31 @@ proof115_unsigned="$(curl -s -o /dev/null -w '%{http_code}' "$STORAGE_ENDPOINT/$
   || fail "the same object answered $proof115_unsigned unsigned, want 403 — a proof photograph identifies an address and a recipient"
 ok "and the same object is refused without a signature: the only way to a photograph is a URL issued after an authorisation check"
 
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-15r  a download URL is signed for a shorter window than an upload URL"
+
+# The two lifetimes were one number until SHIP-15r, and the reason they are two is demonstrated here
+# rather than in a unit test: what is being shown is that the *service* asks for different windows in
+# the two directions, over the wire, against a real signer.
+#
+# Neither number is typed. internal/config owns both, and a check that hard-coded five minutes and
+# fifteen would keep passing after somebody stopped reading them — the same reasoning as SHIP-114's
+# upload window above, whose measured figure this compares against.
+proof115_download_window="$(python3 -c '
+import sys, urllib.parse
+query = urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[1]).query)
+print(int(query["X-Amz-Expires"][0]))
+' "$proof115_download")"
+
+(( proof115_download_window > 0 && proof115_download_window <= 3600 )) \
+  || fail "the download is signed to last $proof115_download_window seconds; internal/config caps both lifetimes at an hour because nothing revokes either"
+ok "the download URL carries its own signed window — $proof115_download_window seconds"
+
+(( proof115_download_window < proof_expires_seconds )) \
+  || fail "the download is signed for $proof115_download_window seconds against an upload's $proof_expires_seconds; a read link is a live link to a photograph and must not inherit the window a slow PUT needs"
+ok "and it is shorter than the upload's $proof_expires_seconds seconds — the two directions no longer share one lifetime"
+
+
 status="$(read_proof "$delivery_provider_token" "$proof_job" provider)"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/p115-read-provider.json"; fail "the awarded provider reading proof answered $status"; }
 [[ "$(json "$WORKDIR/p115-read-provider.json" '["data"][0]["object_key"]')" == "$proof115_key" ]] \
