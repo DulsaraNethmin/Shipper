@@ -634,6 +634,17 @@ func addVehicle(t *testing.T, pool *pgxpool.Pool, provider uuid.UUID, registrati
 // platform does, rather than through a back door the platform does not have.
 func transition(t *testing.T, pool *pgxpool.Pool, job, actor uuid.UUID, from, to string) {
 	t.Helper()
+	transitionBy(t, pool, "customer", job, actor, from, to)
+}
+
+// transitionBy is [transition] with the actor's kind named (SHIP-94).
+//
+// Every move in this package's fixtures was a customer's until an award had to be followed by the
+// delivery *starting*, and `Awarded → En route to pickup` is the provider's. A history row attributing
+// it to the customer would be a fixture that lies about who acted — which matters here more than it
+// looks, because the row is the whole of what 000402's trigger reads.
+func transitionBy(t *testing.T, pool *pgxpool.Pool, actorType string, job, actor uuid.UUID, from, to string) {
+	t.Helper()
 
 	if err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
 		entry, err := uuid.NewV7()
@@ -643,8 +654,8 @@ func transition(t *testing.T, pool *pgxpool.Pool, job, actor uuid.UUID, from, to
 		if _, err := r.Exec(ctx, `
 			INSERT INTO job_status_history
 				(id, job_id, from_status, to_status, actor_type, actor_id, actor_recorded_at)
-			VALUES ($1, $2, $3, $4, 'customer', $5, $6)`,
-			entry, job, from, to, actor, publishInstant); err != nil {
+			VALUES ($1, $2, $3, $4, $7, $5, $6)`,
+			entry, job, from, to, actor, publishInstant, actorType); err != nil {
 			return err
 		}
 		if _, err := r.Exec(ctx,

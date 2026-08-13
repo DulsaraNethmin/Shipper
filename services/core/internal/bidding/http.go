@@ -739,6 +739,14 @@ func (a awardRequest) bid() (uuid.UUID, error) {
 // An award is an update of a row that already exists, so the record itself answers a retry. See
 // [Service.WithdrawBid], which made the same call for the same reason.
 //
+// **SHIP-94 is that division stated rather than assumed** (Docs/11 §3, and SHIP-111's before it). The
+// middleware replays the stored response while its entry lives and the handler is never reached; past
+// that — a TTL, an eviction, a failover, or a phone that restarted and generated a fresh key — this
+// handler runs a second time and [Service.AwardBid]'s already-accepted branch answers from the row.
+// The one case where the two disagree is a **key reused for a different bid**, which the middleware
+// refuses with `idempotency_key_reused` before this function is called, because it fingerprints the
+// body and that is a different request rather than a retry of this one.
+//
 // The response is the accepted bid, in the same [bidResponse] every other endpoint here answers with
 // — the closed key set stays one list rather than two, and nothing of the job travels in it beyond
 // its identifier. A client that wants the job's new status reads the job.

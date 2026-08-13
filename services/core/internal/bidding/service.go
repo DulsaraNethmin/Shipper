@@ -577,7 +577,20 @@ func (s *Service) CounterOffer(
 // stronger"). SHIP-94 is the ticket that states this as its own *Done when*; the property is here
 // because the alternative was building the endpoint to be wrong about it first.
 //
-// Awarding a *different* bid on a job that is already awarded is refused at step 6, which is the
+// **SHIP-94 settles which of the two mechanisms is doing which work, and the split is SHIP-111's.**
+// `httpx.Idempotent` replays the *response* while its entry lives, so the handler is never reached
+// and the retry costs a Redis read; this branch answers the retry the cache no longer has — a TTL
+// that expired, an eviction, a failover, or a fresh key — where the request runs all the way into
+// this transaction. **Redis makes the retry cheap; the record makes it correct.** They disagree in
+// exactly one case, the *same key naming a different bid*, and the middleware wins because it is in
+// front: it fingerprints method, path and body, so that is not a retry at all, and replaying the
+// first request's response would tell a client that something it never sent had succeeded.
+//
+// Since SHIP-93 a repeated award has a second write to *not* do — the rejection sweep, over rows no
+// caller ever named. Returning at this branch is what keeps it from running again, which is why
+// `updated_at` is asserted on the competing offers as well as on the accepted one.
+//
+// Awarding a *different* bid on a job that is already awarded is refused at step 4, which is the
 // same rule seen from the other side.
 func (s *Service) AwardBid(
 	ctx context.Context,

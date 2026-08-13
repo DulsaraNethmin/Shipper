@@ -3531,3 +3531,112 @@ func TestAFailedTransitionRollsTheSweepBackToo(t *testing.T) {
 		t.Errorf("the job is %s with %d transitions, want Open with 1", status, changes)
 	}
 }
+
+// TestARetriedAwardDoesNotSweepAgain is SHIP-94's *Done when* met at the layer the key cannot reach.
+//
+// The ticket asks that "a retried award with the same key returns the original outcome, not an
+// error", and the middleware is what answers a key it still holds. **This is the retry the middleware
+// has already forgotten** — a TTL that expired, an eviction, a failover, or a phone that restarted and
+// generated a fresh key — where the request runs a second time all the way to the transaction and the
+// only thing standing between it and a second act is the record itself.
+//
+// SHIP-93 raises what "not an error" has to mean. A repeated award now has a *second* write behind
+// it, and returning the right bid while sweeping again would be a retry that wrote — silently, to
+// rows no caller named. `updated_at` on every offer of the job is what says it did not: the trigger
+// moves the column on any write, so a sweep that closed already-closed offers would be visible even
+// though it would set the status they already have.
+func TestARetriedAwardDoesNotSweepAgain(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-retry-sweep-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	loser, _, err := m.place(t, m.rival(t, 940), m.job, offer("key-retry-sweep-loser"))
+	if err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("the first award: %v", err)
+	}
+	wroteWinner, wroteLoser := m.row(t, winner.ID), m.row(t, loser.ID)
+	if wroteLoser.status != string(StatusRejected) {
+		t.Fatalf("the competing offer is %s after the award, want Rejected", wroteLoser.status)
+	}
+
+	again, err := m.award(t, m.customer, m.job, winner.ID)
+	if err != nil {
+		t.Fatalf("the retry: %v — an award is idempotent by state, and a phone that restarted and "+
+			"generated a fresh key must not be told it failed", err)
+	}
+	if again.ID != winner.ID || again.Status != StatusAccepted {
+		t.Errorf("the retry answered %s at %s, want the accepted offer %s", again.ID, again.Status, winner.ID)
+	}
+
+	if now := m.row(t, winner.ID); !now.updatedAt.Equal(wroteWinner.updatedAt) {
+		t.Errorf("the retry rewrote the accepted offer: updated_at moved from %s to %s",
+			wroteWinner.updatedAt, now.updatedAt)
+	}
+	if now := m.row(t, loser.ID); !now.updatedAt.Equal(wroteLoser.updatedAt) {
+		t.Errorf("the retry ran the sweep a second time: the closed offer's updated_at moved from "+
+			"%s to %s, and no caller ever named that row", wroteLoser.updatedAt, now.updatedAt)
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 2 {
+		t.Errorf("the job is %s with %d transitions, want Awarded with 2", status, changes)
+	}
+}
+
+// TestARetryIsAnsweredAfterTheJobHasMovedOnAgain is the sentence SHIP-92 wrote and nothing tested: a
+// retry asks what happened to a request, and that answer does not change when the world does.
+//
+// The interesting retry is not the one that arrives a second later. It is the one that arrives after
+// the delivery has **started** — the phone found signal in the afternoon and sent the morning's award
+// again — by which time the job is past `Awarded` and `LockForAward` answers "not permitted". The
+// award still happened, the customer still needs to be told so, and the branch that says so is the
+// already-`Accepted` check sitting in front of the job's standing.
+//
+// It is also the one case where getting the ordering backwards is invisible in ordinary use and
+// plausible on inspection: refusing with `conflict` reads like a correct answer about a job that has
+// moved on, and it would be a client told its award failed when the provider is already driving.
+func TestARetryIsAnsweredAfterTheJobHasMovedOnAgain(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-retry-moved-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	loser, _, err := m.place(t, m.rival(t, 941), m.job, offer("key-retry-moved-loser"))
+	if err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("the award: %v", err)
+	}
+	wrote := m.row(t, winner.ID)
+
+	// The provider sets off. Docs/02 §2 permits Awarded → En route to pickup directly, and from there
+	// there is no move to Awarded at all — so the job's standing is now a refusal.
+	transitionBy(t, m.pool, "provider", m.job, m.provider, "Awarded", "En route to pickup")
+
+	late, err := m.award(t, m.customer, m.job, winner.ID)
+	if err != nil {
+		t.Fatalf("a retry arriving after the delivery started: %v, want the accepted offer", err)
+	}
+	if late.ID != winner.ID || late.Status != StatusAccepted {
+		t.Errorf("the late retry answered %s at %s, want the accepted offer %s", late.ID, late.Status, winner.ID)
+	}
+	if now := m.row(t, winner.ID); !now.updatedAt.Equal(wrote.updatedAt) {
+		t.Errorf("the late retry wrote to the row: updated_at moved from %s to %s", wrote.updatedAt, now.updatedAt)
+	}
+
+	// And a *different* offer under the same conditions is still refused, which is what says the
+	// branch above recognised a retry rather than stopping checking.
+	if _, err := m.award(t, m.customer, m.job, loser.ID); !errors.Is(err, ErrJobNotAwardable) {
+		t.Errorf("awarding a different offer on a job under way: %v, want ErrJobNotAwardable", err)
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "En route to pickup" || changes != 3 {
+		t.Errorf("the job is %s with %d transitions, want En route to pickup with 3", status, changes)
+	}
+}

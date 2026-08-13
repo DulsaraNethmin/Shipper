@@ -730,13 +730,27 @@ AwardJob:
 
       ## Awarding twice
 
-      Awarding the offer you already awarded answers `200` with the same bid and records nothing
-      further. That is deliberate and it does not depend on the `Idempotency-Key`: a phone that lost
-      its connection, was restarted and generated a **fresh** key for the same intent must not be told
-      its award failed when it succeeded. You asked for an outcome, and the outcome holds.
+      **Retry this request as often as you need to.** Two separate mechanisms make that safe, and they
+      cover different retries:
 
-      Awarding a **different** offer on a job you have already awarded is `conflict`. One job, one
-      accepted bid — enforced by the database rather than by a check.
+      | What you send | What answers | What you get |
+      |---|---|---|
+      | the same `Idempotency-Key`, soon | the stored response | the original `200`, byte for byte, with `Idempotency-Replayed: true` |
+      | the same key, much later, or a **fresh** key | the accepted offer itself | `200` with the same bid, and nothing further recorded |
+      | the same key naming a **different** offer | neither | `409 idempotency_key_reused` |
+
+      The middle row is the one that matters and the one you should design against. A phone that lost
+      its connection, was restarted and generated a fresh key for the same intent must not be told its
+      award failed when it succeeded — so the guarantee does not depend on the key at all. An award is
+      an update of a row that already exists, so applying it twice reaches the state applying it once
+      reaches; the accepted offer *is* the record of your request, and it outlives any cache.
+
+      The last row is not a retry, and it is refused on purpose. A key identifies one request, not an
+      intention: answering it from the first request's response would tell you that something you never
+      sent had succeeded. Generate one key per action.
+
+      Awarding a **different** offer under a **fresh** key on a job you have already awarded is
+      `conflict`. One job, one accepted bid — enforced by the database rather than by a check.
 
       ## Every other offer on the job closes with it
 

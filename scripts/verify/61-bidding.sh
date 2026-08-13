@@ -1645,3 +1645,108 @@ status="$(bid_get "$award_customer_token" "/v1/jobs/$sweep_job/bids/$sweep_count
 [[ "$(python3 -c "import json,sys; d=json.load(open(sys.argv[1]))['data']; print(str(len(d)) + ' ' + d[0]['status'] + ' ' + d[1]['status'])" "$WORKDIR/bid-swhist.json")" == "2 superseded rejected" ]] \
   || { cat "$WORKDIR/bid-swhist.json"; fail "the losing negotiation is not readable end to end after the award"; }
 ok "and the whole losing negotiation is still readable, each row saying how it ended — Docs/01 §4.3 records every offer, and a status is the record"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-94  a retried award returns the original outcome, through whichever mechanism is left"
+
+# # There are two mechanisms and they answer different retries, so the checks tell them apart
+#
+# | Mechanism | What it guarantees | For how long |
+# |---|---|---|
+# | httpx.Idempotent (Redis) | the *response* is replayed and the handler never runs | while the entry lives — a TTL, an eviction, a failover |
+# | the record itself | the *act* cannot happen twice | permanently |
+#
+# SHIP-111 made the same split and named the honest version of it: **Redis makes the retry cheap, the
+# database makes it correct.** The difference here is that the award needs no stored key to be correct,
+# because it is an `UPDATE` of a row that already exists — there is no second row a retry could create,
+# so the accepted status *is* the record of the request. That is SHIP-86's idempotency by state, and it
+# is what a phone that reconnected, restarted and generated a **fresh** key falls back on.
+#
+# `Idempotency-Replayed` on the wire is what makes the claim checkable rather than asserted: it is
+# present when Redis answered and absent when the handler did.
+idem_job="$(new_award_job six)"
+idem_key="verify-award-idem-$$"
+
+status="$(bid_post "$bid_provider_token" "verify-idem-winner-$$" "/v1/jobs/$idem_job/bids" "$bid_body" idwinner)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-idwinner.json"; fail "the offer to award returned $status"; }
+idem_winner="$(json "$WORKDIR/bid-idwinner.json" '["id"]')"
+
+# Placed before the award, for the reason the sweep's fixture is: an Awarded job is offered to nobody.
+status="$(bid_post "$bid_rival_token" "verify-idem-loser-$$" "/v1/jobs/$idem_job/bids" "$bid_body" idloser)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-idloser.json"; fail "the competing offer returned $status"; }
+idem_loser="$(json "$WORKDIR/bid-idloser.json" '["id"]')"
+
+status="$(award "$award_customer_token" "$idem_key" "$idem_job" "$idem_winner" idfirst)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-idfirst.json"; fail "the award returned $status, want 200"; }
+replayed_from_redis idfirst && fail "the first award was answered from the cache"
+idem_winner_written="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$idem_winner';")"
+idem_loser_written="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$idem_loser';")"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$idem_loser';")" == "Rejected" ]] \
+  || fail "the award did not close the competing offer"
+ok "the award runs once, accepting one offer and closing the other"
+
+# 1. The same key while Redis still holds it. The handler is never reached, so this proves nothing
+#    about the domain — which is exactly why the next check deletes the entry.
+status="$(award "$award_customer_token" "$idem_key" "$idem_job" "$idem_winner" idreplay)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-idreplay.json"; fail "the cached retry returned $status"; }
+replayed_from_redis idreplay || fail "the immediate retry was not replayed by the middleware"
+diff -q "$WORKDIR/bid-idfirst.json" "$WORKDIR/bid-idreplay.json" >/dev/null \
+  || fail "the replayed response is not byte-identical to the original"
+ok "the same key immediately after replays the stored response from Redis, byte for byte — the handler is never reached"
+
+# 2. The entry deleted, which is what a TTL expiry, an eviction or a failover looks like from the
+#    handler's side. **This is the check the ticket turns on**: the request now runs a second time, all
+#    the way into the transaction, and has to answer the same thing having written nothing.
+forget_the_cached_response "$award_customer_id" "$idem_key"
+status="$(award "$award_customer_token" "$idem_key" "$idem_job" "$idem_winner" idforgotten)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-idforgotten.json"; fail "the retry after the cached response expired returned $status, want 200"; }
+replayed_from_redis idforgotten && fail "the entry was deleted and the middleware still replayed; this check is proving nothing"
+[[ "$(json "$WORKDIR/bid-idforgotten.json" '["id"]')" == "$idem_winner" ]] \
+  || fail "the retry answered with a different offer"
+[[ "$(json "$WORKDIR/bid-idforgotten.json" '["status"]')" == "accepted" ]] \
+  || fail "the retry did not answer with the accepted offer"
+ok "with the cached response gone the request runs again, reaches the transaction, and is answered from the row it already wrote"
+
+# 3. And it wrote nothing — including the sweep, which is the write no caller ever names. Both
+#    timestamps, because bids_set_updated_at moves on any write to a row even when the status it sets
+#    is the status already there.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$idem_winner';")" == "$idem_winner_written" ]] \
+  || fail "the retry rewrote the accepted offer"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$idem_loser';")" == "$idem_loser_written" ]] \
+  || fail "the retry ran the rejection sweep a second time"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$idem_job';")" == "Awarded 2" ]] \
+  || fail "the retries left more than one transition on the job"
+ok "and it recorded nothing further — not the accept, not the sweep, not a second transition"
+
+# 4. The two mechanisms disagreeing, which is the case worth naming. The **same key** carrying a
+#    **different offer** is not a retry at all: the middleware fingerprints method, path and body, so
+#    it refuses rather than replaying — answering with the first request's response would tell a client
+#    that something it never sent had succeeded. The record would have said "that job is already
+#    awarded", which is also true; the key wins because it is in front, and because "you have reused a
+#    key" is the more actionable of the two.
+status="$(award "$award_customer_token" "$idem_key" "$idem_job" "$idem_loser" idreused)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-idreused.json"; fail "one key carrying two different awards returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-idreused.json" '["error"]["code"]')" == "idempotency_key_reused" ]] \
+  || { cat "$WORKDIR/bid-idreused.json"; fail "expected code=idempotency_key_reused"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$idem_job' and status = 'Accepted';")" == "1" ]] \
+  || fail "the reused key awarded a second offer"
+ok "the same key naming a different offer is refused rather than replayed — a key identifies a request, not an intention"
+
+# And the answer the record would have given, under a key of its own, so both halves are on the record.
+status="$(award "$award_customer_token" "verify-award-idem-other-$$" "$idem_job" "$idem_loser" idother)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-idother.json"; fail "awarding a second offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-idother.json" '["error"]["code"]')" == "conflict" ]] \
+  || { cat "$WORKDIR/bid-idother.json"; fail "expected code=conflict"; }
+ok "under a key of its own that same request is a conflict — the two mechanisms refuse it for different reasons and the middleware's is the one in front"
+
+# 5. The key is namespaced by the authenticated subject (SHIP-44), which is the gate CLAUDE.md holds
+#    every authenticated state-changing endpoint behind. A stranger sending this customer's key gets
+#    their own refusal rather than this customer's stored 200 — the cross-tenant read that
+#    idem:v1:anonymous:<key> would have made possible.
+status="$(award "$award_stranger_token" "$idem_key" "$idem_job" "$idem_winner" idstranger)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-idstranger.json"; fail "a stranger reusing the key returned $status, want 404"; }
+replayed_from_redis idstranger && fail "a stranger was handed this customer's stored response"
+ok "and another caller sending the same key is answered in their own scope, never from this customer's stored response"

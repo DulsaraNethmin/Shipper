@@ -219,7 +219,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **506 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **513 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -356,6 +356,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-92** | M3 | `POST /v1/jobs/{id}/award` — one offer accepted and the job moved, in one transaction, against the lock ordering SHIP-88 wrote down rather than one invented here. **A verb on the job, so the bid travels in the body**, and the one rule no constraint can express — that the offer was live when it was accepted — is the only thing application logic checks. Idempotent by **state**, so it needs no key column and no migration — *see below* |
 | **SHIP-93** | M3 | The rejection sweep — every offer still live on the awarded job becomes `Rejected` in the award's own transaction, and every offer that had **already** closed keeps the status saying how it closed. One `UPDATE` at step 4 of the recorded lock ordering, no `id <> winner` in it, and the refusal order changed so that a second award still answers `conflict` rather than `bidding_bid_closed` — *see below* |
+| **SHIP-94** | M3 | Award idempotency — **two mechanisms, and the ticket is settling which does which work.** Redis replays the response while its entry lives; the accepted offer answers every retry it cannot, including one under a fresh key. They disagree on exactly one request — a key reused for a *different* offer — and the middleware refuses it, rightly. **No key column, no migration, no handler change**: what it adds is the proof, and the two retries nobody had tested — the one that runs after SHIP-93's sweep, and the one that arrives after the delivery has started — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -3991,6 +3992,120 @@ negotiation, a plain competitor and one already withdrawn — has to be placed *
 once the job is `Awarded` it is offered to nobody and a provider asked to bid afterwards is refused by
 the eligibility filter with a `404`. A true answer to a different question that reads exactly like a
 broken fixture.
+
+### SHIP-94 — the key is not what makes the retry safe, and §3 had already found that out once
+
+SHIP-94's *Done when* is "a retried award with the same key returns the original outcome, not an
+error", and it names the wrong mechanism — which is the reading §8 pointed this branch at rather than
+a complaint about the backlog. **§3's SHIP-111 entry settled it a wave ago** and this ticket did not
+re-litigate it:
+
+| Mechanism | What it guarantees | For how long |
+|---|---|---|
+| `httpx.Idempotent` (Redis) | the *response* is replayed and the handler never runs | while the entry lives — a TTL, an eviction, a failover |
+| the accepted offer itself | the *act* cannot happen twice | permanently |
+
+**Redis makes the retry cheap; the record makes it correct.** SHIP-111 needed a migration to get the
+second half, because a milestone is an insert and a retry outliving the cache creates a second row.
+An award needs nothing: it is an `UPDATE` of a row that already exists, so applying it twice reaches
+the state applying it once reaches, and the accepted status *is* the record of the request. **No key
+column, no migration, and no change to the handler or the service** — SHIP-92 built the state half
+deliberately and said so, because the alternative was building the endpoint to be wrong about it
+first.
+
+So what this ticket is, honestly, is the proof: the key mechanism demonstrated against the running
+binary, the two retries nobody had tested, and this entry saying which mechanism answers which
+request. **It is the SHIP-91 shape in miniature** — a *Done when* already met by another ticket's
+work — with one difference that matters: SHIP-91 was met by SHIP-80 before anyone looked, and this
+was met by SHIP-92 *knowing* it was doing so, which is why that entry names SHIP-94 by number.
+
+#### What the two mechanisms do, and the one request where they disagree
+
+| What the client sends | What answers | What it gets |
+|---|---|---|
+| the same key, soon | the stored response | the original `200`, byte for byte, `Idempotency-Replayed: true` |
+| the same key, past the TTL — or a **fresh** key | the accepted offer | `200`, the same bid, nothing further written |
+| the same key naming a **different** offer | neither | `409 idempotency_key_reused` |
+| a fresh key naming a different offer | the record | `409 conflict` |
+
+**The third row is the case worth naming and the brief for this ticket was right to ask for it.** The
+middleware fingerprints method, path and body, so a key carrying a different `bid_id` is not a retry
+at all — it is a second request under a reused key, and replaying the first one's response would tell
+a client that something it never sent had succeeded. The record would have answered `conflict`, which
+is also true. **The middleware wins because it is in front, and that precedence is right**: "you have
+reused a key" is a client defect the client can fix, where `conflict` would send them to look at a job
+that is exactly as they left it. Both answers are demonstrated in sequence by `make verify` — the same
+request, once under the reused key and once under a key of its own, answering with two different
+codes.
+
+`make verify` also deletes the Redis entry with `redis-cli del` and sends the request again, which is
+what a TTL expiry, an eviction or a failover looks like from the handler's side. That is the check the
+ticket turns on: `Idempotency-Replayed: true` on the second request and **absent** on the third is
+what makes "the record answered this one" checkable rather than asserted. SHIP-111's section does the
+same thing and this is deliberately the same shape.
+
+#### The two retries nobody had tested, and one of them exists because of SHIP-93
+
+**A retry must not run the sweep again.** Before SHIP-93 a repeated award had exactly one write to not
+do; now it has a second, over rows *no caller ever named*. Returning the right bid while quietly
+re-closing three offers would satisfy every assertion `TestAwardingTheSameBidTwiceIsTheSameOutcome`
+makes. `TestARetriedAwardDoesNotSweepAgain` reads `updated_at` on the competing offers as well as on
+the accepted one — `bids_set_updated_at` moves the column on any write, so a sweep that set the status
+already there is still visible — and `make verify` makes the same comparison from outside Go.
+
+**A retry must survive the world moving on, and "the world" now goes further than `Awarded`.** SHIP-92
+wrote the principle — *a retry asks what happened to a request, and that answer does not change when
+the world does* — and no test moved anything. `TestARetryIsAnsweredAfterTheJobHasMovedOnAgain` moves
+the job to `En route to pickup`, from which `Docs/02` §2 has no path to `Awarded` at all, and sends the
+award again: `200`, the accepted offer, nothing written. That is the phone that found signal in the
+afternoon and sent the morning's award, by which time the provider is already driving. Getting it
+backwards is invisible in ordinary use and *plausible on inspection* — refusing with `conflict` reads
+like a correct answer about a job that has moved on. The same test then awards a **different** offer
+under the same conditions and requires the refusal, so it says the branch recognised a retry rather
+than stopping checking.
+
+That test needed a fixture change: `transitionBy` names the actor's kind, because `Awarded → En route
+to pickup` is the provider's move and every fixture transition in this package had been a customer's.
+A history row attributing it to the customer would be a fixture that lies about the one thing 000402's
+trigger reads.
+
+#### Mutation testing
+
+Three mutations, each reverted immediately and confirmed with `git diff`. Added to the running record
+in the SHIP-92 and SHIP-93 entries above.
+
+| Mutation | Result |
+|---|---|
+| The already-`Accepted` branch in `AwardBid` deleted — the retry stops being recognised | **Caught by 4**: `TestAwardingTheSameBidTwiceIsTheSameOutcome`, `TestARetriedAwardUnderAFreshKeyIsStillTwoHundred`, and both new tests |
+| The job's standing judged **before** the retry branch rather than after | **Caught by the same 4.** This is the ordering SHIP-92 argued for and the mutation that shows the argument was load-bearing: a successful award leaves the job at `Awarded`, so its own retry is refused with `conflict` |
+| The refusal reorder undone — the offer judged before the job | **Caught by 3**: both second-award tests and `TestARetryIsAnsweredAfterTheJobHasMovedOnAgain`. SHIP-93's entry is where that change is argued; this is what holds it |
+
+**None survived, and none of them could have.** All three are single-threaded orderings inside one
+transaction. **SHIP-92's two survivors are still the whole list of what a race would be needed to
+distinguish**, and this ticket added nothing to it: it writes no new statement, takes no new lock, and
+its one new branch is a comparison against a status already read under the bid's own `FOR UPDATE`.
+
+**One thing SHIP-95 should know**, and it is about the *middleware* rather than the domain. Two
+concurrent awards under one key never both reach the service: the second is refused with
+`idempotency_request_in_progress` before the handler runs. So a race test that wants two awards
+arriving together has to bypass `httpx.Idempotent` and call the service directly — which is what
+SHIP-111's concurrent test does and says why: two API instances, or a cache miss on both sides of a
+retry, is the same race with nothing in front of it. A suite written against the middleware would
+prove the middleware works and nothing about the award.
+
+#### Shared surfaces
+
+**None**, for the second commit running. No migration, no route, no `routes_golden.txt` line, no error
+code, no `contracts/openapi.yaml` edit — `idempotency_key_reused` is `httpx`'s and has been registered
+since SHIP-15. Everything is inside `internal/bidding/**`, `contracts/paths/bidding.yaml`,
+`scripts/verify/61-bidding.sh` and this file.
+
+`make verify` went from 506 checks across 13 sections to the figure at the top of this section, all
+seven in `scripts/verify/61-bidding.sh`. One of them is not about idempotency at all and earns its
+place anyway: a **stranger** sending this customer's key is answered in their own scope rather than
+handed the stored `200`. That is SHIP-44's subject-scoped namespace demonstrated on the endpoint with
+the most to lose from `idem:v1:anonymous:<key>`, which is the gate `CLAUDE.md` held every
+authenticated state-changing endpoint behind.
 
 ### What SHIP-105 built, and the two rules that follow from a driver having no account
 
