@@ -33,8 +33,16 @@ import (
 func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	t.Helper()
 
-	handler, err := NewHandler(newTestService(), pool,
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return newTestRouterFor(t, pool, newTestService())
+}
+
+// newTestRouterFor is the same mux over a service the test built, which SHIP-115's wire tests need:
+// what the proof endpoints answer depends on what the object store says it is holding, and that is a
+// collaborator rather than a fixture.
+func newTestRouterFor(t *testing.T, pool *pgxpool.Pool, svc *Service) http.Handler {
+	t.Helper()
+
+	handler, err := NewHandler(svc, pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -42,6 +50,8 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs/{id}/driver", handler.AssignDriver())
 	mux.Handle("POST /v1/jobs/{id}/milestones", handler.RecordMilestone())
+	mux.Handle("POST /v1/jobs/{id}/proof-uploads", handler.PresignProofUpload())
+	mux.Handle("GET /v1/jobs/{id}/delivery/proof", handler.ProofOnJob())
 	return mux
 }
 

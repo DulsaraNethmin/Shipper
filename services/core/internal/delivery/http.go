@@ -265,10 +265,50 @@ func (h *Handler) AssignDriver() http.Handler {
 // Omitting it means "now", which is what an online client sends. There is no field for the
 // platform's clock and there cannot be — the trigger behind that column raises on an INSERT that
 // names it.
+//
+// # `proof` is an object rather than a string, and SHIP-116 is why (SHIP-115)
+//
+//	{"milestone": "picked_up", "proof": {"object_key": "proof/<job>/<uuid>"}}
+//
+// A bare `proof_object_key` would have been shorter and would have had to be replaced. Docs/01 §4.4
+// makes the exception path "part of the same feature… built with it, not after": SHIP-116 records a
+// *reason* in place of a photograph, and it belongs in the same field because it answers the same
+// question — what is the evidence for this milestone. A nested object grows a second key; a flat
+// string grows a second field that has to be mutually exclusive with the first by convention.
+//
+// The key is the one the platform issued (`object_key` from `POST /v1/jobs/{id}/proof-uploads`) and
+// clients do not invent one: it is checked against the job in the path before anything is looked up.
 type recordMilestoneRequest struct {
 	Milestone  string `json:"milestone"`
 	RecordedAt string `json:"recorded_at"`
 	Reason     string `json:"reason"`
+
+	Proof *proofRequest `json:"proof"`
+}
+
+// proofRequest is the evidence for this milestone: what the client uploaded, or why it could not.
+//
+// A pointer on [recordMilestoneRequest] so that "no proof" and "proof with nothing in it" are
+// different requests: the first is every milestone recorded today, and the second is a client that
+// meant to send something and did not, which is worth telling them about rather than silently
+// recording an unphotographed delivery.
+//
+// There is no `content_type` and no `content_length`. The client stated both when it asked for the
+// URL, and what is recorded is what the **store** reports — see delivery.VerifyProof. Accepting them
+// here would be accepting the client's word for the thing this ticket exists to stop taking on
+// trust.
+//
+// # `exception_reason` is the second field SHIP-115 said this object would grow (SHIP-116)
+//
+//	{"milestone": "picked_up", "proof": {"exception_reason": "recipient_objected"}}
+//
+// Exactly one of the two, which is the shape [recordMilestoneRequest] chose an object for: Docs/01
+// §4.4's exception is "in place of" the photograph, so the two are alternatives to one question
+// rather than two independent fields a client could send together or omit together by accident.
+// Sending both is refused, and so is sending an object with neither — see [recordingFrom].
+type proofRequest struct {
+	ObjectKey       string `json:"object_key"`
+	ExceptionReason string `json:"exception_reason"`
 }
 
 // milestoneResponse is one recorded milestone.
@@ -361,7 +401,7 @@ func (h *Handler) RecordMilestone() http.Handler {
 			return err
 		}
 
-		recording, err := recordingFrom(req, r.Header.Get(httpx.HeaderIdempotencyKey))
+		recording, proofKey, err := recordingFrom(req, r.Header.Get(httpx.HeaderIdempotencyKey))
 		if err != nil {
 			return err
 		}
@@ -369,6 +409,23 @@ func (h *Handler) RecordMilestone() http.Handler {
 		pool, err := h.database(r)
 		if err != nil {
 			return err
+		}
+
+		// The store is asked **before** the transaction opens (SHIP-115), and the ordering is
+		// the decision rather than an accident. VerifyProof makes a network request to the
+		// object store, and a database transaction held open across a call to another service
+		// puts a pool connection at the mercy of that service's worst day. So the question is
+		// asked on the pool, and the transaction below starts with the answer already in hand.
+		//
+		// The cost is that the accepted-bid lookup happens twice, which is one indexed read.
+		// Skipping it here would let a stranger learn whether an object exists; skipping it in
+		// RecordMilestone would make this call's result load-bearing for authorisation, which is
+		// exactly the kind of rule that survives until somebody adds a second caller.
+		if proofKey != "" {
+			recording.Proof, err = h.svc.VerifyProof(r.Context(), pool, providerID, jobID, proofKey)
+			if err != nil {
+				return apiError(err)
+			}
 		}
 
 		var (
@@ -382,6 +439,34 @@ func (h *Handler) RecordMilestone() http.Handler {
 		})
 		if err != nil {
 			return apiError(err)
+		}
+
+		// Logged when proof was recorded, for the reason [Handler.PresignProofUpload]'s line is:
+		// **the object is otherwise invisible to this service.** The bytes never came through here
+		// and the fetch never will, so this line and the store's own access log are the only two
+		// records that a photograph became evidence for this delivery — which is what somebody
+		// reconciling a bucket against the database has to work from. The URL is not logged
+		// anywhere and neither is anything derived from it; a key is a name, not a credential.
+		if recording.Proof.present() && outcome != OutcomeAlreadyRecorded {
+			httpx.LoggerFrom(r.Context()).Info("a photograph was recorded as proof of delivery",
+				slog.String("job_id", jobID.String()),
+				slog.String("milestone_id", record.ID.String()),
+				slog.String("milestone", record.Milestone.Wire()),
+				slog.String("object_key", recording.Proof.ObjectKey()))
+		}
+
+		// Logged at warning rather than info, and it is the one line in this handler that is
+		// about operations rather than about reconciliation (SHIP-116). Docs/04 §5 puts "failed
+		// proof of delivery" in a moderation queue and **SHIP-117 is the ticket that builds
+		// one**; until it does, this line is the only trace an exception leaves anywhere outside
+		// the `proofs` table, and a delivery with no photograph is exactly what somebody should
+		// be able to find in a log while the queue is being written.
+		if recording.Exception != "" && outcome != OutcomeAlreadyRecorded {
+			httpx.LoggerFrom(r.Context()).Warn("a milestone was recorded with a reasoned exception instead of a photograph",
+				slog.String("job_id", jobID.String()),
+				slog.String("milestone_id", record.ID.String()),
+				slog.String("milestone", record.Milestone.Wire()),
+				slog.String("exception_reason", recording.Exception.String()))
 		}
 
 		switch outcome {
@@ -427,6 +512,309 @@ func (h *Handler) RecordMilestone() http.Handler {
 				"delivery: recording %s on %s answered %q with no error",
 				recording.Milestone, jobID, outcome))
 		}
+	})
+}
+
+// proofUploadRequest is the body of POST /v1/jobs/{id}/proof-uploads.
+//
+//	{"content_type": "image/jpeg", "content_length": 1874233}
+//
+// **Both fields are signed into the URL**, which is why they are required and why neither is a
+// hint. A URL that did not bind them would authorise any body at all, and the platform's size limit
+// and accepted-type list would be advice the client gave itself (see [UploadPolicy]).
+//
+// `content_length` is the exact size, not a maximum. A pre-signed PUT has one bound available to it
+// and that is the signed `Content-Length` header, so an upload of any other size is refused by the
+// store. The client has the file, so it knows.
+//
+// There is no `job_id`, no `provider_id` and no `object_key`. The first two are the path and the
+// token; the third is the platform's to choose, and a client that could name the object it writes
+// to could name one that already holds somebody's proof.
+type proofUploadRequest struct {
+	ContentType   string `json:"content_type"`
+	ContentLength int64  `json:"content_length"`
+}
+
+// proofUploadResponse is one place to put one photograph.
+//
+// # It carries a credential, and it is scoped like one
+//
+// `upload_url` is the whole of the authorisation to write that object — anyone holding it can,
+// until `expires_at`, and nothing can revoke it. The idempotency middleware stores this response
+// under `idem:v1:user:<provider>:<key>` (SHIP-44), so even a replay reaches only the provider who
+// asked. That is the same property [assignmentResponse] relies on, stated again because neither
+// shape looks like a credential.
+//
+// # The two echoed fields are instructions rather than confirmations
+//
+// `content_type` and `content_length` are what the client **must** send on the PUT, byte for byte:
+// they are inside the signature. They are echoed rather than assumed because a client that
+// normalised its own media type differently — `IMAGE/JPEG`, or a `; charset=` parameter — would get
+// a signature failure from the store with no explanation, and the platform has already decided on
+// one spelling by the time it signs.
+//
+// The method is stated for the same reason. A PUT is not guessable from a `201`-shaped response
+// body, and SHIP-122's caller is a browser doing this by hand.
+type proofUploadResponse struct {
+	ObjectKey string `json:"object_key"`
+
+	UploadURL string `json:"upload_url"`
+	Method    string `json:"method"`
+
+	ContentType   string `json:"content_type"`
+	ContentLength int64  `json:"content_length"`
+
+	ExpiresAt string `json:"expires_at"`
+}
+
+func proofUploadFrom(u Upload) proofUploadResponse {
+	return proofUploadResponse{
+		ObjectKey: u.ObjectKey,
+
+		UploadURL: u.URL,
+		Method:    http.MethodPut,
+
+		ContentType:   u.ContentType,
+		ContentLength: u.ContentLength,
+
+		ExpiresAt: timestamp(u.ExpiresAt),
+	}
+}
+
+// PresignProofUpload handles POST /v1/jobs/{id}/proof-uploads (SHIP-114).
+//
+// # 200 rather than 201, and the difference is not pedantry
+//
+// Nothing was created. The platform holds no record of this URL, wrote no row and reserved no
+// object — the same request a minute later produces a different key, and the bucket is untouched
+// until the client PUTs. What happened is that a credential was issued, which is what
+// `POST /v1/auth/login` does and what it also answers `200` to. **SHIP-115 is the ticket that
+// creates something**: the record linking an uploaded object to a job and a milestone, at which
+// point the object becomes proof and the response that says so is a `201`.
+//
+// # POST on a read-shaped request, and it is state-changing enough to need a key
+//
+// It reads nothing and writes nothing, so `GET` was available and is wrong twice over: the request
+// carries a body the platform signs, and issuing a credential that cannot be revoked is not a safe
+// method whatever the database did. It therefore requires an `Idempotency-Key` like every other
+// state-changing route (SHIP-15), and what a retry gets is argued at [Service.PresignProofUpload] —
+// the short version is that the middleware replays the identical URL with its expiry already
+// running down, which is correct, because one intent bought one upload slot.
+//
+// # The bytes do not come back through here, and that is the ticket
+//
+// A successful response is the end of this service's involvement. The client PUTs to `upload_url`
+// directly (Docs/06 §5.2) and the API sees neither the request nor the photograph — which is what
+// `scripts/verify/70-delivery.sh` demonstrates by uploading to a host that is not the API's.
+func (h *Handler) PresignProofUpload() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req proofUploadRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		upload, err := h.svc.PresignProofUpload(r.Context(), pool, providerID, jobID, UploadRequest{
+			ContentType:   req.ContentType,
+			ContentLength: req.ContentLength,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Logged because the URL is otherwise invisible to operations: the upload it authorises
+		// never touches this service, so this line and the store's own access log are the only
+		// two records that it was issued. **The URL itself is not logged and never is** — it is
+		// the credential, and a log line carrying one is a credential in whatever collects the
+		// logs. The key and the expiry are what somebody reconciling a missing photograph wants.
+		httpx.LoggerFrom(r.Context()).Info("an upload URL was issued for proof of delivery",
+			slog.String("job_id", jobID.String()),
+			slog.String("object_key", upload.ObjectKey),
+			slog.String("content_type", upload.ContentType),
+			slog.Int64("content_length", upload.ContentLength),
+			slog.Time("expires_at", upload.ExpiresAt))
+
+		httpx.WriteJSON(w, http.StatusOK, proofUploadFrom(upload))
+		return nil
+	})
+}
+
+// proofResponse is one photograph and the milestone it is evidence for (SHIP-115).
+//
+// # `download_url` is a credential and is the reason this endpoint exists at all
+//
+// The bucket has no public read path (internal/platform/storage/doc.go), so a proof photograph is
+// reachable only through a short-lived signed URL, and one is issued only after this service has
+// decided that the caller is the job's customer or the provider who was awarded it. Whoever ends up
+// holding the URL can fetch the image until `download_expires_at`, and **nothing can revoke it** —
+// the same property the upload URL has, which is why the lifetime is short and why a client should
+// render the image rather than store the link.
+//
+// # What is deliberately not here
+//
+// No `etag`. The store's tag for the bytes is recorded (000603) so that a later overwrite is
+// detectable, and it is an integrity fact for an administrator (SHIP-155) rather than something a
+// customer's app would do anything with.
+//
+// No actor. Who recorded the milestone is on the milestone, and `GET /v1/jobs/{id}` is where a
+// client assembles a delivery's timeline; repeating it here would be a second copy that can
+// disagree with the first.
+//
+// `recorded_at` is the **actor's** clock, carried through from the milestone — when the driver says
+// they took the photograph — and `accepted_at` is when the platform recorded it. The pair is
+// Docs/02 §3.1's and it is the same pair [milestoneResponse] carries, named the same way on purpose.
+//
+// # Two shapes in one, and `exception_reason` is how a client tells them apart (SHIP-116)
+//
+// A reasoned exception carries no object, so it carries no key, no media type, no size and **no
+// download URL** — none of them is signed, and there is nothing to sign one for. Every one of those
+// fields is `omitempty`, so what a client receives is the six fields every row has plus either the
+// photograph's five or `exception_reason`. Branching on `exception_reason` is the supported test;
+// branching on a missing `download_url` would also work today and would be reading the absence of a
+// credential as a fact about the delivery.
+//
+// The alternative — always present, `"object_key": ""`, `"content_length": 0` — was rejected because
+// a zero length is a statement about a photograph that does not exist. An absent field says nothing;
+// a zero says something false.
+type proofResponse struct {
+	ID          string `json:"id"`
+	JobID       string `json:"job_id"`
+	MilestoneID string `json:"milestone_id"`
+
+	Milestone string `json:"milestone"`
+
+	ObjectKey string `json:"object_key,omitempty"`
+
+	ContentType   string `json:"content_type,omitempty"`
+	ContentLength int64  `json:"content_length,omitempty"`
+
+	DownloadURL       string `json:"download_url,omitempty"`
+	DownloadExpiresAt string `json:"download_expires_at,omitempty"`
+
+	// ExceptionReason is why this milestone has no photograph, from Docs/01 §4.4's three.
+	//
+	// It is the wire form of delivery.ProofExceptionReason and the stored form is the same
+	// string, so there is no translation here — see that type for why it has none.
+	ExceptionReason string `json:"exception_reason,omitempty"`
+
+	RecordedAt string `json:"recorded_at"`
+	AcceptedAt string `json:"accepted_at"`
+}
+
+// proofListResponse is the collection envelope of Docs/10 §4.5.
+//
+// `next_cursor` is always null and `has_more` always false: a delivery has at most five recordable
+// milestones (Docs/01 §4.4) and at most one photograph each, so this is bounded by the domain rather
+// than by a page size. The envelope is here anyway, because a client tells a collection from a single
+// resource by its shape and not by knowing which endpoint it called — the reading `bidding`'s
+// negotiation chain already takes of its own bound.
+type proofListResponse struct {
+	Data       []proofResponse `json:"data"`
+	NextCursor *string         `json:"next_cursor"`
+	HasMore    bool            `json:"has_more"`
+}
+
+func proofListFrom(links []ProofLink) proofListResponse {
+	// A non-nil empty slice, so a job with nothing photographed answers `[]` rather than `null`.
+	// Reachable and ordinary: every job before its first proof is in this state.
+	data := make([]proofResponse, 0, len(links))
+	for _, link := range links {
+		data = append(data, proofResponse{
+			ID:          link.ID.String(),
+			JobID:       link.JobID.String(),
+			MilestoneID: link.MilestoneID.String(),
+
+			Milestone: link.Milestone.Wire(),
+
+			ObjectKey: link.ObjectKey,
+
+			ContentType:   link.ContentType,
+			ContentLength: link.ContentLength,
+
+			DownloadURL:       link.URL,
+			DownloadExpiresAt: timestamp(link.ExpiresAt),
+
+			ExceptionReason: string(link.ExceptionReason),
+
+			RecordedAt: timestamp(link.RecordedAt),
+			AcceptedAt: timestamp(link.AcceptedAt),
+		})
+	}
+	return proofListResponse{Data: data}
+}
+
+// ProofOnJob handles GET /v1/jobs/{id}/proof (SHIP-115).
+//
+// # This is the access control, and it is the half of the ticket that is not the table
+//
+// A proof photograph identifies an address and a recipient, which makes it the most sensitive thing
+// a delivery produces. Two parties may see it — the customer who owns the job and the provider it
+// was awarded to — and the decision is made from the database rather than from a role claim, because
+// `role: provider` says nothing about *this* delivery. [Service.ProofFor] argues who is on the list,
+// who is not, and why the assigned driver and the administrator are both deferred.
+//
+// Everybody else gets the 404 a job that does not exist gets, for the reason [apiError] gives.
+//
+// # The URLs are minted per request and cannot be cached
+//
+// Each response signs a fresh short-lived URL per photograph. A client that caches the *response*
+// caches expiring links, which is why `download_expires_at` is beside each one rather than left to
+// be parsed out of the query string.
+//
+// # A GET, with no idempotency key
+//
+// It reads and writes nothing. Contrast `POST /v1/jobs/{id}/proof-uploads`, which is a POST despite
+// writing nothing because it *issues a credential* — this hands out short-lived read links too, and
+// the difference is that they reach an object the caller has just been authorised for rather than
+// authorising a new one. Repeating a read is free; repeating a write of evidence is not.
+func (h *Handler) ProofOnJob() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		readerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		links, err := h.svc.ProofFor(r.Context(), pool, readerID, jobID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Logged for the reason PresignProofUpload's line is: the fetch that follows never
+		// touches this service, so this and the store's own access log are the only two records
+		// that a photograph was reachable. **No URL is logged** — it is the credential.
+		//
+		// It is deliberately not the access log Docs/04 §6 requires of an administrator viewing
+		// evidence. That is a durable record with a decision attached to it, and it is SHIP-155's.
+		httpx.LoggerFrom(r.Context()).Info("proof of delivery was read",
+			slog.String("job_id", jobID.String()),
+			slog.Int("proof_count", len(links)))
+
+		httpx.WriteJSON(w, http.StatusOK, proofListFrom(links))
+		return nil
 	})
 }
 
@@ -551,7 +939,7 @@ func (h *Handler) DriverJob() http.Handler {
 // The key is read from the header rather than from the body. It identifies the *request*, and a
 // client able to put a different value in each would have two answers to which one a milestone was
 // recorded under.
-func recordingFrom(req recordMilestoneRequest, key string) (Recording, error) {
+func recordingFrom(req recordMilestoneRequest, key string) (Recording, string, error) {
 	var problems validate.Errors
 
 	var milestone Milestone
@@ -580,8 +968,56 @@ func recordingFrom(req recordMilestoneRequest, key string) (Recording, error) {
 		}
 	}
 
+	// The evidence: one object key, or one reason there is none, and never both (SHIP-116).
+	//
+	// The object key is read and checked for being *there*, and nothing else is decided here
+	// (SHIP-115). Whether it names this job, whether the object exists and whether the platform
+	// will accept what it holds are all [Service.VerifyProof]'s, because two of the three need a
+	// database and a store and the third belongs beside them rather than split off.
+	//
+	// The reason **is** decided here, and the asymmetry is the point: there is nothing to look it
+	// up against. It is a selection from three values the platform published, so the only thing
+	// that can be wrong with it is that it is not one of them, and that is answerable from the
+	// string alone.
+	var (
+		proofKey  string
+		exception ProofExceptionReason
+	)
+	if req.Proof != nil {
+		proofKey = strings.TrimSpace(req.Proof.ObjectKey)
+		reason := strings.TrimSpace(req.Proof.ExceptionReason)
+
+		switch {
+		case proofKey != "" && reason != "":
+			problems.Add("proof.exception_reason", validate.CodeNotAllowed,
+				"Send the photograph you uploaded or a reason there is none, not both.")
+
+		case proofKey == "" && reason == "":
+			// Reported against `object_key`, because a client that sent `"proof": {}` was
+			// almost certainly trying to send a photograph and lost the key on the way. The
+			// message names the other door.
+			problems.Add("proof.object_key", validate.CodeRequired,
+				"Send the object_key you were given when you asked for an upload URL, or an "+
+					"exception_reason if there is no photograph.")
+
+		case reason != "":
+			// Case-sensitive, which is [MilestoneFromWire]'s call and made here for the same
+			// reason: a client sending `Recipient_Objected` has misread the contract, and
+			// accepting a second spelling would make two forms interchangeable in one
+			// direction and not the other. The domain checks it again — see
+			// [Recording.problems] — because a rule that holds only for callers who came in
+			// through this decoder is not a rule.
+			exception = ProofExceptionReason(reason)
+			if !exception.Valid() {
+				problems.Add("proof.exception_reason", validate.CodeInvalid,
+					"That is not a reason a photograph can be missing. Use one of %s.",
+					strings.Join(proofExceptionWire(), ", "))
+			}
+		}
+	}
+
 	if err := problems.Err(); err != nil {
-		return Recording{}, err
+		return Recording{}, "", err
 	}
 
 	return Recording{
@@ -589,7 +1025,8 @@ func recordingFrom(req recordMilestoneRequest, key string) (Recording, error) {
 		RecordedAt: recordedAt,
 		Reason:     req.Reason,
 		Key:        key,
-	}, nil
+		Exception:  exception,
+	}, proofKey, nil
 }
 
 // jobIDFrom reads and parses the {id} path parameter.
@@ -710,9 +1147,40 @@ func apiError(err error) error {
 				"for each action.", httpx.HeaderIdempotencyKey).WithCause(err)
 
 	case errors.Is(err, ErrProofRequired):
+		// 409 rather than 422, and the difference is which thing is wrong: the body is a
+		// perfectly good milestone recording. What it contradicts is a rule about deliveries,
+		// and a client fixes it by capturing something rather than by correcting a field.
 		return httpx.NewError(http.StatusConflict, CodeProofRequired,
-			"A delivery cannot be recorded without proof, and capturing proof is not built yet.").
+			"A delivery is recorded with a photograph, or with a reason there is none.").
 			WithCause(err)
+
+	case errors.Is(err, ErrProofNotForThisJob):
+		// 422 with the field named, because it is the caller's own body disagreeing with the
+		// caller's own path — the same treatment an unaccepted content type gets, and it
+		// discloses nothing: the key names the other job in plain text and the caller sent it.
+		//
+		// Built here rather than in [recordingFrom] because the job in the path is not something
+		// that function is given, and passing it in so the check could live there would put an
+		// authorisation rule in the request decoder.
+		var problems validate.Errors
+		problems.Add("proof.object_key", validate.CodeInvalid,
+			"That object_key was issued for a different job. Ask for an upload URL on this job "+
+				"and send the key it answers with.")
+		return problems.Err()
+
+	case errors.Is(err, ErrProofNotUploaded):
+		return httpx.NewError(http.StatusConflict, CodeProofNotUploaded,
+			"That photograph has not reached us. Finish uploading it, then record the milestone "+
+				"again.").WithCause(err)
+
+	case errors.Is(err, ErrProofRejected):
+		return httpx.NewError(http.StatusConflict, CodeProofRejected,
+			"That file is not a photograph this platform accepts.").WithCause(err)
+
+	case errors.Is(err, ErrProofAlreadyRecorded):
+		return httpx.NewError(http.StatusConflict, CodeProofAlreadyRecorded,
+			"That photograph is already the proof for another milestone. Ask for a new upload "+
+				"URL and send it again.").WithCause(err)
 
 	case errors.Is(err, ErrMilestoneNotPermitted):
 		// Since SHIP-112 this can only mean "too early". A milestone the delivery has already

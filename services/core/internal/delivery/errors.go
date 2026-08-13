@@ -82,18 +82,94 @@ var (
 	// make "once per key" false.
 	ErrIdempotencyKeyReused = errors.New("delivery: that idempotency key already recorded a different milestone")
 
-	// ErrProofRequired means a delivery was recorded with nothing to show for it.
+	// ErrProofRequired means a delivery was recorded with nothing to show for it (SHIP-118).
 	//
 	// CLAUDE.md states the invariant and Docs/01 §4.4 decides it: "a job cannot be recorded as
-	// Delivered without photo proof, except through the exception path". Neither the proof
-	// (SHIP-114, SHIP-115) nor the exception (SHIP-116) can be captured yet, so **every**
-	// 'Delivered' is refused here for now — which is the only answer that does not leave a job at
-	// Delivered with neither.
+	// Delivered without photo proof, except through the exception path". This is the refusal that
+	// makes it true, and **it is now a condition rather than a blanket**: 'Delivered' carrying a
+	// photograph (SHIP-115) or a reasoned exception (SHIP-116) is recorded, and 'Delivered'
+	// carrying neither is refused here before anything is written.
 	//
-	// **SHIP-118 is the ticket that narrows this**, from "always" to "when the job has neither
-	// proof nor a recorded exception". The sentinel, the code and the message already say what
-	// that ticket needs to say; what changes is the condition in front of them.
+	// It is one of two layers. 000605's deferred constraint trigger refuses the same row at
+	// commit, whoever wrote it and through whatever path — which is what makes the invariant a
+	// property of the platform rather than of one function. What this layer buys is the answer a
+	// client can act on; see [CodeProofRequired].
 	ErrProofRequired = errors.New("delivery: a delivery needs photo proof or a recorded exception")
+
+	// ErrEvidenceNotCoherent means a [Recording] reached the insert carrying evidence that is not
+	// one photograph or one reasoned exception (SHIP-116).
+	//
+	// Both shapes it refuses — a recording carrying both, and one naming a reason that is not one
+	// of Docs/01 §4.4's three — are caught by [Recording.problems] and answered as
+	// `validation_failed` with `proof.exception_reason` named, so **this is unreachable through
+	// any endpoint**. It exists for the same reason [ErrProofNotVerified] does: the guard against a
+	// future caller *inside* this package assembling a recording by hand, where the next line of
+	// defence is ck_proofs_photograph_or_exception and a constraint name explains nothing
+	// (Docs/10 §4.6).
+	//
+	// It maps to no code and becomes an opaque 500 with its cause logged, which is the right
+	// treatment: the client did nothing wrong and there is nothing it could usefully be told.
+	ErrEvidenceNotCoherent = errors.New("delivery: a milestone's evidence must be one photograph or one reasoned exception")
+
+	// ErrProofNotUploaded means the object the client named is not in the store (SHIP-115).
+	//
+	// # It is an ordinary outcome, not an attack, and the code says so
+	//
+	// The bytes go from the client straight to the object store and the platform is not in the
+	// path (Docs/06 §5.2), so the request that records proof is the *first* thing this service
+	// hears about an upload. A driver in a yard with one bar can perfectly well be issued a URL,
+	// fail the PUT, and record the milestone anyway — Docs/01 §4.4 spends a section on not
+	// stranding exactly that person. So this refuses the recording and tells them to send the
+	// photograph again.
+	//
+	// **The alternative was to believe them**, and it is worth naming because it is the cheaper
+	// design and it is wrong: a `proofs` row nobody checked is the platform asserting that a
+	// photograph exists when it has never looked, and Docs/01 §4.4 makes proof "the *only*
+	// evidence that the job happened as claimed".
+	ErrProofNotUploaded = errors.New("delivery: there is no such object in the store")
+
+	// ErrProofRejected means the object is there and is not something the platform accepts
+	// (SHIP-115).
+	//
+	// # This is where [UploadPolicy] stops being advice, inside the domain
+	//
+	// SHIP-114 signs the content type and the length into the upload URL, so the store refuses a
+	// substitute on the request that carries the bytes. That is the strong guard and it is
+	// **outside this package** — a domain test cannot fail on it, because the domain's tests stub
+	// the signer, which SHIP-114's mutation testing recorded as an open hole.
+	//
+	// This closes it from the other end. What the store reports is checked against the same
+	// policy before anything is recorded, so an object that reached the bucket by any route — a
+	// signer that stopped binding the headers, a key uploaded to before the rules tightened — is
+	// refused the moment somebody tries to make it evidence. The limits are then enforced against
+	// the object that exists rather than only against the request that asked to create one.
+	ErrProofRejected = errors.New("delivery: the stored object is not something this platform accepts as proof")
+
+	// ErrProofAlreadyRecorded means that object is already proof of something (SHIP-115).
+	//
+	// uq_proofs_object_key is what answers it, in the database rather than here, because two
+	// concurrent recordings would both read no row and both insert. One photograph is evidence for
+	// one recorded claim: the same object on two milestones would put a picture of one delivery on
+	// another job's timeline, and object keys are unguessable but not unshareable.
+	ErrProofAlreadyRecorded = errors.New("delivery: that object is already proof of another milestone")
+
+	// ErrProofNotForThisJob means the object key names a different delivery (SHIP-115).
+	//
+	// The platform chooses every key and prefixes it with the job it issued the URL for, so this
+	// is a client attaching one job's photograph to another. Refused on the string alone, before
+	// any lookup, which is what keeps it from being an oracle: no row is read and no object is
+	// asked about, so the answer says nothing except that the caller's own body disagrees with
+	// the caller's own path.
+	ErrProofNotForThisJob = errors.New("delivery: that object key was issued for another job")
+
+	// ErrProofNotVerified means a [Recording] carries proof that no [Service.VerifyProof]
+	// produced.
+	//
+	// Unreachable through any endpoint — [VerifiedProof]'s fields are unexported, so the only
+	// value another package can build is the zero one, which means "no proof" — and reported
+	// rather than assumed away, because the shape it guards against is a future caller inside
+	// this package assembling one by hand and skipping the store.
+	ErrProofNotVerified = errors.New("delivery: proof was recorded without being checked against the store")
 
 	// ErrMilestoneNotPermitted means the delivery has not reached the point this milestone
 	// describes — an `in_transit` recorded while the job is still on its way to the pickup.
@@ -214,18 +290,24 @@ var (
 // describes them and cmd/api's uniqueness test can see them. Named <domain>_<condition>, which is
 // what stops two domains meaning different things by one string.
 //
-// There are deliberately five, and the list is short for a reason. A malformed mobile number is
-// `validation_failed` with details, a job that is not the caller's is `not_found`, and a repeated
-// idempotency key is the protocol's own `idempotency_key_reused` rather than a delivery code — the
-// database enforces it here (000602) and the middleware enforces it in Redis, and a client that had
-// to tell the two apart would be branching on where the platform happened to catch it. A domain code
-// earns its place only where a client would otherwise parse a message to know what to do, and each
-// of these five leads to a different screen.
+// The list is short for a reason. A malformed mobile number is `validation_failed` with details, a
+// job that is not the caller's is `not_found`, and a repeated idempotency key is the protocol's own
+// `idempotency_key_reused` rather than a delivery code — the database enforces it here (000602) and
+// the middleware enforces it in Redis, and a client that had to tell the two apart would be
+// branching on where the platform happened to catch it. A domain code earns its place only where a
+// client would otherwise parse a message to know what to do, and each of these leads to a different
+// screen.
 //
 // **The fifth arrived with SHIP-108 and is the only one on an authentication failure.** Every other
 // refusal a driver's link can meet is `unauthenticated` or `not_found`, which is deliberate: what
 // the driver portal must do about a bad link is the same whatever was wrong with it, except when it
 // has simply run out.
+//
+// **SHIP-115 added three, which is a lot for one ticket and each earns it on the same test.** The
+// photograph is not there yet, the photograph is there and is not acceptable, and the photograph is
+// already evidence for something else: retry the upload, capture again, ask for a new URL. Three
+// different things for the app to do, and a driver standing at a delivery point is exactly the
+// person who must not be shown one generic conflict and left to guess (Docs/01 §4.4).
 var (
 	// CodeJobNotAssignable is returned when the job is in no status a driver can be assigned
 	// from.
@@ -267,10 +349,13 @@ var (
 	//
 	// A code of its own because it leads somewhere specific: the camera, or the exception path
 	// beside it (Docs/01 §4.4). What a client must never do with it is offer "try again", which
-	// is what a generic conflict would suggest.
+	// is what a generic conflict would suggest — the identical request will be refused for as long
+	// as it carries nothing, and the way out is to capture something or to say why there is
+	// nothing to capture.
 	CodeProofRequired = httpx.RegisterCode("delivery_proof_required",
-		"A delivery is recorded with photo proof, or with a reason why there is none. Capturing "+
-			"either is not built yet, so 'delivered' cannot be recorded through this endpoint.")
+		"A delivery is recorded with photo proof, or with a reason why there is none. Send the "+
+			"object_key of a photograph you have uploaded, or one of the exception reasons, in "+
+			"this request's proof field.")
 
 	// CodeDriverLinkExpired is returned when a driver's job-scoped link has run out (SHIP-108).
 	//
@@ -285,4 +370,38 @@ var (
 	CodeDriverLinkExpired = httpx.RegisterCode("delivery_driver_link_expired",
 		"This delivery link has expired. There is nothing to refresh — ask the transport provider "+
 			"to send a new one.")
+
+	// CodeProofNotUploaded is returned when the photograph never reached the store (SHIP-115).
+	//
+	// 409, and a code of its own because it is the one refusal on this path a client can fix
+	// without a person: retry the PUT to the URL it already holds, or ask for a new one and PUT
+	// again. Every other conflict here tells the driver to do something different; this tells the
+	// app to finish what it started.
+	//
+	// It exists at all because the platform is not in the upload path (Docs/06 §5.2) and
+	// therefore cannot know an upload happened until it asks. See [ErrProofNotUploaded].
+	CodeProofNotUploaded = httpx.RegisterCode("delivery_proof_not_uploaded",
+		"That photograph is not in the store yet. Finish uploading it to the URL you were given, "+
+			"then record the milestone again.")
+
+	// CodeProofRejected is returned when the stored object is not something the platform accepts
+	// as proof (SHIP-115).
+	//
+	// 409 rather than 422, and the difference is which thing was wrong: the request body is
+	// perfectly well formed and names an object that exists — what fails the platform's rules is
+	// the object. A client cannot fix it by editing the request, so it is not a validation error;
+	// it captures again.
+	CodeProofRejected = httpx.RegisterCode("delivery_proof_rejected",
+		"That file is not a photograph this platform accepts. Capture it again, and compress it "+
+			"if it is large.")
+
+	// CodeProofAlreadyRecorded is returned when the object is already proof of another milestone
+	// (SHIP-115).
+	//
+	// 409, and distinct from the two above because the app must not retry with the same key: it
+	// asks for a fresh upload URL, which is a fresh object, which is what SHIP-114 guarantees
+	// every request gets.
+	CodeProofAlreadyRecorded = httpx.RegisterCode("delivery_proof_already_recorded",
+		"That photograph is already the proof for another milestone. Ask for a new upload URL and "+
+			"send it again.")
 )

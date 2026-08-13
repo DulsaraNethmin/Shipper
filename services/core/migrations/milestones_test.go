@@ -217,6 +217,16 @@ func TestMilestoneRecordsBothClocksIndependently(t *testing.T) {
 				id, batchJob, milestone, driver, at); err != nil {
 				t.Fatalf("recording %s: %v", milestone, err)
 			}
+
+			// The photograph, in the same transaction, because SHIP-118's deferred trigger
+			// refuses a delivered milestone with nothing behind it — and because that is what a
+			// sync worker actually drains: a driver who photographed a delivery in a yard with
+			// no signal has a queue holding both, and they arrive together or not at all.
+			if milestone == "Delivered" {
+				if err := storeExceptionIn(t, tx, batchJob, id, "camera_unavailable"); err != nil {
+					t.Fatalf("recording the evidence for the batch's delivery: %v", err)
+				}
+			}
 		}
 		if err := tx.Commit(t.Context()); err != nil {
 			t.Fatalf("committing the batch: %v", err)
@@ -273,12 +283,16 @@ func TestTheServerClockIsNotTheCallersToSet(t *testing.T) {
 
 	backdated := time.Now().UTC().Add(-6 * time.Hour)
 
+	// **'In transit' rather than 'Delivered', and SHIP-118 is why.** The clock rule is the same for
+	// every milestone; a delivered one now needs a `proofs` row in the same transaction (000605), so
+	// using it here would make each subtest below pass or fail for two reasons at once — and the
+	// second subtest commits, which is where the deferred trigger fires.
 	t.Run("naming the column is refused", func(t *testing.T) {
 		id, _ := uuid.NewV7()
 		_, err := pool.Exec(t.Context(), `
 			INSERT INTO milestones
 				(id, job_id, milestone, actor_type, actor_id, actor_recorded_at, server_recorded_at)
-			VALUES ($1, $2, 'Delivered', 'driver', $3, $4, $5)`,
+			VALUES ($1, $2, 'In transit', 'driver', $3, $4, $5)`,
 			id, job, assignment, backdated, backdated)
 		if err == nil {
 			t.Fatal("a caller set the platform's clock, so a backdated delivery is indistinguishable from a live one")
@@ -289,7 +303,7 @@ func TestTheServerClockIsNotTheCallersToSet(t *testing.T) {
 	})
 
 	t.Run("omitting it fills it from the platform's clock", func(t *testing.T) {
-		id, err := record(t, pool, job, "Delivered", "driver", assignment, nil, backdated)
+		id, err := record(t, pool, job, "In transit", "driver", assignment, nil, backdated)
 		if err != nil {
 			t.Fatalf("recording a milestone: %v", err)
 		}
@@ -329,8 +343,11 @@ func TestMilestoneIsAppendOnly(t *testing.T) {
 	job := newDeliveryJob(t, pool, "append-only-milestone@example.com", "+61400000613")
 	assignment := assign(t, pool, job, "Dave Nguyen", "+61412345678")
 
+	// 'In transit' rather than 'Delivered', because 000605 requires a delivered milestone to carry
+	// evidence written in the same transaction and this test is about neither. Every milestone is
+	// append-only, so any of the five demonstrates it.
 	claimed := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
-	id, err := record(t, pool, job, "Delivered", "driver", assignment, "left with neighbour", claimed)
+	id, err := record(t, pool, job, "In transit", "driver", assignment, "left with neighbour", claimed)
 	if err != nil {
 		t.Fatalf("recording a milestone: %v", err)
 	}
@@ -393,13 +410,18 @@ func TestMilestoneConstraints(t *testing.T) {
 	t.Run("an administrator must say why", func(t *testing.T) {
 		// Docs/02 §3: an administrator may act, "acting with an audit reason". Docs/01 §3
 		// forbids changing a commercial record without one.
-		if _, err := record(t, pool, job, "Delivered", "admin", uuid.New(), nil, now); err == nil {
+		//
+		// 'In transit' rather than 'Delivered' since SHIP-118: a delivered milestone needs
+		// evidence in the same transaction (000605) whoever records it, **an administrator
+		// included** — CLAUDE.md's invariant has no actor exemption in it — so recording one
+		// here would refuse for a second reason and the audit rule would go untested.
+		if _, err := record(t, pool, job, "In transit", "admin", uuid.New(), nil, now); err == nil {
 			t.Error("an administrator recorded a delivery with no reason")
 		} else if !strings.Contains(err.Error(), "ck_milestones_admin_reason") {
 			t.Errorf("expected ck_milestones_admin_reason to refuse it, got: %v", err)
 		}
 
-		if _, err := record(t, pool, job, "Delivered", "admin", uuid.New(), "driver phone flat, confirmed by call", now); err != nil {
+		if _, err := record(t, pool, job, "In transit", "admin", uuid.New(), "driver phone flat, confirmed by call", now); err != nil {
 			t.Errorf("an administrator with a reason was refused: %v", err)
 		}
 	})

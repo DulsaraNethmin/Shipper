@@ -13,6 +13,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/storage"
 )
 
 // The delivery domain's routes (SHIP-106 onwards).
@@ -69,6 +70,71 @@ func init() {
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordMilestone() },
 		},
 		Route{
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/proof-uploads",
+			Group:   GroupV1,
+
+			// RequireUser, and the third route in this file to explain why it is not the
+			// driver's. The caller is the awarded provider, checked against the accepted
+			// bid.
+			//
+			// **SHIP-122 needs the driver's version of this and it is not here**, which is a
+			// gap recorded in Docs/11 §3 rather than a decision. A driver-token route is
+			// served with the idempotency scope `anonymous` — the scope is computed
+			// group-wide, outside the middleware, while a guard runs per route inside it —
+			// and this response carries a URL that can write into the evidence bucket. That
+			// is the SHIP-44 shape the whole service was fixed for, and it stays shut until
+			// SHIP-121 settles the scope.
+			//
+			// # A pre-signed URL is minted here and spent nowhere in this service
+			//
+			// The same pairing as `/jobs/{id}/driver` above: this route hands out a
+			// credential and no route in the manifest accepts one. The bytes go straight to
+			// the object store (Docs/06 §5.2), so there is no upload endpoint to declare.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).PresignProofUpload() },
+		},
+		Route{
+			Method: http.MethodGet,
+
+			// **`/jobs/{id}/proof` was the intended pattern and it cannot be served**, which
+			// is a finding SHIP-115 made rather than a preference. `GET /jobs/open/{id}`
+			// (SHIP-83) puts a literal in the `{id}` position, so it and any three-segment
+			// `GET /jobs/{id}/<literal>` both match `/jobs/open/proof` with neither more
+			// specific — Go's ServeMux refuses the pair at registration and the process does
+			// not start. `POST /jobs/{id}/proof-uploads` is unaffected only because the other
+			// route is a GET.
+			//
+			// So the delivery domain takes a shelf of its own under the job, and that turns
+			// out to be worth having rather than a workaround: **every read this domain adds
+			// under a job would have hit the same wall** — SHIP-116's exception, SHIP-133's
+			// tracking view, a milestone timeline — and each now has somewhere to go that
+			// composes. Docs/11 §3 records the collision for whoever owns `/jobs/open/{id}`,
+			// because it is the shape that will keep costing tickets an hour.
+			Pattern: "/jobs/{id}/delivery/proof",
+			Group:   GroupV1,
+
+			// **The route above hands out a credential to write into the evidence bucket;
+			// this one hands out credentials to read out of it** (SHIP-115), and the pairing
+			// is why the auth class alone is not the access control here. RequireUser gets a
+			// caller as far as the handler, and the handler asks the database which of two
+			// parties they are — the customer who owns the job, or the provider on its
+			// accepted bid. Being neither answers exactly what a job that does not exist
+			// answers.
+			//
+			// A proof photograph identifies an address and a recipient, so there is no public
+			// read path to one anywhere in this service and no route that serves the bytes.
+			// What this returns is short-lived signed URLs at the object store, issued after
+			// the check and never before.
+			//
+			// **Not RequireDriverToken, and not a second route under /driver/ either.** The
+			// assigned driver is deliberately not a reader yet — internal/delivery's
+			// Service.ProofFor argues it, and SHIP-122 is where it gets revisited with a
+			// driver who can actually capture proof in front of it.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).ProofOnJob() },
+		},
+		Route{
 			Method:  http.MethodGet,
 			Pattern: "/driver/jobs/{id}",
 			Group:   GroupV1,
@@ -116,10 +182,24 @@ func init() {
 // a transient condition the service is built to survive, and the handlers answer 503 for as long as
 // it lasts.
 func deliveryHandler(d Deps) *delivery.Handler {
+	// One signer, handed to the domain as two ports (SHIP-115). `delivery` asks for permission to
+	// upload through one and reads an object back through the other, and the two are separate
+	// interfaces so that a path holding the reader cannot mint permission to write. That they are
+	// satisfied by the same value is this file's business and nothing the domain can see.
+	store := proofUploads(d)
+
 	svc := delivery.NewService(
 		jobLifecycle{jobs: newJobService(d)},
 		acceptedBids{},
+		jobCustomers{jobs: newJobService(d)},
 		driverTokenIssuer(d),
+		store,
+		store,
+		delivery.UploadPolicy{
+			MaxBytes:             d.Config.Storage.MaxUploadBytes,
+			AcceptedContentTypes: d.Config.Storage.AcceptedContentTypes,
+			URLTTL:               d.Config.Storage.PresignTTL,
+		},
 		d.Clock,
 	)
 
@@ -128,6 +208,44 @@ func deliveryHandler(d Deps) *delivery.Handler {
 		panic("cmd/api: delivery handler: " + err.Error())
 	}
 	return handler
+}
+
+// proofUploads builds the signer behind POST /v1/jobs/{id}/proof-uploads (SHIP-114).
+//
+// # This is the only place the domain and the adapter meet, and neither names the other
+//
+// `delivery` declares delivery.ProofUploads in its own ports.go and imports nothing from
+// internal/platform; `storage` knows what a bucket is and has never heard of a job. Go satisfies
+// the interface structurally, so the two are joined by the assignment below and by the compile-time
+// assertion at the foot of this file — which is, as with the two ports above, the only place in the
+// build where that can be established at all.
+//
+// # Three of the nine configured values are read here and the other three in the policy above
+//
+// The split is not arbitrary: everything below describes the *store* — where it is, what it is
+// called, how to authenticate to it — and everything in [delivery.UploadPolicy] describes what the
+// platform will allow into it. The first is the adapter's business and the second is the domain's,
+// which is Docs/06 §4.1's division written as two structs.
+//
+// It panics for the reason driverTokenIssuer does: it runs during attach, from a Handler closure
+// with nowhere to put an error, and every failure it can report is a configuration fault that will
+// still be there after a restart. config.Load has already refused an unparseable endpoint, a
+// loopback host outside development, an implausible bucket name and an empty credential, so
+// reaching this means configuration produced something it validates against.
+func proofUploads(d Deps) *storage.S3 {
+	signer, err := storage.NewS3(storage.Options{
+		Endpoint:        d.Config.Storage.Endpoint,
+		Bucket:          d.Config.Storage.Bucket,
+		Region:          d.Config.Storage.Region,
+		AccessKeyID:     d.Config.Storage.AccessKeyID,
+		SecretAccessKey: d.Config.Storage.SecretAccessKey,
+		UsePathStyle:    d.Config.Storage.UsePathStyle,
+		Clock:           d.Clock,
+	})
+	if err != nil {
+		panic("cmd/api: proof upload signer: " + err.Error())
+	}
+	return signer
 }
 
 // driverTokenIssuer builds the signer of the driver's job-scoped link (SHIP-107).
@@ -212,11 +330,12 @@ func (l jobLifecycle) MoveToDriverAssigned(
 // and nowhere else.** `delivery` names milestones, this names statuses, and the mapping between the
 // two vocabularies lives in the composition root where both are visible.
 //
-// `Delivered` is deliberately absent. Docs/01 §4.4 makes photo proof or a recorded exception the
-// condition of recording one, neither can be captured until SHIP-114…SHIP-116, and a method here
-// would be a way to reach that status without either. The delivery domain refuses it in front of
-// this (delivery.ErrProofRequired); having no method behind it as well means the refusal cannot be
-// removed by editing one file.
+// **`Delivered` was deliberately absent until SHIP-118, and this is where that ends.** While
+// neither photo proof nor a reasoned exception could be captured, having no method here meant the
+// refusal could not be removed by editing one file. Both can be captured now (SHIP-115, SHIP-116),
+// so the refusal has a condition rather than being unconditional, and what replaces this method's
+// absence as the second layer is a database constraint: 000605 refuses a `Delivered` milestone with
+// no `proofs` row at commit, whoever wrote it and through whatever code path.
 //
 // RecordedAt is the actor's clock, passed through to job_status_history's actor_recorded_at. The
 // transition and the milestone that caused it are one act, and the pair of rows they leave must
@@ -260,6 +379,26 @@ func (l jobLifecycle) MoveToInTransit(
 	return l.move(ctx, r, jobs.Move{
 		JobID:      jobID,
 		To:         jobs.StatusInTransit,
+		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		RecordedAt: recordedAt,
+	})
+}
+
+// MoveToDelivered is `In transit → Delivered` (SHIP-118).
+//
+// Identical in shape to the three above, which is the point: whether the delivery has anything to
+// show for itself was decided in `delivery` before this was called, and the transition table has no
+// opinion about it. Docs/02 §2's condition on this row — "proof-of-delivery data recorded, or a
+// reasoned exception recorded" — is a fact about `proofs`, and `jobs` has never heard of that table.
+func (l jobLifecycle) MoveToDelivered(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+	recordedAt time.Time,
+) (delivery.JobMove, error) {
+	return l.move(ctx, r, jobs.Move{
+		JobID:      jobID,
+		To:         jobs.StatusDelivered,
 		Actor:      jobs.User(jobs.ActorProvider, providerID),
 		RecordedAt: recordedAt,
 	})
@@ -385,10 +524,57 @@ func (acceptedBids) AwardedProvider(
 	return providerID, true, nil
 }
 
-// Compile-time proof that the two adapters satisfy the ports delivery declared, which is the only
-// place in the build where that can be established — delivery names neither type and neither type
+// jobCustomers implements delivery.JobOwners by asking `jobs` whether this account owns the job
+// (SHIP-115).
+//
+// # Why this one goes through the domain and acceptedBids does not
+//
+// acceptedBids is raw SQL here because `bidding` has no store yet and will not until SHIP-92. `jobs`
+// does, and jobs.Service.Job is the reader that already knows what ownership means — it takes the
+// job without a lock and compares customer_id, keeping "somebody else's" and "nobody's" apart in Go
+// while answering the same thing on the wire. Writing `SELECT customer_id FROM jobs` here instead
+// would be a second definition of a rule that domain owns, in a file that cannot be tested against a
+// database.
+//
+// # Both refusals collapse to false, which is the port's own contract
+//
+// jobs.ErrNotJobOwner and jobs.ErrJobNotFound are two facts and one answer: "no". delivery turns
+// that into the 404 a stranger gets, and a reader who could tell them apart would learn that
+// somebody else's job exists (delivery.JobOwners says so).
+type jobCustomers struct {
+	jobs *jobs.Service
+}
+
+// IsCustomer reports whether userID is the customer who owns jobID.
+//
+// No lock and no transaction: one read, and nothing downstream of it changes the answer — a job's
+// customer_id is fixed at creation and no endpoint updates it.
+func (c jobCustomers) IsCustomer(
+	ctx context.Context,
+	r db.Runner,
+	jobID, userID uuid.UUID,
+) (bool, error) {
+	_, err := c.jobs.Job(ctx, r, userID, jobID)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, jobs.ErrNotJobOwner), errors.Is(err, jobs.ErrJobNotFound):
+		return false, nil
+	default:
+		return false, fmt.Errorf("cmd/api: reading whether %s owns %s: %w", userID, jobID, err)
+	}
+}
+
+// Compile-time proof that the adapters satisfy the ports delivery declared, which is the only place
+// in the build where that can be established — delivery names none of these types and none of them
 // names delivery, so nothing else links them.
+//
+// *storage.S3 appears twice on purpose. delivery declares upload signing and object reading as two
+// ports, and this is where one value is shown to satisfy both.
 var (
-	_ delivery.Jobs   = jobLifecycle{}
-	_ delivery.Awards = acceptedBids{}
+	_ delivery.Jobs         = jobLifecycle{}
+	_ delivery.Awards       = acceptedBids{}
+	_ delivery.JobOwners    = jobCustomers{}
+	_ delivery.ProofUploads = (*storage.S3)(nil)
+	_ delivery.ProofObjects = (*storage.S3)(nil)
 )

@@ -232,6 +232,8 @@ paths:
     $ref: './paths/bidding.yaml#/WithdrawBid'
   /v1/jobs/{id}/cancel:
     $ref: './paths/jobs.yaml#/CancelJob'
+  /v1/jobs/{id}/delivery/proof:
+    $ref: './paths/delivery.yaml#/ProofOnJob'
   /v1/jobs/{id}/disputes:
     $ref: './paths/admin.yaml#/Disputes'
   /v1/jobs/{id}/driver:
@@ -240,6 +242,8 @@ paths:
     $ref: './paths/jobs.yaml#/ExtendJob'
   /v1/jobs/{id}/milestones:
     $ref: './paths/delivery.yaml#/Milestones'
+  /v1/jobs/{id}/proof-uploads:
+    $ref: './paths/delivery.yaml#/ProofUploads'
 
 components:
   schemas:

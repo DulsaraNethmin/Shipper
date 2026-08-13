@@ -219,7 +219,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **516 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **555 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -368,6 +368,10 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
+| **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
+| **SHIP-115** | M4 | `proofs` and `GET /v1/jobs/{id}/delivery/proof` — an uploaded object becomes evidence for **one recorded milestone**, and the customer and the awarded provider read it back through short-lived signed URLs issued *after* an authorisation check. Because the platform is not in the upload path it **asks the store whether the object arrived** rather than believing the client, and records what the store reports — which is also what finally puts SHIP-114's upload limits under a guard inside the domain — *see below* |
+| **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
+| **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -6901,6 +6905,619 @@ lands with no chance of a conflict — and a path-scoped `/CLAUDE.md` in `apps/<
 the repository's own `CLAUDE.md`, which a `**/CLAUDE.md` in the shared file very nearly could.
 Verified by running `next dev` for **both** surfaces, stopping it, and reading `git status` clean
 with `git check-ignore -v` naming the rule.
+### SHIP-114 — the upload the API is not in the path of, and the implementation that was deleted before it was written
+
+Five points, one endpoint, one adapter, **no migration and no table**. `POST /v1/jobs/{id}/proof-uploads`
+answers the awarded provider with a short-lived pre-signed URL and an object key; the client PUTs the
+photograph **to the object store**, and this service sees neither the request nor the bytes. That is
+`Docs/06` §5.2 read exactly, and it is the word the *Done when* turns on — "uploads **directly**" —
+so it is the one claim `scripts/verify/70-delivery.sh` checks three separate ways: the URL is
+asserted to be at `STORAGE_ENDPOINT` before it is used, the upload goes there, and the object is
+read back out of the bucket from inside the container.
+
+**The ticket had been struck in §6 for five consecutive waves** for want of a store to demonstrate
+against. SHIP-15p supplied it, and the pre-step earned its three points here: the two findings it
+recorded — that SigV4 signs the `host` header, and that there is no empty-endpoint state — were both
+load-bearing and neither cost this ticket an hour.
+
+#### The recorded question: `local.go` is dropped, and the filesystem implementation is not written
+
+SHIP-15p left this open deliberately and it is now decided. **`internal/platform/storage` holds one
+implementation, `s3.go`, used in every environment.** `doc.go` carries the reasoning; the four
+arguments are:
+
+- **The premise is gone.** That specification was written at SHIP-10, when development had no object
+  store. It has one now, so the implementation that runs in production is the one exercised locally
+  against genuine pre-signed-URL semantics — which is the argument `CLAUDE.md` already makes for
+  testing against a real PostgreSQL rather than a mocked repository, and the one SHIP-15p made for
+  putting a real store in compose rather than a stub.
+- **`Docs/06` §4.1's test is "does a second implementation exist today"**, and writing one so that
+  the answer becomes yes inverts the test into the thing it was written to refuse. Email and SMS
+  have two because console-versus-provider is a real operational difference — development must not
+  send mail to a person. Storage has no equivalent: writing a byte into a local bucket harms nobody.
+- **It would be a second signing scheme**, plus a verifier inside the API, plus a route serving the
+  bytes — and that last part contradicts the one rule this package states most firmly. A filesystem
+  implementation is not a second implementation of the same thing; it is a *different architecture*
+  that only development would ever run, which is the drift that produces "it worked locally".
+- **"A developer with no container running"** is answered the way it already is for PostgreSQL and
+  Redis: `make up`. The tests fail rather than skip without the stack, deliberately.
+
+**`Docs/06` §4.1's adapter table said "Local storage in development, S3 deployed", and that row went
+wrong the moment `local.go` was dropped. The repository owner has ruled: accept the drop — one
+`s3.go`, in every environment.** The row now reads "the store, not the code", and the four arguments
+above are condensed into a paragraph under the table, so the document and the tree agree. The row is
+**corrected rather than deleted**: `CLAUDE.md` names object storage in its adapter list, the seam is
+still there — `delivery` declares the port and may not import the adapter — and what changed is only
+that the second implementation is the store rather than a second Go type. That correction is the one
+shared-file edit this branch was unlocked for, and it carries no ticket of its own.
+
+#### No SDK, and the reason is the architecture rather than `go.mod`
+
+The signature is about eighty lines of HMAC against the standard library. `aws-sdk-go-v2` was not
+taken, and the first reason is not the one a reader expects: **this package makes no request to the
+object store, ever.** There is no upload, download, listing or delete — only signing — so an SDK
+would contribute a transport, a retry policy and a credential chain that nothing here would call.
+The second reason is the rule: `go.mod` is a shared surface no domain branch may edit, so the
+dependency would have been a request rather than a commit. It did not decide the design, but it is
+what made the question worth asking first.
+
+**The algorithm is held to AWS's own published example** —
+`TestTheAWSExampleSignsToThePublishedSignature` reproduces the documented query-string request and
+its signature `aeeed9bb…`, a value nobody in this repository computed. Every other test here would
+still pass if the implementation were self-consistently wrong; that one would not. Beside it, the
+signer is exercised against the running MinIO, which is the only evidence that matters for the
+*Done when*.
+
+#### The type and the size are signed, which is what makes them enforcement rather than advice
+
+This is the design decision most worth reading. `STORAGE_MAX_UPLOAD_BYTES` and
+`STORAGE_ACCEPTED_CONTENT_TYPES` are checked before a URL is issued — and **that check on its own
+enforces nothing**, because the request it inspects carries no bytes. A URL signed over `host` alone
+authorises *any* body: a client could ask for a 200 KB JPEG, be told yes, and PUT four hundred
+megabytes of anything.
+
+So the URL signs `content-type` and `content-length` as well, and the client is told both back and
+must send them exactly. The store recomputes the signature over the headers the request actually
+carried, so an upload that changes either is refused with `403 SignatureDoesNotMatch` — **by the
+store, on the request that matters, with this service nowhere in the path**. `content-length` is the
+only bound available to a pre-signed PUT at all (S3's `content-length-range` belongs to the browser
+POST-policy form, a different protocol), which is why a client states the exact size rather than a
+maximum. It has the file; it knows.
+
+The consequence for the wire is that `content_type` comes back possibly re-spelled — lower-cased and
+trimmed — and a client that sends its own spelling gets a signature failure with no explanation. The
+contract says so at the top of the operation.
+
+#### What a retry returns, and why there is no row behind it
+
+**The middleware's replay is the whole of the guarantee, and here that is the right amount.** A
+repeat carrying the same `Idempotency-Key` never reaches the handler: the client gets the identical
+URL, the identical key and the identical `expires_at`, already running down. One intent bought one
+upload slot, and a retry must not extend the life of a credential nothing can revoke. Once the Redis
+entry has gone, a retry mints a **new** URL for a **new** object key.
+
+That is deliberately weaker than SHIP-111's arrangement, and the difference is what is durable.
+`RecordMilestone` needed a unique index because a second row would be a second *recorded fact* about
+the delivery. Here nothing was written the first time — no row, no object — so a second URL leaves at
+most one unreferenced object, and SHIP-115 is what decides which key is the job's proof.
+
+**A key derived from the idempotency key was considered and rejected**, and the rejection is the
+interesting half. It would make a retry return the same object key, which sounds better and is
+worse: a client holding an old key could ask for a fresh URL over an object that already holds
+proof, and **proof is evidence**. A key nothing can predict means an issued URL can only ever write
+an object that did not exist when it was signed. `TestEveryUploadGetsAKeyOfItsOwn` is what fails if
+somebody "fixes" the retry behaviour later.
+
+The key is `proof/<job>/<uuidv7>`, prefixed so it is legible in a log without a lookup, and **with no
+file extension** — an extension would have to come from a hard-coded content-type-to-suffix map that
+had to stay in step with a *configured* list, which is exactly the drift `Docs/06` §5.3 is about. The
+store already records the media type from the signed header.
+
+#### 200 rather than 201, and no migration at all
+
+Nothing is created. The platform holds no record of the URL and the bucket holds no object until the
+client PUTs one, so this answers `200` like `POST /v1/auth/login` — the other endpoint whose whole
+output is a credential. **SHIP-115 is the ticket that creates something**, and migrations `000603`
+onward are still unallocated: "uploaded proof is linked to a job and milestone with access control"
+is its *Done when*, not this one's, and a `proof` table written here would have been building into
+its way. `internal/platform/storage` likewise has no `PresignDownload`; reading proof back needs an
+authorisation check this package must not make and a consumer that does not exist (SHIP-115,
+SHIP-155). When one arrives it is four lines.
+
+#### What was needed of `internal/config` beyond SHIP-15p: nothing
+
+All nine fields were used and none was missing, which is the first time a wave-7 track can say that
+about a shared surface. The split is worth recording because it is not arbitrary: six describe the
+*store* and are read by `cmd/api` into `storage.Options`; three — `PresignTTL`, `MaxUploadBytes`,
+`AcceptedContentTypes` — describe what the platform will allow into it and are read into
+`delivery.UploadPolicy`. That is `Docs/06` §4.1's division of labour written as two structs, and it
+is why the adapter takes the TTL as an argument rather than holding it.
+
+#### Two edits outside this lane's own files, both minimal
+
+`cmd/api/routes_test.go` gained a `testStorageConfig()` beside the argon2 profile and the driver
+keyset already there, for the third instance of one cause: the delivery handler is built during
+attach from every test that constructs a router, and a signer that cannot sign stops the process.
+`config.Storage{}` has an empty endpoint and an empty endpoint is not a URL. **This is the shape
+SHIP-15p fixed in `routerWithApp` and did not fix here** — `testDeps` still substitutes a whole
+`config.Config` literal, so it collects a section per domain requirement. A guard like
+`TestTheAppFixtureOverwritesNothingButApp` cannot help, because this fixture *is* the base. Worth a
+§9 item rather than a fix from a domain branch.
+
+And `routes_golden.txt` gained one line. The sorted set was confirmed unchanged apart from the
+addition before `-update` was run.
+
+#### Mutation testing: seven mutations, seven caught, and one instructive survivor
+
+Each was reverted immediately and the revert confirmed with `git diff`.
+
+| Mutation | Result |
+|---|---|
+| Ignore the configured TTL and sign for the protocol maximum | **Caught** — four tests, including `TestAnExpiredURLIsRefused` against the real store |
+| Neuter the accepted-content-type check | **Caught** — four cases across the domain and the wire |
+| Neuter the size limit | **Caught** — two cases |
+| Remove the `awarded != providerID` check | **Caught** — `TestOnlyTheAwardedProviderGetsAnUploadURL`, both refusals, and the 404-parity test |
+| Sign `host` alone, dropping the two content headers | **Caught** — and by the test that matters: the *real store accepted a substituted content type and a longer body* |
+| Make the object key deterministic per job | **Caught** — `TestEveryUploadGetsAKeyOfItsOwn` |
+| Set `mc anonymous set download` on the bucket | **Caught** — twice, by `TestTheBucketHasNoPublicReadPath` and by `scripts/verify/00-stack.sh`'s SHIP-15p block |
+
+**The survivor is inside the fifth**, and it is worth naming rather than tuning away: with the signer
+reduced to `host` alone, **`internal/delivery`'s entire test package stays green.** That is correct —
+the domain's tests use a stub port, and a domain test that also signed could not fail on the
+condition that matters — but it means the enforcement claim has exactly two guards, both outside the
+domain: `internal/platform/storage`'s integration tests and `scripts/verify/70-delivery.sh`. Anybody
+who ever finds those slow and skips them has removed the check that the platform's upload limits are
+enforced at all, and no delivery test will say so.
+
+#### One thing recorded rather than built: SHIP-121 and SHIP-122 both need a driver-token *write*
+
+§9 already carries the mechanism — `httpx.SubjectScope` keys on the `authctx.Subject`, a driver
+token deliberately produces none, and the scope is computed group-wide **outside** `Idempotent`
+while a guard runs per route **inside** it, so a driver-token request scopes its idempotency key to
+`anonymous` whatever the guard does. Building this endpoint sharpens it from a scoping question into
+a concrete one, and the shape is now obvious enough to write down:
+
+- **SHIP-121** needs `POST /v1/driver/jobs/{id}/milestones`, `RequireDriverToken`, under `/driver/`
+  beside SHIP-108's read. The handler is `RecordMilestone` with `callerID` replaced by
+  `driverGrantFrom` and `Record.Actor` set to `ActorDriver` — which `000601` and `milestone.go`
+  already declare and nothing can yet reach. `delivery.Awards` is not consulted: a verified grant
+  *is* the authorisation, and the grant already names the job and the assignment.
+- **SHIP-122** needs the driver's version of this ticket's endpoint,
+  `POST /v1/driver/jobs/{id}/proof-uploads`, on the same guard.
+
+**Neither is built here, and the reason is not effort.** Both are state-changing, so both would land
+in the `anonymous` idempotency scope — and SHIP-122's response body *is a credential that can write
+into the evidence bucket*. That is precisely the cross-tenant read SHIP-44 was written to close, so
+the honest position is that **the scope has to be settled before either endpoint exists**, not
+alongside them. §9's two options stand: a second group-wide resolver a driver grant can populate
+with `SubjectScope` widened to read either, or an explicit decision that a job-scoped grant scopes on
+the job identifier already in the path. The first is right if a driver ever holds two links.
+
+`make verify` went from 481 checks to 493 across the same 13 sections, all twelve in
+`scripts/verify/70-delivery.sh`: the URL is issued, it points at the store and not at this API, it is
+short-lived by its own signed window, the client uploads with it, the bytes are read back out of the
+bucket, the object is refused unsigned, a substituted type or size is refused by the store, a
+provider who was not awarded the job gets a 404, a script container and an over-limit photograph are
+both refused with the field named, the request is refused without an `Idempotency-Key`, a retry
+replays the identical URL, and the object is removed. **Every assertion names the key it created**,
+because the bucket may be shared with four other worktrees.
+
+### SHIP-115 — the record, and the question of what the platform is entitled to believe
+
+`proofs` (migration `000603`), an optional `proof` on the milestone request, and
+`GET /v1/jobs/{id}/delivery/proof`. An uploaded object becomes evidence for **one recorded
+milestone**, and through it for one job, and the two parties to the delivery can read it back
+through short-lived signed URLs issued after an authorisation check.
+
+#### The hard part is not the table. It is that the platform never saw the photograph
+
+SHIP-114 issues a URL and the client PUTs the bytes **to the store**, with this service in neither
+direction. There is no callback and nothing to poll, so the platform cannot tell an upload that
+succeeded from one that failed halfway from one that was never attempted. Two failures follow, and
+**they are not symmetric**:
+
+| | What it means | Decided |
+|---|---|---|
+| A row with no object | The platform holds a record saying a delivery was photographed, having never looked | **Refused.** `Service.VerifyProof` asks the store before anything is written |
+| An object with no row | A URL was issued and spent and nothing came back to claim it | **Expected.** It is proof of nothing, reachable by nobody, and ages out under a lifecycle rule |
+
+The first direction is the one the invariant rests on. `Docs/01` §4.4 makes proof "the *only*
+evidence that the job happened as claimed", and `Docs/04` §7 has an administrator reviewing it in a
+dispute; a record that might point at nothing is not evidence, and the moment somebody discovers
+that is the moment it is needed. **The cheaper design — record the client's word for it — is the one
+this ticket exists to refuse.**
+
+Closing the second direction would have meant writing something when the URL is issued, and
+SHIP-114 argues at length why nothing is written then. An unreferenced object is not a defect: the
+bucket has no public read path, the keys are unguessable, and UUIDv7 keys were chosen so that a
+lifecycle rule over them is expressible.
+
+#### Which cost `internal/platform/storage` its strongest sentence, and the narrowing is deliberate
+
+SHIP-114 wrote "this package makes no request to the object store, ever". `S3.Stored` now makes
+one — a pre-signed HEAD, spent immediately, against an object this platform named. **The rule that
+was always doing the work is *no transfer through this service*, and a metadata request carries no
+body in either direction.** `doc.go` and `s3.go` both say so now, and `S3.PresignDownload` arrived
+with it: the four lines SHIP-114 said a download signer would be, now that a consumer exists to
+guard it.
+
+A download URL signs `host` alone, which is the *opposite* of the upload and is right for the same
+reason: an upload URL binds `content-type` and `content-length` because the request it authorises
+carries a body the platform has not seen, and a GET carries none.
+
+#### The record stores what the store reported, and that is what closes SHIP-114's open hole
+
+SHIP-114's mutation testing found that reducing the signer to `host` alone left `internal/delivery`'s
+entire test package green — correct, since the domain stubs the port, but it meant the claim "the
+platform's upload limits are enforced" had **no guard inside the domain at all**, only
+`internal/platform/storage`'s live tests and `70-delivery.sh`.
+
+**It is closed, and by a different guard rather than the same one moved.** `content_type`,
+`content_length` and `etag` on a `proofs` row are what the *store* answered with, and `VerifyProof`
+measures them against `UploadPolicy` before recording anything. So the limits are now applied to the
+object that exists, at the moment it becomes evidence, whatever route it took into the bucket.
+`TestProofOverTheSizeLimitIsRefusedEvenThoughItReachedTheBucket` and
+`TestProofOfAnUnacceptedTypeIsRefusedEvenThoughItReachedTheBucket` are the two that fail if that
+check is removed, and neither depends on the signer.
+
+`etag` is recorded and returned to nobody. A pre-signed PUT stays usable until it expires, so the
+holder of an upload URL can overwrite the object inside that window; nothing can revoke the URL, so
+the answer is detection rather than prevention. SHIP-155's viewer is where an administrator would be
+shown a mismatch.
+
+#### Proof follows the milestone, not the job — and SHIP-112 is what settles it
+
+A photograph is evidence *for a recorded claim*, so it hangs off the `milestones` row. The
+consequence worth knowing is that **an absorbed milestone keeps its proof.** SHIP-112 keeps a late
+milestone's row and deliberately does not move the job, so a photograph taken at dawn in a yard with
+no signal is kept, and appears on a timeline at the time the driver acted rather than at the time
+the phone found a tower. Proof hung off the *job* would have had to answer "which one is current"
+from the arrival order, which is the one order `Docs/02` §3.1 says not to show a customer. The other
+direction is unchanged: a premature milestone is still refused and rolls back whole, and its proof
+rolls back with it.
+
+**`job_id` is on the row as well, and it cannot drift.** `fk_proofs_milestone` is a *composite* key
+over `(milestone_id, job_id)`, so "this proof's job is its milestone's job" is a fact PostgreSQL
+checks. Two separate foreign keys would each hold while permitting a row that puts a photograph of
+one delivery on another customer's timeline — which is the shape a mistyped identifier produces, and
+which reads perfectly. `services/core/migrations/proofs_test.go` is where that is demonstrated,
+because no Go path in this service can produce it, and that is the point rather than a gap.
+
+#### Who may read proof, and the two readers who deliberately may not
+
+| Reader | Gets | Why |
+|---|---|---|
+| The customer who owns the job | The record, and a short-lived signed URL per photograph | `Docs/01` §4.4's acceptance measure is theirs, and SHIP-133 is the screen |
+| The provider it was awarded to | **The same thing** | They took it. Being unable to see what they submitted makes a dispute unanswerable from their side |
+| The assigned driver | Nothing, yet | Not distrust: **nothing they could do with it exists.** SHIP-122 is the first ticket that has a driver capture proof at all, and it is blocked on the idempotency scope. Their link is forwardable through whatever channel the provider used and lives seven days, and a proof photograph identifies an address and a recipient — widening that credential before there is a need is a cost with no benefit. **SHIP-122 revisits it** |
+| An administrator | Nothing, and cannot | There is no administrator. `ck_users_role` refuses `'admin'` and admin sign-in is SHIP-147. SHIP-155 is that reader, and what it needs from here — the download signing — is now built |
+
+Neither party gets a reduced view, and that is a decision: a photograph is not a field that can be
+redacted, and the two of them are looking at the same object when they disagree about a delivery
+(`Docs/04` §7). Anybody else gets the 404 a job that does not exist gets. **The download URL is
+issued only after the check** — `TestNobodyElseMayReadProofAndNoURLIsSignedForThem` asserts the
+signer was never *called* for a refused reader, rather than merely that the answer was empty,
+because a credential minted and then discarded has already left the building.
+
+#### The route could not be `GET /v1/jobs/{id}/proof`, and that will cost the next ticket too
+
+`GET /v1/jobs/open/{id}` (SHIP-83) puts a literal in the `{id}` position. It and **any**
+three-segment `GET /jobs/{id}/<literal>` both match `/jobs/open/proof` with neither more specific,
+so Go's `ServeMux` refuses the pair at registration and the process does not start.
+`POST /jobs/{id}/proof-uploads` is unaffected only because the other route is a `GET`.
+
+So the delivery domain took a shelf of its own: `GET /v1/jobs/{id}/delivery/proof`. That turns out
+to be worth having rather than a workaround — SHIP-116's exception, SHIP-133's tracking view and a
+milestone timeline would each have hit the same wall, and each now has somewhere to go that
+composes. **It is recorded here for whoever owns `/jobs/open/{id}`**, because it is the shape that
+will keep costing tickets an hour: it is the one route in the manifest that squats a variable
+position with a literal, and the collision is invisible until a `GET` is added beside it.
+
+#### What a retry does, and why `proofs` carries no idempotency key of its own
+
+The milestone's key is the whole of it. Proof is written in the same transaction as the milestone it
+proves, so a retry that outlives its cached response finds the milestone already recorded under
+`uq_milestones_idempotency` and returns before the proof insert is attempted. A key column here
+would be a second copy of a guarantee that already holds.
+
+`uq_proofs_object_key` is separate and is access control rather than tidiness: one object is
+evidence for one recorded claim, and the same key on two milestones would put a picture of one
+delivery against another. Enforced by the index rather than by a read-then-write, because two
+concurrent recordings would both read no row.
+
+#### What was needed of `internal/config` beyond SHIP-15p: nothing, and one field worth asking for
+
+All nine fields were already there and the download reuses `PresignTTL`. **A separate, shorter
+`STORAGE_DOWNLOAD_TTL` is the field to ask for**, and the reason it is not urgent is that reusing
+the upload's lifetime errs long rather than short: an upload TTL has to outlast a phone finishing a
+slow PUT, while a download only has to outlast an image rendering. One number serving both makes the
+read link longer-lived than it needs to be, and every one of those is a link to a photograph of
+somebody's front door. Not a domain branch's edit; it belongs in whatever the next prep ticket
+collects.
+
+The metadata request's timeout and its own signing window are adapter constants rather than
+configuration, deliberately: nothing is ever handed the URL `Stored` signs for itself, so that
+window bounds one in-process round trip rather than describing a policy about what a credential may
+reach.
+
+#### Mutation testing: eleven mutations, eleven caught
+
+Each was reverted immediately and the revert confirmed with `git diff`.
+
+| Mutation | Result |
+|---|---|
+| Believe the client — record proof without asking the store | **Caught** — `TestProofIsRefusedWhenNothingWasUploaded`, and `70-delivery.sh`'s first SHIP-115 check against the real store |
+| Treat a store that errors as "no such object" | **Caught** — `TestAStoreThatFailsIsNotAMissingPhotograph`, and the live `TestStoredRefusesAWrongCredentialRatherThanCallingItMissing` |
+| Drop the stored-size check | **Caught** — `TestProofOverTheSizeLimitIsRefusedEvenThoughItReachedTheBucket`. **This is SHIP-114's recorded hole, now covered inside the domain** |
+| Drop the stored-content-type check | **Caught** — `TestProofOfAnUnacceptedTypeIsRefusedEvenThoughItReachedTheBucket` |
+| Record the client's stated type and length instead of the store's | **Caught** — the row assertion in `TestProofIsLinkedToTheJobAndTheMilestoneItProves`, and `70-delivery.sh` reading `image/jpeg 48` out of the table |
+| Remove `keyBelongsToJob`, so one job's object can be proof on another | **Caught** — three ways: the domain, the wire table, and `70-delivery.sh` |
+| Answer `mayReadProof` true for any caller | **Caught** — `TestNobodyElseMayReadProofAndNoURLIsSignedForThem`, both refused readers, and two verify checks |
+| Sign the download URLs before the authorisation check rather than after | **Caught** — that same test's second assertion, which counts what the signer was asked. **Nothing else fails**, which is why the assertion is written against the signer rather than against the response |
+| Split `fk_proofs_milestone` into two single-column foreign keys | **Caught** — `TestProofCannotNameOneJobAndAMilestoneOnAnother`, and the raw-SQL forgery in `70-delivery.sh` |
+| Make `uq_proofs_object_key` a plain index | **Caught** — and loudly, by ten tests rather than one: `ON CONFLICT (object_key)` infers *that* index, so without it no proof can be recorded at all. The uniqueness is load-bearing for the insert as well as for the rule |
+| In the adapter, fold every non-2xx into "no such object" | **Caught** — `TestStoredRefusesAWrongCredentialRatherThanCallingItMissing`, against the real store with a wrong secret. A separate guard from the domain-level one above, and the one that matters: a rotated key would otherwise tell every driver their photograph had failed to upload |
+
+`make verify` went from 493 checks to 507 across the same 13 sections, all fourteen in
+`scripts/verify/70-delivery.sh`: a milestone naming an object nobody uploaded is refused, the upload
+and the recording then succeed, the row names the job and the milestone and holds what the store
+reported, the composite key refuses a forged pair **in raw SQL**, the customer reads it, the URL is
+at the store rather than at this API, it fetches the bytes, the same object is refused unsigned, the
+awarded provider reads the same record, a stranger gets what a missing job gets, an anonymous read
+is refused, one object cannot be proof twice, and another job's key is refused with the field named.
+
+### SHIP-116 — the exception is evidence, not a hole in the rule
+
+`proofs` gains `exception_reason` and loses four `NOT NULL`s (migration `000604`), and the milestone
+request's `proof` object gains a second field. A milestone may now be evidenced by a photograph
+**or** by one of `Docs/01` §4.4's three reasons there is none — and never by both, and never by
+neither.
+
+#### One table, because "never both" is expressible in no other shape
+
+The obvious design is a second table beside `proofs`, and `000603`'s own header had already rejected
+it: "exception_reason, and object_key becoming nullable with a CHECK that exactly one of the two is
+present". The reason is that **no constraint spans two tables.** A photograph and a reason are
+alternatives, so the interesting rule is not that either may exist but that exactly one does, and
+with two tables that rule can only ever be application logic — which is precisely what `CLAUDE.md`
+says an invariant must not only be.
+
+```sql
+CHECK ((num_nonnulls(object_key, content_type, content_length, etag) = 4 AND exception_reason IS NULL)
+    OR (num_nonnulls(object_key, content_type, content_length, etag) = 0 AND exception_reason IS NOT NULL))
+```
+
+`num_nonnulls` rather than four `IS NOT NULL` conjunctions because the failure it guards is a
+*partial* photograph — a key with no entity tag reads as evidence to every query that only selects
+`object_key`, and `000603`'s four `NOT NULL`s were the only thing refusing it. Dropping them without
+counting would have been the one regression this migration could have introduced silently.
+
+It is also **not** the whole of `CLAUDE.md`'s invariant and does not pretend to be. This makes an
+evidence row coherent; a delivered milestone requiring one is a rule about milestones, and that is
+SHIP-118.
+
+#### The vocabulary is closed, and there is deliberately no `other`
+
+`recipient_objected`, `camera_unavailable`, `location_unsafe` — `Docs/01` §4.4's own three,
+paired with the `CHECK` in both directions by
+`TestProofExceptionConstraintMatchesTheGoConstants` (`Docs/10` §3.4). A free-text reason nobody
+can group is a moderation queue nobody can triage (`Docs/04` §5), and the driver's own words are not
+lost by leaving it out: `milestones.reason` is optional, five hundred characters and one row away.
+"The recipient asked me not to photograph their door" goes there, *beside* a selection rather than
+instead of one.
+
+The stored form is the wire form, which is `ActorType`'s arrangement rather than `Milestone`'s.
+Milestones store `Docs/02` §1's exact strings because a document fixes them; no document fixes
+these, so a second spelling would be a translation table with nothing on the other side of it.
+
+#### An exception may stand behind any milestone, and the narrower rule is wrong
+
+The first design restricted it to `Delivered`, on the reasoning that a photograph is only *required*
+there. It was reversed before anything was written. `Docs/01` §4.4's three reasons are about
+**capture** — a camera, a recipient, a place — and not one of them knows which milestone is being
+recorded. A driver who cannot photograph a pickup is in exactly the position the paragraph is about,
+and refusing the exception there leaves them choosing between recording nothing and claiming
+something they do not have.
+
+What is specific to `Delivered` is that evidence is required at all. That is SHIP-118's rule, and
+keeping the two apart is what let this ticket be demonstrated on an ordinary milestone — exactly as
+SHIP-115 demonstrated a photograph on `en_route_to_pickup`.
+
+#### Nothing is asked of the object store, and nothing is signed for a reader
+
+An exception has no object, so the recording path never calls `Stored` and the read path never calls
+`PresignDownload`. Both are **assertions about a call rather than about an answer**, so both tests
+read what the stub was asked rather than what came back — `recordingObjects.lookups` and
+`.downloads`. That shape is SHIP-115's finding reused: `internal/platform/storage` will sign a URL
+for any key it is handed and says so, so a service that asked it about an exception would receive a
+perfectly good credential naming an object that does not exist, and a response assertion could pass
+while that happened.
+
+The consequence for a client is one field: a record carries `exception_reason` **or** the
+photograph's five, and `download_url` is absent rather than empty. A zero `content_length` is a
+statement about a photograph that does not exist; an absent field says nothing.
+
+#### What was assumed about SHIP-117 and X-6, neither of which is this ticket's
+
+| Ticket | What it needs from here | What was built for it |
+|---|---|---|
+| **SHIP-117** — an exception-completed job enters the moderation queue | To ask which jobs carry one | `idx_proofs_exception`, partial on `exception_reason IS NOT NULL`. **The flag itself is deliberately not here**: whether a job is queued for review is a fact about the *job* and belongs with the queue, which is what `000603` already said. The queue's own question is a join to the `Delivered` milestone, which SHIP-118 makes recordable |
+| **X-6** — may an exception-completed job auto-complete under `Docs/02` §6.1? | Not to have been decided | Nothing here presumes an answer. The exception is a durable fact joined to the milestone that carries it, so SHIP-119 can branch either way and no column changes in either direction |
+
+Until SHIP-117 exists the only trace an exception leaves outside the table is a **warning** log line
+from the handler — the one place in it that is about operations rather than reconciliation. A
+delivery with no photograph is exactly what somebody should be able to find in a log while the queue
+is being written.
+
+#### What was needed of `internal/config`: nothing, and run 2's request stands
+
+No new setting. The exception path touches no limit, no lifetime and no bucket — which is itself the
+argument for having put the reason vocabulary in a `CHECK` rather than in configuration: it is
+paired with a Go constant list by a test, and `Docs/10` §3.4 is explicit that this is how an
+enumeration is held.
+
+**The `STORAGE_DOWNLOAD_TTL` SHIP-115 asked for is still the right request**, and this ticket
+narrows what it is for rather than widening it: an exception is now one of the records a customer's
+tracking screen renders, and it needs no URL at all, so the population of long-lived read links is
+smaller than it was but no shorter-lived.
+
+**One request that is not `internal/config`'s and is recorded because somebody will reach for it.**
+The three reasons a driver *picks from* are a vocabulary; the **words shown beside them** in the
+picker are copy, and `Docs/06` §5.3 puts copy server-side because Flutter has no over-the-air update
+path. No endpoint serves them, and SHIP-131 — the camera-permission fallback, which depends on this
+ticket — is the first screen that needs them. Compiling three English strings into Dart is the
+cheap answer and the one that needs a store review to correct.
+
+#### Mutation testing: seven mutations, seven caught
+
+Each was reverted immediately, by copy rather than by `git checkout`, and confirmed with `git diff`
+and a checksum.
+
+| Mutation | Result |
+|---|---|
+| Make `ck_proofs_photograph_or_exception` always true, so a row may carry both or neither | **Caught** — `TestEvidenceIsAPhotographOrAReasonAndNeverBothOrNeither`. `70-delivery.sh` asserts the same rule in raw SQL against the running database |
+| Write `num_nonnulls(...) > 0` in place of `= 4`, so half a photograph is a photograph | **Caught** — that test's `half a photograph is refused` subtest, and **nothing else**. It is the mutation this migration could most easily have shipped with: every ordinary path writes four columns, so no Go test and no verify check can reach it |
+| `ProofExceptionReason.Valid` always true, so any string is a reason | **Caught** — three tests, and the interesting part is *how*. The domain test now fails with `ck_proofs_exception_reason` in the message rather than a validation error, which is the two layers behaving exactly as `Docs/10` §4.6 describes: the database still refuses the row, and what the Go check buys is a 422 naming the field instead of a constraint name in a 500 |
+| Remove **both** Go refusals of a photograph-and-a-reason together | **Caught** — but by one test rather than three, and this is the mutation worth reading. `TestEvidenceThatIsNotOneOrTheOtherIsRefusedInsideThePackage` fails. `TestAPhotographAndAReasonTogetherAreRefused` and the wire table both keep passing, because `ck_proofs_photograph_or_exception` refuses the row on the way past. The rule holds; what is lost is the ability to say which field was wrong |
+| Treat `"proof": {}` as no evidence rather than as a refusal | **Caught** — the wire table's `neither` case and SHIP-115's `TestProofOnTheWireIsRefusedByTheCasesAClientCanCause`. The failure it prevents is the quiet one: a client that meant to send a photograph, silently recorded as having none |
+| Sign a download URL for an exception row | **Caught** — `TestAnExceptionIsReadBackWithNoDownloadURLAndNothingIsSignedForIt` by the assertion that counts what the signer was asked, plus both wire tests. The signer-call assertion is the one that would still fail if the URL were minted and then discarded |
+| Ask the store about the object an exception does not name (`req.Proof != nil` in place of `proofKey != ""`) | **Caught** — both wire tests, and note that the *domain* `lookups` assertion does not fail, because the mutation is in the handler and the domain test calls the service directly. That is the division working: the handler owns the ordering, so the handler's tests are what hold it |
+
+`make verify` went from 507 checks to 514 across the same 13 sections, all seven in
+`scripts/verify/70-delivery.sh`: an exception is recorded against a real MinIO with no bucket
+interaction at all, the row holds the reason and four NULLs, the table refuses both-and-neither in
+raw SQL, the customer and the awarded provider each read the reason with no URL, and both-together,
+neither and an unpublished reason are each refused with the field named and the three published.
+
+### SHIP-118 — the invariant stops being intended
+
+`Delivered` is recordable, and refused when it carries neither a photograph nor a reasoned
+exception. `delivery.Jobs` gains `MoveToDelivered`, `Service.RecordMilestone`'s blanket refusal
+becomes a condition, and migration `000605` adds a deferred constraint trigger.
+
+**This is the ticket the four before it were for.** SHIP-114 put a photograph in a bucket, SHIP-115
+made it evidence, SHIP-116 gave a delivery that could not be photographed something to say instead —
+and none of them could reach `Delivered` at all. `CLAUDE.md` has listed "Delivered requires photo
+proof or a recorded exception reason — never neither" as an invariant since before any of it existed,
+and `Docs/02` §3's own line has had no enforcement since the status model was written.
+
+#### The missing port method was half the enforcement, and it is deliberately given up
+
+`cmd/api/routes_delivery.go` said it plainly: "a method here would be a way to reach that status
+without either… having no method behind it as well means the refusal cannot be removed by editing
+one file." That was right while nothing could be captured, and it is the wrong shape now — a status
+nobody can reach is not a rule, it is an absence.
+
+So the second layer is a real one instead:
+
+```sql
+CREATE CONSTRAINT TRIGGER milestones_delivered_has_evidence
+    AFTER INSERT ON milestones
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW WHEN (NEW.milestone = 'Delivered')
+    EXECUTE FUNCTION milestones_delivered_needs_evidence();
+```
+
+**Deferred, because the evidence points at the milestone and can therefore only be written second.**
+An ordinary `AFTER INSERT` trigger fires between the two statements and refuses every honest delivery
+there is — which is not a hypothetical: making it `NOT DEFERRABLE` fails nine tests. Deferring moves
+the check to `COMMIT`, which is the first moment the question is answerable at all.
+
+`WHEN (NEW.milestone = 'Delivered')` keeps the other four free of it. `Docs/01` §4.4 requires a
+photograph of one moment, not of five.
+
+#### Two layers, and each one is for something the other cannot do
+
+| Layer | What it is for |
+|---|---|
+| `Service.RecordMilestone` | The answer a client can act on: `409 delivery_proof_required`, pointing at the camera and the exception path beside it. Nothing is written — not even a row the transaction later unwinds |
+| `000605`'s trigger | The rule surviving a writer that never read that function. SHIP-121 gives the driver's portal a milestone endpoint, SHIP-113 rewrites the switch deciding what an administrative conflict does with one, and `cmd/worker` already applies transitions on a timer |
+
+Removing the Go check leaves the invariant standing and the API broken — a `500` with a constraint
+name where a `409` should be, which is exactly what `Docs/10` §4.6 says a constraint is a bad
+explanation for. That is not a hypothetical either; it is what the mutation run produced, and four
+named tests report it.
+
+**The trigger has no actor exemption**, and that is a decision rather than an oversight. `Docs/02` §3
+lets an administrator record a delivery "acting with an audit reason"; `CLAUDE.md`'s invariant has no
+"unless" in it, so an administrator recording one needs evidence like anybody else. Two SHIP-110
+tests recorded a `Delivered` milestone as a convenient arbitrary value and now record `In transit`
+instead, each with a line saying why.
+
+#### The ordering with SHIP-112's absorption, which is where this could have gone wrong
+
+The check sits **in front of the insert**, and since SHIP-112 that placement carries weight it did
+not have before. Absorption *commits* a milestone whose move was refused — so a `Delivered` reaching
+the switch on a job that has already been there would be kept rather than unwound.
+`TestAbsorptionCannotReachDelivered` drives precisely that job, and it is one of the four tests that
+fail if the condition is removed.
+
+The other direction is unchanged and worth stating: a **late** `Delivered` that does carry evidence
+is now absorbed like any other late milestone, keeps its photograph or its reason, and moves nothing.
+That is `Docs/02` §3.1 read exactly, and it is what SHIP-115's decision to hang proof off the
+milestone bought.
+
+#### What this does *not* build: the recipient name and the delivery note
+
+**Two documents are ahead of the code here, and the gap belongs to SHIP-123 rather than being a
+defect in this ticket.** `Docs/01` §4.4 requires a delivered job to carry a **recipient name** and a
+**delivery note** as well as proof, and `Docs/02` §3 repeats it, naming `01` §4.4 as authoritative
+for the field set. **No column holds either.** `milestones` carries `job_id`, `milestone`,
+`actor_type`, `actor_id`, `reason` and the two clocks; `proofs` carries the object metadata and
+`exception_reason`; neither table has a field for a recipient or for a note about the delivery
+itself. **This ticket opens `Delivered` without them**, and that is recorded here rather than
+resolved quietly:
+
+- SHIP-123's *Done when* is "recipient name, note, and proof captured; portal becomes read-only
+  after", and it **depends on SHIP-118**. The field set is therefore behind this ticket in build
+  order, and capturing it here would be building SHIP-123's API half inside this one.
+- What SHIP-118 is judged on is the clause `CLAUDE.md` calls an invariant, and that clause is closed
+  end to end.
+- `milestones.reason` is a plausible home for the delivery note and was **not** quietly reused for
+  it. It is the actor's optional note on any milestone; making it mean a second, specific thing on
+  one milestone is exactly the one-column-two-meanings `Docs/10` §3.3 already refuses, in the row
+  holding the actor clock and the server clock to two explicit columns rather than one.
+
+Whoever takes SHIP-123 should expect to add both columns and to make them required for `Delivered`,
+beside the evidence rule rather than instead of it. **This is a gap with an owner, not an undecided
+question**, so a wave reconciliation should carry it as documentation ahead of code against
+SHIP-123 rather than as a §9 recommendation waiting on somebody's ruling.
+
+#### SHIP-117 and X-6 are unblocked and untouched
+
+Both now have something to work on that did not exist an hour ago: **an exception-completed job**.
+The join is `proofs.exception_reason IS NOT NULL` against the job's `Delivered` milestone, indexed by
+SHIP-116's `idx_proofs_exception`, and `70-delivery.sh` asserts it end to end so that neither ticket
+finds the fact missing.
+
+Neither is answered here. Nothing flags a job for moderation and nothing completes one; X-6's
+question — whether a job completed through the exception path may auto-complete under `Docs/02` §6.1
+— is a decision for operations, and the schema branches either way without a column changing.
+
+#### What was needed of `internal/config`: nothing
+
+No setting, no limit and no lifetime. The two requests standing are still SHIP-115's
+`STORAGE_DOWNLOAD_TTL` and SHIP-116's note that the *words* beside the three exception reasons are
+copy rather than vocabulary, and belong server-side rather than compiled into Dart.
+
+#### Mutation testing: four mutations, four caught
+
+Each was reverted immediately, by copy rather than by `git checkout`, and confirmed with `git diff`
+and a checksum.
+
+| Mutation | Result |
+|---|---|
+| **Remove the refusal itself** — `Delivered` with neither is recorded | **Caught, by four named tests**, and the way it fails is the finding. `TestDeliveredWithNeitherProofNorExceptionIsRefused` and `TestAbsorptionCannotReachDelivered` both report `a delivered milestone needs photo proof or a recorded exception` **from the COMMIT**, and `TestADeliveryWithNothingBehindItIsRefusedAtTheWire` gets a `500` where a `409` belongs. The invariant holds; the API stops being usable |
+| `Recording.hasEvidence` always true | **Caught** — ten tests, most of them nothing to do with deliveries: every milestone then tries to write an evidence row it does not have, and `ErrEvidenceNotCoherent` refuses it. A mutation that fails loudly and far from its own subject, which is the shape a shared helper produces |
+| The trigger is never created | **Caught** — `TestTheDeliveredRuleIsAlsoTheDatabases` in the domain and `TestADeliveredMilestoneCannotBeWrittenWithoutEvidence` in `migrations`, and **nothing else**. Every path through the service still refuses, which is exactly why the second layer needs a test that goes round the service |
+| The trigger is `NOT DEFERRABLE` | **Caught** — nine tests. Evidence points at the milestone, so it is written second; a trigger that fires between the two statements refuses every honest delivery. The deferral is load-bearing rather than tidy |
+
+`make verify` went from 514 checks to 520 across the same 13 sections, all six in
+`scripts/verify/70-delivery.sh`: a delivery with neither is refused with the job unmoved and nothing
+written, the same row is refused in raw SQL at `COMMIT`, a delivery evidenced by a reasoned exception
+is accepted and moves the job through the transition guard leaving one history row, the
+exception-completed job is findable by the join SHIP-117 and X-6 both start from, and a delivery
+evidenced by a photograph is accepted the same way.
 
 ## 4. Partly done — do not treat these as finished
 

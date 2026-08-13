@@ -45,9 +45,29 @@ import (
 type Service struct {
 	jobs   Jobs
 	awards Awards
+	owners JobOwners
 	tokens *DriverTokenIssuer
+	proof  proofStorage
 	clock  clock.Clock
 	store  postgresStore
+}
+
+// proofStorage is everything the object store is asked for, and the limits it is asked within
+// (SHIP-114, SHIP-115).
+//
+// One field rather than three on [Service], because they are never useful apart: a signer with no
+// policy would issue URLs for anything, a policy with no signer is a struct nobody reads, and a
+// metadata reader judged against a different policy from the one that signed would accept objects
+// the platform refused to authorise. It is also what stops one positional argument to [NewService]
+// becoming three as SHIP-155 adds its own.
+//
+// **SHIP-114 called this `proofUploader` and SHIP-115 renamed it.** With one port the specific name
+// was clearer; with a second port that exists to *read* an object back, "uploader" would have been
+// actively wrong about half of what it holds.
+type proofStorage struct {
+	uploads ProofUploads
+	objects ProofObjects
+	policy  UploadPolicy
 }
 
 // NewService builds the domain service.
@@ -61,7 +81,16 @@ type Service struct {
 // the way jobs' geocoder is. A nil Awards is "nobody is checked", a nil Jobs is "the job never
 // moves", and a nil issuer is an assignment that produces no link — all three are silent failures
 // of a rule this endpoint exists to enforce.
-func NewService(jobs Jobs, awards Awards, tokens *DriverTokenIssuer, c clock.Clock) *Service {
+func NewService(
+	jobs Jobs,
+	awards Awards,
+	owners JobOwners,
+	tokens *DriverTokenIssuer,
+	uploads ProofUploads,
+	objects ProofObjects,
+	policy UploadPolicy,
+	c clock.Clock,
+) *Service {
 	if jobs == nil {
 		panic("delivery: NewService needs the job lifecycle; an assignment that moves no job " +
 			"leaves a driver on a job nothing downstream believes has one (Docs/02 §2)")
@@ -69,6 +98,13 @@ func NewService(jobs Jobs, awards Awards, tokens *DriverTokenIssuer, c clock.Clo
 	if awards == nil {
 		panic("delivery: NewService needs the award lookup; without it any provider could put a " +
 			"driver on any job (Docs/02 §3)")
+	}
+	if owners == nil {
+		// Refused rather than defaulted to "nobody is the customer", which would start the
+		// service and quietly answer 404 to every customer asking for the proof on their own
+		// job — a broken screen (Docs/01 §4.4's acceptance measure) reported as a missing one.
+		panic("delivery: NewService needs the job ownership lookup; without it a customer cannot " +
+			"be told apart from a stranger asking about their delivery (SHIP-115)")
 	}
 	if tokens == nil {
 		// Refused rather than made optional, because SHIP-107's *Done when* is that the token
@@ -78,12 +114,45 @@ func NewService(jobs Jobs, awards Awards, tokens *DriverTokenIssuer, c clock.Clo
 		panic("delivery: NewService needs the driver token issuer; an assignment with no " +
 			"job-scoped link leaves the driver nothing to open (SHIP-107)")
 	}
+	if uploads == nil {
+		// Refused rather than made optional, for the reason the issuer above is. A service
+		// that could answer an upload request with no signer would have to answer it with
+		// something, and every candidate is worse than not starting: a URL nobody signed, an
+		// empty string a client would PUT to nowhere, or a 500 on the one request path
+		// Docs/01 §4.4 makes the condition of completing a delivery.
+		panic("delivery: NewService needs somewhere to put proof; a delivery cannot be " +
+			"completed without a photograph or a recorded exception (SHIP-114)")
+	}
+	if objects == nil {
+		// Refused rather than made optional, and this one has the sharpest failure direction of
+		// the four. Without it the platform cannot ask whether a photograph was ever uploaded,
+		// and the only way to record proof at all would be to believe the client — which is
+		// precisely the arrangement SHIP-115 exists to refuse (see proof.go).
+		panic("delivery: NewService needs to be able to read an object back; the platform is not " +
+			"in the upload path, so asking the store is the only way it can know proof exists " +
+			"(SHIP-115)")
+	}
+	if !policy.valid() {
+		// Checked here rather than per request, so a configuration failure stops the process
+		// at startup instead of surfacing as a validation error blaming a client's perfectly
+		// good photograph. internal/config has already refused a zero TTL and an empty type
+		// list, so reaching this means the policy came from somewhere other than configuration.
+		panic("delivery: NewService needs an upload policy with a size limit, at least one " +
+			"accepted content type, and a lifetime (SHIP-114)")
+	}
 	if c == nil {
 		// Defaulting to clock.System{} would start the service, and the first milestone
 		// recorded without an actor-supplied time would be stamped from a clock nobody chose.
 		panic("delivery: NewService needs a clock (Docs/10 §6.3)")
 	}
-	return &Service{jobs: jobs, awards: awards, tokens: tokens, clock: c}
+	return &Service{
+		jobs:   jobs,
+		awards: awards,
+		owners: owners,
+		tokens: tokens,
+		proof:  proofStorage{uploads: uploads, objects: objects, policy: policy},
+		clock:  c,
+	}
 }
 
 // AssignDriver puts a driver on a job the caller was awarded, moves the job to 'Driver assigned',
@@ -333,7 +402,7 @@ func (s *Service) refused(err error) (Assignment, DriverToken, bool, error) {
 //  1. nothing recorded, and nothing said, without an idempotency key: [ErrNoIdempotencyKey];
 //  2. a job nobody was awarded, or no job at all: [ErrJobNotFound];
 //  3. a job awarded to another provider: [ErrNotAwardedProvider];
-//  4. 'Delivered', until proof can be captured: [ErrProofRequired];
+//  4. 'Delivered' carrying neither a photograph nor a reasoned exception: [ErrProofRequired];
 //  5. a milestone the job has not reached the point for: [ErrMilestoneNotPermitted].
 //
 // The customer of the job is refused by (2) and (3) like any other stranger, which is Docs/02 §3
@@ -419,20 +488,29 @@ func (s *Service) RecordMilestone(
 			jobID, awarded, providerID, ErrNotAwardedProvider))
 	}
 
-	// Checked in front of the insert, so nothing is written for a 'Delivered' at all.
+	// **CLAUDE.md's invariant, and SHIP-118 is the ticket that turns it from intended into
+	// enforced.** "Delivered requires photo proof or a recorded exception reason — never neither."
 	//
-	// **This is the first of three layers, and mutation testing was what established the order
-	// of them.** Moving this check to *after* the insert changes nothing today, because it still
-	// returns an error and the transaction still rolls the row back — and because [Service.moveFor]
-	// has no case for 'Delivered' either, so one reaching the switch below would fail there. What
-	// SHIP-112 changes is that a case in that switch now *commits* rather than rolling back, so the
-	// layer that has to hold is the one that keeps a delivered milestone from reaching it. Only
-	// removing this check **and** giving 'Delivered' a move that answers [JobAlreadyPast] produces
-	// a delivered milestone with neither photo proof nor an exception behind it — which is what
-	// SHIP-118 will be editing, and the shape TestAbsorptionCannotReachDelivered exists to catch.
-	if recording.Milestone == MilestoneDelivered {
-		return notRecorded(fmt.Errorf("delivery: %s cannot be recorded delivered yet: %w",
-			jobID, ErrProofRequired))
+	// Checked in front of the insert, so a delivery with nothing to show for it writes no row at
+	// all — not even one the transaction later rolls back. The ordering matters more since
+	// SHIP-112 than it did before it: absorption *commits* a milestone whose move was refused, so
+	// a 'Delivered' that reached the switch below on a job that has already been there would be
+	// kept rather than unwound. TestAbsorptionCannotReachDelivered drives exactly that job.
+	//
+	// It is one of two layers and neither is decorative. 000605's deferred constraint trigger
+	// refuses a 'Delivered' milestone with no `proofs` row at commit, whoever wrote it — which is
+	// what makes this a property of the platform rather than of this function. What *this* layer
+	// buys is the answer a client can act on: `delivery_proof_required` names the camera and the
+	// exception path beside it, where the constraint would give a name and a 500 (Docs/10 §4.6).
+	//
+	// **Docs/01 §4.4 numbers more than this.** A delivered job also requires a recipient name and
+	// a delivery note, and neither is captured by any endpoint yet; SHIP-123 is the ticket whose
+	// *Done when* names them ("recipient name, note, and proof captured") and it depends on this
+	// one. Docs/11 §3 records the gap rather than leaving the document and the code to disagree
+	// quietly.
+	if recording.Milestone == MilestoneDelivered && !recording.hasEvidence() {
+		return notRecorded(fmt.Errorf("delivery: %s cannot be recorded delivered with neither a "+
+			"photograph nor a reason there is none: %w", jobID, ErrProofRequired))
 	}
 
 	recordedAt := recording.RecordedAt
@@ -473,6 +551,22 @@ func (s *Service) RecordMilestone(
 
 	if !recorded {
 		return s.alreadyRecorded(ctx, r, jobID, recording)
+	}
+
+	// The evidence, in the same transaction as the claim it stands behind (SHIP-115, SHIP-116).
+	//
+	// Written after the milestone because it points at it, and before the move because the move
+	// is the one step that can *commit* on a refusal: SHIP-112's absorption keeps the row and
+	// leaves the job alone, and a delivery whose absorbed milestone lost its photograph on the way
+	// through would be the record growing and the evidence not.
+	//
+	// A photograph and a reasoned exception take the identical path, which is what makes the
+	// absorption argument above true of both: a driver who could not photograph a pickup in a yard
+	// with no signal keeps their reason when the queued milestone finally syncs.
+	if recording.hasEvidence() {
+		if _, err := s.recordEvidence(ctx, r, jobID, stored.ID, recording.Proof, recording.Exception); err != nil {
+			return notRecorded(err)
+		}
 	}
 
 	move, err := s.moveFor(ctx, r, providerID, jobID, recording.Milestone, recordedAt)
@@ -573,10 +667,14 @@ func (s *Service) alreadyRecorded(
 // moveFor runs the transition a milestone implies, through the port method that names it.
 //
 // A switch rather than a map, so that a milestone with no move is a compile-time-visible case
-// rather than a missing key that reads as zero. The two milestones with no case here are refused
-// before this is reached — 'Driver assigned' by [Recording.problems] and 'Delivered' by
-// [ErrProofRequired] — and reaching it with either would mean one of those checks had been removed,
-// which is worth an error rather than a silent no-op.
+// rather than a missing key that reads as zero. The one milestone with no case here is
+// 'Driver assigned', refused by [Recording.problems] before this is reached, and reaching it would
+// mean that check had been removed — which is worth an error rather than a silent no-op.
+//
+// **'Delivered' gained a case at SHIP-118 and did not gain a condition here**, deliberately.
+// Whether the delivery has anything to show for itself was decided above, before the milestone was
+// inserted; repeating it at the move would be a second copy of a rule with no way to keep the two
+// in step, and the copy that ran later would be the one that mattered.
 func (s *Service) moveFor(
 	ctx context.Context,
 	r db.Runner,
@@ -591,6 +689,8 @@ func (s *Service) moveFor(
 		return s.jobs.MoveToPickedUp(ctx, r, jobID, providerID, recordedAt)
 	case MilestoneInTransit:
 		return s.jobs.MoveToInTransit(ctx, r, jobID, providerID, recordedAt)
+	case MilestoneDelivered:
+		return s.jobs.MoveToDelivered(ctx, r, jobID, providerID, recordedAt)
 	default:
 		return JobMoveUnrecognised, fmt.Errorf("delivery: %s implies no move this domain can ask for: %w",
 			m, ErrJobMoveUnrecognised)

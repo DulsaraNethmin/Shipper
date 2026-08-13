@@ -58,6 +58,124 @@ type Awards interface {
 	AwardedProvider(ctx context.Context, r db.Runner, jobID uuid.UUID) (providerID uuid.UUID, awarded bool, err error)
 }
 
+// ProofUploads is somewhere to put a proof photograph, declared by the domain that needs one
+// (SHIP-114).
+//
+// # It signs a URL and does nothing else
+//
+// Docs/06 §5.2 puts the bytes outside this service entirely: the client is handed a short-lived
+// pre-signed URL and uploads straight to the store. So this port has no Put, no Get and no Delete —
+// there is no method here that moves a byte, because no byte ever reaches the platform. What the
+// implementation is asked for is permission, in the form of a URL, and permission is all it can
+// give.
+//
+// # The wide signature is forced, exactly as jobs.Geocoder's was
+//
+// A port may not name a type declared in the package that implements it — that is the import the
+// lint refuses — so no struct from internal/platform/storage can appear below, in either direction.
+// The answer is the one Docs/11 §9 records for geocoding: primitives in, primitives out, with the
+// domain's own [Upload] assembled from them one statement later.
+//
+// # What the four arguments are, and why the domain supplies every one of them
+//
+// The key, because which object a job's proof goes to is this domain's question and not the
+// store's — nothing in internal/platform/storage knows what a job is (its doc.go says so). The
+// content type and the length, because they are what the implementation must *sign*: an upload URL
+// that does not bind them authorises any body at all, and the platform's limits become a promise
+// the client made to itself. And the lifetime, because "short-lived" is the whole of the
+// authorisation — nothing can revoke a pre-signed URL once it is signed — and the number comes from
+// configuration rather than from the signer.
+//
+// An implementation may refuse: a key that names another object, a content type carrying a newline,
+// a length of zero. Those are failures of the mechanism rather than answers, so they come back as
+// errors and become an opaque 500 — the domain has already checked everything a client could get
+// wrong, so reaching one means this platform asked for something it should not have.
+type ProofUploads interface {
+	// PresignUpload returns a URL the client may PUT exactly one object to, and when it stops
+	// working.
+	//
+	// The expiry is returned rather than computed by the caller, so that what a client is told
+	// and what the store will enforce come from one clock and one arithmetic.
+	PresignUpload(
+		ctx context.Context,
+		key, contentType string,
+		contentLength int64,
+		ttl time.Duration,
+	) (uploadURL string, expiresAt time.Time, err error)
+}
+
+// ProofObjects is what the store already holds, and permission to read one back (SHIP-115).
+//
+// # A second port rather than two more methods on [ProofUploads], and the split is the question
+//
+// [ProofUploads] answers "where may this client put a photograph". This answers "what is actually
+// there, and may this reader see it" — a different question, asked at a different moment, by a
+// different caller. Both are satisfied by the same adapter and cmd/api joins them in one place, so
+// the split costs a line there and buys the property that a domain reading proof cannot mint
+// permission to write it.
+//
+// # Why [ProofObjects.Stored] has to exist at all
+//
+// This is the whole of SHIP-115's difficulty and it is worth stating in the interface rather than
+// in a commit message. SHIP-114 hands out a URL and the client PUTs the bytes **to the store**, so
+// the platform is not in the path and never observes the upload: it cannot tell an upload that
+// succeeded from one that failed halfway from one that was never attempted. So a proof record
+// written from the client's say-so would be a row asserting that a photograph exists, held by a
+// platform that has never checked — and Docs/01 §4.4 makes proof "the *only* evidence that the job
+// happened as claimed".
+//
+// Asking the store closes it, and it also closes something else: what comes back is what was
+// *stored*, so [UploadPolicy]'s limits can be applied to the object that exists rather than only
+// to the request that asked to create one. See [Service.VerifyProof].
+//
+// # The five-value return is forced, exactly as [ProofUploads]'s width was
+//
+// A port may not name a type declared in the package that implements it, so no struct from
+// internal/platform/storage can appear below. Primitives in, primitives out, with a comma-ok for
+// "no such object" — the same answer Docs/11 §9 records for jobs.Geocoder, and the same one this
+// domain's [Awards] gives.
+type ProofObjects interface {
+	// Stored is the media type, size and entity tag the store holds under key, or found=false
+	// when there is no such object.
+	//
+	// A missing object is an answer rather than an error: it is what a client that has not
+	// uploaded yet looks like, which for a driver on a poor connection is an ordinary morning.
+	// Anything that is not an answer — a store refusing the credentials, a connection that never
+	// opens — comes back as an error and becomes an opaque 500.
+	Stored(ctx context.Context, key string) (
+		contentType string, contentLength int64, etag string, found bool, err error)
+
+	// PresignDownload returns a URL the caller may GET the object at, and when it stops working.
+	//
+	// **It authorises nothing by itself and checks nobody.** The implementation will sign a URL
+	// for any key it is handed; deciding whether this reader may have it is [Service.ProofFor]'s,
+	// from the database, and it happens before this is called. That division is
+	// internal/platform/storage/doc.go's own rule, and the reason a download signer could not be
+	// written until a domain existed to guard it.
+	PresignDownload(ctx context.Context, key string, ttl time.Duration) (
+		downloadURL string, expiresAt time.Time, err error)
+}
+
+// JobOwners is whose job it is (SHIP-115).
+//
+// The counterpart of [Awards], and the two together are the whole of this domain's access control
+// for reading proof: `bidding` knows who won the work and `jobs` knows who published it.
+//
+// # It asks rather than fetches, and that is the port being a port
+//
+// The shape a first draft reaches for is `CustomerOf(jobID) (uuid.UUID, error)` — hand back the
+// identifier and let the caller compare. This domain has no use for the customer's identifier: it
+// never displays one, never writes one and never passes one on. What it needs is a yes or a no
+// about the caller in front of it, so that is what the port says, and the identifier of a customer
+// who is not the caller never crosses the boundary at all.
+//
+// A job that does not exist and a job belonging to somebody else are one answer, for the reason
+// [Awards] gives at greater length: a reader who could tell them apart would learn that a
+// stranger's job exists.
+type JobOwners interface {
+	IsCustomer(ctx context.Context, r db.Runner, jobID, userID uuid.UUID) (bool, error)
+}
+
 // JobMove is what the guarded transition did, in terms this domain can act on.
 //
 // The four values are the four outcomes of Docs/02 §2's table as seen from one caller: it moved,
@@ -212,4 +330,27 @@ type Jobs interface {
 	// the actor's path and is not widened to carry an actor type it would only ever be given one
 	// value of.
 	MoveToInTransit(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+
+	// MoveToDelivered is `In transit → Delivered` (SHIP-118).
+	//
+	// # It is the fifth method, and its absence used to be half of the enforcement
+	//
+	// SHIP-111 deliberately left it out, and cmd/api's own comment said why: "a method here would
+	// be a way to reach that status without either [proof or an exception]… having no method
+	// behind it as well means the refusal cannot be removed by editing one file." That was the
+	// right arrangement while neither kind of evidence could be captured. Both can now, so the
+	// refusal has a condition instead of being unconditional, and the condition is
+	// [Service.RecordMilestone]'s to check.
+	//
+	// **What replaces the missing method as the second layer is a database constraint** —
+	// 000605's deferred trigger, which refuses a `Delivered` milestone with no `proofs` row at
+	// commit whoever wrote it. A rule that lives in one function is a rule the next function does
+	// not have; this one now lives in the domain, in the schema, and in
+	// scripts/verify/70-delivery.sh against the running binary.
+	//
+	// Docs/02 §2's condition on this row — "proof-of-delivery data recorded, or a reasoned
+	// exception recorded" — is deliberately not `jobs`' to check. The transition table says which
+	// moves exist; what a delivery must carry is this domain's, and asking `jobs` to know about
+	// `proofs` would be the import the lint refuses.
+	MoveToDelivered(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
 }
