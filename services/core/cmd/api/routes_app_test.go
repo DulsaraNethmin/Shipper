@@ -4,26 +4,61 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 )
 
+// withApp copies deps' configuration and replaces the one section under test, and the shape is
+// the point (SHIP-15p).
+//
+// routerWithApp used to substitute a whole config.Config literal, which meant every domain's
+// requirements had to be repeated in it — every handler is built during attach, so a router built
+// without the delivery keyset stops the process (SHIP-107) whether or not a minimum-version test
+// has any use for one. **Every new configuration section therefore broke this file silently**
+// until somebody noticed and added the section to the literal. Docs/11 §9 carried that as an open
+// item with no owner from wave 6, and Storage was the section that would have collected on it.
+//
+// Overwriting one field on a copy has the property the literal did not: a section added tomorrow
+// arrives here already correct, because it arrives through whatever built the configuration.
+func withApp(deps Deps, app config.App) Deps {
+	cfg := *deps.Config
+	cfg.App = app
+	deps.Config = &cfg
+	return deps
+}
+
 func routerWithApp(t *testing.T, app config.App) http.Handler {
 	t.Helper()
+	return newRouter(withApp(testDeps(), app), idempotency.NewMemoryStore(),
+		testAuthenticator(), testDriverGuard())
+}
 
-	deps := testDeps()
-	// Every domain's handler is built during attach, so this literal has to carry what all of
-	// them need rather than what this test reads. Replacing Config wholesale is what makes that
-	// easy to forget: the delivery keyset is here because a router built without one stops the
-	// process (SHIP-107), not because a minimum-version test has any use for it.
-	deps.Config = &config.Config{
-		App:      app,
-		Identity: testIdentityConfig(),
-		Delivery: testDeliveryConfig(),
+// TestTheAppFixtureOverwritesNothingButApp is the guard on that shape rather than on any value in
+// it, and it is written so that no future configuration section has to remember it exists.
+//
+// The marker in a section this test has no use for is what stops the assertion being vacuous: a
+// fixture that rebuilds the configuration from a literal cannot carry a value it does not name,
+// and comparing the whole struct with App blanked on both sides catches that without naming a
+// section either. Demonstrated by mutation — restoring the literal fails this test.
+func TestTheAppFixtureOverwritesNothingButApp(t *testing.T) {
+	base := testDeps()
+	base.Config.Storage = config.Storage{Bucket: "a-bucket-only-this-test-names"}
+
+	got := *withApp(base, config.App{MinimumIOSBuild: 7, MinimumAndroidBuild: 7}).Config
+	if got.App.MinimumIOSBuild != 7 {
+		t.Fatalf("App.MinimumIOSBuild = %d, want the value the fixture was given", got.App.MinimumIOSBuild)
 	}
-	return newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
+
+	want := *base.Config
+	got.App, want.App = config.App{}, config.App{}
+	if !reflect.DeepEqual(got, want) {
+		t.Error("the app fixture changed configuration other than App. Overwrite the one field " +
+			"under test on a copy of the configuration it was given — a literal here silently " +
+			"drops every section it does not name, and every domain's handler is built from those.")
+	}
 }
 
 func getMinimumVersion(t *testing.T, router http.Handler) (int, minimumVersionResponse) {
