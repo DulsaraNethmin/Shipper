@@ -275,6 +275,13 @@ func (m market) counter(t *testing.T, caller, job, bid uuid.UUID, c Counter) (Bi
 	return made, created, err
 }
 
+// chain reads one negotiation's history, on the pool rather than in a transaction — which is what
+// [Service.Chain] is built for and what the handler passes it.
+func (m market) chain(t *testing.T, caller, job, bid uuid.UUID) ([]Bid, bool, error) {
+	t.Helper()
+	return m.svc.Chain(t.Context(), m.pool, caller, job, bid)
+}
+
 // counterOf is a counter-offer changing the price alone, which is the ordinary shape.
 //
 // Price alone deliberately: it is the case 000501 named when it removed `ck_bids_offer_has_timing`

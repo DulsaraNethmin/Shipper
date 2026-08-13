@@ -24,15 +24,16 @@
 # scoped to the caller as well as to the job, and the two endpoints that take a bid identifier refuse
 # one that is not the caller's with the answer a bid that does not exist gets.
 #
-# # Four endpoints and one shape
+# # Five endpoints and one shape
 #
 # Docs/01 §4.2 gives the provider three verbs — "place, update, and withdraw a bid until it is accepted
 # or expires" — and each has its own path here. Docs/02 §4 adds the fourth, which belongs to *both*
-# parties: a counter-offer supersedes the prior offer, from whichever side it comes.
+# parties: a counter-offer supersedes the prior offer, from whichever side it comes. The fifth is the
+# read that keeps the resulting chain visible.
 #
-# All four answer with the same `Bid`, so a client holds one type throughout: place it, revise it,
-# take it back or counter it, and what comes back is the same object each time. SHIP-88 adds the read
-# that keeps the resulting chain visible.
+# All of them answer with the same `Bid`, so a client holds one type throughout: place it, revise it,
+# take it back, counter it, or list the whole exchange, and what comes back is the same object each
+# time.
 #
 # # The counter endpoint is the first thing here a customer may call, and one rule governs it
 #
@@ -433,7 +434,8 @@ CounterOffer:
 
       **This creates a row and leaves the one it answers behind.** The offer you countered becomes
       `superseded` and gains a `superseded_by` pointing at your counter; your counter becomes the live
-      head of the negotiation. Nothing is deleted and nothing is overwritten.
+      head of the negotiation. Nothing is deleted and nothing is overwritten, so the whole exchange
+      stays readable through `GET /v1/jobs/{id}/bids/{bid_id}/history`.
 
       That is the difference from `PATCH /v1/jobs/{id}/bids/{bid_id}`: **you counter the other
       party's offer and revise your own.** Getting it the wrong way round answers
@@ -561,6 +563,101 @@ CounterOffer:
           One or more fields were rejected (`validation_failed`). `error.details` carries one entry
           per field — including fields you did not send, when the value inherited from the offer you
           answered no longer makes a valid offer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+BidHistory:
+  get:
+    operationId: bidHistory
+    summary: Read one negotiation's offers
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Every offer exchanged between one customer and one provider on one job, oldest first (SHIP-88).
+
+      **Nothing is deleted and nothing is overwritten**, so every round is here at the amount it was
+      made at: the original offer, each counter, and any offer that was withdrawn and replaced. Docs/01
+      §4.3 requires the platform to record all offers, counter-offers and withdrawals, and Docs/02 §4
+      keeps that history visible.
+
+      Address it through **any** offer in the negotiation — the one you are holding will do, however
+      old. What you get back is the whole exchange either way.
+
+      ## Reading the chain
+
+      Each entry carries `offered_by`, which is `provider` or `customer`, and `superseded_by`, which
+      names the counter that displaced it. **The one entry with no `superseded_by` is the live head**,
+      and it is the only offer anybody can act on: the only one that can be countered, and the only
+      one the customer can award.
+
+      ## Who may read it
+
+      The two parties to the negotiation: the provider who is bidding, and the customer who owns the
+      job. Anybody else answers `404`, byte-identically to a bid that does not exist — **another
+      provider's prices, counters and timing are private** (Docs/01 §4.3), and this is the response
+      that would otherwise hand a competitor an entire negotiation at once.
+
+      This is one negotiation, not every bid on the job. A customer comparing offers from several
+      providers reads a different endpoint.
+
+      It keeps working after the job is awarded, cancelled or completed. A record is most useful once
+      the work is over.
+
+      ## No paging
+
+      A negotiation is a handful of rounds, so the response is the collection envelope with
+      `next_cursor` always null. `has_more` is a truncation report rather than an invitation to ask
+      for the rest.
+
+      Read-only, so no `Idempotency-Key`.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/BidID'
+    responses:
+      '200':
+        description: |
+          The negotiation's offers, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/BidChain'
+      '400':
+        description: |
+          A malformed identifier in the path (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such bid — or one you are not a party to, or not on the job in the path. These are one
+          answer.
         headers:
           X-Request-Id:
             $ref: '../openapi.yaml#/components/headers/RequestID'
@@ -747,6 +844,37 @@ BidCounter:
       description: |
         Replaces the conditions accompanying the offer. Send it blank to remove them.
       example: Happy at this price if you can make it Thursday morning.
+
+BidChain:
+  type: object
+  additionalProperties: false
+  required: [data, next_cursor, has_more]
+  description: |
+    One negotiation's offers, oldest first — the collection envelope every collection in this API uses.
+
+    `next_cursor` is always null: this does not page. `has_more` is a truncation report for a
+    negotiation longer than a hundred rounds, not an invitation to ask for the rest.
+  properties:
+    data:
+      type: array
+      description: |
+        Every offer exchanged between this customer and this provider on this job, oldest first,
+        including offers that were withdrawn and any replacement placed afterwards.
+
+        The one entry with no `superseded_by` is the live head, and it is the only offer that can be
+        countered or awarded.
+      items:
+        $ref: '#/Bid'
+    next_cursor:
+      type: string
+      nullable: true
+      description: Always null. This endpoint does not page.
+      example: null
+    has_more:
+      type: boolean
+      description: |
+        True only when the negotiation is longer than the response carries.
+      example: false
 
 Bid:
   type: object

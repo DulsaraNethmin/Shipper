@@ -742,6 +742,12 @@ status="$(bid_post "$bid_customer_token" "verify-bid-job5-$$" /v1/jobs \
 counter_job="$(json "$WORKDIR/bid-job5.json" '["id"]')"
 move_job "$counter_job" Draft Open
 
+# bid_get <token> <path> <name> — one authenticated read, for SHIP-88's history.
+bid_get() {
+  curl -s -o "$WORKDIR/bid-$3.json" -D "$WORKDIR/bid-$3.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" "http://localhost:$VERIFY_PORT$2"
+}
+
 # counter_at <token> <key> <bid> <cents> <name> — one round of the negotiation.
 counter_at() {
   bid_post "$1" "$2" "/v1/jobs/$counter_job/bids/$3/counter" "{\"amount_cents\":$4}" "$5"
@@ -936,6 +942,28 @@ sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
 ok "a competitor's counter answers exactly what a bid that is not there answers — the refusal confirms nothing"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-88  only the latest valid offer is acceptable, and the database is what says so"
+
+# **This is what SHIP-92 is being handed.** Docs/11 §8 warns that the award's lock ordering has to be
+# designed against uq_bids_one_accepted_per_job rather than around it; these two constraints are the
+# other half, and they hold whatever order the award takes its locks in. The statements are
+# deliberately the naive ones — no lock, no status check — because that is what a plausible first
+# draft would write.
+refusal="$("$PSQL" "$DATABASE_URL" -tAc \
+  "update bids set status = 'Accepted' where id = '$round1';" 2>&1 || true)"
+grep -q 'ck_bids_superseded_is_not_live' <<<"$refusal" \
+  || fail "a superseded offer was awarded, or refused by something else: $refusal"
+ok "a superseded offer cannot be awarded — ck_bids_superseded_is_not_live, not a rule SHIP-92 has to remember"
+
+# Round 4 is the live head and the *customer* made it. Awarding it would bind the provider to a price
+# and a date they never offered.
+refusal="$("$PSQL" "$DATABASE_URL" -tAc \
+  "update bids set status = 'Accepted' where id = '$round4';" 2>&1 || true)"
+grep -q 'ck_bids_only_a_providers_offer_is_accepted' <<<"$refusal" \
+  || fail "the customer's own counter was awarded, or refused by something else: $refusal"
+ok "and neither can the customer's own counter — Docs/02 §1's \"provider commitment exists\", as a constraint"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-87  a retried counter adds no second link to the chain"
 
 # **The two mechanisms again, told apart the way the placement's checks tell them apart.** The key
@@ -973,6 +1001,14 @@ ok "and a retry the cache has forgotten is answered from the row — 200, the sa
   || fail "three requests under one key added more than one link to the chain"
 ok "one new link at the end of all three — the key is a column, not only a cache entry"
 
+# The provider's offer at the head of a chain *is* awardable, which is what makes the pair of
+# constraints a shape rather than a wall: a customer who wants their own number waits for the provider
+# to counter at it. Reverted immediately, because the checks below still need a live negotiation.
+"$PSQL" "$DATABASE_URL" -q -c "update bids set status = 'Accepted' where id = '$round5';" \
+  || fail "a provider's offer at the head of a chain could not be awarded"
+"$PSQL" "$DATABASE_URL" -q -c "update bids set status = 'Submitted' where id = '$round5';"
+ok "a provider's counter at the head of the chain is awardable — the customer waits for the offer rather than awarding their own"
+
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-87  countering does not move the job — Open → Negotiating is still SHIP-90's"
 
@@ -985,3 +1021,138 @@ after="$("$PSQL" "$DATABASE_URL" -tAc \
 [[ "$after" == "Open 1" ]] \
   || fail "the job reads '$after' (status, history rows), want 'Open 1' — a counter moves no job"
 ok "a job with five rounds of negotiation on it is still Open, with only the row that published it"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-88  GET /v1/jobs/{id}/bids/{bid_id}/history — the full chain stays readable"
+
+# Addressed through the *first* offer, which is the ordinary case: a client holding an old identifier
+# still gets the whole exchange.
+history_path="/v1/jobs/$counter_job/bids/$round1/history"
+
+status="$(curl -s -o "$WORKDIR/bid-hist-anon.json" -w '%{http_code}' "http://localhost:$VERIFY_PORT$history_path")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-hist-anon.json"; fail "an unauthenticated history read returned $status, want 401"; }
+
+# Read-only, so no Idempotency-Key — the middleware lets safe methods through untouched, and an
+# endpoint demanding one would be asking a client to generate a value per read.
+status="$(bid_get "$bid_customer_token" "$history_path" histcust)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-histcust.json"; fail "the customer's history read returned $status, want 200"; }
+ok "it needs a credential and no Idempotency-Key — nothing changes, so there is nothing to absorb"
+
+status="$(bid_get "$bid_provider_token" "$history_path" histprov)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-histprov.json"; fail "the provider's history read returned $status, want 200"; }
+diff -q "$WORKDIR/bid-histcust.json" "$WORKDIR/bid-histprov.json" >/dev/null \
+  || fail "the two parties see different histories; Docs/02 §4 gives both the same chain"
+ok "both parties read the negotiation, and they read the same thing"
+
+python3 - "$WORKDIR/bid-histprov.json" "$round1" "$round2" "$round3" "$round4" "$round5" \
+  <<'PY' || fail "the chain is not readable end to end"
+import json, sys
+
+page = json.load(open(sys.argv[1]))
+want = sys.argv[2:]
+
+if page["has_more"] or page["next_cursor"] is not None:
+    print("the history paged or reported itself truncated:", page, file=sys.stderr)
+    sys.exit(1)
+
+got = [entry["id"] for entry in page["data"]]
+if got != want:
+    print("the chain reads", got, "want", want, "oldest first", file=sys.stderr)
+    sys.exit(1)
+
+parties = [entry["offered_by"] for entry in page["data"]]
+if parties != ["provider", "customer", "provider", "customer", "provider"]:
+    print("the rounds are attributed", parties, file=sys.stderr)
+    sys.exit(1)
+
+amounts = [entry["amount_cents"] for entry in page["data"]]
+if amounts != [45000, 40000, 43000, 41500, 42000]:
+    print("an intermediate price was lost:", amounts, file=sys.stderr)
+    sys.exit(1)
+
+for i, entry in enumerate(page["data"][:-1]):
+    if entry["status"] != "superseded":
+        print("round", i + 1, "is", entry["status"], "want superseded", file=sys.stderr)
+        sys.exit(1)
+    if entry.get("superseded_by") != page["data"][i + 1]["id"]:
+        print("round", i + 1, "points at", entry.get("superseded_by"), file=sys.stderr)
+        sys.exit(1)
+
+head = page["data"][-1]
+if head["status"] != "submitted" or "superseded_by" in head:
+    print("the last round is not the live head:", head, file=sys.stderr)
+    sys.exit(1)
+PY
+ok "five rounds, oldest first, each at the price it was made at, each linked to the one that answered it"
+
+python3 - "$WORKDIR/bid-histprov.json" <<'PY' || fail "the history carries something of the customer's"
+import json, re, sys
+
+# **The response where the customer's own numbers reach a provider**, which makes it the sharpest case
+# for Docs/01 §4.3 in this domain. The counters are offers the customer deliberately made and are
+# meant to be read; the budget is not, and is not here in any form.
+allowed = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
+    "created_at", "updated_at",
+    "data", "next_cursor", "has_more",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised a provider:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the history is the same closed set of keys at every depth, and carries nothing of the customer's budget"
+
+status="$(bid_get "$bid_rival_token" "$history_path" histrival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-histrival.json"; fail "a competing provider read the negotiation: $status"; }
+ok "a competing provider cannot read it at all — a whole negotiation in one response is exactly what Docs/01 §4.3 keeps private"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-88  the record outlives the job, and a chain cannot fork"
+
+move_job "$counter_job" Open Cancelled
+
+status="$(bid_get "$bid_customer_token" "$history_path" histover)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-histover.json"; fail "the history on a cancelled job returned $status"; }
+[[ "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['data']))" "$WORKDIR/bid-histover.json")" == "5" ]] \
+  || fail "the chain shrank when the job ended; a record is most useful once the work is over"
+ok "both parties still read the whole chain after the job is cancelled — CustomerOf is asked, AwardableBy is not"
+
+# And a counter on it is refused, which is the customer's half of the check a provider meets as
+# eligibility: there is nothing a counter-offer could now lead to.
+status="$(counter_at "$bid_customer_token" "verify-bid-ctover-$$" "$round5" 39000 ctover)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-ctover.json"; fail "a counter on a cancelled job returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-ctover.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-ctover.json"; fail "expected code=bidding_bid_closed"; }
+ok "and a counter on a job that can no longer be awarded is refused — the negotiation is over"
+
+# A chain is a list rather than a tree. "At most one successor per offer" is true by construction, and
+# this is the direction the column shape does not give: two offers cannot name one counter as what
+# displaced them.
+refusal="$("$PSQL" "$DATABASE_URL" -tAc \
+  "update bids set superseded_by = '$round3' where id = '$round1';" 2>&1 || true)"
+grep -q 'uq_bids_one_successor' <<<"$refusal" \
+  || fail "a negotiation merged: two offers were displaced by one counter ($refusal)"
+ok "two offers cannot be displaced by the same counter — a chain is a list, not a tree"

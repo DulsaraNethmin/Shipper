@@ -244,6 +244,36 @@ func (postgresStore) lockBid(ctx context.Context, r db.Runner, id uuid.UUID) (Bi
 	return bid, nil
 }
 
+// readBid takes one bid by its identifier and holds nothing (SHIP-88).
+//
+// [postgresStore.lockBid] with the `FOR UPDATE` removed, and the difference is what the caller is
+// about to do. That one is read by a writer which decides against the status it reads; this one is
+// read by [Service.Chain], which decides nothing about the row beyond who may see it — and ownership
+// does not change under a reader.
+//
+// Two statements rather than one with a flag, because a lock is not a parameter of a query so much as
+// a statement about the transaction around it, and a `readBid(…, lock bool)` is exactly the shape
+// where somebody eventually passes `false` from a writer. The scan and the columns are shared, so the
+// duplication is one line of SQL.
+//
+// Scoped by the identifier alone, for the reason lockBid is: an addressed read has to be able to tell
+// "somebody else's" from "nobody's", and [Service.reachableBid] makes that judgement in Go.
+func (postgresStore) readBid(ctx context.Context, r db.Runner, id uuid.UUID) (Bid, error) {
+	const q = `
+		SELECT ` + bidColumns + `
+		FROM bids
+		WHERE id = $1`
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Bid{}, fmt.Errorf("bidding: %s: %w", id, ErrBidNotFound)
+	case err != nil:
+		return Bid{}, fmt.Errorf("bidding: reading bid %s: %w", id, err)
+	}
+	return bid, nil
+}
+
 // reviseOffer writes a revised price, timing and message (SHIP-85).
 //
 // # Three columns are absent from the SET list and each absence is a decision
@@ -374,4 +404,62 @@ func (postgresStore) linkSuccessor(ctx context.Context, r db.Runner, id, success
 		return Bid{}, fmt.Errorf("bidding: linking %s to its successor %s: %w", id, successor, err)
 	}
 	return bid, nil
+}
+
+// chain is every offer in one negotiation, oldest first (SHIP-88).
+//
+// # A negotiation is `(job_id, provider_id)`, and that is wider than a link chain on purpose
+//
+// Following `superseded_by` from the first row would produce the counters and nothing else. A
+// negotiation legitimately holds rows outside any one link chain: a withdrawn offer and the
+// replacement placed after it (SHIP-86 established that a provider who withdraws may bid again), and
+// eventually an expired offer and whatever followed it. **Those rows are record** — Docs/01 §4.3
+// requires the platform to keep every offer, counter-offer and withdrawal, and Docs/02 §4 keeps the
+// history readable — so a read that walked links would quietly omit exactly the rows somebody is most
+// likely to be asking about.
+//
+// `superseded_by` still reaches the caller on each row, so the links inside the set are legible; what
+// this refuses to do is let a broken link hide a row.
+//
+// # Ordering, and why `created_at` is enough
+//
+// Every offer in a chain is written by its own transaction, strictly after the one it answers, so
+// `created_at` — which is `now()`, the transaction timestamp — is strictly increasing along a chain.
+// `id` breaks a tie that this platform cannot currently produce and orders the same way if it ever
+// can, because these are UUIDv7 and time-ordered.
+//
+// Limited rather than paged. A negotiation is a handful of rounds between two people, not a
+// collection that grows without bound, and the cap is a truncation report in the envelope rather than
+// an invitation to ask for the rest — the reading `identity`'s device list takes.
+func (postgresStore) chain(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+	limit int,
+) ([]Bid, error) {
+	const q = `
+		SELECT ` + bidColumns + `
+		FROM bids
+		WHERE job_id = $1 AND provider_id = $2
+		ORDER BY created_at ASC, id ASC
+		LIMIT $3`
+
+	rows, err := r.Query(ctx, q, jobID, providerID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("bidding: reading the chain on %s for %s: %w", jobID, providerID, err)
+	}
+	defer rows.Close()
+
+	offers := make([]Bid, 0, limit)
+	for rows.Next() {
+		bid, err := scanBid(rows)
+		if err != nil {
+			return nil, fmt.Errorf("bidding: reading an offer on %s: %w", jobID, err)
+		}
+		offers = append(offers, bid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bidding: reading the chain on %s: %w", jobID, err)
+	}
+	return offers, nil
 }

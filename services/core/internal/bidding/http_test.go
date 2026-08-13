@@ -66,6 +66,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("PATCH /v1/jobs/{id}/bids/{bid_id}", handler.Revise())
 	mux.Handle("POST /v1/jobs/{id}/bids/{bid_id}/withdraw", handler.Withdraw())
 	mux.Handle("POST /v1/jobs/{id}/bids/{bid_id}/counter", handler.Counter())
+	mux.Handle("GET /v1/jobs/{id}/bids/{bid_id}/history", handler.History())
 	return mux
 }
 
@@ -160,6 +161,16 @@ func (w wire) counter(t *testing.T, caller uuid.UUID, job, bid uuid.UUID, key, b
 	t.Helper()
 	return as(t, w.router, caller, key,
 		"/v1/jobs/"+job.String()+"/bids/"+bid.String()+"/counter", body)
+}
+
+// history sends one GET against a bid's history (SHIP-88).
+//
+// No idempotency key: the route is read-only, the middleware lets safe methods through untouched, and
+// a key on a request that changes nothing would be a key stored for no reason.
+func (w wire) history(t *testing.T, caller uuid.UUID, job, bid uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+	return send(t, w.router, http.MethodGet, caller, "",
+		"/v1/jobs/"+job.String()+"/bids/"+bid.String()+"/history", "")
 }
 
 // placed is one offer on the fixture job, over the wire, with its identifier read back out.
@@ -309,10 +320,14 @@ func TestASecondOfferIs409WithItsOwnCode(t *testing.T) {
 // It is the same list as the `Bid` schema in contracts/paths/bidding.yaml, which is
 // `additionalProperties: false` for the same reason, and the same list
 // scripts/verify/61-bidding.sh asserts from outside Go.
-// **SHIP-87 adds two keys, and the mechanism worked exactly as it was built to.** Adding `offered_by`
-// and `superseded_by` to the response made all four existing subtests fail before a line of the new
-// tests had been written, which is what a closed set is for: each arrived as a deliberate entry here,
-// in the contract, and in the verify script, rather than as a schema change nobody read.
+// **SHIP-87 and SHIP-88 add two keys, and the mechanism worked exactly as it was built to.** Adding
+// `offered_by` and `superseded_by` to the response made all four existing subtests fail before a line
+// of the new tests had been written, which is what a closed set is for: the field arrived as a
+// deliberate entry here, in the contract, and in the verify script, rather than as a schema change
+// nobody read.
+//
+// The chain envelope's own two keys are here too, since it is a response carrying bids and is held to
+// the same set at every depth.
 var providerBidKeys = map[string]bool{
 	"id":            true,
 	"job_id":        true,
@@ -325,6 +340,11 @@ var providerBidKeys = map[string]bool{
 	"superseded_by": true,
 	"created_at":    true,
 	"updated_at":    true,
+
+	// The collection envelope of Docs/10 §4.5, which the history endpoint answers with.
+	"data":        true,
+	"next_cursor": true,
+	"has_more":    true,
 }
 
 // TestTheBidResponseCarriesNothingOfTheCustomers is SHIP-83's proof applied to the first
@@ -400,11 +420,12 @@ func TestTheBidResponseCarriesNothingOfTheCustomers(t *testing.T) {
 	}
 	responses["the withdrawal, 200"] = withdrawn.Body.Bytes()
 
-	// **SHIP-87 is the hardest case in this test and the reason it grew.** A counter-offer is an amount
-	// the *customer* chose, in a shape a provider reads — so a budget leaking through it would be doing
-	// so on the one path where an amount from the customer's side is legitimately present, which is
-	// exactly where a weaker test would stop looking. The counter is placed at 40000 cents, which is
-	// not the budget in any rendering.
+	// **SHIP-87 and SHIP-88 are the hardest two cases in this test and the reason it grew.** A
+	// counter-offer is an amount the *customer* chose, and the history is the response that carries it
+	// to a provider — so a budget leaking through either would be doing so on the one path where an
+	// amount from the customer's side is legitimately present, which is exactly where a weaker test
+	// would stop looking. The counter is placed at 40000 cents, which is not the budget in any
+	// rendering.
 	replaced := w.bid(t, w.provider, "wire-privacy-replace", validBody())
 	if replaced.Code != http.StatusCreated {
 		t.Fatalf("bidding again after the withdrawal = %d (%s)", replaced.Code, replaced.Body)
@@ -420,6 +441,15 @@ func TestTheBidResponseCarriesNothingOfTheCustomers(t *testing.T) {
 		t.Fatalf("the customer's counter = %d (%s)", countered.Code, countered.Body)
 	}
 	responses["the customer's counter, 201"] = countered.Body.Bytes()
+
+	// Read by the **provider**, deliberately. The customer reading their own job's negotiation could
+	// not leak anything to a competitor; the provider reading a chain that holds the customer's
+	// counters is the direction Docs/01 §4.3 is about.
+	chain := w.history(t, w.provider, w.job, replacedID)
+	if chain.Code != http.StatusOK {
+		t.Fatalf("the history = %d (%s)", chain.Code, chain.Body)
+	}
+	responses["the negotiation's history, 200"] = chain.Body.Bytes()
 
 	for how, body := range responses {
 		t.Run(how, func(t *testing.T) {
@@ -1242,5 +1272,78 @@ func TestACounterThatChangesNothingIsRefusedAtTheWire(t *testing.T) {
 	}
 	if got := decode[errorEnvelope](t, rec).Error.Code; got != string(httpx.CodeBadRequest) {
 		t.Errorf("the code is %q, want %q", got, httpx.CodeBadRequest)
+	}
+}
+
+// TestTheHistoryIsReadableByBothPartiesAndNobodyElse is SHIP-88's *Done when* at the wire, with the
+// privacy rule that guards it.
+//
+// Docs/02 §4 keeps bid history visible to the customer and the bidding provider; a competing provider
+// gets the answer a bid that does not exist gets. The administrator's view is SHIP-96's.
+func TestTheHistoryIsReadableByBothPartiesAndNobodyElse(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-history-base")
+
+	countered := w.counter(t, w.customer, w.job, placed, "wire-history-counter", `{"amount_cents": 40000}`)
+	if countered.Code != http.StatusCreated {
+		t.Fatalf("the counter = %d (%s)", countered.Code, countered.Body)
+	}
+
+	for who, caller := range map[string]uuid.UUID{"the customer": w.customer, "the provider": w.provider} {
+		rec := w.history(t, caller, w.job, placed)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s reading the history = %d (%s)", who, rec.Code, rec.Body)
+		}
+
+		var page struct {
+			Data       []map[string]any `json:"data"`
+			NextCursor *string          `json:"next_cursor"`
+			HasMore    bool             `json:"has_more"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+			t.Fatalf("the history is not JSON: %v (%s)", err, rec.Body)
+		}
+		if len(page.Data) != 2 {
+			t.Fatalf("%s sees %d offers, want the offer and the counter", who, len(page.Data))
+		}
+		if page.HasMore {
+			t.Errorf("a two-entry history reports itself truncated")
+		}
+		if page.NextCursor != nil {
+			t.Errorf("the history carries a cursor; it does not page")
+		}
+		if page.Data[0]["offered_by"] != "provider" || page.Data[1]["offered_by"] != "customer" {
+			t.Errorf("%s sees the rounds in the wrong order or wrongly attributed: %s", who, rec.Body)
+		}
+		if page.Data[0]["status"] != "superseded" {
+			t.Errorf("the answered offer is %v, want superseded", page.Data[0]["status"])
+		}
+		if page.Data[0]["superseded_by"] != page.Data[1]["id"] {
+			t.Errorf("the first round points at %v, want the second, %v",
+				page.Data[0]["superseded_by"], page.Data[1]["id"])
+		}
+	}
+
+	rival := newVerifiedProvider(t, w.pool, "wire-history-rival@example.com", "+61400000879")
+	declare(t, w.pool, rival, "VIC")
+	addVehicle(t, w.pool, rival, "BID879")
+
+	refused := w.history(t, rival, w.job, placed)
+	if refused.Code != http.StatusNotFound {
+		t.Fatalf("a competing provider read the negotiation: %d (%s)", refused.Code, refused.Body)
+	}
+}
+
+// TestTheHistoryNeedsNoIdempotencyKey is the read-only half of SHIP-15's rule.
+//
+// Every *state-changing* request carries a key and is refused without one. A `GET` changes nothing, so
+// a key on it would be a key stored for no reason — and an endpoint that demanded one would be telling
+// a client to generate a value per read.
+func TestTheHistoryNeedsNoIdempotencyKey(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-history-nokey-base")
+
+	if rec := w.history(t, w.provider, w.job, placed); rec.Code != http.StatusOK {
+		t.Fatalf("a history read with no key = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
 }

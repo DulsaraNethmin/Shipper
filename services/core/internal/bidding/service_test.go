@@ -1615,8 +1615,9 @@ func TestRevisingAndWithdrawingRefuseAConnectionPool(t *testing.T) {
 //	provider can counter          TestAProviderCountersTheCustomersCounter
 //	supersedes the prior offer    both of the above, on the stored row rather than the return value
 //
-// The chain those counters build is SHIP-88's, and so is everything that reads it or holds the award
-// to it.
+// SHIP-88's *Done when* — "only the latest valid offer is acceptable; full chain remains readable" —
+// is TestOnlyTheHeadOfAChainCanBeCountered and TestTheDatabaseRefusesToAwardADisplacedOffer for the
+// first half, and TestTheChainIsReadableAfterSeveralRounds for the second.
 
 // TestACustomerCountersTheProvidersOffer is the first half of SHIP-87's *Done when*, and the first
 // time in this domain that a customer changes anything.
@@ -2298,14 +2299,13 @@ func TestConcurrentCountersLeaveExactlyOneLiveOffer(t *testing.T) {
 	}
 }
 
-// --- SHIP-87: what a counter does to the offer before last ---------------------------------------
+// --- SHIP-88: only the latest valid offer, and the chain that stays readable ----------------------
 
-// TestOnlyTheHeadOfAChainCanBeCountered is what "each counter supersedes the prior offer" means for
-// the offer before last.
+// TestOnlyTheHeadOfAChainCanBeCountered is the application half of SHIP-88's first *Done when*.
 //
 // A superseded offer is not the latest valid one, so it cannot be answered. Docs/02 §4 says only the
-// latest valid offer can be acted on, and this is that rule met through the endpoint — where the
-// refusal is legible. SHIP-88 makes it a constraint as well.
+// latest valid offer can be accepted; this is the same rule reached through the endpoint rather than
+// through the constraint, and the refusal is legible where the constraint's would not be.
 func TestOnlyTheHeadOfAChainCanBeCountered(t *testing.T) {
 	m := newMarket(t)
 
@@ -2372,5 +2372,314 @@ func TestAnAcceptedOfferCannotBeCountered(t *testing.T) {
 	if _, _, err := m.counter(t, m.customer, m.job, placed.ID,
 		counterOf(40000, "key-accepted-counter-c")); !errors.Is(err, ErrBidAccepted) {
 		t.Fatalf("countering an accepted offer = %v, want ErrBidAccepted", err)
+	}
+}
+
+// TestTheDatabaseRefusesToAwardADisplacedOffer is the half of SHIP-88's *Done when* that application
+// logic cannot have, and it is the entry SHIP-92 is being handed.
+//
+// "Only the latest valid offer is acceptable" is `ck_bids_superseded_is_not_live`, an ordinary column
+// constraint made possible by putting the chain link on the *displaced* row. An award transaction
+// that wrote `status = 'Accepted'` over a countered offer — because it forgot to re-read the status
+// under its lock, or read it before taking one — is refused by PostgreSQL rather than by a rule it had
+// to remember.
+//
+// The statement below is deliberately the naive one: no lock, no status check, exactly what a
+// plausible first draft of SHIP-92 would do.
+func TestTheDatabaseRefusesToAwardADisplacedOffer(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-stale"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-award-stale-c")); err != nil {
+		t.Fatalf("countering: %v", err)
+	}
+
+	_, err = m.pool.Exec(t.Context(), `UPDATE bids SET status = 'Accepted' WHERE id = $1`, placed.ID)
+	if err == nil {
+		t.Fatal("a superseded offer was awarded; ck_bids_superseded_is_not_live is what makes " +
+			"\"only the latest valid offer is acceptable\" true for SHIP-92 rather than remembered")
+	}
+	if !strings.Contains(err.Error(), "ck_bids_superseded_is_not_live") {
+		t.Errorf("expected ck_bids_superseded_is_not_live to refuse the award, got: %v", err)
+	}
+}
+
+// TestTheDatabaseRefusesToAwardACustomersOwnOffer is the second constraint SHIP-92 inherits.
+//
+// With counters, the head of a chain is sometimes the customer's own offer — and awarding that would
+// bind a provider to a price and a date they never agreed to, with `uq_bids_one_accepted_per_job`
+// allowing it and nothing else noticing. Docs/02 §1 defines Awarded as "Customer has accepted one
+// **provider** bid; provider commitment exists", and `ck_bids_only_a_providers_offer_is_accepted` is
+// that sentence.
+//
+// It costs a customer nothing: a customer who wants their own number accepted waits for the provider
+// to counter at it, and that row is the provider's commitment and is awardable.
+func TestTheDatabaseRefusesToAwardACustomersOwnOffer(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-customers"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	theirs, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-award-customers-c"))
+	if err != nil {
+		t.Fatalf("countering: %v", err)
+	}
+
+	_, err = m.pool.Exec(t.Context(), `UPDATE bids SET status = 'Accepted' WHERE id = $1`, theirs.ID)
+	if err == nil {
+		t.Fatal("the customer's own counter was awarded; a provider would be committed to terms they " +
+			"never agreed to")
+	}
+	if !strings.Contains(err.Error(), "ck_bids_only_a_providers_offer_is_accepted") {
+		t.Errorf("expected ck_bids_only_a_providers_offer_is_accepted to refuse it, got: %v", err)
+	}
+
+	// And the provider's counter at the same number *is* awardable, which is what makes the
+	// constraint a shape rather than a wall.
+	mine, _, err := m.counter(t, m.provider, m.job, theirs.ID, counterOf(40000, "key-award-agreed"))
+	if err != nil {
+		t.Fatalf("the provider's counter: %v", err)
+	}
+	if _, err := m.pool.Exec(t.Context(), `UPDATE bids SET status = 'Accepted' WHERE id = $1`, mine.ID); err != nil {
+		t.Fatalf("the provider's own counter could not be awarded: %v", err)
+	}
+}
+
+// TestTheChainIsReadableAfterSeveralRounds is the second half of SHIP-88's *Done when*.
+//
+// Docs/01 §4.3 requires the platform to "record all offers, counter-offers, withdrawals, and
+// acceptances", and Docs/02 §4 keeps that history visible. **Nothing is deleted and nothing is
+// overwritten**: every round is still there at the amount it was made at, in order, with the link
+// that says which offer answered which.
+//
+// Five rounds rather than two, because a two-round chain passes against an implementation that keeps
+// only the previous offer.
+func TestTheChainIsReadableAfterSeveralRounds(t *testing.T) {
+	m := newMarket(t)
+
+	head, _, err := m.place(t, m.provider, m.job, offer("key-chain-0"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	want := []struct {
+		amount int64
+		by     Party
+	}{{45000, PartyProvider}}
+
+	callers := []uuid.UUID{m.customer, m.provider, m.customer, m.provider}
+	for i, caller := range callers {
+		amount := int64(40000 + i*500)
+		head, _, err = m.counter(t, caller, m.job, head.ID, counterOf(amount, fmt.Sprintf("key-chain-%d", i+1)))
+		if err != nil {
+			t.Fatalf("round %d: %v", i+1, err)
+		}
+		by := PartyCustomer
+		if caller == m.provider {
+			by = PartyProvider
+		}
+		want = append(want, struct {
+			amount int64
+			by     Party
+		}{amount, by})
+	}
+
+	offers, truncated, err := m.chain(t, m.customer, m.job, head.ID)
+	if err != nil {
+		t.Fatalf("reading the chain: %v", err)
+	}
+	if truncated {
+		t.Error("a five-round chain reports itself truncated")
+	}
+	if len(offers) != len(want) {
+		t.Fatalf("the chain holds %d offers after five rounds, want %d — a superseded offer is "+
+			"neither deleted nor overwritten", len(offers), len(want))
+	}
+
+	for i, expected := range want {
+		got := offers[i]
+		if got.AmountCents != expected.amount {
+			t.Errorf("round %d is %d cents, want %d — an intermediate price was lost",
+				i, got.AmountCents, expected.amount)
+		}
+		if got.OfferedBy != expected.by {
+			t.Errorf("round %d was offered by %s, want %s", i, got.OfferedBy, expected.by)
+		}
+
+		switch i {
+		case len(want) - 1:
+			if got.Status != StatusSubmitted || got.SupersededBy != uuid.Nil {
+				t.Errorf("the last round is %s with successor %s, want the live head",
+					got.Status, got.SupersededBy)
+			}
+		default:
+			if got.Status != StatusSuperseded {
+				t.Errorf("round %d is %s, want Superseded", i, got.Status)
+			}
+			if got.SupersededBy != offers[i+1].ID {
+				t.Errorf("round %d points at %s, want the round that answered it, %s",
+					i, got.SupersededBy, offers[i+1].ID)
+			}
+		}
+	}
+
+	// The provider reads the identical chain, which is the other half of "visible to the customer and
+	// the bidding provider". Addressed through the *first* offer rather than the head, because a
+	// client holding an old identifier is the ordinary case for a history.
+	byProvider, _, err := m.chain(t, m.provider, m.job, offers[0].ID)
+	if err != nil {
+		t.Fatalf("the provider could not read their own chain: %v", err)
+	}
+	if len(byProvider) != len(offers) {
+		t.Errorf("the provider sees %d offers and the customer sees %d", len(byProvider), len(offers))
+	}
+}
+
+// TestOnlyAPartyToTheNegotiationCanReadTheChain is Docs/01 §4.3's second line at its sharpest.
+//
+// "Treat provider bid price as private from competing providers" — and this endpoint is the one place
+// a competitor could otherwise read an entire negotiation at once: every price, every counter, every
+// commitment about timing. A rival meets the answer a bid that does not exist gets.
+func TestOnlyAPartyToTheNegotiationCanReadTheChain(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-chain-privacy"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-chain-privacy-c")); err != nil {
+		t.Fatalf("countering: %v", err)
+	}
+
+	rival := newVerifiedProvider(t, m.pool, "chain-rival@example.com", "+61400000875")
+	declare(t, m.pool, rival, "VIC")
+	addVehicle(t, m.pool, rival, "BID875")
+
+	// The rival bids on the same job, so they have a negotiation of their own on it — which is
+	// exactly the caller who might expect to reach the other one.
+	if _, _, err := m.place(t, rival, m.job, offer("key-chain-rival")); err != nil {
+		t.Fatalf("the rival's own bid: %v", err)
+	}
+
+	if _, _, err := m.chain(t, rival, m.job, placed.ID); !errors.Is(err, ErrNotBidOwner) {
+		t.Fatalf("a competing provider read another provider's negotiation: %v", err)
+	}
+
+	stranger := newCustomer(t, m.pool, "chain-stranger@example.com", "+61400000876")
+	if _, _, err := m.chain(t, stranger, m.job, placed.ID); !errors.Is(err, ErrNotBidOwner) {
+		t.Fatalf("a stranger read a negotiation: %v", err)
+	}
+}
+
+// TestAChainHoldsOnlyItsOwnNegotiation is the other direction of the same rule.
+//
+// A refusal is not the only way a competitor's price could leak: a read scoped by job alone would
+// answer the caller's own request with everybody's offers in it. The negotiation is
+// `(job_id, provider_id)`, and this is what says the second half of that pair is really in the query.
+func TestAChainHoldsOnlyItsOwnNegotiation(t *testing.T) {
+	m := newMarket(t)
+
+	mine, _, err := m.place(t, m.provider, m.job, offer("key-chain-scope"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	rival := newVerifiedProvider(t, m.pool, "chain-scope-rival@example.com", "+61400000877")
+	declare(t, m.pool, rival, "VIC")
+	addVehicle(t, m.pool, rival, "BID877")
+
+	theirOffer := offer("key-chain-scope-rival")
+	theirOffer.AmountCents = 777701
+	if _, _, err := m.place(t, rival, m.job, theirOffer); err != nil {
+		t.Fatalf("the rival's bid: %v", err)
+	}
+
+	offers, _, err := m.chain(t, m.customer, m.job, mine.ID)
+	if err != nil {
+		t.Fatalf("reading the chain: %v", err)
+	}
+	if len(offers) != 1 {
+		t.Fatalf("the chain holds %d offers, want 1 — it is one negotiation, not every bid on the job", len(offers))
+	}
+	for _, o := range offers {
+		if o.AmountCents == 777701 {
+			t.Error("the chain carries a competing provider's price")
+		}
+	}
+}
+
+// TestTheChainStaysReadableAfterTheJobIsOver is why [Negotiation.CustomerOf] is a separate question
+// from [Negotiation.AwardableBy].
+//
+// A record is at its most useful once the work is over: the customer reconstructing why they awarded
+// elsewhere, the provider checking what they committed to, an administrator handling a dispute
+// (Docs/02 §4). A read gated on the job still being live would go dark exactly then.
+func TestTheChainStaysReadableAfterTheJobIsOver(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-chain-after"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	countered, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-chain-after-c"))
+	if err != nil {
+		t.Fatalf("countering: %v", err)
+	}
+
+	transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+
+	for who, caller := range map[string]uuid.UUID{"the customer": m.customer, "the provider": m.provider} {
+		offers, _, err := m.chain(t, caller, m.job, countered.ID)
+		if err != nil {
+			t.Fatalf("%s could not read the chain on a cancelled job: %v", who, err)
+		}
+		if len(offers) != 2 {
+			t.Errorf("%s sees %d offers on a cancelled job, want 2 — the record outlives the job", who, len(offers))
+		}
+	}
+}
+
+// TestAWithdrawnOfferAndItsReplacementAreBothInTheChain is why the read is a negotiation rather than
+// a walk along the links.
+//
+// SHIP-86 established that a provider who withdraws may bid again, so a negotiation legitimately
+// holds rows outside any one link chain. Following `superseded_by` from the first row would omit
+// exactly the rows somebody is most likely to be asking about — and Docs/01 §4.3 requires every
+// withdrawal to be recorded, not merely retained where a query happens to look.
+func TestAWithdrawnOfferAndItsReplacementAreBothInTheChain(t *testing.T) {
+	m := newMarket(t)
+
+	first, _, err := m.place(t, m.provider, m.job, offer("key-chain-withdraw"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, err := m.withdraw(t, m.provider, m.job, first.ID); err != nil {
+		t.Fatalf("withdrawing: %v", err)
+	}
+
+	replacement := offer("key-chain-replace")
+	replacement.AmountCents = 41000
+	second, _, err := m.place(t, m.provider, m.job, replacement)
+	if err != nil {
+		t.Fatalf("bidding again: %v", err)
+	}
+
+	offers, _, err := m.chain(t, m.customer, m.job, second.ID)
+	if err != nil {
+		t.Fatalf("reading the chain: %v", err)
+	}
+	if len(offers) != 2 {
+		t.Fatalf("the chain holds %d offers, want 2 — a withdrawn offer is record and stays", len(offers))
+	}
+	if offers[0].ID != first.ID || offers[0].Status != StatusWithdrawn {
+		t.Errorf("the first entry is %s at %s, want the withdrawn offer %s",
+			offers[0].ID, offers[0].Status, first.ID)
+	}
+	if offers[1].ID != second.ID {
+		t.Errorf("the second entry is %s, want the replacement %s", offers[1].ID, second.ID)
 	}
 }

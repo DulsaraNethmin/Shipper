@@ -262,6 +262,34 @@ func bidFrom(b Bid) bidResponse {
 	return response
 }
 
+// chainResponse is one negotiation's offers, oldest first (SHIP-88).
+//
+// The collection envelope of Docs/10 §4.5, so a client tells a collection from a single resource
+// without knowing the endpoint. `next_cursor` is always null: this does not page, for the reason
+// [maxChainLength] gives, and `has_more` is a truncation report rather than an invitation to ask for
+// the rest — the reading `identity`'s device list takes and states.
+//
+// **The element type is the same [bidResponse] every other endpoint here answers with**, which is
+// what keeps the closed key set one list rather than two. A separate "offer in a history" shape would
+// be a second place for a field to be added without anybody noticing it had reached a provider — and
+// this is the response where the *customer's* numbers reach one.
+type chainResponse struct {
+	Data       []bidResponse `json:"data"`
+	NextCursor *string       `json:"next_cursor"`
+	HasMore    bool          `json:"has_more"`
+}
+
+func chainFrom(offers []Bid, truncated bool) chainResponse {
+	// A non-nil empty slice, so the field is `[]` rather than `null`. Unreachable through the
+	// endpoint — a caller reaches a chain by naming an offer in it — and written anyway, because the
+	// shape must not depend on that staying true.
+	data := make([]bidResponse, 0, len(offers))
+	for _, offer := range offers {
+		data = append(data, bidFrom(offer))
+	}
+	return chainResponse{Data: data, HasMore: truncated}
+}
+
 // timestamp renders an instant the way every other endpoint does, in UTC with milliseconds.
 func timestamp(t time.Time) string {
 	if t.IsZero() {
@@ -641,6 +669,64 @@ func (h *Handler) Counter() http.Handler {
 			status = http.StatusCreated
 		}
 		httpx.WriteJSON(w, status, bidFrom(bid))
+		return nil
+	})
+}
+
+// History handles GET /v1/jobs/{id}/bids/{bid_id}/history (SHIP-88).
+//
+// SHIP-88's *Done when* is "only the latest valid offer is acceptable; **full chain remains
+// readable**". The first half is a database constraint (000502's `ck_bids_superseded_is_not_live`);
+// this is the second.
+//
+// # What it is and, as importantly, what it is not
+//
+// **One negotiation's offers, addressed through any offer in it.** Docs/02 §4 keeps bid history
+// visible to the customer, the bidding provider and administrators, and this serves the first two —
+// the administrator's view arrives with **SHIP-96**, which owns the visibility rules in full and is
+// where an administrator's wider reach belongs.
+//
+// It is deliberately **not** `GET /v1/jobs/{id}/bids`. That path is the customer's comparison of
+// *every* provider's offer side by side, which routes_bidding.go reserved for SHIP-102 by way of
+// SHIP-96 at SHIP-84 — a different resource with a different privacy rule, since one provider may
+// never see another's price. Serving it here would have taken that ticket's design.
+//
+// Read-only, so no `Idempotency-Key`: the middleware lets safe methods through untouched, and a key
+// on a request that changes nothing would be a key stored for no reason.
+//
+// # Two callers, and the one this file has to be most careful about
+//
+// The customer sees the provider's prices, which Docs/01 §4.3 explicitly wants — "allow a customer to
+// compare price, timing, provider profile". The provider sees the customer's *counters*, which is new
+// and is the shape worth stating: an amount the customer chose, in a response that reaches a
+// provider. **It is not the budget.** Docs/01 §4.3 makes the customer's private maximum unreachable
+// in any form, and nothing in this package reads a job at all; a counter-offer is a number the
+// customer deliberately offered to this provider, and withholding it would leave a counter-offer
+// endpoint whose counters nobody can read. Docs/11 §3 states the distinction and reports the one
+// consequence a customer should be told about.
+func (h *Handler) History() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		callerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, bidID, err := pathIDs(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		offers, truncated, err := h.svc.Chain(r.Context(), pool, callerID, jobID, bidID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, chainFrom(offers, truncated))
 		return nil
 	})
 }

@@ -82,7 +82,13 @@ import (
 // role claim in a token is evidence about the token rather than the fact. A customer whose token
 // claims `provider` is still recognised as the customer of their own job, which is what CLAUDE.md
 // means by no authorisation decision on the device.
-
+//
+// # And the history is a `GET` under the same offer
+//
+// SHIP-88's "full chain remains readable". It is deliberately **not** `GET /v1/jobs/{id}/bids`, which
+// this file reserved for SHIP-102's customer comparison at SHIP-84 and which is a different resource
+// with a different privacy rule — every provider's offer side by side, where this is one negotiation's.
+// Read-only, so the idempotency middleware lets it through untouched and it carries no key.
 func init() {
 	register(
 		Route{
@@ -112,6 +118,13 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Counter() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs/{id}/bids/{bid_id}/history",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).History() },
 		},
 	)
 }

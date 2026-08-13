@@ -45,6 +45,18 @@ const (
 	// delivery this marketplace arranges and near enough to catch a year typed wrong, which is the
 	// mistake this exists for — 2027 for 2026 sails past every other check.
 	maxLeadTime = 2 * 365 * 24 * time.Hour
+
+	// maxChainLength bounds one negotiation's history in a single response (SHIP-88).
+	//
+	// A truncation report rather than a page, which is the reading `identity`'s device list takes and
+	// for the same reason: two people haggling over one delivery exchange a handful of rounds, so a
+	// cursor would be machinery for a case that does not occur — while an unbounded response is a
+	// promise this API should not make about a set no constraint bounds. `has_more` says the answer
+	// was cut rather than inviting anybody to ask for the rest.
+	//
+	// Docs/02 §4 requires the history to remain visible, and a hundred rounds is far past the point
+	// at which the next one is the one somebody needs.
+	maxChainLength = 100
 )
 
 // Service is this domain's rules.
@@ -407,7 +419,7 @@ func (s *Service) CounterOffer(
 	// The lock is taken before anything is decided, and it is what serialises two counters against
 	// one offer. The second waits here, then re-reads at a fresh snapshot: either it is the retry
 	// answered below, or it meets a head that is already 'Superseded' and is refused legibly.
-	answered, err := s.reachableBid(ctx, r, callerID, jobID, bidID)
+	answered, err := s.reachableBid(ctx, r, callerID, jobID, bidID, true)
 	if err != nil {
 		return Bid{}, false, err
 	}
@@ -486,6 +498,61 @@ func (s *Service) CounterOffer(
 	return counter, true, nil
 }
 
+// Chain is every offer in one negotiation, oldest first (SHIP-88).
+//
+// SHIP-88's *Done when* is "only the latest valid offer is acceptable; **full chain remains
+// readable**", and this is the second half. Docs/02 §4: "Bid history remains visible to the customer,
+// bidding provider, and administrators."
+//
+// `truncated` reports that the negotiation is longer than [maxChainLength] rather than offering a
+// page. See that constant.
+//
+// # Who may read it, and the two rules that are not the same rule
+//
+// **Both parties to the negotiation, and nobody else.** The provider it is with, and the customer who
+// owns the job — the two Docs/02 §4 names, less the administrator, whose view is SHIP-96's along with
+// the rest of the visibility rules. A *competing* provider is refused with the 404 a bid that does not
+// exist gets, which is Docs/01 §4.3's second line: another provider's price, timing and counters are
+// private, and this endpoint is the one place a competitor could otherwise read a whole negotiation
+// at once.
+//
+// **The customer's budget is not in this shape**, because no shape in this package carries anything
+// of the job. What *is* here and is new is an amount the customer chose — their counter — reaching a
+// provider. That is not the budget and Docs/11 §3 states the distinction rather than leaving it to be
+// inferred: Docs/01 §4.3 forbids the platform disclosing the customer's private maximum, and a
+// counter-offer is an offer the customer deliberately made to this provider.
+//
+// # It keeps working after the job ends, deliberately
+//
+// [Negotiation.CustomerOf] is asked and [Negotiation.AwardableBy] is not. A record is at its most
+// useful once the job is over — the customer reconstructing why they awarded elsewhere, the provider
+// checking what they committed to, an administrator handling a dispute — and a read gated on the job
+// still being live would go dark exactly then.
+//
+// No transaction and no lock. This is a read, and a chain that changed under it would produce an
+// older row beside a newer one rather than an inconsistent one.
+func (s *Service) Chain(
+	ctx context.Context,
+	r db.Runner,
+	callerID, jobID, bidID uuid.UUID,
+) ([]Bid, bool, error) {
+	answered, err := s.reachableBid(ctx, r, callerID, jobID, bidID, false)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// One more than the cap, so that "there are more" is read off the query rather than off a second
+	// count that could disagree with it.
+	offers, err := s.store.chain(ctx, r, answered.bid.JobID, answered.bid.ProviderID, maxChainLength+1)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(offers) > maxChainLength {
+		return offers[:maxChainLength], true, nil
+	}
+	return offers, false, nil
+}
+
 // reached is a bid the caller may act on, and which side of the negotiation they are.
 type reached struct {
 	bid Bid
@@ -517,19 +584,26 @@ type reached struct {
 // the two cannot both be true — `users.role` is immutable (000005) and SHIP-81's filter excludes a
 // job's own customer from bidding on it.
 //
-// The row is taken `FOR UPDATE`, because its one caller reads a status and decides against it — and
-// that decision is only one decision while the lock is held. SHIP-88's chain read needs the same
-// lookup without the lock and will add the seam for it.
+// `lock` is true for a writer and false for a reader. A writer needs the row held for the rest of the
+// transaction, because it reads a status and decides against it; a reader taking a lock would be
+// taking one it does not need and, on the pool, would take and release it inside the statement
+// anyway.
 func (s *Service) reachableBid(
 	ctx context.Context,
 	r db.Runner,
 	callerID, jobID, bidID uuid.UUID,
+	lock bool,
 ) (reached, error) {
 	if bidID == uuid.Nil || jobID == uuid.Nil || callerID == uuid.Nil {
 		return reached{}, fmt.Errorf("bidding: %s on %s: %w", bidID, jobID, ErrBidNotFound)
 	}
 
-	bid, err := s.store.lockBid(ctx, r, bidID)
+	read := s.store.readBid
+	if lock {
+		read = s.store.lockBid
+	}
+
+	bid, err := read(ctx, r, bidID)
 	if err != nil {
 		return reached{}, err
 	}
