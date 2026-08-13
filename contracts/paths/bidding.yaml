@@ -678,6 +678,166 @@ BidHistory:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+AwardJob:
+  post:
+    operationId: awardJob
+    summary: Award the job to one offer
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Accepts one provider's offer and moves the job to `awarded`, in a single transaction (SHIP-92).
+
+      **Only the customer who owns the job may award it** (Docs/02 §3). Anybody else — including the
+      provider whose offer it is — answers `404`, byte-identically to a job that does not exist. The
+      refusal is made before the offer in the body is read, so this endpoint cannot be used to find
+      out whether an identifier names a real bid.
+
+      ## The offer travels in the body
+
+      ```json
+      { "bid_id": "0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0" }
+      ```
+
+      A verb on the **job**, not on the offer, because the job is what moves. `withdraw` and `counter`
+      act on an offer and leave the job where it is; this ends the bidding on it.
+
+      There is no field for the status of anything. A bid's status is the platform's and so is a
+      job's, and unknown fields are refused, so a client sending one is told it does not exist rather
+      than having it ignored.
+
+      ## What has to be true
+
+      | | |
+      |---|---|
+      | The job is yours | otherwise `404` |
+      | The bid is on **this** job | otherwise `404` — a real offer paired with the wrong job names nothing |
+      | The job can still be awarded | otherwise `conflict`: it has already been awarded, cancelled, or has expired |
+      | The offer is **live** | otherwise `bidding_bid_closed`: it has been withdrawn, superseded, rejected or has expired |
+      | The offer is a **provider's** | otherwise `bidding_wrong_party`: awarding your own counter would commit a provider to terms they never agreed to |
+
+      They are checked in that order, and the order matters on a job you have already awarded. Since
+      the award closes every other offer (below), "that offer is closed" and "you have already awarded
+      this job" become the same fact about every offer on it — and only the second tells you where to
+      look, so it is the one you are given.
+
+      **Only the latest offer in a negotiation can be awarded.** Each counter supersedes the one it
+      answers, so the offer you award is the one with no `superseded_by` — read
+      `GET /v1/jobs/{id}/bids/{bid_id}/history` if you are not sure which that is.
+
+      If you want your own counter-offer accepted, wait for the provider to counter back at your
+      number. That offer is their commitment, and it is the one you award.
+
+      ## Awarding twice
+
+      **Retry this request as often as you need to.** Two separate mechanisms make that safe, and they
+      cover different retries:
+
+      | What you send | What answers | What you get |
+      |---|---|---|
+      | the same `Idempotency-Key`, soon | the stored response | the original `200`, byte for byte, with `Idempotency-Replayed: true` |
+      | the same key, much later, or a **fresh** key | the accepted offer itself | `200` with the same bid, and nothing further recorded |
+      | the same key naming a **different** offer | neither | `409 idempotency_key_reused` |
+
+      The middle row is the one that matters and the one you should design against. A phone that lost
+      its connection, was restarted and generated a fresh key for the same intent must not be told its
+      award failed when it succeeded — so the guarantee does not depend on the key at all. An award is
+      an update of a row that already exists, so applying it twice reaches the state applying it once
+      reaches; the accepted offer *is* the record of your request, and it outlives any cache.
+
+      The last row is not a retry, and it is refused on purpose. A key identifies one request, not an
+      intention: answering it from the first request's response would tell you that something you never
+      sent had succeeded. Generate one key per action.
+
+      Awarding a **different** offer under a **fresh** key on a job you have already awarded is
+      `conflict`. One job, one accepted bid — enforced by the database rather than by a check.
+
+      ## Every other offer on the job closes with it
+
+      In the same transaction, every offer on the job that was still `submitted` becomes `rejected`
+      (SHIP-93) — Docs/02 §3: "awarding a job atomically marks one bid accepted and all others
+      closed". One award, one accepted offer, and nothing left live on the job.
+
+      Offers that had **already** ended keep the status that says how they ended. A `superseded` offer
+      stays `superseded`, a `withdrawn` one stays `withdrawn`, an `expired` one stays `expired`: the
+      status is the record of what happened to an offer, and the award did not happen to those.
+
+      For a **provider**, this is where an offer goes when somebody else wins the job. It is not a
+      notification — poll your own bids, or wait for the push — and it is final: a `rejected` offer
+      can no longer be revised, withdrawn or countered, and all three answer `bidding_bid_closed`.
+
+      Nothing about the closed offers travels in the response. This endpoint answers with the offer
+      you accepted; the rest of the job's bids are read where they were always read.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/BidAward'
+    responses:
+      '200':
+        description: |
+          The offer is accepted and the job is `awarded`. The same `200` answers an award that had
+          already been made, in which case nothing further was recorded.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Bid'
+      '400':
+        description: |
+          A malformed job identifier in the path, an unknown field in the body, or a missing
+          `Idempotency-Key` (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such job — or one that is not yours, or an offer that is not on it. These are one answer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        $ref: '#/JobNotAwardable'
+      '422':
+        description: |
+          `bid_id` is missing or is not an identifier (`validation_failed`, with `details` naming the
+          field).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- shared responses -------------------------------------------------------------------------
 
 BidNoLongerYours:
@@ -688,6 +848,24 @@ BidNoLongerYours:
     |---|---|
     | `bidding_bid_accepted` | The customer awarded this bid. Show them the job they have won |
     | `bidding_bid_closed` | The offer is rejected, expired, superseded — or, for a revision, already withdrawn. Show the feed |
+    | `idempotency_key_reused` | This key was used for a *different* request. Generate a new one |
+  headers:
+    X-Request-Id:
+      $ref: '../openapi.yaml#/components/headers/RequestID'
+  content:
+    application/json:
+      schema:
+        $ref: '../openapi.yaml#/components/schemas/Error'
+
+JobNotAwardable:
+  description: |
+    The award did not happen. Four codes, and they lead to three different places:
+
+    | `error.code` | What happened |
+    |---|---|
+    | `conflict` | The job can no longer be awarded — you have already awarded it, or it was cancelled or expired. Reload the job |
+    | `bidding_bid_closed` | The offer you named is over: withdrawn, superseded, rejected or expired. Reload the job's offers and pick another |
+    | `bidding_wrong_party` | That is your own counter-offer. Award one the provider made — wait for them to counter at your number if that is what you want accepted |
     | `idempotency_key_reused` | This key was used for a *different* request. Generate a new one |
   headers:
     X-Request-Id:
@@ -845,6 +1023,27 @@ BidCounter:
         Replaces the conditions accompanying the offer. Send it blank to remove them.
       example: Happy at this price if you can make it Thursday morning.
 
+BidAward:
+  type: object
+  additionalProperties: false
+  required: [bid_id]
+  description: |
+    Which offer you are accepting. One field, and it is the only body in this file that names a bid —
+    every other endpoint here has the offer in its path, because every other endpoint acts on the
+    offer. This one acts on the job.
+
+    There is no `status` field and no field for whose job it is. A bid's status and a job's status are
+    both the platform's, and the customer is whoever the credential says is calling. Unknown fields
+    are refused, so a client typo fails loudly rather than being silently ignored.
+  properties:
+    bid_id:
+      type: string
+      format: uuid
+      description: |
+        The offer you are awarding. It has to be **live** and on the job in the path, and it has to be
+        an offer the **provider** made — the entry in the negotiation with no `superseded_by`.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+
 BidChain:
   type: object
   additionalProperties: false
@@ -911,8 +1110,11 @@ Bid:
 
         `withdrawn` comes from `POST /v1/jobs/{id}/bids/{bid_id}/withdraw`, and `superseded` is what an
         offer becomes when the other party counters it — after which it can be neither changed nor
-        answered, only read. The remaining four are reachable through endpoints still being built:
-        expiry, the award, and the rejection an award leaves behind. `countered` is in the list because
+        answered, only read. `accepted` and `rejected` are the two halves of one award: the offer the
+        customer chose, and every offer that was still live on that job when they chose it.
+
+        `expired` waits on the ticket that gives an offer its own terms. `draft` is not written by any
+        endpoint — an offer you send is live when you send it — and `countered` is in the list because
         Docs/02 §4 names it; nothing writes it, because `superseded` is the one status this platform
         gives a displaced offer.
       example: submitted

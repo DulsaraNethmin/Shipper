@@ -218,6 +218,8 @@ paths:
     $ref: './paths/fleet.yaml#/OpenJobByID'
   /v1/jobs/{id}:
     $ref: './paths/jobs.yaml#/JobByID'
+  /v1/jobs/{id}/award:
+    $ref: './paths/bidding.yaml#/AwardJob'
   /v1/jobs/{id}/bids:
     $ref: './paths/bidding.yaml#/Bids'
   /v1/jobs/{id}/bids/{bid_id}:

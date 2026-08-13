@@ -124,16 +124,71 @@ var (
 	// awarded job is already `Rejected` and reaches [ErrBidClosed] directly.
 	ErrNegotiationOver = errors.New("bidding: that job can no longer be awarded")
 
+	// ErrNotJobCustomer means the job is not this caller's to award (SHIP-92).
+	//
+	// **Two cases in one sentinel**: no such job, and a job belonging to another customer. The same
+	// collapse [ErrJobNotOffered] makes on the provider's side and for the same reason — separating
+	// them would take a second query whose only product is the knowledge that somebody else's job
+	// exists. On the wire it is the 404 a job that does not exist gets, byte-identically.
+	//
+	// It is the *job* that is refused rather than the bid, because the award is addressed at a job:
+	// `POST /v1/jobs/{id}/award` names the bid in its body. A caller who is not the customer is
+	// refused before any bid is read, so a provider cannot use this endpoint to find out whether an
+	// identifier is a real bid.
+	ErrNotJobCustomer = errors.New("bidding: that job belongs to another customer")
+
+	// ErrJobNotAwardable means Docs/02 §2 has no move to 'Awarded' from where the job stands
+	// (SHIP-92).
+	//
+	// **The ordinary case is a job the customer has already awarded**, which is CLAUDE.md's "exactly
+	// one accepted bid per job" arriving from the job's side. The rest are a job that was cancelled,
+	// expired, or never published.
+	//
+	// # It is deliberately not [ErrNegotiationOver], which says the same sentence
+	//
+	// The two sentinels describe one fact — this job can no longer be awarded — reached from two
+	// endpoints, and they are kept apart because a client does different things with them. A
+	// *counter* refused this way is told the negotiation is finished, which is [CodeBidClosed] and
+	// the offer's own screen. An *award* refused this way is told its request did not happen and the
+	// job is not where it thought, which is `conflict` — whose registered description has named "a
+	// second award on one job" since SHIP-12, before this endpoint existed.
+	//
+	// It also stands behind `uq_bids_one_accepted_per_job`. A second award that somehow reached the
+	// write is refused by the index rather than by a check, and [postgresStore.acceptBid] reports
+	// that refusal as this.
+	ErrJobNotAwardable = errors.New("bidding: that job cannot be awarded from the status it is in")
+
+	// ErrNotAProvidersOffer means the offer being awarded was made by the customer (SHIP-92).
+	//
+	// Docs/02 §1 defines Awarded as "Customer has accepted one **provider** bid; provider commitment
+	// exists", and awarding the customer's own counter would bind a provider to a price and a date
+	// they never agreed to. `ck_bids_only_a_providers_offer_is_accepted` is that sentence in the
+	// schema and stands behind this refusal; this is what makes it legible, because a caller handed a
+	// constraint name learns nothing they can act on.
+	//
+	// **It costs a customer nothing.** A customer who wants their own number accepted waits for the
+	// provider to counter at it, and that row is the provider's commitment and is awardable.
+	//
+	// It answers [CodeWrongParty] rather than a code of its own, because it is the third instance of
+	// one rule: you counter the other party's offer, you revise your own, and you award theirs. The
+	// client's correct response is a different request in every one of the three.
+	ErrNotAProvidersOffer = errors.New("bidding: only a provider's offer can be awarded")
+
 	// ErrNotInTransaction means a method that reads a row, decides against it and writes it was handed
 	// a connection pool rather than a transaction.
 	//
-	// Checked by [Service.ReviseBid], [Service.WithdrawBid] and [Service.CounterOffer] and deliberately
-	// not by [Service.PlaceBid], because they do not rest on the same mechanism. A placement's
-	// correctness is `ON CONFLICT`'s, which holds statement by statement; a revision's and a
-	// withdrawal's is [postgresStore.lockBid]'s `FOR UPDATE`, and outside a transaction that lock is
-	// released the instant the SELECT returns — leaving the status this code decided against free to
-	// change before the UPDATE lands, with nothing to report afterwards. The same sentinel fleet has,
-	// for the same reason.
+	// Checked by [Service.ReviseBid], [Service.WithdrawBid], [Service.CounterOffer] and
+	// [Service.AwardBid] and deliberately not by [Service.PlaceBid], because they do not rest on the
+	// same mechanism. A placement's correctness is `ON CONFLICT`'s, which holds statement by
+	// statement; a revision's and a withdrawal's is [postgresStore.lockBid]'s `FOR UPDATE`, and
+	// outside a transaction that lock is released the instant the SELECT returns — leaving the status
+	// this code decided against free to change before the UPDATE lands, with nothing to report
+	// afterwards. The same sentinel fleet has, for the same reason.
+	//
+	// **The award is the strongest case of the four**, and the one where the check stops being
+	// defensive: it holds two row locks in two tables and writes through a port into a third
+	// statement, and outside a transaction those are three independent acts that can each half
+	// happen. A job at 'Awarded' with no accepted bid is not a state anything downstream can read.
 	ErrNotInTransaction = errors.New("bidding: this must run inside a transaction")
 )
 

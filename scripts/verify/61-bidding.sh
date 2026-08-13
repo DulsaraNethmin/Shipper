@@ -8,6 +8,22 @@
 # append to and no other track's to edit — which is the whole reason the script was split
 # (Docs/11 §9, SHIP-15e).
 #
+# # Mobile numbers are a shared namespace across every section, and this is the corrected map
+#
+# Sections are *sourced* into one process, and every account registered anywhere needs a unique
+# mobile — so two sections drawing the same prefix collide on the phone unique index. Docs/11 §9
+# records that a track lost twenty minutes to it, and that the only copy of the allocation was a
+# comment in 90-admin.sh's header which did not mention this file at all.
+#
+#   04120  identity      0413x  jobs        0414x  fleet
+#   0416x  bidding       0417x  delivery    04180  outbox      0419x  admin
+#
+# **The three accounts below draw 04145, 04146 and 04147, which are inside fleet's block.** They are
+# free only because 60-fleet.sh stopped at 04144, which is a coincidence rather than a guarantee — one
+# more vehicle in that file would end it. They are left where they are because renumbering a working
+# fixture is a change with no test behind it; **anything new in this file takes 0416x**, and SHIP-92's
+# accounts are the first to do so.
+#
 # # This section registers its own accounts rather than reusing 60-fleet.sh's
 #
 # Sections are sourced, so everything 60-fleet.sh left behind is in scope, and using it would be
@@ -1156,3 +1172,671 @@ refusal="$("$PSQL" "$DATABASE_URL" -tAc \
 grep -q 'uq_bids_one_successor' <<<"$refusal" \
   || fail "a negotiation merged: two offers were displaced by one counter ($refusal)"
 ok "two offers cannot be displaced by the same counter — a chain is a list, not a tree"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-92  POST /v1/jobs/{id}/award — one bid accepted and the job moved, in one transaction"
+
+# # A fixture of its own, and three accounts on the 0416x block
+#
+# The award ends a job, so it cannot run against a negotiation the checks above still need — and the
+# rows it leaves behind are what the checks after it assert on. `$award_customer` is a second customer
+# deliberately: the award is the first endpoint in this domain where being the *right* customer is the
+# whole of the authorisation, and a section with one customer could not tell "the platform read
+# jobs.customer_id" from "the platform let any credential through".
+status="$(post_json "verify-award-cust-$$" /v1/auth/register \
+  "{\"email\":\"award-customer-$$@example.com\",\"phone\":\"04160$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/award-customer.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/award-customer.json"; fail "could not register the awarding customer: $status"; }
+award_customer_id="$(json "$WORKDIR/award-customer.json" '["id"]')"
+award_customer_token="$(mint_token "$award_customer_id")"
+
+status="$(post_json "verify-award-other-$$" /v1/auth/register \
+  "{\"email\":\"award-stranger-$$@example.com\",\"phone\":\"04161$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/award-stranger.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/award-stranger.json"; fail "could not register the stranger: $status"; }
+award_stranger_token="$(mint_token "$(json "$WORKDIR/award-stranger.json" '["id"]')")"
+
+# move_job writes `$bid_customer_id` as the actor, so the award job needs its own mover: a history row
+# attributing this customer's publication to a different account would be a fixture that lies.
+move_award_job() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<SQL
+DO \$do\$
+DECLARE entry uuid := gen_random_uuid();
+BEGIN
+  INSERT INTO job_status_history
+      (id, job_id, from_status, to_status, actor_type, actor_id, actor_recorded_at)
+  VALUES (entry, '$1', '$2', '$3', 'customer', '$award_customer_id', now());
+  PERFORM set_config('shipper.job_status_transition', entry::text, true);
+  UPDATE jobs SET status = '$3' WHERE id = '$1';
+END
+\$do\$;
+SQL
+}
+
+# new_award_job <name> — one Open job belonging to the awarding customer, with a budget on it.
+new_award_job() {
+  local status
+  status="$(bid_post "$award_customer_token" "verify-award-job-$1-$$" /v1/jobs \
+    '{"pickup":{"line":"7 Coppin Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+      "dropoff":{"line":"55 Little Malop Street","suburb":"Geelong","state":"VIC","postcode":"3220"},
+      "goods_description":"Pallet of tiles","weight_kg":300,"budget_cents":432199}' "awjob-$1")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-awjob-$1.json"; fail "creating award job $1 returned $status"; }
+  local id
+  id="$(json "$WORKDIR/bid-awjob-$1.json" '["id"]')"
+  move_award_job "$id" Draft Open
+  printf '%s' "$id"
+}
+
+# award <token> <key> <job> <bid> <name> — one award request.
+award() {
+  bid_post "$1" "$2" "/v1/jobs/$3/award" "{\"bid_id\":\"$4\"}" "$5"
+}
+
+award_job="$(new_award_job one)"
+
+status="$(bid_post "$bid_provider_token" "verify-award-offer-$$" "/v1/jobs/$award_job/bids" "$bid_body" awoffer)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-awoffer.json"; fail "the offer to award returned $status"; }
+award_bid="$(json "$WORKDIR/bid-awoffer.json" '["id"]')"
+
+# The rival's offer is placed **now**, before the award, and the reason is worth stating rather than
+# discovering: once the job is Awarded it is no longer offered to anybody, so a rival asked to bid
+# afterwards is refused by the eligibility filter with a 404 — a true answer to a different question,
+# and one that would look like a broken fixture. The competing offer the second award below names has
+# to exist before the first award closes the job.
+status="$(bid_post "$bid_rival_token" "verify-award-rival-$$" "/v1/jobs/$award_job/bids" "$bid_body" awrival)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-awrival.json"; fail "the rival could not bid before the award: $status"; }
+rival_award_bid="$(json "$WORKDIR/bid-awrival.json" '["id"]')"
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-aw-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-award-anon-$$" -H 'Content-Type: application/json' \
+  -d "{\"bid_id\":\"$award_bid\"}" "http://localhost:$VERIFY_PORT/v1/jobs/$award_job/award")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-aw-anon.json"; fail "an unauthenticated award returned $status, want 401"; }
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-aw-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $award_customer_token" -H 'Content-Type: application/json' \
+  -d "{\"bid_id\":\"$award_bid\"}" "http://localhost:$VERIFY_PORT/v1/jobs/$award_job/award")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-aw-nokey.json"; fail "an award with no Idempotency-Key returned $status, want 400"; }
+ok "it needs a credential and an Idempotency-Key, like every other state-changing route"
+
+# The refusals come before the success, so that each is asserted against a job that is still awardable
+# — a refusal on a job that had already been awarded would pass for the wrong reason.
+status="$(award "$bid_provider_token" "verify-award-prov-$$" "$award_job" "$award_bid" awprov)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-awprov.json"; fail "the bidding provider awarded the job: $status"; }
+[[ "$(json "$WORKDIR/bid-awprov.json" '["error"]["code"]')" == "not_found" ]] \
+  || { cat "$WORKDIR/bid-awprov.json"; fail "expected code=not_found"; }
+grep -q "$award_bid" "$WORKDIR/bid-awprov.json" \
+  && { cat "$WORKDIR/bid-awprov.json"; fail "the refusal echoes the bid identifier back to a provider"; }
+
+status="$(award "$award_stranger_token" "verify-award-str-$$" "$award_job" "$award_bid" awstr)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-awstr.json"; fail "another customer awarded the job: $status"; }
+ok "only the job's own customer may award it — a provider and another customer both get the answer a job that does not exist gets"
+
+status="$(award "$award_customer_token" "verify-award-nobid-$$" "$award_job" "" awnobid)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-awnobid.json"; fail "an award naming no bid returned $status, want 422"; }
+[[ "$(json "$WORKDIR/bid-awnobid.json" '["error"]["details"][0]["field"]')" == "bid_id" ]] \
+  || { cat "$WORKDIR/bid-awnobid.json"; fail "the refusal does not name bid_id"; }
+ok "and the offer it accepts is named in the body, so a missing one is a field error rather than a broken request"
+
+# The award itself.
+status="$(award "$award_customer_token" "verify-award-$$" "$award_job" "$award_bid" award)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-award.json"; fail "awarding returned $status, want 200"; }
+[[ "$(json "$WORKDIR/bid-award.json" '["id"]')" == "$award_bid" ]] || fail "the award answered with a different bid"
+[[ "$(json "$WORKDIR/bid-award.json" '["status"]')" == "accepted" ]] \
+  || fail "the bid came back as $(json "$WORKDIR/bid-award.json" '["status"]'), want accepted"
+ok "the customer awards one offer and is answered with it, accepted"
+
+# Both tables, in one query, because the *Done when* is one transaction: an accepted bid on a job that
+# did not move, or a job at Awarded with nothing accepted, are the two half-states this is here to
+# refuse. The history count is the third: 000402 will not let the status move without a row describing
+# the move, so 'Awarded 1 2' is a transition that went through the guard rather than around it.
+stored="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status
+          || ' ' || (select count(*) from bids where job_id = j.id and status = 'Accepted')::text
+          || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$award_job';")"
+[[ "$stored" == "Awarded 1 2" ]] \
+  || fail "the job reads '$stored' (status, accepted bids, history rows), want 'Awarded 1 2'"
+ok "the job is Awarded with exactly one accepted bid and a recorded transition — one act, one transaction"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select actor_type || ' ' || actor_id::text from job_status_history
+     where job_id = '$award_job' and to_status = 'Awarded';")" == "customer $award_customer_id" ]] \
+  || fail "the transition is not attributed to the customer who made it"
+ok "and the transition names the customer as the actor, which is who Docs/02 §3 gives the award to"
+
+python3 - "$WORKDIR/bid-award.json" <<'PY' || fail "the award response carries something of the customer's"
+import json, re, sys
+
+# The seventh response in this domain held to the closed key set, and the one where the two sides of a
+# negotiation meet — which makes it the shape a later ticket is most tempted to widen.
+allowed = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by",
+    "created_at", "updated_at",
+    "data", "next_cursor", "has_more",
+}
+
+def keys(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            yield key
+            yield from keys(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from keys(child)
+
+raw = open(sys.argv[1]).read()
+unexpected = sorted(set(keys(json.loads(raw))) - allowed)
+if unexpected:
+    print(sys.argv[1], "carries keys this API never promised:", unexpected, file=sys.stderr)
+    sys.exit(1)
+if "budget" in raw.lower():
+    print(sys.argv[1], "mentions the budget:", raw, file=sys.stderr)
+    sys.exit(1)
+
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw)
+for rendering in ("4321.99", "432199", "4,321.99"):
+    if rendering in searchable:
+        print(sys.argv[1], "carries the budget's value as", rendering, file=sys.stderr)
+        sys.exit(1)
+PY
+ok "the award response is the same closed set of keys, and carries nothing of the customer's budget"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-92  an award is idempotent by state, and a job is awarded once"
+
+# The middleware's own replay first, which is a different mechanism from the one below it.
+status="$(award "$award_customer_token" "verify-award-$$" "$award_job" "$award_bid" awagain)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-awagain.json"; fail "the cached retry returned $status"; }
+replayed_from_redis awagain || fail "the second request was not replayed by the middleware"
+diff -q "$WORKDIR/bid-award.json" "$WORKDIR/bid-awagain.json" >/dev/null \
+  || fail "the replayed response is not byte-identical to the original"
+ok "a retry inside the cache is replayed by the middleware, byte for byte"
+
+# And a **different** key, which is what a restarted phone sends. There is no stored key on this
+# endpoint and there is no need for one: an award is an UPDATE of a row that already exists, so
+# applying it twice reaches the state applying it once reaches. That is idempotency by state, which
+# SHIP-86 established is stronger than a stored key — two clients with two keys still cannot award one
+# job twice.
+before_updated="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$award_bid';")"
+
+status="$(award "$award_customer_token" "verify-award-fresh-$$" "$award_job" "$award_bid" awfresh)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-awfresh.json"; fail "an award retried under a fresh key returned $status, want 200"; }
+replayed_from_redis awfresh && fail "the request under a fresh key was answered from the cache"
+[[ "$(json "$WORKDIR/bid-awfresh.json" '["id"]')" == "$award_bid" ]] || fail "the retry answered with a different bid"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$award_bid';")" == "$before_updated" ]] \
+  || fail "the repeated award wrote to the row again"
+ok "and one under a fresh key is still 200 with the same bid, having written nothing — idempotent by state, not by key"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$award_job';")" == "2" ]] \
+  || fail "three awards left more than one transition on the job"
+ok "three awards, one transition — the job moved once"
+
+# A **different** offer on the job that has been awarded — the rival's, placed before the award. Since
+# SHIP-93 it is `Rejected`, closed by the award itself, and that is what makes the refusal below worth
+# checking rather than obvious: an implementation that judged the *offer* before the *job* would
+# answer `bidding_bid_closed` here and send the customer to offers the same sweep has just closed.
+# What refuses it is the job's own status, held under the lock the award takes first.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$rival_award_bid';")" == "Rejected" ]] \
+  || fail "the competing offer is not Rejected; the award is supposed to have closed it (SHIP-93)"
+
+status="$(award "$award_customer_token" "verify-award-second-$$" "$award_job" "$rival_award_bid" awsecond)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-awsecond.json"; fail "a second award on one job returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-awsecond.json" '["error"]["code"]')" == "conflict" ]] \
+  || { cat "$WORKDIR/bid-awsecond.json"; fail "expected code=conflict, not bidding_bid_closed — the job is what the customer has to look at"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$award_job' and status = 'Accepted';")" == "1" ]] \
+  || fail "a second bid was accepted on one job"
+ok "a second award naming an offer the sweep closed is refused with conflict and not bid_closed, and the job still holds exactly one accepted bid"
+
+# The database's own half of the same rule, which is what holds if the ordering above is ever changed.
+refusal="$("$PSQL" "$DATABASE_URL" -tAc \
+  "update bids set status = 'Accepted' where id = '$rival_award_bid';" 2>&1 || true)"
+grep -q 'uq_bids_one_accepted_per_job' <<<"$refusal" \
+  || fail "a second bid was accepted at the database level ($refusal)"
+ok "and the index refuses it even with the endpoint out of the way — SHIP-91's constraint, not a check that could race"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-92  the selected bid must be active, and only a provider's offer can be awarded"
+
+closed_job="$(new_award_job two)"
+status="$(bid_post "$bid_provider_token" "verify-award-closed-$$" "/v1/jobs/$closed_job/bids" "$bid_body" awclosed)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-awclosed.json"; fail "the offer to withdraw returned $status"; }
+closed_bid="$(json "$WORKDIR/bid-awclosed.json" '["id"]')"
+
+status="$(bid_post "$bid_provider_token" "verify-award-wd-$$" \
+  "/v1/jobs/$closed_job/bids/$closed_bid/withdraw" '{}' awwd)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-awwd.json"; fail "withdrawing returned $status"; }
+
+status="$(award "$award_customer_token" "verify-award-wdaward-$$" "$closed_job" "$closed_bid" awwdaward)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-awwdaward.json"; fail "awarding a withdrawn offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-awwdaward.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-awwdaward.json"; fail "expected code=bidding_bid_closed"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$closed_job';")" == "Open" ]] \
+  || fail "the refused award moved the job"
+ok "an offer that is no longer live cannot be awarded, and the refusal points the customer at the other offers rather than at the job"
+
+# The negotiation case, which is the one SHIP-88's chain link exists for: only the head is awardable,
+# and the head is only awardable if the *provider* made it.
+status="$(bid_post "$bid_provider_token" "verify-award-neg-$$" "/v1/jobs/$closed_job/bids" "$bid_body" awneg)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-awneg.json"; fail "the replacement offer returned $status"; }
+neg_round1="$(json "$WORKDIR/bid-awneg.json" '["id"]')"
+
+status="$(bid_post "$award_customer_token" "verify-award-negc-$$" \
+  "/v1/jobs/$closed_job/bids/$neg_round1/counter" '{"amount_cents":40000}' awnegc)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-awnegc.json"; fail "the customer's counter returned $status"; }
+neg_round2="$(json "$WORKDIR/bid-awnegc.json" '["id"]')"
+
+status="$(award "$award_customer_token" "verify-award-stale-$$" "$closed_job" "$neg_round1" awstale)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-awstale.json"; fail "a superseded offer was awarded: $status"; }
+[[ "$(json "$WORKDIR/bid-awstale.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-awstale.json"; fail "expected code=bidding_bid_closed"; }
+ok "only the latest offer in a negotiation is acceptable — a displaced one answers the same code a withdrawn one does"
+
+status="$(award "$award_customer_token" "verify-award-own-$$" "$closed_job" "$neg_round2" awown)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-awown.json"; fail "the customer awarded their own counter: $status"; }
+[[ "$(json "$WORKDIR/bid-awown.json" '["error"]["code"]')" == "bidding_wrong_party" ]] \
+  || { cat "$WORKDIR/bid-awown.json"; fail "expected code=bidding_wrong_party"; }
+ok "and a customer cannot award their own counter-offer — awarding it would commit a provider to terms they never agreed to"
+
+# The provider counters back at the customer's number, and *that* row is awardable. This is what makes
+# the pair of constraints a shape rather than a wall.
+status="$(bid_post "$bid_provider_token" "verify-award-agree-$$" \
+  "/v1/jobs/$closed_job/bids/$neg_round2/counter" '{"amount_cents":40000}' awagree)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-awagree.json"; fail "the provider's counter returned $status"; }
+neg_round3="$(json "$WORKDIR/bid-awagree.json" '["id"]')"
+
+status="$(award "$award_customer_token" "verify-award-agreed-$$" "$closed_job" "$neg_round3" awagreed)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-awagreed.json"; fail "awarding the provider's counter returned $status, want 200"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select amount::text from bids where id = '$neg_round3')
+     from jobs j where j.id = '$closed_job';")" == "Awarded 400.00" ]] \
+  || fail "the negotiated job did not end at Awarded on the agreed amount"
+ok "the provider's counter at the customer's own number is awardable, and the job ends at Awarded on the agreed price"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-92  a job that cannot be awarded, and a bid that is not on the job in the path"
+
+gone_job="$(new_award_job three)"
+status="$(bid_post "$bid_provider_token" "verify-award-gone-$$" "/v1/jobs/$gone_job/bids" "$bid_body" awgone)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-awgone.json"; fail "the offer on the cancelled job returned $status"; }
+gone_bid="$(json "$WORKDIR/bid-awgone.json" '["id"]')"
+
+# The bid on the *first* job, awarded under this one. Both identifiers are real and the pair is not,
+# which is the only endpoint in this domain where the two come from two different places.
+status="$(award "$award_customer_token" "verify-award-cross-$$" "$gone_job" "$award_bid" awcross)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-awcross.json"; fail "a bid on another job was awarded: $status"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$gone_job';")" == "Open" ]] \
+  || fail "the cross-job award moved the job"
+ok "a real offer paired with the wrong job names nothing — the job in the path is checked, not decorative"
+
+move_award_job "$gone_job" Open Cancelled
+
+status="$(award "$award_customer_token" "verify-award-cancelled-$$" "$gone_job" "$gone_bid" awcancelled)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-awcancelled.json"; fail "a cancelled job was awarded: $status"; }
+[[ "$(json "$WORKDIR/bid-awcancelled.json" '["error"]["code"]')" == "conflict" ]] \
+  || { cat "$WORKDIR/bid-awcancelled.json"; fail "expected code=conflict"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$gone_bid';")" == "Submitted" ]] \
+  || fail "the refused award moved the bid"
+ok "a job that has been cancelled can no longer be awarded, and the refused award leaves the offer where it was"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-93  the award closes every other live offer, and leaves the already-closed ones alone"
+
+# # Two more providers, and every offer below is placed before the award for one reason
+#
+# **Once the job is Awarded it is offered to nobody**, so a provider asked to bid afterwards is
+# refused by SHIP-81's eligibility filter with a 404 — a true answer to a different question that
+# reads exactly like a broken fixture. SHIP-92's block met that once with one rival; a sweep needs a
+# market, so the whole market is built first and awarded second.
+#
+# The accounts take 04162 and 04163, which is the 0416x block this file's header allocates to bidding.
+status="$(post_json "verify-sweep-p2-$$" /v1/auth/register \
+  "{\"email\":\"sweep-second-$$@example.com\",\"phone\":\"04162$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/sweep-second.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/sweep-second.json"; fail "could not register the second sweep provider: $status"; }
+sweep_second_id="$(json "$WORKDIR/sweep-second.json" '["id"]')"
+sweep_second_token="$(mint_token "$sweep_second_id")"
+
+status="$(post_json "verify-sweep-p3-$$" /v1/auth/register \
+  "{\"email\":\"sweep-third-$$@example.com\",\"phone\":\"04163$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/sweep-third.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/sweep-third.json"; fail "could not register the third sweep provider: $status"; }
+sweep_third_id="$(json "$WORKDIR/sweep-third.json" '["id"]')"
+sweep_third_token="$(mint_token "$sweep_third_id")"
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set email_verified_at = now(), phone_verified_at = now()
+     where id in ('$sweep_second_id', '$sweep_third_id');"
+
+for pair in "$sweep_second_token:SWP102" "$sweep_third_token:SWP103"; do
+  status="$(bid_post "${pair%%:*}" "verify-sweep-veh-${pair##*:}-$$" /v1/fleet/vehicles \
+    "{\"registration\":\"${pair##*:}\",\"vehicle_type\":\"box_truck\",\"max_weight_kg\":1200,\"load_length_cm\":300,\"load_width_cm\":160,\"load_height_cm\":180}" \
+    "vehicle-${pair##*:}")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-vehicle-${pair##*:}.json"; fail "adding ${pair##*:} returned $status"; }
+
+  status="$(curl -s -X PATCH -o "$WORKDIR/sweep-profile.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer ${pair%%:*}" -H "Idempotency-Key: verify-sweep-prof-${pair##*:}-$$" \
+    -H 'Content-Type: application/json' -d '{"service_area":{"states":["VIC"]}}' \
+    "http://localhost:$VERIFY_PORT/v1/fleet/profile")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/sweep-profile.json"; fail "declaring VIC returned $status"; }
+done
+
+sweep_job="$(new_award_job four)"
+
+# A second job, with one live offer on it, standing beside the first for the whole of the award. The
+# sweep's `WHERE job_id` is the one clause whose absence would be catastrophic *and* silent — every
+# live offer in the marketplace closes on the first award of the day, no constraint is violated, and
+# the customers whose jobs were emptied are not the ones who made the request.
+bystander_job="$(new_award_job five)"
+status="$(bid_post "$bid_provider_token" "verify-sweep-bystander-$$" "/v1/jobs/$bystander_job/bids" "$bid_body" swbystander)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swbystander.json"; fail "the offer on the second job returned $status"; }
+sweep_bystander_bid="$(json "$WORKDIR/bid-swbystander.json" '["id"]')"
+
+# 1. The offer that wins.
+status="$(bid_post "$bid_provider_token" "verify-sweep-winner-$$" "/v1/jobs/$sweep_job/bids" "$bid_body" swwinner)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swwinner.json"; fail "the winning offer returned $status"; }
+sweep_winner="$(json "$WORKDIR/bid-swwinner.json" '["id"]')"
+
+# 2. A negotiation that loses, which is two rows and two different fates. The provider's first offer is
+#    displaced by the customer's counter and is already terminal at Superseded; the counter is the live
+#    head, it was made by the *customer*, and it is still a live offer on the job.
+status="$(bid_post "$bid_rival_token" "verify-sweep-neg1-$$" "/v1/jobs/$sweep_job/bids" "$bid_body" swneg1)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swneg1.json"; fail "the losing negotiation's first offer returned $status"; }
+sweep_displaced="$(json "$WORKDIR/bid-swneg1.json" '["id"]')"
+
+status="$(bid_post "$award_customer_token" "verify-sweep-neg2-$$" \
+  "/v1/jobs/$sweep_job/bids/$sweep_displaced/counter" '{"amount_cents":41000}' swneg2)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swneg2.json"; fail "the customer's counter returned $status"; }
+sweep_counter="$(json "$WORKDIR/bid-swneg2.json" '["id"]')"
+
+# 3. A plain competing offer.
+status="$(bid_post "$sweep_second_token" "verify-sweep-live-$$" "/v1/jobs/$sweep_job/bids" "$bid_body" swlive)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swlive.json"; fail "the competing offer returned $status"; }
+sweep_live="$(json "$WORKDIR/bid-swlive.json" '["id"]')"
+
+# 4. And one the provider had already taken back, which the award must not touch.
+status="$(bid_post "$sweep_third_token" "verify-sweep-wd-$$" "/v1/jobs/$sweep_job/bids" "$bid_body" swwd)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-swwd.json"; fail "the offer to withdraw returned $status"; }
+sweep_withdrawn="$(json "$WORKDIR/bid-swwd.json" '["id"]')"
+status="$(bid_post "$sweep_third_token" "verify-sweep-wdo-$$" \
+  "/v1/jobs/$sweep_job/bids/$sweep_withdrawn/withdraw" '{}' swwdo)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-swwdo.json"; fail "withdrawing returned $status"; }
+
+before="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(status, ',' order by status) from bids where job_id = '$sweep_job';")"
+[[ "$before" == "Submitted,Submitted,Submitted,Superseded,Withdrawn" ]] \
+  || fail "the market before the award reads '$before', want three live offers, one superseded and one withdrawn"
+ok "five offers stand on one job — three live, one displaced by a counter, one withdrawn"
+
+# The two timestamps that say whether a row was written at all. bids_set_updated_at moves on any
+# write, so a sweep that rewrote a closed offer with the status it already had would still show here.
+withdrawn_before="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$sweep_withdrawn';")"
+displaced_before="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$sweep_displaced';")"
+
+status="$(award "$award_customer_token" "verify-sweep-award-$$" "$sweep_job" "$sweep_winner" swaward)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-swaward.json"; fail "awarding returned $status, want 200"; }
+
+# Every row of the job, by name, in one query. Read as a whole rather than one assertion per offer:
+# what is being demonstrated is a *state of the job*, and five separate checks would pass individually
+# on a sweep that closed four of the five.
+after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (select status from bids where id = '$sweep_winner')
+       || ' ' || (select status from bids where id = '$sweep_counter')
+       || ' ' || (select status from bids where id = '$sweep_live')
+       || ' ' || (select status from bids where id = '$sweep_displaced')
+       || ' ' || (select status from bids where id = '$sweep_withdrawn');")"
+[[ "$after" == "Accepted Rejected Rejected Superseded Withdrawn" ]] \
+  || fail "after the award the five offers read '$after', want 'Accepted Rejected Rejected Superseded Withdrawn'"
+ok "the award accepts one offer and rejects every other live one — including the customer's own outstanding counter, which they decline by awarding elsewhere"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$sweep_withdrawn';")" == "$withdrawn_before" ]] \
+  || fail "the sweep wrote to a withdrawn offer"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$sweep_displaced';")" == "$displaced_before" ]] \
+  || fail "the sweep wrote to a superseded offer"
+ok "and it does not touch an offer that had already ended — how an offer closed is the record, and no constraint would have refused overwriting it"
+
+live_and_accepted="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) filter (where status = 'Submitted')::text || ' ' || count(*) filter (where status = 'Accepted')::text
+     from bids where job_id = '$sweep_job';")"
+[[ "$live_and_accepted" == "0 1" ]] \
+  || fail "the awarded job reads '$live_and_accepted' (live, accepted), want '0 1'"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$sweep_job';")" == "Awarded 2" ]] \
+  || fail "the sweep did not happen inside the award's own transaction"
+ok "nothing is left live on the awarded job, and the whole act is still one transition — Docs/02 §3's 'atomically', both halves"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$sweep_bystander_bid';")" == "Submitted" ]] \
+  || fail "the sweep closed an offer on another job entirely"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$bystander_job';")" == "Open" ]] \
+  || fail "the award moved a job it was not made on"
+ok "a live offer on another job is untouched — the sweep is scoped to the job that was awarded, and nothing would have said so if it were not"
+
+# What the sweep buys the rest of the domain: the three verbs that gate on a live offer now all refuse.
+# Before it, a provider could revise the price of an offer on a job somebody else had already won.
+status="$(curl -s -X PATCH -o "$WORKDIR/bid-swrevise.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $sweep_second_token" -H "Idempotency-Key: verify-sweep-rev-$$" \
+  -H 'Content-Type: application/json' -d '{"amount_cents":30000}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$sweep_job/bids/$sweep_live")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-swrevise.json"; fail "revising a closed offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-swrevise.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-swrevise.json"; fail "expected code=bidding_bid_closed"; }
+
+status="$(bid_post "$sweep_second_token" "verify-sweep-wdlost-$$" \
+  "/v1/jobs/$sweep_job/bids/$sweep_live/withdraw" '{}' swwdlost)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-swwdlost.json"; fail "withdrawing a closed offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-swwdlost.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-swwdlost.json"; fail "expected code=bidding_bid_closed"; }
+
+status="$(bid_post "$award_customer_token" "verify-sweep-ctlost-$$" \
+  "/v1/jobs/$sweep_job/bids/$sweep_live/counter" '{"amount_cents":30000}' swctlost)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-swctlost.json"; fail "countering a closed offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-swctlost.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || { cat "$WORKDIR/bid-swctlost.json"; fail "expected code=bidding_bid_closed"; }
+ok "a losing offer can no longer be revised, withdrawn or countered — one code for all three, because the client does the same thing with all three"
+
+# The record survives, which is the whole reason a rejection is a status rather than a delete. Both
+# parties can still read the losing negotiation from end to end.
+status="$(bid_get "$award_customer_token" "/v1/jobs/$sweep_job/bids/$sweep_counter/history" swhist)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-swhist.json"; fail "the losing negotiation's history returned $status"; }
+[[ "$(python3 -c "import json,sys; d=json.load(open(sys.argv[1]))['data']; print(str(len(d)) + ' ' + d[0]['status'] + ' ' + d[1]['status'])" "$WORKDIR/bid-swhist.json")" == "2 superseded rejected" ]] \
+  || { cat "$WORKDIR/bid-swhist.json"; fail "the losing negotiation is not readable end to end after the award"; }
+ok "and the whole losing negotiation is still readable, each row saying how it ended — Docs/01 §4.3 records every offer, and a status is the record"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-94  a retried award returns the original outcome, through whichever mechanism is left"
+
+# # There are two mechanisms and they answer different retries, so the checks tell them apart
+#
+# | Mechanism | What it guarantees | For how long |
+# |---|---|---|
+# | httpx.Idempotent (Redis) | the *response* is replayed and the handler never runs | while the entry lives — a TTL, an eviction, a failover |
+# | the record itself | the *act* cannot happen twice | permanently |
+#
+# SHIP-111 made the same split and named the honest version of it: **Redis makes the retry cheap, the
+# database makes it correct.** The difference here is that the award needs no stored key to be correct,
+# because it is an `UPDATE` of a row that already exists — there is no second row a retry could create,
+# so the accepted status *is* the record of the request. That is SHIP-86's idempotency by state, and it
+# is what a phone that reconnected, restarted and generated a **fresh** key falls back on.
+#
+# `Idempotency-Replayed` on the wire is what makes the claim checkable rather than asserted: it is
+# present when Redis answered and absent when the handler did.
+idem_job="$(new_award_job six)"
+idem_key="verify-award-idem-$$"
+
+status="$(bid_post "$bid_provider_token" "verify-idem-winner-$$" "/v1/jobs/$idem_job/bids" "$bid_body" idwinner)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-idwinner.json"; fail "the offer to award returned $status"; }
+idem_winner="$(json "$WORKDIR/bid-idwinner.json" '["id"]')"
+
+# Placed before the award, for the reason the sweep's fixture is: an Awarded job is offered to nobody.
+status="$(bid_post "$bid_rival_token" "verify-idem-loser-$$" "/v1/jobs/$idem_job/bids" "$bid_body" idloser)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-idloser.json"; fail "the competing offer returned $status"; }
+idem_loser="$(json "$WORKDIR/bid-idloser.json" '["id"]')"
+
+status="$(award "$award_customer_token" "$idem_key" "$idem_job" "$idem_winner" idfirst)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-idfirst.json"; fail "the award returned $status, want 200"; }
+replayed_from_redis idfirst && fail "the first award was answered from the cache"
+idem_winner_written="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$idem_winner';")"
+idem_loser_written="$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$idem_loser';")"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$idem_loser';")" == "Rejected" ]] \
+  || fail "the award did not close the competing offer"
+ok "the award runs once, accepting one offer and closing the other"
+
+# 1. The same key while Redis still holds it. The handler is never reached, so this proves nothing
+#    about the domain — which is exactly why the next check deletes the entry.
+status="$(award "$award_customer_token" "$idem_key" "$idem_job" "$idem_winner" idreplay)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-idreplay.json"; fail "the cached retry returned $status"; }
+replayed_from_redis idreplay || fail "the immediate retry was not replayed by the middleware"
+diff -q "$WORKDIR/bid-idfirst.json" "$WORKDIR/bid-idreplay.json" >/dev/null \
+  || fail "the replayed response is not byte-identical to the original"
+ok "the same key immediately after replays the stored response from Redis, byte for byte — the handler is never reached"
+
+# 2. The entry deleted, which is what a TTL expiry, an eviction or a failover looks like from the
+#    handler's side. **This is the check the ticket turns on**: the request now runs a second time, all
+#    the way into the transaction, and has to answer the same thing having written nothing.
+forget_the_cached_response "$award_customer_id" "$idem_key"
+status="$(award "$award_customer_token" "$idem_key" "$idem_job" "$idem_winner" idforgotten)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-idforgotten.json"; fail "the retry after the cached response expired returned $status, want 200"; }
+replayed_from_redis idforgotten && fail "the entry was deleted and the middleware still replayed; this check is proving nothing"
+[[ "$(json "$WORKDIR/bid-idforgotten.json" '["id"]')" == "$idem_winner" ]] \
+  || fail "the retry answered with a different offer"
+[[ "$(json "$WORKDIR/bid-idforgotten.json" '["status"]')" == "accepted" ]] \
+  || fail "the retry did not answer with the accepted offer"
+ok "with the cached response gone the request runs again, reaches the transaction, and is answered from the row it already wrote"
+
+# 3. And it wrote nothing — including the sweep, which is the write no caller ever names. Both
+#    timestamps, because bids_set_updated_at moves on any write to a row even when the status it sets
+#    is the status already there.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$idem_winner';")" == "$idem_winner_written" ]] \
+  || fail "the retry rewrote the accepted offer"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select updated_at from bids where id = '$idem_loser';")" == "$idem_loser_written" ]] \
+  || fail "the retry ran the rejection sweep a second time"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
+     from jobs j where j.id = '$idem_job';")" == "Awarded 2" ]] \
+  || fail "the retries left more than one transition on the job"
+ok "and it recorded nothing further — not the accept, not the sweep, not a second transition"
+
+# 4. The two mechanisms disagreeing, which is the case worth naming. The **same key** carrying a
+#    **different offer** is not a retry at all: the middleware fingerprints method, path and body, so
+#    it refuses rather than replaying — answering with the first request's response would tell a client
+#    that something it never sent had succeeded. The record would have said "that job is already
+#    awarded", which is also true; the key wins because it is in front, and because "you have reused a
+#    key" is the more actionable of the two.
+status="$(award "$award_customer_token" "$idem_key" "$idem_job" "$idem_loser" idreused)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-idreused.json"; fail "one key carrying two different awards returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-idreused.json" '["error"]["code"]')" == "idempotency_key_reused" ]] \
+  || { cat "$WORKDIR/bid-idreused.json"; fail "expected code=idempotency_key_reused"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$idem_job' and status = 'Accepted';")" == "1" ]] \
+  || fail "the reused key awarded a second offer"
+ok "the same key naming a different offer is refused rather than replayed — a key identifies a request, not an intention"
+
+# And the answer the record would have given, under a key of its own, so both halves are on the record.
+status="$(award "$award_customer_token" "verify-award-idem-other-$$" "$idem_job" "$idem_loser" idother)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-idother.json"; fail "awarding a second offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-idother.json" '["error"]["code"]')" == "conflict" ]] \
+  || { cat "$WORKDIR/bid-idother.json"; fail "expected code=conflict"; }
+ok "under a key of its own that same request is a conflict — the two mechanisms refuse it for different reasons and the middleware's is the one in front"
+
+# 5. The key is namespaced by the authenticated subject (SHIP-44), which is the gate CLAUDE.md holds
+#    every authenticated state-changing endpoint behind. A stranger sending this customer's key gets
+#    their own refusal rather than this customer's stored 200 — the cross-tenant read that
+#    idem:v1:anonymous:<key> would have made possible.
+status="$(award "$award_stranger_token" "$idem_key" "$idem_job" "$idem_winner" idstranger)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-idstranger.json"; fail "a stranger reusing the key returned $status, want 404"; }
+replayed_from_redis idstranger && fail "a stranger was handed this customer's stored response"
+ok "and another caller sending the same key is answered in their own scope, never from this customer's stored response"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-95  two awards arriving together leave exactly one accepted offer"
+
+# SHIP-95's races are pinned in Go, where a test can hold one transaction open and ask PostgreSQL
+# whether the other is waiting on it — see internal/bidding/race_test.go. This is the one assertion
+# that cannot be made there: the same race through the **served binary**, against cmd/api's own
+# `LockForAward` rather than the copy the package's fixtures carry.
+#
+# **What is asserted is the outcome invariant, not the interleaving.** Two curls started together may
+# or may not overlap on any given run, and a shell check that depended on them overlapping would be
+# flaky rather than strict. Either way exactly one award may succeed — Docs/01 §6, "a job can have one
+# accepted bid only" — and the loser is `conflict` rather than `bidding_bid_closed`, because the sweep
+# has made "that offer is closed" true of every offer on the job and only "you have already awarded
+# this job" tells the client where to look.
+#
+# The fixture is a job of its own. The sections above have already awarded theirs, and a race needs a
+# job with two live offers on it.
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set email_verified_at = now(), phone_verified_at = now()
+     where id in ('$bid_provider_id', '$bid_rival_id');"
+
+status="$(bid_post "$bid_customer_token" "verify-race-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":432199}' race-job)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-race-job.json"; fail "creating the race job returned $status"; }
+race_job_id="$(json "$WORKDIR/bid-race-job.json" '["id"]')"
+move_job "$race_job_id" Draft Open
+
+status="$(bid_post "$bid_provider_token" "verify-race-bid-a-$$" "/v1/jobs/$race_job_id/bids" "$bid_body" race-bid-a)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-race-bid-a.json"; fail "the first racer's offer returned $status"; }
+race_bid_a="$(json "$WORKDIR/bid-race-bid-a.json" '["id"]')"
+
+status="$(bid_post "$bid_rival_token" "verify-race-bid-b-$$" "/v1/jobs/$race_job_id/bids" "$bid_body" race-bid-b)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-race-bid-b.json"; fail "the second racer's offer returned $status"; }
+race_bid_b="$(json "$WORKDIR/bid-race-bid-b.json" '["id"]')"
+
+# race_award <key> <bid> <name> — one award, writing its status to a file so a background job can
+# report it. Distinct keys deliberately: under one key the middleware refuses the second request with
+# `idempotency_request_in_progress` and the platform below it never sees two.
+race_award() {
+  curl -s -X POST -o "$WORKDIR/bid-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $bid_customer_token" -H "Idempotency-Key: $1" \
+    -H 'Content-Type: application/json' -d "{\"bid_id\":\"$2\"}" \
+    "http://localhost:$VERIFY_PORT/v1/jobs/$race_job_id/award" > "$WORKDIR/bid-$3.status"
+}
+
+race_award "verify-race-a-$$" "$race_bid_a" race-a &
+race_pid_a=$!
+race_award "verify-race-b-$$" "$race_bid_b" race-b &
+race_pid_b=$!
+wait "$race_pid_a" || fail "the first concurrent award never answered"
+wait "$race_pid_b" || fail "the second concurrent award never answered"
+
+race_won=0
+race_refused=0
+for race_name in race-a race-b; do
+  race_status="$(< "$WORKDIR/bid-$race_name.status")"
+  case "$race_status" in
+    200) race_won=$((race_won + 1)) ;;
+    409)
+      race_refused=$((race_refused + 1))
+      race_code="$(json "$WORKDIR/bid-$race_name.json" '["error"]["code"]')"
+      [[ "$race_code" == "conflict" ]] \
+        || fail "the losing award answered $race_code, want conflict — a second award is a job that has moved on, not an offer that closed"
+      ;;
+    *) cat "$WORKDIR/bid-$race_name.json"; fail "a concurrent award returned $race_status, want 200 or 409" ;;
+  esac
+done
+[[ "$race_won" == 1 ]] || fail "$race_won of 2 concurrent awards succeeded, want exactly 1"
+[[ "$race_refused" == 1 ]] || fail "$race_refused of 2 concurrent awards were refused, want exactly 1"
+ok "two awards on one job answer one 200 and one 409 conflict, whichever arrives first"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$race_job_id' and status = 'Accepted';")" == "1" ]] \
+  || fail "the race left more or fewer than one accepted offer — two providers each believing they have the job is a marketplace-credibility failure"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where job_id = '$race_job_id' and status = 'Submitted';")" == "0" ]] \
+  || fail "an offer is still live on an awarded job"
+ok "the database holds exactly one accepted offer and nothing still live, which is what uq_bids_one_accepted_per_job is for"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$race_job_id';")" == "Awarded" ]] \
+  || fail "the job did not reach Awarded"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$race_job_id' and to_status = 'Awarded';")" == "1" ]] \
+  || fail "the job was moved to Awarded more than once — the losing award ran the transition as well"
+ok "and the job was moved to Awarded exactly once, through the guarded transition"

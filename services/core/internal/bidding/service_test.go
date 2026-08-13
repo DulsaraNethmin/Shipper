@@ -696,6 +696,7 @@ func TestAnEligibilityFailureIsNotARefusal(t *testing.T) {
 	m.svc = NewService(
 		refusing{err: errors.New("the filter could not run")},
 		newTestNegotiation(m.svc.clock),
+		newTestAwarding(m.svc.clock),
 		m.svc.clock,
 	)
 
@@ -2040,6 +2041,7 @@ func TestANegotiationFailureIsNotARefusal(t *testing.T) {
 	m.svc = NewService(
 		fleet.NewService(m.svc.clock),
 		brokenNegotiation{err: errors.New("the job service could not run")},
+		newTestAwarding(m.svc.clock),
 		m.svc.clock,
 	)
 
@@ -2681,5 +2683,960 @@ func TestAWithdrawnOfferAndItsReplacementAreBothInTheChain(t *testing.T) {
 	}
 	if offers[1].ID != second.ID {
 		t.Errorf("the second entry is %s, want the replacement %s", offers[1].ID, second.ID)
+	}
+}
+
+// --- SHIP-92: the award, in one transaction -------------------------------------------------------
+//
+// SHIP-92's *Done when*: "POST /v1/jobs/{id}/award accepts one bid and moves the job to Awarded in
+// one transaction."
+//
+// Three claims, and each has a test that fails if it stops holding:
+//
+//	accepts one bid          TestAwardingAcceptsTheBidAndMovesTheJob, read out of the row
+//	moves the job to Awarded the same test, read out of `jobs` and `job_status_history` together
+//	in one transaction       TestAFailedTransitionRollsTheAcceptBackWithIt
+//
+// The fourth claim is Docs/02 §3's rather than the ticket sentence's — "only the customer can award a
+// job, and the selected bid must be active" — and it is two tests: TestOnlyTheJobsCustomerCanAward
+// and TestOnlyALiveProvidersOfferCanBeAwarded.
+//
+// **The award is the one place in this domain where four database constraints stand behind the
+// code**, and the tests below are deliberately split between the two kinds of proof. What the schema
+// enforces was proved at SHIP-88, against naive statements this service does not make
+// (TestTheDatabaseRefusesToAwardADisplacedOffer, TestTheDatabaseRefusesToAwardACustomersOwnOffer).
+// What is proved here is the half no constraint can express — that the offer being accepted was
+// **live when it was accepted** — plus the translation of every refusal into something a client can
+// act on.
+//
+// **The concurrency suite is deliberately not here.** SHIP-95 owns "double award,
+// withdraw-during-award, and expiry-during-award", and Docs/11 §8 asks for it to be written against
+// Docs/02 §3 and Docs/08's named races by somebody who has not read this implementation. What is here
+// instead is TestTheIndexRefusesASecondAcceptedBid, which demonstrates the same backstop
+// deterministically rather than by racing.
+
+// TestAwardingAcceptsTheBidAndMovesTheJob is SHIP-92's *Done when*, read out of the tables.
+//
+// Every assertion is against a row rather than against what the service said about itself. A method
+// returning the value it meant to write would satisfy a test comparing against its own return value
+// even if nothing had been written at all — which is the specific failure this endpoint cannot have,
+// because a customer who is told they awarded a job and did not has no way to find out.
+//
+// The history row is checked as well as the status, and that pairing is what makes the transition
+// real: 000402 refuses a status write that no `job_status_history` row written in the same
+// transaction describes, so a job at 'Awarded' with one history row is a job that went through the
+// guard rather than around it.
+func TestAwardingAcceptsTheBidAndMovesTheJob(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	before, changes := m.jobStatus(t, m.job)
+	if before != "Open" || changes != 1 {
+		t.Fatalf("the fixture job is %s with %d transitions, want Open with 1", before, changes)
+	}
+
+	accepted, err := m.award(t, m.customer, m.job, placed.ID)
+	if err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+	if accepted.ID != placed.ID {
+		t.Errorf("the award answered with %s, want the bid that was awarded %s", accepted.ID, placed.ID)
+	}
+	if accepted.Status != StatusAccepted {
+		t.Errorf("the award answered %s, want %s", accepted.Status, StatusAccepted)
+	}
+
+	if stored := m.row(t, placed.ID); stored.status != string(StatusAccepted) {
+		t.Errorf("the stored bid is %s, want Accepted", stored.status)
+	}
+
+	after, changes := m.jobStatus(t, m.job)
+	if after != "Awarded" {
+		t.Errorf("the job is %s, want Awarded", after)
+	}
+	if changes != 2 {
+		t.Errorf("the job has %d recorded transitions, want 2 — an award that moved the status "+
+			"without leaving a history row would have gone round 000402's guard", changes)
+	}
+}
+
+// TestOnlyTheJobsCustomerCanAward is Docs/02 §3's first transition control.
+//
+// "Only the customer can award a job." The three callers who are not that customer are the bidding
+// provider, a competing provider, and a stranger — and all three get one answer, which is the answer
+// a job that does not exist gets.
+//
+// **The refusal happens before the bid is read**, and the test asserts it by naming a real bid: a
+// caller who could tell "that bid exists and the job is not yours" from "no such bid" would be able
+// to confirm identifiers by trying them.
+func TestOnlyTheJobsCustomerCanAward(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-who"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	rival := newVerifiedProvider(t, m.pool, "award-rival@example.com", "+61400000920")
+	stranger := newCustomer(t, m.pool, "award-stranger@example.com", "+61400000921")
+
+	for who, caller := range map[string]uuid.UUID{
+		"the bidding provider": m.provider,
+		"a competing provider": rival,
+		"another customer":     stranger,
+	} {
+		t.Run(who, func(t *testing.T) {
+			_, err := m.award(t, caller, m.job, placed.ID)
+			if !errors.Is(err, ErrNotJobCustomer) {
+				t.Fatalf("%s awarding the job: %v, want ErrNotJobCustomer", who, err)
+			}
+		})
+	}
+
+	if stored := m.row(t, placed.ID); stored.status != string(StatusSubmitted) {
+		t.Errorf("the bid is %s after three refused awards, want Submitted", stored.status)
+	}
+	if status, _ := m.jobStatus(t, m.job); status != "Open" {
+		t.Errorf("the job is %s after three refused awards, want Open", status)
+	}
+}
+
+// TestOnlyALiveProvidersOfferCanBeAwarded is the second half of Docs/02 §3's first control — "the
+// selected bid must be active" — and the half no constraint can hold.
+//
+// **This is the one rule the schema cannot express**, and Docs/11 §3's SHIP-88 entry says so: a
+// partial unique index can hold "at most one accepted bid per job", and a column `CHECK` can hold "a
+// displaced offer is never live", but "the offer you are accepting was live when you accepted it" is
+// a statement about a transition rather than about a row. 000500 deliberately declined to give `bids`
+// the transition trigger `jobs` has, so this is application logic and it runs inside the transaction,
+// under the bid's own lock.
+//
+// The four closed statuses are written directly, which is what [market.setStatus] exists for: three
+// of them are reachable only through tickets that do not exist yet.
+func TestOnlyALiveProvidersOfferCanBeAwarded(t *testing.T) {
+	for _, status := range []Status{StatusWithdrawn, StatusRejected, StatusExpired, StatusSuperseded} {
+		t.Run(string(status), func(t *testing.T) {
+			m := newMarket(t)
+
+			placed, _, err := m.place(t, m.provider, m.job, offer("key-award-"+string(status)))
+			if err != nil {
+				t.Fatalf("placing: %v", err)
+			}
+			m.setStatus(t, placed.ID, status)
+
+			_, err = m.award(t, m.customer, m.job, placed.ID)
+			if !errors.Is(err, ErrBidClosed) {
+				t.Fatalf("awarding a %s offer: %v, want ErrBidClosed", status, err)
+			}
+			if stored := m.row(t, placed.ID); stored.status != string(status) {
+				t.Errorf("the refused award moved the bid to %s", stored.status)
+			}
+			if job, changes := m.jobStatus(t, m.job); job != "Open" || changes != 1 {
+				t.Errorf("the job is %s with %d transitions, want Open with 1", job, changes)
+			}
+		})
+	}
+}
+
+// TestACustomersOwnCounterCannotBeAwarded is `ck_bids_only_a_providers_offer_is_accepted` met from
+// the service's side.
+//
+// The constraint was proved at SHIP-88 against a naive `UPDATE`. What is proved here is that the
+// service refuses first and refuses legibly — a customer handed a constraint name learns nothing they
+// can act on, and the thing they can act on is "wait for the provider to counter at your number".
+//
+// **The second half is what makes the rule a shape rather than a wall**: the provider's counter at
+// the customer's own number is awardable, and the same customer awards it through the same call.
+func TestACustomersOwnCounterCannotBeAwarded(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-mine"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	theirs, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-award-mine-c"))
+	if err != nil {
+		t.Fatalf("countering: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, theirs.ID); !errors.Is(err, ErrNotAProvidersOffer) {
+		t.Fatalf("awarding the customer's own counter: %v, want ErrNotAProvidersOffer", err)
+	}
+	if status, _ := m.jobStatus(t, m.job); status != "Open" {
+		t.Errorf("the refused award moved the job to %s", status)
+	}
+
+	agreed, _, err := m.counter(t, m.provider, m.job, theirs.ID, counterOf(40000, "key-award-agreed-c"))
+	if err != nil {
+		t.Fatalf("the provider's counter: %v", err)
+	}
+	if _, err := m.award(t, m.customer, m.job, agreed.ID); err != nil {
+		t.Fatalf("awarding the provider's counter at the customer's own number: %v", err)
+	}
+	if status, _ := m.jobStatus(t, m.job); status != "Awarded" {
+		t.Errorf("the job is %s, want Awarded", status)
+	}
+}
+
+// TestOnlyTheHeadOfAChainCanBeAwarded is SHIP-88's first *Done when* — "only the latest valid offer
+// is acceptable" — met by the endpoint it was written for.
+//
+// The service's own check is [Status.live], and `ck_bids_superseded_is_not_live` is what makes "live"
+// and "head of the chain" the same row rather than two facts that have to agree. So a displaced offer
+// is refused as closed, and the refusal never reaches the database.
+func TestOnlyTheHeadOfAChainCanBeAwarded(t *testing.T) {
+	m := newMarket(t)
+
+	first, _, err := m.place(t, m.provider, m.job, offer("key-award-head"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, first.ID, counterOf(40000, "key-award-head-c")); err != nil {
+		t.Fatalf("countering: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, first.ID); !errors.Is(err, ErrBidClosed) {
+		t.Fatalf("awarding a superseded offer: %v, want ErrBidClosed", err)
+	}
+	if stored := m.row(t, first.ID); stored.status != string(StatusSuperseded) {
+		t.Errorf("the displaced offer is %s, want Superseded", stored.status)
+	}
+}
+
+// TestAwardingTheSameBidTwiceIsTheSameOutcome is idempotency by state, which SHIP-86 established is
+// stronger than idempotency by key.
+//
+// **A phone that reconnected, restarted and generated a fresh key must not be told its award
+// failed.** The middleware's key absorbs a retry while its entry lives; this absorbs the one that
+// arrives afterwards, or under a different value, and it does so without a stored key and without a
+// column — because an `UPDATE` applied twice reaches the state applying it once reaches.
+//
+// The proof that nothing further was recorded is `updated_at` and the history count together.
+// `bids_set_updated_at` moves the column on every write to the row, so a second accept would be
+// visible there even though it would set the same status.
+func TestAwardingTheSameBidTwiceIsTheSameOutcome(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-twice"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	first, err := m.award(t, m.customer, m.job, placed.ID)
+	if err != nil {
+		t.Fatalf("the first award: %v", err)
+	}
+	written := m.row(t, placed.ID)
+
+	second, err := m.award(t, m.customer, m.job, placed.ID)
+	if err != nil {
+		t.Fatalf("awarding the same bid again: %v — an award is idempotent by state, and a phone "+
+			"that retried under a fresh key must not be told it failed", err)
+	}
+	if second.ID != first.ID || second.Status != StatusAccepted {
+		t.Errorf("the second award answered %s at %s, want the accepted bid %s",
+			second.ID, second.Status, first.ID)
+	}
+
+	if again := m.row(t, placed.ID); !again.updatedAt.Equal(written.updatedAt) {
+		t.Errorf("the repeated award wrote to the row: updated_at moved from %s to %s",
+			written.updatedAt, again.updatedAt)
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 2 {
+		t.Errorf("the job is %s with %d transitions, want Awarded with 2", status, changes)
+	}
+}
+
+// TestASecondAwardOnOneJobIsRefused is CLAUDE.md's "exactly one accepted bid per job", met from the
+// job's side rather than the index's.
+//
+// A customer awarding a *different* bid on a job they have already awarded is refused with
+// [ErrJobNotAwardable] — because the job is at 'Awarded' and Docs/02 §2 has no move from there to
+// itself. That refusal happens under the job's lock, before the second bid is touched, which is why
+// the index below it is a backstop rather than the mechanism.
+func TestASecondAwardOnOneJobIsRefused(t *testing.T) {
+	m := newMarket(t)
+
+	rival := newVerifiedProvider(t, m.pool, "award-second@example.com", "+61400000922")
+	declare(t, m.pool, rival, "VIC")
+	addVehicle(t, m.pool, rival, "AWD002")
+
+	mine, _, err := m.place(t, m.provider, m.job, offer("key-award-first"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	theirs, _, err := m.place(t, rival, m.job, offer("key-award-other"))
+	if err != nil {
+		t.Fatalf("the rival's offer: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, mine.ID); err != nil {
+		t.Fatalf("the first award: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, theirs.ID); !errors.Is(err, ErrJobNotAwardable) {
+		t.Fatalf("awarding a second bid on one job: %v, want ErrJobNotAwardable", err)
+	}
+	// **SHIP-93 makes this the interesting assertion rather than a formality.** The rival's offer is
+	// already `Rejected` when the second award arrives, so an implementation that judged the *offer*
+	// before the *job* would answer ErrBidClosed — a true statement that sends the customer to the
+	// job's other offers, every one of which the same sweep has just closed. The job is what they
+	// need to look at, and that is what the refusal above says.
+	if stored := m.row(t, theirs.ID); stored.status != string(StatusRejected) {
+		t.Errorf("the rival's offer is %s, want Rejected — the award closed it (SHIP-93)", stored.status)
+	}
+
+	var accepted int
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM bids WHERE job_id = $1 AND status = 'Accepted'`, m.job).Scan(&accepted); err != nil {
+		t.Fatalf("counting accepted bids: %v", err)
+	}
+	if accepted != 1 {
+		t.Errorf("the job has %d accepted bids, want exactly 1", accepted)
+	}
+}
+
+// TestTheIndexRefusesASecondAcceptedBid is `uq_bids_one_accepted_per_job` doing the job the lock
+// ordering usually does first, and the translation of its refusal.
+//
+// **A deterministic stand-in for a race, and it is honest about being one.** Two awards arriving at
+// once are serialised by the `jobs` lock long before they reach the index — Docs/11 §3's ordering is
+// what arranges that — so the index's refusal is not reachable through two well-behaved requests.
+// SHIP-95 owns the racing version. What this does instead is put the database in the state a race
+// would have to produce for the index to matter: a job that is still Open carrying an accepted bid,
+// which is what a writer that skipped the job lock would leave.
+//
+// The assertion is that the violation comes back as [ErrJobNotAwardable] rather than as a 500. A
+// constraint name reaching a client is a defect twice over: it is unactionable, and it discloses the
+// schema.
+func TestTheIndexRefusesASecondAcceptedBid(t *testing.T) {
+	m := newMarket(t)
+
+	rival := newVerifiedProvider(t, m.pool, "award-index@example.com", "+61400000923")
+	declare(t, m.pool, rival, "VIC")
+	addVehicle(t, m.pool, rival, "AWD003")
+
+	mine, _, err := m.place(t, m.provider, m.job, offer("key-award-index"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	theirs, _, err := m.place(t, rival, m.job, offer("key-award-index-rival"))
+	if err != nil {
+		t.Fatalf("the rival's offer: %v", err)
+	}
+
+	// The state a writer that skipped the job lock would leave behind: an accepted bid on a job that
+	// is still Open, so LockForAward answers "awardable" and the index is the only thing left.
+	m.setStatus(t, theirs.ID, StatusAccepted)
+
+	if _, err := m.award(t, m.customer, m.job, mine.ID); !errors.Is(err, ErrJobNotAwardable) {
+		t.Fatalf("the index's refusal came back as %v, want ErrJobNotAwardable", err)
+	}
+	if stored := m.row(t, mine.ID); stored.status != string(StatusSubmitted) {
+		t.Errorf("the refused award left the bid at %s", stored.status)
+	}
+	if status, _ := m.jobStatus(t, m.job); status != "Open" {
+		t.Errorf("the refused award moved the job to %s", status)
+	}
+}
+
+// TestAJobThatHasMovedOnCannotBeAwarded is the third of Docs/02 §2's refusals, and the one a customer
+// meets most often.
+//
+// Cancelled and Draft are both jobs with no row to 'Awarded' in the transition table, reached from
+// two different directions: one has finished and one has not started. Both answer
+// [ErrJobNotAwardable], and neither answer distinguishes itself from the other — which is the same
+// collapse this domain makes everywhere else, and here it costs nothing because the customer owns the
+// job and can read its status.
+func TestAJobThatHasMovedOnCannotBeAwarded(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-gone"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+
+	if _, err := m.award(t, m.customer, m.job, placed.ID); !errors.Is(err, ErrJobNotAwardable) {
+		t.Fatalf("awarding a cancelled job: %v, want ErrJobNotAwardable", err)
+	}
+	if stored := m.row(t, placed.ID); stored.status != string(StatusSubmitted) {
+		t.Errorf("the refused award moved the bid to %s", stored.status)
+	}
+}
+
+// TestAwardingABidOnAnotherJobIsNotFound keeps the job in the path from being decorative.
+//
+// The award names a job in its path and a bid in its body, which is the one shape in this domain
+// where the two could drift apart without anybody noticing. A real bid paired with a job it is not on
+// is a request for something that does not exist, and answering it from the bid alone would let a
+// customer award, against their own job, an offer somebody made on a different one.
+func TestAwardingABidOnAnotherJobIsNotFound(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-elsewhere"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	other := m.publish(t)
+	if _, err := m.award(t, m.customer, other, placed.ID); !errors.Is(err, ErrBidNotFound) {
+		t.Fatalf("awarding a bid under the wrong job: %v, want ErrBidNotFound", err)
+	}
+	if status, _ := m.jobStatus(t, other); status != "Open" {
+		t.Errorf("the refused award moved the other job to %s", status)
+	}
+	if stored := m.row(t, placed.ID); stored.status != string(StatusSubmitted) {
+		t.Errorf("the refused award moved the bid to %s", stored.status)
+	}
+}
+
+// TestAwardingRefusesAConnectionPool is the guard [ErrNotInTransaction] exists for, at its strongest.
+//
+// The award holds two row locks in two tables and writes through a port into a third statement.
+// Outside a transaction each of those is an independent act that can half happen, and a job at
+// 'Awarded' with no accepted bid is not a state anything downstream can read. It is checked before
+// anything is locked, so a caller that got this wrong finds out before it has changed anything.
+func TestAwardingRefusesAConnectionPool(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-pool"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	if _, err := m.svc.AwardBid(t.Context(), m.pool, m.customer, m.job, placed.ID); !errors.Is(err, ErrNotInTransaction) {
+		t.Fatalf("awarding on the pool: %v, want ErrNotInTransaction", err)
+	}
+	if stored := m.row(t, placed.ID); stored.status != string(StatusSubmitted) {
+		t.Errorf("an award outside a transaction still wrote: the bid is %s", stored.status)
+	}
+}
+
+// TestAnAwardingFailureIsNotARefusal separates the two things the port can answer, which is the
+// distinction [refusing] and [brokenNegotiation] exist for on the other two ports.
+//
+// A port that says "no" is an answer and produces a 404 or a 409. A port that could not *reach* an
+// answer — the database is gone — is a failure, and reporting it as a refusal would tell a customer
+// their job had vanished during an outage.
+func TestAnAwardingFailureIsNotARefusal(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-broken"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	m.svc = NewService(
+		fleet.NewService(m.svc.clock),
+		newTestNegotiation(m.svc.clock),
+		brokenAwarding{lockErr: errors.New("the job service could not run")},
+		m.svc.clock,
+	)
+
+	_, err = m.award(t, m.customer, m.job, placed.ID)
+	if err == nil {
+		t.Fatal("a broken port let an award through")
+	}
+	if errors.Is(err, ErrNotJobCustomer) || errors.Is(err, ErrJobNotAwardable) {
+		t.Error("a port that failed was reported as a port that said no")
+	}
+	if !strings.Contains(err.Error(), "the job service could not run") {
+		t.Errorf("the cause was lost: %v", err)
+	}
+}
+
+// TestAnUnrecognisedAwardAnswerIsRefused is why [JobAwardUnrecognised] is first in the enumeration.
+//
+// A half-written adapter, a stub, or a switch with a missing case returns the zero value, and the
+// service has to refuse it rather than read silence as permission to award. **The real adapter cannot
+// produce this** — every branch of it returns something else — so a stub is the only way to
+// demonstrate that the refusal is there at all, and without this test the branch would be reachable
+// only by a mistake nobody had made yet.
+func TestAnUnrecognisedAwardAnswerIsRefused(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-zero"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	m.svc = NewService(
+		fleet.NewService(m.svc.clock),
+		newTestNegotiation(m.svc.clock),
+		brokenAwarding{lock: JobAwardUnrecognised},
+		m.svc.clock,
+	)
+
+	if _, err := m.award(t, m.customer, m.job, placed.ID); err == nil {
+		t.Fatal("an adapter that answered nothing was read as permission to award")
+	}
+	if stored := m.row(t, placed.ID); stored.status != string(StatusSubmitted) {
+		t.Errorf("the bid was accepted anyway: %s", stored.status)
+	}
+}
+
+// TestAFailedTransitionRollsTheAcceptBackWithIt is the "one transaction" half of SHIP-92's *Done
+// when*, and it is the claim that cannot be demonstrated by a happy path.
+//
+// The accept is written and *then* the job is moved. If the two were not one transaction, a refusal
+// at the second would leave an accepted bid on a job that never moved — a provider believing they had
+// won work the customer's own job screen says is still open, and a state SHIP-93's sweep would then
+// close every other bid against.
+//
+// The transition is made to fail through the port, which is the only way to produce it: the job has
+// been held `FOR UPDATE` since before the bid was read, so nothing can genuinely move it in between.
+// What the test then asserts is the *rollback*, in both tables.
+func TestAFailedTransitionRollsTheAcceptBackWithIt(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-rollback"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	m.svc = NewService(
+		fleet.NewService(m.svc.clock),
+		newTestNegotiation(m.svc.clock),
+		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},
+		m.svc.clock,
+	)
+
+	if _, err := m.award(t, m.customer, m.job, placed.ID); err == nil {
+		t.Fatal("the award reported success with the job left where it was")
+	}
+
+	if stored := m.row(t, placed.ID); stored.status != string(StatusSubmitted) {
+		t.Errorf("the bid is %s, want Submitted — the accept committed without the transition, "+
+			"which leaves a provider holding work the job says nobody was given", stored.status)
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "Open" || changes != 1 {
+		t.Errorf("the job is %s with %d transitions, want Open with 1", status, changes)
+	}
+}
+
+// TestAwardingRefusesAnIdentifierThatNamesNothing is the shape of every "no such thing" in this
+// domain, applied to the endpoint that takes two identifiers from two places.
+func TestAwardingRefusesAnIdentifierThatNamesNothing(t *testing.T) {
+	m := newMarket(t)
+
+	placed, _, err := m.place(t, m.provider, m.job, offer("key-award-nothing"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, uuid.Must(uuid.NewV7())); !errors.Is(err, ErrBidNotFound) {
+		t.Errorf("awarding a bid that does not exist: %v, want ErrBidNotFound", err)
+	}
+	if _, err := m.award(t, m.customer, uuid.Must(uuid.NewV7()), placed.ID); !errors.Is(err, ErrNotJobCustomer) {
+		t.Errorf("awarding on a job that does not exist: %v, want ErrNotJobCustomer", err)
+	}
+	if _, err := m.award(t, m.customer, m.job, uuid.Nil); !errors.Is(err, ErrBidNotFound) {
+		t.Errorf("awarding the nil bid: %v, want ErrBidNotFound", err)
+	}
+}
+
+// TestAnAwardClosesEveryCompetingOffer is SHIP-93's *Done when*: "every other bid on the job becomes
+// Rejected in the same transaction".
+//
+// Docs/02 §3 is the sentence behind it — "awarding a job atomically marks one bid accepted and all
+// others closed" — and SHIP-92 met half of it. This is the other half.
+//
+// **Three competitors rather than one**, because a sweep against a single row is indistinguishable
+// from a statement that closes whatever it happens to find first, and because the shape a customer
+// actually meets is a job with several offers on it.
+//
+// The final assertion is the one that matters most and is the easiest to leave out: the job has
+// exactly one accepted bid and no live one. A sweep that closed two of the three would leave a
+// provider whose offer the customer can no longer act on and who has been told nothing.
+func TestAnAwardClosesEveryCompetingOffer(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+
+	losers := make([]uuid.UUID, 0, 3)
+	for n := 930; n < 933; n++ {
+		placed, _, err := m.place(t, m.rival(t, n), m.job, offer(fmt.Sprintf("key-sweep-%d", n)))
+		if err != nil {
+			t.Fatalf("the offer from rival %d: %v", n, err)
+		}
+		losers = append(losers, placed.ID)
+	}
+
+	before := m.statuses(t, m.job)
+	if len(before) != 4 {
+		t.Fatalf("the job carries %d offers before the award, want 4", len(before))
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+
+	after := m.statuses(t, m.job)
+	if after[winner.ID] != string(StatusAccepted) {
+		t.Errorf("the awarded offer is %s, want Accepted", after[winner.ID])
+	}
+	for _, loser := range losers {
+		if after[loser] != string(StatusRejected) {
+			t.Errorf("the competing offer %s is %s, want Rejected", loser, after[loser])
+		}
+	}
+
+	var live, accepted int
+	if err := m.pool.QueryRow(t.Context(), `
+		SELECT count(*) FILTER (WHERE status = 'Submitted'),
+		       count(*) FILTER (WHERE status = 'Accepted')
+		FROM bids WHERE job_id = $1`, m.job).Scan(&live, &accepted); err != nil {
+		t.Fatalf("counting the offers on %s: %v", m.job, err)
+	}
+	if live != 0 || accepted != 1 {
+		t.Errorf("the awarded job holds %d live offers and %d accepted, want 0 and 1", live, accepted)
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 2 {
+		t.Errorf("the job is %s with %d transitions, want Awarded with 2", status, changes)
+	}
+}
+
+// TestTheSweepReachesNoOtherJob is the `WHERE job_id` clause, which is the one part of the statement
+// whose absence would be catastrophic and silent.
+//
+// A sweep without it closes every live offer in the marketplace on the first award of the day, and
+// nothing else in the platform would notice: the rows are legitimately `Rejected`, no constraint is
+// violated, and the customers whose jobs were emptied are not the ones making the request. This test
+// is what says so — one job awarded, another job's offers untouched, including one from the same
+// provider.
+func TestTheSweepReachesNoOtherJob(t *testing.T) {
+	m := newMarket(t)
+
+	elsewhere := m.publish(t)
+	bystander := m.rival(t, 933)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-scope-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	if _, _, err := m.place(t, bystander, m.job, offer("key-sweep-scope-loser")); err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	// The same provider bidding on the other job as well, which is what makes the scope a *job*
+	// scope rather than something a provider filter would also have satisfied.
+	untouched, _, err := m.place(t, m.provider, elsewhere, offer("key-sweep-scope-other"))
+	if err != nil {
+		t.Fatalf("the offer on the other job: %v", err)
+	}
+	alsoUntouched, _, err := m.place(t, bystander, elsewhere, offer("key-sweep-scope-other-rival"))
+	if err != nil {
+		t.Fatalf("the rival's offer on the other job: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+
+	other := m.statuses(t, elsewhere)
+	for name, bid := range map[string]uuid.UUID{
+		"the winning provider's offer on the other job": untouched.ID,
+		"a rival's offer on the other job":              alsoUntouched.ID,
+	} {
+		if other[bid] != string(StatusSubmitted) {
+			t.Errorf("%s is %s, want Submitted — the sweep left its own job", name, other[bid])
+		}
+	}
+	if status, _ := m.jobStatus(t, elsewhere); status != "Open" {
+		t.Errorf("the other job is %s, want Open", status)
+	}
+}
+
+// TestTheSweepLeavesAnAlreadyClosedOfferAsItWas is the predicate's other half, and the half no
+// constraint would catch.
+//
+// `ck_bids_superseded_is_not_live` refuses `Submitted` and `Accepted` on a displaced row and permits
+// `Rejected` — so a sweep written as "everything except the winner" would overwrite a `Superseded`
+// row with `Rejected`, the database would allow it, and the negotiation's history would then say the
+// customer declined an offer that was actually displaced by their own counter. Docs/01 §4.3 requires
+// every offer, counter-offer and withdrawal to be *recorded*; a status is the record.
+//
+// So each closed status is set up and checked by name rather than as a group, because the four end
+// in four different ways and only one predicate keeps all four.
+func TestTheSweepLeavesAnAlreadyClosedOfferAsItWas(t *testing.T) {
+	for _, closed := range []Status{StatusWithdrawn, StatusRejected, StatusExpired, StatusSuperseded} {
+		t.Run(string(closed), func(t *testing.T) {
+			m := newMarket(t)
+
+			winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-closed-winner"))
+			if err != nil {
+				t.Fatalf("the winning offer: %v", err)
+			}
+			done, _, err := m.place(t, m.rival(t, 934), m.job, offer("key-sweep-closed"))
+			if err != nil {
+				t.Fatalf("the offer that is already over: %v", err)
+			}
+			m.setStatus(t, done.ID, closed)
+			was := m.row(t, done.ID)
+
+			if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+				t.Fatalf("awarding: %v", err)
+			}
+
+			now := m.row(t, done.ID)
+			if now.status != string(closed) {
+				t.Errorf("the sweep rewrote a %s offer as %s — how an offer ended is the record, "+
+					"and no constraint would have refused this", closed, now.status)
+			}
+			if !now.updatedAt.Equal(was.updatedAt) {
+				t.Errorf("the sweep wrote to a %s offer: updated_at moved from %s to %s",
+					closed, was.updatedAt, now.updatedAt)
+			}
+		})
+	}
+}
+
+// TestTheSweepClosesALosingNegotiationsHeadAndNotItsHistory is the chain case, which is where "every
+// other bid" stops being one question.
+//
+// A negotiation the customer did not award holds two kinds of row: the offers already displaced by a
+// counter, which are `Superseded` and terminal, and the one at the head, which is live. **Only the
+// head is swept**, and both halves of that are defects if they go the other way — leaving the head
+// `Submitted` would strand a live offer on an awarded job, and closing the predecessors would erase
+// how they ended.
+//
+// The head here is the **customer's own counter**, which is the awkward case and the reason it is the
+// one written: they decline their own outstanding offer by awarding somebody else, and `Rejected` —
+// "an offer the customer declined" — is the only status in Docs/02 §4 that says so.
+func TestTheSweepClosesALosingNegotiationsHeadAndNotItsHistory(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-chain-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+
+	losing := m.rival(t, 935)
+	round1, _, err := m.place(t, losing, m.job, offer("key-sweep-chain-1"))
+	if err != nil {
+		t.Fatalf("the losing provider's offer: %v", err)
+	}
+	round2, _, err := m.counter(t, m.customer, m.job, round1.ID, counterOf(40000, "key-sweep-chain-2"))
+	if err != nil {
+		t.Fatalf("the customer's counter: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+
+	after := m.statuses(t, m.job)
+	if after[round1.ID] != string(StatusSuperseded) {
+		t.Errorf("the displaced offer is %s, want Superseded — it was already terminal and the "+
+			"sweep has no business saying how it ended", after[round1.ID])
+	}
+	if after[round2.ID] != string(StatusRejected) {
+		t.Errorf("the live head of the losing negotiation is %s, want Rejected — a live offer on an "+
+			"awarded job is what the sweep exists to remove", after[round2.ID])
+	}
+	if stored := m.row(t, round1.ID); stored.supersededBy != round2.ID {
+		t.Errorf("the chain link was lost: %s points at %s", round1.ID, stored.supersededBy)
+	}
+}
+
+// TestASweptOfferCanNoLongerBeActedOn is what the sweep buys the rest of the domain, and it is more
+// than tidiness.
+//
+// Before SHIP-93 a competing offer stayed `Submitted` after the award, so the three verbs that gate
+// on [Status.live] all let it through: its provider could revise the price of an offer on a job
+// somebody else had already won, or withdraw it, or counter it. Nothing corrupted — the customer
+// could not accept it, because the job had moved — but every one of those is a provider acting on
+// work that no longer exists and being told it worked.
+//
+// The refusals all answer [ErrBidClosed], which is the code that already means "this offer is over".
+func TestASweptOfferCanNoLongerBeActedOn(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-acted-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	loser := m.rival(t, 936)
+	theirs, _, err := m.place(t, loser, m.job, offer("key-sweep-acted"))
+	if err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("awarding: %v", err)
+	}
+
+	newPrice := int64(30000)
+	if _, err := m.revise(t, loser, m.job, theirs.ID, Revision{AmountCents: &newPrice}); !errors.Is(err, ErrBidClosed) {
+		t.Errorf("revising a swept offer: %v, want ErrBidClosed", err)
+	}
+	if _, err := m.withdraw(t, loser, m.job, theirs.ID); !errors.Is(err, ErrBidClosed) {
+		t.Errorf("withdrawing a swept offer: %v, want ErrBidClosed", err)
+	}
+	if _, _, err := m.counter(t, m.customer, m.job, theirs.ID, counterOf(30000, "key-sweep-acted-c")); !errors.Is(err, ErrBidClosed) {
+		t.Errorf("countering a swept offer: %v, want ErrBidClosed", err)
+	}
+	if stored := m.row(t, theirs.ID); stored.status != string(StatusRejected) {
+		t.Errorf("the swept offer is %s after three refused acts, want Rejected", stored.status)
+	}
+}
+
+// TestAFailedTransitionRollsTheSweepBackToo extends SHIP-92's rollback proof to the statement SHIP-93
+// added between the accept and the move.
+//
+// "In the same transaction" is SHIP-93's *Done when* as much as SHIP-92's, and the only way to
+// demonstrate it is to make the last step fail: an award that rolled back leaving three offers
+// `Rejected` would have closed a live market on a job that is still open, with no accepted bid to
+// show for it and nothing for the providers to be told.
+func TestAFailedTransitionRollsTheSweepBackToo(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-sweep-rollback-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	loser, _, err := m.place(t, m.rival(t, 937), m.job, offer("key-sweep-rollback"))
+	if err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	m.svc = NewService(
+		fleet.NewService(m.svc.clock),
+		newTestNegotiation(m.svc.clock),
+		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},
+		m.svc.clock,
+	)
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err == nil {
+		t.Fatal("the award reported success with the job left where it was")
+	}
+
+	after := m.statuses(t, m.job)
+	if after[winner.ID] != string(StatusSubmitted) {
+		t.Errorf("the accept survived the rollback: the awarded offer is %s", after[winner.ID])
+	}
+	if after[loser.ID] != string(StatusSubmitted) {
+		t.Errorf("the sweep survived the rollback: the competing offer is %s — a job still Open "+
+			"with its offers closed is a market emptied by a request that failed", after[loser.ID])
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "Open" || changes != 1 {
+		t.Errorf("the job is %s with %d transitions, want Open with 1", status, changes)
+	}
+}
+
+// TestARetriedAwardDoesNotSweepAgain is SHIP-94's *Done when* met at the layer the key cannot reach.
+//
+// The ticket asks that "a retried award with the same key returns the original outcome, not an
+// error", and the middleware is what answers a key it still holds. **This is the retry the middleware
+// has already forgotten** — a TTL that expired, an eviction, a failover, or a phone that restarted and
+// generated a fresh key — where the request runs a second time all the way to the transaction and the
+// only thing standing between it and a second act is the record itself.
+//
+// SHIP-93 raises what "not an error" has to mean. A repeated award now has a *second* write behind
+// it, and returning the right bid while sweeping again would be a retry that wrote — silently, to
+// rows no caller named. `updated_at` on every offer of the job is what says it did not: the trigger
+// moves the column on any write, so a sweep that closed already-closed offers would be visible even
+// though it would set the status they already have.
+func TestARetriedAwardDoesNotSweepAgain(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-retry-sweep-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	loser, _, err := m.place(t, m.rival(t, 940), m.job, offer("key-retry-sweep-loser"))
+	if err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("the first award: %v", err)
+	}
+	wroteWinner, wroteLoser := m.row(t, winner.ID), m.row(t, loser.ID)
+	if wroteLoser.status != string(StatusRejected) {
+		t.Fatalf("the competing offer is %s after the award, want Rejected", wroteLoser.status)
+	}
+
+	again, err := m.award(t, m.customer, m.job, winner.ID)
+	if err != nil {
+		t.Fatalf("the retry: %v — an award is idempotent by state, and a phone that restarted and "+
+			"generated a fresh key must not be told it failed", err)
+	}
+	if again.ID != winner.ID || again.Status != StatusAccepted {
+		t.Errorf("the retry answered %s at %s, want the accepted offer %s", again.ID, again.Status, winner.ID)
+	}
+
+	if now := m.row(t, winner.ID); !now.updatedAt.Equal(wroteWinner.updatedAt) {
+		t.Errorf("the retry rewrote the accepted offer: updated_at moved from %s to %s",
+			wroteWinner.updatedAt, now.updatedAt)
+	}
+	if now := m.row(t, loser.ID); !now.updatedAt.Equal(wroteLoser.updatedAt) {
+		t.Errorf("the retry ran the sweep a second time: the closed offer's updated_at moved from "+
+			"%s to %s, and no caller ever named that row", wroteLoser.updatedAt, now.updatedAt)
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 2 {
+		t.Errorf("the job is %s with %d transitions, want Awarded with 2", status, changes)
+	}
+}
+
+// TestARetryIsAnsweredAfterTheJobHasMovedOnAgain is the sentence SHIP-92 wrote and nothing tested: a
+// retry asks what happened to a request, and that answer does not change when the world does.
+//
+// The interesting retry is not the one that arrives a second later. It is the one that arrives after
+// the delivery has **started** — the phone found signal in the afternoon and sent the morning's award
+// again — by which time the job is past `Awarded` and `LockForAward` answers "not permitted". The
+// award still happened, the customer still needs to be told so, and the branch that says so is the
+// already-`Accepted` check sitting in front of the job's standing.
+//
+// It is also the one case where getting the ordering backwards is invisible in ordinary use and
+// plausible on inspection: refusing with `conflict` reads like a correct answer about a job that has
+// moved on, and it would be a client told its award failed when the provider is already driving.
+func TestARetryIsAnsweredAfterTheJobHasMovedOnAgain(t *testing.T) {
+	m := newMarket(t)
+
+	winner, _, err := m.place(t, m.provider, m.job, offer("key-retry-moved-winner"))
+	if err != nil {
+		t.Fatalf("the winning offer: %v", err)
+	}
+	loser, _, err := m.place(t, m.rival(t, 941), m.job, offer("key-retry-moved-loser"))
+	if err != nil {
+		t.Fatalf("the competing offer: %v", err)
+	}
+
+	if _, err := m.award(t, m.customer, m.job, winner.ID); err != nil {
+		t.Fatalf("the award: %v", err)
+	}
+	wrote := m.row(t, winner.ID)
+
+	// The provider sets off. Docs/02 §2 permits Awarded → En route to pickup directly, and from there
+	// there is no move to Awarded at all — so the job's standing is now a refusal.
+	transitionBy(t, m.pool, "provider", m.job, m.provider, "Awarded", "En route to pickup")
+
+	late, err := m.award(t, m.customer, m.job, winner.ID)
+	if err != nil {
+		t.Fatalf("a retry arriving after the delivery started: %v, want the accepted offer", err)
+	}
+	if late.ID != winner.ID || late.Status != StatusAccepted {
+		t.Errorf("the late retry answered %s at %s, want the accepted offer %s", late.ID, late.Status, winner.ID)
+	}
+	if now := m.row(t, winner.ID); !now.updatedAt.Equal(wrote.updatedAt) {
+		t.Errorf("the late retry wrote to the row: updated_at moved from %s to %s", wrote.updatedAt, now.updatedAt)
+	}
+
+	// And a *different* offer under the same conditions is still refused, which is what says the
+	// branch above recognised a retry rather than stopping checking.
+	if _, err := m.award(t, m.customer, m.job, loser.ID); !errors.Is(err, ErrJobNotAwardable) {
+		t.Errorf("awarding a different offer on a job under way: %v, want ErrJobNotAwardable", err)
+	}
+	if status, changes := m.jobStatus(t, m.job); status != "En route to pickup" || changes != 3 {
+		t.Errorf("the job is %s with %d transitions, want En route to pickup with 3", status, changes)
 	}
 }
