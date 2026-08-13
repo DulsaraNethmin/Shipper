@@ -1,9 +1,21 @@
 import type { Metadata } from "next";
 import "./globals.css";
 
+/**
+ * One title for every route, and no delivery named in it.
+ *
+ * A title is what a browser writes into its history, what a tab strip shows from across a cab, and
+ * what a screenshot captures. The link route has a job identifier in its path and puts none of it
+ * here (SHIP-120).
+ *
+ * `noindex` covers the whole portal rather than the link route alone. Nothing here should be held
+ * by a search engine: a delivery page is credential-gated and would index as a refusal, and the
+ * root page is reached from a message rather than from a search.
+ */
 export const metadata: Metadata = {
   title: "Shipper — Delivery",
   description: "The job a driver was sent a link to.",
+  robots: { index: false, follow: false },
 };
 
 /**

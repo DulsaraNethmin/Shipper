@@ -364,6 +364,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
+| **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
@@ -6101,6 +6102,263 @@ simulator and a Pixel emulator, against this worktree's API on port 8092:
 The store link is deliberately not tapped on a device: `launchUrl` would leave the simulator's App
 Store in front of the harness, and what a live run demonstrates is that the platform's URL reached
 the screen. The tap is a host test, over a seam.
+### SHIP-120 — the link is the credential, and the job identifier is in it twice on purpose
+
+The fourth deployable has product code in it. `apps/driver-portal` had been a placeholder shell
+since wave 1; a driver now opens a link and sees the delivery it names, authenticated by SHIP-107's
+token and refused by SHIP-108's verifier.
+
+**The link is `https://<portal>/j/<job-id>#<token>`, and the identifier being in it as well as
+inside the token is the mechanism rather than the redundancy.** This is the decision the ticket
+turned on and the one every later driver ticket inherits. SHIP-108 put the one-job comparison in the
+auth class so no handler could skip it — the path says what the client means to act on, the token
+says what the caller may act on, and comparing them is what makes "exactly one job" observable from
+outside. **A client that decoded `job_id` out of the token to build the path would make that
+comparison compare the token with itself.** It would pass for ever, on any grant, however widely
+issued: the platform would still be checking and the check would have nothing left to catch. So the
+identifier reaches the portal independently, and **nothing in this application parses a JWT**. The
+one claim a page might want is served as `link_expires_at`, which is what the contract already tells
+clients to do instead of reading a credential.
+
+**The token lives in the URL fragment on arrival and in `sessionStorage` after it, and the fragment
+is stripped from the address bar.** A fragment is the one part of a URL never sent to any server: it
+is in no request line, so it reaches no access log, no proxy, no CDN and no `Referer`. A token in
+the path or the query is in all of them, at every hop, for as long as those logs are kept — and this
+credential lasts seven days and travels through whatever messaging channel the provider already
+uses. Stripping it afterwards is the second half: the address bar is the most screenshotted and most
+shoulder-surfed surface a driver has, and once the token is in storage the URL is a job identifier
+the platform will not serve to anybody else.
+
+The alternatives, and what each costs. **`localStorage`** would leave a working credential on the
+device until something deleted it, which is wrong on a phone drivers share and hand over.
+**A cookie** would be attached to every request to the origin including ones with nothing to do with
+the delivery, and would need a scope and a lifetime decided in the client rather than by the token's
+own `exp`. **Leaving it in the URL** is what stripping gives up, and the cost is real: closing the
+tab loses the token. That is the right trade because **the message thread the link arrived in is the
+durable store** — the driver already has it, it is where they will look, and it is the only copy
+that should survive. The fragment is stripped **only once the token is somewhere a reload can
+find it**, so a browser refusing storage keeps a working link in its URL rather than a page that
+cannot survive the pull-to-refresh a driver on one bar of signal will certainly do.
+
+**An expired or revoked link says something true about the credential and nothing at all about the
+job.** Four answers, and the difference between two of them is why SHIP-108 minted a code of its
+own. `401` with `delivery_driver_link_expired` is "this link has expired, ask for a new one" —
+deliberately not `token_expired`, whose meaning is "refresh and retry" and which would put a portal
+with no refresh behind it into a loop. `401` with anything else is "this link is not valid", and the
+platform does not distinguish a bad signature from a truncated URL from a mobile token, so neither
+does the page. **`404` is one answer to two questions and it stays one**: a valid link on a
+*different* job and a *stood-down* driver render identical copy, because `404` was chosen over `403`
+precisely so a link-holder cannot confirm a competitor's job exists. A test holds the refusal copy
+against a list of disclosing phrases, and the five messages are a `Record` keyed by the refusal
+union so a new case without copy is a build failure rather than a blank screen.
+
+**The page shows five fields because five is what the endpoint serves, and it renders every one.**
+The endpoint's response *is* the platform's answer to what a driver may see, so a page that dropped
+a field would take that decision back off the platform and one that added a field would invent it.
+The two identifiers are the least interesting to look at and the most useful on a phone call, so
+they are small and at the bottom rather than absent.
+
+**And here is the honest half of the *Done when*, in the SHIP-65 and SHIP-77 shape.** "Opening the
+link shows only that job's delivery detail" — the *only that job's* is demonstrable and demonstrated
+below; the *delivery detail* is not, because **the endpoint serves no pickup, no drop-off, no goods
+and no contact**. SHIP-108 said so in place ("the delivery detail is SHIP-120's… fields are added to
+this shape") and this lane may touch no Go. So the page says the details are not carried by the link
+yet rather than leaving a blank card, and **`Docs/11` §4 wants a SHIP-120 row**: the screen exists,
+one clause of its *Done when* belongs to a Go change nobody has a ticket for. `Docs/03` §3 puts
+those fields in the driver's Prepare stage, so this is a product gap and not only a bookkeeping one.
+The shape is small — `driverJobResponse` gains the pickup and drop-off locations, the goods
+description and a contact, from a port into `jobs` that `delivery` does not yet declare — and it is
+additive, so no route moves.
+
+**There is a route handler in front of the API, and it is not a BFF tier.** `CLAUDE.md` is explicit
+that the Go platform owns the versioned public API directly. `app/api/driver/jobs/[jobId]/route.ts`
+adds nothing to it and hides nothing from it: one route, one method, one upstream path, no logic and
+no state, forwarding the platform's status and body with the request id intact. **It exists because
+the service serves no CORS headers** — a browser asked to send a bearer credential header
+cross-origin sends a preflight `OPTIONS` first, nothing in `internal/httpx` answers one, and the
+fetch is refused before the platform sees it. `Docs/10` §8.4 already allows a web surface its own
+server-side data access as "an application detail and not a shared platform tier", which is what
+this is. **If CORS is added on the Go side this file is deleted** and the browser fetches the
+platform directly — but note what would be lost: the API's location is currently a *server*
+environment variable read per request (`SHIPPER_API_BASE_URL`), where the direct-fetch shape needs a
+`NEXT_PUBLIC_` value inlined into a bundle at build time. "Anything expected to change under
+operational pressure lives server-side" is the same argument this repository makes about Dart.
+
+**The narrowness is the security property.** A `rewrites()` entry in `next.config.ts` would have
+been three lines and would have proxied everything under `/v1`, making this origin a
+credential-forwarding front door to the whole platform. This route reaches one endpoint: `GET`
+because no other export exists, a template for the path, and the one hole refused unless it is a job
+identifier. `..%2f..%2fv1%2fjobs` produces a `400` and no outbound request. **That refusal is not an
+authorisation decision** — it declines to build a URL other than the one the route exists for, and
+who may open the job is the platform's answer and the only one forwarded.
+
+**Twenty tests, and no test framework in the dependencies.** Node 22 strips TypeScript types itself,
+so `node --test` over `lib/` costs no dependency, no lockfile change and no build step —
+`tsconfig.json` sets `allowImportingTsExtensions` so a test imports `./link.ts` by its real name.
+`lib/surface.test.ts` is the one worth knowing about: **the set of files that may make a request,
+name a credential, or hold one is closed**, so a second call site is a failing test naming the file
+rather than a review comment. It reads code with comments stripped, because every doc comment in
+this application discusses the credential header and `localStorage` at length — the first draft failed on
+the page copy that reads "there is no account to sign in to", which is the page saying the right
+thing, and the rule was narrowed from a phrase search to a file set in response.
+
+~~**`make web-check` does not run those tests, and that is a one-line ask rather than a gap this lane
+could close.**~~ **Closed by the follow-up run below.** `web-check` is now
+`web-lint web-test web-build web-typecheck`, `web-test` exists, and CI runs it because both web
+workflows run `web-check`. The original reasoning stood: the target was
+`web-lint web-build web-typecheck` in `mk/web.mk`, both that file and
+`.github/workflows/web-driver-portal.yml` were outside SHIP-120's ownership, and `pnpm -r run test`
+skips a package with no `test` script — which was confirmed rather than assumed before the target
+was written, and the admin panel is untouched until it grows one. The point it was making is the one
+worth keeping: **a test that quietly does not run is the thing this repository is most careful
+about**, which is `CLAUDE.md`'s position on integration tests that skip, applied to a surface where
+nothing enforced it.
+
+**Demonstrated in a real browser against a real running service, not asserted.** Headless Chrome
+against the built portal on 3002 and the API on 8093, over two awarded jobs each with a real driver
+token minted by `POST /v1/jobs/{id}/driver`: the driver's own link renders the delivery; the *same*
+link on the *other* job renders "this link no longer opens a delivery"; the second link opens its
+own job and not the first; a link with no fragment renders "open the link you were sent"; a
+provider's mobile session token in the fragment renders "this link is not valid"; a hand-built
+expired token renders "this link has expired"; and `/j/..%2f..%2fv1%2fjobs` renders the same
+invalid-link page with no request made. The platform's raw answers behind those six were `200`,
+`404 not_found`, `401 unauthenticated`, `401 delivery_driver_link_expired` and `400 bad_request`.
+
+**Three mutations, and the one that survived is the most useful thing in this entry.** Pointing the
+page at another job while holding the first job's link renders the `404` copy — the *platform*
+refuses it, and there is no client-side branch that could have hidden it instead. Adding a second
+`fetch` to a user route fails `surface.test.ts` naming the file. **The third is the one to read:
+deriving the job identifier from the token instead of from the path makes the wrong-job case
+*succeed*, and every test in the application still passes.** That is the tautology described at the
+top of this entry, made concrete: the platform's one-job check is only worth anything while the
+client states its intention independently of the credential, and no test on either side of the wire
+catches a client that stops doing so. ~~It is recorded because it is the thing SHIP-121, SHIP-122 and
+SHIP-123 are most likely to do by accident while making the code tidier.~~ **It is now caught —
+`lib/one-job.test.ts`, in the follow-up below.** The finding stands exactly as written; what has
+changed is that a test fails when somebody makes it true.
+
+**What SHIP-121's endpoint should look like, which this ticket makes obvious and builds none of.**
+§9 already carries the correction — the driver's idempotency scope was booked against SHIP-112 and
+is now against SHIP-121 — and it is right that whoever picks it up is adding a route rather than
+drawing buttons over an existing one. The shape:
+
+- **`POST /v1/driver/jobs/{id}/milestones`**, `RequireDriverToken`, beside the read rather than
+  under `/jobs`. Two credential systems on one path is what SHIP-108 refused for the read and the
+  argument is unchanged; `/driver/...` says whose surface it is.
+- **It accepts what `recordMilestoneRequest` accepts** — `milestone`, `recorded_at`, `reason` — and
+  **refuses `delivered`** for the reason `jobLifecycle` has no method for it: `Docs/01` §4.4 makes
+  proof or a recorded exception the condition, and neither can be captured until SHIP-114…116.
+- **The actor is `driver`, not `provider`.** `milestones.actor_type = 'driver'` names the
+  `driver_assignments` row, and **SHIP-107 put `assignment_id` in the token for exactly this** —
+  `RecordMilestone` says in place that this is the one field which changes when a driver can present
+  a credential. Nothing has to be looked up to attribute the work.
+- **The idempotency key is the open question and it is now reachable.** §9's two shapes stand: a
+  second group-wide resolver beside `ResolveSubject` that a driver grant can populate, with
+  `SubjectScope` widened to read either; or an explicit ruling that a job-scoped grant scopes on the
+  job identifier already in the path. **A third is worth adding: scope on `assignment_id`**, which
+  is inside the token, is not in the URL, and is not guessable from anything a link-holder can see —
+  where the job identifier is in the path of every request the driver makes, so scoping on it is
+  barely stronger than `anonymous`. `anonymous` is defensible for a read and this is a write from a
+  phone with a bad connection, which is the whole reason the entry exists.
+
+**What this lane wants from `internal/config`, and it is one variable.** **`DRIVER_PORTAL_BASE_URL`,
+so the platform can assemble the link.** SHIP-107 declined to — "a base URL here would be this
+domain asserting a path in an application it does not own" — and that was right while the route did
+not exist. It exists now: `<base>/j/<job-id>#<token>`. Today the assignment response returns
+`driver_token` and the *provider's app* would have to build the URL, which puts a portal path and
+hostname inside a Flutter binary that cannot be updated over the air — precisely what `Docs/07` §1
+says belongs on the server. A `driver_link` field beside `driver_token`, built from one configuration
+value, is the fix, and it is a Go change no wave-7 lane can make. Nothing else is needed: the
+portal's own configuration is a server environment variable in its own deployment.
+
+**Two smaller things.** The placeholder `/job` route is deleted rather than kept — a route rendering
+a delivery beside no credential is the shape SHIP-23 refused to build, and keeping it once the real
+one exists would be worse than never having had it. And the whole portal is `noindex`, because a
+delivery page is credential-gated and would index as a refusal.
+
+No new dependency, no lockfile change, no Go, no route, no contract, no migration, and no
+`make verify` section — this ticket adds no HTTP endpoint to the platform.
+
+### The two gaps SHIP-120 recorded, closed — and this claims no ticket
+
+A follow-up run on the same branch, holding no ticket of its own: SHIP-120 is delivered and both
+findings above are now closed rather than only found. Nothing here builds SHIP-121, SHIP-122 or
+SHIP-123, and nothing here touches Go.
+
+**The surviving mutation is caught, and it is caught on the wire.** `lib/one-job.test.ts` opens a
+link whose *URL* names one job and whose *token* grants another, and asserts on **the requests the
+portal actually issues**. Both hops are real: `openLink` is what the page calls, its `fetch` is
+answered by the application's own route handler — the same `GET` Next serves — and that handler's
+outbound call is what the test records. Only the platform is a stand-in, and the stand-in
+*implements* SHIP-108's check rather than asserting about it, so the wrong-job case is refused there
+for the same reason it is refused in production.
+
+**It is deliberately not a source scan**, and the reason is two scars in this file: §7a's budget
+guard was satisfied by a rename, and §9 records the client-side one carrying the same blind spot. A
+scan for "does anything decode the token" would be a third of those. Asking instead what path left
+the process cannot be renamed past.
+
+**Demonstrated in both directions, at all three places the mutation could be made**, each applied,
+run, and reverted to a byte-identical file:
+
+| The job identifier derived from the token in | Result |
+|---|---|
+| `lib/open.ts` — what the page calls | 23 pass, **2 fail**: the upstream path is the token's job, and the wrong-job case returns a delivery instead of the refusal |
+| `lib/delivery.ts` — the browser's fetch | 23 pass, **2 fail**, identically |
+| `app/api/driver/jobs/[jobId]/route.ts` — the outbound hop | 22 pass, **3 fail**: the two above plus `surface.test.ts`'s single-path assertion |
+| nothing mutated | **25 pass** |
+
+The first row is the one to read against the original finding. **Under that same mutation, all five
+of `surface.test.ts`'s tests still pass** — the guard that was in place kept passing, exactly as
+recorded, and the two that fail are the new ones.
+
+**One structural change made the test possible, and it is worth naming as a cost.** Reading the link
+— `tokenForThisView` and `openLink` — moved out of `components/delivery-link.tsx` into
+`lib/open.ts`. **Node 22 strips types but not JSX**, so nothing inside a `.tsx` file can be reached
+by `node --test`, and the chain had to be somewhere a test could call it. The component is left
+holding state and markup, which is the half a test could not check anyway. `lib/alias-hooks.mts` is
+the other piece: fifteen lines resolving `@/` the way `tsconfig.json` does, registered by the one
+test that imports the route handler, so no other test file's runtime changes.
+
+**`make web-check` runs the tests.** `web-check` is now `web-lint web-test web-build web-typecheck`
+— 25 tests where it ran none, and green in a worktree. **The tests sit second rather than last on
+purpose**: they cost a tenth of a second against the build's thirty, so a failing guard is reported
+before the slow part, and they depend on nothing the build produces. The lint → build → typecheck
+order SHIP-15e established is untouched, because that dependency is the type-check's alone.
+`pnpm -r run test` skipping a package with no `test` script was **confirmed, not assumed** — the
+target exits 0 and never names the admin panel — so the admin surface is unaffected until it grows
+a script. Both workflows' job names now read `lint, test, build, typecheck`, because a job name
+claiming three checks while the target ran four is the same drift in miniature.
+
+**The path filter was re-demonstrated rather than trusted to have survived**, by evaluating every
+workflow's `paths:` block against this run's own changed files:
+
+| A change to | Go | Flutter | Admin | Driver portal |
+|---|---|---|---|---|
+| `apps/driver-portal/lib/one-job.test.ts` | — | — | — | runs |
+| `apps/driver-portal/.gitignore` | — | — | — | runs |
+| `apps/admin/.gitignore` | — | — | runs | — |
+| `.github/workflows/web-driver-portal.yml` | — | — | — | runs |
+| `mk/web.mk` | **runs** | — | runs | runs |
+| `services/core/**` | runs | — | — | — |
+| `apps/mobile/**` | — | runs | — | — |
+| `Docs/**` | — | — | — | — |
+
+A driver-portal change starts the driver-portal workflow and nothing else, which is the line that
+mattered. **The `mk/web.mk` row is a finding and it is not this run's to fix**: `go.yml` filters on
+`mk/**`, so a change to the *web* make targets starts the **Go** workflow. `flutter.yml` narrowed
+that glob deliberately and says so in its header — "it deliberately does not list `mk/**` the way
+the Go workflow does" — and the Go workflow did not follow. It is one line in a file this run does
+not own, it costs a Linux run rather than a macOS one, and it is reported here rather than changed.
+
+**`next dev` writes `AGENTS.md` and `CLAUDE.md` into the application it serves**, on every start.
+They were in no `.gitignore`, so `git add -A` collected them — a generated file arriving in a commit
+that has nothing to do with it. The rules are **app-local**, one file per web surface, rather than in
+the root `.gitignore`: the root file is shared with every lane and these are not, so the change
+lands with no chance of a conflict — and a path-scoped `/CLAUDE.md` in `apps/<app>/` cannot reach
+the repository's own `CLAUDE.md`, which a `**/CLAUDE.md` in the shared file very nearly could.
+Verified by running `next dev` for **both** surfaces, stopping it, and reading `git status` clean
+with `git check-ignore -v` naming the rule.
 
 ## 4. Partly done — do not treat these as finished
 

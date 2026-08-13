@@ -1,13 +1,13 @@
-import Link from "next/link";
-import { Button } from "@/components/ui/button";
-
 /**
  * The root of the portal, which in production almost nobody sees: a driver arrives on a
- * job link, not here.
+ * delivery link, not here.
  *
- * It exists so that someone who reaches the origin without a link is told what this is and
- * is not left at a 404 wondering whether the link was broken. It offers no way in — there
- * is nothing to sign in to, and the link is the only entry (SHIP-120).
+ * It exists so that someone who reaches the origin without a link is told what this is and is not
+ * left at a 404 wondering whether the link was broken. **It offers no way in, and after SHIP-120
+ * that is a stronger statement than it was at SHIP-23**: there is now a real route behind a real
+ * credential, and this page still has no field to type one into, no sign-in, and no link to
+ * anywhere. A driver has no account, so the only entry is the link, and the only place the link
+ * lives is the message the transport provider sent.
  */
 export default function LandingPage() {
   return (
@@ -25,12 +25,9 @@ export default function LandingPage() {
         delivery here, open the link again from the message you were sent.
       </p>
 
-      <Button asChild variant="outline" size="lg" className="h-12 justify-center">
-        <Link href="/job">See the placeholder delivery page</Link>
-      </Button>
-
-      <p className="text-muted-foreground/80 text-xs">
-        Scaffold only (SHIP-23). The link-authenticated delivery page is SHIP-120.
+      <p className="text-muted-foreground text-sm">
+        Open it from the message rather than from your browser history — the link carries the only
+        credential there is, and your history may not have kept it.
       </p>
     </main>
   );
