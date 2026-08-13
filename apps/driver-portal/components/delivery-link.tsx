@@ -5,9 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
-import { REFUSALS, openDelivery, type Delivery, type Refusal } from "@/lib/delivery";
+import { REFUSALS, type Delivery, type Refusal } from "@/lib/delivery";
 import { dayFirst } from "@/lib/format";
-import { isJobId, recallToken, rememberToken, tokenFromFragment } from "@/lib/link";
+import { openLink, type Opened } from "@/lib/open";
 
 /**
  * The delivery a link opens (SHIP-120).
@@ -21,56 +21,17 @@ import { isJobId, recallToken, rememberToken, tokenFromFragment } from "@/lib/li
  * answer. There is no filtering, no "is this job mine", and no branch that could hide a delivery
  * the platform was willing to serve: on this surface the platform decides and the page displays
  * (`Docs/07` §3).
- */
-
-/** What the page is showing. */
-type View =
-  | { kind: "opening" }
-  | { kind: "missing" }
-  | { kind: "delivery"; delivery: Delivery }
-  | { kind: "refused"; refusal: Refusal };
-
-/**
- * The token for this page view, taken from the fragment if the driver has just arrived and from
- * this tab's storage if they have reloaded.
  *
- * **The fragment is stripped only once the token is somewhere a reload can find it.** A browser
- * that refuses storage keeps a working link in its address bar, which is the worse of the two
- * exposures and much better than a page that cannot survive the pull-to-refresh a driver on one
- * bar of signal will certainly do.
+ * **Reading the link is in `lib/open.ts` rather than here, and that is not a tidy-up.** JSX cannot
+ * be imported by `node --test`, so nothing in this file can be asserted on; `lib/one-job.test.ts`
+ * holds the portal to asking the platform for the job in the *URL* rather than the job in the
+ * *token*, and it can only do that against code a test can reach. What is left here is state and
+ * markup. `jobId` arrives as a prop from the route and is handed on unchanged — it is not derived
+ * from anything, and nothing in this file has the token to derive it from.
  */
-function tokenForThisView(jobId: string): string | null {
-  const arriving = tokenFromFragment(window.location.hash);
-  if (arriving === null) return recallToken(jobId);
 
-  if (rememberToken(jobId, arriving)) {
-    window.history.replaceState(null, "", window.location.pathname);
-  }
-  return arriving;
-}
-
-/**
- * One attempt at opening the link, from the address bar through to a view.
- *
- * `async` and outside the component on purpose. The whole sequence — recognise the identifier,
- * take the token, ask the platform — resolves to a single view, so the component never sets state
- * partway through and `react-hooks/set-state-in-effect` has nothing to object to. It is also the
- * shape that reads correctly: there is one question, "what does this link open", and one answer.
- */
-async function openLink(jobId: string, signal: AbortSignal): Promise<View> {
-  // A path segment that is not a job identifier never reaches the platform. That is not the page
-  // deciding anything — there is nothing here to decide about, because there is no delivery this
-  // could be naming and no request worth making.
-  if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
-
-  const token = tokenForThisView(jobId);
-  if (token === null) return { kind: "missing" };
-
-  const outcome = await openDelivery(jobId, token, signal);
-  return outcome.kind === "delivery"
-    ? { kind: "delivery", delivery: outcome.delivery }
-    : { kind: "refused", refusal: outcome.refusal };
-}
+/** What the page is showing: an answer, or the moment before there is one. */
+type View = { kind: "opening" } | Opened;
 
 export function DeliveryLink({ jobId }: { jobId: string }) {
   const [view, setView] = useState<View>({ kind: "opening" });
