@@ -174,6 +174,8 @@ paths:
     $ref: './paths/identity.yaml#/VerifyEmail'
   /v1/auth/verify-phone:
     $ref: './paths/identity.yaml#/VerifyPhone'
+  /v1/driver/jobs/{id}:
+    $ref: './paths/delivery.yaml#/DriverJob'
   /v1/fleet/profile:
     $ref: './paths/fleet.yaml#/Profile'
   /v1/fleet/vehicles:
@@ -230,6 +232,24 @@ components:
         **The driver portal's token is a different system and is never accepted here.** It
         carries its own audience and its own key material, and neither can be exchanged for the
         other (`Docs/10` §5).
+
+    BearerDriverToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        The driver's job-scoped link (SHIP-107, SHIP-108). HS256 under **its own signing keys**,
+        `aud=shipper-driver`, seven days, and it names exactly one job.
+
+        It is issued by `POST /v1/jobs/{id}/driver` and obtainable nowhere else — the awarded
+        provider forwards it, because Shipper sends no SMS in the MVP (`Docs/01` §4.5). There is no
+        refresh and no account behind it: a driver has neither, so this is the whole of their
+        access, and when it expires the provider issues another.
+
+        **It grants one job and nothing else.** Presenting it on any other job answers `404`, the
+        same as a job that does not exist. Presenting it on an operation secured with
+        `BearerAccessToken` answers `401`, and presenting a mobile access token here answers `401`
+        too — the two systems cannot be exchanged in either direction (`Docs/10` §5).
 
   responses:
     BadRequest:

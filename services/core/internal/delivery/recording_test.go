@@ -34,19 +34,19 @@ import (
 const theKey = "6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d"
 
 // recordMilestone runs one recording in its own transaction, which is what the handler does.
-func recordMilestone(t *testing.T, pool *pgxpool.Pool, svc *Service, provider, jobID uuid.UUID, rec Recording) (Record, bool, error) {
+func recordMilestone(t *testing.T, pool *pgxpool.Pool, svc *Service, provider, jobID uuid.UUID, rec Recording) (Record, Outcome, error) {
 	t.Helper()
 
 	var (
-		record   Record
-		recorded bool
+		record  Record
+		outcome Outcome
 	)
 	err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
 		var err error
-		record, recorded, err = svc.RecordMilestone(ctx, r, provider, jobID, rec)
+		record, outcome, err = svc.RecordMilestone(ctx, r, provider, jobID, rec)
 		return err
 	})
-	return record, recorded, err
+	return record, outcome, err
 }
 
 // milestoneCount is how many rows a job has, read from the table rather than from what the service
@@ -87,15 +87,15 @@ func TestAProviderRecordsAMilestone(t *testing.T) {
 	provider := newAccount(t, pool, "record-p@example.com", "+61400000661", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	record, recorded, err := recordMilestone(t, pool, newTestService(), provider, jobID,
+	record, outcome, err := recordMilestone(t, pool, newTestService(), provider, jobID,
 		Recording{Milestone: MilestoneEnRouteToPickup, Reason: "  loading   now ", Key: theKey})
 	if err != nil {
 		t.Fatalf("RecordMilestone() = %v", err)
 	}
 
 	switch {
-	case !recorded:
-		t.Error("the recording reports that it wrote nothing")
+	case outcome != OutcomeRecorded:
+		t.Errorf("outcome = %q, want recorded", outcome)
 	case record.ID == uuid.Nil:
 		t.Error("the milestone has no id")
 	case record.Milestone != MilestoneEnRouteToPickup:
@@ -203,17 +203,17 @@ func TestTheSameKeyRecordsOneMilestone(t *testing.T) {
 	jobID := awardedJob(t, pool, customer, provider)
 	svc := newTestService()
 
-	first, recorded, err := recordMilestone(t, pool, svc, provider, jobID, enRoute(theKey))
-	if err != nil || !recorded {
-		t.Fatalf("the first recording = %v (recorded = %v)", err, recorded)
+	first, outcome, err := recordMilestone(t, pool, svc, provider, jobID, enRoute(theKey))
+	if err != nil || outcome != OutcomeRecorded {
+		t.Fatalf("the first recording = %v (outcome = %q)", err, outcome)
 	}
 
-	second, recorded, err := recordMilestone(t, pool, svc, provider, jobID, enRoute(theKey))
+	second, outcome, err := recordMilestone(t, pool, svc, provider, jobID, enRoute(theKey))
 	if err != nil {
 		t.Fatalf("the retry = %v, want the first milestone back", err)
 	}
-	if recorded {
-		t.Error("the retry reports that it recorded a second milestone")
+	if outcome != OutcomeAlreadyRecorded {
+		t.Errorf("the retry answered %q, want already recorded", outcome)
 	}
 	if second.ID != first.ID {
 		t.Errorf("the retry answered with %s, want the milestone the first attempt recorded (%s)",
@@ -263,12 +263,12 @@ func TestConcurrentRetriesRecordOneMilestone(t *testing.T) {
 			defer wg.Done()
 
 			var (
-				record   Record
-				recorded bool
+				record  Record
+				outcome Outcome
 			)
 			err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
 				var err error
-				record, recorded, err = svc.RecordMilestone(ctx, r, provider, jobID, enRoute(theKey))
+				record, outcome, err = svc.RecordMilestone(ctx, r, provider, jobID, enRoute(theKey))
 				return err
 			})
 
@@ -279,7 +279,7 @@ func TestConcurrentRetriesRecordOneMilestone(t *testing.T) {
 				return
 			}
 			ids[record.ID]++
-			if recorded {
+			if outcome == OutcomeRecorded {
 				writers++
 			}
 		}()
@@ -477,13 +477,14 @@ func TestARepeatedMilestoneIsRecordedAndMovesNothing(t *testing.T) {
 		t.Fatalf("the first recording: %v", err)
 	}
 
-	second, recorded, err := recordMilestone(t, pool, svc, provider, jobID,
+	second, outcome, err := recordMilestone(t, pool, svc, provider, jobID,
 		Recording{Milestone: MilestoneEnRouteToPickup, Reason: "nobody at the gate", Key: theKey + "-2"})
 	if err != nil {
 		t.Fatalf("recording the same milestone again: %v", err)
 	}
-	if !recorded || second.ID == first.ID {
-		t.Error("a second attempt under a new key was absorbed as a retry; it is a second record")
+	if outcome != OutcomeRecorded || second.ID == first.ID {
+		t.Errorf("a second attempt under a new key answered %q; it is a second record, not a retry "+
+			"and not a late arrival — the job is standing exactly where this milestone says", outcome)
 	}
 
 	if n := milestoneCount(t, pool, jobID); n != 2 {
@@ -494,13 +495,21 @@ func TestARepeatedMilestoneIsRecordedAndMovesNothing(t *testing.T) {
 	}
 }
 
-// TestAMilestoneTheJobHasMovedPastIsRefusedForNow marks SHIP-112's boundary.
+// TestAMilestoneTheJobHasMovedPastIsAbsorbedAsHistory is SHIP-112's acceptance criterion, and it is
+// SHIP-111's boundary test inverted.
 //
-// **Docs/02 §3.1 says this must be absorbed rather than refused**, and it is not, because absorbing
-// it is SHIP-112 — a five-point ticket that has to decide what the job's timeline looks like when a
-// late record lands in the middle of it. What SHIP-111 owes that ticket is a transaction that leaves
-// nothing behind when it rolls back, which is what the count below asserts.
-func TestAMilestoneTheJobHasMovedPastIsRefusedForNow(t *testing.T) {
+// **This test used to assert the refusal.** It was called
+// TestAMilestoneTheJobHasMovedPastIsRefusedForNow, it named SHIP-112 in its own comment, and its
+// milestone count was there to prove that the transaction which had to leave nothing behind did
+// leave nothing behind. That count is still here and it is the assertion that changed sides: the row
+// is now what must survive, because Docs/02 §3.1 says "the platform accepts the historical fact
+// without moving the job backwards" and a discarded record is the defect this ticket exists to
+// prevent.
+//
+// Both halves of the *Done when* are below, and the second is three assertions rather than one.
+// "Without moving the job backwards" means the status is untouched, **no job_status_history row was
+// written**, and the transition the job made honestly an hour ago is still the only one it has.
+func TestAMilestoneTheJobHasMovedPastIsAbsorbedAsHistory(t *testing.T) {
 	pool := pgtest.DB(t)
 	customer := newAccount(t, pool, "late-c@example.com", "+61400000683", "customer")
 	provider := newAccount(t, pool, "late-p@example.com", "+61400000684", "provider")
@@ -511,18 +520,183 @@ func TestAMilestoneTheJobHasMovedPastIsRefusedForNow(t *testing.T) {
 	moveJob(t, pool, jobID, jobs.User(jobs.ActorProvider, provider),
 		jobs.StatusEnRouteToPickup, jobs.StatusPickedUp)
 
-	_, _, err := recordMilestone(t, pool, newTestService(), provider, jobID,
-		Recording{Milestone: MilestoneEnRouteToPickup, RecordedAt: testInstant.Add(-time.Hour), Key: theKey})
-	if !errors.Is(err, ErrMilestoneNotPermitted) {
-		t.Fatalf("RecordMilestone(late) = %v, want ErrMilestoneNotPermitted", err)
+	actedAt := testInstant.Add(-time.Hour)
+
+	record, outcome, err := recordMilestone(t, pool, newTestService(), provider, jobID,
+		Recording{Milestone: MilestoneEnRouteToPickup, RecordedAt: actedAt, Key: theKey})
+	if err != nil {
+		t.Fatalf("RecordMilestone(late) = %v, want it absorbed rather than refused (Docs/02 §3.1)", err)
+	}
+	if outcome != OutcomeAbsorbed {
+		t.Errorf("outcome = %q, want absorbed", outcome)
 	}
 
-	if n := milestoneCount(t, pool, jobID); n != 0 {
-		t.Errorf("%d milestone rows survived the refusal; SHIP-112 keeps the row deliberately, "+
-			"and until it lands the transaction must leave nothing", n)
+	// Recorded as history — the first half, and the half a client would never see if the
+	// transaction had rolled back the way SHIP-111 left it.
+	if n := milestoneCount(t, pool, jobID); n != 1 {
+		t.Errorf("%d milestone rows, want 1 — a late milestone is kept, not discarded", n)
 	}
+	if !record.ActorRecordedAt.Equal(actedAt) {
+		t.Errorf("actor_recorded_at = %s, want %s — the actor's clock is the truth about when a "+
+			"late milestone happened, and the platform does not correct it", record.ActorRecordedAt, actedAt)
+	}
+	if !record.ServerRecordedAt.After(record.ActorRecordedAt) {
+		t.Error("server_recorded_at is not after actor_recorded_at; absorption is the one feature " +
+			"that consumes the pair SHIP-110 built, and it has been collapsed")
+	}
+
+	// The row is readable afterwards, and it is the row the service described. Read back through
+	// the pool because what the service returned is not evidence that anything committed.
+	var storedMilestone string
+	var storedActorRecordedAt time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT milestone, actor_recorded_at FROM milestones WHERE id = $1`, record.ID).
+		Scan(&storedMilestone, &storedActorRecordedAt); err != nil {
+		t.Fatalf("reading the absorbed milestone back: %v", err)
+	}
+	if storedMilestone != string(MilestoneEnRouteToPickup) || !storedActorRecordedAt.Equal(actedAt) {
+		t.Errorf("the committed row is %q at %s, want %q at %s",
+			storedMilestone, storedActorRecordedAt, MilestoneEnRouteToPickup, actedAt)
+	}
+
+	// Without moving the job backwards — the other half.
 	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusPickedUp) {
 		t.Errorf("the job is %q, want Picked up — a late milestone moved it backwards", got)
+	}
+	if n := historyCount(t, pool, jobID, jobs.StatusEnRouteToPickup); n != 1 {
+		t.Errorf("%d transitions into En route to pickup, want the 1 the job really made: an "+
+			"absorbed milestone writes no job_status_history row, because no status changed", n)
+	}
+	if n := historyCount(t, pool, jobID, jobs.StatusPickedUp); n != 1 {
+		t.Errorf("%d transitions into Picked up, want 1 — absorbing rewrote the job's history", n)
+	}
+}
+
+// TestAnAbsorbedMilestoneIsStillRecordedOncePerKey — the retry path over an absorbed row.
+//
+// A phone that syncs a late milestone and then loses the response retries with the same key. It must
+// get the same row back and record nothing further, exactly as a milestone that moved the job does:
+// absorption must not open a second way to write two rows under one key.
+func TestAnAbsorbedMilestoneIsStillRecordedOncePerKey(t *testing.T) {
+	pool := pgtest.DB(t)
+	customer := newAccount(t, pool, "lateretry-c@example.com", "+61400000691", "customer")
+	provider := newAccount(t, pool, "lateretry-p@example.com", "+61400000692", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+	svc := newTestService()
+
+	moveJob(t, pool, jobID, jobs.User(jobs.ActorProvider, provider),
+		jobs.StatusEnRouteToPickup, jobs.StatusPickedUp, jobs.StatusInTransit)
+
+	late := Recording{
+		Milestone:  MilestonePickedUp,
+		RecordedAt: testInstant.Add(-2 * time.Hour),
+		Key:        theKey,
+	}
+
+	first, outcome, err := recordMilestone(t, pool, svc, provider, jobID, late)
+	if err != nil || outcome != OutcomeAbsorbed {
+		t.Fatalf("the late recording = %v (outcome = %q), want it absorbed", err, outcome)
+	}
+
+	second, outcome, err := recordMilestone(t, pool, svc, provider, jobID, late)
+	if err != nil {
+		t.Fatalf("the retry of a late recording = %v", err)
+	}
+	if outcome != OutcomeAlreadyRecorded {
+		t.Errorf("the retry answered %q, want already recorded", outcome)
+	}
+	if second.ID != first.ID {
+		t.Errorf("the retry answered with %s, want the absorbed milestone %s", second.ID, first.ID)
+	}
+
+	if n := milestoneCount(t, pool, jobID); n != 1 {
+		t.Errorf("%d milestone rows, want 1 — one key records one thing, absorbed or not", n)
+	}
+	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusInTransit) {
+		t.Errorf("the job is %q, want In transit", got)
+	}
+	if n := historyCount(t, pool, jobID, jobs.StatusPickedUp); n != 1 {
+		t.Errorf("%d transitions into Picked up, want the 1 the job really made", n)
+	}
+}
+
+// TestAMilestoneTheDeliveryHasNotReachedIsRefused is the other side of SHIP-112's line, and the
+// reason the sentinel it used to share with the late case still exists.
+//
+// A premature milestone is not a historical fact that arrived out of order — it is a claim about
+// something that has not happened. Refusing it costs the client a retry and nothing else, because
+// the identical request succeeds as soon as the delivery reaches that point; absorbing it would
+// answer "recorded" for a move that then never happens. The second half of this test is that
+// recoverability, which is what makes the refusal defensible rather than merely conservative.
+func TestAMilestoneTheDeliveryHasNotReachedIsRefused(t *testing.T) {
+	pool := pgtest.DB(t)
+	customer := newAccount(t, pool, "early-c@example.com", "+61400000693", "customer")
+	provider := newAccount(t, pool, "early-p@example.com", "+61400000694", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+	svc := newTestService()
+
+	moveJob(t, pool, jobID, jobs.User(jobs.ActorProvider, provider), jobs.StatusEnRouteToPickup)
+
+	early := Recording{Milestone: MilestoneInTransit, Key: theKey}
+
+	_, outcome, err := recordMilestone(t, pool, svc, provider, jobID, early)
+	if !errors.Is(err, ErrMilestoneNotPermitted) {
+		t.Fatalf("RecordMilestone(premature) = %v (outcome = %q), want ErrMilestoneNotPermitted", err, outcome)
+	}
+	if n := milestoneCount(t, pool, jobID); n != 0 {
+		t.Errorf("%d milestone rows survived a refusal; only a late milestone is kept", n)
+	}
+	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusEnRouteToPickup) {
+		t.Errorf("the job is %q, want En route to pickup", got)
+	}
+
+	// The delivery catches up, and the same recording — same key, same milestone — now stands.
+	if _, _, err := recordMilestone(t, pool, svc, provider, jobID,
+		Recording{Milestone: MilestonePickedUp, Key: theKey + "-pickup"}); err != nil {
+		t.Fatalf("recording the pickup: %v", err)
+	}
+
+	_, outcome, err = recordMilestone(t, pool, svc, provider, jobID, early)
+	if err != nil {
+		t.Fatalf("the retried premature recording = %v, want it to succeed now the job has "+
+			"reached the point it describes", err)
+	}
+	if outcome != OutcomeRecorded {
+		t.Errorf("outcome = %q, want recorded — a premature milestone is refused, not lost", outcome)
+	}
+	if got := jobStatus(t, pool, jobID); got != string(jobs.StatusInTransit) {
+		t.Errorf("the job is %q, want In transit", got)
+	}
+}
+
+// TestAbsorptionCannotReachDelivered holds CLAUDE.md's invariant against the one ticket that could
+// plausibly have widened it.
+//
+// SHIP-112 makes a refused move keep its row, and 'Delivered' is refused for a different reason
+// entirely — there is neither photo proof nor a recorded exception, and neither can be captured
+// until SHIP-114…SHIP-116. That check sits in front of the insert rather than in the switch that
+// absorbs, so a 'Delivered' never reaches the milestone table at all. This drives it from a job that
+// has *already been Delivered*, which is the one state where "the job has moved past it" is true and
+// absorption would otherwise apply.
+func TestAbsorptionCannotReachDelivered(t *testing.T) {
+	pool := pgtest.DB(t)
+	customer := newAccount(t, pool, "deliv-c@example.com", "+61400000695", "customer")
+	provider := newAccount(t, pool, "deliv-p@example.com", "+61400000696", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+
+	moveJob(t, pool, jobID, jobs.User(jobs.ActorProvider, provider),
+		jobs.StatusEnRouteToPickup, jobs.StatusPickedUp, jobs.StatusInTransit,
+		jobs.StatusDelivered, jobs.StatusCompleted)
+
+	_, _, err := recordMilestone(t, pool, newTestService(), provider, jobID,
+		Recording{Milestone: MilestoneDelivered, RecordedAt: testInstant.Add(-time.Hour), Key: theKey})
+	if !errors.Is(err, ErrProofRequired) {
+		t.Fatalf("RecordMilestone(late delivered) = %v, want ErrProofRequired — absorption must "+
+			"not become a second way to record a delivery with nothing behind it", err)
+	}
+	if n := milestoneCount(t, pool, jobID); n != 0 {
+		t.Errorf("%d milestone rows, want 0 — a delivered milestone was absorbed with neither "+
+			"photo proof nor a recorded exception", n)
 	}
 }
 
@@ -545,10 +719,10 @@ func TestADeliveryRunsThroughItsMilestones(t *testing.T) {
 		{MilestonePickedUp, jobs.StatusPickedUp},
 		{MilestoneInTransit, jobs.StatusInTransit},
 	} {
-		record, recorded, err := recordMilestone(t, pool, svc, provider, jobID,
+		record, outcome, err := recordMilestone(t, pool, svc, provider, jobID,
 			Recording{Milestone: step.milestone, Key: theKey + string(rune('a'+i))})
-		if err != nil || !recorded {
-			t.Fatalf("recording %s: %v (recorded = %v)", step.milestone, err, recorded)
+		if err != nil || outcome != OutcomeRecorded {
+			t.Fatalf("recording %s: %v (outcome = %q)", step.milestone, err, outcome)
 		}
 		if record.Milestone != step.milestone {
 			t.Fatalf("recorded %q, want %q", record.Milestone, step.milestone)
@@ -586,7 +760,7 @@ func TestAnUnrecognisedOutcomeFailsARecording(t *testing.T) {
 	provider := newAccount(t, pool, "unknown-mp@example.com", "+61400000690", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	svc := NewService(staticJobs{move: JobMoveUnrecognised}, testAwards{}, testClock())
+	svc := newTestServiceWith(staticJobs{move: JobMoveUnrecognised})
 
 	_, _, err := recordMilestone(t, pool, svc, provider, jobID, enRoute(theKey))
 	if !errors.Is(err, ErrJobMoveUnrecognised) {

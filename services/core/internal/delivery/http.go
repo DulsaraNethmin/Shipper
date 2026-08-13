@@ -5,20 +5,29 @@
 // domains be built at once without touching a shared file. A domain importing internal/httpx is
 // sitting on infrastructure, not crossing a boundary, and the import lint permits it.
 //
-// # These endpoints are called by the provider, not by the driver
+// # Two callers, two credentials, and they are never the same credential
 //
-// Worth stating first, because the domain's name invites the opposite assumption. The driver has no
-// account and no session — the portal is link-authenticated (Docs/07 §3) — and the job-scoped token
-// they eventually hold is a separate system that cannot be exchanged for a user token in either
-// direction (Docs/10 §5, SHIP-108). Nothing here reads or issues one. The caller is the awarded
-// provider, authenticated the ordinary way, and the route declares RequireUser like every other
-// product endpoint in the service.
+// Worth stating first, because the domain's name invites the assumption that the driver calls all of
+// this. Almost all of it is the awarded provider, authenticated the ordinary way, and every route
+// under `/jobs/{id}` below declares RequireUser like every other product endpoint in the service.
+//
+// **One route is the driver's, and it is served under a different auth class entirely** (SHIP-108).
+// `GET /v1/driver/jobs/{id}` is reached with the job-scoped link the provider forwarded, verified by
+// [RequireDriverToken] rather than by httpx.RequireSubject. The driver has no account and no session
+// — the portal is link-authenticated (Docs/07 §3) — and the two token systems cannot be exchanged in
+// either direction (Docs/10 §5): the mobile token is refused on the driver route and the driver token
+// is refused on all the others, both over HTTP.
+//
+// The split is visible in the code rather than remembered: a provider route reads its caller with
+// [callerID], which reads an authctx.Subject; the driver route reads a [DriverGrant], which has no
+// subject in it and cannot be turned into one.
 //
 // # There is no field for whose job, and no field for who is assigning
 //
 // The provider is whoever the token says is calling. A provider id in the request would be an
 // authorisation decision made from client input, which Docs/07 §3 puts on the platform. The job is
-// named in the path and the platform checks it against the accepted bid.
+// named in the path and the platform checks it against the accepted bid — or, on the driver route,
+// against the job inside the link.
 //
 // The blank line below keeps this a file note rather than a second package comment.
 
@@ -27,6 +36,7 @@ package delivery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -101,6 +111,23 @@ type assignDriverRequest struct {
 // provider: the customer's view of a delivery (SHIP-133) is a shape of its own rather than this one
 // reached by another route, for the same reason `jobs` keeps the customer's and the provider's views
 // apart.
+//
+// # The driver's token is returned here, and the awarded provider is the right person to hand it to
+//
+// Docs/01 §4.5 decides it: "the provider forwards the job-scoped portal link to their driver
+// themselves". Shipper sends no SMS in the MVP, so the only way the link reaches the driver is
+// through the response to the request that created the assignment — which is also what makes
+// SHIP-107's *Done when* readable as one sentence, since the token is generated on assignment and
+// obtainable nowhere else.
+//
+// **This response therefore carries a credential, and it is scoped like one.** The idempotency
+// middleware stores it under `idem:v1:user:<provider>:<key>` (SHIP-44), so a replay reaches only the
+// provider who made the request — a stronger position than the anonymous scope the sign-in endpoints
+// already store their tokens under, and one worth stating because it is not obvious from the shape.
+//
+// The URL is deliberately **not** assembled here. The driver portal's landing route is SHIP-120's to
+// define, and a base URL in this response would be this domain asserting a path in an application it
+// does not own; a client that has the token can build the link once that route exists.
 type assignmentResponse struct {
 	ID    string `json:"id"`
 	JobID string `json:"job_id"`
@@ -109,9 +136,23 @@ type assignmentResponse struct {
 	DriverMobile string `json:"driver_mobile"`
 
 	AssignedAt string `json:"assigned_at"`
+
+	// DriverToken is the signed, job-scoped credential the driver presents (SHIP-107).
+	//
+	// It grants exactly this job and cannot be exchanged for a mobile session in either
+	// direction (Docs/10 §5). Nothing verifies one until SHIP-108, so today it is a value the
+	// provider can forward and a driver cannot yet spend.
+	DriverToken string `json:"driver_token"`
+
+	// DriverTokenExpiresAt is when the link stops working, in UTC.
+	//
+	// Returned rather than left to the client to decode out of the token, for two reasons: a
+	// client that parsed the JWT to find it would be reading a credential it has no business
+	// interpreting, and the provider needs to be able to tell the driver how long they have.
+	DriverTokenExpiresAt string `json:"driver_token_expires_at"`
 }
 
-func assignmentFrom(a Assignment) assignmentResponse {
+func assignmentFrom(a Assignment, token DriverToken) assignmentResponse {
 	return assignmentResponse{
 		ID:    a.ID.String(),
 		JobID: a.JobID.String(),
@@ -120,6 +161,9 @@ func assignmentFrom(a Assignment) assignmentResponse {
 		DriverMobile: a.DriverMobile,
 
 		AssignedAt: timestamp(a.CreatedAt),
+
+		DriverToken:          token.Value,
+		DriverTokenExpiresAt: timestamp(token.ExpiresAt),
 	}
 }
 
@@ -169,11 +213,12 @@ func (h *Handler) AssignDriver() http.Handler {
 
 		var (
 			assignment Assignment
+			token      DriverToken
 			created    bool
 		)
 		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
 			var err error
-			assignment, created, err = h.svc.AssignDriver(ctx, runner, providerID, jobID, Nomination{
+			assignment, token, created, err = h.svc.AssignDriver(ctx, runner, providerID, jobID, Nomination{
 				DriverName:   req.DriverName,
 				DriverMobile: req.DriverMobile,
 				Self:         req.Self,
@@ -188,15 +233,20 @@ func (h *Handler) AssignDriver() http.Handler {
 			// The same driver, nominated twice, with two idempotency keys. Logged because
 			// it is the signal that a client is retrying without reusing its key, which is
 			// worth seeing in aggregate and impossible to see from the response.
+			//
+			// The token is not logged and never is — it is the credential itself, and a
+			// log line carrying one is a credential in whatever collects the logs. The
+			// expiry is safe and is what somebody diagnosing a dead link actually wants.
 			httpx.LoggerFrom(r.Context()).Info("a repeated driver nomination was absorbed",
 				slog.String("job_id", jobID.String()),
-				slog.String("assignment_id", assignment.ID.String()))
+				slog.String("assignment_id", assignment.ID.String()),
+				slog.Time("driver_token_expires_at", token.ExpiresAt))
 
-			httpx.WriteJSON(w, http.StatusOK, assignmentFrom(assignment))
+			httpx.WriteJSON(w, http.StatusOK, assignmentFrom(assignment, token))
 			return nil
 		}
 
-		httpx.WriteJSON(w, http.StatusCreated, assignmentFrom(assignment))
+		httpx.WriteJSON(w, http.StatusCreated, assignmentFrom(assignment, token))
 		return nil
 	})
 }
@@ -231,7 +281,8 @@ type recordMilestoneRequest struct {
 //
 // The job's status is not echoed, for the reason [assignmentResponse] gives — it is the jobs
 // endpoints' vocabulary — and here there is a second reason: a milestone may deliberately move
-// nothing at all.
+// nothing at all. Since SHIP-112 there are two ways for that to happen and this shape distinguishes
+// neither of them; [Outcome] is where the decision not to is argued.
 type milestoneResponse struct {
 	ID    string `json:"id"`
 	JobID string `json:"job_id"`
@@ -282,6 +333,17 @@ func milestoneFrom(rec Record) milestoneResponse {
 // milestone the first attempt recorded. A driver's phone reconnecting after a day in a valley takes
 // that path, and it is the only reason "records a milestone once per idempotency key" is true of the
 // platform rather than of its cache.
+//
+// # An absorbed milestone is a 201 like any other, and the response says nothing more (SHIP-112)
+//
+// A late milestone — one whose point in the delivery the job has already passed — is recorded and
+// the job is left where it stands. The row was created, so the status is `201`, and the body is the
+// same body: **there is no field saying the job did not move**, because this response has never told
+// a client what status the job is in and Docs/02 §3.1 puts that reconciliation on the job resource.
+// See [Outcome] for why one was not added.
+//
+// What changes for a client is that the `409` it used to get here has gone, which is the whole point:
+// the driver's work is now safe on the platform rather than pending on a phone forever.
 func (h *Handler) RecordMilestone() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		providerID, err := callerID(r.Context())
@@ -310,19 +372,40 @@ func (h *Handler) RecordMilestone() http.Handler {
 		}
 
 		var (
-			record   Record
-			recorded bool
+			record  Record
+			outcome Outcome
 		)
 		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
 			var err error
-			record, recorded, err = h.svc.RecordMilestone(ctx, runner, providerID, jobID, recording)
+			record, outcome, err = h.svc.RecordMilestone(ctx, runner, providerID, jobID, recording)
 			return err
 		})
 		if err != nil {
 			return apiError(err)
 		}
 
-		if !recorded {
+		switch outcome {
+		case OutcomeRecorded:
+			httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+			return nil
+
+		case OutcomeAbsorbed:
+			// Logged because it is the *only* trace absorption leaves. The row is
+			// indistinguishable from any other milestone, the job did not move, no history
+			// row was written and no event was emitted — so without this line a late
+			// milestone is invisible to operations, and Docs/02 §3.1's escalation is
+			// entirely about how long updates have been out of sync.
+			httpx.LoggerFrom(r.Context()).Info("a late milestone was absorbed as history and the job was not moved",
+				slog.String("job_id", jobID.String()),
+				slog.String("milestone", record.Milestone.Wire()),
+				slog.String("milestone_id", record.ID.String()),
+				slog.Time("recorded_at", record.ActorRecordedAt),
+				slog.Time("accepted_at", record.ServerRecordedAt))
+
+			httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+			return nil
+
+		case OutcomeAlreadyRecorded:
 			// Logged because it is the signal that the middleware's entry had gone and the
 			// database caught the retry instead. That is the mechanism working, and it is
 			// otherwise invisible: the response is indistinguishable from an ordinary one.
@@ -333,9 +416,124 @@ func (h *Handler) RecordMilestone() http.Handler {
 
 			httpx.WriteJSON(w, http.StatusOK, milestoneFrom(record))
 			return nil
+
+		default:
+			// The service returned no error and no outcome, which is a defect here rather
+			// than anything the caller did. Answering 201 would be the tempting default and
+			// the wrong one: it would report a recording that nothing in this function can
+			// say happened.
+			return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+				"Something went wrong at our end.").WithCause(fmt.Errorf(
+				"delivery: recording %s on %s answered %q with no error",
+				recording.Milestone, jobID, outcome))
+		}
+	})
+}
+
+// driverJobResponse is what a driver's link opens (SHIP-108).
+//
+// # It is the assignment, and deliberately not the delivery
+//
+// A driver opening their link wants the addresses, the goods and who to call, and **none of that is
+// here**. That is SHIP-120's — "opening the link shows only that job's delivery detail" — and it
+// needs a port into `jobs` that this domain has no reason to declare for a middleware ticket. What
+// this answers is the smallest true thing: which job the link grants, which assignment it belongs
+// to, and how long it lasts. SHIP-120 adds fields to this shape, which is an additive change
+// (Docs/07 §6) and does not move the route.
+//
+// # The driver's mobile is not here, and that is a decision rather than an omission
+//
+// [assignmentResponse] returns it, because the provider typed it and needs to see it was read
+// correctly. The driver already knows their own number, so returning it would buy nothing and cost
+// something: a link travels through whatever channel the provider uses (Docs/01 §4.5), so it lands
+// in a message thread and can be forwarded again. Whoever ends up holding it should learn as little
+// as the endpoint can manage.
+//
+// The driver's *name* stays, because it is what tells them the link is theirs rather than the other
+// driver's on the next job.
+//
+// The job's status is not echoed, for the reason [assignmentResponse] gives: it is `jobs`'
+// vocabulary and a copy here would be a second list to keep in step.
+type driverJobResponse struct {
+	JobID        string `json:"job_id"`
+	AssignmentID string `json:"assignment_id"`
+
+	DriverName string `json:"driver_name"`
+
+	AssignedAt string `json:"assigned_at"`
+
+	// LinkExpiresAt is when this link stops working, in UTC.
+	//
+	// The same instant the provider was shown as `driver_token_expires_at`, named for what the
+	// person reading it holds: the provider forwards a token, and the driver opens a link
+	// (Docs/01 §4.5 calls it a link throughout). It is returned rather than left to be decoded out
+	// of the credential, which is what the contract already tells clients not to do.
+	LinkExpiresAt string `json:"link_expires_at"`
+}
+
+func driverJobFrom(a Assignment, grant DriverGrant) driverJobResponse {
+	return driverJobResponse{
+		JobID:        a.JobID.String(),
+		AssignmentID: a.ID.String(),
+
+		DriverName: a.DriverName,
+
+		AssignedAt:    timestamp(a.CreatedAt),
+		LinkExpiresAt: timestamp(grant.ExpiresAt),
+	}
+}
+
+// DriverJob handles GET /v1/driver/jobs/{id} (SHIP-108).
+//
+// # This is the route that makes the *Done when* demonstrable, and it is deliberately the smallest
+//
+// SHIP-108 is a middleware ticket: it needs one route declaring RequireDriverToken so that "grants
+// exactly one job" and "cannot be exchanged for a user session" can be shown over HTTP rather than
+// only in Go. A read is the right size for that — it needs no idempotency scope (Docs/11 §9 records
+// that a driver-token request scopes its key to `anonymous`, which bites a write and not a read) —
+// and the delivery detail behind it belongs to SHIP-120.
+//
+// # Why the job is in the path when the token already names it
+//
+// It looks redundant and it is the mechanism. The path is the client's statement of what it means to
+// act on; the token is the platform's statement of what the caller may act on; comparing them is what
+// makes "exactly one job" **observable from outside** rather than merely true inside. Drop the id and
+// a grant that had silently widened would be undetectable — there would be no other job to ask for.
+//
+// It is also what the driver half of M4 needs anyway: SHIP-121 records milestones per job, a driver
+// carrying two deliveries holds two links, and two links that resolved to one URL would be
+// indistinguishable in a browser's history.
+//
+// # The handler never reads the path, and that is the other half
+//
+// The job comes from the grant, which the guard has already checked against the path. There is no
+// call to [jobIDFrom] here and there must not be: the two would agree today and a handler that read
+// the path directly is one refactor away from being the only thing deciding.
+func (h *Handler) DriverJob() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, ok := driverGrantFrom(r.Context())
+		if !ok {
+			// The route declares RequireDriverToken, so the guard has run and a grant is
+			// guaranteed by the time this executes. Reaching here means the route was declared
+			// with the wrong auth class — a wiring defect the caller can do nothing about, and
+			// the same call [callerID] makes about a missing subject.
+			return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+				"Something went wrong at our end.").WithCause(errors.New(
+				"delivery: a driver route was reached with no verified grant on the context; " +
+					"its Auth class is not RequireDriverToken"))
 		}
 
-		httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		assignment, err := h.svc.AssignmentFor(r.Context(), pool, grant)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, driverJobFrom(assignment, grant))
 		return nil
 	})
 }
@@ -476,6 +674,16 @@ func apiError(err error) error {
 		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
 			"No such job.").WithCause(err)
 
+	case errors.Is(err, ErrDriverLinkSuperseded):
+		// 404 rather than 401, and the distinction is not pedantic: the credential is fine, and
+		// what has gone is the assignment behind it. Telling a stood-down driver "your link is
+		// invalid" would send them back to the provider for a *new link*, which is not what they
+		// need. The same answer a job that never existed gets, for the reason apiError gives
+		// above — and SHIP-109, which is the ticket that makes this reachable, is the right place
+		// to decide whether a reissued link deserves a code of its own.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such delivery.").WithCause(err)
+
 	case errors.Is(err, ErrJobNotAssignable):
 		return httpx.NewError(http.StatusConflict, CodeJobNotAssignable,
 			"A driver can only be assigned to a job that has been awarded and has not set off yet.").
@@ -507,8 +715,11 @@ func apiError(err error) error {
 			WithCause(err)
 
 	case errors.Is(err, ErrMilestoneNotPermitted):
+		// Since SHIP-112 this can only mean "too early". A milestone the delivery has already
+		// passed is absorbed and never reaches here, so the message says which direction the
+		// conflict is in rather than leaving a client to work out whether retrying is futile.
 		return httpx.NewError(http.StatusConflict, CodeMilestoneNotPermitted,
-			"This milestone cannot be recorded from the job's current status.").WithCause(err)
+			"This delivery has not reached the point where that milestone can be recorded.").WithCause(err)
 
 	default:
 		return err

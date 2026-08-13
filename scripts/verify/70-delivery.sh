@@ -191,6 +191,10 @@ status="$(delivery_request "$delivery_provider_token" "verify-del-again-$$" \
   || fail "the repeat wrote a second transition"
 ok "the same driver nominated twice with a fresh key is absorbed — one row, one transition"
 
+delivery_again_token="$(json "$WORKDIR/delivery-again.json" '["driver_token"]')"
+[[ -n "$delivery_again_token" ]] || fail "the absorbed repeat answered with no driver_token"
+ok "and it still answers with a link — a provider who lost the first response has no other way to get one"
+
 status="$(delivery_request "$delivery_provider_token" "verify-del-replace-$$" \
   "/v1/jobs/$delivery_job/driver" '{"driver_name":"Ravi Chandra","driver_mobile":"+61412000999"}' \
   "$WORKDIR/delivery-replace.json")"
@@ -250,6 +254,156 @@ ok "the transition guard refuses the move, and the endpoint says which of the tw
   "select count(*) from driver_assignments where job_id = '$delivery_draft_job';")" == "0" ]] \
   || fail "an assignment row survived a refused transition"
 ok "and the assignment rolled back with it — a driver on a job that never moved cannot happen"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-107  a signed, time-limited, single-job driver token is generated on assignment"
+
+# # Why this is checked here and not only in Go
+#
+# internal/delivery's tests build the issuer from constants of their own. What they cannot show is
+# that the *service as configured* signs with the driver keyset rather than identity's, and that a
+# real driver token presented as a mobile credential to a running instance is refused. Both are
+# properties of the wiring, and the wiring is what this file exists to exercise.
+#
+# Nothing in *this* section presents a driver token to a route that accepts one. That is SHIP-108's
+# section further down, and the split is deliberate: these checks are about what the token *is*, and
+# those are about what happens when it meets a request.
+
+# jwt_segment <token> <0|1> <outfile> — decode a token's header (0) or payload (1) into a JSON file.
+#
+# python3 rather than `base64 -d`: a JWT segment is base64url with the padding stripped, and neither
+# macOS's nor coreutils' base64 accepts that. Nothing here verifies anything — the signature is the
+# check below, and keeping the two apart is what lets this one read claims out of a token it has not
+# yet trusted, exactly as an attacker would.
+jwt_segment() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import base64, json, sys
+
+token, index, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+segment = token.split('.')[index]
+segment += '=' * (-len(segment) % 4)
+json.dump(json.loads(base64.urlsafe_b64decode(segment)), open(out, 'w'))
+PY
+}
+
+# jwt_claim_names <file> — the claim names a decoded token carries, sorted and comma-separated.
+jwt_claim_names() {
+  python3 -c 'import json,sys; print(",".join(sorted(json.load(open(sys.argv[1])))))' "$1"
+}
+
+# hs256 <signing-input> <key> — the HS256 signature in the form a token carries it.
+hs256() { printf '%s' "$1" | openssl dgst -sha256 -hmac "$2" -binary | b64url; }
+
+# The two development keys from deploy/.env.example. Both are public and in this repository; the
+# service refuses either outside development. They are written out here rather than derived, because
+# what these checks are about is that the *right one of the two* signed the token.
+delivery_driver_dev_key="shipper-local-development-driver-token-key-not-a-secret"
+delivery_mobile_dev_key="shipper-local-development-signing-key-not-a-secret"
+
+delivery_driver_token="$(json "$WORKDIR/delivery-assign.json" '["driver_token"]')"
+delivery_token_expiry="$(json "$WORKDIR/delivery-assign.json" '["driver_token_expires_at"]')"
+
+[[ "$delivery_driver_token" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]] \
+  || fail "the assignment carried no signed driver token: '$delivery_driver_token'"
+[[ "$delivery_token_expiry" =~ Z$ ]] || fail "driver_token_expires_at is '$delivery_token_expiry', want UTC"
+ok "assigning a driver returns a signed token and the instant it stops working — generated on assignment, and nowhere else"
+
+jwt_segment "$delivery_driver_token" 0 "$WORKDIR/delivery-token-header.json"
+jwt_segment "$delivery_driver_token" 1 "$WORKDIR/delivery-token-claims.json"
+
+[[ "$(json "$WORKDIR/delivery-token-header.json" '["alg"]')" == "HS256" ]] \
+  || fail "the token's alg is $(json "$WORKDIR/delivery-token-header.json" '["alg"]'), want HS256"
+[[ "$(json "$WORKDIR/delivery-token-header.json" '["kid"]')" == "driver-dev" ]] \
+  || fail "the token names key $(json "$WORKDIR/delivery-token-header.json" '["kid"]'), want the driver keyset's driver-dev"
+ok "it is signed HS256 under the driver keyset's own key identifier, not identity's"
+
+# The claim set, held closed. A search for `sub` would catch `sub` and miss `user_id`, which is the
+# same argument SHIP-83's budget test makes: assert the whole set, not the absence of one name.
+delivery_claim_names="$(jwt_claim_names "$WORKDIR/delivery-token-claims.json")"
+[[ "$delivery_claim_names" == "assignment_id,aud,exp,iat,iss,job_id,jti" ]] \
+  || fail "the claim set is '$delivery_claim_names', want exactly assignment_id,aud,exp,iat,iss,job_id,jti"
+ok "seven claims and no eighth — no sub, no role and no sid, so there is nothing to build a session from"
+
+[[ "$(json "$WORKDIR/delivery-token-claims.json" '["aud"]')" == "shipper-driver" ]] \
+  || fail "aud is $(json "$WORKDIR/delivery-token-claims.json" '["aud"]'), want shipper-driver"
+[[ "$(json "$WORKDIR/delivery-token-claims.json" '["job_id"]')" == "$delivery_job" ]] \
+  || fail "the token grants $(json "$WORKDIR/delivery-token-claims.json" '["job_id"]'), want $delivery_job"
+[[ "$(json "$WORKDIR/delivery-token-claims.json" '["assignment_id"]')" == "$delivery_assignment_id" ]] \
+  || fail "the token names assignment $(json "$WORKDIR/delivery-token-claims.json" '["assignment_id"]'), want $delivery_assignment_id"
+ok "it names one job and the assignment it was minted for — the driver's only identity, since they have no account"
+
+# Seven days, read off the token rather than off the configuration that produced it.
+delivery_token_window="$(json "$WORKDIR/delivery-token-claims.json" '["exp"]-json.load(open(sys.argv[1]))["iat"]')"
+[[ "$delivery_token_window" == "604800" ]] \
+  || fail "the token is valid for ${delivery_token_window}s, want 604800 (seven days)"
+ok "time-limited to exactly seven days — long enough for a long-haul delivery, and there is no refresh behind it"
+
+# The signature, against each development key in turn. This is the check that makes "separate
+# signing key material" (Docs/10 §5) a fact about the running service rather than about a struct.
+delivery_signing_input="${delivery_driver_token%.*}"
+[[ "${delivery_driver_token##*.}" == "$(hs256 "$delivery_signing_input" "$delivery_driver_dev_key")" ]] \
+  || fail "the token does not verify under the driver signing key"
+ok "the signature verifies under the driver token's own key"
+
+[[ "${delivery_driver_token##*.}" != "$(hs256 "$delivery_signing_input" "$delivery_mobile_dev_key")" ]] \
+  || fail "the driver token was signed with identity's access token key — the two systems share key material"
+ok "and not under the mobile session's — two keysets, which is what stops either verifier ever accepting the other's tokens"
+
+# The separation, over HTTP. `GET /v1/jobs` declares RequireUser, so this is a real driver token
+# presented to a real authenticated endpoint on the running binary. The other direction — a mobile
+# token presented to a driver route — is in SHIP-108's section, which is the ticket that created a
+# route able to refuse one.
+status="$(curl -s -o "$WORKDIR/delivery-token-as-session.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_driver_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/delivery-token-as-session.json"; fail "a driver token was accepted as a mobile session: $status"; }
+ok "presented as a mobile credential it is refused 401 — the driver token cannot be exchanged for a session"
+
+# --- single-job, demonstrated across two assignments -------------------------------------------
+
+delivery_second_job="$(delivery_awarded_job second)"
+status="$(delivery_request "$delivery_provider_token" "verify-del-second-$$" \
+  "/v1/jobs/$delivery_second_job/driver" '{"driver_name":"Ravi Chandra","driver_mobile":"+61412000999"}' \
+  "$WORKDIR/delivery-second.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/delivery-second.json"; fail "assigning the second job returned $status, want 201"; }
+
+delivery_second_token="$(json "$WORKDIR/delivery-second.json" '["driver_token"]')"
+[[ "$delivery_second_token" != "$delivery_driver_token" ]] || fail "two jobs were assigned and both got the same token"
+
+jwt_segment "$delivery_second_token" 1 "$WORKDIR/delivery-second-claims.json"
+[[ "$(json "$WORKDIR/delivery-second-claims.json" '["job_id"]')" == "$delivery_second_job" ]] \
+  || fail "the second token grants $(json "$WORKDIR/delivery-second-claims.json" '["job_id"]'), want $delivery_second_job"
+[[ "$(json "$WORKDIR/delivery-second-claims.json" '["job_id"]')" != "$delivery_job" ]] \
+  || fail "the second job's token grants the first job, which is not a single-job token"
+ok "a second assignment gets a token for its own job and no other — one token, one job"
+
+# A repointed token. The job identifier lives inside the signature, so widening it means re-signing
+# it, and re-signing it means holding the key. This is what "cannot be widened" actually rests on.
+delivery_forged="$(python3 - "$delivery_driver_token" "$delivery_second_job" <<'PY'
+import base64, json, sys
+
+
+def decode(segment):
+    return base64.urlsafe_b64decode(segment + '=' * (-len(segment) % 4))
+
+
+def encode(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b'=').decode()
+
+
+header, payload, signature = sys.argv[1].split('.')
+claims = json.loads(decode(payload))
+claims['job_id'] = sys.argv[2]
+print('.'.join([header, encode(json.dumps(claims, separators=(',', ':')).encode()), signature]))
+PY
+)"
+[[ "${delivery_forged##*.}" == "${delivery_driver_token##*.}" ]] \
+  || fail "the forgery changed the signature, so it is not testing what it claims"
+[[ "${delivery_forged%.*}" != "${delivery_signing_input}" ]] \
+  || fail "the forgery did not change the payload, so it is not testing what it claims"
+[[ "${delivery_forged##*.}" != "$(hs256 "${delivery_forged%.*}" "$delivery_driver_dev_key")" ]] \
+  || fail "a token repointed at another job still carries a valid signature"
+ok "rewriting the job a token names breaks its signature — the grant is inside what was signed"
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-111  POST /v1/jobs/{id}/milestones records a milestone once per idempotency key"
@@ -433,16 +587,225 @@ status="$(milestone_request "$delivery_provider_token" "$milestone_key-delivered
   || fail "a job reached Delivered with neither proof nor a recorded exception"
 ok "delivered is refused while nothing can prove it — the invariant holds without SHIP-118, which narrows the refusal rather than adding it"
 
-status="$(milestone_request "$delivery_provider_token" "$milestone_key-late" '{"milestone":"en_route_to_pickup"}' late)"
-[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-late.json"; fail "a milestone the job has moved past returned $status, want 409"; }
-[[ "$(json "$WORKDIR/ms-late.json" '["error"]["code"]')" == "delivery_milestone_not_permitted" ]] \
-  || { cat "$WORKDIR/ms-late.json"; fail "expected code=delivery_milestone_not_permitted"; }
-[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "4" ]] \
-  || fail "the refused recording left a row behind; SHIP-112 keeps it deliberately, and until then the transaction must not"
-ok "a milestone the job has moved past is refused and rolls back whole — SHIP-112 is the ticket that absorbs it instead"
-
 status="$(milestone_request "$delivery_provider_token" "$milestone_key-assigned" '{"milestone":"driver_assigned"}' assigned)"
 [[ "$status" == "422" ]] || { cat "$WORKDIR/ms-assigned.json"; fail "driver_assigned returned $status, want 422"; }
 [[ "$(json "$WORKDIR/ms-assigned.json" '["error"]["details"][0]["field"]')" == "milestone" ]] \
   || { cat "$WORKDIR/ms-assigned.json"; fail "the refusal does not name the milestone field"; }
 ok "driver_assigned is refused here — it has an endpoint of its own, and nothing writes it to this table"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-112  a late milestone is recorded as history without moving the job backwards"
+
+# # Why these checks are here and not only in Go
+#
+# The refusal `delivery` absorbs is produced by neither `delivery` nor `jobs`: the transition guard
+# answers one sentinel for a move that points backwards and one that points forwards, and telling
+# them apart is the composition root's half — `jobLifecycle.refusal` in cmd/api/routes_delivery.go.
+# internal/delivery's tests drive a *copy* of that adapter, because cmd/api has no database in a Go
+# test. The production one is exercised here or nowhere, and a copy that drifted would show as a
+# late milestone absorbed by one and refused by the other.
+#
+# $milestone_job is In transit with four milestone rows and one transition into 'En route to pickup'
+# behind it. The driver's queued `en_route_to_pickup`, recorded at dawn in a yard with no signal, is
+# about to arrive — which is Docs/02 §3.1's own example read backwards.
+
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-late" \
+  '{"milestone":"en_route_to_pickup","recorded_at":"2026-08-12T06:40:11Z"}' late)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-late.json"; fail "a late milestone returned $status, want 201 — Docs/02 §3.1 requires it absorbed, not rejected"; }
+milestone_late_id="$(json "$WORKDIR/ms-late.json" '["id"]')"
+[[ "$milestone_late_id" =~ ^[0-9a-f-]{36}$ ]] || fail "the absorbed milestone came back with no id"
+ok "a milestone the job has moved past is recorded rather than refused — the 409 SHIP-111 answered with has gone"
+
+# The row, read from the table rather than from what the endpoint said about itself. This is the
+# load-bearing half: a late milestone that is silently discarded is what this ticket exists to stop.
+milestone_late_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select milestone || ' @ ' || to_char(actor_recorded_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+        || ' arrived ' || (server_recorded_at > actor_recorded_at)
+     from milestones where id = '$milestone_late_id';")"
+[[ "$milestone_late_row" == "En route to pickup @ 2026-08-12 06:40:11 arrived true" ]] \
+  || fail "the absorbed milestone is stored as '$milestone_late_row', want 'En route to pickup @ 2026-08-12 06:40:11 arrived true'"
+ok "the row is there afterwards, carrying the actor's own clock uncorrected and the platform's beside it — absorption is what the pair SHIP-110 built is for"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "5" ]] \
+  || fail "the late milestone did not survive its own request"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$milestone_job';")" == "In transit" ]] \
+  || fail "a late milestone moved the job backwards"
+ok "five rows and the job still In transit — the record grew and the delivery did not go backwards"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$milestone_job' and to_status = 'En route to pickup';")" == "1" ]] \
+  || fail "an absorbed milestone wrote a job_status_history row for a move that did not happen"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select to_status from job_status_history where job_id = '$milestone_job' order by server_recorded_at desc limit 1;")" \
+  == "In transit" ]] || fail "the job's latest recorded transition is no longer the one it really made last"
+ok "and no transition was recorded for it — 'without moving the job backwards' means the history says nothing moved, because nothing did"
+
+# The retry, because absorption must not have opened a second way past uq_milestones_idempotency.
+forget_the_cached_response "$milestone_key-late"
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-late" \
+  '{"milestone":"en_route_to_pickup","recorded_at":"2026-08-12T06:40:11Z"}' late-again)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/ms-late-again.json"; fail "the retry of an absorbed milestone returned $status, want 200"; }
+[[ "$(json "$WORKDIR/ms-late-again.json" '["id"]')" == "$milestone_late_id" ]] \
+  || fail "the retry answered with a different milestone"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" == "5" ]] \
+  || fail "the retry of an absorbed milestone wrote a second row"
+ok "retried with its cached response deleted it is answered from the row it already wrote — once per key, absorbed or not"
+
+# --- the other direction, which is deliberately still a refusal ---------------------------------
+#
+# A milestone the delivery has not *reached* is not a historical fact that arrived out of order. It
+# is refused, and SHIP-113 is the ticket that decides what a job cancelled out from under a queued
+# update does with one.
+
+milestone_early_job="$(delivery_awarded_job early)"
+delivery_move "$milestone_early_job" Awarded 'En route to pickup'
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-early.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-early" \
+  -H 'Content-Type: application/json' -d '{"milestone":"in_transit"}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$milestone_early_job/milestones")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-early.json"; fail "a premature milestone returned $status, want 409"; }
+[[ "$(json "$WORKDIR/ms-early.json" '["error"]["code"]')" == "delivery_milestone_not_permitted" ]] \
+  || { cat "$WORKDIR/ms-early.json"; fail "expected code=delivery_milestone_not_permitted"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_early_job';")" == "0" ]] \
+  || fail "a premature recording left a row behind; only a late one is kept"
+ok "a milestone the delivery has not reached yet is still refused and still rolls back whole — retrying it succeeds, which is what makes the refusal cost a retry rather than a record"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-108  a driver token grants exactly one job and cannot be exchanged for a user session"
+
+# # What only this section can show
+#
+# internal/delivery drives the guard on a mux of its own and cmd/api drives it through the real
+# router, but both build their key material from constants. What neither can show is the running
+# service, configured from deploy/.env, refusing and accepting the right things — and, more to the
+# point, **both directions of the exchange invariant against one binary**. SHIP-107 could only prove
+# one of them here, because no route accepted a driver token; the route below is what closes it.
+#
+# Everything runs against the two assignments the SHIP-107 section already made, so no fixture is
+# repeated: $delivery_driver_token grants $delivery_job, $delivery_second_token grants
+# $delivery_second_job, and $delivery_forged is that first token repointed at the second job with
+# its signature left alone.
+#
+# The route is a GET, so nothing here needs an Idempotency-Key — and that is not an accident.
+# Docs/11 §9 records that a driver-token request scopes its idempotency key to `anonymous`, because
+# the scope is computed group-wide outside the middleware while a guard runs per route inside it. A
+# read does not meet that; SHIP-121's milestone controls will.
+
+# open_delivery <token> <job-id> <name> — one driver-portal read, answering with the status code.
+#
+# The credential and the job are separate arguments on purpose: every check below is some pairing of
+# the two, and a helper that derived one from the other could not express the pairing that matters.
+open_delivery() {
+  curl -s -o "$WORKDIR/driver-$3.json" -D "$WORKDIR/driver-$3.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$2"
+}
+
+status="$(open_delivery "$delivery_driver_token" "$delivery_job" own)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/driver-own.json"; fail "the driver's own link returned $status, want 200"; }
+[[ "$(json "$WORKDIR/driver-own.json" '["job_id"]')" == "$delivery_job" ]] \
+  || fail "the link opened $(json "$WORKDIR/driver-own.json" '["job_id"]'), want $delivery_job"
+[[ "$(json "$WORKDIR/driver-own.json" '["assignment_id"]')" == "$delivery_assignment_id" ]] \
+  || fail "the link named assignment $(json "$WORKDIR/driver-own.json" '["assignment_id"]'), want $delivery_assignment_id"
+[[ "$(json "$WORKDIR/driver-own.json" '["driver_name"]')" == "Sam Patel" ]] \
+  || fail "driver_name is $(json "$WORKDIR/driver-own.json" '["driver_name"]')"
+ok "the driver's link opens the one delivery it names — the first route in the service served on a credential that is not a mobile session"
+
+# json_keys <file> — the top-level keys of a JSON object, sorted and comma-separated.
+#
+# The same shape as jwt_claim_names and deliberately a second function: that one is about a token's
+# claims and this is about a response body, and one helper doing both would read as though a response
+# were a token.
+json_keys() { python3 -c 'import json,sys; print(",".join(sorted(json.load(open(sys.argv[1])))))' "$1"; }
+
+# The response held to a closed set of keys rather than searched for the field it must not carry,
+# which is SHIP-83's argument: a search for driver_mobile catches driver_mobile and misses `phone`.
+driver_response_keys="$(json_keys "$WORKDIR/driver-own.json")"
+[[ "$driver_response_keys" == "assigned_at,assignment_id,driver_name,job_id,link_expires_at" ]] \
+  || fail "the driver's view carries '$driver_response_keys', want exactly assigned_at,assignment_id,driver_name,job_id,link_expires_at"
+ok "and answers with five fields and no sixth — no mobile number, and no delivery detail, which is SHIP-120's"
+
+# --- exactly one job, and this is the check the *Done when* rests on ---------------------------
+
+status="$(open_delivery "$delivery_driver_token" "$delivery_second_job" wrong)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/driver-wrong.json"; fail "a link for $delivery_job opened $delivery_second_job with status $status, want 404"; }
+[[ "$(json "$WORKDIR/driver-wrong.json" '["error"]["code"]')" == "not_found" ]] \
+  || { cat "$WORKDIR/driver-wrong.json"; fail "expected code=not_found; a 403 would confirm the other job exists"; }
+ok "the same link presented on another job gets exactly what a job that does not exist gets"
+
+status="$(open_delivery "$delivery_second_token" "$delivery_job" wrong-back)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/driver-wrong-back.json"; fail "the second link opened the first job: $status"; }
+status="$(open_delivery "$delivery_second_token" "$delivery_second_job" second-own)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/driver-second-own.json"; fail "the second link did not open its own job: $status"; }
+ok "and the refusal is symmetric — each link opens its own delivery and neither opens the other's"
+
+# --- the exchange, over HTTP, in both directions at once ---------------------------------------
+
+status="$(open_delivery "$delivery_provider_token" "$delivery_job" as-session)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-as-session.json"; fail "a mobile session token opened the driver's route: $status"; }
+[[ "$(json "$WORKDIR/driver-as-session.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || { cat "$WORKDIR/driver-as-session.json"; fail "expected code=unauthenticated"; }
+ok "a mobile session token is refused on the driver's route — the direction SHIP-107 could not test, because no route accepted a driver token"
+
+status="$(curl -s -o "$WORKDIR/driver-on-user-route.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_driver_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-on-user-route.json"; fail "a driver token was accepted as a mobile session: $status"; }
+ok "and the driver's link is still refused on a user route — both directions, one binary, one run"
+
+# --- the ways a link fails to be one -----------------------------------------------------------
+
+status="$(curl -s -o "$WORKDIR/driver-none.json" -D "$WORKDIR/driver-none.headers" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/driver/jobs/$delivery_job")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-none.json"; fail "the driver route was reachable with no credential: $status"; }
+grep -qi '^www-authenticate: *Bearer' "$WORKDIR/driver-none.headers" \
+  || { cat "$WORKDIR/driver-none.headers"; fail "the 401 carries no WWW-Authenticate challenge, which RFC 9110 requires"; }
+ok "it cannot be reached with no link at all, and the refusal says what scheme it wanted"
+
+# The forgery from the SHIP-107 section: the first job's token with its `job_id` rewritten to the
+# second job and its signature untouched. Presented on the job it now *claims*, so a service that
+# read the claim before checking the signature would answer 200.
+status="$(open_delivery "$delivery_forged" "$delivery_second_job" forged)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-forged.json"; fail "a repointed token opened the job it was repointed at: $status, want 401"; }
+[[ "$(json "$WORKDIR/driver-forged.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || { cat "$WORKDIR/driver-forged.json"; fail "expected code=unauthenticated"; }
+ok "a token repointed at the job it is presented on is refused by the signature, before the job is ever compared"
+
+# An expired link, built by hand from the development key rather than by waiting seven days. The
+# header names the same kid the service signs with, so everything about it verifies except `exp`.
+driver_expired_header="$(printf '{"alg":"HS256","kid":"driver-dev","typ":"JWT"}' | b64url)"
+driver_expired_claims="$(python3 - "$delivery_job" "$delivery_assignment_id" <<'PY'
+import base64, json, sys, time, uuid
+
+issued = int(time.time()) - 8 * 24 * 3600
+claims = {
+    "job_id": sys.argv[1],
+    "assignment_id": sys.argv[2],
+    "iat": issued,
+    "exp": issued + 7 * 24 * 3600,
+    "jti": str(uuid.uuid4()),
+    "iss": "shipper",
+    "aud": "shipper-driver",
+}
+raw = json.dumps(claims, separators=(',', ':')).encode()
+print(base64.urlsafe_b64encode(raw).rstrip(b'=').decode())
+PY
+)"
+driver_expired_input="$driver_expired_header.$driver_expired_claims"
+driver_expired="$driver_expired_input.$(hs256 "$driver_expired_input" "$delivery_driver_dev_key")"
+
+status="$(open_delivery "$driver_expired" "$delivery_job" expired)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-expired.json"; fail "an expired link returned $status, want 401"; }
+[[ "$(json "$WORKDIR/driver-expired.json" '["error"]["code"]')" == "delivery_driver_link_expired" ]] \
+  || { cat "$WORKDIR/driver-expired.json"; fail "expected code=delivery_driver_link_expired, got $(json "$WORKDIR/driver-expired.json" '["error"]["code"]')"; }
+ok "a link that has run out is refused with a code of its own — a driver has nothing to refresh, so token_expired's 'refresh and retry' would be a loop"
+
+# The same claims signed with identity's key instead. Two keysets is what makes this a 401 rather
+# than a working link, and it is the running service's answer rather than a struct's.
+driver_wrong_key="$driver_expired_input.$(hs256 "$driver_expired_input" "$delivery_mobile_dev_key")"
+status="$(open_delivery "$driver_wrong_key" "$delivery_job" wrong-key)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/driver-wrong-key.json"; fail "a link signed with identity's key was accepted: $status"; }
+[[ "$(json "$WORKDIR/driver-wrong-key.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || { cat "$WORKDIR/driver-wrong-key.json"; fail "expected code=unauthenticated"; }
+ok "and one signed with the mobile session's key is refused too — separate key material, checked by the service that is running"

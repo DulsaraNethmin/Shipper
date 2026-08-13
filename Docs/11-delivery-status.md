@@ -181,7 +181,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **355 checks across 12 sections**, and `make check` green. Since
+Verified by `make verify` — **381 checks across 12 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -311,8 +311,11 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
+| **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
+| **SHIP-108** | M4 | The driver token verifier and `GET /v1/driver/jobs/{id}` — the first route in the service served on something other than a mobile session. **The one-job check is the auth class**, so a driver route cannot declare the class and skip it, and both directions of the exchange invariant are now demonstrated over HTTP rather than only in Go — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
+| **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
@@ -3641,6 +3644,314 @@ gets its own database — and has no equivalent for a topic. **On a Kafka topic 
 not a timestamp.** `scripts/verify/80-notifications.sh` fences on `published_at` and has been correct
 by luck; it is another domain's file and this ticket deliberately did not touch it, so the rule is
 stated and the instance is left where §9 recorded it.
+
+### SHIP-107 — the driver's token, and the claim it deliberately does not carry
+
+The driver holds a signed, seven-day token naming exactly one job, minted when the provider assigns
+them and available from nowhere else. It is the first half of the pair §8 has always kept with one
+owner; SHIP-108 is the verifier.
+
+**The interesting decision is an omission.** `Docs/10` §5 specifies separate key material, a
+`shipper-driver` audience and one `job_id`, and all three are here — but the claim set is
+`job_id`, `assignment_id`, `iat`, `exp`, `jti`, `iss`, `aud` and **nothing else**. No `sub`, no
+`role`, no `sid`. An `authctx.Subject` is built from a user id, and this token has none: the
+exchange CLAUDE.md forbids is not merely refused by a check somebody could remove, it has no
+material to work from. A closed-set test holds the seven keys, for the reason SHIP-83's budget test
+holds a closed set of response keys — searching for `sub` catches `sub` and misses `user_id`.
+
+**`assignment_id` is required by code that already exists, not added speculatively.** A driver has
+no account, so `milestones.actor_type = 'driver'` names their `driver_assignments` row (000601,
+following 000401), and `RecordMilestone` says in place that this is the one field which changes when
+a driver can present a credential. Without the claim, SHIP-108 could authenticate a driver and still
+have nothing to attribute their work to. It also narrows what `Service.Driver` is for: the token
+identifies the assignment, so that lookup exists to answer the question a claim cannot — whether the
+assignment is still live.
+
+**Seven days, and the comparison with identity's fifteen minutes is the wrong one.** There is no
+refresh: a driver holds no second credential, so the TTL is the whole life of their access rather
+than the short leg of a pair. It has to outlast a delivery — Australian long-haul freight is quoted
+in days — and it does not have to outlast the job, because the 72-hour completion window
+(`Docs/02` §6.1) is the customer's and the driver plays no part in it. Longer is a real cost: the
+provider forwards the link by whatever channel they already use (`Docs/01` §4.5), so it lands in a
+message thread and stays there. `DELIVERY_DRIVER_TOKEN_TTL`, refused above thirty days at load.
+
+**Two keysets, and configuration refuses one.** `internal/config` grew a `Delivery` section with its
+own `kid`-indexed keyset and its own development default — a *different* throwaway from identity's,
+because sharing one would leave the two systems separated by the audience alone on every machine
+anybody works on. `validate` refuses a configuration in which the two sets share a secret, **in
+development as well**, since that is a structural rule rather than a deployment-hardening one. The
+audience alone is still sufficient, and the tests prove it by constructing exactly the configuration
+that is refused: both directions are exercised with the key material deliberately shared.
+
+**Which direction of the separation this run could prove, and which could not.** Both, in Go —
+`internal/delivery`'s test file imports `internal/identity` (the boundary lint skips `_test.go`,
+which is what makes it possible), mints a real token from each issuer, and shows each parser
+refusing the other's. That is stronger than identity's existing
+`TestAccessTokenWithTheDriverAudienceIsRejected`, which builds a driver-audience token by hand
+because it cannot import this package. **Over HTTP only one direction exists**: `make verify`
+presents a real driver token to `GET /v1/jobs` and gets `401`. The other — a mobile token presented
+to a driver route — needs a route that accepts one, and that is SHIP-108's.
+
+**Minted inside the assignment transaction, which costs nothing and buys the rollback.** Signing is
+an HMAC over a few hundred bytes and touches no I/O, so putting it before the commit means a failure
+to sign takes the assignment with it. The alternative — commit, then mint — would leave a driver on
+a job with no way to open it, and nothing downstream would notice, because the row is complete and
+the status is right. `Service.AssignDriver` grew a fourth return value and two helpers,
+`granted` and `refused`, so that a refusal cannot accidentally carry a token and a fifth success
+path cannot forget to mint one.
+
+**It is returned in the assignment response, and it is a credential in there.** Shipper sends no SMS
+in the MVP, so the response to the request that created the assignment is the only place a link
+comes from. That puts a credential in a body the idempotency middleware stores — under
+`idem:v1:user:<provider>:<key>` (SHIP-44), which is a stronger scope than the anonymous one the
+sign-in endpoints already store their tokens under, and worth stating because it is not obvious from
+the shape. The token is never logged; the expiry is, which is what somebody diagnosing a dead link
+actually wants. **No URL is assembled** — the portal's landing route is SHIP-120's to define, and a
+base URL here would be this domain asserting a path in an application it does not own.
+
+**A repeated nomination gets a fresh token and the previous one keeps working.** Both grant the same
+one job to the same one driver, so nothing is widened, and refusing to reissue would strand a
+provider whose phone lost the first response. **Invalidating the previous link is SHIP-109**, which
+is a different intent and needs state this ticket does not write. There is a test asserting that
+both links verify, so the ticket that changes it has a test to change.
+
+**What makes it single-job is that the job identifier is inside the signature.** Two tests and one
+`make verify` check take a valid token, rewrite `job_id` to another job, re-encode, and show the
+signature refusing it — which is the property the *Done when* is asking for. Asserting that the
+claim contains one job id would have proved nothing on its own. `make verify` also assigns a second
+job and confirms its token grants that job and not the first, and verifies the signature under the
+driver development key while confirming it does **not** verify under identity's — the one check that
+makes "separate key material" a fact about the running service rather than about a struct.
+
+**No migration, and the delivery block is still at `000602`.** The token is stateless and the
+assignment row it names already exists. SHIP-109 is the ticket that will need state, and it has a
+cheap route to it: a token whose `assignment_id` is no longer live names a row that says so.
+
+`make verify` went from 355 checks across 12 sections to the figure at the top of this section, all
+eleven of the new ones in `scripts/verify/70-delivery.sh`. The Go tests cover the issuer; the verify
+section covers what only the wiring can show — that the *service as configured* signs with the
+driver keyset and not with identity's, and that a real driver token is refused as a session by a
+running instance.
+
+**One finding about SHIP-15m's seam, and it is a gap rather than a fault.** The seam did exactly
+what it promised for the *router*: `newDriverTokenGuard` is in place, `cmd/api/routes.go`,
+`manifest.go`, `main.go` and `Deps` are untouched, and no route was declared with
+`RequireDriverToken`. What it did not carry is the **configuration** its own comments say SHIP-108 is
+certain to need — `newDriverTokenGuard(cfg, clk)` takes a `*config.Config` that had no driver-token
+fields in it. So this ticket edited `internal/config`, `deploy/.env.example`, and two `cmd/api` test
+files whose `config.Config` literals build every domain's handler during attach
+(`routes_test.go`'s `testDeps`, `routes_app_test.go`'s `routerWithApp`). None of those is on the
+forbidden list and none was a conflict, but a wave-7 prep ticket that pre-seeds a configuration
+section the way `Deps` was pre-seeded would remove the class.
+
+### SHIP-108 — the verifier, and the check that is the auth class rather than a step inside it
+
+The other half of the pair §8 has always kept with one owner. SHIP-107 signs the link; this spends
+it, and adds the one route in the service reached with something other than a mobile session:
+`GET /v1/driver/jobs/{id}`, declared `RequireDriverToken`.
+
+**The interesting decision is where the one-job check lives, and it is not where it first looks like
+it belongs.** The token names a job, the request names a job in its path, and something has to
+compare them. Putting that comparison in the handler is the obvious shape and it is wrong: it makes
+the check a thing a handler can *forget*, and a handler that forgot it would answer somebody else's
+delivery with a `200` — no compile error, no failing test of its own, and no symptom until a driver
+held two links. So the comparison is in the guard, which `attach` installs from the manifest's auth
+class. **A route cannot declare `RequireDriverToken` and skip the check, because the check is the
+class.** The handler never reads the path at all: the job comes out of the grant, which the guard has
+already reconciled with the path.
+
+That leaves one shape the guard cannot check at startup — a route declaring the class on a pattern
+with no `{id}`, since a guard is handed a handler rather than a pattern. It fails **closed**:
+`PathValue` answers `""`, which is not an identifier, so every request to such a route is refused.
+A route that visibly never works, rather than one served with no scope at all, and there is a test
+holding that direction because the tempting one-line alternative — "no job in the path, so nothing to
+compare, let it through" — passes every other test in the file.
+
+**Both directions of the exchange invariant are now demonstrated over HTTP, which is what this lane
+existed to finish.** SHIP-107 could only show one: a driver token presented to `GET /v1/jobs`
+answering `401`. The other needed a route that accepts a driver token, and there was none.
+`scripts/verify/70-delivery.sh` now presents a *mobile* token to the driver route and gets `401`, two
+checks apart from its mirror image, against one running binary in one run.
+`TestNeitherTokenSystemOpensTheOthersRoutes` is the same pair in Go through the real router. The
+audience is doing that work alone in the domain's tests, where the mobile token is signed with the
+**driver keyset's own key** — the arrangement `internal/config` refuses in a deployment, tested
+precisely because the guarantee should not depend on it.
+
+**The grant type is exported and its context key and accessor are not.** `DriverGrant` has no
+`UserID`, no role and no session id, so the conversion `Docs/10` §5 forbids has nothing to draw on —
+SHIP-107 made that structurally true and this ticket had to not put the material back. Keeping
+`driverGrantFrom` unexported goes one step further: **nothing outside `internal/delivery` can read a
+driver grant at all**, so "delivery is the only domain that serves a driver-token route" is a fact
+about the build rather than a rule somebody follows.
+
+**The middleware went into `internal/delivery` rather than staying in `cmd/api`, which is the one
+thing SHIP-15m deliberately left open.** Everything it does is that domain's — its error codes, its
+path parameter, its grant — and handlers live in the domain, a guard being the front half of one.
+What is left in `cmd/api/driverauth.go` is three statements, the same shape as
+`newAccessTokenAuthenticator`.
+
+**A fifth error code, and it is the only one this domain puts on an authentication failure.**
+`delivery_driver_link_expired`, deliberately **not** `httpx.CodeTokenExpired`, whose whole meaning is
+"refresh and retry, do not sign the user out" — advice a driver portal cannot take, because there is
+no refresh behind a link and no account to sign back into. A portal branching on `token_expired`
+would loop. Everything else is undifferentiated: a bad signature, an unknown `kid`, `alg: none` and a
+mobile token all answer `unauthenticated`, which is the call `httpx.ResolveSubject` already makes,
+and the wrong job answers `404` because a `403` would confirm to a link-holder that a competitor's
+job exists.
+
+**The route is deliberately the smallest one that makes the *Done when* demonstrable.** It answers
+which job the link opens, which assignment it belongs to, the driver's name and when the link
+expires — five fields, held to a closed set by a test and by a `make verify` check. **The delivery
+detail is SHIP-120's**, and it needs a port into `jobs` that a middleware ticket has no business
+declaring; fields are added to this shape rather than moved elsewhere, which is additive
+(`Docs/07` §6). The driver's **mobile is absent on purpose**, unlike the provider's view of the same
+row: the driver knows their own number, and a link travels through whatever channel the provider
+already uses, so whoever ends up holding it should learn as little as possible.
+
+**The `{id}` looks redundant against the token and is the mechanism.** The path is the client's
+statement of what it means to act on and the token is the platform's statement of what the caller
+may act on; comparing them is what makes "exactly one job" *observable from outside* rather than
+merely true inside. Drop it and a grant that had silently widened would be undetectable, because
+there would be no other job to ask for. It is also what SHIP-121 needs anyway, and what lets a driver
+carrying two deliveries hold two links a browser can tell apart.
+
+**`Service.AssignmentFor` takes a `DriverGrant` rather than a job id**, so there is no way to ask it
+about an arbitrary job — a grant comes from `Verify` and from nothing else. It is also where the
+question a claim cannot answer gets asked: a token is stateless and keeps verifying after the
+assignment behind it has ended, so the row is what says the grant has lapsed. That is the lookup
+`Service.Driver`'s comment reserved for this ticket and the mechanism **SHIP-109 will reissue
+against** — revocation as a read rather than a denylist. Nothing writes `unassigned_at` through an
+endpoint yet, so a test writes it directly; the answer is `404`, not `401`, because the credential is
+fine and telling a stood-down driver their link is invalid sends them asking for the wrong thing.
+
+**Demonstrated by mutation rather than asserted, four times, each read for its message rather than
+its verdict.** Removing the one-job comparison fails three tests, and the bodies in the failure
+output show one driver being handed the *other* driver's assignment — which is the defect made
+visible rather than described. Making the missing-`{id}` case permissive fails the test named for it.
+Removing the expiry distinction turns the code back into `unauthenticated`. Resolving the driver into
+an `authctx.Subject` fails `TestADriverRouteProducesNoSubject` — **and `cmd/api` passes**, because the
+seam's own probe route is guarded by a stub rather than by the real middleware. That last one is the
+argument for the domain-side test existing at all: the seam test holds the *wiring*, and only a test
+against the real guard holds the invariant.
+
+**SHIP-15m's seam held for every non-test file, and did not hold for the test callers.**
+`cmd/api/routes.go`, `manifest.go`, `main.go` and `Deps` are untouched, exactly as promised — filling
+in `newDriverTokenGuard` is what maps the class. What the seam did not carry is that `newRouter`
+takes the guard as an *argument*, so every test that builds a router passes one: **seventeen call
+sites across five files** passed `nil` while nothing declared the class, and all seventeen had to
+become a real guard the moment a route did — including eleven in `routes_identity_test.go`, another
+domain's test file. The edit is mechanical and none of those files is shared in `Docs/10` §9.2's
+sense, so it cost nothing this time; it is recorded because **`RequireAdmin` will meet it again at
+SHIP-147**, and a prep ticket that gives `newRouter` a test constructor taking the guards it needs
+would remove the class. The two seam tests passed unchanged throughout, which is what
+`TestTheClassIsServedExactlyWhenTheConstructorSuppliesAGuard` was written for: it asserts the rule
+rather than today's answer to it, so it kept passing on the day the `nil` stopped being `nil`.
+
+**`internal/config` was not touched.** SHIP-107 added the driver-token section and it carried
+everything this ticket needed, which is the pre-seeding argument working one wave after the finding.
+
+**The idempotency scope does not bite this route, and it will bite the next one.** `Docs/11` §9
+records that a driver-token request scopes its key to `anonymous` — `SubjectScope` keys on the
+subject, a driver token deliberately produces none, and the scope is computed group-wide *outside*
+`Idempotent` while a guard runs per route inside it. `GET /v1/driver/jobs/{id}` is a read, so it
+never reaches the middleware's store. **SHIP-121's milestone controls are state-changing and will**,
+and §9's entry is still the place that decision gets made.
+
+**No migration, and the delivery block is still at `000602`.** Verification is stateless and the row
+it checks against already exists.
+
+`make verify` went from 366 checks across 12 sections to the figure at the top of this section, all
+ten of the new ones in `scripts/verify/70-delivery.sh`.
+
+### SHIP-112 — absorption, and what "backwards" had to be decided to mean
+
+A queued `en_route_to_pickup` that syncs after the job is already `In transit` is now **kept and
+moves nothing**. SHIP-111 refused it with `delivery_milestone_not_permitted` and rolled the row back
+with its transaction; `Docs/02` §3.1 had always said it must be "absorbed, not rejected as an
+error… the platform accepts the historical fact without moving the job backwards", and this is that
+sentence built.
+
+**SHIP-111's seam held exactly as it promised.** The milestone row is inserted before the move is
+attempted and is already independent of whether the job moved, so absorbing costs nothing but
+declining to return an error. What SHIP-111 could not predict is that the change is *not* confined to
+`Service.RecordMilestone` — one `case` of that switch is where absorption happens, and deciding
+**which** refusals get it needed a fifth value on the port and a second question asked in `cmd/api`.
+
+**"Backwards" is: the job has already recorded a transition into the status this milestone names.**
+That is a fact in `job_status_history`, not an inference over `Docs/02` §2's table, and it is the
+document's own phrasing — "a queued update that arrives after a later transition has already been
+recorded". Two alternatives were considered and rejected:
+
+| Considered | Rejected because |
+|---|---|
+| Absorb **every** refusal of the transition guard | It would answer `201` to a milestone the delivery has not reached — an `in_transit` while the job is still on its way to the pickup — and the job would then never move to `In transit` at all. The client is told "recorded" for a move that silently never happens, which is the same loss this ticket exists to prevent, wearing a success code |
+| Absorb whatever the job can no longer **reach** by any permitted sequence | A job cancelled or disputed at `Awarded` can no longer reach `Picked up` either, and it has not moved *past* the pickup — it lost the delivery to something else. That is `Docs/02` §3.1's administrative-conflict bullet and **SHIP-113's ticket**, and folding it in here would have finished half of that ticket by accident and in the wrong place |
+
+So the split is **late** against **premature**, and the asymmetry is not fastidiousness: a late
+milestone can never succeed on a retry, because `Docs/02` §2 has no way back, so refusing it discards
+a driver's record permanently. A premature one succeeds unchanged as soon as the delivery gets there,
+so refusing it costs a retry. `TestAMilestoneTheDeliveryHasNotReachedIsRefused` records the second
+half by recording the refused milestone, moving the job on, and replaying the identical recording
+successfully.
+
+**An absorbed milestone writes one row and nothing else.** No `job_status_history` row — every row in
+that table describes a status change, and one written for a move that did not happen would be read by
+SHIP-77's timeline and by support as though it had. No status update, and **no domain event**, because
+`jobs` emits `job.status_changed` from inside the transition and there was no transition. The one
+trace it leaves besides the row is a log line, which is deliberate: absorption is otherwise entirely
+invisible, and `Docs/02` §3.1's escalation ladder is about exactly how long updates have been unsynced.
+
+**The distinction is made in `cmd/api`, because it is a question about a `jobs.Status`.**
+`jobs.ErrTransitionNotPermitted` says only that the table has no such edge — it has no notion of
+forwards, and should not. `jobLifecycle.refusal` asks `jobs.Service.History`, inside the caller's
+transaction and after `Transition` has taken the job row `FOR UPDATE`, and answers the domain in the
+domain's own vocabulary: a fifth `delivery.JobMove`, `JobAlreadyPast`. `internal/delivery` still names
+no status and still holds no second copy of the transition table. `internal/jobs` was not touched.
+
+**`AssignDriver` sees the new outcome too, and refuses it.** A job past `Driver assigned` is still
+`delivery_job_not_assignable` — a milestone is a claim about something that already happened, so
+keeping it costs nothing, while an assignment is an instruction about who drives the job *now*, and
+there is nothing historical to keep. The case is written out rather than left to fall through, because
+an unnamed outcome becomes a `500` and that is the right answer for something nobody has considered
+and the wrong one for this.
+
+**The response shape did not change, and that was a decision.** No `absorbed` field, no third status
+code. The milestone response has never told a client what status the job is in — `Docs/02` §3.1 puts
+that reconciliation on the job resource — and a flag here would have to be answered from a *stored*
+fact on a retry and a *computed* one on the first attempt, which is two answers to one question. What
+changed for a client is that the `409` has gone, which is the whole point: the driver's work is now on
+the platform instead of pending on a phone forever. `delivery.Outcome` carries the distinction as far
+as the handler and no further.
+
+**SHIP-111's boundary test was inverted rather than deleted**, keeping what it was protecting.
+`TestAMilestoneTheJobHasMovedPastIsRefusedForNow` became
+`TestAMilestoneTheJobHasMovedPastIsAbsorbedAsHistory`, and its milestone count — which existed to
+prove the transaction left nothing behind — is now the assertion that the row survives. Three further
+assertions carry the second clause: the status is untouched, the transition count into that status is
+still the one the job really made, and the job's latest recorded transition is unchanged.
+
+**`Delivered` cannot be reached through absorption**, and the check that stops it is a matter of
+ordering rather than a new rule. `ErrProofRequired` is tested in front of the insert, so a `delivered`
+never reaches the switch that absorbs and never reaches the table.
+`TestAbsorptionCannotReachDelivered` drives it from a job that has already *been* `Delivered` — the
+one state where "the job has moved past it" is true and absorption would otherwise apply.
+
+**It does not make the `anonymous` idempotency scope live, and §9 has the wrong ticket.** §9 says
+"decide with SHIP-112, which is the first ticket whose retries are a driver's rather than a
+provider's". It is not: `POST /v1/jobs/{id}/milestones` declares `RequireUser` and is the awarded
+provider's, SHIP-108's driver route is a read, and **no driver-token route in the service changes
+state**. The first one that does is **SHIP-121**, the driver portal's milestone controls, and that is
+where §9's decision belongs. Nothing about the scope changed here and nothing needed to.
+
+**No migration** — the delivery block is still at `000602`. Absorption stores no new fact: the row,
+its two clocks and its idempotency key were all already there, which is what made a five-point ticket
+a change to one switch, one adapter and their two test copies.
+
+`make verify` went from 376 checks across 12 sections to the figure at the top of this section, all
+of the new ones in `scripts/verify/70-delivery.sh` — five in a `SHIP-112` section of its own, which
+is where the production adapter's half is exercised at all. `internal/delivery`'s tests drive a
+*copy* of `jobLifecycle`, because `cmd/api` has no database in a Go test, and a copy that drifted
+would show as a late milestone absorbed by one and refused by the other.
 
 ## 4. Partly done — do not treat these as finished
 

@@ -89,10 +89,32 @@ func (j testJobs) move(ctx context.Context, r db.Runner, m jobs.Move) (JobMove, 
 	case errors.Is(err, jobs.ErrAlreadyInStatus):
 		return JobAlreadyInStatus, nil
 	case errors.Is(err, jobs.ErrTransitionNotPermitted):
-		return JobNotAssignable, nil
+		return j.refusal(ctx, r, m)
 	default:
 		return JobMoveUnrecognised, err
 	}
+}
+
+// refusal splits jobs.ErrTransitionNotPermitted into "the job has already been there" and "the job
+// has not reached it yet" (SHIP-112), exactly as cmd/api/routes_delivery.go does.
+//
+// The duplication is the arrangement this file's header describes and not an accident: the
+// production adapter lives in package main, which has no database in a Go test, so the only way to
+// drive the real guard from here is to hold a copy. Both are exercised — this one by the tests
+// below, and cmd/api's by scripts/verify/70-delivery.sh against the running binary — and a copy that
+// drifted would show up as a late milestone absorbed by one and refused by the other.
+func (j testJobs) refusal(ctx context.Context, r db.Runner, m jobs.Move) (JobMove, error) {
+	history, err := j.svc.History(ctx, r, m.JobID)
+	if err != nil {
+		return JobMoveUnrecognised, err
+	}
+
+	for _, change := range history {
+		if change.To == m.To {
+			return JobAlreadyPast, nil
+		}
+	}
+	return JobNotAssignable, nil
 }
 
 // testAwards is delivery.Awards over the accepted bid, as cmd/api reads it.
@@ -146,11 +168,17 @@ func (s staticJobs) MoveToInTransit(context.Context, db.Runner, uuid.UUID, uuid.
 func testClock() *clock.Fixed { return clock.NewFixed(testInstant) }
 
 func newTestService() *Service {
-	return NewService(
-		testJobs{svc: jobs.NewService(events.NewOutbox(), testClock(), nil)},
-		testAwards{},
-		testClock(),
-	)
+	return newTestServiceWith(testJobs{svc: jobs.NewService(events.NewOutbox(), testClock(), nil)})
+}
+
+// newTestServiceWith is the same service over a different job lifecycle, which is what the tests
+// covering outcomes no fixture can produce need.
+//
+// One constructor rather than four literals, so that the driver token issuer SHIP-107 added arrives
+// in every one of them: a test built without one panics, which is the right answer and a tedious one
+// to rediscover four times.
+func newTestServiceWith(lifecycle Jobs) *Service {
+	return NewService(lifecycle, testAwards{}, testDriverIssuer(testClock()), testClock())
 }
 
 // newAccount inserts a user with the role the test needs.
@@ -229,19 +257,38 @@ func awardedJob(t *testing.T, pool *pgxpool.Pool, customer, provider uuid.UUID) 
 }
 
 // assign runs one assignment in its own transaction, which is what the handler does.
+//
+// It drops the driver token, because most of the tests below are about the assignment and the
+// status move. [assignGranting] is the same call with the token kept, and token_test.go is where the
+// tests that care about it live.
 func assign(t *testing.T, pool *pgxpool.Pool, svc *Service, provider, jobID uuid.UUID, n Nomination) (Assignment, bool, error) {
+	t.Helper()
+
+	assignment, _, created, err := assignGranting(t, pool, svc, provider, jobID, n)
+	return assignment, created, err
+}
+
+// assignGranting runs one assignment and keeps the job-scoped token it minted (SHIP-107).
+func assignGranting(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	svc *Service,
+	provider, jobID uuid.UUID,
+	n Nomination,
+) (Assignment, DriverToken, bool, error) {
 	t.Helper()
 
 	var (
 		assignment Assignment
+		token      DriverToken
 		created    bool
 	)
 	err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
 		var err error
-		assignment, created, err = svc.AssignDriver(ctx, r, provider, jobID, n)
+		assignment, token, created, err = svc.AssignDriver(ctx, r, provider, jobID, n)
 		return err
 	})
-	return assignment, created, err
+	return assignment, token, created, err
 }
 
 // jobStatus reads the column, not what the service said about it.
@@ -598,7 +645,7 @@ func TestAssignmentOutsideATransactionIsRefused(t *testing.T) {
 	provider := newAccount(t, pool, "notx-p@example.com", "+61400000622", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	_, _, err := newTestService().AssignDriver(t.Context(), pool, provider, jobID, Nomination{
+	_, _, _, err := newTestService().AssignDriver(t.Context(), pool, provider, jobID, Nomination{
 		DriverName:   "Sam Patel",
 		DriverMobile: "+61412345678",
 	})
@@ -617,7 +664,7 @@ func TestAnUnrecognisedOutcomeIsAFailure(t *testing.T) {
 	provider := newAccount(t, pool, "unknown-p@example.com", "+61400000624", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	svc := NewService(staticJobs{move: JobMoveUnrecognised}, testAwards{}, testClock())
+	svc := newTestServiceWith(staticJobs{move: JobMoveUnrecognised})
 
 	_, _, err := assign(t, pool, svc, provider, jobID, Nomination{
 		DriverName:   "Sam Patel",
@@ -638,7 +685,7 @@ func TestAJobAlreadyDriverAssignedKeepsTheNewDriver(t *testing.T) {
 	provider := newAccount(t, pool, "already-p@example.com", "+61400000626", "provider")
 	jobID := awardedJob(t, pool, customer, provider)
 
-	svc := NewService(staticJobs{move: JobAlreadyInStatus}, testAwards{}, testClock())
+	svc := newTestServiceWith(staticJobs{move: JobAlreadyInStatus})
 
 	assignment, created, err := assign(t, pool, svc, provider, jobID, Nomination{
 		DriverName:   "Sam Patel",
@@ -652,22 +699,72 @@ func TestAJobAlreadyDriverAssignedKeepsTheNewDriver(t *testing.T) {
 	}
 }
 
+// TestAJobPastDriverAssignedIsRefused is SHIP-112's new outcome arriving on the assignment path.
+//
+// **An assignment is not absorbed the way a late milestone is**, and this is the test that says so.
+// A milestone is a claim about something that already happened, so keeping it costs nothing; an
+// assignment is an instruction about who drives the job *now*, and a driver_assignments row written
+// for a job that has already gone would name a live driver on a delivery somebody else is carrying.
+//
+// The port is stubbed because no fixture can produce this. Reaching it needs a job that has been at
+// 'Driver assigned' and has no live assignment, and nothing writes `unassigned_at` until SHIP-109 —
+// the same reason TestAJobAlreadyDriverAssignedKeepsTheNewDriver stubs its outcome. A job that set
+// off without ever being 'Driver assigned' is JobNotAssignable and is covered by
+// TestAJobThatHasSetOffCannotTakeADriver, against the real guard.
+//
+// The second assertion is wave 5's invariant, which SHIP-112 must not have loosened: the assignment
+// row is inserted before the transition is attempted, so a refusal has to take it with it.
+func TestAJobPastDriverAssignedIsRefused(t *testing.T) {
+	pool := pgtest.DB(t)
+	customer := newAccount(t, pool, "past-c@example.com", "+61400000627", "customer")
+	provider := newAccount(t, pool, "past-p@example.com", "+61400000628", "provider")
+	jobID := awardedJob(t, pool, customer, provider)
+
+	svc := newTestServiceWith(staticJobs{move: JobAlreadyPast})
+
+	_, _, err := assign(t, pool, svc, provider, jobID, Nomination{
+		DriverName:   "Sam Patel",
+		DriverMobile: "+61412345678",
+	})
+	if !errors.Is(err, ErrJobNotAssignable) {
+		t.Fatalf("AssignDriver() = %v, want ErrJobNotAssignable — a job past 'Driver assigned' "+
+			"has nothing historical to keep, so there is nothing to absorb", err)
+	}
+
+	var rows int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM driver_assignments WHERE job_id = $1`, jobID).Scan(&rows); err != nil {
+		t.Fatalf("counting assignments: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("%d assignment rows survived the refusal; absorption must not have turned a "+
+			"rollback into a partial write", rows)
+	}
+}
+
 // TestNewServiceRefusesAMissingCollaborator.
 //
-// All three are load-bearing rules rather than conveniences: without Awards nobody is checked,
-// without Jobs the job never moves, and without a clock a milestone recorded with no actor-supplied
-// time has nothing to be stamped from. A service that started without any of them would fail
-// silently, in production, at the first request.
+// All four are load-bearing rules rather than conveniences: without Awards nobody is checked,
+// without Jobs the job never moves, without a token issuer an assignment produces no link for the
+// driver (SHIP-107), and without a clock a milestone recorded with no actor-supplied time has
+// nothing to be stamped from. A service that started without any of them would fail silently, in
+// production, at the first request.
 func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		jobs   Jobs
 		awards Awards
+		tokens *DriverTokenIssuer
 		clk    clock.Clock
 	}{
-		{name: "no job lifecycle", jobs: nil, awards: testAwards{}, clk: testClock()},
-		{name: "no award lookup", jobs: staticJobs{move: JobMoved}, awards: nil, clk: testClock()},
-		{name: "no clock", jobs: staticJobs{move: JobMoved}, awards: testAwards{}, clk: nil},
+		{name: "no job lifecycle", jobs: nil, awards: testAwards{},
+			tokens: testDriverIssuer(testClock()), clk: testClock()},
+		{name: "no award lookup", jobs: staticJobs{move: JobMoved}, awards: nil,
+			tokens: testDriverIssuer(testClock()), clk: testClock()},
+		{name: "no driver token issuer", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
+			tokens: nil, clk: testClock()},
+		{name: "no clock", jobs: staticJobs{move: JobMoved}, awards: testAwards{},
+			tokens: testDriverIssuer(testClock()), clk: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer func() {
@@ -675,7 +772,7 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 					t.Error("NewService returned a service that cannot work")
 				}
 			}()
-			NewService(tc.jobs, tc.awards, tc.clk)
+			NewService(tc.jobs, tc.awards, tc.tokens, tc.clk)
 		})
 	}
 }

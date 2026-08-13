@@ -45,6 +45,7 @@ import (
 type Service struct {
 	jobs   Jobs
 	awards Awards
+	tokens *DriverTokenIssuer
 	clock  clock.Clock
 	store  postgresStore
 }
@@ -56,10 +57,11 @@ type Service struct {
 // collaborator is a programming mistake rather than a runtime condition, and the alternative here
 // is a service that starts and then answers every assignment with a nil-pointer panic.
 //
-// Neither may be defaulted to something harmless, which is the reason they are not optional the way
-// jobs' geocoder is. A nil Awards is "nobody is checked", and a nil Jobs is "the job never moves" —
-// both are silent failures of the two rules this endpoint exists to enforce.
-func NewService(jobs Jobs, awards Awards, c clock.Clock) *Service {
+// None of them may be defaulted to something harmless, which is the reason they are not optional
+// the way jobs' geocoder is. A nil Awards is "nobody is checked", a nil Jobs is "the job never
+// moves", and a nil issuer is an assignment that produces no link — all three are silent failures
+// of a rule this endpoint exists to enforce.
+func NewService(jobs Jobs, awards Awards, tokens *DriverTokenIssuer, c clock.Clock) *Service {
 	if jobs == nil {
 		panic("delivery: NewService needs the job lifecycle; an assignment that moves no job " +
 			"leaves a driver on a job nothing downstream believes has one (Docs/02 §2)")
@@ -68,19 +70,43 @@ func NewService(jobs Jobs, awards Awards, c clock.Clock) *Service {
 		panic("delivery: NewService needs the award lookup; without it any provider could put a " +
 			"driver on any job (Docs/02 §3)")
 	}
+	if tokens == nil {
+		// Refused rather than made optional, because SHIP-107's *Done when* is that the token
+		// is generated **on assignment**: a service that could assign a driver without minting
+		// one would leave a job at 'Driver assigned' whose driver has no way to reach it, and
+		// no later request would notice.
+		panic("delivery: NewService needs the driver token issuer; an assignment with no " +
+			"job-scoped link leaves the driver nothing to open (SHIP-107)")
+	}
 	if c == nil {
 		// Defaulting to clock.System{} would start the service, and the first milestone
 		// recorded without an actor-supplied time would be stamped from a clock nobody chose.
 		panic("delivery: NewService needs a clock (Docs/10 §6.3)")
 	}
-	return &Service{jobs: jobs, awards: awards, clock: c}
+	return &Service{jobs: jobs, awards: awards, tokens: tokens, clock: c}
 }
 
-// AssignDriver puts a driver on a job the caller was awarded, and moves the job to
-// 'Driver assigned' (SHIP-106).
+// AssignDriver puts a driver on a job the caller was awarded, moves the job to 'Driver assigned',
+// and mints the driver's job-scoped link (SHIP-106, SHIP-107).
 //
 // It reports whether the assignment was created. False means the job already had this exact driver
 // and nothing was written — see "a repeated nomination" below.
+//
+// # The token is generated here, and "on assignment" is SHIP-107's whole specification
+//
+// Every success returns a [DriverToken] for this assignment and this job, and there is no other
+// way to obtain one: minting is not an endpoint of its own, so a token cannot exist without a
+// driver_assignments row behind it. It is minted **inside the caller's transaction**, before the
+// commit, which costs nothing — signing is an HMAC over a few hundred bytes and touches no I/O —
+// and buys the property that a failure to sign takes the assignment with it rather than leaving a
+// committed driver with no way to reach the job.
+//
+// A repeated nomination gets a *fresh* token for the same assignment, and both remain valid until
+// they expire. That is deliberate rather than overlooked: the two tokens grant the same one job to
+// the same one driver, so nothing is widened, and refusing to reissue would mean a provider whose
+// phone lost the response could never obtain the link again. **Invalidating a previous link is
+// SHIP-109**, which is a different intent — reissue *and revoke* — and needs state this ticket
+// does not write.
 //
 // # The refusals, in this order, and the order is the point
 //
@@ -122,30 +148,30 @@ func (s *Service) AssignDriver(
 	r db.Runner,
 	providerID, jobID uuid.UUID,
 	n Nomination,
-) (Assignment, bool, error) {
+) (Assignment, DriverToken, bool, error) {
 	// pgx.Tx and *pgxpool.Pool both satisfy db.Runner and only one of them is a transaction.
 	// Asking the type is blunt, and it is the only way to tell: Runner exists precisely so that
 	// a query does not have to know which it is holding.
 	if _, inTx := r.(pgx.Tx); !inTx {
-		return Assignment{}, false, fmt.Errorf("delivery: assigning a driver to %s: %w", jobID, ErrNotInTransaction)
+		return s.refused(fmt.Errorf("delivery: assigning a driver to %s: %w", jobID, ErrNotInTransaction))
 	}
 
 	nomination := n.normalise()
 	problems := nomination.problems()
 	if err := problems.Err(); err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 
 	awarded, isAwarded, err := s.awards.AwardedProvider(ctx, r, jobID)
 	if err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 	if !isAwarded {
-		return Assignment{}, false, fmt.Errorf("delivery: %s has no accepted bid: %w", jobID, ErrJobNotFound)
+		return s.refused(fmt.Errorf("delivery: %s has no accepted bid: %w", jobID, ErrJobNotFound))
 	}
 	if awarded != providerID {
-		return Assignment{}, false, fmt.Errorf("delivery: %s was awarded to %s, not %s: %w",
-			jobID, awarded, providerID, ErrNotAwardedProvider)
+		return s.refused(fmt.Errorf("delivery: %s was awarded to %s, not %s: %w",
+			jobID, awarded, providerID, ErrNotAwardedProvider))
 	}
 
 	if nomination.Self {
@@ -154,26 +180,26 @@ func (s *Service) AssignDriver(
 		// only one of them is worth putting a job-scoped link on (SHIP-107).
 		phone, err := s.store.accountPhone(ctx, r, providerID)
 		if err != nil {
-			return Assignment{}, false, err
+			return s.refused(err)
 		}
 		nomination.DriverMobile = phone
 	}
 
 	live, hasDriver, err := s.store.liveAssignment(ctx, r, jobID)
 	if err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 	if hasDriver {
 		if live.DriverName == nomination.DriverName && live.DriverMobile == nomination.DriverMobile {
-			return live, false, nil
+			return s.granted(live, false)
 		}
-		return Assignment{}, false, fmt.Errorf("delivery: %s is already driven by %s: %w",
-			jobID, live.ID, ErrDriverAlreadyAssigned)
+		return s.refused(fmt.Errorf("delivery: %s is already driven by %s: %w",
+			jobID, live.ID, ErrDriverAlreadyAssigned))
 	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
-		return Assignment{}, false, fmt.Errorf("delivery: generating an assignment id: %w", err)
+		return s.refused(fmt.Errorf("delivery: generating an assignment id: %w", err))
 	}
 
 	assignment, err := s.store.insert(ctx, r, Assignment{
@@ -183,45 +209,101 @@ func (s *Service) AssignDriver(
 		DriverMobile: nomination.DriverMobile,
 	})
 	if err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 
 	move, err := s.jobs.MoveToDriverAssigned(ctx, r, jobID, providerID)
 	if err != nil {
-		return Assignment{}, false, err
+		return s.refused(err)
 	}
 
 	switch move {
 	case JobMoved:
-		return assignment, true, nil
+		return s.granted(assignment, true)
 
 	case JobAlreadyInStatus:
 		// The job says 'Driver assigned' and no assignment was live, which is the state a
 		// stood-down driver leaves behind. The new assignment stands and the job is already
 		// where it should be, so there is nothing to move and no history row to write —
 		// exactly the absorption Docs/02 §3.1 asks for rather than an error.
-		return assignment, true, nil
+		return s.granted(assignment, true)
 
 	case JobNotAssignable:
-		return Assignment{}, false, fmt.Errorf("delivery: %s cannot take a driver: %w", jobID, ErrJobNotAssignable)
+		return s.refused(fmt.Errorf("delivery: %s cannot take a driver: %w", jobID, ErrJobNotAssignable))
+
+	case JobAlreadyPast:
+		// The job has been at 'Driver assigned' and has set off since. **Refused, and not
+		// absorbed the way a late milestone is** — the two look alike and are not.
+		//
+		// A milestone is a claim about something that already happened, so keeping it costs
+		// nothing and discarding it loses a record (Docs/02 §3.1). An assignment is an
+		// instruction about who drives the job *now*: there is nothing historical to keep, and
+		// a driver_assignments row written for a job that has already gone would name a live
+		// driver on a delivery somebody else is carrying. Docs/02 §2 offers no way back to
+		// 'Driver assigned' from anywhere, so the honest answer is the one SHIP-106 gave.
+		//
+		// It is the same answer as JobNotAssignable and it is written out rather than folded
+		// in with it: an outcome no case names falls to the default below and becomes a 500,
+		// which is the right treatment for an outcome nobody has thought about and the wrong
+		// one for this.
+		//
+		// **Unreachable through any endpoint today**, for the same reason [ErrDriverLinkSuperseded]
+		// is: reaching it needs a job that has been at 'Driver assigned' and has no live
+		// assignment, and nothing writes `unassigned_at` until SHIP-109. A job that has set off
+		// without ever being 'Driver assigned' — the ordinary case, since Docs/02 §2 permits
+		// Awarded → En route to pickup directly — is [JobNotAssignable] above.
+		// TestAJobPastDriverAssignedIsRefused drives it through a stubbed port for that reason.
+		return s.refused(fmt.Errorf("delivery: %s has already moved past taking a driver: %w",
+			jobID, ErrJobNotAssignable))
 
 	case JobNotFound:
 		// Reachable only if the job was deleted between the award lookup and here, which
 		// nothing in this platform does — fk_driver_assignments_job would have refused the
 		// insert first. Reported rather than assumed away.
-		return Assignment{}, false, fmt.Errorf("delivery: %s vanished mid-assignment: %w", jobID, ErrJobNotFound)
+		return s.refused(fmt.Errorf("delivery: %s vanished mid-assignment: %w", jobID, ErrJobNotFound))
 
 	default:
-		return Assignment{}, false, fmt.Errorf("delivery: moving %s: %q: %w",
-			jobID, move, ErrJobMoveUnrecognised)
+		return s.refused(fmt.Errorf("delivery: moving %s: %q: %w",
+			jobID, move, ErrJobMoveUnrecognised))
 	}
 }
 
-// RecordMilestone records what the awarded provider says happened on a delivery, and moves the job
-// if Docs/02 §2 has a row for it (SHIP-111).
+// granted is every successful exit from [Service.AssignDriver]: the assignment stands, so the
+// driver gets their link.
 //
-// It reports whether the milestone was recorded. False means this idempotency key had already
-// recorded it and nothing was written — the retry path, which is what this endpoint exists for.
+// One function rather than a mint at each of the three success points, for the reason
+// cmd/api/routes_delivery.go gives about its own `move`: a fourth outcome that minted differently —
+// or not at all — would still compile, still pass its own test, and hand one path a link the other
+// two did not.
+//
+// The token names the assignment rather than the driver, because a driver has nothing else to be
+// named by (see [DriverClaims.AssignmentID]).
+func (s *Service) granted(a Assignment, created bool) (Assignment, DriverToken, bool, error) {
+	token, err := s.tokens.Issue(a.JobID, a.ID)
+	if err != nil {
+		// Inside the transaction, so this rolls the assignment back. An assignment that
+		// committed without a link would leave a driver on a job they cannot open, and nothing
+		// downstream would notice: the row is complete and the status is right.
+		return s.refused(fmt.Errorf("delivery: minting the link for %s on %s: %w", a.ID, a.JobID, err))
+	}
+	return a, token, created, nil
+}
+
+// refused is the empty answer, so that a refusal cannot accidentally carry a token.
+//
+// Four return values is three too many to retype at twelve exit points, and the one that matters is
+// the second: a `DriverToken{}` written by hand at each of them is a `DriverToken{Value: token}`
+// away from a refusal that hands out a link anyway.
+func (s *Service) refused(err error) (Assignment, DriverToken, bool, error) {
+	return Assignment{}, DriverToken{}, false, err
+}
+
+// RecordMilestone records what the awarded provider says happened on a delivery, and moves the job
+// if Docs/02 §2 has a row for it (SHIP-111, SHIP-112).
+//
+// It reports what it did, as an [Outcome]: the milestone was recorded, it was recorded and
+// deliberately moved nothing because the job is already past it, or this idempotency key had
+// already recorded it and nothing was written.
 //
 // # What guarantees "once per idempotency key", and it is not Redis
 //
@@ -252,27 +334,50 @@ func (s *Service) AssignDriver(
 //  2. a job nobody was awarded, or no job at all: [ErrJobNotFound];
 //  3. a job awarded to another provider: [ErrNotAwardedProvider];
 //  4. 'Delivered', until proof can be captured: [ErrProofRequired];
-//  5. a milestone Docs/02 §2 has no transition for from where the job now stands:
-//     [ErrMilestoneNotPermitted] — **and this one is SHIP-112's, not this ticket's.** See below.
+//  5. a milestone the job has not reached the point for: [ErrMilestoneNotPermitted].
 //
 // The customer of the job is refused by (2) and (3) like any other stranger, which is Docs/02 §3
 // read exactly: "delivery-status updates must be made only by the awarded provider, their assigned
 // driver, or an administrator acting with an audit reason". Confirming a delivery is not recording
 // one.
 //
-// # A milestone that moves nothing is still recorded, and that boundary is deliberate
+// # A milestone that moves nothing is still recorded, and there are now two ways to get there
 //
 // A repeat of the milestone the job is already at — a driver who reaches a pickup, finds nobody
 // there, and records 'En route to pickup' again on the way back (Docs/02 §5) — writes a row and
 // moves nothing. 000601 has no uniqueness on (job_id, milestone) precisely so that it can.
 //
-// What is *not* built here is the late arrival: a queued 'Picked up' that syncs after 'In transit'
-// is already recorded. Docs/02 §3.1 requires it to be "absorbed, not rejected as an error", and
-// that is **SHIP-112**, a ticket of its own. Until it lands the answer is [ErrMilestoneNotPermitted]
-// and the transaction rolls back, so nothing half-recorded is left behind. The seam is one case of
-// the switch at the bottom of this function: SHIP-112 changes what `JobNotAssignable` returns, and
-// nothing else, because the milestone row is already written by then and already independent of
-// whether the job moved.
+// A **late** milestone does the same and means something different. A queued 'Picked up' that syncs
+// after 'In transit' is already recorded is [OutcomeAbsorbed]: Docs/02 §3.1 requires it to be
+// "absorbed, not rejected as an error… the platform accepts the historical fact without moving the
+// job backwards", and that is SHIP-112. This is where the milestone row already being written pays
+// off — it is inserted before the move is attempted and is independent of whether the job moved, so
+// absorbing costs nothing but declining to return the error.
+//
+// # What an absorbed milestone writes, and what it deliberately does not
+//
+// One row, in `milestones`, carrying the actor's own clock. That is the whole of it.
+//
+// **No `job_status_history` row**, and that is what "without moving the job backwards" means here
+// rather than a softer reading. Every row in that table describes a status change (000402's trigger
+// will not let one exist otherwise), the job's status does not change, and a history row for a move
+// that did not happen would be read by SHIP-77's timeline and by support as though it had. No status
+// update, and no domain event: `jobs` emits `job.status_changed` from inside the transition, and
+// there was no transition.
+//
+// # Late and premature are different refusals, and only one of them is absorbed
+//
+// [JobAlreadyPast] is the job having been there already. [JobNotAssignable] is the job not having
+// arrived yet — an `in_transit` recorded while the delivery is still on its way to the pickup — and
+// stays [ErrMilestoneNotPermitted] with the transaction rolled back. Docs/02 §3.1 asks for the
+// first and says nothing about the second, and the asymmetry is not pedantry: a late milestone can
+// never succeed on a retry, because Docs/02 §2 has no way back, while a premature one succeeds
+// unchanged as soon as the delivery reaches that point. Absorbing a premature milestone would
+// answer a client "recorded" for a move that then silently never happened.
+//
+// A job cancelled or disputed before it reached the milestone falls in the second group today, and
+// **that is SHIP-113's** — "a queued update that contradicts an administrative action loses… the
+// attempt is retained in history". Retaining it is that ticket's change to this same switch.
 //
 // r must be a transaction. The milestone and the transition are one act recorded in two tables, and
 // a milestone that committed without its transition would leave a delivery whose timeline and whose
@@ -282,15 +387,15 @@ func (s *Service) RecordMilestone(
 	r db.Runner,
 	providerID, jobID uuid.UUID,
 	rec Recording,
-) (Record, bool, error) {
+) (Record, Outcome, error) {
 	if _, inTx := r.(pgx.Tx); !inTx {
-		return Record{}, false, fmt.Errorf("delivery: recording on %s: %w", jobID, ErrNotInTransaction)
+		return notRecorded(fmt.Errorf("delivery: recording on %s: %w", jobID, ErrNotInTransaction))
 	}
 
 	recording := rec.normalise()
 	problems := recording.problems()
 	if err := problems.Err(); err != nil {
-		return Record{}, false, err
+		return notRecorded(err)
 	}
 
 	// Checked in the domain and not left to the handler that read the header. A milestone
@@ -298,25 +403,36 @@ func (s *Service) RecordMilestone(
 	// this is the one input whose absence would silently remove the guarantee this function
 	// spends most of its length on, rather than failing loudly.
 	if recording.Key == "" {
-		return Record{}, false, fmt.Errorf("delivery: recording %s on %s: %w",
-			recording.Milestone, jobID, ErrNoIdempotencyKey)
+		return notRecorded(fmt.Errorf("delivery: recording %s on %s: %w",
+			recording.Milestone, jobID, ErrNoIdempotencyKey))
 	}
 
 	awarded, isAwarded, err := s.awards.AwardedProvider(ctx, r, jobID)
 	if err != nil {
-		return Record{}, false, err
+		return notRecorded(err)
 	}
 	if !isAwarded {
-		return Record{}, false, fmt.Errorf("delivery: %s has no accepted bid: %w", jobID, ErrJobNotFound)
+		return notRecorded(fmt.Errorf("delivery: %s has no accepted bid: %w", jobID, ErrJobNotFound))
 	}
 	if awarded != providerID {
-		return Record{}, false, fmt.Errorf("delivery: %s was awarded to %s, not %s: %w",
-			jobID, awarded, providerID, ErrNotAwardedProvider)
+		return notRecorded(fmt.Errorf("delivery: %s was awarded to %s, not %s: %w",
+			jobID, awarded, providerID, ErrNotAwardedProvider))
 	}
 
+	// Checked in front of the insert, so nothing is written for a 'Delivered' at all.
+	//
+	// **This is the first of three layers, and mutation testing was what established the order
+	// of them.** Moving this check to *after* the insert changes nothing today, because it still
+	// returns an error and the transaction still rolls the row back — and because [Service.moveFor]
+	// has no case for 'Delivered' either, so one reaching the switch below would fail there. What
+	// SHIP-112 changes is that a case in that switch now *commits* rather than rolling back, so the
+	// layer that has to hold is the one that keeps a delivered milestone from reaching it. Only
+	// removing this check **and** giving 'Delivered' a move that answers [JobAlreadyPast] produces
+	// a delivered milestone with neither photo proof nor an exception behind it — which is what
+	// SHIP-118 will be editing, and the shape TestAbsorptionCannotReachDelivered exists to catch.
 	if recording.Milestone == MilestoneDelivered {
-		return Record{}, false, fmt.Errorf("delivery: %s cannot be recorded delivered yet: %w",
-			jobID, ErrProofRequired)
+		return notRecorded(fmt.Errorf("delivery: %s cannot be recorded delivered yet: %w",
+			jobID, ErrProofRequired))
 	}
 
 	recordedAt := recording.RecordedAt
@@ -330,7 +446,7 @@ func (s *Service) RecordMilestone(
 
 	id, err := uuid.NewV7()
 	if err != nil {
-		return Record{}, false, fmt.Errorf("delivery: generating a milestone id: %w", err)
+		return notRecorded(fmt.Errorf("delivery: generating a milestone id: %w", err))
 	}
 
 	stored, recorded, err := s.store.insertMilestone(ctx, r, Record{
@@ -338,11 +454,12 @@ func (s *Service) RecordMilestone(
 		JobID:     jobID,
 		Milestone: recording.Milestone,
 
-		// The provider, always, in this ticket. The driver's job-scoped token is SHIP-107 and
-		// SHIP-108 and cannot be presented here yet, so ActorDriver is declared (000601, and
-		// milestone.go) and unreachable: a driver's milestone would name their
-		// driver_assignments row rather than an account, which is why Service.Driver exists
-		// and why this is the one field that changes when that token lands.
+		// The provider, always, in this ticket. SHIP-107 mints the driver's job-scoped
+		// token and **nothing verifies one** until SHIP-108, so no request can arrive here
+		// as a driver and ActorDriver stays declared (000601, and milestone.go) and
+		// unreachable. What that ticket needs for the attribution is already inside the
+		// token: DriverClaims.AssignmentID names the driver_assignments row, which is the
+		// only identity a driver has.
 		Actor:   ActorProvider,
 		ActorID: providerID,
 
@@ -351,7 +468,7 @@ func (s *Service) RecordMilestone(
 		ActorRecordedAt: recordedAt.UTC(),
 	})
 	if err != nil {
-		return Record{}, false, err
+		return notRecorded(err)
 	}
 
 	if !recorded {
@@ -360,36 +477,57 @@ func (s *Service) RecordMilestone(
 
 	move, err := s.moveFor(ctx, r, providerID, jobID, recording.Milestone, recordedAt)
 	if err != nil {
-		return Record{}, false, err
+		return notRecorded(err)
 	}
 
 	switch move {
 	case JobMoved:
-		return stored, true, nil
+		return stored, OutcomeRecorded, nil
 
 	case JobAlreadyInStatus:
 		// The job is already where this milestone would put it, which is a recording rather
 		// than a transition — the failed pickup attempt above. The row stands and no history
 		// row is written, because nothing moved.
-		return stored, true, nil
+		return stored, OutcomeRecorded, nil
+
+	case JobAlreadyPast:
+		// **SHIP-112.** The job has been past this point and Docs/02 §3.1 is explicit: "the
+		// platform accepts the historical fact without moving the job backwards". So this
+		// returns rather than erroring, the transaction commits, and the milestone inserted
+		// above is the whole of what it leaves behind — see this function's header for what
+		// is deliberately not written with it.
+		//
+		// Nothing is undone and nothing extra is done. The value of the seam SHIP-111 left is
+		// exactly that: the row was already independent of whether the job moved.
+		return stored, OutcomeAbsorbed, nil
 
 	case JobNotAssignable:
-		// **SHIP-112's seam.** Docs/02 §3.1 wants this absorbed: the row kept, the job left
-		// where it is, and the client told what happened. Doing that here would be building
-		// SHIP-112, so the transaction rolls back instead and the milestone goes with it.
-		// What SHIP-112 changes is this case and this case alone.
-		return Record{}, false, fmt.Errorf("delivery: %s cannot record %s from where it stands: %w",
-			jobID, recording.Milestone, ErrMilestoneNotPermitted)
+		// The delivery has not reached the point this milestone describes. Refused, and the
+		// transaction rolls the milestone back with it — see the header for why this one is
+		// not absorbed and the case above is.
+		return notRecorded(fmt.Errorf("delivery: %s cannot record %s from where it stands: %w",
+			jobID, recording.Milestone, ErrMilestoneNotPermitted))
 
 	case JobNotFound:
 		// Unreachable in practice — fk_milestones_job would have refused the insert above —
 		// and reported rather than assumed away.
-		return Record{}, false, fmt.Errorf("delivery: %s vanished mid-recording: %w", jobID, ErrJobNotFound)
+		return notRecorded(fmt.Errorf("delivery: %s vanished mid-recording: %w", jobID, ErrJobNotFound))
 
 	default:
-		return Record{}, false, fmt.Errorf("delivery: moving %s: %q: %w",
-			jobID, move, ErrJobMoveUnrecognised)
+		return notRecorded(fmt.Errorf("delivery: moving %s: %q: %w",
+			jobID, move, ErrJobMoveUnrecognised))
 	}
+}
+
+// notRecorded is every failing exit from [Service.RecordMilestone], so that a refusal cannot
+// accidentally carry an outcome that says something was written.
+//
+// The same call [Service.refused] makes one function up, and it earns its place for the same reason:
+// [OutcomeUnrecognised] typed out by hand at eleven exit points is one keystroke from
+// [OutcomeRecorded], and a caller reading that beside a non-nil error would take the branch that
+// writes a 201.
+func notRecorded(err error) (Record, Outcome, error) {
+	return Record{}, OutcomeUnrecognised, err
 }
 
 // alreadyRecorded answers a request whose idempotency key has already recorded something.
@@ -405,26 +543,31 @@ func (s *Service) alreadyRecorded(
 	r db.Runner,
 	jobID uuid.UUID,
 	recording Recording,
-) (Record, bool, error) {
+) (Record, Outcome, error) {
 	existing, found, err := s.store.milestoneRecordedBy(ctx, r, jobID, recording.Key)
 	if err != nil {
-		return Record{}, false, err
+		return notRecorded(err)
 	}
 	if !found {
 		// The index refused the insert and the row is not there to be read. Nothing in this
 		// platform deletes a milestone — the table is append-only and has no DELETE path — so
 		// this is a contradiction rather than a race, and it becomes an opaque 500 with its
 		// cause logged rather than a reply that invents an answer.
-		return Record{}, false, fmt.Errorf("delivery: %s refused a duplicate on %s and holds no row for it: %w",
-			recording.Key, jobID, ErrMilestoneVanished)
+		return notRecorded(fmt.Errorf("delivery: %s refused a duplicate on %s and holds no row for it: %w",
+			recording.Key, jobID, ErrMilestoneVanished))
 	}
 
 	if existing.Milestone != recording.Milestone {
-		return Record{}, false, fmt.Errorf("delivery: %s already recorded %s on %s, not %s: %w",
-			recording.Key, existing.Milestone, jobID, recording.Milestone, ErrIdempotencyKeyReused)
+		return notRecorded(fmt.Errorf("delivery: %s already recorded %s on %s, not %s: %w",
+			recording.Key, existing.Milestone, jobID, recording.Milestone, ErrIdempotencyKeyReused))
 	}
 
-	return existing, false, nil
+	// [OutcomeAlreadyRecorded] whether the first attempt moved the job or was absorbed, and the
+	// move is not re-evaluated to find out which. The question "is the job past this?" has a
+	// different answer at a different moment — a delivery only travels forwards — so asking it
+	// again would let one action's outcome change under a retry, which is precisely what an
+	// idempotency key exists to prevent. What the client is told is what the platform holds.
+	return existing, OutcomeAlreadyRecorded, nil
 }
 
 // moveFor runs the transition a milestone implies, through the port method that names it.
@@ -460,11 +603,57 @@ func (s *Service) moveFor(
 //
 // SHIP-106 wrote it for SHIP-111, expecting it to be how a driver's milestone is attributed.
 // **SHIP-111 does not use it, and that is the honest outcome rather than an oversight**: every
-// caller of [Service.RecordMilestone] is the awarded provider, because the job-scoped token a driver
-// would present is SHIP-107 and SHIP-108 and does not exist. The attribution it was written for is
-// one field — `Actor` in that function — and it needs this lookup on the day a driver token can name
-// the assignment it belongs to, not before. It stays because this domain's tests read it and because
-// deleting it would only mean writing it again at SHIP-108.
+// caller of [Service.RecordMilestone] is the awarded provider, because nothing verifies a driver
+// token until SHIP-108.
+//
+// **SHIP-107 narrows what it will eventually be for, and that is worth recording before somebody
+// reaches for it.** A verified token already names the assignment
+// ([DriverClaims.AssignmentID]), so SHIP-108 does not need this lookup to *identify* a driver —
+// what it needs it for is the question the claim cannot answer, which is whether that assignment
+// is still live. A token outlives a stand-down; the row is what says so.
+//
+// **SHIP-108 uses it for exactly that, through [Service.AssignmentFor] rather than directly**, and
+// the indirection is the point rather than ceremony: this method takes a bare job id, so anybody
+// holding one can ask it anything. The method a driver route calls takes a [DriverGrant], and a
+// grant is obtainable only from a verified token.
 func (s *Service) Driver(ctx context.Context, r db.Runner, jobID uuid.UUID) (Assignment, bool, error) {
 	return s.store.liveAssignment(ctx, r, jobID)
+}
+
+// AssignmentFor is the delivery a driver's own link opens (SHIP-108).
+//
+// # It takes a grant rather than a job id, and that is the whole signature
+//
+// There is no way to ask this question about an arbitrary job: a [DriverGrant] is produced by
+// [DriverTokenVerifier.Verify] and by nothing else, and the middleware that produces one has already
+// checked that the job in the request path is the job inside the token. A handler therefore cannot
+// widen the scope by passing the wrong identifier, because it has no identifier to pass.
+//
+// # What it checks that the token cannot say
+//
+// A token is stateless and cannot be recalled, so it keeps verifying after the assignment behind it
+// has ended. The row is what knows: if the job's live assignment is not the one the grant names, the
+// link has been superseded and opens nothing ([ErrDriverLinkSuperseded]). That is the lookup
+// [Service.Driver]'s comment reserved for this ticket, and it is the mechanism SHIP-109 will reissue
+// against — revocation as a read rather than a denylist.
+//
+// Nothing writes `unassigned_at` today, so a superseded link is unreachable through any endpoint;
+// the check is here because the alternative is a link that outlives its assignment in silence.
+//
+// One statement and no transaction: a single read is atomic on its own.
+func (s *Service) AssignmentFor(ctx context.Context, r db.Runner, grant DriverGrant) (Assignment, error) {
+	live, hasDriver, err := s.Driver(ctx, r, grant.JobID)
+	if err != nil {
+		return Assignment{}, err
+	}
+
+	// One answer for two states, deliberately: a job with no live driver and a job whose live
+	// driver is somebody else both mean this link no longer opens anything, and telling them apart
+	// would say something about the job to a holder who is no longer on it.
+	if !hasDriver || live.ID != grant.AssignmentID {
+		return Assignment{}, fmt.Errorf("delivery: %s is not the live assignment on %s: %w",
+			grant.AssignmentID, grant.JobID, ErrDriverLinkSuperseded)
+	}
+
+	return live, nil
 }

@@ -40,9 +40,36 @@ func testIdentityConfig() config.Identity {
 	}
 }
 
+// testDriverSigningKey is the driver token's throwaway, and it is deliberately **not**
+// testSigningKey (SHIP-107).
+//
+// Docs/10 §5 requires the two token systems to have separate signing key material, config.Load
+// refuses a configuration in which they share a secret, and a test fixture that shared one would be
+// the only place in the repository where they did.
+var testDriverSigningKey = []byte("cmd-api-test-driver-token-key-012")
+
+const testDriverKID = "test-driver"
+
+// testDeliveryConfig is the driver token keyset the delivery handler is built from.
+//
+// It has to be a real one for the reason [testIdentityConfig]'s argon2 profile does: the delivery
+// handler is built during attach, from every test in this package that constructs a router, and a
+// keyset that cannot sign stops the process at startup rather than producing a service that quietly
+// hands out no link.
+func testDeliveryConfig() config.Delivery {
+	return config.Delivery{
+		DriverTokenTTL:       7 * 24 * time.Hour,
+		DriverTokenKeys:      map[string][]byte{testDriverKID: testDriverSigningKey},
+		DriverTokenActiveKID: testDriverKID,
+	}
+}
+
 func testDeps() Deps {
 	return Deps{
-		Config:    &config.Config{Identity: testIdentityConfig()},
+		Config: &config.Config{
+			Identity: testIdentityConfig(),
+			Delivery: testDeliveryConfig(),
+		},
 		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		Clock:     clock.System{},
 		StartedAt: time.Now(),
@@ -61,6 +88,26 @@ func testAuthenticator() httpx.Authenticator {
 		panic("cmd/api test: building the authenticator: " + err.Error())
 	}
 	return authenticate
+}
+
+// testDriverGuard builds the real driver-token middleware, for the reason [testAuthenticator] gives
+// about the real authenticator (SHIP-108).
+//
+// **It is not optional any more, and that is the change SHIP-108 made to every caller of newRouter
+// in this package.** While nothing declared RequireDriverToken, passing nil was correct: the class
+// stayed out of the guard map and no route wanted it. `GET /v1/driver/jobs/{id}` declares it, so a
+// router built with nil now panics at startup, naming the class — which is the seam behaving exactly
+// as SHIP-15m designed it, met from the other side.
+//
+// A stub would satisfy the panic and prove nothing. The real guard is what puts internal/delivery's
+// verifier, the configured keyset and the manifest's auth class in one process, which is the only
+// place they meet.
+func testDriverGuard() Guard {
+	guard, err := newDriverTokenGuard(testDeps().Config, clock.System{})
+	if err != nil {
+		panic("cmd/api test: building the driver token guard: " + err.Error())
+	}
+	return guard
 }
 
 // testAccessToken mints a token the test router will accept.
@@ -85,7 +132,7 @@ func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sess
 }
 
 func testRouter() http.Handler {
-	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), nil)
+	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
 }
 
 // SHIP-6's acceptance criterion: GET /health returns 200 with version and commit.
