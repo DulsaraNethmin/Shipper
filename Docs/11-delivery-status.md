@@ -44,7 +44,7 @@ And once more before wave 4: **SHIP-15g** (M0, 5 points), which took 205 tickets
 
 **Its blocking item is `RequireAdmin`, which §8 has called the last live gate in that section since SHIP-108 cleared the driver's.** SHIP-147 has had every dependency met since wave 2 and has been struck in §6 for six consecutive waves, for two reasons that are both shared-surface work: the class is mapped in `guardsFor`, which a domain branch may not edit, and an administrator's password hashing lived inside `internal/identity`, which `internal/admin` may not import. Both are closed here. **The second one is the more interesting**, because the alternative was not "wait" but "duplicate" — a second argon2id implementation inside `admin`, agreeing with the first by comment about a security parameter, which is exactly the shape `Docs/10` §3.4 exists to refuse.
 
-**It asked, as SHIP-15p established, and the answer this time was nothing.** All four tracks were asked at dispatch what they expected to need from `internal/config`; none named a field. The one setting this ticket adds — `STORAGE_DOWNLOAD_TTL` — came from §9 rather than from a track, recorded by SHIP-115 and SHIP-118 a wave earlier. **A wave where the question returns nothing is the question working**, not evidence it can be dropped: it costs a sentence at dispatch, and the four preceding waves each absorbed a parked request that had cost a track a workaround.
+**It asked, as SHIP-15p established, and the answer this time was nothing.** All four tracks were asked at dispatch what they expected to need from `internal/config`; every one answered nothing, the last of them explicitly. The one setting this ticket adds — `STORAGE_DOWNLOAD_TTL` — came from §9 rather than from a track, recorded by SHIP-115 and SHIP-118 a wave earlier. **A wave where the question returns nothing is the question working**, not evidence it can be dropped: it costs a sentence at dispatch, and the four preceding waves each absorbed a parked request that had cost a track a workaround.
 
 **One of the 121 was closed by a ruling rather than by work.** SHIP-91 was declared delivered by the owner on 12 August 2026, met by SHIP-80's partial unique index rather than built separately — see §3 and §6. It is why `make status` reports it, along with SHIP-57a, as declared done with no commit subject naming it; both are correct and neither is wishful.
 
@@ -7870,13 +7870,19 @@ is the whole of why it is a second route rather than a relaxation of `POST /v1/j
 which is `RequireUser` and always will be; a row that omitted the class is a row the next lane reads
 as somebody else's.
 
-**SHIP-101a is `GET /v1/fleet/bids`, and the shape was chosen before the ticket.** §9's route-shape
-constraint is that no four-segment `GET /v1/jobs/{id}/<literal>` can ever be registered while
-`GET /v1/jobs/open/{id}` exists — `ServeMux` panics at registration and the process does not start. A
-provider's own bids are a fleet-side collection anyway, beside `/v1/fleet/vehicles`, so this one
-sidesteps the constraint rather than taking another shelf. **SHIP-115a takes the shelf**, because a
-job's delivery detail genuinely belongs under its job: `GET /v1/jobs/{id}/delivery/` is where
-SHIP-115's proof read already lives, and five segments are safe.
+**The route shapes were decided before the tickets, and both rows name their paths.** §9's
+constraint is that no four-segment `GET /v1/jobs/{id}/<literal>` can be registered while
+`GET /v1/jobs/open/{id}` exists — both match `/v1/jobs/open/<literal>`, neither is more specific, and
+`ServeMux` **panics at registration**. That is a `make run` that dies rather than a red test, which
+is why leaving the shape to whoever builds the ticket is not a neutral choice.
+
+SHIP-101a is `GET /v1/fleet/bids` — a provider's own bids are a fleet-side collection anyway, beside
+`/v1/fleet/vehicles`, so it sidesteps the constraint rather than taking another shelf. **SHIP-115a
+takes the shelf and its row names both paths**: `GET /v1/jobs/{id}/delivery/detail` and
+`GET /v1/jobs/{id}/delivery/milestones`, five segments each, beside SHIP-115's
+`GET /v1/jobs/{id}/delivery/proof`. `GET /v1/jobs/{id}/delivery` on its own is **four** and is the
+panic; the row and `Docs/09`'s M4 note both say so, because "a shelf under the job" read as a
+description would have been built as four by whoever read it that way.
 
 **SHIP-101a sorts after SHIP-101 and is its prerequisite**, which is the one place in M3 where the
 table's order is not the build order. `Docs/09`'s M3 note says so and says to build SHIP-101a first.
@@ -9283,8 +9289,9 @@ none of them built here.** The entry asked for "a lettered M3 ticket"; it turned
 across two milestones, because the three lanes had met three different halves of it. Each row names
 its auth class, which is the part that stops the convergence happening again: SHIP-120a is
 `RequireDriverToken` and is why it is a second route rather than a relaxation of the existing one's
-guard. SHIP-101a took `GET /v1/fleet/bids` on the next entry's advice, and SHIP-115a took the
-`/v1/jobs/{id}/delivery/` shelf beside SHIP-115's proof read. The original entry is kept because the
+guard. SHIP-101a took `GET /v1/fleet/bids` on the next entry's advice; SHIP-115a took
+`GET /v1/jobs/{id}/delivery/detail` and `GET /v1/jobs/{id}/delivery/milestones`, **named in the row
+rather than described**, because `GET /v1/jobs/{id}/delivery` is four segments and is the panic. The original entry is kept because the
 reasoning is what the three tickets are built from.
 
 **Nothing serves a job to the provider delivering it, and nothing lists a provider's own bids.**
