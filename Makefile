@@ -38,9 +38,28 @@ REDIS_PORT        ?= 6379
 KAFKA_PORT        ?= 29092
 HTTP_PORT         ?= 8080
 
+# The object store (SHIP-15p). Consumed by docker-compose; the service reads STORAGE_* below.
+MINIO_PORT          ?= 9000
+MINIO_CONSOLE_PORT  ?= 9001
+MINIO_ROOT_USER     ?= shipper
+MINIO_ROOT_PASSWORD ?= shipperminio
+
 DATABASE_URL  ?= postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
 REDIS_URL     ?= redis://localhost:$(REDIS_PORT)/0
 KAFKA_BROKERS ?= localhost:$(KAFKA_PORT)
+
+# Derived from MINIO_PORT for the same reason DATABASE_URL is derived from POSTGRES_PORT: a
+# tree that moves the published port would otherwise have the service still signing for 9000.
+#
+# **It is the host-published address, not `minio:9000`, and that is load-bearing rather than
+# cosmetic.** SigV4 signs the `host` header, so a pre-signed URL minted for one address and
+# fetched at another is refused with SignatureDoesNotMatch — an error that says nothing about
+# the address. The client fetching the URL is on the host, so the signer has to be too.
+STORAGE_ENDPOINT ?= http://localhost:$(MINIO_PORT)
+
+# One bucket per worktree, and unlike Kafka this one genuinely can be split — see CLAUDE.md's
+# worktree table. Overridden in deploy/.env, not here.
+STORAGE_BUCKET ?= shipper-dev
 
 # Homebrew keeps libpq unlinked because it collides with a full PostgreSQL install, so
 # psql is frequently present but not on PATH. Find it rather than asking every developer
@@ -68,8 +87,25 @@ help: ## Show this help
 # --- Local stack (SHIP-2, SHIP-3, SHIP-4) ---------------------------------------------
 
 .PHONY: up
-up: ## Start Postgres, Redis and Kafka, waiting until each is healthy
+up: ## Start Postgres, Redis, Kafka and the object store, waiting until each is healthy
 	$(COMPOSE) up -d --wait
+	@$(MAKE) --no-print-directory storage-bucket
+
+# The bucket is made here rather than by a one-shot container in compose, for two reasons the
+# compose file states at length: `up -d --wait` fails on a service that exits, and the bucket is
+# per-worktree while the stack is shared, so it has to be created on every `make up` in every
+# tree rather than once when a container is created.
+#
+# Idempotent, so `make up` on an already-running stack is free and a second worktree gets its
+# own bucket without disturbing the first.
+.PHONY: storage-bucket
+storage-bucket: ## Create this worktree's object-storage bucket, private (SHIP-15p)
+	@set -euo pipefail; \
+	$(COMPOSE) exec -T minio sh -c 'set -e; \
+		mc alias set local http://127.0.0.1:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null; \
+		mc mb --ignore-existing "local/$(STORAGE_BUCKET)" >/dev/null; \
+		mc anonymous set none "local/$(STORAGE_BUCKET)" >/dev/null'; \
+	echo "bucket $(STORAGE_BUCKET) exists and has no public read path"
 
 .PHONY: down
 down: ## Stop the stack, keeping data
