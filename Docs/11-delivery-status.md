@@ -219,7 +219,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **481 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **499 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -354,6 +354,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-87** | M3 | `POST /v1/jobs/{id}/bids/{bid_id}/counter` — **the first endpoint in this domain a customer may call**, and one route for both directions because Docs/02 §4's two sentences describe one act. Each counter is a new row and the offer it answers becomes `Superseded`; a counter inherits the terms it does not restate, which is the choice `000501` deferred to it — *see below* |
 | **SHIP-88** | M3 | The supersede chain — `superseded_by` on the **displaced** row, which is what turns "only the latest valid offer is acceptable" into a column `CHECK` SHIP-92 cannot violate rather than a rule it must remember. Plus `GET …/history`, because a chain nobody can read is not one that remains readable — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
+| **SHIP-92** | M3 | `POST /v1/jobs/{id}/award` — one offer accepted and the job moved, in one transaction, against the lock ordering SHIP-88 wrote down rather than one invented here. **A verb on the job, so the bid travels in the body**, and the one rule no constraint can express — that the offer was live when it was accepted — is the only thing application logic checks. Idempotent by **state**, so it needs no key column and no migration — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -3621,6 +3622,208 @@ ordering has to be designed against rather than around.
 warning is correct.** It is the same shape SHIP-57a has carried since wave 2: work that landed
 inside a commit naming a different ticket. The script warns rather than fails for exactly this
 case, and silencing it would mean writing a commit that claims work it does not contain.
+
+### SHIP-92 — the award, built against a written-down lock ordering rather than an invented one
+
+SHIP-92's *Done when* is "`POST /v1/jobs/{id}/award` accepts one bid and moves the job to `Awarded`
+in one transaction", and the three clauses are three separate proofs: the bid row reads `Accepted`,
+the job row reads `Awarded` beside a `job_status_history` row describing that exact move, and a
+transition made to fail leaves neither.
+
+**Nothing about the ordering was decided on this branch.** §3's SHIP-88 entry gave it —
+`jobs` `FOR UPDATE` → the bid by identifier → the accept → the rejection sweep → the transition — and
+the implementation follows it step for step, with the comments naming the entry rather than
+re-arguing it. That is the whole value of having written it down four waves before it was needed: two
+people produce two lock orderings, and the second one is a deadlock.
+
+#### The endpoint is a verb on the job, so the bid travels in the body
+
+`POST /v1/jobs/{id}/award` with `{"bid_id": "…"}`. That is `Docs/09`'s own path and it is the right
+one: **the job is what moves.** `withdraw` and `counter` are acts on an offer and leave the job where
+it is, so they are verbs under `/bids/{bid_id}`; this ends the bidding, moves the job exactly once,
+and the offer is what it selects. `POST …/bids/{bid_id}/award` would have made the two kinds of act
+look alike.
+
+It has one consequence worth naming, because it is the only endpoint in this domain with it: **the
+two identifiers arrive from two places**, the job from the URL and the bid from the body, so a client
+can pair them wrongly in a way no other endpoint here allows. `TestAwardingABidOnAnotherJobIsNotFound`
+and a `make verify` check both award a real offer under a real job it is not on, and both expect the
+404 a bid that does not exist gets. Without that comparison a customer could award, against their own
+job, an offer somebody made on a different one.
+
+#### The one rule no constraint can express, and the four that do
+
+§3's SHIP-88 entry is exact about the division and this ticket did not widen it. Four rules are
+schema and hold whatever the code remembers: `uq_bids_one_accepted_per_job` (one accepted bid per
+job), `ck_bids_superseded_is_not_live` (a displaced offer can never be accepted),
+`ck_bids_only_a_providers_offer_is_accepted` (only a provider's commitment is awardable) and
+`uq_bids_one_successor` (a chain is a list).
+
+**The fifth is application logic and it is the only check this service makes about the bid's state:
+that it is `Submitted`.** That is a statement about a transition rather than about a row, and 000500
+declined to give `bids` the trigger `jobs` has. It runs inside the transaction, under the bid's own
+`FOR UPDATE`, and `acceptBid`'s `WHERE status = 'Submitted' AND superseded_by IS NULL` checks it a
+second time — the same deliberate redundancy `supersedeHead` carries, and for the same reason: the
+lock makes the refusal legible, the compare-and-set makes it true.
+
+**No migration**, because there is nothing to store. An award is an `UPDATE` of a row that already
+exists.
+
+#### Idempotent by state, which is why there is no key column
+
+§8 said to read SHIP-86 for "the difference between idempotency by key and idempotency by state,
+which the award needs and which is stronger", and the reading held: awarding the offer you already
+awarded answers `200` with it and writes nothing further, exactly as a repeated withdrawal does.
+**A placement and a counter are inserts and need a stored key** — a retry outliving the middleware's
+cache would otherwise create a second row. An award is not, so the record itself answers the retry,
+and the guarantee survives a phone that reconnected, restarted and generated a *fresh* key.
+
+The proof that nothing further was recorded is `updated_at` and the history count together:
+`bids_set_updated_at` moves the column on any write to the row, so a second accept would show even
+though it would set the same status. `make verify` asserts all three mechanisms in sequence — the
+middleware's byte-identical replay, a fresh key answered from the row, and three awards leaving one
+transition.
+
+**The ordering that makes it work is the retry being answered before the job's status is judged.**
+A successful award leaves the job at `Awarded`, so a status check in front of the already-accepted
+branch would refuse the caller's own successful request with "that job cannot be awarded". Both
+[Service.PlaceBid] and [Service.CounterOffer] put their retries first and state the principle; this
+is the third instance of it and the one where getting it backwards would be hardest to notice, since
+the wrong answer is a plausible 409.
+
+Awarding a **different** offer on an awarded job is refused, and that is the same rule from the other
+side.
+
+#### The port carries an outcome rather than a bool, and it is the first one here that writes
+
+`ports.go` argues at length that a caller deciding whether to *permit* something wants a boolean, and
+`Eligibility` and `Negotiation` both take that shape. **`Awarding` does not, and the reason is that it
+is asking a different kind of question.** Those two ask "may this happen"; this one asks *and acts*,
+and its refusals lead to two different places — "not yours or no such job" is a 404 and "the job has
+moved on" is a 409 naming what became of it. A bool would have collapsed them and made `bidding`
+choose one answer for both, which is a disclosure decision this domain makes deliberately elsewhere
+and would here have been making by accident. So it is `delivery.Jobs`' shape, for `delivery.Jobs`'
+reason: `error` could not carry it either, because matching `errors.Is` against `jobs`' sentinels is
+an import by another name.
+
+**Two methods rather than one, and the lock ordering is why.** A single `AwardJob(…)` would have to
+take the lock and run the transition in one call, leaving nowhere for the two statements about `bids`
+that happen in between — and nowhere for SHIP-93's sweep, which the comment in `AwardBid` marks as
+step 4 rather than leaving to be found.
+
+#### `cmd/api` writes one statement against another domain's table, and that is the honest place for it
+
+`awardableJobs.LockForAward` runs `SELECT customer_id, status FROM jobs WHERE id = $1 FOR UPDATE`.
+`jobs.Service` has `lockJob` and it is unexported, reachable only from its own `Transition`;
+exporting it would mean editing another domain from this branch and widening that domain's surface
+for one caller.
+
+**This is `acceptedBids` in `routes_delivery.go` pointing the other way**, and that type's own comment
+makes the argument: the composition root is where a dependency between two domains is *visible to
+anybody reading how the service is wired*, rather than buried in a domain's `postgres.go` where it
+would read as a table that domain owns. The trade is real and is stated rather than hidden — two
+statements now know that a job has a `customer_id` and a `status`. What keeps them honest is that
+nothing in `cmd/api` *interprets* the status: `jobs.Permitted(status, jobs.StatusAwarded)` is asked,
+which is `Docs/02` §2's table in the one place that holds it, and the transition still goes through
+the guarded function. When `jobs` grows an exported lock for a caller in another domain, this method
+becomes a call to it and nothing else changes.
+
+The test package holds a second copy, `jobAwards`, as it already does for `negotiatedJobs`. **The copy
+matters more here than it did there**: this port *writes*, and a stub answering "awardable" and
+"awarded" would make every award test pass against a service that never locked anything and never
+moved a job.
+
+#### No new error code, and the protocol code was waiting for this endpoint
+
+Three refusals, and all three reuse. An offer that is not live is `bidding_bid_closed`, which is where
+a client already goes when an offer is over. The customer's own counter is `bidding_wrong_party` with
+a message of its own — the third instance of one rule, *you counter the other party's offer, you
+revise your own, and you award theirs*, and in all three the client's correct response is a different
+request, which is `Docs/10` §4.4's test for whether a code earns its place.
+
+**A job that can no longer be awarded is `conflict`, and that is not a fallback.** The protocol code's
+registered description has read "Valid, but it contradicts the current state — a bid on a job that has
+just been awarded, **a second award on one job**" since SHIP-12, before this endpoint existed. Using
+it honours a decision already recorded, and it keeps the two 409s apart in the way a client needs:
+`bidding_bid_closed` sends them back to the job's other offers, `conflict` sends them to the job.
+
+So `Docs/10-api-error-codes.md` is untouched, which is also what the ownership rules for a domain
+branch require.
+
+#### What is deliberately absent
+
+**The concurrency suite.** SHIP-95 owns "double award, withdraw-during-award, and
+expiry-during-award", and §8 asks for it to be written from `Docs/02` §3 and `Docs/08`'s named races
+by somebody who has *not* read this implementation. Writing the double-award race here would have
+taken a third of that ticket and anchored the agent who is meant to arrive at it independently. What
+stands in for it is `TestTheIndexRefusesASecondAcceptedBid`, which is honest about being a stand-in:
+two well-behaved awards are serialised by the `jobs` lock long before they reach the index, so the
+test puts the database in the state a race would have to produce — a job still `Open` carrying an
+accepted bid, which is what a writer that skipped the job lock would leave — and asserts that
+`uq_bids_one_accepted_per_job`'s violation comes back as a conflict rather than as a 500.
+
+**SHIP-93's rejection sweep.** Every competing offer is still `Submitted` after an award. It cannot be
+awarded, because the job has moved on, and `make verify` asserts that state explicitly rather than
+letting it be discovered. `Docs/02` §3's "awarding a job atomically marks one bid accepted and all
+others closed" is therefore half met, and the half that is missing is a ticket rather than a gap in
+this one. The transaction is shaped to grow it: step 4 is marked in `AwardBid` and the sweep goes
+after the accept and before the transition.
+
+#### Mutation testing
+
+Four mutations, run against the real database, each reverted immediately and confirmed with
+`git diff` before the next.
+
+| Mutation | Result |
+|---|---|
+| `acceptable`'s `!b.Status.live()` branch deleted — the one rule no constraint can express | **Caught.** `TestOnlyALiveProvidersOfferCanBeAwarded` (all four statuses), `TestOnlyTheHeadOfAChainCanBeAwarded`, `TestAwardingAClosedOfferAnswersItsOwnCode` |
+| `FOR UPDATE` removed from `LockForAward`, in both the `cmd/api` adapter and the test copy | **Survived** |
+| Steps 1 and 2 swapped — the bid locked before the job | **Caught**, and for the wrong reason. See below |
+| `acceptBid`'s `WHERE … AND status = 'Submitted' AND superseded_by IS NULL` reduced to `WHERE id = $1` | **Survived** |
+
+**Two survived and a third was caught by accident, and that is the finding worth reporting rather
+than tuning away.** The three have one thing in common: each removes a *serialisation* mechanism, and
+every test in this repository runs its award transactions one after another. A suite that never
+overlaps two awards cannot tell `FOR UPDATE` from a plain read, cannot tell `jobs`-then-`bids` from
+`bids`-then-`jobs`, and cannot tell a compare-and-set from an unconditional write, because with no
+concurrency all three pairs behave identically.
+
+**The swapped ordering is the instructive one.** It failed
+`TestAwardingRefusesAnIdentifierThatNamesNothing`, and the message says why: awarding a real bid
+against a job that does not exist answered `bidding: no such bid on that job` instead of
+`ErrNotJobCustomer`, because the bid lock now runs first and its `job_id` comparison gets there
+before the ownership check does. That is a **disclosure-ordering** assertion catching a **lock
+ordering** change — a real defect (the endpoint would start telling a caller which of the two
+identifiers was wrong) but not the defect the mutation introduces, which is a deadlock against any
+future writer that takes `jobs` first. A reader who saw only the red test would conclude the ordering
+is covered. It is not.
+
+**This is precisely the hole SHIP-95 exists to fill**, and it is a sharper argument for that ticket
+than the backlog's one-line justification. Recorded here so that whoever writes it knows which three
+mutations their suite has to kill, and so that nobody reads a green run as evidence that the ordering
+is load-bearing *in the tests*. It is load-bearing in the design; today it is held by review, by
+`acceptBid`'s redundancy, and by the constraints underneath — not by a test.
+
+One qualification on the fourth, because it is less exposed than the bare "survived" suggests. The
+compare-and-set is unreachable while `acceptable` refuses a closed offer two statements earlier, so
+under single-threaded conditions it can only ever match. It is there for the reason `supersedeHead`'s
+identical clause is there and says so: **a future writer that forgets the lock still cannot accept a
+displaced or closed offer.** Removing it is invisible today and is a live hazard the moment somebody
+adds a second path to this table.
+
+#### Shared surfaces
+
+One `$ref` line in `contracts/openapi.yaml`'s sorted `paths:` block, one line in
+`cmd/api/routes_golden.txt` (regenerated, and confirmed to be exactly one addition), and §3's check
+count, written by `make verify-update`. **No migration, no `internal/boundaries` edit, no `Deps`
+field, and no new error code** — so `Docs/10-api-error-codes.md` is untouched.
+
+`make verify` went from 481 checks across 13 sections to the figure at the top of this section, all
+eighteen in `scripts/verify/61-bidding.sh`. Its three new accounts are the first in that file to draw
+the **`0416x`** block, and the corrected allocation map now sits in that file's own header — §9
+recorded that the only copy lived in `90-admin.sh` and did not mention bidding at all, and that
+`61-bidding.sh`'s existing `04145`–`04147` sit inside fleet's block, free by coincidence. The existing
+three are left where they are; anything new takes `0416x`.
 
 ### What SHIP-105 built, and the two rules that follow from a driver having no account
 

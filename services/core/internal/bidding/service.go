@@ -61,14 +61,16 @@ const (
 
 // Service is this domain's rules.
 //
-// It holds both ports rather than reaching for one per call, so that a caller cannot supply a
-// different answer to "may this provider bid" or "is this the job's customer" on one request than on
-// another. The store is a value with no state for the reason jobs' and fleet's are: it is a namespace
-// for SQL, not a dependency to swap. Docs/06 §4.1 is explicit that the database is not abstracted,
-// and the partial unique indexes this file is built against are PostgreSQL's.
+// It holds all three ports rather than reaching for one per call, so that a caller cannot supply a
+// different answer to "may this provider bid", "is this the job's customer" or "can this job be
+// awarded" on one request than on another. The store is a value with no state for the reason jobs'
+// and fleet's are: it is a namespace for SQL, not a dependency to swap. Docs/06 §4.1 is explicit that
+// the database is not abstracted, and the partial unique indexes this file is built against are
+// PostgreSQL's.
 type Service struct {
 	eligibility Eligibility
 	negotiation Negotiation
+	awarding    Awarding
 	store       postgresStore
 	clock       clock.Clock
 }
@@ -76,12 +78,14 @@ type Service struct {
 // NewService wires the domain to what it cannot decide for itself.
 //
 // Two ports since SHIP-87, because a counter-offer is the first thing in this domain a *customer*
-// may do and "is this the customer who owns that job" is `jobs`' fact. See ports.go.
+// may do and "is this the customer who owns that job" is `jobs`' fact. Three since SHIP-92, because
+// the award *moves* the job and a status change passes one guarded function in `jobs` — which this
+// package may not import and does not. See ports.go.
 //
 // The clock is injected (Docs/10 §6.3) because two of the three timing rules compare against "now",
 // and a test that had to wait for wall-clock time to pass would either be slow or be flaky.
-func NewService(eligibility Eligibility, negotiation Negotiation, c clock.Clock) *Service {
-	return &Service{eligibility: eligibility, negotiation: negotiation, clock: c}
+func NewService(eligibility Eligibility, negotiation Negotiation, awarding Awarding, c clock.Clock) *Service {
+	return &Service{eligibility: eligibility, negotiation: negotiation, awarding: awarding, clock: c}
 }
 
 // PlaceBid records one provider's offer against one job (SHIP-84).
@@ -496,6 +500,178 @@ func (s *Service) CounterOffer(
 		return Bid{}, false, err
 	}
 	return counter, true, nil
+}
+
+// AwardBid accepts one offer and moves the job to 'Awarded', in one transaction (SHIP-92).
+//
+// Docs/02 §3's first control: "only the customer can award a job, and the selected bid must be
+// active". Docs/10 §3.2's rule about which domain owns the transaction: "the award is one
+// transaction and `bidding` owns it, even though it also moves the job."
+//
+// r must be a transaction, and this is the method with the most riding on that — see
+// [ErrNotInTransaction].
+//
+// # The lock ordering is Docs/11 §3's, written down before this endpoint existed
+//
+//  1. **`jobs` first**, `FOR UPDATE`, through [Awarding.LockForAward]. It is the outermost lock and
+//     the only one shared with the status guard and `job_status_history`. Everything else in this
+//     domain locks only its own `bids` rows and never a `jobs` row, which is what keeps the ordering
+//     acyclic: `jobs` → `bids` in one direction and nothing coming back.
+//  2. **Then the bid, by its identifier**, `FOR UPDATE`, with `status`, `superseded_by`, `offered_by`
+//     and `job_id` re-read under it.
+//  3. **Then the accept**, which takes the `uq_bids_one_accepted_per_job` btree entry and serialises
+//     two awards that somehow got past step 1.
+//  4. **Then the rejection sweep**, which is SHIP-93's and is not here yet. The order is what leaves
+//     room for it: every other bid is closed after this one is accepted and before the job moves.
+//  5. **Then the transition**, through `jobs`' one guarded function, in the same transaction.
+//
+// # What the database enforces whatever this function remembers, and the one thing it cannot
+//
+// Four of the five rules are schema (Docs/11 §3, SHIP-88): at most one accepted bid per job
+// (`uq_bids_one_accepted_per_job`), a displaced offer can never become 'Accepted'
+// (`ck_bids_superseded_is_not_live`), only a provider's offer can be accepted
+// (`ck_bids_only_a_providers_offer_is_accepted`), and a chain is a list (`uq_bids_one_successor`).
+//
+// **The fifth is this function's and no constraint can express it: that the bid being accepted is
+// 'Submitted'.** That is a statement about a transition rather than about a row, and 000500
+// deliberately declined to give `bids` the transition trigger `jobs` has. So it is checked here,
+// under the lock, and [postgresStore.acceptBid] checks it again in its `WHERE` clause.
+//
+// # The refusals, in the order they are made, and why the retry is not last
+//
+//  1. **A job that is not this customer's** is [ErrNotJobCustomer], before any bid is read. A
+//     provider probing this endpoint learns nothing about whether an identifier is a real bid.
+//  2. **A bid that is not on the job in the path** is [ErrBidNotFound], the 404 a bid that does not
+//     exist gets.
+//  3. **A bid that is already 'Accepted' is the caller's own award, answered rather than refused.**
+//     This has to come before the job's status is judged, and that ordering is the whole of the
+//     idempotency guarantee: an award that succeeded leaves the job at 'Awarded', so a status check
+//     in front of this would refuse the caller's own successful request with "that job cannot be
+//     awarded". [Service.PlaceBid] and [Service.CounterOffer] put their retries first for the same
+//     reason and state the principle — a retry asks what happened to a request, and that answer does
+//     not change when the world does.
+//  4. **An offer that is not live** is [ErrBidClosed]: withdrawn, rejected, expired or superseded.
+//  5. **The customer's own offer** is [ErrNotAProvidersOffer]. You award the provider's commitment.
+//  6. **A job that has moved on** is [ErrJobNotAwardable] — held from step 1 and answered here.
+//
+// # Idempotent by state rather than by key, which is stronger
+//
+// Awarding a bid that is already accepted answers with it and writes nothing further, exactly as
+// [Service.WithdrawBid] absorbs a repeated withdrawal. There is no key column and no migration: an
+// award is an `UPDATE` of a row that already exists, so applying it twice reaches the state applying
+// it once reaches, and there is no second row for a retry to create. That is what makes the
+// guarantee hold for a phone that reconnected, restarted and generated a **fresh** key — which a
+// stored key could not do (Docs/11 §8: SHIP-86's distinction, "which the award needs and which is
+// stronger"). SHIP-94 is the ticket that states this as its own *Done when*; the property is here
+// because the alternative was building the endpoint to be wrong about it first.
+//
+// Awarding a *different* bid on a job that is already awarded is refused at step 6, which is the
+// same rule seen from the other side.
+func (s *Service) AwardBid(
+	ctx context.Context,
+	r db.Runner,
+	customerID, jobID, bidID uuid.UUID,
+) (Bid, error) {
+	if _, inTx := r.(pgx.Tx); !inTx {
+		return Bid{}, fmt.Errorf("bidding: awarding %s: %w", bidID, ErrNotInTransaction)
+	}
+	if customerID == uuid.Nil || jobID == uuid.Nil || bidID == uuid.Nil {
+		return Bid{}, fmt.Errorf("bidding: %s on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	// 1. The job, held for the rest of the transaction.
+	standing, err := s.awarding.LockForAward(ctx, r, customerID, jobID)
+	if err != nil {
+		return Bid{}, fmt.Errorf("bidding: holding %s for %s to award: %w", jobID, customerID, err)
+	}
+	switch standing {
+	case JobAwardNoSuchJob:
+		return Bid{}, fmt.Errorf("bidding: %s is not %s's to award: %w", jobID, customerID, ErrNotJobCustomer)
+	case JobAwardable, JobAwardNotPermitted:
+		// Both carry on. A job that has moved on is refused below rather than here, so that an award
+		// this caller has already made is recognised as their own retry first.
+	default:
+		// JobAwardUnrecognised, or JobAwarded from a method that does not move anything. Reported
+		// rather than read as permission: the zero value is first in the enumeration precisely so
+		// that a half-written adapter cannot look like a job that may be awarded.
+		return Bid{}, fmt.Errorf("bidding: holding %s for award answered %q", jobID, standing)
+	}
+
+	// 2. The bid, by its identifier, under its own lock.
+	bid, err := s.store.lockBid(ctx, r, bidID)
+	if err != nil {
+		return Bid{}, err
+	}
+	if bid.JobID != jobID {
+		return Bid{}, fmt.Errorf("bidding: %s is not on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	// The retry, answered before the job's status is judged. See the note above: this ordering is
+	// the idempotency guarantee rather than an optimisation.
+	if bid.Status == StatusAccepted {
+		return bid, nil
+	}
+	if err := acceptable(bid); err != nil {
+		return Bid{}, err
+	}
+	if standing != JobAwardable {
+		return Bid{}, fmt.Errorf("bidding: %s is %s: %w", jobID, standing, ErrJobNotAwardable)
+	}
+
+	// 3. The accept, which takes the index entry.
+	accepted, moved, err := s.store.acceptBid(ctx, r, bid.ID)
+	if err != nil {
+		return Bid{}, err
+	}
+	if !moved {
+		// Unreachable: the row is held FOR UPDATE and was read as a live provider offer two
+		// statements ago. Reported rather than papered over, because continuing would move the job
+		// to 'Awarded' with nothing accepted — a job two parties believe is committed and no row
+		// says who to.
+		return Bid{}, fmt.Errorf("bidding: %s was live when it was locked and is not now", bid.ID)
+	}
+
+	// 4. SHIP-93's rejection sweep belongs here: every other bid on this job closes after this one is
+	//    accepted and before the job moves.
+
+	// 5. The transition, through jobs' one guarded function, in this transaction.
+	switch move, err := s.awarding.MoveToAwarded(ctx, r, jobID, customerID); {
+	case err != nil:
+		return Bid{}, fmt.Errorf("bidding: moving %s to Awarded: %w", jobID, err)
+	case move == JobAwarded:
+		return accepted, nil
+	default:
+		// Unreachable: the job has been held FOR UPDATE since before the bid was read, and it was
+		// awardable then. An error rather than a refusal, because the accept above has already been
+		// written — returning one would roll the whole act back, which is right, and reporting it as
+		// a client's mistake would not be.
+		return Bid{}, fmt.Errorf(
+			"bidding: %s was awardable when it was locked and its transition answered %q", jobID, move)
+	}
+}
+
+// acceptable refuses an offer the customer cannot award (SHIP-92).
+//
+// The status half is [changeable]'s and [counterable]'s: Docs/02 §4 lets only the latest valid offer
+// be acted on, and `ck_bids_superseded_is_not_live` makes "live" and "head of the chain" the same
+// row, so [Status.live] is the whole test.
+//
+// **'Accepted' is deliberately absent from this switch**, unlike the other two. There it is a refusal
+// with its own code, because an accepted offer is one the provider may no longer revise or answer.
+// Here it is the caller's own completed award, and [Service.AwardBid] returns it as a success before
+// reaching this function.
+//
+// The party half is this function's own. Docs/02 §1 defines Awarded as "Customer has accepted one
+// **provider** bid; provider commitment exists", and `ck_bids_only_a_providers_offer_is_accepted`
+// stands behind it — this is what makes the refusal legible rather than a constraint name.
+func acceptable(b Bid) error {
+	switch {
+	case !b.Status.live():
+		return fmt.Errorf("bidding: %s is %s: %w", b.ID, b.Status, ErrBidClosed)
+	case b.OfferedBy != PartyProvider:
+		return fmt.Errorf("bidding: %s was offered by %s: %w", b.ID, b.OfferedBy, ErrNotAProvidersOffer)
+	}
+	return nil
 }
 
 // Chain is every offer in one negotiation, oldest first (SHIP-88).

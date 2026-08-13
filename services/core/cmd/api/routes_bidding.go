@@ -89,8 +89,28 @@ import (
 // this file reserved for SHIP-102's customer comparison at SHIP-84 and which is a different resource
 // with a different privacy rule — every provider's offer side by side, where this is one negotiation's.
 // Read-only, so the idempotency middleware lets it through untouched and it carries no key.
+//
+// # The award is a verb on the **job**, and the bid it accepts travels in the body
+//
+// SHIP-92, and it is the one route here that does not sit under an offer. Docs/09's *Done when* names
+// `POST /v1/jobs/{id}/award`, and the shape follows what the act is: the job moves — exactly once,
+// through the guarded transition — and the bid is what the customer selected. `withdraw` and
+// `counter` are acts on an offer and leave the job where it is; this is the other kind, and putting
+// it under `/bids/{bid_id}` would have made the two look alike.
+//
+// **`RequireUser` and not a role, for the fourth time and with the most riding on it.** Docs/02 §3
+// gives the award to the customer alone, and which account that is is a column — `jobs.customer_id` —
+// rather than a claim in a token. A provider presenting a token that says `customer` is refused by
+// the database with the 404 a job that does not exist gets.
 func init() {
 	register(
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/award",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).Award() },
+		},
 		Route{
 			Method:  http.MethodPost,
 			Pattern: "/jobs/{id}/bids",
@@ -150,11 +170,14 @@ func init() {
 // ports.go and imports no domain; `fleet` knows nothing about `bidding`; the two are joined here,
 // which is the only place they may be (Docs/06 §4.1, CLAUDE.md).
 //
-// **No adapter type was needed, and that is worth noticing rather than assuming.** routes_delivery.go
-// has two — `jobLifecycle` and `acceptedBids` — because a transition has four outcomes that cannot
-// be carried across without naming a `jobs` sentinel. This port answers a bool, which has no
-// vocabulary to translate, so `*fleet.Service` satisfies it structurally and the wiring is one
-// argument and the assertion below.
+// **The eligibility port needed no adapter type, and that is worth noticing rather than assuming.**
+// routes_delivery.go has two — `jobLifecycle` and `acceptedBids` — because a transition has four
+// outcomes that cannot be carried across without naming a `jobs` sentinel. That port answers a bool,
+// which has no vocabulary to translate, so `*fleet.Service` satisfies it structurally and the wiring
+// is one argument and the assertion below.
+//
+// The other two do need types, and for two different reasons: `negotiatedJobs` translates `jobs`'
+// sentinels into bools (SHIP-87), and `awardableJobs` carries an outcome and takes a lock (SHIP-92).
 //
 // A second `fleet.Service` rather than the one `fleetHandler` builds, for the reason
 // `newJobService` builds a second `jobs.Service`: both are pure functions of the clock, neither
@@ -164,6 +187,7 @@ func biddingHandler(d Deps) *bidding.Handler {
 	svc := bidding.NewService(
 		fleet.NewService(d.Clock),
 		negotiatedJobs{jobs: newJobService(d)},
+		awardableJobs{jobs: newJobService(d)},
 		d.Clock,
 	)
 
@@ -246,7 +270,122 @@ func (negotiatedJobs) answer(err error) (bool, error) {
 	}
 }
 
-// Compile-time proof that the two adapters satisfy the ports bidding declared.
+// awardableJobs implements bidding.Awarding, which is the port the award writes through (SHIP-92).
+//
+// # Why the lock is a statement here rather than a method on jobs.Service
+//
+// `jobs` has `lockJob` and it is unexported, reachable only from its own `Transition`. Exporting it
+// would mean editing another domain from a branch that owns `bidding`, and it would widen that
+// domain's surface for one caller. So the statement is written here, in the composition root — the
+// same call `acceptedBids` in routes_delivery.go makes in the opposite direction, with the same
+// reasoning recorded there: this is where a dependency between two domains is *visible to anybody
+// reading how the service is wired*, rather than buried in a domain's postgres.go where it would read
+// as a table that domain owns.
+//
+// **The trade is deliberate and it is not free.** Two statements now know that a job has a
+// `customer_id` and a `status`: this one, and `jobs`' own store. What keeps them honest is that
+// nothing here interprets the status — `jobs.Permitted` is asked, which is Docs/02 §2's table in the
+// one place that holds it — and that the transition itself still goes through the guarded function
+// below. When `jobs` grows an exported lock for a caller in another domain, this method becomes a
+// call to it and nothing else changes.
+//
+// # It takes the lock even to refuse
+//
+// A read that answered "awardable" and let go would be answering about a job that can be cancelled,
+// disputed or awarded to somebody else before `bidding` writes anything. Docs/11 §3's SHIP-88 entry
+// puts this first in the ordering for that reason: it is the outermost lock, and the only one shared
+// with the status guard and `job_status_history`.
+type awardableJobs struct {
+	jobs *jobs.Service
+}
+
+// LockForAward holds the job row and reports whether this customer may still award it.
+//
+// The two refusals are deliberately different values rather than one. "Not yours or no such job"
+// leads a client to a 404 and "the job has moved on" to a 409 naming what became of it, and a bool
+// would have made `bidding` choose one answer for both — see bidding.JobAward.
+//
+// `customer_id` is compared here rather than folded into the `WHERE` clause, which is the same choice
+// `jobs.Service.Job` makes and for the same reason: a query scoped to the caller that returns nothing
+// cannot say whether the job was somebody else's or nobody's, and only one of those is a caller
+// probing for identifiers. Both are one answer on the wire; keeping them apart costs a comparison and
+// buys a fact a test can assert.
+func (a awardableJobs) LockForAward(
+	ctx context.Context,
+	r db.Runner,
+	customerID, jobID uuid.UUID,
+) (bidding.JobAward, error) {
+	const q = `SELECT customer_id, status FROM jobs WHERE id = $1 FOR UPDATE`
+
+	var (
+		owner  uuid.UUID
+		status jobs.Status
+	)
+	switch err := r.QueryRow(ctx, q, jobID).Scan(&owner, &status); {
+	case errors.Is(err, db.ErrNoRows):
+		return bidding.JobAwardNoSuchJob, nil
+	case err != nil:
+		return bidding.JobAwardUnrecognised, fmt.Errorf("cmd/api: holding %s for award: %w", jobID, err)
+	}
+
+	if owner != customerID {
+		return bidding.JobAwardNoSuchJob, nil
+	}
+
+	// jobs.Permitted rather than a list of statuses written here. Docs/02 §2's table is authoritative
+	// and `jobs` holds it in exactly one place; the two statuses that can reach 'Awarded' today are
+	// Open and Negotiating, and writing them out would be a copy that stops agreeing with the
+	// document the first time somebody corrects one of them. negotiatedJobs.AwardableBy makes the
+	// same call for the counter's version of this question.
+	if !jobs.Permitted(status, jobs.StatusAwarded) {
+		return bidding.JobAwardNotPermitted, nil
+	}
+	return bidding.JobAwardable, nil
+}
+
+// MoveToAwarded runs Docs/02 §2's `Open / Negotiating → Awarded` through the one guarded function,
+// inside the caller's transaction.
+//
+// The actor is the **customer**, which is Docs/02 §3's first transition control — "only the customer
+// can award a job" — and what `job_status_history` records. No reason: Docs/01 §3 requires one only
+// of an administrator.
+//
+// RecordedAt is left zero, so jobs.Transition uses the platform's clock for both. An award is made
+// online, by a customer looking at the screen, so there is only one clock — unlike a milestone, where
+// routes_delivery.go carries the actor's separately.
+//
+// The translation is of errors into outcomes, exactly as `jobLifecycle.move` does it: everything
+// `jobs` treats as a refusal becomes an outcome with a nil error, and everything else stays an error
+// because a failing database is not an answer.
+func (a awardableJobs) MoveToAwarded(
+	ctx context.Context,
+	r db.Runner,
+	jobID, customerID uuid.UUID,
+) (bidding.JobAward, error) {
+	_, err := a.jobs.Transition(ctx, r, jobs.Move{
+		JobID: jobID,
+		To:    jobs.StatusAwarded,
+		Actor: jobs.User(jobs.ActorCustomer, customerID),
+	})
+
+	switch {
+	case err == nil:
+		return bidding.JobAwarded, nil
+	case errors.Is(err, jobs.ErrJobNotFound):
+		return bidding.JobAwardNoSuchJob, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus), errors.Is(err, jobs.ErrTransitionNotPermitted):
+		// One outcome for both, unlike delivery's port, and the difference is what the caller does
+		// with it. A milestone arriving late is a record worth keeping (SHIP-112), so `delivery` has
+		// to tell "already been there" from "not there yet". An award has no such case: a job already
+		// at 'Awarded' and a job that can never reach it are both "this award did not happen", and
+		// the accepted bid the customer is holding is what tells them which.
+		return bidding.JobAwardNotPermitted, nil
+	default:
+		return bidding.JobAwardUnrecognised, err
+	}
+}
+
+// Compile-time proof that the three adapters satisfy the ports bidding declared.
 //
 // This is the only place in the build where that can be established — `bidding` names neither `fleet`
 // nor `jobs`, and neither names `bidding`, so nothing else links them. If any of them ever part
@@ -255,4 +394,5 @@ func (negotiatedJobs) answer(err error) (bool, error) {
 var (
 	_ bidding.Eligibility = (*fleet.Service)(nil)
 	_ bidding.Negotiation = negotiatedJobs{}
+	_ bidding.Awarding    = awardableJobs{}
 )

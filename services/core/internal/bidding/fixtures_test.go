@@ -65,14 +65,16 @@ var (
 
 // newTestService is the domain wired to the real eligibility filter and the real job service.
 //
-// Both ports are satisfied by the packages cmd/api passes, for the reason this file's header gives:
-// a stub agrees with itself. SHIP-87's customer side is the sharper case — [jobParties] answers "is
-// this the job's customer" and "can this job still be awarded" out of the real `jobs` package, so
-// TestOnlyAPartyToTheNegotiationCanCounter is refused by the same comparison the served endpoint
-// makes.
+// All three ports are satisfied by the packages cmd/api passes, for the reason this file's header
+// gives: a stub agrees with itself. SHIP-87's customer side is the sharper case — [jobParties]
+// answers "is this the job's customer" and "can this job still be awarded" out of the real `jobs`
+// package, so TestOnlyAPartyToTheNegotiationCanCounter is refused by the same comparison the served
+// endpoint makes. SHIP-92's is sharper again: [jobAwards] takes the real `FOR UPDATE` and runs the
+// real guarded transition, so an award test that passed against a stub would prove nothing about
+// whether the job actually moved.
 func newTestService() *Service {
 	c := clock.NewFixed(testInstant)
-	return NewService(fleet.NewService(c), newTestNegotiation(c), c)
+	return NewService(fleet.NewService(c), newTestNegotiation(c), newTestAwarding(c), c)
 }
 
 // newTestNegotiation is [Negotiation] over the real `jobs` service, as cmd/api wires it.
@@ -119,6 +121,76 @@ func (jobParties) answer(err error) (bool, error) {
 
 var _ Negotiation = jobParties{}
 
+// newTestAwarding is [Awarding] over the real `jobs` service, as cmd/api wires it (SHIP-92).
+//
+// A second copy of `awardableJobs` from cmd/api/routes_bidding.go, for the reason [newTestNegotiation]
+// is a second copy of `negotiatedJobs`: the composition root is not importable from here, and the
+// whole point of the port is that this package names neither type.
+//
+// **The copy matters more here than it did for the counter's port**, and it is worth saying why
+// rather than leaving it to be assumed. This one *writes*: it takes the `FOR UPDATE` that starts the
+// lock ordering and it runs the guarded transition that ends it. A stub answering `JobAwardable` and
+// `JobAwarded` would make every award test below pass against a service that never locked anything
+// and never moved a job — which is precisely the failure `make verify` could not catch either, since
+// it drives the same binary from outside.
+func newTestAwarding(c clock.Clock) jobAwards {
+	return jobAwards{jobs: jobs.NewService(events.NewOutbox(), c, nil)}
+}
+
+type jobAwards struct{ jobs *jobs.Service }
+
+func (a jobAwards) LockForAward(
+	ctx context.Context,
+	r db.Runner,
+	customerID, jobID uuid.UUID,
+) (JobAward, error) {
+	const q = `SELECT customer_id, status FROM jobs WHERE id = $1 FOR UPDATE`
+
+	var (
+		owner  uuid.UUID
+		status jobs.Status
+	)
+	switch err := r.QueryRow(ctx, q, jobID).Scan(&owner, &status); {
+	case errors.Is(err, db.ErrNoRows):
+		return JobAwardNoSuchJob, nil
+	case err != nil:
+		return JobAwardUnrecognised, err
+	}
+
+	if owner != customerID {
+		return JobAwardNoSuchJob, nil
+	}
+	if !jobs.Permitted(status, jobs.StatusAwarded) {
+		return JobAwardNotPermitted, nil
+	}
+	return JobAwardable, nil
+}
+
+func (a jobAwards) MoveToAwarded(
+	ctx context.Context,
+	r db.Runner,
+	jobID, customerID uuid.UUID,
+) (JobAward, error) {
+	_, err := a.jobs.Transition(ctx, r, jobs.Move{
+		JobID: jobID,
+		To:    jobs.StatusAwarded,
+		Actor: jobs.User(jobs.ActorCustomer, customerID),
+	})
+
+	switch {
+	case err == nil:
+		return JobAwarded, nil
+	case errors.Is(err, jobs.ErrJobNotFound):
+		return JobAwardNoSuchJob, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus), errors.Is(err, jobs.ErrTransitionNotPermitted):
+		return JobAwardNotPermitted, nil
+	default:
+		return JobAwardUnrecognised, err
+	}
+}
+
+var _ Awarding = jobAwards{}
+
 // refusing is [Eligibility] answering "no" to everything.
 //
 // The one test double here, and it earns its place: [TestAnEligibilityFailureIsNotARefusal] needs
@@ -144,6 +216,32 @@ func (b brokenNegotiation) CustomerOf(context.Context, db.Runner, uuid.UUID, uui
 
 func (b brokenNegotiation) AwardableBy(context.Context, db.Runner, uuid.UUID, uuid.UUID) (bool, error) {
 	return false, b.err
+}
+
+// brokenAwarding is [Awarding] failing rather than answering, which is [brokenNegotiation]'s twin
+// and earns its place for a reason of its own (SHIP-92).
+//
+// The other two stubs exist because a port that *fails* is a condition no arrangement of rows
+// produces. This one has a second job: [JobAwardUnrecognised] is what an adapter with a missing case
+// returns, and [Service.AwardBid] has to refuse it rather than read it as permission to award. That
+// value cannot be produced by the real adapter at all — every branch of it returns something else —
+// so a stub is the only way to demonstrate that the refusal exists.
+// The two halves are separate fields because the interesting cases are asymmetric: a lock that
+// answers and a transition that then does not is the shape [Service.AwardBid]'s last branch exists
+// for, and one field could not express it.
+type brokenAwarding struct {
+	lock     JobAward
+	lockErr  error
+	move     JobAward
+	moveErr  error
+}
+
+func (b brokenAwarding) LockForAward(context.Context, db.Runner, uuid.UUID, uuid.UUID) (JobAward, error) {
+	return b.lock, b.lockErr
+}
+
+func (b brokenAwarding) MoveToAwarded(context.Context, db.Runner, uuid.UUID, uuid.UUID) (JobAward, error) {
+	return b.move, b.moveErr
 }
 
 // market is a verified provider who can bid, a customer, and one published job they can bid on.
@@ -273,6 +371,43 @@ func (m market) counter(t *testing.T, caller, job, bid uuid.UUID, c Counter) (Bi
 		return err
 	})
 	return made, created, err
+}
+
+// award runs one award in a transaction, which is what [Service.AwardBid] requires (SHIP-92).
+//
+// The customer is a parameter rather than the fixture's, because "only the customer may award" is
+// itself a rule under test — a helper that always supplied the right one could not exercise it.
+func (m market) award(t *testing.T, customer, job, bid uuid.UUID) (Bid, error) {
+	t.Helper()
+
+	var accepted Bid
+	err := db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		accepted, err = m.svc.AwardBid(ctx, r, customer, job, bid)
+		return err
+	})
+	return accepted, err
+}
+
+// jobStatus is the job's status and how many transitions have been recorded against it.
+//
+// Read together, and out of the tables rather than off anything the service said about itself: an
+// award that moved the status without leaving a history row would be a transition that bypassed the
+// guard, and 000402's trigger makes that impossible — so a test that checked only the status could
+// not tell a real transition from one that never happened.
+func (m market) jobStatus(t *testing.T, job uuid.UUID) (string, int) {
+	t.Helper()
+
+	var (
+		status  string
+		changes int
+	)
+	if err := m.pool.QueryRow(t.Context(), `
+		SELECT j.status, (SELECT count(*) FROM job_status_history WHERE job_id = j.id)
+		FROM jobs j WHERE j.id = $1`, job).Scan(&status, &changes); err != nil {
+		t.Fatalf("reading job %s: %v", job, err)
+	}
+	return status, changes
 }
 
 // chain reads one negotiation's history, on the pool rather than in a transaction — which is what

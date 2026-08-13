@@ -382,6 +382,56 @@ func (postgresStore) supersedeHead(ctx context.Context, r db.Runner, id uuid.UUI
 	return tag.RowsAffected() == 1, nil
 }
 
+// acceptBid moves the offer the customer chose to Accepted (SHIP-92).
+//
+// # It is a compare-and-set, exactly as [postgresStore.supersedeHead] is, and for a sharper reason
+//
+// `status = 'Submitted' AND superseded_by IS NULL` is the check rather than a filter over a row
+// already chosen. Under READ COMMITTED an `UPDATE` re-evaluates its `WHERE` after taking the row
+// lock, so a transaction that waited on somebody else sees the committed result and matches nothing.
+// The caller has already taken this row `FOR UPDATE` and read its status, so a false here is
+// unreachable through [Service.AwardBid] — and the redundancy is the point, because what this
+// statement writes is the one thing in the platform that two parties are then committed to.
+//
+// The second condition is redundant against `ck_bids_superseded_is_not_live`, which already refuses
+// 'Accepted' on a displaced row. It is written anyway so that a displaced offer *matches nothing*
+// rather than raising a constraint violation that would abort the transaction: the caller can then
+// report which offer it was and why, instead of handing a client a constraint name.
+//
+// # This is the statement that takes the uq_bids_one_accepted_per_job entry, and that is the lock
+//
+// 000500 records it: two transactions writing one key into a btree do not race — the second blocks
+// on the first's uncommitted entry and is then told the answer. **That serialisation is a backstop
+// here rather than the mechanism**, because the award takes the `jobs` row `FOR UPDATE` first and a
+// second award waits there. The index is what holds if some future writer forgets to.
+//
+// A violation of it is [ErrJobNotAwardable] and not an internal failure: it means this job already
+// has an accepted bid, which is a state the customer can act on. Named rather than matched on
+// SQLSTATE alone, so a unique violation from some future index is not reported as an award that
+// already happened.
+//
+// `updated_at` is left to `bids_set_updated_at` (000500), which is what makes "the retry wrote
+// nothing" observable — a repeated award returns before reaching this statement, and the column is
+// what says so.
+func (postgresStore) acceptBid(ctx context.Context, r db.Runner, id uuid.UUID) (Bid, bool, error) {
+	const q = `
+		UPDATE bids
+		SET status = $2
+		WHERE id = $1 AND status = $3 AND superseded_by IS NULL
+		RETURNING ` + bidColumns
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id, string(StatusAccepted), string(StatusSubmitted)))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Bid{}, false, nil
+	case db.IsUniqueViolation(err, "uq_bids_one_accepted_per_job"):
+		return Bid{}, false, fmt.Errorf("bidding: awarding %s: %w", id, ErrJobNotAwardable)
+	case err != nil:
+		return Bid{}, false, fmt.Errorf("bidding: accepting bid %s: %w", id, err)
+	}
+	return bid, true, nil
+}
+
 // linkSuccessor records which offer displaced this one, completing the chain (SHIP-88).
 //
 // The third statement of a counter and the one that makes the history readable. `superseded_by IS

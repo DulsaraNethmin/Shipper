@@ -67,6 +67,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("POST /v1/jobs/{id}/bids/{bid_id}/withdraw", handler.Withdraw())
 	mux.Handle("POST /v1/jobs/{id}/bids/{bid_id}/counter", handler.Counter())
 	mux.Handle("GET /v1/jobs/{id}/bids/{bid_id}/history", handler.History())
+	mux.Handle("POST /v1/jobs/{id}/award", handler.Award())
 	return mux
 }
 
@@ -172,6 +173,19 @@ func (w wire) history(t *testing.T, caller uuid.UUID, job, bid uuid.UUID) *httpt
 	return send(t, w.router, http.MethodGet, caller, "",
 		"/v1/jobs/"+job.String()+"/bids/"+bid.String()+"/history", "")
 }
+
+// award sends one POST against a job's award verb (SHIP-92).
+//
+// **The bid travels in the body**, which is the one request in this file where the subject of the act
+// is not in the URL — see [awardRequest] for why. The body is a parameter rather than built from the
+// bid, because what a client may send in it is itself under test.
+func (w wire) award(t *testing.T, caller uuid.UUID, job uuid.UUID, key, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	return as(t, w.router, caller, key, "/v1/jobs/"+job.String()+"/award", body)
+}
+
+// awarding is the ordinary award body: the offer, named.
+func awarding(bid uuid.UUID) string { return fmt.Sprintf(`{"bid_id": %q}`, bid) }
 
 // placed is one offer on the fixture job, over the wire, with its identifier read back out.
 //
@@ -450,6 +464,29 @@ func TestTheBidResponseCarriesNothingOfTheCustomers(t *testing.T) {
 		t.Fatalf("the history = %d (%s)", chain.Code, chain.Body)
 	}
 	responses["the negotiation's history, 200"] = chain.Body.Bytes()
+
+	// **SHIP-92's award is the seventh and last, and it is the response most likely to grow a
+	// field.** The award is where the customer's side and the provider's side meet, so it is the
+	// shape a later ticket is most tempted to widen — with the number the two agreed on, or with the
+	// job it just moved. Neither may arrive without being added to this list first.
+	//
+	// The provider has to counter back before there is anything awardable, because the head of the
+	// chain is the customer's own offer and `ck_bids_only_a_providers_offer_is_accepted` refuses that
+	// — which is exactly the sequence a real negotiation ends with. It is placed at 42000, which is
+	// not the budget in any rendering.
+	counterID := uuid.MustParse(decode[map[string]any](t, countered)["id"].(string))
+	agreed := w.counter(t, w.provider, w.job, counterID, "wire-privacy-agree",
+		`{"amount_cents": 42000}`)
+	if agreed.Code != http.StatusCreated {
+		t.Fatalf("the provider's counter = %d (%s)", agreed.Code, agreed.Body)
+	}
+	agreedID := uuid.MustParse(decode[map[string]any](t, agreed)["id"].(string))
+
+	awarded := w.award(t, w.customer, w.job, "wire-privacy-award", awarding(agreedID))
+	if awarded.Code != http.StatusOK {
+		t.Fatalf("the award = %d (%s)", awarded.Code, awarded.Body)
+	}
+	responses["the award, 200"] = awarded.Body.Bytes()
 
 	for how, body := range responses {
 		t.Run(how, func(t *testing.T) {
@@ -1345,5 +1382,217 @@ func TestTheHistoryNeedsNoIdempotencyKey(t *testing.T) {
 
 	if rec := w.history(t, w.provider, w.job, placed); rec.Code != http.StatusOK {
 		t.Fatalf("a history read with no key = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+}
+
+// --- SHIP-92: the award, at the wire --------------------------------------------------------------
+
+// TestAwardingABidOverTheWire is SHIP-92's *Done when* at the wire.
+//
+// `POST /v1/jobs/{id}/award` with the offer named in the body, answered 200 with the accepted bid.
+// The status is read back in its wire form, which is the string a client branches on and the one
+// SHIP-84's `Status.Wire` published.
+func TestAwardingABidOverTheWire(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-award-base")
+
+	rec := w.award(t, w.customer, w.job, "wire-award", awarding(placed))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("awarding = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	body := decode[map[string]any](t, rec)
+	if body["id"] != placed.String() {
+		t.Errorf("the award answered with %v, want the bid it accepted %s", body["id"], placed)
+	}
+	if body["status"] != "accepted" {
+		t.Errorf("the bid came back as %v, want accepted", body["status"])
+	}
+
+	var status string
+	if err := w.pool.QueryRow(t.Context(), `SELECT status FROM jobs WHERE id = $1`, w.job).Scan(&status); err != nil {
+		t.Fatalf("reading the job: %v", err)
+	}
+	if status != "Awarded" {
+		t.Errorf("the job is %s, want Awarded — the award moves the job in the same transaction", status)
+	}
+}
+
+// TestAwardingIsTheCustomersAloneAtTheWire is Docs/02 §3's first control, and CLAUDE.md's "no
+// authorisation decision on the device" seen from the other end.
+//
+// Every request in this file carries a subject claiming `role: customer`, including the provider's.
+// The platform decides from `jobs.customer_id` instead, so the provider is refused with the answer a
+// job that does not exist gets — and the 404 is what stops this endpoint confirming that a bid
+// identifier is real.
+func TestAwardingIsTheCustomersAloneAtTheWire(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-award-who-base")
+
+	rec := w.award(t, w.provider, w.job, "wire-award-who", awarding(placed))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("the provider awarding their own bid = %d, want 404 (%s)", rec.Code, rec.Body)
+	}
+	if got := decode[errorEnvelope](t, rec).Error.Code; got != "not_found" {
+		t.Errorf("the code is %q, want not_found", got)
+	}
+	if strings.Contains(rec.Body.String(), placed.String()) {
+		t.Errorf("the refusal echoes the bid identifier back: %s", rec.Body)
+	}
+}
+
+// TestAnAwardNamingNoBidIsRefusedByField is Docs/10 §4.6 applied to the one endpoint here whose
+// subject is in the body.
+//
+// A missing or malformed identifier is a field error naming `bid_id`, not "the request body is not
+// valid JSON" — which is what encoding/json alone could say, and which is untrue when the body is
+// perfectly good JSON containing a truncated value.
+func TestAnAwardNamingNoBidIsRefusedByField(t *testing.T) {
+	w := newWire(t)
+
+	for how, body := range map[string]string{
+		"an empty body":             `{}`,
+		"a blank identifier":        `{"bid_id": ""}`,
+		"a truncated identifier":    `{"bid_id": "0198f2c1-6b40-7a11"}`,
+		"something that is not one": `{"bid_id": "the cheapest one"}`,
+	} {
+		t.Run(how, func(t *testing.T) {
+			rec := w.award(t, w.customer, w.job, "wire-award-field-"+how, body)
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("= %d, want 422 (%s)", rec.Code, rec.Body)
+			}
+
+			envelope := decode[errorEnvelope](t, rec)
+			if envelope.Error.Code != "validation_failed" {
+				t.Fatalf("the code is %q, want validation_failed (%s)", envelope.Error.Code, rec.Body)
+			}
+			if len(envelope.Error.Details) != 1 || envelope.Error.Details[0].Field != "bid_id" {
+				t.Errorf("the refusal does not name bid_id: %s", rec.Body)
+			}
+		})
+	}
+}
+
+// TestAnAwardCannotSetTheStatus is the invariant at the only layer a client can reach.
+//
+// A bid's status is the platform's and so is a job's. httpx.DecodeJSON refuses unknown fields, so a
+// client sending one is told it does not exist rather than having it quietly ignored — which is the
+// failure worth preventing here above anywhere else, because a request that appeared to award a job
+// and did not is one a customer acts on.
+func TestAnAwardCannotSetTheStatus(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-award-status-base")
+
+	rec := w.award(t, w.customer, w.job, "wire-award-status",
+		fmt.Sprintf(`{"bid_id": %q, "status": "accepted"}`, placed))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("= %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "status") {
+		t.Errorf("the refusal does not name the field: %s", rec.Body)
+	}
+	if stored := w.row(t, placed); stored.status != string(StatusSubmitted) {
+		t.Errorf("the refused request moved the bid to %s", stored.status)
+	}
+}
+
+// TestAwardingAClosedOfferAnswersItsOwnCode is the refusal a client acts on rather than parses.
+//
+// `bidding_bid_closed` and not `conflict`: the *offer* is over, and the customer's next action is to
+// pick another one from the same job. That is a different screen from a job that can no longer be
+// awarded, which is the distinction the two codes carry.
+func TestAwardingAClosedOfferAnswersItsOwnCode(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-award-closed-base")
+
+	if rec := w.withdraw(t, w.provider, w.job, placed, "wire-award-closed-withdraw"); rec.Code != http.StatusOK {
+		t.Fatalf("withdrawing = %d (%s)", rec.Code, rec.Body)
+	}
+
+	rec := w.award(t, w.customer, w.job, "wire-award-closed", awarding(placed))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("awarding a withdrawn offer = %d, want 409 (%s)", rec.Code, rec.Body)
+	}
+	if got := decode[errorEnvelope](t, rec).Error.Code; got != string(CodeBidClosed) {
+		t.Errorf("the code is %q, want %q", got, CodeBidClosed)
+	}
+}
+
+// TestASecondAwardOnOneJobIsAConflictAtTheWire is the protocol code doing what it was registered for.
+//
+// `conflict`'s description in Docs/10-api-error-codes.md has named "a second award on one job" since
+// SHIP-12, before this endpoint existed. The client's next screen is the *job*, which is what
+// separates it from `bidding_bid_closed` above.
+func TestASecondAwardOnOneJobIsAConflictAtTheWire(t *testing.T) {
+	w := newWire(t)
+	mine := w.placed(t, "wire-award-second-base")
+
+	rival := newVerifiedProvider(t, w.pool, "wire-award-rival@example.com", "+61400000924")
+	declare(t, w.pool, rival, "VIC")
+	addVehicle(t, w.pool, rival, "BID924")
+
+	theirs := as(t, w.router, rival, "wire-award-second-rival",
+		"/v1/jobs/"+w.job.String()+"/bids", validBody())
+	if theirs.Code != http.StatusCreated {
+		t.Fatalf("the rival's offer = %d (%s)", theirs.Code, theirs.Body)
+	}
+	theirID := uuid.MustParse(decode[map[string]any](t, theirs)["id"].(string))
+
+	if rec := w.award(t, w.customer, w.job, "wire-award-second-first", awarding(mine)); rec.Code != http.StatusOK {
+		t.Fatalf("the first award = %d (%s)", rec.Code, rec.Body)
+	}
+
+	rec := w.award(t, w.customer, w.job, "wire-award-second", awarding(theirID))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("a second award = %d, want 409 (%s)", rec.Code, rec.Body)
+	}
+	if got := decode[errorEnvelope](t, rec).Error.Code; got != "conflict" {
+		t.Errorf("the code is %q, want conflict", got)
+	}
+}
+
+// TestARetriedAwardUnderAFreshKeyIsStillTwoHundred is the retry this endpoint has to survive, and the
+// reason it needs no key column.
+//
+// A phone that lost its connection, was restarted and generated a **fresh** `Idempotency-Key` for the
+// same intent must not be told its award failed when it succeeded. The middleware absorbs the retry
+// that reuses its key; this absorbs the one that does not — idempotency by state, which SHIP-86
+// established is stronger than a stored key because two clients with two keys still cannot award one
+// job twice.
+func TestARetriedAwardUnderAFreshKeyIsStillTwoHundred(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-award-retry-base")
+
+	first := w.award(t, w.customer, w.job, "wire-award-retry-one", awarding(placed))
+	if first.Code != http.StatusOK {
+		t.Fatalf("the first award = %d (%s)", first.Code, first.Body)
+	}
+
+	second := w.award(t, w.customer, w.job, "wire-award-retry-two", awarding(placed))
+	if second.Code != http.StatusOK {
+		t.Fatalf("the retry under a fresh key = %d, want 200 (%s)", second.Code, second.Body)
+	}
+	if first.Body.String() != second.Body.String() {
+		t.Errorf("the retry answered differently:\n  first:  %s\n  second: %s", first.Body, second.Body)
+	}
+}
+
+// TestAwardingABidOnAnotherJobIsNotFoundAtTheWire keeps the job in the path from being decorative.
+//
+// This is the endpoint where the two identifiers come from two places — the job from the URL and the
+// bid from the body — so a client that pairs them wrongly is naming something that does not exist.
+// Answering from the bid alone would let a customer award, against their own job, an offer somebody
+// made on a different one.
+func TestAwardingABidOnAnotherJobIsNotFoundAtTheWire(t *testing.T) {
+	w := newWire(t)
+	placed := w.placed(t, "wire-award-elsewhere-base")
+
+	other := w.publish(t)
+	rec := w.award(t, w.customer, other, "wire-award-elsewhere", awarding(placed))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("awarding a bid under the wrong job = %d, want 404 (%s)", rec.Code, rec.Body)
+	}
+	if got := decode[errorEnvelope](t, rec).Error.Code; got != "not_found" {
+		t.Errorf("the code is %q, want not_found", got)
 	}
 }

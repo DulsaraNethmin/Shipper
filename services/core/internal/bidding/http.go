@@ -673,6 +673,117 @@ func (h *Handler) Counter() http.Handler {
 	})
 }
 
+// awardRequest is the body of POST /v1/jobs/{id}/award (SHIP-92).
+//
+// **The one request in this domain that names a bid in the body rather than in the path**, and that
+// follows from what the endpoint is rather than from taste. Docs/09's *Done when* is
+// `POST /v1/jobs/{id}/award`, and it is right: awarding is an act on the **job** — the job is what
+// moves, exactly once, and the bid is what the act selects. `POST …/bids/{bid_id}/award` would have
+// read as one more verb on an offer, beside `withdraw` and `counter`, which are acts on the offer and
+// leave the job where it is.
+//
+// A string rather than a `uuid.UUID`, parsed by hand below, for the reason [bidRequest]'s timestamps
+// are strings: encoding/json reports a malformed value as an ordinary error with no type of its own,
+// so httpx.DecodeJSON could only answer "the request body is not valid JSON" — which is untrue and
+// unactionable when the body is perfectly good JSON containing a truncated identifier.
+//
+// There is no `status` and no `customer_id`. The status is the platform's, and the customer is
+// whoever the token says is calling — a customer id in a body would be an authorisation decision
+// made from client input, which Docs/07 §3 puts on the platform.
+type awardRequest struct {
+	BidID string `json:"bid_id"`
+}
+
+// bid parses the identifier, reporting anything it could not read as a field error.
+//
+// Empty and unparseable are one answer with two messages, both naming `bid_id`. A client that sent
+// nothing and a client that sent a truncated value have made the same kind of mistake and fix it in
+// the same place, and Docs/10 §4.6 wants the field named either way.
+func (a awardRequest) bid() (uuid.UUID, error) {
+	var e validate.Errors
+
+	switch trimmed := strings.TrimSpace(a.BidID); {
+	case trimmed == "":
+		e.Add("bid_id", validate.CodeRequired, "Name the offer you are awarding.")
+	default:
+		id, err := uuid.Parse(trimmed)
+		if err == nil {
+			return id, nil
+		}
+		e.Add("bid_id", validate.CodeInvalid, "That is not a valid offer identifier.")
+	}
+	return uuid.Nil, e.Err()
+}
+
+// Award handles POST /v1/jobs/{id}/award (SHIP-92).
+//
+// SHIP-92's *Done when*: "accepts one bid and moves the job to Awarded in one transaction". Both
+// halves happen inside one `db.InTx` here, which is Docs/10 §3.2's rule about where a transaction
+// boundary goes — "the award is one transaction and `bidding` owns it, even though it also moves the
+// job".
+//
+// Protected, and **only the customer may award**: Docs/02 §3's first transition control. The route
+// declares `RequireUser` rather than a role, exactly as the four before it, and for the sharper
+// reason SHIP-87's counter has — whether this account is the customer of *this* job is a fact in the
+// database, and a role claim in a token is evidence about the token. A provider presenting a valid
+// token is refused with the 404 a job that does not exist gets.
+//
+// **200, and there is no 201 to answer with.** Nothing is created: one row moves to 'Accepted' and
+// the job moves to 'Awarded'. The same 200 answers an award that had already been made, which is the
+// idempotency-by-state [Service.AwardBid] describes — a phone that reconnected and generated a fresh
+// key is told what it did, not that it failed.
+//
+// State-changing, so it carries an `Idempotency-Key` and is refused without one by the middleware
+// (SHIP-15). **The key is not read here and there is no column for it**, unlike a placement or a
+// counter: those are inserts, where a retry that outlives the cache could otherwise add a second row.
+// An award is an update of a row that already exists, so the record itself answers a retry. See
+// [Service.WithdrawBid], which made the same call for the same reason.
+//
+// The response is the accepted bid, in the same [bidResponse] every other endpoint here answers with
+// — the closed key set stays one list rather than two, and nothing of the job travels in it beyond
+// its identifier. A client that wants the job's new status reads the job.
+func (h *Handler) Award() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		customerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req awardRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		bidID, err := req.bid()
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var bid Bid
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			bid, err = h.svc.AwardBid(ctx, runner, customerID, jobID, bidID)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, bidFrom(bid))
+		return nil
+	})
+}
+
 // History handles GET /v1/jobs/{id}/bids/{bid_id}/history (SHIP-88).
 //
 // SHIP-88's *Done when* is "only the latest valid offer is acceptable; **full chain remains
@@ -842,6 +953,15 @@ func apiError(err error) error {
 		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
 			"No such job.").WithCause(err)
 
+	case errors.Is(err, ErrNotJobCustomer):
+		// The award's 404, byte-identical to the one above. A job that is not the caller's and a job
+		// that does not exist are one answer: a provider who could tell them apart would learn that
+		// somebody else's job exists, which is the disclosure Docs/01 §4.3 and this domain's 404s are
+		// for. It is answered before any bid is read, so this endpoint cannot be used to probe for
+		// bid identifiers either.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such job.").WithCause(err)
+
 	case errors.Is(err, ErrBidNotFound), errors.Is(err, ErrNotBidOwner):
 		// One answer for both, and the domain keeps them apart behind it. A provider told "that bid
 		// is not yours" has been told the bid exists, which is a competitor's offer confirmed by
@@ -879,6 +999,26 @@ func apiError(err error) error {
 		return httpx.NewError(http.StatusConflict, CodeWrongParty,
 			"That offer belongs to the other party. Counter an offer they made; revise one you "+
 				"made yourself.").WithCause(err)
+
+	case errors.Is(err, ErrNotAProvidersOffer):
+		// [CodeWrongParty] again, with the message the award needs (SHIP-92). One code for the third
+		// instance of one rule — you counter the other party's offer, you revise your own, and you
+		// award theirs — because the client's correct response is a different request in all three,
+		// which is Docs/10 §4.4's test. A second code would have said the same thing to a client
+		// that would branch to the same place.
+		return httpx.NewError(http.StatusConflict, CodeWrongParty,
+			"That is your own counter-offer, and awarding it would commit a provider to terms they "+
+				"have not agreed to. Award an offer they made.").WithCause(err)
+
+	case errors.Is(err, ErrJobNotAwardable):
+		// `conflict` rather than a domain code, and this is the protocol code doing exactly what it
+		// was registered for: its description has read "a second award on one job" since SHIP-12,
+		// before this endpoint existed. The request is well formed and contradicts the state the job
+		// is in, and the client's next screen is the job — not the offer, which is what separates
+		// this from [CodeBidClosed].
+		return httpx.NewError(http.StatusConflict, httpx.CodeConflict,
+			"That job can no longer be awarded. Reload it to see its current status — it may "+
+				"already have been awarded, cancelled, or have expired.").WithCause(err)
 
 	case errors.Is(err, ErrNothingToRevise):
 		return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
