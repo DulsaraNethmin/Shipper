@@ -128,7 +128,7 @@ The MVP carries no live GPS (`§2`), which means proof of delivery is the *only*
 
 In these cases the driver selects a reason and proceeds. The job completes, the missing proof is recorded with its reason, and the job is flagged into the moderation queue (`04` §5). What must never happen is a driver standing at a delivery point unable to finish the job — that converts a UI constraint into an operational failure and a support call.
 
-**Decision required:** whether a job completed via the exception path requires customer confirmation before it can auto-complete, rather than expiring into Completed under the 72-hour rule. Owner: operations.
+~~**Decision required:** whether a job completed via the exception path requires customer confirmation before it can auto-complete, rather than expiring into Completed under the 72-hour rule. Owner: operations.~~ **Decided on 14 August 2026 (X-6): it does not.** A job delivered through this path auto-completes on `02` §6.1's ordinary 72-hour rule, which is where the decision and its reasoning are recorded. The short form is that SHIP-117 now queues every exception-completed job for moderation, so a person reviews it either way — blocking auto-completion would add no review and would only strand the job when the customer never acts. SHIP-119 implements the rule.
 
 **Acceptance measure:** A customer can see the latest delivery milestone and proof of delivery for their awarded job; a driver can record a full delivery with no connectivity and have it appear correctly once back in range; and a driver with a denied camera permission can still complete a job.
 
