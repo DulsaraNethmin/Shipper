@@ -136,6 +136,31 @@ A ticket is done when **all** of these hold:
 
 Meeting all six makes the branch **ready to merge**, not merged. Hand it to the repository owner.
 
+### Every finished piece of work ends with a handoff
+
+**When a ticket, a track or a wave finishes, write the handoff before saying it is done.** Two
+artefacts, both for a reader who has none of the context that produced the work:
+
+1. **What is ready to merge** — every branch, its tip commit, the tickets on it, the gate results
+   *as re-run rather than as reported*, and **the order to merge them in, measured** with
+   `git merge-tree --write-tree --name-only <base> <branch>` rather than predicted.
+2. **A handoff prompt for the next phase**, written to `~/.claude/plans/` and given to the owner in
+   full, so the next session can start from a cleared context. It carries the verified state with
+   every figure measured on a named commit, what is blocked and on whom, the traps accumulated so
+   far, and the decisions still outstanding.
+
+**This exists because context does not survive the session and the repository has repeatedly paid
+for that.** The same commit-count error has been made four times, each by a session that copied a
+figure instead of measuring it; the "17 call sites" figure travelled through two dispatch briefs from
+a stale comment; and three separate lanes specified one endpoint that none of them built. A handoff
+that states where the figures came from is what stops the next session inheriting the last one's
+mistakes.
+
+**A handoff is not a summary of what happened.** It is the input the next piece of work runs on:
+state, blockers, traps, decisions. Say what was measured and on which commit, what was taken on
+report and not verified, and what was left undone and why — a gap named in a handoff costs an hour,
+and the same gap discovered later costs the wave.
+
 ### What Claude does and does not do
 
 | Action | Who |
