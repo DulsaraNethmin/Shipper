@@ -78,7 +78,7 @@ func storedEvidence(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) (
 //
 // One request, one milestone, one `proofs` row — and the row holds a reason and no object. That the
 // object columns are NULL rather than empty is the half worth reading twice: 000604 counts NULLs, so
-// a row that stored `''` would satisfy the CHECK by looking like a photograph.
+// a row that stored an empty string would satisfy the CHECK by looking like a photograph.
 func TestAReasonedExceptionIsRecordedInPlaceOfAPhotograph(t *testing.T) {
 	pool := pgtest.DB(t)
 
