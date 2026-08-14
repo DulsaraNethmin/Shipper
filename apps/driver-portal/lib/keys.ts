@@ -119,3 +119,24 @@ export function settle(scope: string): void {
     // A browser that refused to store it has nothing to remove.
   }
 }
+
+/**
+ * A key for an action that is over the moment it is answered (SHIP-122).
+ *
+ * **The presign is the case, and it is the opposite of a milestone.** `POST
+ * /v1/driver/jobs/{id}/proof-uploads` answers with a short-lived URL, and reusing a stored key makes
+ * SHIP-15's middleware replay the stored response — so every retry gets the *same* URL with its
+ * expiry already running down, dead until Redis evicts it. What a driver retrying an upload needs is
+ * a new slot, which means a new key and a new object key.
+ *
+ * That is not a hole in the idempotency contract, it is the contract read correctly: "one value per
+ * action, reused for every retry of **that action**". Asking for somewhere to put a photograph after
+ * the first place expired is a different action. The platform's own contract fragment says the same
+ * thing to every client.
+ *
+ * It is deliberately not held anywhere. Nothing needs to find it again, and a key in storage that
+ * nothing settles is a key that comes back on the next attempt.
+ */
+export function freshKey(): string {
+  return mint();
+}

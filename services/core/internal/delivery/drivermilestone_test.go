@@ -484,15 +484,19 @@ func TestTheDriverRouteRecordsOnNoOtherJobOverHTTP(t *testing.T) {
 	}
 }
 
-// TestADriverMayRecordAnExceptionAndMayNotAttachAPhotograph is the evidence line this ticket draws,
-// and it is a line rather than a gap.
+// TestADriverMayRecordAnExceptionAndAKeyTheyWereNeverIssued is the evidence line this ticket drew,
+// as SHIP-122 left it.
 //
-// The exception needs nothing but a string and Docs/01 §4.4 makes it part of the same feature, so a
-// driver who cannot photograph a pickup can still record the pickup. A photograph needs an upload
-// URL and **there is no operation a driver can call to obtain one** — SHIP-122 builds the pair — so
-// a key presented here came from somewhere a driver should not have been, and is refused as a field
-// error rather than verified against the store.
-func TestADriverMayRecordAnExceptionAndMayNotAttachAPhotograph(t *testing.T) {
+// **The line moved and did not disappear.** SHIP-120a refused *every* `object_key` from a driver,
+// because there was no operation one could call to obtain a key at all, so anything presented here
+// had come from somewhere a driver should not have been. SHIP-122 built that operation, and what is
+// refused now is narrower and better founded: a key the platform did not issue **for this job**,
+// checked against the grant rather than against a path — see [Service.VerifyDriverProof]. The
+// invented key below is well formed, correctly prefixed, and names an object that does not exist.
+//
+// The exception half is unchanged and is checked in the same test on purpose: Docs/01 §4.4 makes the
+// two one feature, and a driver who cannot photograph a pickup must still be able to record it.
+func TestADriverMayRecordAnExceptionAndAKeyTheyWereNeverIssued(t *testing.T) {
 	pool := pgtest.DB(t)
 	router := driverMilestoneRouter(t, pool)
 
@@ -502,17 +506,37 @@ func TestADriverMayRecordAnExceptionAndMayNotAttachAPhotograph(t *testing.T) {
 
 	_, _, token := driverOnJob(t, pool, provider, jobID)
 
+	// Correctly shaped for this job and never issued, so the store is asked and answers that it
+	// holds nothing. `409` rather than `422`: the body is a perfectly good recording, and what it
+	// contradicts is a fact about the world — which a client fixes by finishing an upload rather
+	// than by correcting a field.
 	refused := postMilestoneAs(router, jobID, bearer(token.Value), theKey,
 		`{"milestone":"en_route_to_pickup","proof":{"object_key":"proof/`+jobID.String()+
 			`/019bd7a1-2c44-7f10-9a2c-3d4e5f607182"}}`)
-	if refused.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("a driver attached a photograph with status %d, want 422 (%s)", refused.Code, refused.Body)
+	if refused.Code != http.StatusConflict {
+		t.Fatalf("a photograph that never arrived was accepted with status %d, want 409 (%s)",
+			refused.Code, refused.Body)
 	}
-	if field := firstFieldOf(t, refused); field != "proof.object_key" {
-		t.Errorf("the refusal names %q, want proof.object_key", field)
+	if code := errorCodeOf(t, refused); code != string(CodeProofNotUploaded) {
+		t.Errorf("code = %q, want %q", code, CodeProofNotUploaded)
 	}
 	if n := milestoneCount(t, pool, jobID); n != 0 {
 		t.Errorf("%d milestones, want 0 — the refused request must write nothing", n)
+	}
+
+	// A key naming another job is refused earlier and differently: from the string alone, with no
+	// lookup, as a field error. That is the disclosure boundary — the store is never asked about a
+	// key the caller was not issued for the delivery they are acting on.
+	elsewhere := postMilestoneAs(router, jobID, bearer(token.Value), theKey+"-elsewhere",
+		`{"milestone":"en_route_to_pickup","proof":{"object_key":"proof/`+
+			awardedJob(t, pool, customer, provider).String()+
+			`/019bd7a1-2c44-7f10-9a2c-3d4e5f607182"}}`)
+	if elsewhere.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("another delivery's key was accepted with status %d, want 422 (%s)",
+			elsewhere.Code, elsewhere.Body)
+	}
+	if field := firstFieldOf(t, elsewhere); field != "proof.object_key" {
+		t.Errorf("the refusal names %q, want proof.object_key", field)
 	}
 
 	accepted := postMilestoneAs(router, jobID, bearer(token.Value), theKey+"-exception",

@@ -54,6 +54,7 @@ const MAY_REQUEST = [
   "lib/delivery.ts",
   "app/api/driver/jobs/[jobId]/route.ts",
   "app/api/driver/jobs/[jobId]/milestones/route.ts",
+  "app/api/driver/jobs/[jobId]/proof-uploads/route.ts",
 ];
 
 /** The route handlers, which are the only files that may name a platform endpoint. */
@@ -138,6 +139,10 @@ test("only the route handlers name a platform path, and each names exactly one",
   assert.deepEqual(filesContaining(/\/v1\//), [...MAY_NAME_AN_ENDPOINT].sort());
 
   const named = new Map<string, string[]>();
+  // The store's own URL is deliberately not in this map. `putPhotograph` fetches an absolute URL the
+  // platform signed and this application never constructs — it holds no store hostname, no bucket
+  // name and no path — so there is nothing here for a template to hold it to. What holds *that*
+  // request is `lib/upload.test.ts`, which asserts it carries no credential.
   for (const file of MAY_NAME_AN_ENDPOINT) {
     const handler = sources().get(file) ?? "";
     named.set(file, [...handler.matchAll(/\/v1\/[A-Za-z0-9_\-/{}$]*/g)].map((m) => m[0]));
@@ -148,6 +153,7 @@ test("only the route handlers name a platform path, and each names exactly one",
     {
       "app/api/driver/jobs/[jobId]/route.ts": ["/v1/driver/jobs/${jobId}"],
       "app/api/driver/jobs/[jobId]/milestones/route.ts": ["/v1/driver/jobs/${jobId}/milestones"],
+      "app/api/driver/jobs/[jobId]/proof-uploads/route.ts": ["/v1/driver/jobs/${jobId}/proof-uploads"],
     },
     "a route handler names a number of upstream paths other than one",
   );
@@ -189,6 +195,7 @@ test("the idempotency key is named only where one is minted, held or sent", () =
     filesContaining(/idempotency[-_]?key/i),
     [
       "app/api/driver/jobs/[jobId]/milestones/route.ts",
+      "app/api/driver/jobs/[jobId]/proof-uploads/route.ts",
       "lib/delivery.ts",
       "lib/keys.ts",
     ].sort(),

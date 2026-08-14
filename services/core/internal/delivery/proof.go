@@ -269,6 +269,73 @@ func (s *Service) PresignProofUpload(
 			jobID, awarded, providerID, ErrNotAwardedProvider)
 	}
 
+	return s.presign(ctx, jobID, request)
+}
+
+// PresignDriverProofUpload issues one short-lived URL the assigned driver may upload one photograph
+// to (SHIP-122).
+//
+// # It takes a grant and no job identifier, which is the whole signature
+//
+// The same shape [Service.RecordDriverMilestone] and [Service.AssignmentFor] take, and it matters
+// most here because what comes back is a **credential to write into the evidence bucket**. A
+// [DriverGrant] is produced by [DriverTokenVerifier.Verify] and by nothing else, and the middleware
+// that produces one has already compared the job in the request path with the job inside the token.
+// So a handler cannot widen the scope by passing the wrong identifier: it has none to pass, and the
+// key this mints can therefore only ever name the job the link opens.
+//
+// Wave 7 recorded a mutation that survived a full suite — a driver surface deriving the job it acted
+// on from its own credential rather than from what was asked for — and the shape that makes it
+// unwritable is not a test, it is a signature with nothing to get wrong in it.
+//
+// # What it checks that [Service.PresignProofUpload] does not, and what it deliberately drops
+//
+// The provider's path asks `bidding` who was awarded the job. A driver has no account to compare
+// against an award, so the question is asked of a row instead: is the assignment this grant names
+// still the live one on this job. That is the same read SHIP-108 makes before showing a driver
+// anything, and it is what makes a stood-down driver's link stop minting upload URLs at the moment
+// the row changes rather than when the token expires seven days later.
+//
+// The accepted bid is **not** re-checked, for the reason [Service.RecordDriverMilestone] gives: an
+// assignment can only exist on a job that reached 'Driver assigned', which only the awarded provider
+// can ask for, so a live assignment is a stronger statement about this job than the award is.
+//
+// # The refusals, in this order, and the order is every other write in this domain's
+//
+//  1. a request the platform will not sign — no content type, an unaccepted one, no length, or one
+//     over [UploadPolicy.MaxBytes] — is `validation_failed` with the field named;
+//  2. a link whose assignment is no longer live is [ErrDriverLinkSuperseded], one 404.
+//
+// Validation runs first and discloses nothing: a client is told about its own body.
+//
+// r is a reader rather than a transaction. One statement, no write, nothing to keep consistent with
+// anything else — the same call [Service.PresignProofUpload] makes.
+func (s *Service) PresignDriverProofUpload(
+	ctx context.Context,
+	r db.Runner,
+	grant DriverGrant,
+	req UploadRequest,
+) (Upload, error) {
+	request := req.normalise()
+	problems := request.problems(s.proof.policy)
+	if err := problems.Err(); err != nil {
+		return Upload{}, err
+	}
+
+	if _, err := s.AssignmentFor(ctx, r, grant); err != nil {
+		return Upload{}, err
+	}
+
+	return s.presign(ctx, grant.JobID, request)
+}
+
+// presign is the minting itself, after whoever is asking has been established.
+//
+// One function rather than a copy per entry point, which is the same call [Service.record] makes one
+// layer up: the key's shape, the freshness argument and the signer's failure mode are the ticket,
+// and a second copy is a second place for a driver's key to be built differently from a provider's —
+// which [keyBelongsToJob] would then refuse on the milestone that tried to use it.
+func (s *Service) presign(ctx context.Context, jobID uuid.UUID, request UploadRequest) (Upload, error) {
 	key, err := proofObjectKey(jobID)
 	if err != nil {
 		return Upload{}, err
@@ -451,6 +518,61 @@ func (s *Service) VerifyProof(
 			jobID, awarded, providerID, ErrNotAwardedProvider)
 	}
 
+	return s.stored(ctx, jobID, key)
+}
+
+// VerifyDriverProof is [Service.VerifyProof] asked by the driver holding the job's link (SHIP-122).
+//
+// # The same two questions, and only the second one has a different answer
+//
+// "Does this key name an object the platform issued for this job" is identical, because a key is a
+// key: [keyBelongsToJob] compares it against the job in the grant, from the string alone, with no
+// lookup. "May this caller attach it" is where the two paths part — the provider's is the accepted
+// bid, and a driver's is a live assignment, because a driver has no account to compare against an
+// award. That is the same split [Service.RecordDriverMilestone] makes and it is made here again
+// rather than deferred to it, because the store is asked before the transaction opens and the
+// authorisation has to happen on this side of that boundary.
+//
+// **It takes a grant and no job identifier**, for the reason [Service.PresignDriverProofUpload]
+// gives: the job cannot be got wrong because there is nothing to get wrong. The consequence is worth
+// stating — a driver holding two links cannot attach the photograph from one delivery to the other,
+// and the refusal is [ErrProofNotForThisJob] rather than anything that discloses the other job.
+//
+// The check is deliberately made twice, here and again in [Service.RecordDriverMilestone] through
+// [Service.AssignmentFor], for the reason [Service.VerifyProof] gives at greater length: skipping it
+// here would let a stood-down link-holder learn whether an object exists, and skipping it there
+// would make this function's return value load-bearing for authorisation.
+func (s *Service) VerifyDriverProof(
+	ctx context.Context,
+	r db.Runner,
+	grant DriverGrant,
+	objectKey string,
+) (VerifiedProof, error) {
+	key := strings.TrimSpace(objectKey)
+	if !keyBelongsToJob(key, grant.JobID) {
+		return VerifiedProof{}, fmt.Errorf("delivery: %q is not an object key %s issued: %w",
+			key, grant.JobID, ErrProofNotForThisJob)
+	}
+
+	if _, err := s.AssignmentFor(ctx, r, grant); err != nil {
+		return VerifiedProof{}, err
+	}
+
+	return s.stored(ctx, grant.JobID, key)
+}
+
+// stored is what the store holds under key, judged against [UploadPolicy].
+//
+// One function rather than a copy per entry point, and the reason is [UploadPolicy] rather than
+// tidiness: what makes a photograph acceptable evidence is a decision about evidence, and a driver's
+// and a provider's have to be the same decision. Two copies would be two places for a size limit to
+// be raised, and the one that was not raised would refuse a delivery on a handset whose camera had
+// outgrown it — which is `Docs/01` §4.4's operational failure with an extra step.
+//
+// It authorises nobody. Both callers have already decided that this caller may attach this key to
+// this job, which is why this takes a job identifier rather than a grant or a provider: by the time
+// it runs there is no question of *whose* it is left to ask.
+func (s *Service) stored(ctx context.Context, jobID uuid.UUID, key string) (VerifiedProof, error) {
 	contentType, contentLength, etag, found, err := s.proof.objects.Stored(ctx, key)
 	if err != nil {
 		// A failure of the store rather than an answer from it — see [ProofObjects.Stored]. It

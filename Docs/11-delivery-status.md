@@ -480,6 +480,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-120a** | M4 | `POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken` — **the first write in the service served on a credential that names no account**, and the route three wave-7 lanes specified and none built. It settles the idempotency scope §9 had held open since SHIP-15m: a driver's key is scoped by the job, because `uq_milestones_idempotency (job_id, idempotency_key)` already scopes it there and `000602` named this case while doing it. The `Jobs` port's four moves take a `Recorder` instead of a provider identifier, so a driver's transition is attributed to their `driver_assignments` row rather than to their provider — *see below* |
 | **SHIP-121** | M4 | Driver portal milestone controls — four 56-pixel full-width targets over SHIP-120a's route, and **no platform change at all**. The decision worth reading is the idempotency key: one per action, minted from a CSPRNG, held in `sessionStorage` across a reload, and discarded only when the platform **answers** — so a retry in a shed reuses it and `Docs/02` §5's second pickup attempt does not. The portal's proxy grew a second outbound call and stayed narrow by becoming **a file per upstream endpoint**; `surface.test.ts` now holds each route file to exactly one `/v1/` template. `make verify` reads the portal's hand-written milestone list out of its own source and records every value in it against the running service — *see below*
+| **SHIP-122** | M4 | `POST /v1/driver/jobs/{id}/proof-uploads`, auth class `RequireDriverToken`, plus the portal's camera. **It is the route that made a driver-recorded delivery something other than a moderation case**: until it existed a driver could reach `Delivered` only through a reasoned exception, so SHIP-117's queue was the only path rather than one of two. It answers the scope question `routes_delivery.go` held the route shut for a wave over — the stored response is a credential, and what a replay of it can and cannot reach is written out in the handler. Both domain functions take a grant and **no job identifier**, and the browser's PUT to the store carries no credential at all — *see below*
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
@@ -9243,6 +9244,140 @@ built with it, not after", precisely so that "what must never happen is a driver
 delivery point unable to finish the job". A photograph is SHIP-122's, and until it exists there is no
 route by which a driver can obtain an object key. The three reasons come from `lib/statuses.gen.ts`
 and the sentence a driver reads is verbatim from `Docs/01` §4.4.
+
+
+### SHIP-122 — the route that made a driver-recorded delivery something other than a moderation case
+
+`POST /v1/driver/jobs/{id}/proof-uploads`, auth class `RequireDriverToken`, plus the portal's camera
+and the lifting of a refusal that had been there since SHIP-120a.
+
+**What it actually changed is bigger than "one more route", and the old code said so in its own
+words.** `internal/delivery/http.go` refused an `object_key` from a driver by name, because *"there
+is no route by which a driver can obtain an object key — `POST /v1/jobs/{id}/proof-uploads` is
+RequireUser — so any key presented here came from somewhere a driver should not have been"*. The
+consequence, which that comment also recorded: **a driver could reach `Delivered` only through a
+reasoned exception**, and `Docs/04` §5 puts an exception-completed job in the moderation queue. So
+for the whole of wave 8, SHIP-117's queue was the *only* path for a driver-recorded delivery rather
+than one of two, and every delivery a driver completed was by construction a delivery with no
+photograph. The ordinary path is now available to the person actually standing at the door.
+
+**The scope question `routes_delivery.go` held the route shut for a wave over is answered rather than
+inherited, and the answer is written in the handler.** That file said the driver's presign "stays
+shut until SHIP-121 settles the scope", because `httpx.Idempotent` wraps the whole `/v1` group while
+the auth class is applied per route **inside** it — so on a repeated key the middleware replays the
+stored response *before* `RequireDriverToken` runs, and on this route the stored body is a
+**credential** rather than a fact. `Handler.PresignDriverProofUpload` carries the analysis:
+
+- To be handed the response somebody must reproduce the request exactly — `replayOrRefuse`
+  fingerprints method, path and body, and a mismatch is a `409` — so they need the job identifier,
+  the photograph's exact byte length, and the key. The portal mints the key with `crypto.randomUUID`.
+- **They cannot make it evidence**: recording an object needs a valid driver token for that job,
+  because `Service.VerifyDriverProof` takes a grant.
+- **They cannot read it**: no public read path, and a signed download comes only from
+  `GET /v1/jobs/{id}/delivery/proof` after the reader has been decided.
+- **They cannot write anything else**: the type and the length are signed into the URL.
+- **An overwrite of a recorded photograph is detectable**: `000603` stores the entity tag at the
+  moment the object became proof, which is exactly what that column is for.
+
+This is the posture §6 already accepts for every anonymous-scoped route; what is new is that the body
+is a credential. §9 carries it with the mechanism that closes it properly — a second group-wide
+resolver beside `ResolveSubject`, which is an `internal/httpx` change and therefore a prep ticket's.
+
+#### Two functions with nothing to get wrong in them
+
+`Service.PresignDriverProofUpload` and `Service.VerifyDriverProof` take a **`DriverGrant` and no job
+identifier**, which is the shape `Service.RecordDriverMilestone` established and it matters most on
+the one that mints a write credential: a handler cannot widen the scope by passing the wrong job
+because it has none to pass. Wave 7's surviving mutation was exactly that shape.
+
+What differs from the provider's path is only *who is asking*: the provider is checked against the
+accepted bid, and a driver against a **live assignment**, because a driver has no account. That read
+is what makes a stood-down driver's link stop minting URLs at the moment the row changes rather than
+when the token expires seven days later — and it is checked on both halves, so a key minted before a
+reissue cannot be spent after one. `stored()` was factored out so a driver's photograph and a
+provider's are judged against one copy of `UploadPolicy`: two copies would be two places for a size
+limit to be raised, and the one that was not raised refuses a delivery on a handset whose camera has
+outgrown it, which is `Docs/01` §4.4's operational failure with an extra step.
+
+#### The portal: three requests, and the middle one carries no credential
+
+`capturePhotograph` presigns through this origin, PUTs straight to the store, then records the
+milestone against the key. **The driver's link is not sent to the object store** — the pre-signed URL
+carries its own authorisation, and attaching a seven-day forwardable token to a request bound for a
+host this application does not control would undo the reason `Docs/06` §5.2 puts the bytes outside
+the platform in the first place. `surface.test.ts` cannot catch that, because the credential and the
+`fetch` are in `lib/delivery.ts` either way; `upload.test.ts` asserts it against the request that
+goes out.
+
+`Content-Length` is deliberately not set: it is a forbidden header name in the Fetch specification,
+so a browser drops any attempt and computes it from the body — which is fine, because the platform
+signs the *exact* size and the browser sends exactly that file. `Content-Type` **is** set, from what
+the platform answered with rather than what the file reported, because the platform lower-cases
+before signing and a handset reporting `IMAGE/JPEG` would otherwise get `SignatureDoesNotMatch` with
+no explanation.
+
+**The camera is `<input type="file" accept="image/*" capture="environment">` and not `getUserMedia`**,
+which is a decision about this surface rather than a shortcut. It opens the rear camera on both
+platforms, needs no permission prompt of its own because the picker *is* the permission, and a
+browser that ignores the attribute degrades to the photo library — a working path rather than a dead
+end. A media-stream implementation is four more failure modes on devices this repository cannot test
+on. Nothing compresses the file: the platform's limit is server-side and comes back in the refusal,
+which is where a client learns the current one, and the exception path is on the same screen.
+
+**The presign uses a fresh key per attempt and the milestone keeps its held one**, which looks
+inconsistent and is the contract read correctly. Reusing a stored key on the presign makes the
+middleware replay the stored response, so every retry gets the same URL with its expiry already run
+down — dead until Redis evicts it. Asking for somewhere to put a photograph after the first place
+expired is a *different action*. `make verify` demonstrates both directions: a repeated key answers
+with the same object key, a fresh one mints a new object key.
+
+#### The two checks that changed rather than being added
+
+SHIP-120a's Go test and its `make verify` check both asserted the old blanket refusal, and **both
+were rewritten rather than deleted**. The line moved and did not disappear: what is refused now is a
+key the platform did not issue for *this* job. A correctly prefixed key naming an object that never
+arrived is `409 delivery_proof_not_uploaded` — after the store has been asked — and a key naming
+another delivery is `422` on `proof.object_key`, decided from the string alone with no lookup, which
+is the disclosure boundary. Neither test was weakened; both got a case they did not have.
+
+#### What `make verify` shows that no Go test can
+
+The domain's tests stub the signer, so **no Go test in this repository fails when a signature stops
+binding what it should** — SHIP-114 recorded that as an open hole and it is still true. The section
+takes a fresh delivery from assignment to `Delivered` on a driver's link: the presign, the PUT
+straight to MinIO, the object read back out of the bucket with `mc cat`, the recording, and the
+`proofs` row read from SQL to confirm it holds a photograph rather than an exception and is
+attributed to the `driver_assignments` row. It also holds the policy to being one policy — a driver
+is refused `image/svg+xml` and an oversized file with the same field errors a provider gets.
+
+#### Four mutations, three caught, and the survivor is the interesting one
+
+**Caught.** Removing `isJobId` from the presign route handler: `..%2f..%2fjobs` and four other
+traversals construct a URL and a request goes out, and the traversal test fails — it now walks every
+route handler rather than the two a test happened to import. Making `capturePhotograph` decode
+`job_id` out of the token and build the presign path from it: the capture chain asks for an upload
+slot on the token's job, which is wave 7's shape on a route that issues a credential, and the test
+added for it fails. Dropping `keyBelongsToJob` from `VerifyDriverProof`: two tests fail, including
+the one where a driver carrying two deliveries attaches the wrong photograph. Dropping the
+live-assignment read from the presign: the stood-down-driver test fails.
+
+**The survivor: making the presign handler read `{id}` from the path instead of taking it from the
+grant. Every test passes, and that is correct rather than a gap.** `RequireDriverToken` has already
+compared the two by the time the handler runs, so a handler reading the path and one reading the
+grant agree on every request that reaches either — no test can distinguish them, and none should be
+written that pretends to. What the grant-only signature buys is that the disagreement becomes
+**unwritable** rather than merely untested: `Service.PresignDriverProofUpload` has no job parameter,
+so the mutation had to reach into `grant.JobID` to express itself at all. That is the same argument
+`Service.RecordDriverMilestone` records, and it is worth restating because the next person to read
+these handlers will notice the redundancy and be right that it is one.
+
+#### One deployment fact that is not a code fact
+
+**The browser's PUT is cross-origin and needs CORS on the bucket.** MinIO permits it in development,
+which is why the verify section passes; an S3 bucket needs a CORS configuration allowing `PUT` from
+the portal's origin with `Content-Type` among the allowed headers. There is nothing in this
+repository to hold a test against, so §9 records it against the first deployment rather than leaving
+it to be discovered by a driver.
 
 
 ### SHIP-109 — revocation is a read against a column, and a retry must not cause one

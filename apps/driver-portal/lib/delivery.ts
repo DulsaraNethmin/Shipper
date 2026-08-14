@@ -79,7 +79,8 @@ export type Refusal =
   | "unexpected"
   | "too_early"
   | "needs_evidence"
-  | "rejected";
+  | "rejected"
+  | "upload_failed";
 
 /** What one attempt at opening a link produced. */
 export type Outcome =
@@ -132,6 +133,12 @@ export const REFUSALS: Record<Refusal, { title: string; body: string }> = {
       "Take a photograph of the goods where you left them, or say why there is no photograph. " +
       "Either finishes the job.",
   },
+  upload_failed: {
+    title: "The photograph did not upload",
+    body:
+      "It did not reach us — check your signal and take it again. If it keeps failing, say why " +
+      "there is no photograph instead; that finishes the job too.",
+  },
   rejected: {
     title: "That could not be recorded",
     body:
@@ -155,7 +162,7 @@ export const REFUSALS: Record<Refusal, { title: string; body: string }> = {
  * usable — and a retry under the same key is exactly what the mechanism is for.
  */
 export function isSettled(refusal: Refusal): boolean {
-  return refusal !== "unavailable" && refusal !== "unexpected";
+  return refusal !== "unavailable" && refusal !== "unexpected" && refusal !== "upload_failed";
 }
 
 /** The path this portal fetches a delivery from. Relative, and one of three in the application. */
@@ -166,6 +173,11 @@ export function deliveryPath(jobId: string): string {
 /** The path this portal records a milestone at. Relative, under the delivery it names. */
 export function milestonePath(jobId: string): string {
   return `${deliveryPath(jobId)}/milestones`;
+}
+
+/** The path this portal asks for somewhere to put a photograph. Relative, under the same delivery. */
+export function proofUploadPath(jobId: string): string {
+  return `${deliveryPath(jobId)}/proof-uploads`;
 }
 
 /**
@@ -423,4 +435,154 @@ export async function recordMilestone(
   }
 
   return { kind: "refused", refusal: recordRefusalFor(response.status, codeFrom(parsed)) };
+}
+
+/**
+ * Somewhere to put one photograph, as `POST /v1/driver/jobs/{id}/proof-uploads` answers it
+ * (SHIP-122).
+ *
+ * **`upload_url` is a credential** — the whole of the authorisation to write that object, until
+ * `expires_at`, unrevocable. It is used once and never stored: nothing in this application writes it
+ * to `sessionStorage`, and the route handler that carries it sets `cache-control: no-store`.
+ *
+ * `content_type` may come back spelled differently from what was sent — the platform lower-cases and
+ * trims it before signing — so what goes on the PUT is what came back here and never what the file
+ * reported.
+ */
+export interface Upload {
+  object_key: string;
+  upload_url: string;
+  method: string;
+  content_type: string;
+  content_length: number;
+  expires_at: string;
+}
+
+/** What one attempt at obtaining a place to upload produced. */
+export type UploadOutcome =
+  | { kind: "somewhere"; upload: Upload }
+  | { kind: "refused"; refusal: Refusal };
+
+function isUpload(value: unknown): value is Upload {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.object_key === "string" &&
+    typeof candidate.upload_url === "string" &&
+    typeof candidate.method === "string" &&
+    typeof candidate.content_type === "string" &&
+    typeof candidate.content_length === "number" &&
+    typeof candidate.expires_at === "string"
+  );
+}
+
+/**
+ * Ask the platform for somewhere to put one photograph (SHIP-122).
+ *
+ * # The key is fresh for this attempt and is never one held anywhere
+ *
+ * `lib/keys.ts`'s `freshKey` rather than `keyFor`, and it is the opposite call from the milestone.
+ * Reusing a stored key makes SHIP-15's middleware replay the stored response, which hands back the
+ * *same* URL with its expiry already running down — correct for a milestone, useless for an upload,
+ * and dead until Redis evicts it. A driver retrying after a failed upload needs a new slot.
+ *
+ * # The job identifier is the caller's, exactly as it is everywhere else in this file
+ *
+ * `lib/link.ts` has the argument; the short form is that SHIP-108's one-job check compares the job
+ * in the path with the job in the grant, and a client that built the path out of the grant would
+ * leave that check comparing the token with itself. The key the platform mints is scoped to the job
+ * *it* resolves from the token, so a mismatch here is refused rather than silently signed.
+ */
+export async function requestUpload(
+  jobId: string,
+  token: string,
+  what: { contentType: string; contentLength: number },
+  key: string,
+  signal?: AbortSignal,
+): Promise<UploadOutcome> {
+  let response: Response;
+  try {
+    response = await fetch(proofUploadPath(jobId), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`, // spelling:ok — RFC 9110
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": key,
+      },
+      body: JSON.stringify({
+        content_type: what.contentType,
+        content_length: what.contentLength,
+      }),
+      cache: "no-store",
+      signal,
+    });
+  } catch {
+    return { kind: "refused", refusal: "unavailable" };
+  }
+
+  let parsed: unknown = null;
+  try {
+    parsed = await response.json();
+  } catch {
+    parsed = null;
+  }
+
+  if (response.ok) {
+    return isUpload(parsed)
+      ? { kind: "somewhere", upload: parsed }
+      : { kind: "refused", refusal: "unexpected" };
+  }
+
+  return { kind: "refused", refusal: recordRefusalFor(response.status, codeFrom(parsed)) };
+}
+
+/**
+ * PUT one photograph to the store, which is the one request this application makes that does not go
+ * to its own origin (SHIP-122).
+ *
+ * # **The driver's token is not sent here, and that is the point of the whole arrangement**
+ *
+ * `upload_url` carries its own authorisation in its query string — that is what a pre-signed URL is.
+ * Attaching the link credential would send it to a host this application does not control, on a
+ * request that has no use for it, and `Docs/06` §5.2's whole reason for putting the bytes outside the
+ * platform is that the store and the API are separate trust domains. `lib/surface.test.ts` asserts
+ * that this function names no credential, and `lib/upload.test.ts` asserts it against the request
+ * that actually goes out.
+ *
+ * # `Content-Length` is deliberately not set, and it is still signed
+ *
+ * It is a forbidden header name in the Fetch specification: a browser refuses to let a page set it
+ * and computes it from the body. That is fine and is why the platform asks for the *exact* size —
+ * the value it signed is the size of the file, the browser sends that size because it is sending
+ * that file, and a mismatch is refused by the store rather than negotiated. Setting it here would
+ * be silently dropped, which is worse than not trying.
+ *
+ * `Content-Type` **is** set, from what the platform answered with rather than from what the file
+ * reports: the platform normalises the media type before signing it, so `IMAGE/JPEG` from a handset
+ * has already become `image/jpeg` by the time it is in the signature.
+ *
+ * # A refusal here is not an error contract
+ *
+ * The store is not this API and answers in its own vocabulary — a `403 SignatureDoesNotMatch` is XML.
+ * So nothing is parsed: what the caller needs to know is whether the bytes arrived, and the honest
+ * answer to anything else is "take it again".
+ */
+export async function putPhotograph(
+  upload: Upload,
+  photograph: Blob,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const stored = await fetch(upload.upload_url, {
+      method: upload.method,
+      headers: { "Content-Type": upload.content_type },
+      body: photograph,
+      cache: "no-store",
+      signal,
+    });
+    return stored.ok;
+  } catch {
+    return false;
+  }
 }

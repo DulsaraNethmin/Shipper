@@ -941,16 +941,21 @@ ok "and a retry under the same key answers with the milestone the first attempt 
 
 # --- the evidence line this ticket draws --------------------------------------------------------
 
+# **The line this ticket drew moved at SHIP-122 rather than disappearing.** SHIP-120a refused every
+# `object_key` from a driver, because no route issued one; the driver's upload exists now, so what is
+# refused is the narrower and better-founded thing — a key the platform did not issue, which is a
+# `409` after the store has been asked rather than a field error before it. The section below drives
+# the whole photographed path; this is the refusal that guards it.
 status="$(drv_record "$drv_token" "$drv_job" "verify-drvms-key-$$" \
   "{\"milestone\":\"picked_up\",\"proof\":{\"object_key\":\"proof/$drv_job/019bd7a1-2c44-7f10-9a2c-3d4e5f607182\"}}" objkey)"
-[[ "$status" == "422" ]] || { cat "$WORKDIR/drvms-objkey.json"; fail "a driver attached a photograph: $status, want 422"; }
-[[ "$(json "$WORKDIR/drvms-objkey.json" '["error"]["details"][0]["field"]')" == "proof.object_key" ]] \
-  || { cat "$WORKDIR/drvms-objkey.json"; fail "the refusal does not name proof.object_key"; }
+[[ "$status" == "409" ]] || { cat "$WORKDIR/drvms-objkey.json"; fail "a photograph that never arrived was accepted: $status, want 409"; }
+[[ "$(json "$WORKDIR/drvms-objkey.json" '["error"]["code"]')" == "delivery_proof_not_uploaded" ]] \
+  || { cat "$WORKDIR/drvms-objkey.json"; fail "expected code=delivery_proof_not_uploaded"; }
 
 status="$(drv_record "$drv_token" "$drv_job" "verify-drvms-exception-$$" \
   '{"milestone":"picked_up","proof":{"exception_reason":"camera_unavailable"}}' exception)"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/drvms-exception.json"; fail "a driver could not record a reasoned exception: $status"; }
-ok "a driver may say why there is no photograph and may not attach one — there is no route by which a driver could obtain a key, and SHIP-122 builds both halves together"
+ok "a driver may say why there is no photograph, and a key naming an object that never arrived is refused rather than believed — the platform never takes an upload on trust"
 
 # --- the event, fenced on this section's own job ------------------------------------------------
 
@@ -1907,3 +1912,191 @@ ok "the fifth milestone is refused by name and the portal does not offer it — 
 
 unset ms_portal_source ms_portal_wire ms_job ms_token ms_step ms_wire ms_body
 unset -f ms_record
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-122  a driver photographs a delivery, uploads it themselves, and records it as proof"
+
+# # What only this section can show, and it is the whole point of the ticket
+#
+# Until this route existed there was **no way for a driver to photograph a delivery at all**, because
+# there was no way for one to obtain an object key: `POST /v1/jobs/{id}/proof-uploads` is
+# `RequireUser`, and `internal/delivery` refused an `object_key` on the driver's milestone route by
+# name. So a driver could reach 'Delivered' only through a reasoned exception — which means SHIP-117's
+# moderation queue was the *only* path for a driver-recorded delivery rather than one of two.
+#
+# internal/delivery drives both new functions against a real database with a stubbed store, and
+# cmd/api holds the route's auth class. **What neither can reach is the store**: the domain's tests
+# stub the signer, so no Go test in this repository fails when a signature stops binding what it
+# should. This section is where the bytes actually leave a client, land in MinIO under the key the
+# API named, and come back out again.
+#
+# # The fixture is a fresh delivery, driven to 'In transit' on the driver's own link
+#
+# Not one of the jobs above: this is about a delivery a driver carried end to end, and the four
+# recordings are the sequence a portal produces.
+
+drvpx_job="$(delivery_awarded_job drvpx)"
+status="$(delivery_request "$delivery_provider_token" "verify-drvpx-assign-$$" \
+  "/v1/jobs/$drvpx_job/driver" '{"driver_name":"Priya Raman","driver_mobile":"+61417000122"}' \
+  "$WORKDIR/drvpx-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvpx-assign.json"; fail "assigning the driver returned $status, want 201"; }
+drvpx_token="$(json "$WORKDIR/drvpx-assign.json" '["driver_token"]')"
+drvpx_assignment="$(json "$WORKDIR/drvpx-assign.json" '["id"]')"
+
+drvpx_other_job="$(delivery_awarded_job drvpx-other)"
+status="$(delivery_request "$delivery_provider_token" "verify-drvpx-other-assign-$$" \
+  "/v1/jobs/$drvpx_other_job/driver" '{"driver_name":"Owen Blake","driver_mobile":"+61417000123"}' \
+  "$WORKDIR/drvpx-other-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvpx-other-assign.json"; fail "assigning the second driver returned $status"; }
+drvpx_other_token="$(json "$WORKDIR/drvpx-other-assign.json" '["driver_token"]')"
+
+# drvpx_post <token> <job> <suffix> <key> <body> <name> — one driver request under /driver/jobs/{id}.
+#
+# The credential, the job and the suffix are separate arguments for the reason every other driver
+# helper in this file keeps them apart: a helper that built the path out of the token could not
+# express the pairing these routes exist to refuse.
+drvpx_post() {
+  curl -s -X POST -o "$WORKDIR/drvpx-$6.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $4" \
+    -H 'Content-Type: application/json' -d "$5" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$2/$3"
+}
+
+# --- the URL, minted on the driver's own credential ---------------------------------------------
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-url-$$" \
+  '{"content_type":"image/jpeg","content_length":48}' url)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/drvpx-url.json"; fail "the driver's presign answered $status, want 200"; }
+
+drvpx_key="$(json "$WORKDIR/drvpx-url.json" '["object_key"]')"
+drvpx_url="$(json "$WORKDIR/drvpx-url.json" '["upload_url"]')"
+[[ "$(json "$WORKDIR/drvpx-url.json" '["method"]')" == "PUT" ]] || fail "the response does not describe a PUT"
+[[ "$drvpx_key" == proof/$drvpx_job/* ]] \
+  || fail "object_key is $drvpx_key, want it prefixed by proof/$drvpx_job/ — a key naming another job could never be recorded"
+ok "a driver holding a job-scoped link is issued an upload URL and a key under their own delivery — the route that did not exist for the whole of wave 8"
+
+# --- the bytes, which leave a client and never touch this service -------------------------------
+
+printf '%s' 'not a photograph, but exactly forty-eight bytes.' > "$WORKDIR/drvpx-proof.bin"
+put_status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H 'Content-Type: image/jpeg' --data-binary "@$WORKDIR/drvpx-proof.bin" "$drvpx_url")"
+[[ "$put_status" == "200" ]] \
+  || fail "the driver's pre-signed PUT answered $put_status — a browser could not upload directly, which is the whole of SHIP-122"
+
+drvpx_stored="$("${COMPOSE[@]}" exec -T minio sh -c \
+  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; \
+   mc cat "local/'"$STORAGE_BUCKET/$drvpx_key"'"' 2>/dev/null)"
+[[ "$drvpx_stored" == "not a photograph, but exactly forty-eight bytes." ]] \
+  || fail "the driver's object in $STORAGE_BUCKET reads back as '$drvpx_stored'"
+ok "and the browser PUTs it straight to $STORAGE_BUCKET with that URL and nothing else — the platform is in neither direction"
+
+# --- the record, which is what turns bytes into evidence -----------------------------------------
+
+for drvpx_step in en_route_to_pickup picked_up in_transit; do
+  status="$(drvpx_post "$drvpx_token" "$drvpx_job" milestones "verify-drvpx-$drvpx_step-$$" \
+    "{\"milestone\":\"$drvpx_step\"}" "$drvpx_step")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/drvpx-$drvpx_step.json"; fail "recording $drvpx_step answered $status"; }
+done
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" milestones "verify-drvpx-delivered-$$" \
+  "{\"milestone\":\"delivered\",\"proof\":{\"object_key\":\"$drvpx_key\"}}" delivered)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/drvpx-delivered.json"; fail "a driver could not record a photographed delivery: $status"; }
+drvpx_milestone="$(json "$WORKDIR/drvpx-delivered.json" '["id"]')"
+[[ "$(json "$WORKDIR/drvpx-delivered.json" '["recorded_by"]')" == "driver" ]] \
+  || fail "the photographed delivery is not attributed to the driver"
+ok "a driver records Delivered against the photograph they uploaded — the ordinary path, reachable by the person actually at the door"
+
+drvpx_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (p.job_id = '$drvpx_job') || ' ' || (p.milestone_id = '$drvpx_milestone')
+        || ' ' || p.content_type || ' ' || p.content_length
+        || ' ' || (p.exception_reason is null) || ' ' || (length(p.etag) > 0)
+     from proofs p where p.object_key = '$drvpx_key';")"
+[[ "$drvpx_row" == "true true image/jpeg 48 true true" ]] \
+  || fail "the driver's proof row is '$drvpx_row', want 'true true image/jpeg 48 true true'"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select actor_type || '/' || actor_id from milestones where id = '$drvpx_milestone';")" \
+   == "driver/$drvpx_assignment" ]] \
+  || fail "the delivered milestone is not attributed to the driver_assignments row the link names"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$drvpx_job';")" == "Delivered" ]] \
+  || fail "the job did not reach Delivered"
+ok "and the row holds a photograph rather than an exception, with the type, size and tag the store reported — a driver-recorded delivery that Docs/04 §5's queue has no reason to hold"
+
+# --- the two ways to get a key wrong --------------------------------------------------------------
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_other_job" proof-uploads "verify-drvpx-wrong-$$" \
+  '{"content_type":"image/jpeg","content_length":48}' wrong)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/drvpx-wrong.json"; fail "a link for $drvpx_job minted a URL on $drvpx_other_job: $status"; }
+[[ "$(json "$WORKDIR/drvpx-wrong.json" '["error"]["code"]')" == "not_found" ]] \
+  || fail "expected code=not_found; a 403 would confirm the other delivery exists"
+
+drvpx_elsewhere="$(drvpx_post "$drvpx_other_token" "$drvpx_other_job" proof-uploads \
+  "verify-drvpx-elsewhere-$$" '{"content_type":"image/jpeg","content_length":48}' elsewhere)"
+[[ "$drvpx_elsewhere" == "200" ]] || { cat "$WORKDIR/drvpx-elsewhere.json"; fail "the second driver's presign answered $drvpx_elsewhere"; }
+drvpx_elsewhere_key="$(json "$WORKDIR/drvpx-elsewhere.json" '["object_key"]')"
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" milestones "verify-drvpx-cross-$$" \
+  "{\"milestone\":\"picked_up\",\"proof\":{\"object_key\":\"$drvpx_elsewhere_key\"}}" cross)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/drvpx-cross.json"; fail "another delivery's key was accepted: $status, want 422"; }
+[[ "$(json "$WORKDIR/drvpx-cross.json" '["error"]["details"][0]["field"]')" == "proof.object_key" ]] \
+  || { cat "$WORKDIR/drvpx-cross.json"; fail "the refusal does not name proof.object_key"; }
+ok "a link mints no URL on another delivery and cannot attach one issued for another delivery — the grant scopes both halves"
+
+# --- the credential systems stay apart on the new route -------------------------------------------
+
+status="$(delivery_request "$delivery_provider_token" "verify-drvpx-session-$$" \
+  "/v1/driver/jobs/$drvpx_job/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' \
+  "$WORKDIR/drvpx-session.json")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/drvpx-session.json"; fail "a mobile session minted a driver upload URL: $status, want 401"; }
+
+status="$(delivery_request "$drvpx_token" "verify-drvpx-onuser-$$" \
+  "/v1/jobs/$drvpx_job/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' \
+  "$WORKDIR/drvpx-on-user-route.json")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/drvpx-on-user-route.json"; fail "a driver link minted a provider upload URL: $status, want 401"; }
+ok "a mobile access token is refused on the driver's upload route and the driver's link is refused on the provider's — both directions, one binary"
+
+# --- the key, and what a retry gets ---------------------------------------------------------------
+
+status="$(curl -s -X POST -o "$WORKDIR/drvpx-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $drvpx_token" -H 'Content-Type: application/json' \
+  -d '{"content_type":"image/jpeg","content_length":48}' \
+  "http://localhost:$VERIFY_PORT/v1/driver/jobs/$drvpx_job/proof-uploads")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/drvpx-nokey.json"; fail "the driver's presign was accepted with no idempotency key: $status"; }
+[[ "$(json "$WORKDIR/drvpx-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || { cat "$WORKDIR/drvpx-nokey.json"; fail "expected code=idempotency_key_required"; }
+
+# **A repeat under the same key replays the stored URL rather than minting a new slot**, which is
+# correct and is exactly why the driver portal sends a fresh key per attempt: one intent buys one
+# upload slot, and a retry must not extend a credential's life. A driver whose upload failed needs a
+# new slot, so their browser mints a new key — see apps/driver-portal/lib/keys.ts.
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-url-$$" \
+  '{"content_type":"image/jpeg","content_length":48}' url-again)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/drvpx-url-again.json"; fail "the replay answered $status"; }
+[[ "$(json "$WORKDIR/drvpx-url-again.json" '["object_key"]')" == "$drvpx_key" ]] \
+  || fail "the same key minted a second object key; one intent buys one upload slot"
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-fresh-$$" \
+  '{"content_type":"image/jpeg","content_length":48}' fresh)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/drvpx-fresh.json"; fail "the fresh-key presign answered $status"; }
+[[ "$(json "$WORKDIR/drvpx-fresh.json" '["object_key"]')" != "$drvpx_key" ]] \
+  || fail "a fresh key was issued the same object key; a URL issued today could then overwrite an object that already holds proof"
+ok "a driver's presign needs a key, replays under a repeated one, and mints a fresh object key under a new one — which is why the portal sends a new key per attempt"
+
+# --- what the platform will not sign for a driver either -------------------------------------------
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-svg-$$" \
+  '{"content_type":"image/svg+xml","content_length":48}' svg)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/drvpx-svg.json"; fail "a driver was signed a URL for image/svg+xml: $status"; }
+[[ "$(json "$WORKDIR/drvpx-svg.json" '["error"]["details"][0]["field"]')" == "content_type" ]] \
+  || fail "the refusal does not name content_type"
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-huge-$$" \
+  '{"content_type":"image/jpeg","content_length":99999999}' huge)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/drvpx-huge.json"; fail "a driver was signed a URL over the size limit: $status"; }
+[[ "$(json "$WORKDIR/drvpx-huge.json" '["error"]["details"][0]["field"]')" == "content_length" ]] \
+  || fail "the refusal does not name content_length"
+ok "the same policy applies to a driver's upload as to a provider's — one limit, enforced where the URL is signed rather than where the buttons are"
+
+unset drvpx_job drvpx_token drvpx_assignment drvpx_other_job drvpx_other_token drvpx_key drvpx_url
+unset drvpx_stored drvpx_step drvpx_milestone drvpx_row drvpx_elsewhere drvpx_elsewhere_key
+unset -f drvpx_post

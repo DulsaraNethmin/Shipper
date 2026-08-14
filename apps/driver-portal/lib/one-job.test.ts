@@ -67,6 +67,23 @@ register("./alias-hooks.mts", import.meta.url);
 
 const { GET } = await import("../app/api/driver/jobs/[jobId]/route.ts");
 const { POST } = await import("../app/api/driver/jobs/[jobId]/milestones/route.ts");
+const { POST: PRESIGN } = await import("../app/api/driver/jobs/[jobId]/proof-uploads/route.ts");
+
+/**
+ * Every route handler this origin serves, so the traversal test below cannot fall behind the
+ * portal.
+ *
+ * A list rather than the two the tests happened to import, because "can only ever reach one
+ * endpoint" is a property of *each* file: a portal with three route handlers and two guarded is a
+ * portal with an open door, and the failure mode is somebody adding a fourth and not thinking to add
+ * it here. `lib/surface.test.ts` counts the files independently, so a handler missing from this list
+ * is caught there as a `/v1/` template with no entry beside it.
+ */
+const HANDLERS: [string, (r: Request, c: { params: Promise<{ jobId: string }> }) => Promise<Response>][] = [
+  ["GET /api/driver/jobs/{id}", GET],
+  ["POST /api/driver/jobs/{id}/milestones", POST],
+  ["POST /api/driver/jobs/{id}/proof-uploads", PRESIGN],
+];
 
 /** One base64url segment of a token. */
 function segment(value: unknown): string {
@@ -455,8 +472,9 @@ test("the same link records on its own job", async () => {
 test("a traversal in the job identifier reaches no endpoint, on either route", async () => {
   const token = linkTokenFor(JOB_IN_THE_TOKEN);
 
-  for (const traversal of ["../../jobs", "..%2f..%2fjobs", "../../../v1/jobs/open"]) {
-    for (const handler of [GET, POST]) {
+  for (const traversal of ["../../jobs", "..%2f..%2fjobs", "../../../v1/jobs/open", "..", "%2e%2e"]) {
+    for (const [name, handler] of HANDLERS) {
+      const post = name.startsWith("POST");
       const wentOut: string[] = [];
       const globals = globalThis as unknown as { fetch?: typeof fetch };
       const realFetch = globals.fetch;
@@ -468,15 +486,15 @@ test("a traversal in the job identifier reaches no endpoint, on either route", a
       try {
         const response = await handler(
           new Request(`${ORIGIN}/api/driver/jobs/x`, {
-            method: handler === POST ? "POST" : "GET",
+            method: post ? "POST" : "GET",
             headers: { Authorization: `Bearer ${token}` }, // spelling:ok — RFC 9110
-            ...(handler === POST ? { body: '{"milestone":"picked_up"}' } : {}),
+            ...(post ? { body: "{}" } : {}),
           }),
           { params: Promise.resolve({ jobId: traversal }) },
         );
 
-        assert.equal(response.status, 400, `${traversal} was not refused`);
-        assert.deepEqual(wentOut, [], `${traversal} reached ${wentOut.join(", ")}`);
+        assert.equal(response.status, 400, `${name} did not refuse ${traversal}`);
+        assert.deepEqual(wentOut, [], `${name} reached ${wentOut.join(", ")} for ${traversal}`);
       } finally {
         globals.fetch = realFetch;
       }

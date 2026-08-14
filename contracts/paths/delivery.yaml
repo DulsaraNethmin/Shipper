@@ -1191,13 +1191,20 @@ DriverMilestones:
       The response's `recorded_by` is `driver`, and the milestone is attributed to your assignment
       rather than to an account, because a driver has none.
 
-      ## A photograph cannot be attached here yet
+      ## Evidence: a photograph, or a reason there is none
 
-      Send `proof.exception_reason` when there is no photograph to take — the three reasons are the
-      same ones the provider selects from. **`proof.object_key` is refused** with
-      `validation_failed`: there is no operation a driver can call to obtain one, so a key presented
-      here came from somewhere it should not have. The driver's upload arrives with SHIP-122 and
-      this refusal goes with it.
+      Both, now that `POST /v1/driver/jobs/{id}/proof-uploads` exists (SHIP-122). Send
+      `proof.object_key` with a key that operation gave you, **or** `proof.exception_reason` with one
+      of the three reasons a photograph can be impossible — never both, never neither.
+
+      A key is checked against the job your link opens, not against a path, so a driver carrying two
+      deliveries cannot attach one job's photograph to the other: that answers `422` naming
+      `proof.object_key`. A key whose object has not reached the store yet answers `409
+      delivery_proof_not_uploaded` — finish the PUT, then record.
+
+      `delivered` is refused with `409 delivery_proof_required` when it carries neither. That is not
+      a rule about this operation; it is a rule about deliveries, enforced in the domain and again by
+      a database constraint at commit.
 
       The consequence is worth knowing before you build against it: until then, a driver recording
       `delivered` must send an `exception_reason`, because `delivered` requires evidence and the
@@ -1670,3 +1677,127 @@ DriverLinkView:
         assigned. It is the only record a reissue leaves — the platform keeps no copy of a link it
         has replaced.
       example: 2
+
+DriverProofUploads:
+  post:
+    operationId: presignDriverProofUpload
+    summary: Get somewhere to upload a proof photograph, from a driver's link
+    tags: [Delivery]
+    security:
+      - BearerDriverToken: []
+    description: |
+      The driver's own way to obtain a place to put one photograph (SHIP-122). It is the same act as
+      `POST /v1/jobs/{id}/proof-uploads` and answers the same shape; what differs is who is holding
+      the credential.
+
+      Until this operation existed there was **no way for a driver to photograph a delivery at all**,
+      because there was no way for one to obtain an object key — so a driver could only reach
+      `delivered` through a reasoned exception, which flags the job into the moderation queue. This
+      is the operation that makes the ordinary path available to the person actually standing at the
+      door.
+
+      ## It is a separate operation because the credentials are separate systems
+
+      A mobile access token answers `401` here, and a driver's link answers `401` on the provider's
+      operation. Neither can be exchanged for the other in either direction.
+
+      ## The link grants this job and nothing else
+
+      The key you are given names the job inside your token's signature, and no request shape widens
+      that. Presenting the link on another job answers `404`, and a link whose assignment is no
+      longer the live one on the job answers `404` as well — a stood-down driver keeps a credential
+      that still verifies, and what has gone is the assignment behind it.
+
+      ## What to do with the response, and what a retry gets
+
+      Identical to the provider's operation — see `ProofUploads` for the PUT, the two signed headers
+      and why a successful upload answers `200` with an empty body. Keep the `object_key` and send it
+      as `proof.object_key` on `POST /v1/driver/jobs/{id}/milestones`.
+
+      **Use a fresh `Idempotency-Key` for every attempt at this operation.** Reusing one replays the
+      stored response, which hands back the same URL with its expiry already running down — correct
+      for a milestone, useless for an upload. A milestone keeps its key across retries; this does
+      not.
+
+      Generate that key from a cryptographically secure random source. On this operation the stored
+      response is a credential, and an unguessable key is part of what keeps it yours.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/ProofUploadRequest'
+    responses:
+      '200':
+        description: |
+          A URL you may upload one photograph to.
+
+          `200` rather than `201` because nothing was created — see `ProofUploads`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ProofUpload'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          The link is not valid, or it has expired (`delivery_driver_link_expired`). There is nothing
+          to refresh and no account to sign in to: ask the transport provider for a new link.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          The link no longer opens a delivery. One answer to two questions, and deliberately: a valid
+          link presented on a **different job**, and a link whose driver has been **stood down**.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          An identical request is still being handled (`idempotency_request_in_progress`). Retry in
+          a moment.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The upload was refused before anything was signed (`validation_failed`). `error.details`
+          names `content_type` or `content_length`, and the message carries the current limit.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'

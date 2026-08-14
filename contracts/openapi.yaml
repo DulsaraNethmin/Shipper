@@ -212,6 +212,8 @@ paths:
     $ref: './paths/delivery.yaml#/DriverJob'
   /v1/driver/jobs/{id}/milestones:
     $ref: './paths/delivery.yaml#/DriverMilestones'
+  /v1/driver/jobs/{id}/proof-uploads:
+    $ref: './paths/delivery.yaml#/DriverProofUploads'
   /v1/fleet/bids:
     $ref: './paths/bidding.yaml#/FleetBids'
   /v1/fleet/profile:

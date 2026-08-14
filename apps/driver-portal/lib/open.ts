@@ -1,13 +1,15 @@
 import {
   isSettled,
   openDelivery,
+  putPhotograph,
   recordMilestone,
+  requestUpload,
   type Delivery,
   type Evidence,
   type RecordOutcome,
   type Refusal,
 } from "./delivery.ts";
-import { keyFor, settle } from "./keys.ts";
+import { freshKey, keyFor, settle } from "./keys.ts";
 import { isJobId, recallToken, rememberToken, tokenFromFragment } from "./link.ts";
 
 /**
@@ -129,4 +131,77 @@ export async function recordStep(
 
   if (outcome.kind === "recorded" || isSettled(outcome.refusal)) settle(scope);
   return outcome;
+}
+
+/**
+ * Capture one photograph and record the milestone it stands behind (SHIP-122).
+ *
+ * Three requests, in an order that cannot be rearranged, and the middle one does not go to this
+ * origin:
+ *
+ *  1. **Ask for somewhere to put it.** `POST /v1/driver/jobs/{id}/proof-uploads`, through this
+ *     origin's own route handler, on the driver's link. Answers with a short-lived pre-signed URL
+ *     and the `object_key` that names what will be there.
+ *  2. **PUT the bytes to the store.** Straight to the URL, with **no credential attached** — the URL
+ *     is the credential — and with this service in neither direction (`Docs/06` §5.2). The platform
+ *     never sees the photograph.
+ *  3. **Record the milestone against the key.** `POST /v1/driver/jobs/{id}/milestones` with
+ *     `proof.object_key`. This is where the object *becomes* evidence: until it does, it is bytes
+ *     with a name, and `internal/delivery` asks the store what is actually there before it writes
+ *     the row — the platform never takes a client's word for an upload it did not observe.
+ *
+ * # Why the ordering is not negotiable
+ *
+ * Recording before uploading answers `409 delivery_proof_not_uploaded`, which is the platform
+ * refusing to hold a record that asserts a photograph exists when nothing has looked. `Docs/01` §4.4
+ * makes proof "the only evidence that the job happened as claimed", so a row that might point at
+ * nothing is not evidence — and a dispute is where that would be discovered.
+ *
+ * # A failed upload leaves nothing behind, and the driver has two ways forward
+ *
+ * Step 1 wrote nothing durable — SHIP-114 argues at length that issuing a URL reserves no object and
+ * records no row — so a failure at step 2 leaves at most one unreferenced object key nobody will
+ * ever use, which ages out. The driver taps again and gets a **new** URL and a **new** key, because
+ * the presign uses `freshKey`. Or they take the exception path, which finishes the job with a reason
+ * in place of the photograph and is exactly what `Docs/01` §4.4 built it for.
+ *
+ * # The milestone's key is held and the presign's is not
+ *
+ * Step 3 goes through [recordStep], so it takes the held per-action key and settles it on an answer.
+ * Step 1 mints a fresh one every time. That asymmetry is the contract read correctly rather than an
+ * inconsistency — `lib/keys.ts` has the argument.
+ */
+export async function capturePhotograph(
+  jobId: string,
+  milestone: string,
+  photograph: Blob,
+  options: { signal?: AbortSignal } = {},
+): Promise<Told> {
+  if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
+
+  const token = tokenForThisView(jobId);
+  if (token === null) return { kind: "missing" };
+
+  // The type and the size come from the file the camera produced, and the platform signs both. A
+  // handset that reports no media type at all — some Android WebViews, on a file picked rather than
+  // captured — is refused by the platform naming `content_type`, which the page renders as
+  // `rejected` and offers the exception path beside. Guessing one here would be this application
+  // inventing a fact about bytes it has not looked at.
+  const asked = await requestUpload(
+    jobId,
+    token,
+    { contentType: photograph.type, contentLength: photograph.size },
+    freshKey(),
+    options.signal,
+  );
+  if (asked.kind === "refused") return asked;
+
+  if (!(await putPhotograph(asked.upload, photograph, options.signal))) {
+    return { kind: "refused", refusal: "upload_failed" };
+  }
+
+  return recordStep(jobId, milestone, {
+    evidence: { object_key: asked.upload.object_key },
+    signal: options.signal,
+  });
 }

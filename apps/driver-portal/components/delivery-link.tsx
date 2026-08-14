@@ -8,7 +8,7 @@ import { Separator } from "@/components/ui/separator";
 import { REFUSALS, type Delivery, type Evidence, type Refusal } from "@/lib/delivery";
 import { dayFirst } from "@/lib/format";
 import { EXCEPTION_COPY, MILESTONES, type Milestone } from "@/lib/milestones";
-import { openLink, recordStep, type Opened } from "@/lib/open";
+import { capturePhotograph, openLink, recordStep, type Opened, type Told } from "@/lib/open";
 import { proofExceptionReasonValues } from "@/lib/statuses.gen";
 
 /**
@@ -282,26 +282,36 @@ function Progress({ jobId }: { jobId: string }) {
 
   const at = useCallback((wire: string): StepState => steps[wire] ?? { kind: "idle" }, [steps]);
 
-  const record = useCallback(
-    (wire: string, evidence?: Evidence) => {
-      setSteps((held) => ({ ...held, [wire]: { kind: "recording" } }));
+  // One place both the plain recording and the photographed one report into, because the four
+  // outcomes and the "close the completion step" rule are the same for both — a second copy would be
+  // a second place for a photographed delivery to be drawn differently from an exception one.
+  const settle = useCallback((wire: string, attempt: Promise<Told>) => {
+    setSteps((held) => ({ ...held, [wire]: { kind: "recording" } }));
 
-      void recordStep(jobId, wire, { evidence }).then(
-        (told) => {
-          if (!live.current) return;
-          setSteps((held) => ({ ...held, [wire]: stepFrom(told) }));
-          if (told.kind === "recorded") setCompleting(false);
-        },
-        () => {
-          // recordStep resolves rather than rejects, exactly as openLink does. A browser that
-          // surprises us leaves the button offering another go rather than spinning for ever.
-          if (live.current) {
-            setSteps((held) => ({ ...held, [wire]: { kind: "refused", refusal: "unexpected" } }));
-          }
-        },
-      );
-    },
-    [jobId],
+    void attempt.then(
+      (told) => {
+        if (!live.current) return;
+        setSteps((held) => ({ ...held, [wire]: stepFrom(told) }));
+        if (told.kind === "recorded") setCompleting(false);
+      },
+      () => {
+        // Both chains resolve rather than reject, exactly as openLink does. A browser that
+        // surprises us leaves the button offering another go rather than spinning for ever.
+        if (live.current) {
+          setSteps((held) => ({ ...held, [wire]: { kind: "refused", refusal: "unexpected" } }));
+        }
+      },
+    );
+  }, []);
+
+  const record = useCallback(
+    (wire: string, evidence?: Evidence) => settle(wire, recordStep(jobId, wire, { evidence })),
+    [jobId, settle],
+  );
+
+  const capture = useCallback(
+    (wire: string, photograph: Blob) => settle(wire, capturePhotograph(jobId, wire, photograph)),
+    [jobId, settle],
   );
 
   return (
@@ -328,6 +338,7 @@ function Progress({ jobId }: { jobId: string }) {
         {completing ? (
           <Completion
             recording={at("delivered").kind === "recording"}
+            onPhotograph={(photograph) => capture("delivered", photograph)}
             onException={(reason) => record("delivered", { exception_reason: reason })}
             onCancel={() => setCompleting(false)}
           />
@@ -394,43 +405,89 @@ function Step({
  * Finishing the delivery, which needs evidence (`Docs/01` §4.4, and `CLAUDE.md` calls it an
  * invariant).
  *
- * # Only the exception path today, and that is the honest half rather than a stub
+ * # Both halves, and the order they are offered in is the decision
  *
- * `Docs/01` §4.4 makes photo proof mandatory **and**, in the same paragraph, makes the exception
- * path "part of the same feature… built with it, not after". The reason it gives is operational:
- * "what must never happen is a driver standing at a delivery point unable to finish the job — that
+ * `Docs/01` §4.4 makes photo proof mandatory **and**, in the same paragraph, makes the exception path
+ * "part of the same feature… built with it, not after". The reason it gives is operational: "what
+ * must never happen is a driver standing at a delivery point unable to finish the job — that
  * converts a UI constraint into an operational failure and a support call".
  *
- * A photograph is the other half and it is **SHIP-122's**, because there is presently no route by
- * which a driver can obtain an object key — `POST /v1/jobs/{id}/proof-uploads` is `RequireUser`, and
- * `internal/delivery` refuses an `object_key` on the driver's milestone route by name, naming the
- * exception path beside it. So the three reasons below are the whole of what a driver can do here
- * now, and they are enough to finish the job, which is the property that mattered.
+ * So the camera is first and largest, and the three reasons sit under it in the same sheet rather
+ * than behind another tap. A driver whose camera permission has just been denied is exactly the
+ * person who must not have to go looking, and `camera_unavailable` is one of the three reasons for
+ * precisely that case.
+ *
+ * # The camera is a file input and not a media stream, and that is deliberate on this surface
+ *
+ * `capture="environment"` on `<input type="file" accept="image/*">` asks the handset to open the
+ * rear camera directly. It costs no permission prompt of its own on iOS and Android — the picker is
+ * the permission — it needs no `getUserMedia`, no video element, no canvas and no secure-context
+ * fallback, and **a browser that does not honour the attribute degrades to the photo library**,
+ * which is a working path rather than a dead end. A `MediaDevices` implementation would be more
+ * control and four more failure modes on a device this application cannot test on.
+ *
+ * The file is handed straight to `capturePhotograph` as a `Blob`. **Nothing here compresses it**:
+ * SHIP-130's on-device compression budget is the Flutter client's, and the platform's size limit is
+ * server-side and comes back in the refusal message, which is where a client learns the current one.
+ * A photograph over the limit is a `rejected` with the limit in it, and the exception path is on the
+ * same screen.
  *
  * # The reasons are generated and not typed out
  *
  * `lib/statuses.gen.ts` renders them from `contracts/statuses.yaml`, which is where `Docs/01` §4.4's
- * three clauses live. A hand-written list here would be a fourth copy, and it would offer a value
- * `internal/delivery` then rejected the first time operations changed the set.
+ * three clauses live, and `EXCEPTION_COPY` is keyed by that generated union — so a fourth reason is
+ * a build failure here rather than a button that never appears.
  */
 function Completion({
   recording,
+  onPhotograph,
   onException,
   onCancel,
 }: {
   recording: boolean;
+  onPhotograph: (photograph: Blob) => void;
   onException: (reason: string) => void;
   onCancel: () => void;
 }) {
+  const camera = useRef<HTMLInputElement | null>(null);
+
   return (
     <div className="border-border flex flex-col gap-3 rounded-lg border p-3">
       <div className="flex flex-col gap-1">
-        <p className="text-sm font-medium">Why is there no photograph?</p>
+        <p className="text-sm font-medium">Finish the delivery</p>
         <p className="text-muted-foreground text-xs">
-          A delivery is recorded with a photograph, or with a reason there is none. Taking one from
-          this page is not built yet, so choose the reason that fits and the job is finished.
+          A delivery is recorded with a photograph of the goods where you left them, or with a
+          reason there is none. Either one finishes the job.
         </p>
       </div>
+
+      <input
+        ref={camera}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="sr-only"
+        aria-hidden="true"
+        tabIndex={-1}
+        onChange={(event) => {
+          const photograph = event.target.files?.[0];
+          // The value is cleared so that taking the same photograph twice — which a driver does
+          // after a failed upload — fires `change` again. Without it the second attempt is silent.
+          event.target.value = "";
+          if (photograph !== undefined) onPhotograph(photograph);
+        }}
+      />
+
+      <Button
+        size="lg"
+        className="h-14 w-full justify-center text-base"
+        disabled={recording}
+        onClick={() => camera.current?.click()}
+      >
+        {recording ? "Finishing…" : "Take a photograph"}
+      </Button>
+
+      <p className="text-muted-foreground text-xs">Or say why there is no photograph:</p>
 
       {proofExceptionReasonValues.map((reason) => (
         <Button

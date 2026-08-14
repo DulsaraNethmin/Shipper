@@ -100,13 +100,14 @@ func init() {
 			// driver's. The caller is the awarded provider, checked against the accepted
 			// bid.
 			//
-			// **SHIP-122 needs the driver's version of this and it is not here**, which is a
-			// gap recorded in Docs/11 §3 rather than a decision. A driver-token route is
-			// served with the idempotency scope `anonymous` — the scope is computed
-			// group-wide, outside the middleware, while a guard runs per route inside it —
-			// and this response carries a URL that can write into the evidence bucket. That
-			// is the SHIP-44 shape the whole service was fixed for, and it stays shut until
-			// SHIP-121 settles the scope.
+			// **The driver's version of this is now the last route in this file**
+			// (SHIP-122). This comment used to say it was "a gap recorded in Docs/11 §3
+			// rather than a decision", held shut because a driver-token route is served
+			// with the idempotency scope `anonymous` and this response carries a URL that
+			// can write into the evidence bucket. SHIP-120a settled the scope and SHIP-122
+			// wrote down what a replay of that stored credential actually reaches — see
+			// [delivery.Handler.PresignDriverProofUpload], which is the paragraph to read
+			// before touching either route.
 			//
 			// # A pre-signed URL is minted here and spent nowhere in this service
 			//
@@ -260,6 +261,40 @@ func init() {
 			// not a URL that writes into the evidence bucket.
 			Auth:    RequireDriverToken,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordDriverMilestone() },
+		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/driver/jobs/{id}/proof-uploads",
+			Group:   GroupV1,
+
+			// **The route this file recorded as a gap for a wave** (SHIP-122), and the one
+			// that makes a driver able to photograph a delivery at all. Until it existed,
+			// `internal/delivery` refused an `object_key` on the driver's milestone route by
+			// name — there was no route by which a driver could obtain one — so SHIP-117's
+			// moderation queue was the *only* path to a driver-recorded 'Delivered' rather
+			// than one of two.
+			//
+			// # Why a fourth segment is safe here and would not be under /jobs
+			//
+			// `GET /jobs/open/{id}` puts a literal in the `{id}` position, so it and any
+			// three-segment `GET /jobs/{id}/<literal>` both match `/jobs/open/<literal>`
+			// with neither more specific, and Go's ServeMux **panics at registration**. That
+			// collision is confined to the `/jobs` tree and to `GET`: `/driver/...` is a
+			// different tree with no literal in its identifier slot, and this is a POST in
+			// any case — which is the same reason `POST /jobs/{id}/proof-uploads` above is
+			// unaffected.
+			//
+			// # The scope question this route had to answer before it could be served
+			//
+			// A driver token produces no `authctx.Subject`, so the idempotency key lands in
+			// `idem:v1:anonymous:<key>` — and unlike the milestone route beside it, **this
+			// response body is a credential**. [delivery.Handler.PresignDriverProofUpload]
+			// carries the whole analysis: what a replay requires, what it can and cannot
+			// then do, and the `internal/httpx` change that would close it properly, which
+			// is a prep ticket's rather than a domain branch's. Read it before adding a
+			// second driver-token route whose response carries anything issued.
+			Auth:    RequireDriverToken,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).PresignDriverProofUpload() },
 		},
 	)
 }
