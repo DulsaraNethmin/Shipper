@@ -28,6 +28,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"net"
@@ -506,16 +507,40 @@ type administratorResponse struct {
 	Name  string `json:"name"`
 	Role  string `json:"role"`
 
+	// Permissions is what the role holds, expanded (SHIP-148).
+	//
+	// **Published so the console can hide what it may not do, and never so it can decide.**
+	// Docs/07 §3 is the rule and it is a rule about every client: the app may hide or disable,
+	// the platform rules. An administrator who edited this list in a response would find every
+	// endpoint refusing them exactly as before, because the check reads the role out of the
+	// session row on each request.
+	//
+	// Sent expanded rather than left for a client to derive from `role`, because a derivation
+	// is a second copy of [rolePermissions] in TypeScript — and the copy would be the one that
+	// drifted, since nothing fails when a console shows a button that answers 403.
+	Permissions []string `json:"permissions"`
+
 	CreatedAt string `json:"created_at"`
 }
 
 func administratorFrom(a Administrator) administratorResponse {
+	held := a.Role.Permissions()
+
+	// Never nil on the wire: a role with no permissions is a real state — that is what an
+	// unrecognised one grants — and `null` makes a console that iterates without checking crash
+	// on exactly the account it most needs to render.
+	permissions := make([]string, 0, len(held))
+	for _, p := range held {
+		permissions = append(permissions, p.String())
+	}
+
 	return administratorResponse{
-		ID:        a.ID.String(),
-		Email:     a.Email,
-		Name:      a.Name,
-		Role:      a.Role.String(),
-		CreatedAt: timestamp(a.CreatedAt),
+		ID:          a.ID.String(),
+		Email:       a.Email,
+		Name:        a.Name,
+		Role:        a.Role.String(),
+		Permissions: permissions,
+		CreatedAt:   timestamp(a.CreatedAt),
 	}
 }
 
@@ -686,4 +711,106 @@ func retryAfterSeconds(d time.Duration) string {
 		seconds = 1
 	}
 	return strconv.Itoa(seconds)
+}
+
+// --- administrator management, behind a granular permission (SHIP-148) ---------------------------
+
+// createAdministratorRequest is the body of POST /v1/admin/administrators.
+//
+//	{"email": "sam@shipper.example", "name": "Sam Okafor",
+//	 "password": "…", "role": "moderator"}
+//
+// **`role` is optional and omitting it is not an error**, which is the ticket's *Done when* on the
+// wire: a request that does not say gets the least-privileged role rather than the creator's, and
+// rather than a refusal. A role the platform does not have *is* an error, because that is a
+// different mistake — see [CreateCommand.Validate].
+type createAdministratorRequest struct {
+	Email    string `json:"email"`
+	Name     string `json:"name"`
+	Password string `json:"password"`
+	Role     string `json:"role,omitempty"`
+}
+
+// CreateAdministrator handles POST /v1/admin/administrators (SHIP-147, SHIP-148).
+//
+// # This is the endpoint the permission model exists for
+//
+// Somebody who can create an administrator can create one with any role, which makes every other
+// boundary in permissions.go advisory. So it is the one endpoint gated on [PermissionAdminsManage],
+// which only [RoleOwner] holds — a `support` or `moderator` session reaching it gets a 403 naming no
+// permission, and the permission it wanted goes to the log.
+//
+// # There is no bootstrap path here, deliberately
+//
+// The first administrator in a deployment cannot come from an endpoint that requires an
+// administrator. It comes from one `INSERT` by an operator — see `000801`'s header — and this
+// endpoint is how every account after it is made. An "if there are no administrators yet, allow
+// anybody" branch would be an unauthenticated account-creation endpoint for as long as the table
+// was empty, which is every deployment's first minute and any deployment somebody has cleaned.
+//
+// 201 with the account, and the password is not echoed.
+func (h *Handler) CreateAdministrator() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionAdminsManage); err != nil {
+			return err
+		}
+
+		var req createAdministratorRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		created, err := h.creds.Create(r.Context(), CreateCommand{
+			Email:    req.Email,
+			Name:     req.Name,
+			Password: req.Password,
+			Role:     Role(req.Role),
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusCreated, administratorFrom(created))
+		return nil
+	})
+}
+
+// permitted is the authorisation check every administrative handler makes (SHIP-148).
+//
+// # Why it takes a permission and not a role
+//
+// "Granular" is the *Done when*'s first word. A handler asking `if role == owner` would make every
+// future permission a change to that condition, and a condition drifts towards whichever role
+// already worked — which is how a moderation console ends up with three roles and one of them
+// meaning anything.
+//
+// # Why the refusal names nothing
+//
+// The message sends somebody to ask for access rather than to enumerate what the platform can do,
+// and the permission that was missing goes to the log against the request id instead. An
+// administrator who needs to know which permission they lack asks the person who can grant it,
+// which is the same person who can read the log.
+//
+// # Why the grant is returned as well
+//
+// Every caller needs it immediately afterwards — to attribute an audit entry (SHIP-150), or to scope
+// a query. Returning it here means a handler cannot read the grant *without* having stated which
+// permission it was acting under, which is the property that makes an unguarded handler visible in
+// review rather than merely absent.
+func (h *Handler) permitted(r *http.Request, p Permission) (Grant, error) {
+	grant, err := mustGrant(r.Context())
+	if err != nil {
+		return Grant{}, err
+	}
+	if !grant.Permits(p) {
+		httpx.LoggerFrom(r.Context()).LogAttrs(r.Context(), slog.LevelInfo,
+			"an administrator was refused an action their role does not permit",
+			slog.String("administrator_id", grant.Administrator.ID.String()),
+			slog.String("role", grant.Administrator.Role.String()),
+			slog.String("permission", p.String()))
+
+		return Grant{}, apiError(fmt.Errorf("%w: %s needs %s",
+			ErrAdminPermissionDenied, grant.Administrator.Role, p))
+	}
+	return grant, nil
 }

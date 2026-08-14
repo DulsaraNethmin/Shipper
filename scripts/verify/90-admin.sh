@@ -560,3 +560,138 @@ admin_clear_limits
 [[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:admin-signin:*' | wc -l | tr -d ' ')" == "0" ]] \
   || fail "administrator sign-in buckets survived the clean-up"
 ok "the administrator sign-in buckets are cleared, so a later section is not throttled by this one"
+
+# ==========================================================================================
+# SHIP-148 — granular permissions that default to the minimum.
+#
+# The Go tests hold the catalogue, the bundles and the default-deny property. **What only this can
+# show is that the check is in front of the endpoint**, against the real binary, with a real session
+# — a permission model whose middleware is never reached is a table nobody consults.
+#
+# It reuses SHIP-147's fixture hash and clears the same buckets, and it signs in twice, so it runs
+# inside the same allowance the section above cleared at both ends.
+
+ticket "SHIP-148  administrator permissions are granular and default to the minimum"
+
+admin_clear_limits
+
+owner_email="verify-admin-owner-$$@example.com"
+owner_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$owner_email', 'Verify Owner Two', '$admin_fixture_hash', 'owner')
+   returning id;")"
+[[ -n "$owner_id" ]] || fail "the owner could not be created"
+
+status="$(admin_signin "verify-adm-owner-in-$$" "$owner_email" "$admin_password" owner-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-owner-in.json"; fail "the owner could not sign in ($status)"; }
+owner_token="$(json "$WORKDIR/admin-owner-in.json" '["token"]')"
+
+# The permissions are published so a console can hide what it may not do, and they are the role's
+# rather than a copy the client would have to derive.
+owner_permissions="$(json "$WORKDIR/admin-owner-in.json" '["administrator"]["permissions"]')"
+[[ "$owner_permissions" == *"admins.manage"* ]] \
+  || { cat "$WORKDIR/admin-owner-in.json"; fail "the owner's permissions do not include admins.manage"; }
+ok "an administrator is told what their role holds, expanded, so a console can hide what it may not do"
+
+# --- creating an administrator, and the default that makes least privilege real -----------------
+
+made_email="verify-admin-made-$$@example.com"
+status="$(curl -s -X POST -o "$WORKDIR/admin-made.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $owner_token" -H "Idempotency-Key: verify-adm-made-$$" \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$made_email\",\"name\":\"Verify Support\",\"password\":\"$admin_password\"}" \
+  "http://localhost:$VERIFY_PORT/v1/admin/administrators")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/admin-made.json"; fail "creating an administrator returned $status, want 201"; }
+
+made_role="$(json "$WORKDIR/admin-made.json" '["role"]')"
+[[ "$made_role" == "support" ]] \
+  || { cat "$WORKDIR/admin-made.json"; fail "an administrator created with no role stated got '$made_role', want the least-privileged role"; }
+[[ "$(json "$WORKDIR/admin-made.json" '["permissions"]')" != *"admins.manage"* ]] \
+  || { cat "$WORKDIR/admin-made.json"; fail "the created administrator inherited the creator's permission to manage administrators"; }
+ok "an administrator created with no role stated gets the minimum, not the creator's — Docs/04 §9's least privilege"
+
+# The same statement one level down: the column default is what covers a row that never came
+# through the API at all, which is every migration and every support script.
+# -qtAc, not -tAc: without -q psql appends the command tag, so this captures "support\nINSERT 0 1"
+# and the comparison fails on a row that was written correctly. The same trap the SHIP-149 section
+# at the top of this file records.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash)
+   values (gen_random_uuid(), 'verify-admin-defaulted-$$@example.com', 'Defaulted', '$admin_fixture_hash')
+   returning role;")" == "support" ]] \
+  || fail "a row inserted with no role did not default to the least-privileged one"
+ok "and so does a row inserted with no role at all, because the default is the column's as well as the code's"
+
+# --- the granular refusal -----------------------------------------------------------------------
+
+status="$(admin_signin "verify-adm-made-in-$$" "$made_email" "$admin_password" made-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-made-in.json"; fail "the created administrator could not sign in ($status)"; }
+made_token="$(json "$WORKDIR/admin-made-in.json" '["token"]')"
+
+# It reaches an endpoint that needs no special permission, so the refusal below is about the
+# permission and not about the credential.
+status="$(admin_get /v1/admin/me "$made_token" made-me)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-made-me.json"; fail "the support administrator cannot read its own session ($status)"; }
+
+status="$(curl -s -X POST -o "$WORKDIR/admin-made-create.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $made_token" -H "Idempotency-Key: verify-adm-escalate-$$" \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"verify-admin-escalated-$$@example.com\",\"name\":\"Escalated\",\"password\":\"$admin_password\",\"role\":\"owner\"}" \
+  "http://localhost:$VERIFY_PORT/v1/admin/administrators")"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/admin-made-create.json"; fail "a support administrator created an owner and got $status, want 403"; }
+[[ "$(json "$WORKDIR/admin-made-create.json" '["error"]["code"]')" == "admin_permission_denied" ]] \
+  || { cat "$WORKDIR/admin-made-create.json"; fail "the refusal is not a permission refusal"; }
+[[ "$(cat "$WORKDIR/admin-made-create.json")" != *"admins.manage"* ]] \
+  || { cat "$WORKDIR/admin-made-create.json"; fail "the refusal names the permission it wanted, so the console's surface is readable from the least-privileged account"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from admin_users where email = 'verify-admin-escalated-$$@example.com';")" == "0" ]] \
+  || fail "the refused request created the account anyway"
+ok "a granular permission refuses the one endpoint that could grant permissions, names nothing, and writes nothing"
+
+# --- a role change takes effect on the next request, which is why the credential is a row --------
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update admin_users set role = 'owner' where email = '$made_email';" >/dev/null \
+  || fail "the role could not be changed"
+
+status="$(admin_get /v1/admin/me "$made_token" made-promoted)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-made-promoted.json"; fail "the promoted administrator cannot read its own session ($status)"; }
+[[ "$(json "$WORKDIR/admin-made-promoted.json" '["administrator"]["role"]')" == "owner" ]] \
+  || { cat "$WORKDIR/admin-made-promoted.json"; fail "the same credential still reports the old role"; }
+ok "a role change reaches the same unexpired credential on its very next request — a signed token would have carried the old one until it expired"
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update admin_users set role = 'support' where email = '$made_email';" >/dev/null \
+  || fail "the role could not be changed back"
+
+status="$(curl -s -X POST -o "$WORKDIR/admin-demoted-create.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $made_token" -H "Idempotency-Key: verify-adm-demoted-$$" \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"verify-admin-after-$$@example.com\",\"name\":\"After\",\"password\":\"$admin_password\"}" \
+  "http://localhost:$VERIFY_PORT/v1/admin/administrators")"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/admin-demoted-create.json"; fail "a demoted administrator kept the permission and got $status, want 403"; }
+ok "and a demotion takes it away again on the next one, which is the direction that matters"
+
+# --- the invariant SHIP-148 is most able to break -------------------------------------------------
+#
+# CLAUDE.md: audit entries are append-only and ordinary administrators cannot delete them. The Go
+# half is that the catalogue has no such permission, so no endpoint can name one. **This is the half
+# that holds for a connection that never went through the service at all**, which is what makes it a
+# control rather than a convention — and it is the same trigger the SHIP-149 section above tests,
+# re-asserted here because SHIP-148 is the ticket that would break it.
+
+audit_entry="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into audit_log (id, actor_type, actor_id, action, target_type, target_id)
+   values (gen_random_uuid(), 'admin', '$owner_id', 'administrator.created', 'admin_user', '$owner_id')
+   returning id;")"
+[[ -n "$audit_entry" ]] || fail "an audit entry could not be appended"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "delete from audit_log where id = '$audit_entry';" >/dev/null 2>&1; then
+  fail "an audit entry naming an administrator was deleted"
+fi
+ok "no administrator can delete an audit entry — there is no permission for it and the trigger refuses it from any connection"
+
+admin_clear_limits

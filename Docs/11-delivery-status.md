@@ -259,7 +259,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **589 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **596 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -425,6 +425,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
 | **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
+| **SHIP-148** | M6 | Twelve granular permissions and three role bundles, in a **Go table rather than a grant table** — a permission model is the opposite of the thing `Docs/06` §5.3 puts server-side and changeable. Default-deny at three levels: an omitted role becomes the minimum in Go *and* in the column default, and a role with **no bundle holds nothing**. There is deliberately **no permission to delete an audit entry** — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -8182,6 +8183,69 @@ topic. What was wrong is that **a fence protects the assertion and a bound on th
 narrows what the assertion can see.** The bound is now far above anything one machine accumulates in
 a wave, and the timeout is still what ends the consumer. This is the fourth false Kafka failure on
 record and the first with a cause that is not a timestamp fence.
+
+### SHIP-148 — three levels of default-deny, and the permission that does not exist
+
+Twelve permissions, three role bundles, `Grant.Permits`, `Handler.permitted`, and one endpoint to
+put them in front of: `POST /v1/admin/administrators`, gated on `admins.manage`.
+
+#### "Granular" is a statement about the check, not about the list
+
+A model with twelve permissions and handlers that ask `if role == owner` is not granular; it is a
+list nobody consults. So the only authorisation question anything outside `permissions.go` asks is
+`Permits(p)`, and there is no exported way to ask what role somebody has *for the purpose of
+deciding anything* — the role is on the response so a console can hide buttons, which `Docs/07` §3
+allows and is careful to call a courtesy.
+
+The endpoint chosen to demonstrate it is the one that matters: **whoever can create an
+administrator can create one with any role**, which makes every other boundary in the file
+advisory. It is the only permission `owner` has that `moderator` does not.
+
+#### "Default to the minimum" is three separate mechanisms, and none of them is enough alone
+
+| Where | What it covers |
+|---|---|
+| `Credentials.Create` turns an empty role into `RoleSupport` | A request that did not say. It also *reports* the applied role back, so an owner who omits the field is told what they made rather than finding out later |
+| `000801`'s `DEFAULT 'support'` | A row written by something that never came through Go — a migration, a support script, a `psql` prompt |
+| `rolePermissions` has no fallback | A role that is **not in the table at all**: the zero value, a database that has drifted from `ck_admin_users_role`, and the fourth role somebody adds to the vocabulary and forgets here. All three hold nothing |
+
+The third is the one that makes adding a role safe, and the direction is what matters: a lookup that
+fell back to *any existing* bundle would hand an unknown role somebody else's permissions. The
+pairing test between `ck_admin_users_role` and `admin.Roles` is what stops that case being silent
+for a wave.
+
+`Roles` and `Permissions` are both ordered **least privileged first**, and the tests read
+`Roles[0]` rather than the literal `"support"` — so reordering the list, which changes what "the
+minimum" means, fails a test instead of quietly redefining a default.
+
+#### The bundles are written out rather than composed
+
+`moderator` is not "support plus five" and `owner` is not "moderator plus one", although both
+sentences are true today. Composition would mean a permission added to `support` silently reaching
+`owner` — a widening nobody reviewed, arriving through a list they were not reading. Three explicit
+lists cost a dozen lines. `owner` is a **listed set and not a wildcard** for the same reason: a
+permission added to the catalogue later reaches it by somebody writing it there.
+
+#### The permission that does not exist
+
+CLAUDE.md's invariant is that audit entries are append-only and ordinary administrators cannot
+delete them, and SHIP-148 is the ticket most able to break it, because a permission model is exactly
+where somebody adds a delete. **The catalogue has one audit permission, `audit.read`, and no
+endpoint can name a permission the catalogue does not have.**
+
+The test checks the *catalogue* rather than the bundles, deliberately: a permission that existed and
+was granted to nobody would still be an endpoint waiting to be written, and that endpoint would be
+an application rule standing where a database rule already stands — `000003`'s trigger refuses
+`UPDATE` and `DELETE` from any connection, which is what makes the invariant true of a `psql` prompt
+as well as of this service. `scripts/verify/90-admin.sh` re-asserts the trigger inside this section
+rather than relying on SHIP-149's, because this is the ticket that would have broken it.
+
+#### The demotion is the check that could only be made here
+
+`make verify` changes an administrator's role by SQL between two calls **with the same unexpired
+credential**, and the second call is refused. That is the property SHIP-147's design was chosen for
+and the only place it can be demonstrated end to end: a signed token would have carried the old role
+until it expired, and no unit test of a permission table can see the difference.
 
 ## 4. Partly done — do not treat these as finished
 

@@ -90,6 +90,20 @@ func init() {
 			Auth:    RequireAdmin,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).Me() },
 		},
+
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/admin/administrators",
+			Group:   GroupV1,
+
+			// RequireAdmin is the credential; `admins.manage` is the permission, and it is
+			// checked in the handler rather than declared here (SHIP-148). The manifest's
+			// auth class says which *credential system* serves a route, and there is no
+			// fifth class per permission — twelve permissions would be twelve classes, and
+			// guardsFor is finished.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).CreateAdministrator() },
+		},
 	)
 }
 

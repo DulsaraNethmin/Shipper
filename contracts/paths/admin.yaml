@@ -640,7 +640,164 @@ AdminMe:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+AdminAdministrators:
+  post:
+    operationId: createAdministrator
+    summary: Create an administrator account
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Adds an administrator (SHIP-147, SHIP-148).
+
+      **Needs the `admins.manage` permission**, which only the `owner` role holds. Somebody who can
+      create an administrator can create one with any role, so this is the endpoint the whole
+      permission model exists to protect; `support` and `moderator` sessions get `403`
+      `admin_permission_denied`.
+
+      ## `role` is optional, and leaving it out is not an error
+
+      An account created without one becomes `support` — the least-privileged role, which can read
+      the console and change nothing. It does **not** inherit the creator's role and it is not
+      refused. That is deliberate: a forgotten field should produce the account that can do least.
+
+      Sending a role the platform does not have *is* an error (`422`, naming `role`), because that is
+      a different mistake — a client that believes in a role which does not exist would otherwise be
+      handed the minimum without being told.
+
+      ## There is no bootstrap through this endpoint
+
+      The first administrator in a deployment is created by an operator with a database insert. An
+      "allow anybody while the table is empty" branch would be an unauthenticated account-creation
+      endpoint for every deployment's first minute.
+
+      ## The password
+
+      Set by whoever creates the account and handed over out of band; there is no invitation email
+      and no reset flow yet. Twelve characters is the floor.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/NewAdministrator'
+    responses:
+      '201':
+        description: |
+          The account exists. `role` in the response is what was actually applied, which is worth
+          reading — it is `support` whenever the request did not say otherwise.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Administrator'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `admins.manage`
+          (`admin_permission_denied`). The message names no permission — ask whoever administers the
+          platform rather than probing for the list.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          An administrator already exists with that address (`admin_email_taken`), or the
+          `Idempotency-Key` has been used for a different request.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`), with one `error.details` entry per
+          field — including `role` for a role the platform does not have.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- administration schemas --------------------------------------------------------------------
+
+NewAdministrator:
+  type: object
+  additionalProperties: false
+  required: [email, name, password]
+  properties:
+    email:
+      type: string
+      minLength: 3
+      maxLength: 320
+      description: |
+        Case-insensitive, and unique among administrators. It may also be a marketplace account's
+        address — the two systems are unrelated and neither implies the other.
+      example: sam@example.com
+    name:
+      type: string
+      minLength: 1
+      maxLength: 200
+      description: Who this is, as the audit trail will record them.
+      example: Sam Okafor
+    password:
+      type: string
+      minLength: 12
+      maxLength: 512
+      description: |
+        The initial password, handed over out of band. There is no invitation email and no reset
+        flow yet.
+      example: correct-horse-battery-staple
+    role:
+      type: string
+      enum: [support, moderator, owner]
+      description: |
+        **Optional. Omitting it gives `support`**, the least-privileged role — not the creator's,
+        and not a refusal.
+
+        A value outside the list is refused rather than minimised, because sending nothing and
+        sending a role that does not exist are different mistakes.
+      example: moderator
 
 AdminSignIn:
   type: object
@@ -721,14 +878,13 @@ AdminSession:
 Administrator:
   type: object
   additionalProperties: false
-  required: [id, email, name, role, created_at]
+  required: [id, email, name, role, permissions, created_at]
   description: |
     An administrator account.
 
-    **There is no status field.** Every response carrying this shape is being sent to the
-    administrator it describes, and an account that is not active cannot reach any of them — so a
-    status here would always read `active`, which is exactly the kind of field a client eventually
-    branches on and is wrong about.
+    **There is no status field.** An account that is not active cannot sign in and cannot hold a
+    session, so a status here would read `active` on every account the console can reach — which is
+    exactly the kind of field a client eventually branches on and is wrong about.
   properties:
     id:
       type: string
@@ -756,6 +912,27 @@ Administrator:
         - `moderator` — support, plus acting on what it can see.
         - `owner` — moderator, plus managing administrator accounts.
       example: moderator
+    permissions:
+      type: array
+      items:
+        type: string
+      description: |
+        What this role holds, expanded, sorted. Published so the console can **hide what it may not
+        do** — and never so it can decide: every endpoint checks the permission against the role in
+        the session row on each request, so editing this list in a response changes nothing.
+
+        Sent expanded rather than left for a client to derive from `role`, because a derivation is a
+        second copy of the mapping in TypeScript, and it is the copy that drifts — nothing fails
+        when a console shows a button that answers `403`.
+
+        Always present. An empty list is a real answer, not an error.
+      example:
+        - audit.read
+        - disputes.read
+        - jobs.read
+        - moderation.read
+        - users.read
+        - verifications.read
     created_at:
       type: string
       format: date-time

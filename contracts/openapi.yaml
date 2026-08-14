@@ -176,6 +176,8 @@ paths:
     $ref: './paths/service.yaml#/Health'
   /v1/:
     $ref: './paths/service.yaml#/APIRoot'
+  /v1/admin/administrators:
+    $ref: './paths/admin.yaml#/AdminAdministrators'
   /v1/admin/me:
     $ref: './paths/admin.yaml#/AdminMe'
   /v1/admin/sessions:
