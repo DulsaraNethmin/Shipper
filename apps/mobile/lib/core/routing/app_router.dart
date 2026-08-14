@@ -11,6 +11,7 @@ import 'package:shipper/features/bidding/my_bids_screen.dart';
 import 'package:shipper/features/bidding/place_bid_panel.dart';
 import 'package:shipper/features/delivery/delivery_screen.dart';
 import 'package:shipper/features/delivery/proof_capture_screen.dart';
+import 'package:shipper/features/delivery/tracking_screen.dart';
 import 'package:shipper/features/fleet/add_vehicle_screen.dart';
 import 'package:shipper/features/fleet/fleet_screen.dart';
 import 'package:shipper/features/fleet/vehicle_screen.dart';
@@ -133,6 +134,26 @@ abstract final class Routes {
 
   /// [delivery] for one job.
   static String deliveryFor(String jobId) => '/jobs/$jobId/delivery';
+
+  /// How one delivery is going, as the **customer** who owns it (SHIP-133).
+  ///
+  /// A fourth route under `/jobs/` and the second reader of the same delivery, which is the
+  /// arrangement the three before it established: [jobDetail] is the customer's own job,
+  /// [openJobDetail] is a job a provider may bid on, [delivery] is the provider *recording* a
+  /// delivery, and this is the customer *watching* one.
+  ///
+  /// **Not a tab on [jobDetail], and not a section of it.** The two read different endpoints with
+  /// different failure modes — `GET /v1/jobs/{id}` is owner-only and this shelf admits both parties
+  /// — and a customer refreshing a photograph should not be re-reading their whole job to do it.
+  /// Keeping them apart is also what lets the delivery read be added to a job screen that already
+  /// works, rather than making that screen's first load wait on three more requests.
+  ///
+  /// It does not collide with [jobDetail], which matches exactly one segment, nor with [delivery],
+  /// whose second segment is the literal `delivery`.
+  static const tracking = '/jobs/:id/tracking';
+
+  /// [tracking] for one job.
+  static String trackingFor(String jobId) => '/jobs/$jobId/tracking';
 
   /// Photographing one delivery (SHIP-130).
   ///
@@ -270,6 +291,11 @@ final _signedInPatterns = <RegExp>[
   // pushed from the delivery screen rather than deep-linked, which makes forgetting this line a
   // button that appears to do nothing.
   RegExp(r'^/jobs/[^/]+/delivery/proof$'),
+
+  // The customer watching that same delivery (SHIP-133). A fifth pattern, same reasoning, and this
+  // one is deep-linked as well as pushed: `Docs/07` §5 sends a milestone notification to the job it
+  // concerns, so forgetting this line is a notification that lands on the home shell.
+  RegExp(r'^/jobs/[^/]+/tracking$'),
 
   // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
   // route reachable only through an identifier looks, from the outside, like a card that does
@@ -460,6 +486,14 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.delivery,
         builder: (context, state) => DeliveryScreen(
+          jobId: state.pathParameters['id'] ?? '',
+        ),
+      ),
+      // Two segments, like `delivery` and `open/{id}`, and declared before `jobDetail` for the same
+      // reason they are: "everything more specific under /jobs comes before /jobs/:id".
+      GoRoute(
+        path: Routes.tracking,
+        builder: (context, state) => CustomerTrackingScreen(
           jobId: state.pathParameters['id'] ?? '',
         ),
       ),

@@ -430,6 +430,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-127** | M4 | Flutter four-hour unsynced nudge — `Docs/02` §3.1's second rung, and **a prompt rather than a fourth line in SHIP-126's bar**: a card over a scrim, above the router, dismissed by an explicit tap and by nothing else. It measures `enqueued_at` of the oldest **pending or in-flight** operation and excludes quarantined work, because the whole content of the prompt is *go and find signal*. **No timer at all** — a published snapshot and the clock at build time, because every trigger that brings a person back to the app already publishes one. Finding: **the queue's clock and the nudge's clock have to be the same one**, which no fixture had needed until now. The four hours is a value rather than a constant and **should not stay on the device** — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
 | **SHIP-130** | M4 | Flutter camera capture with on-device compression — **`camera` and not `image_picker`**, because the one-line answer hands the capture to the manufacturer's camera application and several of those keep a copy in `DCIM/Camera`, which no Dart can prevent or observe. The negative is proved from the two places that can enforce one: **no Android media permission and no iOS photo-library string**, both asserted. Compression is **pure Dart** so a host test measures it on real JPEGs, EXIF included. It also builds the **three-request upload exchange** SHIP-125 left as an `UnimplementedError` — and corrects that comment, which named a multipart send the platform does not have. `delivered` becomes recordable from the app for the first time — *see below* |
+| **SHIP-133** | M4 | Flutter customer tracking view — `/jobs/{id}/tracking` over SHIP-115a's three-endpoint shelf. **"Confirmed" needed no predicate**: everything the endpoint serves has been accepted, and what is unconfirmed is on the *provider's* handset in SHIP-124's queue, which a customer must never see. Branches on `exception_reason` and never on a missing `download_url` — the mutation draws an expired photograph as a reason nobody recorded. **Nothing is cached, because a proof response is a set of expiring credentials.** Finding: **the recipient name and the delivery note `Docs/01` §4.4 requires cannot be shown** — no column holds either, and this is the first ticket where a *customer* can see the gap — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
@@ -9274,6 +9275,127 @@ test per build flavour. `make verify` does not cover this ticket — that script
 endpoints and this one adds none. What is held by widget test is the whole journey: the session, the
 router, the guard, the shell, the button on the feed, the grouping, the paging, the narrowing, the
 two failure states, the customer's refusal, and the budget.
+
+### SHIP-133 — the customer's side of a delivery, and the two things "confirmed" turns out to mean
+
+`/jobs/{id}/tracking`, over the three-endpoint shelf SHIP-115 and SHIP-115a built:
+`/delivery/detail`, `/delivery/milestones` and `/delivery/proof`, read together and drawn in one
+frame.
+
+#### "The latest confirmed milestone" needed no predicate, and finding that out is the ticket
+
+The *Done when* reads as though a client has to tell confirmed milestones from unconfirmed ones.
+**It does not, and the reason is worth writing down because it is the shape of the whole feature:**
+this endpoint *is* the platform's record. Every row carries `accepted_at`, which is when the platform
+received it and is `required` in the contract, so a row cannot be on this list without having been
+confirmed. `latest` is `milestones.first` and nothing else.
+
+**What is genuinely unconfirmed is on the other party's handset**, in SHIP-124's durable queue, and
+`DeliveryScreen` is the screen that shows it — marked pending in a word, an icon and a sentence,
+because `Docs/02` §3.1 requires exactly that of optimistic local state. So `features/delivery` now
+holds both parties' views of one delivery, and the distinction between them is the distinction
+between a claim and a record. **A customer must never be shown the first**: a milestone recorded in a
+valley an hour ago is not a fact about their delivery.
+
+`first` rather than a search or a sort, because the endpoint orders by the **actor's** clock, newest
+first — deliberately not arrival order, since a batch recorded through a morning with no signal
+arrives all at once and the sync order would show a delivery that ran backwards. A client with a
+second opinion about that order is a client showing the wrong thing.
+
+#### The fifth milestone is readable and is still not recordable
+
+`Milestone` is four values, deliberately: it is *the milestones this app records*, and
+`driver_assigned` has an endpoint of its own that the milestone endpoint refuses with a `422`
+pointing there. `/delivery/milestones` serves **all five**, so a customer's screen needs a name for
+the one the enumeration does not have.
+
+**A fifth enum value was the wrong fix** and is worth recording as a near miss: `Milestone.offered`
+is derived as `values.where((m) => !m.needsProof)`, so adding `driverAssigned` would have put a
+button for it in front of a driver unless a second flag were added to take it out again. The answer
+is `milestoneLabel(wire)` beside the enumeration — four labels **derived** from it and therefore
+unable to drift, and the fifth named once. An unrecognised sixth is returned unaltered rather than
+dropped, which is `Docs/07` §6's rule applied to a value rather than to a field.
+
+#### Every path on the shelf has five segments, and the four-segment form is not a 404
+
+`GET /v1/jobs/{id}/delivery` and `GET /v1/jobs/open/{id}` both match `/v1/jobs/open/delivery` with
+neither more specific, and Go's `ServeMux` **panics at registration** — the service does not start.
+`delivery_repository_test.dart`'s first three tests assert the URL rather than the response for that
+reason: the mistake this client could make is one the platform cannot answer, so no integration test
+would ever catch it.
+
+#### `download_url` is a credential, and three decisions follow from that
+
+**Branch on `exception_reason`, never on a missing URL.** The contract says so and the mutation shows
+why: flipping the branch to `downloadUrl == null` draws an *expired photograph* as a reasoned
+exception — inventing a reason nobody recorded — and passes every other test in the file.
+
+**Nothing is cached.** A cached proof response is a cache of expiring links, so the controller holds
+one in memory for the life of the screen, the provider is auto-disposed, and leaving and returning
+re-reads. The endpoint mints fresh URLs per request, so that is the supported path rather than a
+workaround.
+
+**A further page of milestones does not re-read the proof.** It would re-sign every photograph
+already on screen and reload each one. Asserted by counting the reads on the fake rather than by
+looking at pixels, because the pixels would be identical.
+
+**An expired link is copy, not an error.** `flutter_test` answers every HTTP request `400`, so
+`Image.network` lands in its `errorBuilder` in every host test — which is not an obstacle but the
+exact path a customer meets when a short-lived link runs out. The words name both causes the customer
+cannot distinguish and give the one action that fixes either.
+
+#### The finding: two fields `Docs/01` §4.4 requires cannot be shown
+
+**The recipient's name and the delivery note.** §4.4 requires a delivered job to carry both alongside
+its proof, `Docs/02` §3 repeats it naming §4.4 as authoritative, and **no column holds either** —
+`Docs/11` §4 has carried SHIP-118 as partly done for this since wave 7, and `000605`'s own comment
+names SHIP-123. This screen does not model them, draw them, or leave a space where they would go: a
+customer surface implying a field the platform cannot supply is worse than one honestly short of it.
+**SHIP-133 is now the second ticket blocked by that gap**, and the first that a customer can see.
+
+#### `driver_mobile` is not modelled, which is the client's half of a platform decision
+
+The platform sends it to the provider and **blanks it in the service** for the customer, rather than
+leaving the handler to omit it — "a handler that never receives a number cannot render one"
+(SHIP-115a). `DeliveryDriver` is read by a customer's screen, so the field is one that can never
+arrive, and modelling it would put a permanent null on a customer surface that a later screen could
+draw the day something else populated it. That is the one-shape-with-a-flag arrangement the platform
+declined twice — once for the budget, once for this.
+
+#### The button is on every job, and the platform is what makes that safe
+
+The obvious refinement is to hide "Track this delivery" until a job is awarded. **Not taken**, for the
+reason `app_router.dart` gives about role-aware redirects: a rule on the device about when a screen
+is worth showing is a copy of `Docs/02` §2's table living where nobody maintains it.
+
+`Service.partyTo` asks whether the caller is the job's **customer** before it asks anything about
+status, so the shelf answers a draft's owner with `driver_assigned: false` and two empty lists rather
+than a refusal — read out of `internal/delivery/read.go` rather than assumed. The tracking screen's
+empty state is written for exactly that case.
+
+#### Mutations
+
+| Mutation | Outcome |
+|---|---|
+| branch on `downloadUrl == null` instead of `exception_reason` | **fails** — an exception drawn for a photograph that had no link |
+| draw `accepted_at` where `recorded_at` belongs | **fails** — the fixture puts the two clocks three days apart |
+| `latest` reads `milestones.last` | **fails** — the newest row is not the one at the end |
+
+The second is the one worth keeping: a fixture whose two clocks are equal would pass all three, which
+is the same trap wave 8 recorded twice in the shape of a fixture reading two *different* clocks. Here
+it is the inverse — one clock written into two fields — and it is just as invisible.
+
+#### Shared surfaces
+
+`Docs/11` §3 and `Docs/11-done.txt`. No route manifest, no migration, no `$ref`: this ticket consumes
+three endpoints that already exist and adds none.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **866 host tests**, up from 833, the analyzer clean, and the environment
+test per build flavour. `make verify` does not cover it — no endpoint is added. The journey is walked
+from the customer's own job screen through the button, which is what makes the missing
+`_signedInPatterns` entry a failing test rather than a link that silently lands on the home shell.
 
 
 ## 4. Partly done — do not treat these as finished

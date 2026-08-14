@@ -3,7 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:go_router/go_router.dart';
+
 import 'package:shipper/core/errors/api_failure.dart';
+import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/jobs/job.dart';
 import 'package:shipper/features/jobs/job_actions.dart';
 import 'package:shipper/features/jobs/job_detail_controller.dart';
@@ -185,7 +188,14 @@ class JobDetailScreen extends ConsumerWidget {
 
       _Section(
         title: 'Progress',
-        child: _Timeline(job),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _Timeline(job),
+            const SizedBox(height: 12),
+            _TrackThisDelivery(jobId: jobId),
+          ],
+        ),
       ),
 
       _Section(
@@ -360,6 +370,45 @@ class _TimelineStep extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// The way to the delivery itself (SHIP-133).
+///
+/// ## It is offered on every job, whatever the status, and that is deliberate
+///
+/// The obvious refinement is to hide it until the job is awarded. It is not taken, for the reason
+/// `app_router.dart` gives about role-aware redirects: a rule on the device about when a screen is
+/// worth showing is a copy of `Docs/02` §2's table living where nobody maintains it, and this one
+/// would be wrong in both directions the first time the table changed.
+///
+/// **The platform makes it safe to offer.** `Service.partyTo` asks whether the caller is the job's
+/// customer before it asks anything about status, so the delivery shelf answers a draft's owner with
+/// an empty assignment and an empty milestone list rather than a refusal — and the tracking screen's
+/// empty state is written for exactly that. A customer who taps this on a job published five minutes
+/// ago is told nothing has been recorded yet, which is true and is what they wanted to know.
+///
+/// `Routes` is `core/routing`, so naming a location in `features/delivery` from `features/jobs` is
+/// not a feature importing a feature: the constant is `core`'s and the screen behind it is supplied
+/// by the router (`Docs/07` §2).
+class _TrackThisDelivery extends StatelessWidget {
+  const _TrackThisDelivery({required this.jobId});
+
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: OutlinedButton.icon(
+        key: const Key('track-delivery'),
+        // `push` rather than `go`, so the back gesture returns to the job where it was rather than
+        // rebuilding it — which would re-read the job to show what the customer just left.
+        onPressed: () => context.push(Routes.trackingFor(jobId)),
+        icon: const Icon(Icons.local_shipping_outlined),
+        label: const Text('Track this delivery'),
       ),
     );
   }
