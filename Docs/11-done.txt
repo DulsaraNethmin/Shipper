@@ -58,6 +58,9 @@
 #
 # Track X sorts before M0, as it does in Docs/09.
 
+# Track X — External dependencies
+X-6
+
 # M0 — Foundation
 SHIP-1
 SHIP-2

@@ -259,7 +259,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **600 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **642 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -439,6 +439,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
+| **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -9156,6 +9157,182 @@ this ticket's are the same rule, and the only difference is that one of the two 
 *which* party rather than merely that they are one. Two copies of an authorisation rule is the shape
 where one of them gets a third caller and the other does not.
 
+### X-6 — an exception is evidence, so it does not need a second person to agree
+
+The first Track X ticket to close, and the only one of the nine that needed nobody outside this
+building. **A job delivered through the proof-exception path auto-completes on `Docs/02` §6.1's
+ordinary seventy-two-hour rule**, with no additional customer confirmation. `Docs/02` §6.1 carries the
+rule and the reasoning; `Docs/02` §7's *Decisions still required* is down to one bullet.
+
+**What made it decidable was a fact that did not exist when it was asked.** For eight waves the
+question read as a trade — close the job automatically, or hold it until a person has looked. It is
+not a trade, because **SHIP-117 landed in wave 8 and puts every exception-completed job into the
+moderation queue.** Review happens either way, so the two are not exclusive, and blocking
+auto-completion adds no review at all: it only strands the job in `Delivered` when the customer never
+acts, which is the single outcome §6.1 exists to prevent. Everything else was already written —
+`Completed` carries no financial consequence while Shipper holds no money, and
+`contracts/statuses.yaml` had already framed a reasoned exception as *evidence rather than the absence
+of it*.
+
+**It unblocked nothing by dependency, and that is the finding worth carrying.** X-6 appears in **no
+`Depends on` cell anywhere in `Docs/09`** — measured, not assumed — so SHIP-119 has been
+*dependency*-startable since SHIP-118 landed, and §6 has listed it as startable throughout. What held
+it was a bullet in `Docs/09`'s *Open questions that touch the backlog*, which no tool reads and which
+`make status` cannot see. A reader working from the dependency column alone could never have found out
+why the ticket sat still for eight waves. The bullet is struck rather than deleted, with a paragraph
+beneath it saying exactly that.
+
+### SHIP-96's leftover — `Countered` is a retained synonym, in two files that generate three languages
+
+`Docs/02` §4 listed `Countered` and `Superseded` and described them in almost the same words; §9 had
+carried the question since SHIP-87 wrote `Superseded` and left `Countered` with no writer. SHIP-96's
+owner rendered the chain to all three audiences — customer, bidding provider, administrator — and
+reported that **nothing acts on the distinction**, which is what turned a report into a decision and
+chose the cheaper of the two options §9 had named.
+
+**SHIP-56a made this a two-file edit rather than a one-line one, and that is the part worth knowing for
+the next vocabulary change.** `Docs/02` §4 is the authority and `contracts/statuses.yaml` is the source
+Go, Dart and TypeScript are generated from, so closing it meant a paragraph in the document, the same
+decision against the `Countered` value in the specification, and `make codegen` writing
+`internal/bidding/status_gen.go`, `apps/mobile/lib/features/bidding/bid_status.gen.dart` and
+`apps/driver-portal/lib/statuses.gen.ts`. Before SHIP-56a the reasoning existed as two paragraphs
+somebody had written twice, in Go and in Dart; it now exists once and lands in three places, which is
+the trade that ticket was for.
+
+The value stays in the enumeration. `Docs/10` §3.4 pairs the Go list against `ck_bids_status` in both
+directions, so deleting it means a migration and an edit to another ticket's fixtures; and a value
+missing from a client's enumeration decodes as unknown the day somebody starts writing it. **The
+reopening trigger is named**: a ticket needing to distinguish "displaced because the other party
+answered" from some other way of being displaced. There is no other way today.
+
+### SHIP-15t — the wave-9 pre-step
+
+Not a backlog ticket, on the same reading that makes `ship-15q` and `ship-15s` none: it edits shared
+surfaces ahead of a wave and closes findings the previous wave left with no owner. The branch name
+follows `ship-15r` and `ship-15s`.
+
+#### The Kafka consumer had no fence, and that failure had a date rather than a probability
+
+**`scripts/verify/80-notifications.sh` read `shipper.bid` with `--from-beginning --max-messages 500`,
+and nothing has ever emptied that topic.** `shipper.job` is deleted and recreated at the top of that
+file and `shipper.delivery` by SHIP-135's section at the foot of it; `shipper.bid` is touched by
+neither. So every worktree's bid events accumulate on it for ever, at a **measured ≈50 per `make
+verify` run** — roughly ten runs of headroom from empty before a run's own events sit past the oldest
+five hundred and the section reports them missing.
+
+**This is the distinction that matters, and it is why three wave-8 lanes each read it as a flake.**
+Every other Kafka false failure recorded in this file is concurrency — another worktree's run inside
+the window — and clears on a re-run. This one is **monotonic**: it gets worse with every run and never
+better. *A shared append-only resource read through a fixed-size window has a failure date, not a
+failure probability.* And because section 80 sorts before section 90, a run that dies there **never
+reaches `90-admin.sh` at all**, so a check count from such a run says nothing about admin.
+
+**Raising the bound is the wrong instrument, and had been tried.** Wave 8's Track D took
+`--max-messages` to fifty thousand and reverted it, correctly: a fence protects an assertion, and a
+bound on the read only narrows what the assertion can see. It never says where this run's events
+start.
+
+**The fence is the topic's end offsets, captured at run start.** `scripts/verify-foundation.sh` gains
+`kafka_end_offsets`, `kafka_fence` and `kafka_consume_fenced`, and takes the fence for `shipper.bid`
+and `shipper.delivery` immediately after `run_sections 0 9` — after the stack has been proved up and
+before any product section has run. `kafka-get-offsets.sh --time -1` is the instrument that answers
+this; `GetOffsetShell` through `kafka-run-class` returns nothing usable.
+
+**Two properties of the reader are deliberate.** It reads **per partition**, because
+`kafka-console-consumer` takes one `--partition`/`--offset` pair per invocation and these topics have
+three; and its **bound is derived rather than chosen** — each partition is read for exactly
+`end - fence` messages, recomputed from the broker at read time — so it stops as soon as it has them, a
+partition with nothing new is not read at all, and the eight-second no-more-messages timeout is no
+longer paid twice a run. Messages another worktree appends after that end offset are simply not read,
+which is harmless: every assertion in that section is a subset check over ids this run created.
+
+**It tolerates the two states a shared topic is actually found in.** A topic that does not exist at
+fence time yields no offsets and every partition then starts at zero, which is correct — a topic that
+did not exist holds nothing to read past. A topic deleted and recreated between the fence and the read
+restarts at zero, so a fence *beyond* the current end is treated as a fence for a topic that no longer
+exists and the whole partition is read. `kafka_end_offsets` swallows the non-zero exit
+`kafka-get-offsets.sh` returns for a missing topic: under this file's `set -o pipefail` a bare pipeline
+propagated it and ended the run, which is exactly the case the empty output exists to handle.
+
+**The fence is taken at run start rather than at the top of the section that reads, and that is a
+margin rather than a necessity today.** Measured: the only producer onto those two topics during a run
+is section 80's own worker. `61-bidding.sh` points its worker at `KAFKA_BROKERS=localhost:1` precisely
+so the outbox pass fails and leaves those rows for section 80, and `50-jobs.sh`'s worker runs before
+any bid or delivery row exists. **One further task registered in `cmd/worker` changes that**, and a
+fence taken at the top of the reading section would then be behind the events it needs, silently. Run
+start costs one command and cannot go stale that way.
+
+| Mutation | Outcome |
+|---|---|
+| Pad `shipper.bid` to **1100 messages**, then restore `--from-beginning --max-messages 500` | **Caught.** The run dies at SHIP-136 with `34 of 73 events are on neither topic`, having reached **575** checks and never reaching `90-admin.sh` |
+| The same padded topic, with the fence in place | **Passes** — 642 checks across 13 sections, every one of them |
+| `kafka_end_offsets` against a topic that does not exist | **Caught** before the reproduction, by the probe rather than by the run: under `pipefail` the non-zero exit ended the script. Fixed with a braced `\|\| true` at the producing end rather than on the pipeline, where it would also have masked a broken `awk` |
+
+The padding is deliberate and it stays: a thousand synthetic envelopes sit on `shipper.bid`, and every
+run since reads past them without noticing. That is the demonstration.
+
+#### `gofmt` was not in `CHECKS`, and the reason two files stayed dirty is the interesting half
+
+`Makefile`'s `CHECKS` was `vet lint-imports lint-spelling test`, so **CI was green on a tree
+`gofmt -l` flagged** — `internal/delivery/postgres.go` and `internal/delivery/exception_test.go`.
+
+**The cause is a loop rather than an oversight.** gofmt rewrites a bare doubled apostrophe inside a doc
+comment into a typographic closing quote. Both comments were describing SQL's empty string literal, so
+running `gofmt -w` introduced a character `make lint-spelling` then has an opinion about, and reverting
+that put the files straight back on `gofmt -l`. **No ordering of the two commands converges**, which is
+presumably why "just run gofmt" had been tried and abandoned. Both comments now say "an empty string"
+in words, each carries a line saying why, and the `Makefile` carries the account above the new
+`lint-fmt` target so the next person meets it before reformatting anything.
+
+| Mutation | Outcome |
+|---|---|
+| Append an unformatted function to `internal/delivery/postgres.go` | **Caught** by `make lint-fmt`, naming the file and pointing at the note |
+
+#### `Docs/11-done.txt` lost its sorted position for the second time, and now a guard sees it
+
+`SHIP-120` and `SHIP-120a` sat between `SHIP-112` and `SHIP-114` — a `merge=union` artefact, because a
+union appends in *merge* order while the list is written in *build* order. **This is the second
+occurrence**: `23618e5` is titled *"restore the sorted position a union broke"* and moved `SHIP-15g`
+back from below the M7 group. Nothing caught either, because `make status` sorts before it counts and
+therefore cannot see where a row sits.
+
+`make status` now checks the order. **`sort -c` is the wrong instrument**, for the same reason it is
+wrong for `routes_golden.txt`: this file is ordered by ticket *number* with a letter suffix after its
+parent, and lexicographically `SHIP-12` sorts after `SHIP-119`. The check parses each token into
+(track, number, suffix) and compares the triple, so it also catches a **duplicate** — which `sort -u`
+hides from every other count in the script. The file's own header paragraph, which used to end *"Order
+does not matter: the reader sorts"*, is corrected: that is true of `make status` and false of every
+human reading it, and it is the sentence that let this happen twice.
+
+| Mutation | Outcome |
+|---|---|
+| Put `SHIP-120`/`SHIP-120a` back between `SHIP-112` and `SHIP-114` | **Caught** — `line 187: SHIP-114 follows SHIP-120a` |
+| Append `X-6` at the bottom, as a union would | **Caught** — `line 212: X-6 follows SHIP-179` |
+| Duplicate `SHIP-115a` | **Caught** — `line 188: SHIP-115a follows SHIP-115a` |
+
+#### The `cmd/worker` task count is a test rather than a sentence
+
+§9 set itself a trigger: settle the `--only=<task>` selector question "before the fourth task
+registers". **SHIP-89 registered the fourth in wave 8 and the trigger passed unobserved**, because it
+was a count in prose and the only thing watching it was a reader who happened to remember.
+`cmd/worker/manifest_test.go` gains `TestTheRegisteredTaskSetIsWhatItSaysItIs`, which pins the four
+names against the real registry, and the next registration fails there with the question attached. §9
+carries the decision itself; this is only the trigger, moved somewhere it cannot pass quietly.
+
+#### What was deliberately not touched
+
+**`Config.Identity.Argon2` was not renamed.** It is the platform's password cost rather than
+identity's, since wave 8's Track D correctly reused it for administrator hashing instead of
+duplicating a security parameter — so the name is narrower than the meaning. It is a shared-surface
+rename with no behavioural content, four lanes are about to be cut from this branch, and a rename
+landing under them buys nothing. §9 carries it.
+
+**Neither SHIP-119's task nor the worker selector was built.** Both are tickets, and `cmd/worker`'s
+`main.go` and `manifest.go` are shared surface four lanes are about to depend on.
+
+**SHIP-90's narrowing of SHIP-68 and SHIP-69 was recorded, not fixed.** `Docs/02` §2 has one expiry row
+and it says `Open → Cancelled`; widening the claim means widening the document first. It is
+`Docs/09`'s SHIP-70a and §9 has the account.
 
 ## 4. Partly done — do not treat these as finished
 
@@ -10017,6 +10194,44 @@ trigger is named: a task that sweeps rows due by wall-clock alone**, which is th
 cannot cover; every task today claims what is *due*, so leaving nothing due is sufficient. The
 original entry is kept below because the reopening will need it.
 
+**The deadline this entry set for itself has passed, and nobody noticed — which is the finding, and
+it is separate from the decision.** The trigger was "decide before the fourth task registers, which is
+SHIP-89 or SHIP-119, whichever comes first". **SHIP-89 landed on wave 8's Track A and registered the
+fourth.** The count at `ac62673` is **four** — `job-expiry` and `job-expiry-warning` in
+`tasks_jobs.go`, `bid-expiry` in `tasks_bidding.go`, `outbox-publisher` in `tasks_outbox.go` — and
+SHIP-15r's §3 entry above still records three, which was **true when it was measured** and stale by
+the end of the wave it was written in. That is §2's commit-count failure in a different file, and it
+is the evidence for the fix this section chose there: state the ref, or let a gate hold the number.
+"Measure more carefully" is not available, because the session that got this wrong measured it
+correctly.
+
+**So the trigger is now a test rather than a sentence.**
+`cmd/worker/manifest_test.go`'s `TestTheRegisteredTaskSetIsWhatItSaysItIs` pins the four names against
+the real registry; the fifth registration fails there, with the question and this entry named in the
+failure message. A count in prose cannot see itself go out of date and a count in a test can.
+
+**The question is reopening rather than closed, and it now has an argument it did not have.** Two
+tasks are already queued: **SHIP-119 is the fifth** — unblocked this wave, since X-6 is decided — and
+**SHIP-137 may be the sixth**, depending on whether that lane makes the notification consumer a worker
+task or a service of its own. More importantly, wave 8's Track A found the case the convention does
+not cover: **`outbox-publisher` has no "not due" state.** Every unpublished row is due the moment it
+is written, so "leave nothing due that you are not demonstrating" is unsatisfiable against it — a
+worker started in section 61 drains the rows section 80 needs, and **ordering cannot help, because
+they are different sections**. `scripts/verify/61-bidding.sh:2263` works around it by pointing the
+worker at `KAFKA_BROKERS=localhost:1` so every outbox pass fails legibly and leaves the rows
+claimable. That workaround is load-bearing, and it is the concrete argument for a `--only=<task>`
+selector that the original decision did not have.
+
+**SHIP-15t's consumer fence does *not* retire that workaround, and the distinction is worth stating
+because the two look adjacent.** The fence protects the **read** — which messages section 80 is
+allowed to see off `shipper.bid`. The workaround protects the **fixture** — that the bid and delivery
+rows are still `published_at IS NULL` when section 80 captures `ship136_ids`, since that capture is a
+database query and not a Kafka one. A worker draining them in section 61 removes them from `wanted`
+however the topic is read. **What would retire it is fencing the capture instead of the broker**:
+selecting the rows by an id or a run-start marker rather than by `published_at IS NULL`. The database
+is per worktree, so that fence is safe in a way the Kafka one is not. Nobody has taken it, and it is
+smaller than a selector.
+
 **`cmd/worker` is one binary, so every verify section that starts it starts every registered
 task.** SHIP-68's section demonstrates job expiry by running the real worker binary, which also
 drains the outbox — which is what broke SHIP-134's section the moment the two met at merge (§3,
@@ -10502,6 +10717,112 @@ implementation, which is a stronger reason and is the one the row should rest on
 rewrite §4.1 on the strength of this** — the rows are right, the test is a heuristic, and tightening
 it would put push and geocoding in question for no benefit. It is here so that the next person to
 weigh an adapter against that test knows the test does not decide it on its own.
+
+**A row whose timestamps come from two clocks is a test that expires.** Wave 8 produced this twice, in
+two lanes that never spoke, which is what makes it a class rather than an incident. Track D's
+`admin_sessions.created_at` takes `DEFAULT now()` — the *database's* clock — while every expiry
+decision about that row is computed from the **injected Go clock**. A test that fixes the Go clock
+therefore agrees with the database for exactly one idle window and then disagrees for ever: **it is a
+time bomb rather than a flake**, and a re-run does not clear it. Track C met the same shape from the
+other end, a sync harness pinned to a fixed date while the nudge read the host clock, so the fixture
+was **measuring the calendar** rather than the behaviour. The rule to apply: *one row, one clock.* If
+the domain injects a clock, the column takes its value from the domain and not from `DEFAULT now()`;
+if the column is the database's, nothing may compute against it from an injected clock. Neither
+instance is fixed here — both are live code in `internal/admin` and `apps/mobile` and neither is this
+lane's package — but the next person to add a timestamped row should read this before choosing a
+default.
+
+**§2's commit count can never be correct in the commit that writes it, and the fix is to state the ref
+beside the figure.** This is decided rather than reported. A commit that states a count of its own
+branch cannot include itself, nor the merge that will later bring it to `develop`, so the figure is
+**deterministically low by +2 total, +1 `--first-parent`, +1 `--no-merges`** at the moment it is read
+by anybody else. It has been published wrong **four times**, which is too many for carelessness to be
+the explanation.
+
+Two fixes work and only one of them is cheap. **Generating the line**, the way `make verify` generates
+§3's check count, would own the wording of a sentence people read. **Stating the ref beside the
+figure** costs three words and makes the figure self-dating: *"259 at `ac62673`"* is true for ever,
+where *"259"* is true for about an hour. **The ref is the decision**, and §2 is written that way from
+this pass onwards. Today's values are **259 total / 55 `--first-parent` / 196 `--no-merges`, measured
+at `ac62673`.**
+
+**The evidence that this is the right shape came from a different file in the same wave.** §9's
+`cmd/worker` entry set itself a deadline — decide the task selector "before the fourth task registers"
+— and wave 8's own log recorded *"three registered tasks, not four — confirmed"*. That was **true when
+it was measured** and went stale inside the same wave, because SHIP-89 registered the fourth on Track
+A. So the same session got the measurement right and still shipped it stale. **A figure measured
+correctly, published without its ref, and read later as current is the failure**, and "measure more
+carefully" is not a fix for it. Either state the ref or let a gate hold the number.
+
+**Fencing protects an assertion; a consumer reading `--from-beginning` on a shared topic is unfenced
+however the assertion is written.** This is the general form of the defect SHIP-15t fixed in
+`80-notifications.sh`, and it is worth separating from the rule already in `CLAUDE.md`. That rule — *a
+fence on a Kafka topic must be an id, not a timestamp* — is about what a check may **conclude**. It
+says nothing about what the reader was permitted to **see**, and a subset check over ids is only as
+good as the window it ran over. `shipper.bid` is appended to by every worktree and emptied by nothing,
+so a fixed-size read from the beginning was always going to stop containing this run's events. **A
+shared append-only resource read through a fixed-size window has a failure date, not a failure
+probability** — which is what distinguishes it from every other Kafka false failure recorded here,
+each of which was concurrency and cleared on a re-run. The instrument is `kafka-get-offsets.sh
+--time -1`, captured before the run produces anything; `kafka_consume_fenced` in the harness is the
+worked example, and its bound is derived from `end - fence` rather than chosen.
+
+**`contracts/paths/*.yaml` hold a fourth hand-written copy of the status vocabulary and nothing pairs
+it with the other three. Open, with its reason.** SHIP-56a made `contracts/statuses.yaml` the one
+source for Go, Dart and TypeScript, and `Docs/10` §3.4 pairs the Go list against `ck_bids_status` in
+both directions. The path fragments were not part of that: **deleting `countered` from
+`bidding.yaml`'s enum passes `make check`.**
+
+**It is recorded rather than fixed because the obvious fix false-fails on correct fragments.** Several
+of those enumerations are *legitimate subsets* — `delivery.yaml`'s recordable milestones are four of
+the twelve job statuses on purpose, and a job status a driver may never record has no business in that
+list. So a check that paired by overlap would report every one of them. Making it work needs each
+fragment to **declare which vocabulary it names and whether it is the whole of it**, which is a
+change to how the contract is written rather than a wider net thrown over what is already there.
+**That is a contract decision and it belongs to whoever next edits `contracts/`, not to a codegen
+ticket.**
+
+**SHIP-90 silently narrowed SHIP-68 and SHIP-69, and the fix is a document change before it is a code
+change.** `jobs.ExpiryClaim` and `ExpiryWarningClaim` both filter `WHERE status = 'Open'`
+(`internal/jobs/expiry.go:72` and `:167`), which was the whole of "a live job" when they were written.
+Since SHIP-90 a job with one unanswered offer sits at `Negotiating`, so **neither sweep can see it**
+and `Docs/02` §6.3's deadline stops being enforced on exactly the jobs somebody has bid on.
+
+**Nothing is lost, only delayed**, and that is why this is a ticket rather than an incident: every live
+offer runs out at its own collection time under SHIP-89, the last one leaving returns the job to
+`Open`, and the next pass takes it. **Do not widen the claim from a domain branch.** `Docs/02` §2 has
+one expiry row and it says `Open → Cancelled`; widening the query without widening the document is
+resolving a contradiction silently in code, which `CLAUDE.md` forbids. It is now **`Docs/09`'s
+SHIP-70a**, whose *Done when* names the document first — a paragraph with no owner is how a finding
+goes quiet, and this file has two worked examples of that in SHIP-56a and SHIP-136.
+
+**`LeaveNegotiation`'s `FOR UPDATE SKIP LOCKED` has no test, and it is the strongest untested invariant
+on the board.** Making it blocking reintroduces the `bids` → `jobs` cycle against the award's
+`jobs` → `bids`, which is the deadlock SHIP-88's lock ordering exists to prevent. **Verified rather
+than suspected: `make test` exits 0 with the mutation applied.** It is a **survivor by inspection** —
+no suite notices, because a deadlock needs a sweep and an award racing, and the only harness in this
+repository that can express that is SHIP-95's. Whoever next opens `internal/bidding` should either
+extend that harness or write the reason it cannot be extended; a single-transaction test cannot
+produce this failure and one that appeared to would be testing something else.
+
+**`Config.Identity.Argon2` is narrower than its meaning.** Wave 8's Track D reused it for
+administrator password hashing rather than duplicating a cost knob, which was right — `Docs/10` §3.4's
+whole argument is that two copies of a security parameter agree by comment. The consequence is that
+the platform's password cost is spelled as identity's. A rename is shared-surface work with no
+behavioural content, so it wants a prep slot rather than a lane; SHIP-15t declined it because four
+lanes were about to be cut from that branch and a rename landing underneath them buys nothing.
+
+**`Docs/09`'s dependency column records what must be *built* before a ticket, not what must be
+*served* to it — and for a client ticket those are different questions.** Two client tickets have now
+been found unbuildable with every dependency satisfied: SHIP-101, which had nothing serving a provider
+their own bids, and SHIP-102, whose four comparison clauses are **all** unserved because
+`routes_golden.txt` carries no `GET` collection of a job's bids. Both were found by a lane picking the
+ticket up rather than by this file or by `Docs/09`. **The graph cannot express the relationship even
+where somebody has noticed it**: the three read tickets SHIP-15r wrote — SHIP-101a, SHIP-115a and
+SHIP-120a — appear in **no `Depends on` cell anywhere**, measured. **A client ticket's real
+precondition is a route on the served surface, and `routes_golden.txt` is the only artefact that
+answers it.** The cheap habit, until somebody makes it mechanical: before scheduling a client ticket,
+grep `routes_golden.txt` for each noun in its *Done when*.
 
 ## 10. The done list, in a form a script can read
 
