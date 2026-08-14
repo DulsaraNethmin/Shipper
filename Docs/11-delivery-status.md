@@ -8300,6 +8300,15 @@ Whether a job completed through the exception path may auto-complete under Docs/
 is the owner's. A job entering this queue and a job auto-completing are **not exclusive**. The entry
 carries `job_status` for triage and it means only what it says.
 
+#### The queue is more load-bearing than two points suggest
+
+Track B established during this wave that **a driver can currently reach `Delivered` only through a
+reasoned exception**: there is no route by which a driver obtains an object key, because
+`POST /jobs/{id}/proof-uploads` is `RequireUser`, and that stands until SHIP-122. So for every
+driver-recorded delivery, this queue is not one path into moderation — **it is the only one**. That
+is a temporary consequence of the order the work landed in rather than a decision, and it is worth
+knowing while it lasts.
+
 #### What the entry deliberately cannot carry
 
 No object key and no signed URL, because by construction there is no photograph — a proof row is one
