@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
@@ -634,6 +637,60 @@ func TestTheWriterRefusesAnEntryItCannotRecordHonestly(t *testing.T) {
 				t.Errorf("a refused entry was written anyway: %+v", added)
 			}
 		})
+	}
+}
+
+// TestAFailedAuditWriteIsReportedRatherThanSwallowed is the test SHIP-150's own mutation sweep
+// found missing, and it is the one design decision in audit.go that nothing else checks.
+//
+// # What survived, and why it survived
+//
+// The decision is that a failure to write the entry **fails the mutation** — the opposite of the
+// usual instinct about logging, and right for this table because `Docs/09` puts audit on the
+// do-not-cut list for being impossible to backfill. Making [Auditor.Record] return `nil` when the
+// INSERT fails passed the entire suite: every other test drives a database where the insert
+// succeeds, so the error branch was never taken. The decision was stated in a comment and
+// demonstrated by nothing.
+//
+// # How the write is made to fail without touching the schema
+//
+// A statement the database refuses puts the transaction into the aborted state, after which every
+// subsequent statement in it fails until rollback. That is a real failure at the point Record makes
+// its call, needs no DDL, and cannot leave anything behind — the transaction is rolled back either
+// way. Dropping the table inside a transaction would work too and would be a far heavier fixture for
+// the same signal.
+func TestAFailedAuditWriteIsReportedRatherThanSwallowed(t *testing.T) {
+	f := newAuditFixture(t)
+
+	auditor, err := NewAuditor(f.clk)
+	if err != nil {
+		t.Fatalf("building the writer: %v", err)
+	}
+
+	entry := AuditEntry{
+		Actor:      AdminActor(uuid.New()),
+		Action:     AuditActionAdministratorCreated,
+		TargetType: AuditTargetAdministrator,
+		TargetID:   uuid.New(),
+	}
+
+	rollback := errors.New("this transaction is deliberately abandoned")
+
+	err = db.InTx(t.Context(), f.pool, func(ctx context.Context, r db.Runner) error {
+		// Aborts the transaction. The error is deliberately ignored: it is the *state* this
+		// leaves behind that the assertion is about, not the division.
+		_, _ = r.Exec(ctx, `SELECT 1 / 0`)
+
+		if _, err := auditor.Record(ctx, r, entry); err == nil {
+			t.Error("a failed audit write was reported as a success.\n" +
+				"An entry that cannot be written must fail the action it describes " +
+				"(SHIP-150). Swallowing it leaves a privileged action that happened with " +
+				"nothing recording it, in a table that cannot be backfilled.")
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("the fixture transaction did not roll back as intended: %v", err)
 	}
 }
 

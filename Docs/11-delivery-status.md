@@ -9497,17 +9497,35 @@ nothing about the third.
 
 #### The mutations, and the one that survived
 
+**Every row below was run and its output read. An earlier draft of this table predicted the outcomes
+before running them and was wrong twice** — which is the failure `CLAUDE.md` names about copied
+figures, committed here in miniature, and the reason the table now says what was measured.
+
 | Mutation | Outcome |
 |---|---|
-| Remove the audit write from **sign-out** — the least obvious of the three | **Caught.** `TestEveryAdminMutationWritesAnAuditEntry/signing_out` fails with "signing out wrote 0 audit entries, want exactly 1", and `scripts/verify/90-admin.sh` fails on the wire |
-| Take `created_at` from the column default instead of the injected clock | **Caught**, twice — the per-mutation clock assertion, and the past/future test |
-| Move the entry outside the transaction in `Credentials.Create` (write it before the insert) | **Caught** by `TestAMutationThatFailsLeavesNoAuditEntry`, in its duplicate-address half — the refusal that happens *inside* the transaction, which is the case a best-effort write gets wrong |
-| Return `nil` from `Auditor.Record` when the insert fails | **Caught** — the entry is absent and the mutation reports success, which the same test sees as a missing row |
-| Drop the `admins.manage` check from `CreateAdministrator` while keeping the audit write | **Survived this suite**, and is caught by SHIP-148's `TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission`. Recorded because it is the one plausible edit that makes an audited action *more* reachable, and the guard for it is in another file |
+| Remove the audit write from **sign-out** — the least obvious of the three | **Caught.** `TestEveryAdminMutationWritesAnAuditEntry/signing_out`: "signing out wrote 0 audit entries, want exactly 1" |
+| Skip `SpendEquivalentWork` for an unknown administrator address | **Caught.** `TestSignInSpendsTheSameWorkWhetherOrNotTheAdministratorExists`: an unknown address cost **1.5 ms** and a wrong password **6.6 ms**. `TestUnknownAddressAndWrongPasswordAreOneAnswer` still **passed**, which is the pair working as designed — one tests the answer, the other the time, and only the second is a timing oracle |
+| Take `created_at` from the column default instead of the injected clock | **Caught** twice, and the past/future test failed in **both** directions — 2020 and 2039 — which is the property that stops it rotting |
+| Write the entry ahead of the work in `Credentials.Create`, on the pool rather than the transaction | **Caught** by `TestAMutationThatFailsLeavesNoAuditEntry`, in its duplicate-address half: "a refused duplicate wrote 1 audit entries". That is the refusal happening *inside* the transaction, which is exactly the case a best-effort write gets wrong |
+| Return `nil` from `Auditor.Record` when the **INSERT** fails | **SURVIVED** — see below |
+| Drop the `admins.manage` check from `CreateAdministrator` while keeping the audit write | **Caught**, and by more than expected: `TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission` (SHIP-148's) *and* `TestAMutationThatFailsLeavesNoAuditEntry`, whose fixture takes the 403 as its precondition and reports 201 instead |
 
-**The one that survived is the entry to read.** SHIP-150's suite establishes that every mutation is
-recorded; it establishes nothing about whether the mutation should have been permitted, and a reader
-of this section should not infer otherwise. The two guards are separate on purpose and both are real.
+#### The surviving mutation, and what it says about the design
+
+**`Auditor.Record` swallowing a failed INSERT passed the entire suite** — `internal/admin`, `cmd/api`
+and `migrations`, all green. Every other test drives a database where the insert succeeds, so the
+error branch was never taken once. **The single decision this ticket argues hardest for — that a
+failure to write the entry fails the action — was stated in a comment and demonstrated by nothing.**
+
+That is the shape wave 7 recorded as the most valuable result a mutation run produces: a guard that
+passed when it should have failed. It is also the most plausible edit a future maintainer makes,
+because "do not let logging break the feature" is the correct instinct almost everywhere else.
+
+`TestAFailedAuditWriteIsReportedRatherThanSwallowed` closes it. The write is made to fail without
+touching the schema: a statement the database refuses puts the transaction into the aborted state,
+after which Record's INSERT genuinely fails, and the whole transaction is rolled back either way.
+**Re-applying the mutation against the new test fails it**, which is the half that makes the guard
+real rather than believed.
 
 #### Where it lives, and the trigger for moving it
 
@@ -9612,6 +9630,13 @@ A leading-wildcard LIKE cannot use `uq_users_email`, so this is a sequential sca
 and by a 320-character cap on the term. Right at pilot volume; the fix is a trigram index, which is a
 migration against `users` in the shared block and therefore a **request** rather than something this
 ticket takes.
+
+#### The mutations, run and read
+
+| Mutation | Outcome |
+|---|---|
+| `likeContains` returns the term unescaped | **Caught.** Searching `%` returned **all three** fixture accounts instead of the one that contains the character literally, and `a_@example.com` returned two accounts instead of none |
+| Keep the leading zero in `phonePattern`, so a local-form number is not normalised | **Caught.** `the local form` and `spaced and bracketed` both returned nothing — which is the defect `make verify` found in the first place, now held by a test |
 
 **Nothing was needed from `internal/config`.**
 
