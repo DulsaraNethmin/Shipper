@@ -1811,3 +1811,99 @@ ok "the evidence follows the claim it stands behind, in the outbox and therefore
 
 unset deliv_key
 unset -f delivery_events_on
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-121  every milestone the driver portal offers is one the platform accepts"
+
+# # What only this section can show, and it is the risk this ticket actually carries
+#
+# SHIP-121 draws buttons over `POST /v1/driver/jobs/{id}/milestones`, which SHIP-120a built and the
+# section above already exercises. So there is no new endpoint here and this file is not testing one.
+#
+# **What is new is a hand-written list.** `apps/driver-portal/lib/milestones.ts` names four wire
+# forms, and it names them by hand: `contracts/statuses.yaml` generates three enumerations into that
+# application and milestones are deliberately not among them — `internal/delivery/milestone.go`
+# declares its own five and says SHIP-56a "has no opinion about this one". A fourth enumeration
+# would have meant editing a shared file mid-wave and rewriting a domain's hand-written type, so
+# `Docs/11` §9 carries the generator as a recommendation with a trigger and the list is written out
+# meanwhile.
+#
+# A hand-written list of another system's vocabulary is exactly the thing that drifts, and the drift
+# is silent in the worst place: a driver taps a button in a yard and gets a `422` naming a field.
+# **So the list is read out of the TypeScript source and every value in it is recorded against the
+# running service**, which no Go test and no `node --test` can do — the first has no portal and the
+# second has no platform.
+#
+# The fifth milestone is checked from the other end. `driver_assigned` is refused by name, and a
+# portal that offered it would have a button that could never work.
+
+ms_portal_source="$ROOT/apps/driver-portal/lib/milestones.ts"
+[[ -f "$ms_portal_source" ]] || fail "the driver portal's milestone list is not where this check expects it: $ms_portal_source"
+
+# The wire forms the portal offers, in the order it offers them. `sed` rather than a JSON parse
+# because the file is TypeScript; the shape is one `wire: "..."` per milestone and nothing else in
+# the file matches it.
+ms_portal_wire="$(sed -n 's/^ *wire: "\([a-z_]*\)",$/\1/p' "$ms_portal_source")"
+[[ "$(printf '%s\n' "$ms_portal_wire" | grep -c .)" == "4" ]] \
+  || { printf '%s\n' "$ms_portal_wire"; fail "the portal offers $(printf '%s\n' "$ms_portal_wire" | grep -c .) milestones, want 4"; }
+ok "the driver portal offers four milestones, read out of lib/milestones.ts rather than retyped here"
+
+# ms_record <token> <job-id> <key> <body> <name> — one driver milestone, answering with the status.
+#
+# A helper of this section's own rather than SHIP-120a's `drv_record`, which is `unset -f` above.
+# The credential and the job stay separate arguments for the reason that one's were: every check
+# here is a pairing of the two, and a helper that built the path out of the token could not express
+# the pairing the driver routes exist to refuse.
+ms_record() {
+  curl -s -X POST -o "$WORKDIR/portalms-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $3" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$2/milestones"
+}
+
+ms_job="$(delivery_awarded_job portalms)"
+status="$(delivery_request "$delivery_provider_token" "verify-portalms-assign-$$" \
+  "/v1/jobs/$ms_job/driver" '{"driver_name":"Tam Ngo","driver_mobile":"+61417000121"}' \
+  "$WORKDIR/portalms-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/portalms-assign.json"; fail "assigning the portal driver returned $status, want 201"; }
+ms_token="$(json "$WORKDIR/portalms-assign.json" '["driver_token"]')"
+
+# Each in turn, in the order the buttons read in, on the driver's own credential — which is what the
+# browser holds. `delivered` carries a reasoned exception because that is the whole of what a driver
+# can attach today: there is no route by which one can obtain an object key until SHIP-122, and
+# `internal/delivery` refuses an `object_key` on this route by name. `Docs/01` §4.4 makes the
+# exception path part of the same feature, and the portal's completion step offers exactly these.
+ms_step=0
+while read -r ms_wire; do
+  [[ -n "$ms_wire" ]] || continue
+  ms_step=$((ms_step + 1))
+
+  ms_body="{\"milestone\":\"$ms_wire\"}"
+  if [[ "$ms_wire" == "delivered" ]]; then
+    ms_body="{\"milestone\":\"delivered\",\"proof\":{\"exception_reason\":\"recipient_objected\"}}"
+  fi
+
+  status="$(ms_record "$ms_token" "$ms_job" "verify-portalms-$ms_step-$$" "$ms_body" "$ms_step")"
+  [[ "$status" == "201" ]] \
+    || { cat "$WORKDIR/portalms-$ms_step.json"; fail "the portal offers $ms_wire and the platform answered $status"; }
+  [[ "$(json "$WORKDIR/portalms-$ms_step.json" '["milestone"]')" == "$ms_wire" ]] \
+    || fail "recording $ms_wire came back as $(json "$WORKDIR/portalms-$ms_step.json" '["milestone"]')"
+done <<< "$ms_portal_wire"
+ok "every one of them records on the driver's own link, in the order the buttons read in — the four the portal draws are the four the service accepts"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$ms_job';")" == "Delivered" ]] \
+  || fail "the four milestones did not take the job to Delivered"
+ok "and a driver takes a delivery from assignment to Delivered through the portal's four buttons and nothing else"
+
+# The fifth, refused by name. A portal that offered it would have a button that could never work.
+status="$(ms_record "$ms_token" "$ms_job" "verify-portalms-fifth-$$" \
+  '{"milestone":"driver_assigned"}' fifth)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/portalms-fifth.json"; fail "driver_assigned was accepted as a milestone: $status"; }
+[[ "$(json "$WORKDIR/portalms-fifth.json" '["error"]["details"][0]["field"]')" == "milestone" ]] \
+  || { cat "$WORKDIR/portalms-fifth.json"; fail "the refusal does not name the milestone field"; }
+[[ "$(grep -c 'driver_assigned' "$ms_portal_source")" == "1" ]] \
+  || fail "lib/milestones.ts names driver_assigned more than once; it should appear only in the comment saying it is absent"
+ok "the fifth milestone is refused by name and the portal does not offer it — a driver is put on a job through its own endpoint"
+
+unset ms_portal_source ms_portal_wire ms_job ms_token ms_step ms_wire ms_body
+unset -f ms_record

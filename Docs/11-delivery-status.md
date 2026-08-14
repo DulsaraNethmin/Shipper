@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **642 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **646 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -479,6 +479,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-120a** | M4 | `POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken` — **the first write in the service served on a credential that names no account**, and the route three wave-7 lanes specified and none built. It settles the idempotency scope §9 had held open since SHIP-15m: a driver's key is scoped by the job, because `uq_milestones_idempotency (job_id, idempotency_key)` already scopes it there and `000602` named this case while doing it. The `Jobs` port's four moves take a `Recorder` instead of a provider identifier, so a driver's transition is attributed to their `driver_assignments` row rather than to their provider — *see below* |
+| **SHIP-121** | M4 | Driver portal milestone controls — four 56-pixel full-width targets over SHIP-120a's route, and **no platform change at all**. The decision worth reading is the idempotency key: one per action, minted from a CSPRNG, held in `sessionStorage` across a reload, and discarded only when the platform **answers** — so a retry in a shed reuses it and `Docs/02` §5's second pickup attempt does not. The portal's proxy grew a second outbound call and stayed narrow by becoming **a file per upstream endpoint**; `surface.test.ts` now holds each route file to exactly one `/v1/` template. `make verify` reads the portal's hand-written milestone list out of its own source and records every value in it against the running service — *see below*
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
@@ -9116,6 +9117,132 @@ middleware chain, one in `internal/delivery` against real rows, and one in
 driver-token route named any other way is scoped by nothing and refuses everything.
 `TestEveryDriverTokenRouteNamesItsJobInThePath` walks the manifest rather than the two routes that
 exist today.
+
+
+### SHIP-121 — the buttons, and the idempotency key that decides whether a tap is a retry or a second claim
+
+Four large touch targets on the driver's page, over `POST /v1/driver/jobs/{id}/milestones`. **No new
+platform route and no Go change at all**: SHIP-120a built the endpoint, and this ticket is the
+`apps/driver-portal` half plus a `make verify` section that holds one hand-written list to the
+running service.
+
+**The interesting decision is not the buttons, it is the key.** `httpx.Idempotent`'s own refusal
+states the contract in one sentence — "generate one value per action and reuse it for every retry of
+that action" — and on this surface both halves of that sentence fail silently, in opposite
+directions, and neither produces an error anywhere:
+
+- **Reuse where a fresh key was needed** answers the driver with a milestone they recorded earlier
+  and writes nothing. `Docs/02` §5's failed pickup attempt is the case: a driver who reaches a locked
+  gate and records `en_route_to_pickup` again on the way back has made a second claim about the
+  world, and `000601` deliberately has no uniqueness on `(job_id, milestone)` so that it can be kept.
+- **A fresh key where reuse was needed** records the milestone twice. Tap, request goes out, answer
+  never comes back because the driver is in a shed, tap again.
+
+So `lib/keys.ts` mints one key per action and `lib/open.ts`'s `recordStep` is the only place that
+decides an action is **over**: an answer settles it, silence does not. A `2xx` settles, and so does a
+`4xx` the driver caused — the platform decided, so the next tap is a new action. No answer at all, a
+`429`, a `503`, or an `idempotency_in_progress` leaves the key held. `lib/record.test.ts` asserts
+that against the keys that actually leave the browser rather than describing it in a comment.
+
+The key lives in `sessionStorage` rather than in a React ref, because the sequence this protects
+against includes a reload: a driver on one bar of signal pulls to refresh between the two taps, and a
+ref makes that two milestones. It is deliberately a **second file** from `link.ts` rather than two
+more functions in it — an idempotency key is not a credential, it authorises nothing, and its whole
+purpose is to be sent again, so keeping them apart is what lets `surface.test.ts` go on saying the
+token is named in exactly one place.
+
+**`crypto.randomUUID` and not a counter, and on this route that is load-bearing rather than
+hygiene.** A driver-token request scopes its key to `anonymous` — §9's entry, settled at SHIP-120a —
+so `idem:v1:anonymous:<key>` is a namespace shared with every other anonymous caller. What stops a
+stored response being read by somebody else is that reproducing it needs the exact request *and* the
+exact key, and 122 bits from a CSPRNG is what makes the second unreachable. SHIP-122's upload, whose
+stored response *is* a credential, is why this is written down here rather than assumed.
+
+#### The narrowness of the portal's proxy survives it growing a second outbound call, and that took a decision
+
+SHIP-120's route handler claims a property in its own header: "this route can only ever reach one
+endpoint: the method is `GET` because no other export exists, the upstream path is a template, and
+the one hole in that template is refused unless it is a job identifier". SHIP-121 needs a `POST` to a
+different upstream path, and **the tidy way to add one destroys that property**: a shared
+`forward(path, …)` helper in `lib/` is one `fetch` whose destination is an argument, which is the
+`rewrites()` entry `next.config.ts` refused, with more steps.
+
+So it is **a file per upstream endpoint**. `lib/upstream.ts` holds where the platform is and what a
+locally-made refusal looks like, and deliberately holds no path and makes no request; each route file
+names one template and calls `fetch` itself. The duplication is about fifteen lines and it is the
+visible kind. `surface.test.ts` turns it into an assertion that is now per file rather than global:
+every file mentioning `/v1/` must be a route handler, and each must name **exactly one** template —
+so a handler with a branch in it, or one that builds its path from anything but a literal, fails.
+**The count of templates is the count of endpoints this origin can reach**, and it is the number to
+read at review.
+
+#### Two mutations, both caught, and the second is wave 7's shape on a route that writes
+
+**The traversal.** With `isJobId` removed from the milestones handler, `../../jobs`, `..%2f..%2fjobs`
+and `../../../v1/jobs/open` all construct a URL and a request goes out — the portal origin becomes a
+credential-forwarding front door to the whole platform. `a traversal in the job identifier reaches no
+endpoint, on either route` fails. It asserts two things and the second is the one that matters: the
+status is `400`, **and no outbound request was made at all**, because a `400` after the credential
+has already been forwarded is not a refusal. It is asserted per handler rather than once, since a
+portal with two route files and one guarded is a portal with an open door.
+
+**The job identifier derived from the token.** `recordStep` mutated to decode `job_id` out of the
+credential and build the path from it: two tests fail. This is the shape wave 7's Track D found on
+the read, where it rendered another job's delivery with a `200` while every test passed, and it is
+worse on a write — a milestone attributed to a delivery the driver is not carrying. The platform
+cannot detect it from its own seat, because the path and the grant agree once the client has built
+one out of the other; `one-job.test.ts` now records the requests the portal issues on the write as
+well as on the read.
+
+Both were reverted from a copy taken beforehand and confirmed by checksum, not by `git checkout` —
+`CLAUDE.md`'s recipe, for the reason it gives.
+
+#### What only `make verify` can show here, and it is the risk this ticket actually carries
+
+There is no new endpoint, so the section is not testing one. **What is new is a hand-written list.**
+`contracts/statuses.yaml` generates three enumerations into the driver portal and milestones are
+deliberately not among them — `internal/delivery/milestone.go` declares its own five and records that
+SHIP-56a "has no opinion about this one", because they are a different list from `jobs.Status` with a
+different membership and `ck_milestones_milestone` behind them. Adding a fourth enumeration would
+have meant editing a shared file mid-wave *and* rewriting a domain's hand-written type, so
+`lib/milestones.ts` writes the four out with the authority named beside them and §9 carries the
+generator as a recommendation with a trigger.
+
+A hand-written copy of another system's vocabulary is exactly the thing that drifts, and it drifts
+silently in the worst place — a driver taps a button in a yard and gets a `422` naming a field. So
+the verify section **reads the wire forms out of the TypeScript source with `sed`** and records every
+one of them against the running binary, taking one delivery from assignment to `Delivered` through
+the portal's four buttons and nothing else. Neither a Go test nor `node --test` can do that: the
+first has no portal and the second has no platform. The fifth milestone is checked from the other
+end — `driver_assigned` is refused by name, and the source is held to naming it exactly once, in the
+comment that says it is absent.
+
+#### What SHIP-121 deliberately does not do
+
+**A driver cannot see which milestones they have already recorded.** The buttons start at rest on
+every page view, and a reload forgets what the last one did. Persisting it would need the platform to
+serve a driver their own milestone list, and no such route exists — `GET
+/v1/jobs/{id}/delivery/milestones` is `RequireUser`. That is a gap rather than a decision and it
+belongs to nobody today: a `GET /v1/driver/jobs/{id}/milestones` under `RequireDriverToken` is what
+would close it, and no ticket in `Docs/09` names one. It costs the driver nothing they cannot
+recover from — tapping a milestone twice is safe, and `Docs/02` §5 makes a repeat an ordinary
+recording rather than an error.
+
+**No button is ever greyed out for being out of sequence**, and that is a decision rather than a gap.
+The page has no idea where the delivery has got to and must not pretend to — `GET
+/v1/driver/jobs/{id}` serves no status, deliberately — and a page that guessed would be making the
+authorisation decision `Docs/07` §3 puts on the platform, in the one direction that hurts: a driver
+at a roller door with the button they need disabled. The platform's answers are useful ones anyway: a
+milestone the delivery has already passed is absorbed (SHIP-112), and one it has not reached yet
+comes back as `delivery_milestone_not_permitted`, which the page renders as "record the step before
+it first" because since SHIP-112 that code can only mean too early.
+
+**Delivered is completable only through a reasoned exception**, which is the whole of what a driver
+can do today and is not a stub: `Docs/01` §4.4 makes the exception path "part of the same feature…
+built with it, not after", precisely so that "what must never happen is a driver standing at a
+delivery point unable to finish the job". A photograph is SHIP-122's, and until it exists there is no
+route by which a driver can obtain an object key. The three reasons come from `lib/statuses.gen.ts`
+and the sentence a driver reads is verbatim from `Docs/01` §4.4.
 
 
 ### SHIP-109 — revocation is a read against a column, and a retry must not cause one

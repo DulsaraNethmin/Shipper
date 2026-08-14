@@ -1,4 +1,13 @@
-import { openDelivery, type Delivery, type Refusal } from "./delivery.ts";
+import {
+  isSettled,
+  openDelivery,
+  recordMilestone,
+  type Delivery,
+  type Evidence,
+  type RecordOutcome,
+  type Refusal,
+} from "./delivery.ts";
+import { keyFor, settle } from "./keys.ts";
 import { isJobId, recallToken, rememberToken, tokenFromFragment } from "./link.ts";
 
 /**
@@ -69,4 +78,55 @@ export async function openLink(jobId: string, signal: AbortSignal): Promise<Open
   if (token === null) return { kind: "missing" };
 
   return openDelivery(jobId, token, signal);
+}
+
+/** What one tap on a milestone button produced, before the page decides how to draw it. */
+export type Told = RecordOutcome | { kind: "missing" };
+
+/**
+ * Record one milestone, from the address bar through to an answer (SHIP-121).
+ *
+ * The write counterpart of [openLink], and it is here for the same two reasons: a `.tsx` file
+ * cannot be imported by `node --test`, and everything with a decision in it belongs where a test
+ * can reach it. What is left in the component is state and markup.
+ *
+ * # The idempotency key's whole lifecycle is these four lines and it is the reason this is not
+ * inside the component
+ *
+ * `lib/keys.ts` mints one per action and holds it across a reload; this function is the only place
+ * that decides an action is **over**. The rule is one line — settle on an answer, keep on silence —
+ * and it is testable here and untestable in JSX. Getting it wrong in either direction is a defect a
+ * driver meets and nobody else does: settling on a network failure records the milestone twice when
+ * they tap again, and never settling makes `Docs/02` §5's second pickup attempt come back as the
+ * first one with nothing written.
+ *
+ * The scope is the job and the milestone together, so two recordings in flight at once — a driver
+ * tapping `Picked up` while `En route to pickup` is still retrying in a tunnel — cannot take each
+ * other's key or each other's answer.
+ *
+ * # The job identifier is the caller's, exactly as it is on the read
+ *
+ * `jobId` arrives from the URL path and is handed on unchanged. It is never derived from the token,
+ * and the token is never parsed here — `lib/link.ts` records why at length, and
+ * `lib/one-job.test.ts` asserts it against the requests this function actually issues, on the write
+ * as well as on the read.
+ */
+export async function recordStep(
+  jobId: string,
+  milestone: string,
+  options: { evidence?: Evidence; signal?: AbortSignal } = {},
+): Promise<Told> {
+  if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
+
+  const token = tokenForThisView(jobId);
+  if (token === null) return { kind: "missing" };
+
+  const scope = `${jobId}.${milestone}`;
+  const outcome = await recordMilestone(jobId, token, milestone, keyFor(scope), {
+    evidence: options.evidence,
+    signal: options.signal,
+  });
+
+  if (outcome.kind === "recorded" || isSettled(outcome.refusal)) settle(scope);
+  return outcome;
 }

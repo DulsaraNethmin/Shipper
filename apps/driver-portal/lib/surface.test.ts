@@ -37,11 +37,39 @@ import { test } from "node:test";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORTAL = path.join(HERE, "..");
 
-/** The one place a request is made from the browser, and the one place it is made from the server. */
-const MAY_REQUEST = ["lib/delivery.ts", "app/api/driver/jobs/[jobId]/route.ts"];
+/**
+ * The one place a request is made from the browser, and the route handlers that make them from the
+ * server.
+ *
+ * **One file per upstream endpoint, and that is the mechanism rather than a filing convention**
+ * (SHIP-121). The portal grew from one outbound call to two, and the property SHIP-120 claimed —
+ * "this route can only ever reach one endpoint" — survives that only because each handler names one
+ * path as a literal template. A shared `forward(path, …)` in `lib/` would have been the tidy version
+ * and would have been the `rewrites()` entry `route.ts` refused, with more steps: one `fetch` whose
+ * destination is an argument is a general, credential-forwarding front door however narrow its
+ * callers are today. So the count below is the count of endpoints this origin can reach, and the
+ * `/v1/` test underneath turns that into an assertion.
+ */
+const MAY_REQUEST = [
+  "lib/delivery.ts",
+  "app/api/driver/jobs/[jobId]/route.ts",
+  "app/api/driver/jobs/[jobId]/milestones/route.ts",
+];
 
-/** The one place a credential is held between arriving and being spent. */
-const MAY_HOLD = ["lib/link.ts"];
+/** The route handlers, which are the only files that may name a platform endpoint. */
+const MAY_NAME_AN_ENDPOINT = MAY_REQUEST.filter((file) => file.startsWith("app/"));
+
+/**
+ * The one place a credential is held between arriving and being spent, and the one place a
+ * per-action idempotency key is.
+ *
+ * `lib/keys.ts` joined this list at SHIP-121 and it is deliberately a **second file** rather than
+ * two more functions in `link.ts`. What it holds is not a credential: an idempotency key is a value
+ * the client invents to name its own request, it authorises nothing, and its whole purpose is to be
+ * sent again. Keeping the two in separate files is what lets the credential test below go on saying
+ * that the token is named in exactly one place.
+ */
+const MAY_HOLD = ["lib/keys.ts", "lib/link.ts"];
 
 function sources(): Map<string, string> {
   const found = new Map<string, string>();
@@ -93,15 +121,36 @@ test("only those two name a credential", () => {
 });
 
 /**
- * The platform's own path appears once, in the route handler, spelled out in full. A second `/v1/`
- * anywhere in this application is a second endpoint somebody taught the portal to reach.
+ * A platform path appears only in a route handler, and each handler names exactly one.
+ *
+ * **The second half is the part that grew teeth at SHIP-121.** While there was one route file, "the
+ * platform is addressed at exactly one path" was the whole statement. With more than one, the
+ * statement that matters is per file: a handler that named two templates would be a proxy with a
+ * branch in it, and a handler that built its path from anything but a literal would be a proxy with
+ * a parameter. Both are the `rewrites()` entry `route.ts` refused, and neither would be caught by
+ * counting files.
+ *
+ * The count of templates below is therefore the count of endpoints this origin can reach, and it is
+ * the number that should be read at review: it went from one to two because SHIP-121 added a
+ * milestone write, and any other movement in it is somebody teaching the portal a new destination.
  */
-test("the platform is addressed at exactly one path", () => {
-  assert.deepEqual(filesContaining(/\/v1\//), ["app/api/driver/jobs/[jobId]/route.ts"]);
+test("only the route handlers name a platform path, and each names exactly one", () => {
+  assert.deepEqual(filesContaining(/\/v1\//), [...MAY_NAME_AN_ENDPOINT].sort());
 
-  const handler = sources().get("app/api/driver/jobs/[jobId]/route.ts") ?? "";
-  const paths = [...handler.matchAll(/\/v1\/[A-Za-z0-9_\-/{}$]*/g)].map((m) => m[0]);
-  assert.deepEqual(paths, ["/v1/driver/jobs/${jobId}"]);
+  const named = new Map<string, string[]>();
+  for (const file of MAY_NAME_AN_ENDPOINT) {
+    const handler = sources().get(file) ?? "";
+    named.set(file, [...handler.matchAll(/\/v1\/[A-Za-z0-9_\-/{}$]*/g)].map((m) => m[0]));
+  }
+
+  assert.deepEqual(
+    Object.fromEntries(named),
+    {
+      "app/api/driver/jobs/[jobId]/route.ts": ["/v1/driver/jobs/${jobId}"],
+      "app/api/driver/jobs/[jobId]/milestones/route.ts": ["/v1/driver/jobs/${jobId}/milestones"],
+    },
+    "a route handler names a number of upstream paths other than one",
+  );
 });
 
 /**
@@ -111,9 +160,40 @@ test("the platform is addressed at exactly one path", () => {
  * first draft of this test proves why: it failed on the copy that reads "there is no account to
  * sign in to", which is the page saying the right thing. A guard that a page fails by explaining
  * the invariant is testing the wrong thing.
+ *
+ * **`Idempotency-Key` left this list at SHIP-121 and has a test of its own below.** It was here
+ * because SHIP-120's portal made no state-changing request at all, so the header appearing anywhere
+ * meant a write had been added without anybody deciding to add one. A write is now the ticket, and
+ * leaving the header in a list of *identity* credentials would have made the next person delete the
+ * whole assertion to get their build green.
  */
 test("no identity endpoint or session credential is named anywhere in the portal", () => {
-  assert.deepEqual(filesContaining(/\/auth\/|refresh_token|access_token|Idempotency-Key/i), []);
+  assert.deepEqual(filesContaining(/\/auth\/|refresh_token|access_token/i), []);
+});
+
+/**
+ * The idempotency key is sent where a request is made and minted where one is held, and nowhere else
+ * (SHIP-121).
+ *
+ * `CLAUDE.md` makes an idempotency key mandatory on every state-changing endpoint, and the header is
+ * only correct when the *same* value survives a retry — so a key generated at a hop that is not the
+ * browser's is a key that changes on every attempt, which is the header doing the opposite of its
+ * job. Holding the set of files that may name one to `lib/keys.ts` plus the request path is what
+ * makes a second minting site a failing test rather than a milestone recorded twice in a yard.
+ */
+test("the idempotency key is named only where one is minted, held or sent", () => {
+  // The read is deliberately absent. `GET /v1/driver/jobs/{id}` is not state-changing, the
+  // middleware passes it straight through, and a portal that forwarded a key on it would be
+  // claiming an action where there is only a look.
+  assert.deepEqual(
+    filesContaining(/idempotency[-_]?key/i),
+    [
+      "app/api/driver/jobs/[jobId]/milestones/route.ts",
+      "lib/delivery.ts",
+      "lib/keys.ts",
+    ].sort(),
+  );
+  assert.deepEqual(filesContaining(/randomUUID/), ["lib/keys.ts"]);
 });
 
 /**
