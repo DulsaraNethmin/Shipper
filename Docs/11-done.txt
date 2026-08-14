@@ -5,12 +5,12 @@
 # *Done when* line in Docs/09 is demonstrable.
 #
 # Docs/11 §4 lists the partly-finished tickets, and they are NOT all absent from this list.
-# Every ticket §4 names is here. SHIP-149 is its only live row, and it is here as well as there
-# because it landed and is named by a commit subject, while one clause of its *Done when* — the
-# Go write helper — belongs to work that does not exist yet. SHIP-65 was the other such entry
-# until SHIP-67 closed it, and SHIP-134 until its publisher landed, which is how this shape is
-# meant to end. Do not "tidy" any of them out: `make status` exits 1 when git shows a ticket this
-# file does not declare, so removing one breaks the build rather than making it more honest.
+# Every ticket §4 names is here. SHIP-151 is the newest of them: it landed, it is named by a
+# commit subject, and one clause of its *Done when* — the search by name — has no column in the
+# schema to search. SHIP-149 was such a row until SHIP-150 built its write helper, SHIP-65 until
+# SHIP-67 closed it, and SHIP-134 until its publisher landed, which is how this shape is meant to
+# end. Do not "tidy" any of them out: `make status` exits 1 when git shows a ticket this file
+# does not declare, so removing one breaks the build rather than making it more honest.
 # Docs/11 §10 carries the full reasoning.
 #
 # This paragraph was itself duplicated and self-contradictory until the wave-4 reconciliation —
@@ -207,6 +207,7 @@ SHIP-147
 SHIP-148
 SHIP-149
 SHIP-150
+SHIP-151
 SHIP-163
 
 # M7 — Hardening

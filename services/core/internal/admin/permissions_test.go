@@ -28,6 +28,17 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// testUsers is an account search with no pool, for the same reason as [testModeration]:
+// [NewHandler] requires one (SHIP-151) and no test in this file reaches the search endpoint.
+func testUsers(t *testing.T) *Users {
+	t.Helper()
+	u, err := NewUsers(nil)
+	if err != nil {
+		t.Fatalf("building the account search: %v", err)
+	}
+	return u
+}
+
 // testModeration is a queue service with no pool, for the same reason as [testDisputeService]:
 // [NewHandler] requires one and no test below reaches the queue endpoint.
 func testModeration(t *testing.T) *Moderation {
@@ -269,7 +280,7 @@ func TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission(t *t
 		t.Fatalf("signing in: %v", err)
 	}
 
-	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), nil, testLogger())
+	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), testUsers(t), nil, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -314,7 +325,7 @@ func TestAnOwnerCreatesAnAdministratorAndTheDefaultIsStillTheMinimum(t *testing.
 		t.Fatalf("signing in: %v", err)
 	}
 
-	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), nil, testLogger())
+	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), testUsers(t), nil, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}

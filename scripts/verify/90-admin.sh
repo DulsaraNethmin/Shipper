@@ -979,3 +979,131 @@ fi
 ok "and an entry the service wrote cannot be rewritten or deleted either — the invariant covers the rows that matter"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-151 — searching user accounts.
+#
+# # Three of the four terms, and the fourth said out loud
+#
+# The *Done when* is "search users by email, phone, name, and status". Email, phone and status are
+# below. **Name has no column anywhere in the schema** — `users` never held one and registration
+# never asks — so there is nothing to search and nothing to check. Docs/11 §4 records it. A check
+# here asserting that a name search returns nothing would read as a passing test of a working
+# feature, which is the opposite of recording a gap.
+#
+# # Every account is this run's own
+#
+# The `users` table is shared with every other section and every previous run, so a count would be a
+# statement about the machine. Each search below is fenced on the `$$`-suffixed addresses this
+# section registers, and the assertions are "this account is in the result" rather than "the result
+# has N rows".
+
+ticket "SHIP-151  an administrator searches accounts by email, phone and standing"
+
+admin_clear_limits
+
+# The 0419 prefix is this section's; 04190…04192 are the dispute fixtures above.
+search_email="verify-search-$$@example.com"
+search_phone="04193$$"
+status="$(post_json "verify-adm-search-reg-$$" /v1/auth/register \
+  "{\"email\":\"$search_email\",\"phone\":\"$search_phone\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/search-user.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/search-user.json"; fail "could not register the searchable customer: $status"; }
+search_user_id="$(json "$WORKDIR/search-user.json" '["id"]')"
+
+suspended_email="verify-search-gone-$$@example.com"
+status="$(post_json "verify-adm-search-susp-$$" /v1/auth/register \
+  "{\"email\":\"$suspended_email\",\"phone\":\"04194$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/search-suspended.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/search-suspended.json"; fail "could not register the suspended provider: $status"; }
+suspended_user_id="$(json "$WORKDIR/search-suspended.json" '["id"]')"
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set status = 'suspended' where id = '$suspended_user_id';" >/dev/null \
+  || fail "the account could not be suspended"
+
+# A support administrator, because looking is what the least-privileged role exists to be able to do
+# and Docs/01 §4.6 lists searching first.
+search_admin_email="verify-admin-search-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$search_admin_email', 'Verify Searcher', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the searching administrator could not be created"
+
+status="$(admin_signin "verify-adm-search-in-$$" "$search_admin_email" "$admin_password" search-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-search-in.json"; fail "the searching administrator could not sign in ($status)"; }
+search_token="$(json "$WORKDIR/admin-search-in.json" '["token"]')"
+
+# search_finds <query-string> <user-id> <name> — 1 when the account is on the page, 0 when it is not.
+search_finds() {
+  local found
+  status="$(admin_get "/v1/admin/users?$1" "$search_token" "$3")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-$3.json"; fail "searching accounts returned $status, want 200"; }
+  found="$(python3 - "$WORKDIR/admin-$3.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for u in (page.get("data") or []) if u["id"] == sys.argv[2]))
+PY
+)"
+  printf '%s' "$found"
+}
+
+[[ "$(search_finds "q=$search_email" "$search_user_id" search-email)" == "1" ]] \
+  || fail "an account could not be found by its whole email address"
+[[ "$(search_finds "q=verify-search-$$" "$search_user_id" search-partial)" == "1" ]] \
+  || fail "an account could not be found by part of its email address"
+ok "an account is found by its email address, whole or in part"
+
+[[ "$(search_finds "q=$search_phone" "$search_user_id" search-phone)" == "1" ]] \
+  || fail "an account could not be found by its phone number"
+ok "and by its phone number, through the same parameter — support has a string and does not always know which it is"
+
+# --- the standing filter, in both directions --------------------------------------------------------
+
+[[ "$(search_finds "q=verify-search-$$&status=suspended" "$suspended_user_id" search-susp)" == "1" ]] \
+  || fail "a suspended account is not found when filtering for suspended accounts"
+[[ "$(search_finds "q=verify-search-$$&status=suspended" "$search_user_id" search-susp-neg)" == "0" ]] \
+  || fail "an active account came back from a search filtered to suspended ones"
+ok "the standing filter finds the accounts in that standing and only those"
+
+# An unrecognised standing is refused rather than ignored. Ignoring it answers with every account,
+# which reads exactly like "every account is suspended" to somebody who mistyped one.
+status="$(admin_get "/v1/admin/users?status=suspeneded" "$search_token" search-bad-status)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-search-bad-status.json"; fail "a mistyped standing returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-search-bad-status.json")" == *'"status"'* ]] \
+  || { cat "$WORKDIR/admin-search-bad-status.json"; fail "the refusal does not name the field"; }
+ok "a standing the platform does not have is refused and names the field, rather than answering with everybody"
+
+# --- a search term is a string, not a pattern ---------------------------------------------------
+#
+# The one defect here with a security shape. `%` is LIKE's "anything", so an unescaped term of `%`
+# would return the whole table to the least-privileged role from one character in a search box.
+
+[[ "$(search_finds "q=%25" "$search_user_id" search-wildcard)" == "0" ]] \
+  || fail "a bare % matched every account, so the search term is being used as a LIKE pattern"
+ok "a bare wildcard matches nothing — a search term is a string somebody typed, not a pattern"
+
+# --- what the shape carries, and what it must never ---------------------------------------------
+
+status="$(admin_get "/v1/admin/users?q=$search_email" "$search_token" search-shape)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-search-shape.json"; fail "searching accounts returned $status"; }
+
+python3 - "$WORKDIR/admin-search-shape.json" >"$WORKDIR/search-keys.txt" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+items = page.get("data") or []
+print(",".join(sorted(items[0].keys())) if items else "")
+PY
+search_keys="$(cat "$WORKDIR/search-keys.txt")"
+[[ "$search_keys" == "created_at,email,email_verified_at,id,phone,phone_verified_at,role,status" ]] \
+  || fail "the administrator's view of an account carries [$search_keys], which is not the closed set this shape is held to"
+ok "an account carries a closed set of account facts — no jobs, no bids, no budget and no credential material"
+
+status="$(admin_get "/v1/admin/users?q=$search_email" "" search-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-search-nocred.json"; fail "the account search is readable without a credential ($status)"; }
+[[ "$(cat "$WORKDIR/admin-search-nocred.json")" != *"$search_email"* ]] \
+  || fail "a refused search returned accounts anyway"
+ok "and the search is behind the administrator credential, like every other administrative route"
+
+admin_clear_limits

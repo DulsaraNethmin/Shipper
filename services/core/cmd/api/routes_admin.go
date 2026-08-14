@@ -104,6 +104,23 @@ func init() {
 		},
 
 		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/users",
+			Group:   GroupV1,
+
+			// RequireAdmin is the credential; `users.read` is the permission, checked in the
+			// handler (SHIP-148, SHIP-151). Every role holds it — searching is what the
+			// least-privileged role exists to be able to do, and Docs/01 §4.6 lists it first.
+			//
+			// A collection under /admin rather than /users, because the shape is the
+			// administrator's view of an account and not the account holder's. There is no
+			// endpoint by which a user reads another user, and this is not one arrived at
+			// through a different credential.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).SearchUsers() },
+		},
+
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
@@ -180,7 +197,15 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin moderation: " + err.Error())
 	}
 
-	handler, err := admin.NewHandler(svc, creds, moderation, d.Pool, d.Logger)
+	// SHIP-151. It takes the pool alone: the search reads `users`, which is a shared table this
+	// domain may read directly, and there is no port to supply. See internal/admin/postgres_users.go
+	// for why that is not the arrangement jobPartiesLookup and exceptionQueueLookup use.
+	users, err := admin.NewUsers(d.Pool)
+	if err != nil {
+		panic("cmd/api: admin account search: " + err.Error())
+	}
+
+	handler, err := admin.NewHandler(svc, creds, moderation, users, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
 	}

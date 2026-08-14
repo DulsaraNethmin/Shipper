@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **649 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **656 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -493,6 +493,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
 | **SHIP-148** | M6 | Twelve granular permissions and three role bundles, in a **Go table rather than a grant table** — a permission model is the opposite of the thing `Docs/06` §5.3 puts server-side and changeable. Default-deny at three levels: an omitted role becomes the minimum in Go *and* in the column default, and a role with **no bundle holds nothing**. There is deliberately **no permission to delete an audit entry** — *see below* |
 | **SHIP-150** | M6 | Every admin mutation writes an audit entry — and the ticket had to **build SHIP-149's missing write helper first**, because no Go code in the repository wrote to `audit_log` at all. The entry commits **in the same transaction as the mutation**, so a refused action leaves nothing and a failed entry fails the action. Completeness is checked from both ends: the domain drives every mutation and reads the row back, and `cmd/api` holds the **served surface** to the catalogue. `created_at` takes the **injected clock**, deliberately — *see below* |
+| **SHIP-151** | M6 | `GET /v1/admin/users` — search by email, phone and standing, cursor paged, newest first. **The fourth term of its *Done when* has no column**: nothing in the schema holds a user's name, and this ticket did not add one to a shared-block table — see §4. A phone term is **normalised to the stored E.164 form**, which `make verify` found by searching for the number a customer had registered with and getting nothing. The response is held to a **closed key set** rather than searched for the word budget — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -9526,6 +9527,94 @@ later is a deliberate act rather than a convenience that turns a widened catalog
 
 **Nothing was needed from `internal/config`.** The clock is already on `Deps`.
 
+### SHIP-151 — three of four terms, and the fourth has no column to search
+
+`GET /v1/admin/users`, `RequireAdmin`, gated on `users.read` — which every role holds, because looking
+is what the least-privileged role exists to be able to do and `Docs/01` §4.6 lists searching first.
+`q` matches an email address or a phone number, `status` narrows by standing, cursor paged on
+`(created_at, id)`, newest first.
+
+**Newest first is a departure from the moderation queue and is deliberate.** That queue is oldest-first
+because `Docs/04` §8 sets acknowledgement targets and the oldest entry is closest to breaching one. A
+search has no such target: the tail is where somebody stops reading rather than where the work is.
+
+#### The *Done when* says "email, phone, name, and status", and there is no name
+
+**Measured, not assumed.** `000002_users` holds id, email, phone, password_hash, role, status, the two
+verification timestamps and the two bookkeeping ones. `identity.User` has no name field and
+registration never asks for one. The only `name` columns in the schema are `admin_users.name` — an
+administrator's — and `driver_assignments.driver_name`, captured at assignment and belonging to a job.
+**The platform does not know a user's name.**
+
+This ticket did not add one. `users` is created in the **shared migration block (1–99)**, which is why
+§6 strikes SHIP-169, and a name belongs to registration rather than to search. So it is recorded in §4
+in the same form SHIP-118 and SHIP-77 carry, and serving it later is one more `OR` in
+`postgres_users.go`. A parameter that could only ever match nothing would have been worse than the
+absence: an empty page and "no such account" are the same answer.
+
+#### `make verify` found a defect no unit test would have
+
+The section searched for the account by the phone number it had just registered with — `0419…` — and
+found nothing. **Registration normalises to E.164**, so the row holds `+61419…` and the leading zero is
+simply not in it. A substring match of what a person types against what is stored finds nothing at
+all, which at the endpoint is indistinguishable from there being no such account.
+
+`phonePattern` closes it: the term is reduced to its digits and one leading zero is dropped, which is a
+fact about the **stored form** rather than a guess about Australia — E.164 has no trunk prefix. A term
+with fewer than four digits turns the phone branch **off** rather than matching `%%`; every account has
+a number, so getting that wrong would make every email search return the whole table. Three test cases
+now cover the local, spaced and stored forms, and one covers the short-term guard.
+
+**This is the argument for `make verify` in one paragraph.** The Go tests inserted fixtures directly and
+so agreed with themselves about the stored form. Only the section that registered through the real
+endpoint and searched with the number a person would have used could see it.
+
+#### The search term is a string, not a pattern
+
+`%` is LIKE's "anything", so an unescaped term of `%` returns the whole table to the least-privileged
+role from one character in a search box; `_` is quieter and worse, returning more than was asked for
+while looking as though it worked. `likeContains` escapes the backslash first and then both
+metacharacters. Covered by test and on the wire.
+
+#### The budget invariant, and the axis SHIP-83 established
+
+The response carries **account facts only** and joins no jobs. `TestTheUserSearchResponseCarriesNothingCommercial`
+holds the serialised shape to a **closed set of keys** rather than searching it for the word "budget" —
+SHIP-83's finding was that a field named `max_price` passes that search and leaks the same fact. The
+verify section makes the same closed-set assertion from outside Go, so neither can be quietly deleted
+alone. There is no password material under any name: the column is not selected and `UserRecord` has
+nowhere to put it.
+
+#### Two copies of one closed list, and the pairing that makes it safe
+
+`admin.UserStanding` is a **second Go copy** of `ck_users_status`s three values — `identity.Status` is
+the first — and it has to be, because `admin` may not import `identity`. `Docs/10` §3.4's pairing is
+what makes a copy safe, and `migrations/admin_user_search_test.go` is it, in both directions. It is
+named `UserStanding` rather than `Status` because `Status` in that package is already an
+administrator's, and one name for two closed lists is how a `switch` ends up comparing the wrong
+vocabulary.
+
+An unrecognised standing is **refused (422) rather than ignored**, which is the opposite of how the
+exception queue reports a job status: that field is *reported* and this one is an *input*. An ignored
+filter answers with every account, so `suspeneded` would read as "every account is suspended".
+
+#### This domain now reads `users` directly, and postgres.go's header was amended
+
+It said this store queries neither `jobs`, `bids` nor `users`, and that `users` is "shared and readable,
+but this domain has no reason to". This ticket is the reason. `users` is in the shared block precisely
+because most of the service reads it, and `jobs`, `fleet` and `delivery` each select from it in their
+own stores. What belongs in `cmd/api` is a query spanning **two other domains'** tables — the party
+lookup, the exception queue — and this one spans none.
+
+#### Scale is a known limit with a named fix
+
+A leading-wildcard LIKE cannot use `uq_users_email`, so this is a sequential scan bounded by the LIMIT
+and by a 320-character cap on the term. Right at pilot volume; the fix is a trigram index, which is a
+migration against `users` in the shared block and therefore a **request** rather than something this
+ticket takes.
+
+**Nothing was needed from `internal/config`.**
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -9533,6 +9622,7 @@ later is a deliberate act rather than a convenience that turns a widened catalog
 | ~~**SHIP-149**~~ | ~~`audit_log` table, append-only triggers, tests~~ | **Closed.** SHIP-150 built the write helper — see §3. On `7d7caf0` the only `INSERT INTO audit_log` in the repository was four statements in `migrations/schema_test.go`, and no Go code wrote an entry; `internal/admin/audit.go` and `postgres_audit.go` now do, and `migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing that could not be written while there was no Go vocabulary to pair |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | **SHIP-118** | `Delivered` recordable and refused without evidence, enforced in the domain and by `000605`'s deferred constraint trigger | The **recipient name** and the **delivery note**. `Docs/01` §4.4 requires a delivered job to carry both alongside proof and `Docs/02` §3 repeats it, naming `01` §4.4 as authoritative for the field set — and **no column holds either**. `milestones` has `job_id`, `milestone`, `actor_type`, `actor_id`, `reason` and the two clocks; `proofs` has the object metadata and `exception_reason`. See below |
+| **SHIP-151** | `GET /v1/admin/users` — search by **email**, **phone** and **status**, cursor paged, with the phone term normalised to the stored E.164 form | The **name**. Its *Done when* is "search users by email, phone, name, and status" and **no column anywhere in the schema holds a user's name** — `000002_users` never had one and registration never asks. The only `name` columns are `admin_users.name` and `driver_assignments.driver_name`, and neither is a user's. See below |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 
 **SHIP-65 has left this table.** Its *Done when* — "returns full job including budget" — was met
@@ -9567,6 +9657,22 @@ which no ticket in the backlog adds. The ticket did the honest thing with what i
 invent dates or tick steps a job may legitimately have skipped, the timeline says where the job is
 and says out loud what it does not know. **It stays in the done list either way** — §10 explains
 that removing it would hard-fail `make status` rather than making the record more truthful.
+
+**SHIP-151 is the SHIP-118 shape rather than the SHIP-77 one, and the difference is who owns the gap.**
+SHIP-77's missing half belongs to work that does not exist — no ticket adds a status-history endpoint —
+while SHIP-118's has an owner in SHIP-123. SHIP-151's has **neither**: no ticket in `Docs/09` adds a
+name to registration, and nothing else in the platform wants one, so the field has no owner and no
+scheduled arrival.
+
+**What it would cost, said plainly so the next reader does not re-derive it.** A `name` column on
+`users`, collected at registration, is a change to `000002_users.up.sql` — the **shared migration block
+(1–99)** — plus `identity`'s register handler, its `User`, `userColumns`, and the mobile and contract
+surfaces. §6 strikes SHIP-169 for exactly the first of those, and a domain branch taking it unilaterally
+is the shared-surface edit the block rules exist to prevent. Serving it once the column exists is **one
+more `OR`** in `internal/admin/postgres_users.go` and one line in the contract.
+
+**The ticket is in the done list either way**, on §10's rule: three of four terms are demonstrable on
+the wire, and removing the row would hard-fail `make status` rather than make the record more truthful.
 
 ## 5. Blocked — and only by work outside this repository
 
