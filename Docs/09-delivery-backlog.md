@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**212 tickets, 659 points.**
+**215 tickets, 667 points.**
 
 ## How to read this
 
@@ -24,7 +24,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 
 **Depends on** lists real blockers only, not merely earlier tickets. Where a ticket has no dependency it can genuinely be pulled forward if you want a change of pace.
 
-**Dependencies point backwards, with exactly four forward edges across three tickets — do not write a parser that assumes otherwise, and count edges rather than rows.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, and `SHIP-15m` depends on `SHIP-44` **and** `SHIP-135` — two edges from one row, which is where a count of three comes from and why this sentence now says which unit it is counting. All of them exist because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Every one of those targets is long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
+**Dependencies point backwards, with exactly five forward edges across four tickets — do not write a parser that assumes otherwise, and count edges rather than rows.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, `SHIP-15m` depends on `SHIP-44` **and** `SHIP-135` — two edges from one row, which is why this sentence says which unit it is counting — and `SHIP-70a` depends on `SHIP-90`. All of them exist because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Every one of those targets is long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
 
 **The two totals above are maintained by hand and the rows are the truth.** `scripts/delivery-status.sh` parses the rows, so `make status` is unaffected by a stale header — which is precisely why one drifted unnoticed after SHIP-15e was added. If the two disagree, correct the header.
 
@@ -37,13 +37,13 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
 | **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 38 | 106 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
-| **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 26 | 78 |
-| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 28 | 98 |
+| **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 27 | 81 |
+| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 29 | 101 |
 | **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 31 | 107 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 13 | 45 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 20 | 65 |
-| **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 19 | 56 |
-| | | **212** | **659** |
+| **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 20 | 58 |
+| | | **215** | **667** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -153,7 +153,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M2 — Jobs
 
 **Goal:** A verified customer can create, publish, amend, and cancel a job from the app.  
-**Size:** 26 tickets, 78 points
+**Size:** 27 tickets, 81 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -176,6 +176,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-68 | Job expiry scheduled task | 5 | Open jobs close at the earlier of 14 days or the pickup date passing | SHIP-57, SHIP-67a |
 | SHIP-69 | Expiry warning 48 hours ahead | 2 | A domain event fires 48 hours before a job would expire | SHIP-68 |
 | SHIP-70 | Extend job expiry endpoint | 2 | A customer can extend an expiring job in one call | SHIP-68 |
+| SHIP-70a | Expiry sweeps see a job with live offers, not only an Open one | 3 | Docs 02 §2's expiry row names the statuses a job can expire from, and both the expiry and the expiry-warning claims match it; a job that reached Negotiating expires on its own deadline rather than waiting for its last offer to lapse | SHIP-68, SHIP-69, SHIP-90 |
 | SHIP-71 | Flutter job creation: locations step | 3 | Pickup and drop-off captured with validation and address lookup | SHIP-49, SHIP-60 |
 | SHIP-72 | Flutter job creation: goods step | 3 | Category, description, dimensions, and weight captured | SHIP-71, SHIP-58 |
 | SHIP-73 | Flutter job creation: schedule and vehicle step | 3 | Date window and vehicle requirement captured | SHIP-72 |
@@ -184,10 +185,16 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-76 | Flutter customer job list | 3 | Customer sees their jobs grouped by status with pull-to-refresh | SHIP-49, SHIP-66 |
 | SHIP-77 | Flutter customer job detail | 3 | Full job detail with status timeline and available actions | SHIP-76, SHIP-65 |
 
+**SHIP-70a exists because SHIP-90 narrowed SHIP-68 and SHIP-69 without either ticket being reopened.** Both sweeps in `internal/jobs/expiry.go` claim `WHERE status = 'Open'`, which was the whole of "a live job" when they were written. Since SHIP-90, a job with one unanswered offer sits at `Negotiating` — so neither sweep can see it, and `Docs/02` §6.3's deadline stops being enforced on exactly the jobs somebody has bid on. **Nothing is lost, only delayed**: every live offer runs out at its own collection time under SHIP-89, the last one leaving returns the job to `Open`, and the next pass takes it. That is why this is a ticket rather than an incident.
+
+**It is a document change before it is a code change, and that ordering is the ticket.** `Docs/02` §2 has one expiry row and it says `Open → Cancelled`. Widening the claim without widening that row would be resolving a contradiction silently in code, which `CLAUDE.md` forbids — so the *Done when* names the document first. Whoever takes it decides what `Negotiating → Cancelled` means for the offers on the job, which is a product question the sweep cannot answer for itself.
+
+**Its dependency on SHIP-90 is this file's fifth forward edge**, for the reason *How to read this* gives: the row sits where the work belongs, beside the two expiry tickets it corrects, rather than where its blocker sits. SHIP-90 is done, so nothing computed today changes.
+
 ## M3 — Bidding and award
 
 **Goal:** Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one.  
-**Size:** 28 tickets, 98 points
+**Size:** 29 tickets, 101 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -216,11 +223,16 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-100 | Flutter provider job detail and bid placement | 3 | Provider can review a job and submit a bid | SHIP-99, SHIP-84 |
 | SHIP-101 | Flutter provider bid list | 3 | Provider sees their own bids grouped by status | SHIP-100 |
 | SHIP-101a | A provider reads their own bids — `GET /v1/fleet/bids`, auth class `RequireUser` | 3 | A provider lists every bid they have placed, grouped by status, paginated, and sees no other provider's; the response carries no customer budget in any form | SHIP-88, SHIP-66 |
+| SHIP-102a | A customer reads the offers on their own job — `GET /v1/jobs/{id}/bids`, auth class `RequireUser` | 3 | The owning customer lists every live offer on one of their jobs in the Docs 10 §4.5 collection envelope with cursor pagination, each element carrying the offer's price and timing, a closed customer-facing provider summary and the vehicle it is offered with; a provider gets what a stranger gets; the response carries no budget in any form, and no provider's service area, specialties or other jobs | SHIP-84, SHIP-88, SHIP-66 |
 | SHIP-102 | Flutter customer bid comparison | 5 | Customer compares price, timing, provider profile, and vehicle side by side | SHIP-77, SHIP-96 |
 | SHIP-103 | Flutter negotiation and messaging UI | 5 | Both parties exchange messages and counter-offers against a job | SHIP-102, SHIP-97 |
 | SHIP-104 | Flutter award confirmation flow | 3 | Customer awards a bid with explicit confirmation and sees the result | SHIP-102, SHIP-92 |
 
 **SHIP-101a sorts after SHIP-101 and is its prerequisite, which is the one place in this milestone where the table's order is not the build order.** A letter suffix sorts immediately after its parent (see *How to read this*), and the read the screen needs was found after the screen was written: `Docs/11` §6 struck SHIP-101 as "every dependency met and unbuildable in fact" because nothing on the served surface lists a provider their own bids. Build SHIP-101a first. Its own dependency column points backwards, as every row's must; SHIP-101's is left naming SHIP-100 rather than rewritten, because the ticket it depends on for *data* is a different question from the one it depends on for *sequence*, and no tool computes the second.
+
+**SHIP-102a is the second instance of the same shape, found the same way — by a client lane rather than by this file.** SHIP-102's *Done when* names four things to compare and **all four are unserved.** `routes_golden.txt` has `POST /v1/jobs/{id}/bids` and, as the only `GET` under that tree, `/v1/jobs/{id}/bids/{bid_id}/history` — which needs a bid identifier the customer would have to hold already. So price and timing have no source either, not merely the profile and the vehicle. `cmd/api/routes_bidding.go` **reserves** `/v1/jobs/{id}/bids` for SHIP-102 in three comments, and a reservation is not a route. `contracts/paths/fleet.yaml` says in as many words that the customer's view of a provider is "a separate schema arriving with SHIP-96" — and SHIP-96 shipped no route at all, by its own account: no migration, no `$ref`, no `routes_golden.txt` line.
+
+**Its *Done when* names the disclosure rules in both directions, deliberately.** The customer's budget must not reach the response, which is the invariant every bidding read carries. The mirror is the one that is easy to miss: a **provider** summary rendered to a customer must not disclose what `contracts/paths/fleet.yaml` calls commercial information — the regions a provider covers and the work they specialise in — because that is a competitor's map of the market. So the row says the summary is a **closed** set of fields rather than "the provider's profile", which is the same argument SHIP-83 makes for the job view and the one wave 6 proved the hard way.
 
 **The route is `GET /v1/fleet/bids` rather than anything under `/v1/jobs/`, and that is a constraint rather than a preference.** `GET /v1/jobs/open/{id}` puts a literal in the `{id}` position, so it and any `GET /v1/jobs/{id}/<literal>` both match `/v1/jobs/open/<literal>` with neither more specific — Go's `ServeMux` panics at registration and the process does not start. A provider's own bids are a fleet-side collection anyway, beside `/v1/fleet/vehicles`.
 
@@ -321,11 +333,12 @@ Five segments or more are safe, because the literal route has only three after `
 ## M7 — Hardening and pilot readiness
 
 **Goal:** The store prerequisites are met, the system is observable, and the release gate can be run.  
-**Size:** 19 tickets, 56 points
+**Size:** 20 tickets, 58 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
 | SHIP-167 | Minimum supported version endpoint | 2 | GET /v1/app/minimum-version returns the floor per platform | SHIP-13 |
+| SHIP-167a | Client policy endpoint for operational thresholds | 2 | GET /v1/app/policy serves the unsynced-nudge threshold and the proof compression budget; the app caches the last response and applies it with no connection, falling back to a compiled default only when it has never had one | SHIP-167, SHIP-127, SHIP-130 |
 | SHIP-168 | Flutter launch-time version gate | 3 | A build below the floor blocks with an update prompt linking to the store | SHIP-167, SHIP-49 |
 | SHIP-169 | Account deletion request endpoint | 3 | A signed-in user can request deletion and receives a completion date | SHIP-44 |
 | SHIP-170 | Deletion deferral during an active job | 3 | A request during Awarded to Delivered queues until the job closes and explains why | SHIP-169, SHIP-57 |
@@ -344,6 +357,10 @@ Five segments or more are safe, because the literal route has only three after `
 | SHIP-183 | API-wide rate limiting review | 3 | Every public endpoint has a considered limit and returns a typed error when exceeded | SHIP-47 |
 | SHIP-184 | Pilot-scale load smoke test | 3 | The stack handles expected pilot concurrency without error-rate degradation | SHIP-174 |
 | SHIP-185 | Release gate run-through | 3 | Every condition in Docs 01 §8 is evidenced and signed off | SHIP-180, SHIP-181 |
+
+**SHIP-167a exists because two shipped features carry a threshold that `CLAUDE.md` says belongs server-side, and neither could have it.** SHIP-127's four-hour unsynced nudge and SHIP-130's compression budget are both operational numbers — the kind "anything expected to change under operational pressure lives server-side" is written about — and **both fire on a handset that by assumption has no connection**. That is the premise of the features, not an oversight in them, so an endpoint fetched at the moment of use could never work.
+
+What does work is an endpoint the app reads **while it still has signal** and keeps. SHIP-167's `GET /v1/app/minimum-version` is already exactly that shape — unauthenticated, per-platform, changed by configuration rather than by a release — which is why this row sits beside it and depends on it rather than inventing a second convention. The compiled default stays as the floor for an install that has never once been online, and is the *only* case it is used for; a build that has ever reached the platform uses what it was told.
 
 ## Sequencing notes
 
@@ -396,9 +413,11 @@ Two things move this number more than working faster does: cutting scope (below)
 
 ## Open questions that touch the backlog
 
-- **X-6** must be answered before SHIP-119 (the 72-hour auto-complete task) can be written correctly.
+- ~~**X-6** must be answered before SHIP-119 (the 72-hour auto-complete task) can be written correctly.~~ **Answered on 14 August 2026 — an exception-completed job auto-completes on §6.1's ordinary 72-hour rule.** The decision and its reasoning are in `Docs/02` §6.1. SHIP-119 is unblocked, and it needs no column that does not already exist.
 - **X-4** must be answered before SHIP-171 and SHIP-172 (pseudonymisation) can define what is retained.
 - **X-9** must be answered before SHIP-58 (goods categories) can load real reference data.
 
 None of these blocks the start of its milestone; each blocks one specific ticket inside it.
+
+**X-6 is the worked example of what "blocks one specific ticket" costs when nobody counts it.** It appears in no `Depends on` cell anywhere in this file, so SHIP-119 has been *dependency*-startable since SHIP-118 landed and `Docs/11` §6 has listed it as startable throughout. What actually held it was this list, which no tool reads. A reader working from the dependency column alone could never have seen why the ticket sat still for eight waves — which is the argument for keeping these three bullets where somebody reviewing the queue will meet them.
 

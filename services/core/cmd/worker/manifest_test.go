@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 )
 
@@ -80,6 +83,66 @@ func TestTasksAreBuiltInAStableOrder(t *testing.T) {
 	want := []string{"auto-complete", "bid-expiry", "job-expiry"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Errorf("tasks() = %v, want %v", names, want)
+	}
+}
+
+// TestTheRegisteredTaskSetIsWhatItSaysItIs pins what this binary actually starts, so that adding a
+// task is a decision somebody has to re-read rather than something that happens.
+//
+// # This test exists because a deadline passed unobserved
+//
+// `Docs/11` §9 set itself a trigger: the `--only=<task>` selector question had to be settled
+// "before the fourth task registers, which is SHIP-89 or SHIP-119, whichever comes first". SHIP-89
+// landed in wave 8 and registered the fourth. **Nothing noticed**, because the trigger was a count
+// in a sentence and the only thing watching it was a reader who happened to remember. The same
+// wave's log recorded "three registered tasks, not four — confirmed", which was true when it was
+// measured and stale by the end of the wave it was written in.
+//
+// A count in prose cannot see itself go out of date. A count in a test can, so this is the count,
+// and the next registration fails here with the question attached rather than passing silently.
+//
+// # Updating it is the point, not the cost
+//
+// A lane adding a task edits one line here and reads the paragraph attached to it. That is a
+// deliberate speed bump on a decision worth four paragraphs in §9 — every start of `cmd/worker`
+// runs **every** registered task, so each addition changes what every verify section that starts
+// the worker is doing, whether or not that section mentions the new task.
+func TestTheRegisteredTaskSetIsWhatItSaysItIs(t *testing.T) {
+	// The real registry, deliberately: every other test in this file swaps it out, and this is
+	// the one that has to see what init() actually declared.
+	//
+	// Deps is filled further than a name needs, for the reason outbox_test.go gives: tasks()
+	// builds *every* registration, so a half-filled Deps fails inside somebody else's closure —
+	// jobs.NewService panics without a clock and bidding's registration builds one.
+	built, err := tasks(Deps{
+		Config: &config.Config{},
+		Logger: slog.New(slog.DiscardHandler),
+		Clock:  clock.System{},
+	})
+	if err != nil {
+		t.Fatalf("building the registered tasks: %v", err)
+	}
+
+	var names []string
+	for _, task := range built {
+		names = append(names, task.Name)
+	}
+
+	// Sorted, because tasks() sorts. Add a name here in the same change that registers it.
+	want := []string{"bid-expiry", "job-expiry", "job-expiry-warning", "outbox-publisher"}
+
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Errorf(`cmd/worker registers %v; this test expects %v.
+
+If you have just added a task, add its name above — and read Docs/11 §9's cmd/worker entry
+first. One binary runs every registered task on every start, so your task now runs inside
+every scripts/verify section that starts the worker, including the ones that do not mention
+it. §9 carries the open selector question and the reason the answer has been a convention
+rather than a flag.
+
+If you have just removed one, a task that stops being registered produces no compile error
+and no other failure — which is the whole reason this test is a list rather than a count.`,
+			names, want)
 	}
 }
 

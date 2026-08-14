@@ -39,7 +39,27 @@
 #
 # merge=union resolves line by line. The list used to be grouped several tickets to a line, and
 # two tracks appending to the same line would still have conflicted — the union would have had
-# nothing to keep both of. Order does not matter: the reader sorts.
+# nothing to keep both of.
+#
+# # And the order does matter, which is a correction (SHIP-15t)
+#
+# This paragraph used to end "Order does not matter: the reader sorts." That is true of
+# `make status`, which sorts before it counts, and false of every human reading the file — and it
+# is the sentence that let the same defect happen twice. A union appends in *merge* order while
+# this list is written in *build* order, so a wave's merge lands its tickets wherever the merge
+# put them. `23618e5` is titled "restore the sorted position a union broke" and moved SHIP-15g
+# back from below the M7 group; wave 8 then put SHIP-120 and SHIP-120a between SHIP-112 and
+# SHIP-114 the same way, and nothing caught it, because counting rows cannot see where they sit.
+#
+# **`make status` now checks the order** and fails on a third occurrence. The check is in
+# `scripts/delivery-status.sh`; note that `sort -c` is the wrong instrument, exactly as it is for
+# routes_golden.txt — the order here is by ticket number with letter suffixes
+# (SHIP-120, SHIP-120a, SHIP-121), which is not the lexicographic order of the lines.
+#
+# Track X sorts before M0, as it does in Docs/09.
+
+# Track X — External dependencies
+X-6
 
 # M0 — Foundation
 SHIP-1
@@ -162,14 +182,14 @@ SHIP-109
 SHIP-110
 SHIP-111
 SHIP-112
-SHIP-120
-SHIP-120a
 SHIP-114
 SHIP-115
 SHIP-115a
 SHIP-116
 SHIP-117
 SHIP-118
+SHIP-120
+SHIP-120a
 SHIP-124
 SHIP-125
 SHIP-126

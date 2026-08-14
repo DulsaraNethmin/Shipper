@@ -84,6 +84,65 @@ declared="$(sed -e 's/#.*//' "$DONE" | tr ' \t' '\n\n' | sed '/^$/d' | sort -u)"
 
 [[ -n "$declared" ]] || { echo "$DONE names no tickets" >&2; exit 1; }
 
+# --- and is it still in order? (SHIP-15t) ---------------------------------------------------
+#
+# The counting above sorts, so it cannot see where a row sits — which is why this defect has now
+# happened twice with nothing reporting it. `merge=union` appends both sides of a merge in *merge*
+# order while the list is written in *build* order, so a wave's merge drops its tickets wherever it
+# likes. `23618e5` is titled "restore the sorted position a union broke" and moved SHIP-15g back
+# from below the M7 group; wave 8 then put SHIP-120 and SHIP-120a between SHIP-112 and SHIP-114 in
+# exactly the same way, and it was found by eye a wave later.
+#
+# **`sort -c` is the wrong instrument here**, for the same reason it is wrong for
+# routes_golden.txt, which is sorted by path rather than by whole line: this file is ordered by
+# ticket *number* with a letter suffix after its parent — SHIP-120, SHIP-120a, SHIP-121 — and
+# lexicographically SHIP-120a sorts after SHIP-1200 and SHIP-12 sorts after SHIP-119. So the
+# comparison is on the parsed triple (track, number, suffix) and is written out longhand.
+#
+# Track X sorts before SHIP, as it does in Docs/09. Duplicates fail too: the count deduplicates
+# with `sort -u`, so a ticket listed twice is invisible everywhere else in this script.
+
+misordered="$(awk '
+    { sub(/#.*/, "") }
+    {
+        for (i = 1; i <= NF; i++) {
+            tok = $i
+            if (tok !~ /^(SHIP|X)-[0-9]+[a-z]?$/) {
+                printf "line %d: %s is not a ticket id\n", NR, tok
+                continue
+            }
+
+            split(tok, part, "-")
+            track  = (part[1] == "X") ? 0 : 1
+            number = part[2] + 0
+            letter = tok
+            sub(/^(SHIP|X)-[0-9]+/, "", letter)
+            suffix = (letter == "") ? 0 : index("abcdefghijklmnopqrstuvwxyz", letter)
+
+            if (seen) {
+                ahead = (track > last_track) \
+                     || (track == last_track && number > last_number) \
+                     || (track == last_track && number == last_number && suffix > last_suffix)
+                if (!ahead)
+                    printf "line %d: %s follows %s\n", NR, tok, previous
+            }
+
+            seen = 1
+            last_track = track; last_number = number; last_suffix = suffix; previous = tok
+        }
+    }
+' "$DONE")"
+
+if [[ -n "$misordered" ]]; then
+    printf '\n  %s%s is out of order%s\n' "$yellow" "$DONE" "$off"
+    printf '    %s\n' "$misordered"
+    printf '    %sthe list is in build order: Track X, then by ticket number with a letter\n' "$dim"
+    printf '    suffix immediately after its parent. A merge=union resolution appends in merge\n'
+    printf '    order and has now moved a row twice; move it back rather than re-sorting the\n'
+    printf '    file, and check nothing else was dropped in the same resolution.%s\n\n' "$off"
+    exit 1
+fi
+
 # The list moved out of Docs/11, and a block that reappears there would be a second list
 # nothing reads — which is the drift this whole script exists to catch, in its own house.
 if grep -q '^```done' "$TRACKER" 2>/dev/null; then

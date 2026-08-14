@@ -266,6 +266,27 @@ lint-imports: ## Check the domain boundaries from Docs/06 §4.1 (SHIP-11)
 fmt: ## Format the Go code
 	cd $(CORE) && go fmt ./...
 
+# `gofmt -l` was outside `make check` until SHIP-15t, and CI was green on a tree it flagged.
+#
+# Two files were dirty on develop and the cause is worth knowing before anybody "fixes" a recurrence
+# by running `gofmt -w` over the tree: **gofmt rewrites a bare doubled apostrophe inside a doc
+# comment into a typographic closing quote.** Both files were describing SQL's empty string literal,
+# so formatting them introduced a character `make lint-spelling` then has an opinion about, and
+# reverting that puts them straight back on `gofmt -l`. No ordering of the two commands converges.
+# The fix was to reword both comments to say "an empty string" in words, and each says so in place.
+.PHONY: lint-fmt
+lint-fmt: ## Check gofmt over the Go tree (SHIP-15t)
+	@out="$$(cd $(CORE) && gofmt -l .)"; \
+	if [ -n "$$out" ]; then \
+	  echo "gofmt would rewrite these files:"; \
+	  echo "$$out" | sed 's|^|  $(CORE)/|'; \
+	  echo; \
+	  echo "run 'make fmt' — and if a file comes straight back, read the note above lint-fmt"; \
+	  echo "in the Makefile before reformatting it again."; \
+	  exit 1; \
+	fi; \
+	echo "gofmt: clean"
+
 .PHONY: tidy
 tidy: ## Tidy go.mod and go.sum
 	cd $(CORE) && go mod tidy
@@ -285,7 +306,7 @@ status: ## Where the delivery is: Docs/11 counted against the backlog and the co
 # rather than as a prerequisite list: prerequisites are expanded when the rule is read, and
 # `-include mk/*.mk` is the last line of this file, so anything a track appended would arrive
 # too late to be seen.
-CHECKS := vet lint-imports lint-spelling test
+CHECKS := vet lint-fmt lint-imports lint-spelling test
 
 .PHONY: check
 check: ## Everything CI will run (SHIP-20). Tracks extend it with `CHECKS +=` in mk/<track>.mk

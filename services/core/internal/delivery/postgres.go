@@ -281,10 +281,16 @@ func scanProof(row pgx.Row) (Proof, error) {
 //
 // A [Proof] built for an exception carries an empty object key and a zero length, and 000604's
 // ck_proofs_photograph_or_exception counts NULLs rather than reading empty strings — which is the
-// right way round: `''` is a perfectly good object key as far as `text` is concerned, and a CHECK
-// written against it would be a second spelling of "absent" for the database to disagree with the
-// domain about. The cast on the length is what stops PostgreSQL inferring `nullif($6, 0)` as
-// something other than bigint.
+// right way round: an empty string is a perfectly good object key as far as `text` is concerned, and
+// a CHECK written against it would be a second spelling of "absent" for the database to disagree
+// with the domain about. The cast on the length is what stops PostgreSQL inferring `nullif($6, 0)`
+// as something other than bigint.
+//
+// The empty string is spelled out in words rather than as a pair of quotes deliberately: gofmt
+// rewrites a bare doubled apostrophe inside a doc comment into a typographic closing quote, which
+// puts the file on `gofmt -l` permanently and then reformats it into a character
+// `make lint-spelling` has an opinion about. This comment was one of the two that kept `gofmt` out
+// of `CHECKS` until SHIP-15t.
 //
 // # ON CONFLICT on the object key, for the reason [postgresStore.insertMilestone] gives
 //
