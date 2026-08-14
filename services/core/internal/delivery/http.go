@@ -285,6 +285,25 @@ type recordMilestoneRequest struct {
 	Reason     string `json:"reason"`
 
 	Proof *proofRequest `json:"proof"`
+
+	// RecipientName and DeliveryNote are Docs/01 §4.4's other two required facts about a
+	// delivered job (SHIP-123):
+	//
+	//	{"milestone": "delivered", "recipient_name": "R. Chen",
+	//	 "delivery_note": "Left with reception, signed for",
+	//	 "proof": {"object_key": "proof/<job>/<uuid>"}}
+	//
+	// **Flat rather than nested, unlike `proof`.** That object exists because its two keys are
+	// *alternatives* to one question — a photograph or a reason there is none — and a nested
+	// object is what makes "exactly one of" expressible. These two are not alternatives to
+	// anything: they are required together, on one milestone, and a `delivery` object holding
+	// them would be a wrapper whose only job is to be present.
+	//
+	// Sent on any other milestone they are refused rather than ignored, which is the same call
+	// `ck_milestones_delivery_details` makes in the database: a recipient name on a `picked_up`
+	// would be recording a handover that did not happen.
+	RecipientName string `json:"recipient_name"`
+	DeliveryNote  string `json:"delivery_note"`
 }
 
 // proofRequest is the evidence for this milestone: what the client uploaded, or why it could not.
@@ -338,6 +357,16 @@ type milestoneResponse struct {
 
 	Reason string `json:"reason,omitempty"`
 
+	// RecipientName and DeliveryNote are present on a delivered milestone and absent on every
+	// other (SHIP-123). `omitempty` for the reason [proofResponse]'s fields are: an absent field
+	// says nothing, while an empty string would say that nobody received the goods.
+	//
+	// They are served to the same readers the rest of the row is — both parties to the delivery,
+	// through `GET /v1/jobs/{id}/delivery/milestones` — which is Docs/01 §4.4's acceptance measure
+	// for the customer ("a customer can see the latest delivery milestone and proof of delivery").
+	RecipientName string `json:"recipient_name,omitempty"`
+	DeliveryNote  string `json:"delivery_note,omitempty"`
+
 	RecordedAt string `json:"recorded_at"`
 	AcceptedAt string `json:"accepted_at"`
 }
@@ -350,6 +379,9 @@ func milestoneFrom(rec Record) milestoneResponse {
 		Milestone:  rec.Milestone.Wire(),
 		RecordedBy: string(rec.Actor),
 		Reason:     rec.Reason,
+
+		RecipientName: rec.RecipientName,
+		DeliveryNote:  rec.DeliveryNote,
 
 		RecordedAt: timestamp(rec.ActorRecordedAt),
 		AcceptedAt: timestamp(rec.ServerRecordedAt),
@@ -466,19 +498,26 @@ func (h *Handler) RecordMilestone() http.Handler {
 // this runs. A handler that read `{id}` itself would be a second place deciding, agreeing with the
 // first today and one refactor away from not.
 //
-// # A driver may say there is no photograph and may not attach one
+// # A driver may attach a photograph, and may say there is none (SHIP-122)
 //
-// The exception path needs nothing but a string, so it is here: a driver who cannot photograph a
-// pickup should be able to say why rather than be unable to record the pickup at all (Docs/01 §4.4
-// makes it "part of the same feature"). A photograph is not, because **there is no route by which a
-// driver can obtain an object key** — `POST /v1/jobs/{id}/proof-uploads` is RequireUser — so any key
-// presented here came from somewhere a driver should not have been. SHIP-122 builds the driver's
-// upload and its record together; until it does, an `object_key` on this route is refused as a
-// field error naming the exception path beside it.
+// Both halves of Docs/01 §4.4 are reachable from a driver's link now, and until SHIP-122 only the
+// second was. The reason was never that a driver should not photograph a delivery — it was that
+// **there was no route by which a driver could obtain an object key**, so any key presented here had
+// come from somewhere a driver should not have been, and an `object_key` was refused as a field
+// error naming the exception path beside it. SHIP-122 built the driver's upload and its record
+// together, which is what that refusal said would have to happen.
 //
-// The consequence is worth stating rather than discovering: a driver can reach 'Delivered' today
-// only through a reasoned exception, which SHIP-117 will put in a moderation queue. Docs/11 §3
-// records it.
+// A key is checked against the **grant** rather than against a path — [Service.VerifyDriverProof] —
+// so a driver carrying two deliveries cannot attach one job's photograph to the other, and the
+// refusal is the same [ErrProofNotForThisJob] a provider gets. The store is asked before the
+// transaction opens, for the reason [Handler.RecordMilestone] gives: a database transaction held
+// open across a call to another service puts a pool connection at the mercy of that service's worst
+// day.
+//
+// The consequence of the old refusal is worth recording rather than forgetting: for the whole of
+// wave 8, SHIP-117's moderation queue was the *only* path by which a driver-recorded delivery could
+// reach 'Delivered', because a reasoned exception was the only evidence a driver could produce.
+// Docs/11 §3 carries it.
 //
 // # The idempotency key is scoped `anonymous`, and the guarantee is not Redis's anyway
 //
@@ -523,16 +562,20 @@ func (h *Handler) RecordDriverMilestone() http.Handler {
 		if err != nil {
 			return err
 		}
-		if proofKey != "" {
-			var problems validate.Errors
-			problems.Add("proof.object_key", validate.CodeNotAllowed,
-				"A driver cannot attach a photograph yet. Send an exception_reason instead.")
-			return problems.Err()
-		}
 
 		pool, err := h.database(r)
 		if err != nil {
 			return err
+		}
+
+		// Outside the transaction, exactly as [Handler.RecordMilestone] does it and for the same
+		// reason. The cost is that the live-assignment lookup happens twice, which is one indexed
+		// read on a primary key.
+		if proofKey != "" {
+			recording.Proof, err = h.svc.VerifyDriverProof(r.Context(), pool, grant, proofKey)
+			if err != nil {
+				return apiError(err)
+			}
 		}
 
 		var (
@@ -777,6 +820,111 @@ func (h *Handler) PresignProofUpload() http.Handler {
 	})
 }
 
+// PresignDriverProofUpload handles POST /v1/driver/jobs/{id}/proof-uploads (SHIP-122).
+//
+// # The route routes_delivery.go said was a gap rather than a decision
+//
+// That file's comment on `POST /v1/jobs/{id}/proof-uploads` recorded it in advance: "SHIP-122 needs
+// the driver's version of this and it is not here… a driver-token route is served with the
+// idempotency scope `anonymous`… and this response carries a URL that can write into the evidence
+// bucket. That is the SHIP-44 shape the whole service was fixed for, and it stays shut until
+// SHIP-121 settles the scope." SHIP-121 settled it and this is the route.
+//
+// 200 rather than 201, for the reason [Handler.PresignProofUpload] gives: nothing was created. The
+// platform holds no record of this URL, wrote no row and reserved no object.
+//
+// # The idempotency key on this route is `anonymous`-scoped, and this is the paragraph to read
+// before changing anything here
+//
+// `httpx.Idempotent` wraps the whole `/v1` group and the auth class is applied **per route, inside
+// it** — so on a repeated key the middleware replays the stored response *before* RequireDriverToken
+// runs. On [Handler.RecordDriverMilestone] that is argued as acceptable because the stored body is a
+// milestone both parties to the delivery may read anyway. **Here the stored body is a credential**,
+// which is a different question and is why routes_delivery.go held this route shut for a wave.
+//
+// What is reachable, stated precisely rather than waved at. To be handed this response somebody must
+// send an *identical* request: `replayOrRefuse` fingerprints method, path and body, and a mismatch is
+// a 409 rather than a replay. So they need the job identifier, the exact `content_length` of the
+// driver's photograph in bytes, and the key. The key is 122 bits from a CSPRNG — the driver portal's
+// `lib/keys.ts` mints it with `crypto.randomUUID`, and it is fresh per attempt because a presign must
+// not reuse a stored one (a retry would otherwise get the same URL with its expiry already run down).
+//
+// What such a caller could then do is bounded on every side, and the bounds are the argument:
+//
+//   - **They cannot make it evidence.** Recording an object against a milestone needs a valid driver
+//     token for this job — [Service.VerifyDriverProof] takes a grant — so the object stays
+//     unreferenced, which is the state SHIP-114 already calls expected and ages out under a lifecycle
+//     rule.
+//   - **They cannot read it.** The bucket has no public read path, and a signed download comes only
+//     from `GET /v1/jobs/{id}/delivery/proof` after [Service.ProofFor] has decided the reader is the
+//     job's customer or its awarded provider.
+//   - **They cannot write anything else.** The content type and the length are signed into the URL,
+//     so the only object it authorises is one of exactly that size and type.
+//   - **An overwrite of a recorded photograph is detectable.** 000603 stores the store's entity tag
+//     at the moment the object became proof, which is what that column exists for.
+//
+// **This is the posture Docs/11 §6 already accepts for every anonymous-scoped route** — "reading
+// another caller's stored response requires sending their exact request" — and what is new is that
+// the body is a credential rather than a fact. It is recorded in Docs/11 §9 with the mechanism that
+// closes it properly: §9's *first* option, a second group-wide resolver beside `ResolveSubject` that
+// a driver grant can populate, with `SubjectScope` widened to read either. That is an
+// `internal/httpx` change and therefore a prep ticket's, not a domain branch's.
+//
+// # There is no job identifier in this function, deliberately
+//
+// The same call [Handler.RecordDriverMilestone] and [Handler.DriverJob] make, and it matters most on
+// the route that mints a write credential: the grant is what the service is given, so the only job
+// this handler can sign a key for is the one inside a signature. A handler that read `{id}` itself
+// would agree with the guard today and be one refactor away from being the only thing deciding.
+func (h *Handler) PresignDriverProofUpload() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, ok := driverGrantFrom(r.Context())
+		if !ok {
+			return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+				"Something went wrong at our end.").WithCause(errors.New(
+				"delivery: a driver route was reached with no verified grant on the context; " +
+					"its Auth class is not RequireDriverToken"))
+		}
+
+		var req proofUploadRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		upload, err := h.svc.PresignDriverProofUpload(r.Context(), pool, grant, UploadRequest{
+			ContentType:   req.ContentType,
+			ContentLength: req.ContentLength,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Logged for the reason [Handler.PresignProofUpload]'s line is — the upload never touches
+		// this service, so this and the store's own access log are the only two records that a URL
+		// was issued — plus one this route has of its own: **the assignment is named**, because the
+		// driver has no account and the `driver_assignments` row is their whole identity. Somebody
+		// reconciling a bucket against the database, or asking who was handed a URL that wrote an
+		// object nothing references, has nothing else to work from.
+		//
+		// **The URL is not logged and never is.** It is the credential.
+		httpx.LoggerFrom(r.Context()).Info("an upload URL was issued to a driver for proof of delivery",
+			slog.String("job_id", grant.JobID.String()),
+			slog.String("assignment_id", grant.AssignmentID.String()),
+			slog.String("object_key", upload.ObjectKey),
+			slog.String("content_type", upload.ContentType),
+			slog.Int64("content_length", upload.ContentLength),
+			slog.Time("expires_at", upload.ExpiresAt))
+
+		httpx.WriteJSON(w, http.StatusOK, proofUploadFrom(upload))
+		return nil
+	})
+}
+
 // proofResponse is one photograph and the milestone it is evidence for (SHIP-115).
 //
 // # `download_url` is a credential and is the reason this endpoint exists at all
@@ -981,9 +1129,39 @@ type driverJobResponse struct {
 	// (Docs/01 §4.5 calls it a link throughout). It is returned rather than left to be decoded out
 	// of the credential, which is what the contract already tells clients not to do.
 	LinkExpiresAt string `json:"link_expires_at"`
+
+	// DeliveredAt is when this delivery was recorded as delivered, on the actor's clock, and is
+	// absent until it has been (SHIP-123).
+	//
+	// # A sixth field on a shape whose closed set was the point
+	//
+	// SHIP-108 held this response to five fields and a test and a `make verify` check both say so,
+	// because "what may a driver see" is a decision the endpoint's response *is*. This is an
+	// additive change (Docs/07 §6) made on purpose and with both guards updated, not around them.
+	//
+	// # It is not the job's status wearing a different name
+	//
+	// The status vocabulary stays `jobs`', and this domain still holds no copy of it. What this
+	// reports is a fact about `milestones`, which is this domain's own table: whether a 'Delivered'
+	// milestone has been recorded on this job. The two are not the same question — SHIP-112 records
+	// milestones that move nothing — and this is the one the portal needs.
+	//
+	// # Why the portal cannot do without it
+	//
+	// SHIP-123's *Done when* ends "portal becomes read-only after", and a driver reloads. Component
+	// state does not survive that, `sessionStorage` would be the page inventing a fact about the
+	// delivery, and there is no driver-readable milestone list. So the platform answers it, which is
+	// also where Docs/07 §3 puts every question of this kind: the app may hide or disable, and the
+	// platform decides.
+	//
+	// **It is presentation rather than authorisation.** The link keeps opening the page and the
+	// endpoints keep answering after a delivery is finished — a driver may reasonably reopen it to
+	// check what they recorded, and recording a milestone on a delivered job is still refused by the
+	// transition guard rather than by this field.
+	DeliveredAt string `json:"delivered_at,omitempty"`
 }
 
-func driverJobFrom(a Assignment, grant DriverGrant) driverJobResponse {
+func driverJobFrom(a Assignment, grant DriverGrant, deliveredAt time.Time) driverJobResponse {
 	return driverJobResponse{
 		JobID:        a.JobID.String(),
 		AssignmentID: a.ID.String(),
@@ -992,6 +1170,7 @@ func driverJobFrom(a Assignment, grant DriverGrant) driverJobResponse {
 
 		AssignedAt:    timestamp(a.CreatedAt),
 		LinkExpiresAt: timestamp(grant.ExpiresAt),
+		DeliveredAt:   timestamp(deliveredAt),
 	}
 }
 
@@ -1045,7 +1224,15 @@ func (h *Handler) DriverJob() http.Handler {
 			return apiError(err)
 		}
 
-		httpx.WriteJSON(w, http.StatusOK, driverJobFrom(assignment, grant))
+		// Asked after the assignment and never before it: a caller whose link no longer opens the
+		// delivery is refused by the line above, and this must not become a way to learn that a job
+		// has been delivered by presenting a superseded link.
+		deliveredAt, _, err := h.svc.DeliveryFinishedFor(r.Context(), pool, grant)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, driverJobFrom(assignment, grant, deliveredAt))
 		return nil
 	})
 }
@@ -1150,6 +1337,13 @@ func recordingFrom(req recordMilestoneRequest, key string) (Recording, string, e
 		Reason:     req.Reason,
 		Key:        key,
 		Exception:  exception,
+
+		// Read and passed through untrimmed: [Recording.normalise] collapses whitespace and
+		// [Recording.problems] judges what is left, so a name that is only spaces is refused as
+		// required rather than stored. Deciding either here would put the rule in the decoder,
+		// where a second caller would not get it.
+		RecipientName: req.RecipientName,
+		DeliveryNote:  req.DeliveryNote,
 	}, proofKey, nil
 }
 

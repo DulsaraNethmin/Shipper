@@ -18,6 +18,7 @@ POST   /v1/auth/verify-email                    public       v1
 POST   /v1/auth/verify-phone                    public       v1
 GET    /v1/driver/jobs/{id}                     driver-token v1
 POST   /v1/driver/jobs/{id}/milestones          driver-token v1
+POST   /v1/driver/jobs/{id}/proof-uploads       driver-token v1
 GET    /v1/fleet/bids                           user         v1
 GET    /v1/fleet/profile                        user         v1
 PATCH  /v1/fleet/profile                        user         v1

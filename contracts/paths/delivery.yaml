@@ -477,6 +477,10 @@ MilestoneRecording:
 
         `delivered` requires `proof` — a photograph or a reasoned exception — and is refused with
         `409 delivery_proof_required` without one. The other three accept it and do not require it.
+
+        `delivered` also requires `recipient_name` and `delivery_note`, and the other three refuse
+        both (SHIP-123). Those two are `Docs/01` §4.4's field set for a delivered job, along with the
+        proof and the recorded time.
       example: picked_up
     recorded_at:
       type: string
@@ -498,6 +502,27 @@ MilestoneRecording:
         say — "nobody at the gate, returning at four". It is kept with the record and shown to
         support.
       example: nobody at the gate, returning at four
+    recipient_name:
+      type: string
+      maxLength: 120
+      description: |
+        Who took the goods, as you would write it on a docket. **Required on `delivered` and refused
+        on every other milestone** — a recipient name on a pickup would be recording a handover that
+        did not happen.
+
+        There is no exception path for it, unlike the photograph: `Docs/01` §4.4 gives three reasons
+        a photograph can be impossible and none for a name, because a driver can always write what
+        they see. "Unattended" is a recipient name.
+      example: R. Chen
+    delivery_note:
+      type: string
+      maxLength: 500
+      description: |
+        What was left where. **Required on `delivered` and refused on every other milestone.**
+
+        It is not `reason`, and a delivered milestone may carry both: `reason` is the optional note
+        any milestone accepts, and this is the record of the handover.
+      example: Left with reception, signed for
     proof:
       $ref: '#/ProofAttachment'
 
@@ -595,6 +620,17 @@ Milestone:
       type: string
       description: Present only when one was given.
       example: nobody at the gate, returning at four
+    recipient_name:
+      type: string
+      description: |
+        Who took the goods. Present on a `delivered` milestone and absent on every other — the two
+        states are total, so a client that checks one has checked both.
+      example: R. Chen
+    delivery_note:
+      type: string
+      description: |
+        What was left where. Present on a `delivered` milestone and absent on every other.
+      example: Left with reception, signed for
     recorded_at:
       type: string
       format: date-time
@@ -1150,6 +1186,23 @@ DriverAssignment:
         It is returned rather than left to be decoded out of the credential, which is a thing a
         client should never do.
       example: '2026-08-19T04:15:30.000Z'
+    delivered_at:
+      type: string
+      format: date-time
+      description: |
+        When this delivery was recorded as delivered, on the **actor's** clock, in UTC (SHIP-123).
+        **Absent until it has been**, which is how a portal knows to stop offering the controls that
+        record one.
+
+        It is not the job's status. This API keeps that vocabulary on the job resource, and a driver
+        holding a link has no way to read it; what this reports is a fact about the delivery's own
+        record — that a `delivered` milestone exists on this job.
+
+        **The link keeps working afterwards**, deliberately: a driver may reopen the page to check
+        what they recorded. What this field changes is what a client offers, not what it may reach —
+        recording a milestone on a delivered job is refused by the transition guard, as it always
+        was.
+      example: '2026-08-14T06:22:11.000Z'
 
 DriverMilestones:
   post:
@@ -1191,13 +1244,20 @@ DriverMilestones:
       The response's `recorded_by` is `driver`, and the milestone is attributed to your assignment
       rather than to an account, because a driver has none.
 
-      ## A photograph cannot be attached here yet
+      ## Evidence: a photograph, or a reason there is none
 
-      Send `proof.exception_reason` when there is no photograph to take — the three reasons are the
-      same ones the provider selects from. **`proof.object_key` is refused** with
-      `validation_failed`: there is no operation a driver can call to obtain one, so a key presented
-      here came from somewhere it should not have. The driver's upload arrives with SHIP-122 and
-      this refusal goes with it.
+      Both, now that `POST /v1/driver/jobs/{id}/proof-uploads` exists (SHIP-122). Send
+      `proof.object_key` with a key that operation gave you, **or** `proof.exception_reason` with one
+      of the three reasons a photograph can be impossible — never both, never neither.
+
+      A key is checked against the job your link opens, not against a path, so a driver carrying two
+      deliveries cannot attach one job's photograph to the other: that answers `422` naming
+      `proof.object_key`. A key whose object has not reached the store yet answers `409
+      delivery_proof_not_uploaded` — finish the PUT, then record.
+
+      `delivered` is refused with `409 delivery_proof_required` when it carries neither. That is not
+      a rule about this operation; it is a rule about deliveries, enforced in the domain and again by
+      a database constraint at commit.
 
       The consequence is worth knowing before you build against it: until then, a driver recording
       `delivered` must send an `exception_reason`, because `delivered` requires evidence and the
@@ -1670,3 +1730,127 @@ DriverLinkView:
         assigned. It is the only record a reissue leaves — the platform keeps no copy of a link it
         has replaced.
       example: 2
+
+DriverProofUploads:
+  post:
+    operationId: presignDriverProofUpload
+    summary: Get somewhere to upload a proof photograph, from a driver's link
+    tags: [Delivery]
+    security:
+      - BearerDriverToken: []
+    description: |
+      The driver's own way to obtain a place to put one photograph (SHIP-122). It is the same act as
+      `POST /v1/jobs/{id}/proof-uploads` and answers the same shape; what differs is who is holding
+      the credential.
+
+      Until this operation existed there was **no way for a driver to photograph a delivery at all**,
+      because there was no way for one to obtain an object key — so a driver could only reach
+      `delivered` through a reasoned exception, which flags the job into the moderation queue. This
+      is the operation that makes the ordinary path available to the person actually standing at the
+      door.
+
+      ## It is a separate operation because the credentials are separate systems
+
+      A mobile access token answers `401` here, and a driver's link answers `401` on the provider's
+      operation. Neither can be exchanged for the other in either direction.
+
+      ## The link grants this job and nothing else
+
+      The key you are given names the job inside your token's signature, and no request shape widens
+      that. Presenting the link on another job answers `404`, and a link whose assignment is no
+      longer the live one on the job answers `404` as well — a stood-down driver keeps a credential
+      that still verifies, and what has gone is the assignment behind it.
+
+      ## What to do with the response, and what a retry gets
+
+      Identical to the provider's operation — see `ProofUploads` for the PUT, the two signed headers
+      and why a successful upload answers `200` with an empty body. Keep the `object_key` and send it
+      as `proof.object_key` on `POST /v1/driver/jobs/{id}/milestones`.
+
+      **Use a fresh `Idempotency-Key` for every attempt at this operation.** Reusing one replays the
+      stored response, which hands back the same URL with its expiry already running down — correct
+      for a milestone, useless for an upload. A milestone keeps its key across retries; this does
+      not.
+
+      Generate that key from a cryptographically secure random source. On this operation the stored
+      response is a credential, and an unguessable key is part of what keeps it yours.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/ProofUploadRequest'
+    responses:
+      '200':
+        description: |
+          A URL you may upload one photograph to.
+
+          `200` rather than `201` because nothing was created — see `ProofUploads`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ProofUpload'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          The link is not valid, or it has expired (`delivery_driver_link_expired`). There is nothing
+          to refresh and no account to sign in to: ask the transport provider for a new link.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          The link no longer opens a delivery. One answer to two questions, and deliberately: a valid
+          link presented on a **different job**, and a link whose driver has been **stood down**.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          An identical request is still being handled (`idempotency_request_in_progress`). Retry in
+          a moment.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The upload was refused before anything was signed (`validation_failed`). `error.details`
+          names `content_type` or `content_length`, and the message carries the current limit.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'

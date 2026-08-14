@@ -625,7 +625,8 @@ func TestTheMilestoneWireRefusals(t *testing.T) {
 		{
 			name:   "delivered, while nothing can prove it",
 			caller: provider, job: inTransit, key: theKey + "-delivered",
-			body:   `{"milestone": "delivered"}`,
+			body: `{"milestone": "delivered", "recipient_name": "R. Chen", ` +
+				`"delivery_note": "Left with reception"}`,
 			status: http.StatusConflict, code: "delivery_proof_required",
 		},
 		{
