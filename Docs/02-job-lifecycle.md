@@ -85,6 +85,12 @@ Each bid has one of these statuses: Draft, Submitted, Countered, Accepted, Rejec
 - Only the latest valid offer can be accepted.
 - Bid history remains visible to the customer, bidding provider, and administrators.
 
+**`Countered` is a retained synonym for `Superseded`, and the platform writes only `Superseded`.** Read closely, the first two rules above describe one transition from its two ends — an offer "answered with a different price or timing" is the same event as an offer "displaced by a counter from either party", and there is no third thing either could mean. SHIP-87 built it that way, and SHIP-96 confirmed it from the other side: rendering the chain to the customer, the bidding provider and an administrator, nothing acts on the distinction, so a second status would be a value every client had to branch on to no effect.
+
+`Countered` stays in the list rather than being deleted, for two reasons that are both mechanical. `Docs/10` §3.4 pairs the Go constant list against `ck_bids_status` in both directions, so removing the value means a migration and an edit to another ticket's fixtures; and a value absent from a client's enumeration decodes as unknown on the day somebody starts writing it, which is a worse failure than an unused constant. **The trigger for writing it would be a ticket needing to distinguish "displaced because the other party answered" from some other way of being displaced — and there is no other way today.**
+
+`contracts/statuses.yaml` is the source this vocabulary is generated from for Go, Dart and TypeScript. It carries the same decision against the `Countered` value, and the two are edited together.
+
 ## 5. Exception scenarios
 
 | Scenario | Required handling |
@@ -105,6 +111,14 @@ Each bid has one of these statuses: Draft, Submitted, Countered, Accepted, Rejec
 A job recorded as Delivered auto-completes 72 hours later if no dispute is raised.
 
 The earlier proposal was 48 hours. It was extended because a Friday-evening delivery would otherwise auto-complete on Sunday, when few customers are looking — the window would expire precisely when it was least able to be used. Since Shipper holds no money in the MVP, Completed carries no financial consequence, so a longer window costs the provider nothing while giving the customer a real opportunity to object. Expect to shorten this once payment flows exist and providers have a stake in being marked done.
+
+**A job delivered through the proof-exception path is not an exclusion from this window.** It auto-completes on the same 72-hour rule as a job delivered with a photograph, and needs no additional customer confirmation. That is X-6, decided 14 August 2026 and previously carried in §7.
+
+The question stayed open for eight waves because it looked like a trade between closing the job and having a person look at it. **It is not a trade, and the fact that settled it arrived with SHIP-117: an exception-completed job now enters the moderation queue.** Human review happens either way, so the two are not exclusive — blocking auto-completion would add no review at all. It would only strand the job in `Delivered` when the customer never acts, which is the single outcome this window exists to prevent.
+
+The rest follows from what is already written. `Completed` carries no financial consequence while Shipper holds no money, which is this section's own argument for a window rather than a confirmation; and a reasoned exception is evidence rather than the absence of it, which is the reading `Docs/01` §4.4 and `contracts/statuses.yaml` both take. A dispute still stops the clock exactly as it does for a photographed delivery — that is §6.1's rule and the exception path does not touch it.
+
+**SHIP-119 implements the task; this settles what it implements**, and it needs no column that does not already exist.
 
 ### 6.2 Provider cancellation after award — the job returns to Open
 
@@ -138,4 +152,5 @@ See §3.1.
 ## 7. Decisions still required
 
 - Cancellation fee policy and responsibility for no-shows. Deferred: no payment flows exist in the MVP, so there is nothing to charge against.
-- Whether a job completed through the proof exception path may auto-complete under §6.1, or must be confirmed by the customer. Owner: operations.
+
+**The proof-exception auto-completion question has left this list.** It was the second bullet here from the first draft until 14 August 2026, when X-6 was decided: an exception-completed job auto-completes on §6.1's ordinary 72-hour rule. The decision and its reasoning are recorded in §6.1, where the rule they qualify is, rather than here — a decision taken is not a decision required, and leaving it here as a struck bullet would leave the reader who reaches §6.1 first with no answer.
