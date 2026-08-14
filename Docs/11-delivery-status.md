@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **664 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **678 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -494,6 +494,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-137** | M5 | The notification consumer — **a service of its own, `cmd/notifier`, rather than a sixth `cmd/worker` task**, because a worker pass *is* a transaction and a consumer must commit its topic offsets strictly after one. `internal/notifications` opens: the routing table, recipient resolution through a `Parties` port `cmd/notifier` fills, and dispatch that reads a channel column and knows nothing about events. Idempotence is `uq_notifications_event_recipient_channel` rather than anything the consumer remembers. **Push is declared and unsendable** — SHIP-139 and SHIP-140 do not exist, so `Rules` writes no push row rather than rows nothing can complete — *see below* |
 | **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
 | **SHIP-148** | M6 | Twelve granular permissions and three role bundles, in a **Go table rather than a grant table** — a permission model is the opposite of the thing `Docs/06` §5.3 puts server-side and changeable. Default-deny at three levels: an omitted role becomes the minimum in Go *and* in the column default, and a role with **no bundle holds nothing**. There is deliberately **no permission to delete an audit entry** — *see below* |
+| **SHIP-150** | M6 | Every admin mutation writes an audit entry — and the ticket had to **build SHIP-149's missing write helper first**, because no Go code in the repository wrote to `audit_log` at all. The entry commits **in the same transaction as the mutation**, so a refused action leaves nothing and a failed entry fails the action. Completeness is checked from both ends: the domain drives every mutation and reads the row back, and `cmd/api` holds the **served surface** to the catalogue. `created_at` takes the **injected clock**, deliberately — *see below* |
+| **SHIP-151** | M6 | `GET /v1/admin/users` — search by email, phone and standing, cursor paged, newest first. **The fourth term of its *Done when* has no column**: nothing in the schema holds a user's name, and this ticket did not add one to a shared-block table — see §4. A phone term is **normalised to the stored E.164 form**, which `make verify` found by searching for the number a customer had registered with and getting nothing. The response is held to a **closed key set** rather than searched for the word budget — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -9695,14 +9697,254 @@ on a schedule.
 `81-notifier.sh` takes `04181` and `04182`. The allocation is recorded in both section headers,
 because the harness has no other list of them and §9 records that a track lost twenty minutes to
 exactly this once.
+### SHIP-150 — the ticket had to build SHIP-149's half before it could apply it
+
+**The *Done when* is "all admin mutations write an audit entry; verified by test", and on arrival
+there was nothing to write with.** §4 recorded SHIP-149 as partly done — table and triggers yes, "the
+Go write helper its title names" no — and that row was exactly right. Measured on `7d7caf0`: the
+**only** `INSERT INTO audit_log` statements in the repository were **four in
+`migrations/schema_test.go`**, and the three non-test files that mention the table
+(`identity/session.go:447`, `admin/dispute.go:27` and `:327`, `jobs/model.go:77`) mention it only in
+comments. **No Go code wrote an audit entry.**
+
+So the shape is wave 8's SHIP-130 again — a ticket discovering it owns its dependency's unbuilt
+half — and it is named here rather than absorbed, because that is how §4 eventually closes honestly.
+
+#### What "all admin mutations" turned out to bound
+
+Three, and the number is worth stating because it is smaller than the ticket sounds. `permissions.go`
+has **six mutating permissions** and only one of them — `admins.manage` — has an endpoint;
+`verifications.decide`, `users.restrict`, `jobs.unpublish`, `notes.write` and `disputes.resolve` are
+SHIP-154, 161, 160, 162 and 164, none built. Measured against `routes_golden.txt`, the administrator's
+served surface is five routes and **three change state**:
+
+| Action | Entry | Actor | Target |
+|---|---|---|---|
+| `POST /v1/admin/sessions` | `administrator.signed_in` | the administrator | themselves |
+| `DELETE /v1/admin/sessions/current` | `administrator.signed_out` | the administrator | themselves |
+| `POST /v1/admin/administrators` | `administrator.created` | the creator | the account created |
+
+**Sign-in and sign-out are audited on a deliberate reading rather than an obvious one.** `Docs/01`
+§5.1 asks for "audit logs for privileged actions" and `Docs/04` §6 step 6 wants the actor and the
+timestamp of a decision recorded — a decision has a person behind it, and the only record that the
+person was present is the session. A trail with sign-ins and no sign-outs makes every session look
+open until it expired, which is wrong about exactly the accounts that were being careful.
+
+**Two things are deliberately not audited, and both are decisions.** `POST /v1/jobs/{id}/disputes` is
+a customer or a provider reporting a problem with their own delivery — not privileged by any reading,
+and already recorded twice in `disputes` and `job_status_history`. And **a failed sign-in cannot be**:
+`ck_audit_log_actor_id` requires a non-NULL actor for a non-system entry, and a failure against an
+unknown address has no account to name. Recording it as `system` would put every address anybody has
+guessed into a table support reads — the enumeration oracle `credentials.go` spends an argon2id
+derivation to avoid, moved from the response time into the trail, where it lasts longer.
+
+#### The entry commits with the thing it describes
+
+`Auditor.Record` takes a `db.Runner`, so it joins the caller's transaction (`Docs/10` §3.2), and a
+failure to write **fails the mutation**. That is the opposite of the usual instinct about logging and
+is right for this table specifically: `Docs/09` puts SHIP-149 and SHIP-150 on the do-not-cut list
+because audit is "impossible to backfill", and the entries most worth having are from the moments
+something was going wrong. Two call sites became transactions that were not: `Credentials.Create` and
+`Credentials.SignOut`.
+
+`CreateCommand` gained a required `ActorID`, which makes an unattributed administrator creation
+**unexpressible** rather than merely discouraged — the most privileged action in the console cannot be
+the one entry nobody can trace.
+
+#### `created_at` takes the injected clock, and the alternative was live
+
+`audit_log.created_at` is `DEFAULT now()` — the database's clock — and §9 named this exact hazard
+after this package produced it one table along: `admin_sessions.created_at` took the default while its
+expiries came from the Go clock, so the suite agreed for one idle window and then failed permanently.
+**A time bomb rather than a flake.**
+
+The choice was between supplying the instant and taking the default while never asserting on it. The
+second was rejected on a specific ground: an audit trail is read by ordering it, and an entry has to
+sort against the session row, the dispute row and the status-history row it describes — all of which
+take the injected clock already. Two clocks across those rows make a support timeline that disagrees
+with itself. The column keeps its default for writers that never come through Go: the operator's
+`psql` prompt, and `scripts/verify/90-admin.sh`, which both insert directly.
+`TestAnAuditEntryTakesTheInjectedClockWhateverTheWallClockSays` records at a clock far in the past
+**and** far in the future, so whenever the suite runs at least one is on the wrong side of `now()` —
+which is what makes it unable to rot the way its predecessor did.
+
+**§9's paragraph is now stale in one half and it is worth saying so.** It reads "neither instance is
+fixed here — both are live code in `internal/admin` and `apps/mobile`". The `internal/admin` instance
+**was** fixed: `postgres_auth.go` supplies `created_at` from the clock and carries a long note about
+it, and `TestASessionIsInternallyConsistentWhateverTheWallClockSays` is the guard. The `apps/mobile`
+half was not checked by this lane.
+
+#### Completeness is checked from both ends, because neither end can see the other
+
+The *Done when*'s value is entirely in the word "all". A suite checking two of three mutations proves
+nothing about the third.
+
+- **`internal/admin/audit_test.go`** holds a table of every mutation, each driven **through the
+  handler and `RequireAdmin`** against a real database. It snapshots the log in the instant before
+  the act — the fixtures are themselves audited, so a snapshot taken earlier would make the
+  assertion "some entries were written", which a mutation writing none satisfies — and asserts
+  **exactly one** new entry with the right action, actor, target and instant. "Exactly one" catches
+  both directions: nothing written, and an action recorded twice.
+- The same test pairs the table against `AuditActions`, so an action in the catalogue that nothing
+  exercises fails, and a mutation declaring an action outside it fails.
+- **`cmd/api/routes_admin_test.go`** holds the **served surface** to the catalogue, which the domain
+  cannot see: a route lives in `cmd/api` and nothing in `internal/admin` names it, so an
+  administrative endpoint could be declared, served, and never appear in the domain's suite at all.
+  It is a tripwire rather than a proof — a person can add a row — and the file says so.
+
+#### The mutations, and the one that survived
+
+**Every row below was run and its output read. An earlier draft of this table predicted the outcomes
+before running them and was wrong twice** — which is the failure `CLAUDE.md` names about copied
+figures, committed here in miniature, and the reason the table now says what was measured.
+
+| Mutation | Outcome |
+|---|---|
+| Remove the audit write from **sign-out** — the least obvious of the three | **Caught.** `TestEveryAdminMutationWritesAnAuditEntry/signing_out`: "signing out wrote 0 audit entries, want exactly 1" |
+| Skip `SpendEquivalentWork` for an unknown administrator address | **Caught.** `TestSignInSpendsTheSameWorkWhetherOrNotTheAdministratorExists`: an unknown address cost **1.5 ms** and a wrong password **6.6 ms**. `TestUnknownAddressAndWrongPasswordAreOneAnswer` still **passed**, which is the pair working as designed — one tests the answer, the other the time, and only the second is a timing oracle |
+| Take `created_at` from the column default instead of the injected clock | **Caught** twice, and the past/future test failed in **both** directions — 2020 and 2039 — which is the property that stops it rotting |
+| Write the entry ahead of the work in `Credentials.Create`, on the pool rather than the transaction | **Caught** by `TestAMutationThatFailsLeavesNoAuditEntry`, in its duplicate-address half: "a refused duplicate wrote 1 audit entries". That is the refusal happening *inside* the transaction, which is exactly the case a best-effort write gets wrong |
+| Return `nil` from `Auditor.Record` when the **INSERT** fails | **SURVIVED** — see below |
+| Drop the `admins.manage` check from `CreateAdministrator` while keeping the audit write | **Caught**, and by more than expected: `TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission` (SHIP-148's) *and* `TestAMutationThatFailsLeavesNoAuditEntry`, whose fixture takes the 403 as its precondition and reports 201 instead |
+
+#### The surviving mutation, and what it says about the design
+
+**`Auditor.Record` swallowing a failed INSERT passed the entire suite** — `internal/admin`, `cmd/api`
+and `migrations`, all green. Every other test drives a database where the insert succeeds, so the
+error branch was never taken once. **The single decision this ticket argues hardest for — that a
+failure to write the entry fails the action — was stated in a comment and demonstrated by nothing.**
+
+That is the shape wave 7 recorded as the most valuable result a mutation run produces: a guard that
+passed when it should have failed. It is also the most plausible edit a future maintainer makes,
+because "do not let logging break the feature" is the correct instinct almost everywhere else.
+
+`TestAFailedAuditWriteIsReportedRatherThanSwallowed` closes it. The write is made to fail without
+touching the schema: a statement the database refuses puts the transaction into the aborted state,
+after which Record's INSERT genuinely fails, and the whole transaction is rolled back either way.
+**Re-applying the mutation against the new test fails it**, which is the half that makes the guard
+real rather than believed.
+
+#### Where it lives, and the trigger for moving it
+
+`audit_log` is in the **shared** migration block and `migrations/blocks.go` calls it a table every
+domain reads, so `internal/audit` as infrastructure is arguable. It is in `admin` for two reasons and
+only one is architectural: everything audited today is an administrative action and the vocabulary is
+administrative — and a new package under `internal/` needs a line in `internal/boundaries/boundaries.go`,
+which a domain branch may not edit. **The revisit trigger is named rather than left to judgement: the
+first ticket outside `admin` that needs to append an entry** — SHIP-119's auto-complete and SHIP-68's
+expiry sweep are the candidates, both acting as `system`, which is why that constant exists with
+nothing writing it.
+
+`migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing SHIP-149 could not write, because there
+was no Go vocabulary to pair: `ck_audit_log_actor_type` against `AuditActorTypes`, both directions. It
+also asserts `action` and `target_type` carry **no** CHECK — a deliberate absence, so that adding one
+later is a deliberate act rather than a convenience that turns a widened catalogue into an outage.
+
+**Nothing was needed from `internal/config`.** The clock is already on `Deps`.
+
+### SHIP-151 — three of four terms, and the fourth has no column to search
+
+`GET /v1/admin/users`, `RequireAdmin`, gated on `users.read` — which every role holds, because looking
+is what the least-privileged role exists to be able to do and `Docs/01` §4.6 lists searching first.
+`q` matches an email address or a phone number, `status` narrows by standing, cursor paged on
+`(created_at, id)`, newest first.
+
+**Newest first is a departure from the moderation queue and is deliberate.** That queue is oldest-first
+because `Docs/04` §8 sets acknowledgement targets and the oldest entry is closest to breaching one. A
+search has no such target: the tail is where somebody stops reading rather than where the work is.
+
+#### The *Done when* says "email, phone, name, and status", and there is no name
+
+**Measured, not assumed.** `000002_users` holds id, email, phone, password_hash, role, status, the two
+verification timestamps and the two bookkeeping ones. `identity.User` has no name field and
+registration never asks for one. The only `name` columns in the schema are `admin_users.name` — an
+administrator's — and `driver_assignments.driver_name`, captured at assignment and belonging to a job.
+**The platform does not know a user's name.**
+
+This ticket did not add one. `users` is created in the **shared migration block (1–99)**, which is why
+§6 strikes SHIP-169, and a name belongs to registration rather than to search. So it is recorded in §4
+in the same form SHIP-118 and SHIP-77 carry, and serving it later is one more `OR` in
+`postgres_users.go`. A parameter that could only ever match nothing would have been worse than the
+absence: an empty page and "no such account" are the same answer.
+
+#### `make verify` found a defect no unit test would have
+
+The section searched for the account by the phone number it had just registered with — `0419…` — and
+found nothing. **Registration normalises to E.164**, so the row holds `+61419…` and the leading zero is
+simply not in it. A substring match of what a person types against what is stored finds nothing at
+all, which at the endpoint is indistinguishable from there being no such account.
+
+`phonePattern` closes it: the term is reduced to its digits and one leading zero is dropped, which is a
+fact about the **stored form** rather than a guess about Australia — E.164 has no trunk prefix. A term
+with fewer than four digits turns the phone branch **off** rather than matching `%%`; every account has
+a number, so getting that wrong would make every email search return the whole table. Three test cases
+now cover the local, spaced and stored forms, and one covers the short-term guard.
+
+**This is the argument for `make verify` in one paragraph.** The Go tests inserted fixtures directly and
+so agreed with themselves about the stored form. Only the section that registered through the real
+endpoint and searched with the number a person would have used could see it.
+
+#### The search term is a string, not a pattern
+
+`%` is LIKE's "anything", so an unescaped term of `%` returns the whole table to the least-privileged
+role from one character in a search box; `_` is quieter and worse, returning more than was asked for
+while looking as though it worked. `likeContains` escapes the backslash first and then both
+metacharacters. Covered by test and on the wire.
+
+#### The budget invariant, and the axis SHIP-83 established
+
+The response carries **account facts only** and joins no jobs. `TestTheUserSearchResponseCarriesNothingCommercial`
+holds the serialised shape to a **closed set of keys** rather than searching it for the word "budget" —
+SHIP-83's finding was that a field named `max_price` passes that search and leaks the same fact. The
+verify section makes the same closed-set assertion from outside Go, so neither can be quietly deleted
+alone. There is no password material under any name: the column is not selected and `UserRecord` has
+nowhere to put it.
+
+#### Two copies of one closed list, and the pairing that makes it safe
+
+`admin.UserStanding` is a **second Go copy** of `ck_users_status`s three values — `identity.Status` is
+the first — and it has to be, because `admin` may not import `identity`. `Docs/10` §3.4's pairing is
+what makes a copy safe, and `migrations/admin_user_search_test.go` is it, in both directions. It is
+named `UserStanding` rather than `Status` because `Status` in that package is already an
+administrator's, and one name for two closed lists is how a `switch` ends up comparing the wrong
+vocabulary.
+
+An unrecognised standing is **refused (422) rather than ignored**, which is the opposite of how the
+exception queue reports a job status: that field is *reported* and this one is an *input*. An ignored
+filter answers with every account, so `suspeneded` would read as "every account is suspended".
+
+#### This domain now reads `users` directly, and postgres.go's header was amended
+
+It said this store queries neither `jobs`, `bids` nor `users`, and that `users` is "shared and readable,
+but this domain has no reason to". This ticket is the reason. `users` is in the shared block precisely
+because most of the service reads it, and `jobs`, `fleet` and `delivery` each select from it in their
+own stores. What belongs in `cmd/api` is a query spanning **two other domains'** tables — the party
+lookup, the exception queue — and this one spans none.
+
+#### Scale is a known limit with a named fix
+
+A leading-wildcard LIKE cannot use `uq_users_email`, so this is a sequential scan bounded by the LIMIT
+and by a 320-character cap on the term. Right at pilot volume; the fix is a trigram index, which is a
+migration against `users` in the shared block and therefore a **request** rather than something this
+ticket takes.
+
+#### The mutations, run and read
+
+| Mutation | Outcome |
+|---|---|
+| `likeContains` returns the term unescaped | **Caught.** Searching `%` returned **all three** fixture accounts instead of the one that contains the character literally, and `a_@example.com` returned two accounts instead of none |
+| Keep the leading zero in `phonePattern`, so a local-form number is not normalised | **Caught.** `the local form` and `spaced and bracketed` both returned nothing — which is the defect `make verify` found in the first place, now held by a test |
+
+**Nothing was needed from `internal/config`.**
 
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
 |---|---|---|
-| **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
+| ~~**SHIP-149**~~ | ~~`audit_log` table, append-only triggers, tests~~ | **Closed.** SHIP-150 built the write helper — see §3. On `7d7caf0` the only `INSERT INTO audit_log` in the repository was four statements in `migrations/schema_test.go`, and no Go code wrote an entry; `internal/admin/audit.go` and `postgres_audit.go` now do, and `migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing that could not be written while there was no Go vocabulary to pair |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | **SHIP-118** | `Delivered` recordable and refused without evidence, enforced in the domain and by `000605`'s deferred constraint trigger | The **recipient name** and the **delivery note**. `Docs/01` §4.4 requires a delivered job to carry both alongside proof and `Docs/02` §3 repeats it, naming `01` §4.4 as authoritative for the field set — and **no column holds either**. `milestones` has `job_id`, `milestone`, `actor_type`, `actor_id`, `reason` and the two clocks; `proofs` has the object metadata and `exception_reason`. See below |
+| **SHIP-151** | `GET /v1/admin/users` — search by **email**, **phone** and **status**, cursor paged, with the phone term normalised to the stored E.164 form | The **name**. Its *Done when* is "search users by email, phone, name, and status" and **no column anywhere in the schema holds a user's name** — `000002_users` never had one and registration never asks. The only `name` columns are `admin_users.name` and `driver_assignments.driver_name`, and neither is a user's. See below |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 
 **SHIP-65 has left this table.** Its *Done when* — "returns full job including budget" — was met
@@ -9737,6 +9979,22 @@ which no ticket in the backlog adds. The ticket did the honest thing with what i
 invent dates or tick steps a job may legitimately have skipped, the timeline says where the job is
 and says out loud what it does not know. **It stays in the done list either way** — §10 explains
 that removing it would hard-fail `make status` rather than making the record more truthful.
+
+**SHIP-151 is the SHIP-118 shape rather than the SHIP-77 one, and the difference is who owns the gap.**
+SHIP-77's missing half belongs to work that does not exist — no ticket adds a status-history endpoint —
+while SHIP-118's has an owner in SHIP-123. SHIP-151's has **neither**: no ticket in `Docs/09` adds a
+name to registration, and nothing else in the platform wants one, so the field has no owner and no
+scheduled arrival.
+
+**What it would cost, said plainly so the next reader does not re-derive it.** A `name` column on
+`users`, collected at registration, is a change to `000002_users.up.sql` — the **shared migration block
+(1–99)** — plus `identity`'s register handler, its `User`, `userColumns`, and the mobile and contract
+surfaces. §6 strikes SHIP-169 for exactly the first of those, and a domain branch taking it unilaterally
+is the shared-surface edit the block rules exist to prevent. Serving it once the column exists is **one
+more `OR`** in `internal/admin/postgres_users.go` and one line in the contract.
+
+**The ticket is in the done list either way**, on §10's rule: three of four terms are demonstrable on
+the wire, and removing the row would hard-fail `make status` rather than make the record more truthful.
 
 ## 5. Blocked — and only by work outside this repository
 

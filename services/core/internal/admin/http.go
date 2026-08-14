@@ -57,6 +57,7 @@ type Handler struct {
 	svc        *Service
 	creds      *Credentials
 	moderation *Moderation
+	users      *Users
 	pool       *pgxpool.Pool
 	log        *slog.Logger
 }
@@ -71,6 +72,7 @@ func NewHandler(
 	svc *Service,
 	creds *Credentials,
 	moderation *Moderation,
+	users *Users,
 	pool *pgxpool.Pool,
 	log *slog.Logger,
 ) (*Handler, error) {
@@ -90,10 +92,18 @@ func NewHandler(
 		// round for a collaborator that is decided once, in the composition root.
 		return nil, errors.New("admin: a handler needs the moderation queue service")
 	}
+	if users == nil {
+		// SHIP-151. A nil here would make the search endpoint panic at the first request
+		// rather than at startup, which is the wrong way round for a collaborator decided once
+		// in the composition root — the same argument the queue service above records.
+		return nil, errors.New("admin: a handler needs the account search service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
-	return &Handler{svc: svc, creds: creds, moderation: moderation, pool: pool, log: log}, nil
+	return &Handler{
+		svc: svc, creds: creds, moderation: moderation, users: users, pool: pool, log: log,
+	}, nil
 }
 
 // raiseDisputeRequest is the body of POST /v1/jobs/{id}/disputes.
@@ -682,7 +692,10 @@ func (h *Handler) SignOut() http.Handler {
 			return err
 		}
 
-		if err := h.creds.SignOut(r.Context(), grant.SessionID); err != nil {
+		// The administrator and the session, because SHIP-150 records who signed out as well as
+		// which session ended. Both come from the grant the guard resolved rather than from the
+		// request, so there is no way to attribute a sign-out to somebody else.
+		if err := h.creds.SignOut(r.Context(), grant.Administrator.ID, grant.SessionID); err != nil {
 			return apiError(err)
 		}
 
@@ -765,7 +778,12 @@ type createAdministratorRequest struct {
 // 201 with the account, and the password is not echoed.
 func (h *Handler) CreateAdministrator() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
-		if _, err := h.permitted(r, PermissionAdminsManage); err != nil {
+		// The grant is used rather than discarded, which is what [Handler.permitted]'s note
+		// says it is returned for: SHIP-150 attributes the entry to whoever acted, and taking
+		// the actor from the grant means a handler cannot record one without having stated the
+		// permission it was acting under.
+		grant, err := h.permitted(r, PermissionAdminsManage)
+		if err != nil {
 			return err
 		}
 
@@ -779,6 +797,7 @@ func (h *Handler) CreateAdministrator() http.Handler {
 			Name:     req.Name,
 			Password: req.Password,
 			Role:     Role(req.Role),
+			ActorID:  grant.Administrator.ID,
 		})
 		if err != nil {
 			return apiError(err)
@@ -917,6 +936,182 @@ func (h *Handler) ExceptionQueue() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
 		return nil
 	})
+}
+
+// --- SHIP-151: the administrator's account search -----------------------------------------------
+
+// userResponse is one account as the console sees it.
+//
+// **A closed set of keys, and nothing commercial in it.** A customer's budget is never exposed in
+// any form (Docs/01 §4.3), and SHIP-83 established that searching a response for the word "budget"
+// is not the check that catches it — a field called `max_price` passes that search and leaks the
+// same fact. So this shape is held to its key set by
+// TestTheUserSearchResponseCarriesNothingCommercial, which is an assertion about what is *present*
+// rather than about what is absent.
+//
+// **No password material**, which [UserRecord] makes structural: there is no hash on the struct
+// behind this to leak.
+type userResponse struct {
+	ID string `json:"id"`
+
+	Email string `json:"email"`
+	Phone string `json:"phone"`
+
+	// Role is `customer` or `provider`, fixed at registration (SHIP-45).
+	Role string `json:"role"`
+
+	// Status is the account's standing, which is not the same thing as provider verification —
+	// `000002`s own comment makes the distinction and SHIP-153 is the queue for the other.
+	Status string `json:"status"`
+
+	// The verification timestamps, empty where the channel is unconfirmed. Always present, so a
+	// console that renders without checking does not crash on the ordinary case; `000002` records
+	// why they are instants rather than booleans.
+	EmailVerifiedAt string `json:"email_verified_at"`
+	PhoneVerifiedAt string `json:"phone_verified_at"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+func userFrom(u UserRecord) userResponse {
+	return userResponse{
+		ID:              u.ID.String(),
+		Email:           u.Email,
+		Phone:           u.Phone,
+		Role:            u.Role,
+		Status:          u.Standing.String(),
+		EmailVerifiedAt: timestamp(u.EmailVerifiedAt),
+		PhoneVerifiedAt: timestamp(u.PhoneVerifiedAt),
+		CreatedAt:       timestamp(u.CreatedAt),
+	}
+}
+
+// SearchUsers handles GET /v1/admin/users (SHIP-151).
+//
+// Docs/01 §4.6's first capability, behind [PermissionUsersRead] — which every role holds, because
+// looking is what the least-privileged role exists to be able to do. Acting on what is found is
+// [PermissionUsersRestrict] on a different endpoint (SHIP-161).
+//
+// # Three of the *Done when*'s four terms are served, and the fourth has no column
+//
+// "Search users by email, phone, name, and status." `q` matches an email address or a phone number,
+// `status` narrows by standing, and **there is no name anywhere in the schema** — see users.go. The
+// gap is recorded in Docs/11 §4 rather than papered over with a field that would match nothing.
+//
+// # A collection, cursor paged, newest first
+//
+// Docs/10 §4.5s envelope. Newest first because a search is not a queue: the moderation queue is
+// oldest-first so the entry closest to breaching Docs/04 §8s target surfaces, and no such target
+// applies to looking somebody up.
+func (h *Handler) SearchUsers() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionUsersRead); err != nil {
+			return err
+		}
+
+		query, err := userQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so "is there another page" is answered by the rows rather
+		// than by a second COUNT — the same arrangement the exception queue and the jobs feed
+		// use.
+		query.Limit++
+
+		records, err := h.users.Search(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(records) == query.Limit {
+			last := records[len(records)-2]
+			next = pagination.Cursor{
+				timestamp(last.CreatedAt),
+				last.ID.String(),
+			}.Encode()
+			records = records[:len(records)-1]
+		}
+
+		out := make([]userResponse, 0, len(records))
+		for _, u := range records {
+			out = append(out, userFrom(u))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// userQueryFrom reads the search parameters.
+//
+// Every problem is reported rather than the first (Docs/10 §4.6) for the two fields this endpoint
+// owns. The limit and the cursor are internal/pagination's and refuse on their own, which is
+// deliberate: a malformed cursor is a client bug rather than a person's typing, and mixing the two
+// into one error list would put a field the console generated beside one somebody typed.
+func userQueryFrom(r *http.Request) (UserQuery, error) {
+	values := r.URL.Query()
+
+	var problems validate.Errors
+
+	term := strings.TrimSpace(values.Get("q"))
+	if len(term) > maxSearchTermLength {
+		problems.Add("q", validate.CodeTooLong,
+			"That search term is longer than any address or number this could match. "+
+				"Use at most %d characters.", maxSearchTermLength)
+	}
+
+	// An unrecognised standing is refused rather than ignored. Ignoring it would answer with
+	// every account, and a support engineer who mistyped `suspeneded` would read the whole table
+	// as the suspended ones — which is the opposite of the mistake being caught.
+	standing := UserStanding(strings.TrimSpace(values.Get("status")))
+	if standing != "" && !standing.Valid() {
+		problems.Add("status", validate.CodeInvalid,
+			"That is not an account standing. Use one of %s.", strings.Join(standingNames(), ", "))
+	}
+
+	if err := problems.Err(); err != nil {
+		return UserQuery{}, err
+	}
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return UserQuery{}, err
+	}
+
+	after, err := decodeUserCursor(values.Get("cursor"))
+	if err != nil {
+		return UserQuery{}, err
+	}
+
+	return UserQuery{Term: term, Standing: standing, Limit: limit, After: after}, nil
+}
+
+// decodeUserCursor reads the two fields the search ordering is total on.
+func decodeUserCursor(raw string) (UserCursor, error) {
+	if raw == "" {
+		return UserCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return UserCursor{}, err
+	}
+
+	createdAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return UserCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	userID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return UserCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return UserCursor{CreatedAt: createdAt, UserID: userID}, nil
 }
 
 // exceptionQueryFrom reads the page parameters.

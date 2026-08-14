@@ -825,3 +825,285 @@ status="$(admin_get /v1/admin/moderation/exceptions "" queue-nocred)"
 ok "and the queue is behind the administrator credential like every other administrative route"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-150 — every admin mutation writes an audit entry.
+#
+# # What only this section can show
+#
+# The Go suite in internal/admin drives each mutation through the handler and reads the row back,
+# and it is the stronger of the two: it asserts the entry names the acting administrator, the
+# target, and the injected clock's instant. **What it cannot show is that the wiring in cmd/api
+# hands the domain a writer at all.** `adminHandler` builds the auditor from `d.Clock` and passes it
+# to `NewCredentials`; a change that passed a fresh `clock.System{}`, or that constructed a
+# credentials service somewhere else, compiles and passes every Go test in the domain. Against the
+# built binary it does not.
+#
+# # Everything is fenced on this run's own administrator
+#
+# `make verify` runs against a database that is not reset between runs, so `audit_log` holds every
+# previous run's entries and every other worktree's. A count over the table would be a statement
+# about the machine. Each check below counts entries **for one actor created by this run**, which is
+# the same fencing rule the Kafka and moderation-queue sections follow.
+
+ticket "SHIP-150  every privileged administrative action writes an audit entry"
+
+admin_clear_limits
+
+# audit_count <action> <actor-id> — how many entries this actor has for this action.
+#
+# -qtAc, not -tAc. Without -q psql appends the command tag and this captures "1\nSELECT 1", which
+# the comparisons below fail on for a row that was written perfectly. The same trap the SHIP-149
+# section at the top of this file records, and it has now cost two sections.
+audit_count() {
+  "$PSQL" "$DATABASE_URL" -qtAc \
+    "select count(*) from audit_log where action = '$1' and actor_type = 'admin' and actor_id = '$2';"
+}
+
+audit_email="verify-admin-audit-$$@example.com"
+audit_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$audit_email', 'Verify Auditor', '$admin_fixture_hash', 'owner')
+   returning id;")"
+[[ -n "$audit_id" ]] || fail "the audit fixture administrator could not be created"
+
+# Created by an INSERT rather than through the endpoint, which is `000801`'s bootstrap path — so
+# there is no entry for it yet, and the count below starts at a known zero.
+[[ "$(audit_count administrator.signed_in "$audit_id")" == "0" ]] \
+  || fail "the audit fixture administrator already has sign-in entries, so nothing below is fenced"
+
+# --- sign-in ------------------------------------------------------------------------------------
+
+status="$(admin_signin "verify-adm-audit-in-$$" "$audit_email" "$admin_password" audit-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-audit-in.json"; fail "the audit fixture could not sign in ($status)"; }
+audit_token="$(json "$WORKDIR/admin-audit-in.json" '["token"]')"
+
+[[ "$(audit_count administrator.signed_in "$audit_id")" == "1" ]] \
+  || fail "signing in wrote no audit entry, so nothing records who was in the console"
+ok "an administrator signing in is recorded against their own account"
+
+# The entry carries the clock the rest of the row does. `created_at` is DEFAULT now() in the schema
+# and is supplied by the domain from the injected clock (Docs/11 §9 — one row, one clock), so in a
+# live service it is within seconds of the session it describes. A minute is generous and would
+# still catch a column left to a default on a host whose clock had drifted.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log a
+     join admin_sessions s on s.admin_user_id = a.actor_id
+    where a.actor_id = '$audit_id'
+      and a.action = 'administrator.signed_in'
+      and abs(extract(epoch from (a.created_at - s.created_at))) < 60;")" != "0" ]] \
+  || fail "the audit entry's instant does not agree with the session it describes"
+ok "and its instant agrees with the session row, because both come from one clock"
+
+# --- creating an administrator, which is the action that grants every other permission -----------
+
+audit_made_email="verify-admin-audited-made-$$@example.com"
+status="$(curl -s -X POST -o "$WORKDIR/admin-audit-made.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $audit_token" -H "Idempotency-Key: verify-adm-audit-made-$$" \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$audit_made_email\",\"name\":\"Audited\",\"password\":\"$admin_password\",\"role\":\"moderator\"}" \
+  "http://localhost:$VERIFY_PORT/v1/admin/administrators")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/admin-audit-made.json"; fail "creating an administrator returned $status, want 201"; }
+audit_made_id="$(json "$WORKDIR/admin-audit-made.json" '["id"]')"
+
+[[ "$(audit_count administrator.created "$audit_id")" == "1" ]] \
+  || fail "creating an administrator wrote no audit entry"
+ok "creating an administrator is recorded against the administrator who created it"
+
+# The target and the metadata, which are what make the entry worth reading. "An account was
+# created" is half a fact; "an account was created that can restrict users" is the other half, and
+# Docs/04 §9's least-privilege control is unauditable without it.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where actor_id = '$audit_id'
+      and action = 'administrator.created'
+      and target_type = 'administrator'
+      and target_id = '$audit_made_id'
+      and metadata->>'role' = 'moderator';")" == "1" ]] \
+  || fail "the entry does not name the account created or the role it was given"
+ok "and it names the account created and the role it was granted"
+
+# --- a refused action writes nothing --------------------------------------------------------------
+#
+# The direction that matters. An entry written before the work, or outside the transaction, would
+# record an action that did not happen — and an append-only table has no way to take it back.
+
+status="$(admin_signin "verify-adm-audit-made-in-$$" "$audit_made_email" "$admin_password" audit-made-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-audit-made-in.json"; fail "the created administrator could not sign in ($status)"; }
+audit_made_token="$(json "$WORKDIR/admin-audit-made-in.json" '["token"]')"
+
+status="$(curl -s -X POST -o "$WORKDIR/admin-audit-refused.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $audit_made_token" -H "Idempotency-Key: verify-adm-audit-refused-$$" \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"verify-admin-never-$$@example.com\",\"name\":\"Never\",\"password\":\"$admin_password\"}" \
+  "http://localhost:$VERIFY_PORT/v1/admin/administrators")"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/admin-audit-refused.json"; fail "a moderator created an administrator and got $status, want 403"; }
+[[ "$(audit_count administrator.created "$audit_made_id")" == "0" ]] \
+  || fail "a refused creation was recorded as having happened, in a table nothing can correct"
+ok "a refused action writes no entry — an audit trail records what happened, and cannot be taken back"
+
+# --- signing out, which is the least obvious of the three ------------------------------------------
+#
+# A trail with sign-ins and no sign-outs makes every session look open until it expired, which is
+# wrong about exactly the accounts that were being careful.
+
+status="$(curl -s -X DELETE -o "$WORKDIR/admin-audit-out.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $audit_made_token" -H "Idempotency-Key: verify-adm-audit-out-$$" \
+  "http://localhost:$VERIFY_PORT/v1/admin/sessions/current")"
+[[ "$status" == "204" ]] || { cat "$WORKDIR/admin-audit-out.json"; fail "signing out returned $status, want 204"; }
+
+[[ "$(audit_count administrator.signed_out "$audit_made_id")" == "1" ]] \
+  || fail "signing out wrote no audit entry, so every session looks open until it expired"
+ok "an administrator signing out is recorded, so a session that was closed is distinguishable from one that lapsed"
+
+# --- and what the service wrote is as immutable as what a psql prompt wrote ------------------------
+#
+# The SHIP-148 section above holds the trigger to account over an entry it inserted itself. This is
+# the same control read from the other end: the rows the platform *actually writes* are inside the
+# guarantee, which is the claim an operator cares about and is not quite the same statement.
+
+service_entry="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select id from audit_log
+    where actor_id = '$audit_id' and action = 'administrator.created' limit 1;")"
+[[ -n "$service_entry" ]] || fail "the entry the service wrote could not be found"
+
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "update audit_log set reason = 'rewritten' where id = '$service_entry';" >/dev/null 2>&1; then
+  fail "an entry this service wrote was rewritten"
+fi
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "delete from audit_log where id = '$service_entry';" >/dev/null 2>&1; then
+  fail "an entry this service wrote was deleted"
+fi
+ok "and an entry the service wrote cannot be rewritten or deleted either — the invariant covers the rows that matter"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-151 — searching user accounts.
+#
+# # Three of the four terms, and the fourth said out loud
+#
+# The *Done when* is "search users by email, phone, name, and status". Email, phone and status are
+# below. **Name has no column anywhere in the schema** — `users` never held one and registration
+# never asks — so there is nothing to search and nothing to check. Docs/11 §4 records it. A check
+# here asserting that a name search returns nothing would read as a passing test of a working
+# feature, which is the opposite of recording a gap.
+#
+# # Every account is this run's own
+#
+# The `users` table is shared with every other section and every previous run, so a count would be a
+# statement about the machine. Each search below is fenced on the `$$`-suffixed addresses this
+# section registers, and the assertions are "this account is in the result" rather than "the result
+# has N rows".
+
+ticket "SHIP-151  an administrator searches accounts by email, phone and standing"
+
+admin_clear_limits
+
+# The 0419 prefix is this section's; 04190…04192 are the dispute fixtures above.
+search_email="verify-search-$$@example.com"
+search_phone="04193$$"
+status="$(post_json "verify-adm-search-reg-$$" /v1/auth/register \
+  "{\"email\":\"$search_email\",\"phone\":\"$search_phone\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/search-user.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/search-user.json"; fail "could not register the searchable customer: $status"; }
+search_user_id="$(json "$WORKDIR/search-user.json" '["id"]')"
+
+suspended_email="verify-search-gone-$$@example.com"
+status="$(post_json "verify-adm-search-susp-$$" /v1/auth/register \
+  "{\"email\":\"$suspended_email\",\"phone\":\"04194$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/search-suspended.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/search-suspended.json"; fail "could not register the suspended provider: $status"; }
+suspended_user_id="$(json "$WORKDIR/search-suspended.json" '["id"]')"
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set status = 'suspended' where id = '$suspended_user_id';" >/dev/null \
+  || fail "the account could not be suspended"
+
+# A support administrator, because looking is what the least-privileged role exists to be able to do
+# and Docs/01 §4.6 lists searching first.
+search_admin_email="verify-admin-search-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$search_admin_email', 'Verify Searcher', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the searching administrator could not be created"
+
+status="$(admin_signin "verify-adm-search-in-$$" "$search_admin_email" "$admin_password" search-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-search-in.json"; fail "the searching administrator could not sign in ($status)"; }
+search_token="$(json "$WORKDIR/admin-search-in.json" '["token"]')"
+
+# search_finds <query-string> <user-id> <name> — 1 when the account is on the page, 0 when it is not.
+search_finds() {
+  local found
+  status="$(admin_get "/v1/admin/users?$1" "$search_token" "$3")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-$3.json"; fail "searching accounts returned $status, want 200"; }
+  found="$(python3 - "$WORKDIR/admin-$3.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for u in (page.get("data") or []) if u["id"] == sys.argv[2]))
+PY
+)"
+  printf '%s' "$found"
+}
+
+[[ "$(search_finds "q=$search_email" "$search_user_id" search-email)" == "1" ]] \
+  || fail "an account could not be found by its whole email address"
+[[ "$(search_finds "q=verify-search-$$" "$search_user_id" search-partial)" == "1" ]] \
+  || fail "an account could not be found by part of its email address"
+ok "an account is found by its email address, whole or in part"
+
+[[ "$(search_finds "q=$search_phone" "$search_user_id" search-phone)" == "1" ]] \
+  || fail "an account could not be found by its phone number"
+ok "and by its phone number, through the same parameter — support has a string and does not always know which it is"
+
+# --- the standing filter, in both directions --------------------------------------------------------
+
+[[ "$(search_finds "q=verify-search-$$&status=suspended" "$suspended_user_id" search-susp)" == "1" ]] \
+  || fail "a suspended account is not found when filtering for suspended accounts"
+[[ "$(search_finds "q=verify-search-$$&status=suspended" "$search_user_id" search-susp-neg)" == "0" ]] \
+  || fail "an active account came back from a search filtered to suspended ones"
+ok "the standing filter finds the accounts in that standing and only those"
+
+# An unrecognised standing is refused rather than ignored. Ignoring it answers with every account,
+# which reads exactly like "every account is suspended" to somebody who mistyped one.
+status="$(admin_get "/v1/admin/users?status=suspeneded" "$search_token" search-bad-status)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-search-bad-status.json"; fail "a mistyped standing returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-search-bad-status.json")" == *'"status"'* ]] \
+  || { cat "$WORKDIR/admin-search-bad-status.json"; fail "the refusal does not name the field"; }
+ok "a standing the platform does not have is refused and names the field, rather than answering with everybody"
+
+# --- a search term is a string, not a pattern ---------------------------------------------------
+#
+# The one defect here with a security shape. `%` is LIKE's "anything", so an unescaped term of `%`
+# would return the whole table to the least-privileged role from one character in a search box.
+
+[[ "$(search_finds "q=%25" "$search_user_id" search-wildcard)" == "0" ]] \
+  || fail "a bare % matched every account, so the search term is being used as a LIKE pattern"
+ok "a bare wildcard matches nothing — a search term is a string somebody typed, not a pattern"
+
+# --- what the shape carries, and what it must never ---------------------------------------------
+
+status="$(admin_get "/v1/admin/users?q=$search_email" "$search_token" search-shape)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-search-shape.json"; fail "searching accounts returned $status"; }
+
+python3 - "$WORKDIR/admin-search-shape.json" >"$WORKDIR/search-keys.txt" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+items = page.get("data") or []
+print(",".join(sorted(items[0].keys())) if items else "")
+PY
+search_keys="$(cat "$WORKDIR/search-keys.txt")"
+[[ "$search_keys" == "created_at,email,email_verified_at,id,phone,phone_verified_at,role,status" ]] \
+  || fail "the administrator's view of an account carries [$search_keys], which is not the closed set this shape is held to"
+ok "an account carries a closed set of account facts — no jobs, no bids, no budget and no credential material"
+
+status="$(admin_get "/v1/admin/users?q=$search_email" "" search-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-search-nocred.json"; fail "the account search is readable without a credential ($status)"; }
+[[ "$(cat "$WORKDIR/admin-search-nocred.json")" != *"$search_email"* ]] \
+  || fail "a refused search returned accounts anyway"
+ok "and the search is behind the administrator credential, like every other administrative route"
+
+admin_clear_limits

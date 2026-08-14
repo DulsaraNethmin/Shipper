@@ -1126,3 +1126,243 @@ ExceptionQueueEntry:
         Where the job is now, for triage. It implies nothing about whether a delivery completed
         this way may auto-complete.
       example: Delivered
+
+AdminUsers:
+  get:
+    operationId: adminSearchUsers
+    summary: Search user accounts
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/01 §4.6's first administrative capability — "search users, jobs, bids, and disputes" —
+      in the part of it this ticket builds (SHIP-151). Searching jobs and bids is SHIP-152.
+
+      ## What can be searched, and the one term that cannot
+
+      `q` matches an **email address or a phone number**, anywhere within either. One parameter for
+      both rather than two, because a support engineer has a string off a ticket and does not always
+      know which it is; a console that made them choose would be asking a question the platform can
+      answer by trying both. `status` narrows to one account standing.
+
+      **There is no search by name, because the platform does not hold one.** `users` has an
+      address, a number, a role, a standing and two verification timestamps, and registration never
+      asks for a person's name — so the ticket's fourth term has no column behind it. This is
+      recorded in `Docs/11` §4 rather than served by a parameter that could only ever match
+      nothing. Whoever adds a name to registration serves it here in one line.
+
+      ## What an account carries here, and what it never will
+
+      Account facts only. **No jobs, no bids, and nothing commercial** — a customer's maximum budget
+      is never exposed in any form (Docs/01 §4.3), and the surest way to keep an administrative
+      shape clear of one is for it never to have carried anything from that side of the platform.
+      No password material of any kind: the column is not selected and there is nowhere in the shape
+      to put it.
+
+      `status` is the account's **standing**, which is not the same thing as provider verification —
+      that is an eligibility decision with its own five states (Docs/04 §4) and its own queue
+      (SHIP-153).
+
+      The two verification fields record *when*, not *whether*, and are empty while a channel is
+      unconfirmed. A support conversation asks "since when" as often as it asks "is it".
+
+      ## Ordering and paging
+
+      Newest first, and deliberately unlike the moderation queue: that one is oldest-first because
+      Docs/04 §8 sets acknowledgement targets and the oldest entry is closest to breaching one. A
+      search has no such target. Cursor paged, on `(created_at, id)` — accounts registered in the
+      same instant would make a single-column cursor either skip one or repeat it, and a search that
+      can hide an account is worse than one that shows it twice.
+
+      ## Permission
+
+      Needs `users.read`, which every administrator role holds: looking is what the least-privileged
+      role exists to be able to do. Restricting or suspending an account is `users.restrict` on a
+      different endpoint (SHIP-161).
+    parameters:
+      - name: q
+        in: query
+        required: false
+        description: |
+          Matches an email address or a phone number, anywhere within either. Absent or empty
+          matches every account, which with `status` is how "list the suspended accounts" is
+          expressed.
+
+          **It is a string, not a pattern.** `%` and `_` are matched literally rather than as
+          wildcards, so a search box cannot be turned into a full read of the table.
+        schema:
+          type: string
+          maxLength: 320
+        example: '@acme.example'
+      - name: status
+        in: query
+        required: false
+        description: |
+          Narrows to one account standing. Absent matches every standing. A value that is not one
+          of the three is refused rather than ignored — an ignored filter answers with every
+          account, which reads exactly like "every account is suspended" to somebody who mistyped.
+        schema:
+          type: string
+          enum: [active, restricted, suspended]
+        example: suspended
+      - name: limit
+        in: query
+        required: false
+        description: How many accounts to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page — a client that sent one has a bug, and
+          answering "nothing here" would let it page for ever through a list it never saw.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of accounts, newest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/UserSearchPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          A query parameter carried a value the platform does not have (`validation_failed`), with
+          one `error.details` entry per field — `status` for a standing that is not one of the
+          three, `q` for a term longer than any address it could match. Refused rather than
+          ignored: an ignored filter answers with every account, which reads exactly like "every
+          account is in that standing" to somebody who mistyped one.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+UserSearchPage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/UserAccount'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wNS0wMVQwOTowMDowMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like and a client should not have to know the difference.
+      example: false
+
+UserAccount:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - email
+    - phone
+    - role
+    - status
+    - email_verified_at
+    - phone_verified_at
+    - created_at
+  description: |
+    One account as an administrator sees it. Account facts only — no jobs, no bids, no budget and
+    no credential material of any kind.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    email:
+      type: string
+      format: email
+      example: hana@acme.example
+    phone:
+      type: string
+      description: E.164, as the account holds it.
+      example: '+61400111222'
+    role:
+      type: string
+      enum: [customer, provider]
+      description: |
+        Fixed at registration and immutable thereafter. There is no transition between the two.
+      example: customer
+    status:
+      type: string
+      enum: [active, restricted, suspended]
+      description: |
+        The account's standing — whether it may be used at all. **Not** provider verification,
+        which is a separate eligibility decision with five states of its own (Docs/04 §4).
+      example: active
+    email_verified_at:
+      type: string
+      description: |
+        When the address was confirmed, in UTC. Empty while it has not been. A timestamp rather
+        than a boolean, because "since when" is asked as often as "is it".
+      example: '2026-05-01T09:12:00.000Z'
+    phone_verified_at:
+      type: string
+      description: |
+        When the number was confirmed, in UTC. Empty while it has not been.
+      example: ''
+    created_at:
+      type: string
+      format: date-time
+      description: When the account was registered, in UTC.
+      example: '2026-05-01T09:00:00.000Z'
