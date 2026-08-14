@@ -794,11 +794,11 @@ func (s *Service) ProofFor(
 	r db.Runner,
 	readerID, jobID uuid.UUID,
 ) ([]ProofLink, error) {
-	mayRead, err := s.mayReadProof(ctx, r, readerID, jobID)
+	party, err := s.partyTo(ctx, r, readerID, jobID)
 	if err != nil {
 		return nil, err
 	}
-	if !mayRead {
+	if party == PartyNone {
 		return nil, fmt.Errorf("delivery: %s may not read the proof on %s: %w",
 			readerID, jobID, ErrJobNotFound)
 	}
@@ -826,34 +826,4 @@ func (s *Service) ProofFor(
 		links = append(links, ProofLink{Proof: p, URL: url, ExpiresAt: expiresAt})
 	}
 	return links, nil
-}
-
-// mayReadProof answers whether this account is one of the two parties to the delivery.
-//
-// The customer is asked first and the awarded provider second, which is an ordering rather than a
-// preference: the two are never the same account today — `ck_users_role` fixes the role at
-// registration and SHIP-45's trigger keeps it fixed — and cmd/api's jobPartiesLookup records the
-// same ordering for the same reason.
-//
-// Both questions are asked of ports rather than of a role claim on the token. Being the customer on
-// the job and the provider on its accepted bid are facts; `role: provider` is an assertion the
-// platform issued about an account and says nothing about *this* delivery.
-func (s *Service) mayReadProof(
-	ctx context.Context,
-	r db.Runner,
-	readerID, jobID uuid.UUID,
-) (bool, error) {
-	isCustomer, err := s.owners.IsCustomer(ctx, r, jobID, readerID)
-	if err != nil {
-		return false, err
-	}
-	if isCustomer {
-		return true, nil
-	}
-
-	awarded, isAwarded, err := s.awards.AwardedProvider(ctx, r, jobID)
-	if err != nil {
-		return false, err
-	}
-	return isAwarded && awarded == readerID, nil
 }

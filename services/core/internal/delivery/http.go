@@ -48,6 +48,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
@@ -441,78 +442,201 @@ func (h *Handler) RecordMilestone() http.Handler {
 			return apiError(err)
 		}
 
-		// Logged when proof was recorded, for the reason [Handler.PresignProofUpload]'s line is:
-		// **the object is otherwise invisible to this service.** The bytes never came through here
-		// and the fetch never will, so this line and the store's own access log are the only two
-		// records that a photograph became evidence for this delivery — which is what somebody
-		// reconciling a bucket against the database has to work from. The URL is not logged
-		// anywhere and neither is anything derived from it; a key is a name, not a credential.
-		if recording.Proof.present() && outcome != OutcomeAlreadyRecorded {
-			httpx.LoggerFrom(r.Context()).Info("a photograph was recorded as proof of delivery",
-				slog.String("job_id", jobID.String()),
-				slog.String("milestone_id", record.ID.String()),
-				slog.String("milestone", record.Milestone.Wire()),
-				slog.String("object_key", recording.Proof.ObjectKey()))
-		}
-
-		// Logged at warning rather than info, and it is the one line in this handler that is
-		// about operations rather than about reconciliation (SHIP-116). Docs/04 §5 puts "failed
-		// proof of delivery" in a moderation queue and **SHIP-117 is the ticket that builds
-		// one**; until it does, this line is the only trace an exception leaves anywhere outside
-		// the `proofs` table, and a delivery with no photograph is exactly what somebody should
-		// be able to find in a log while the queue is being written.
-		if recording.Exception != "" && outcome != OutcomeAlreadyRecorded {
-			httpx.LoggerFrom(r.Context()).Warn("a milestone was recorded with a reasoned exception instead of a photograph",
-				slog.String("job_id", jobID.String()),
-				slog.String("milestone_id", record.ID.String()),
-				slog.String("milestone", record.Milestone.Wire()),
-				slog.String("exception_reason", recording.Exception.String()))
-		}
-
-		switch outcome {
-		case OutcomeRecorded:
-			httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
-			return nil
-
-		case OutcomeAbsorbed:
-			// Logged because it is the *only* trace absorption leaves. The row is
-			// indistinguishable from any other milestone, the job did not move, no history
-			// row was written and no event was emitted — so without this line a late
-			// milestone is invisible to operations, and Docs/02 §3.1's escalation is
-			// entirely about how long updates have been out of sync.
-			httpx.LoggerFrom(r.Context()).Info("a late milestone was absorbed as history and the job was not moved",
-				slog.String("job_id", jobID.String()),
-				slog.String("milestone", record.Milestone.Wire()),
-				slog.String("milestone_id", record.ID.String()),
-				slog.Time("recorded_at", record.ActorRecordedAt),
-				slog.Time("accepted_at", record.ServerRecordedAt))
-
-			httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
-			return nil
-
-		case OutcomeAlreadyRecorded:
-			// Logged because it is the signal that the middleware's entry had gone and the
-			// database caught the retry instead. That is the mechanism working, and it is
-			// otherwise invisible: the response is indistinguishable from an ordinary one.
-			httpx.LoggerFrom(r.Context()).Info("a milestone retry was answered from the record rather than recorded again",
-				slog.String("job_id", jobID.String()),
-				slog.String("milestone", record.Milestone.Wire()),
-				slog.String("milestone_id", record.ID.String()))
-
-			httpx.WriteJSON(w, http.StatusOK, milestoneFrom(record))
-			return nil
-
-		default:
-			// The service returned no error and no outcome, which is a defect here rather
-			// than anything the caller did. Answering 201 would be the tempting default and
-			// the wrong one: it would report a recording that nothing in this function can
-			// say happened.
-			return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
-				"Something went wrong at our end.").WithCause(fmt.Errorf(
-				"delivery: recording %s on %s answered %q with no error",
-				recording.Milestone, jobID, outcome))
-		}
+		return writeMilestone(w, r, jobID, recording, record, outcome)
 	})
+}
+
+// RecordDriverMilestone handles POST /v1/driver/jobs/{id}/milestones (SHIP-120a).
+//
+// # The second entry point to the same recording, and it is a second route rather than a relaxation
+//
+// `POST /v1/jobs/{id}/milestones` is RequireUser and always will be. This is RequireDriverToken, and
+// the two credentials are separate systems that cannot be exchanged in either direction (Docs/10
+// §5): a mobile access token answers 401 here, and a driver's link answers 401 there. Neither is a
+// special case in a handler — both are what the auth class does, which is why the route is separate.
+//
+// It is the route three lanes of wave 7 independently specified and none built, each correctly
+// finding it belonged to another lane's ticket (Docs/11 §9). SHIP-121 draws the buttons over it.
+//
+// # There is no job identifier in this function, deliberately
+//
+// [Handler.DriverJob] made the same call for a read and this one matters more, because this writes.
+// The grant is what the service is given, so the *only* job this handler can act on is the one
+// inside a signature — and the guard has already refused a link presented on any other job before
+// this runs. A handler that read `{id}` itself would be a second place deciding, agreeing with the
+// first today and one refactor away from not.
+//
+// # A driver may say there is no photograph and may not attach one
+//
+// The exception path needs nothing but a string, so it is here: a driver who cannot photograph a
+// pickup should be able to say why rather than be unable to record the pickup at all (Docs/01 §4.4
+// makes it "part of the same feature"). A photograph is not, because **there is no route by which a
+// driver can obtain an object key** — `POST /v1/jobs/{id}/proof-uploads` is RequireUser — so any key
+// presented here came from somewhere a driver should not have been. SHIP-122 builds the driver's
+// upload and its record together; until it does, an `object_key` on this route is refused as a
+// field error naming the exception path beside it.
+//
+// The consequence is worth stating rather than discovering: a driver can reach 'Delivered' today
+// only through a reasoned exception, which SHIP-117 will put in a moderation queue. Docs/11 §3
+// records it.
+//
+// # The idempotency key is scoped `anonymous`, and the guarantee is not Redis's anyway
+//
+// Docs/11 §9 has held this decision open since SHIP-15m for the first driver-authenticated write,
+// which is this one. `httpx.SubjectScope` keys on the `authctx.Subject`; a driver token deliberately
+// produces none, and the scope is computed group-wide outside the middleware while a guard runs per
+// route inside it — so **nothing this route can do changes it**, and the only shape that would is a
+// second resolver in `internal/httpx`, which no domain branch may edit.
+//
+// **The decision is the second of the two §9 offered: a job-scoped grant scopes on the job
+// identifier already in the path, and it costs nothing because the platform already does it.**
+// `uq_milestones_idempotency` is `(job_id, idempotency_key)` and 000602 argued that scope in
+// advance, naming this exact case — "a subject column would be a second copy of that fact, and a
+// wrong one the moment SHIP-108's driver records under the same key". So the guarantee lives in a
+// btree that survives an eviction, a flush and two instances; Redis makes a retry cheap and the
+// index makes it correct. `replayOrRefuse` fingerprints method, path and body, and the path carries
+// the job, so reaching another caller's stored response means already holding their job identifier,
+// their key and their exact body — the posture Docs/11 §6 accepts for every public route.
+//
+// What a driver and their provider **do** share is that namespace: a key one has used on a job
+// answers the other with the row it recorded, or refuses it as reused. That is correct rather than
+// a leak — they are the two actors on one delivery, and a milestone is not private between them.
+func (h *Handler) RecordDriverMilestone() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, ok := driverGrantFrom(r.Context())
+		if !ok {
+			// The same call [Handler.DriverJob] makes: the route declares RequireDriverToken, so
+			// reaching here with no grant means it was declared with the wrong class — a wiring
+			// defect the caller can do nothing about.
+			return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+				"Something went wrong at our end.").WithCause(errors.New(
+				"delivery: a driver route was reached with no verified grant on the context; " +
+					"its Auth class is not RequireDriverToken"))
+		}
+
+		var req recordMilestoneRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		recording, proofKey, err := recordingFrom(req, r.Header.Get(httpx.HeaderIdempotencyKey))
+		if err != nil {
+			return err
+		}
+		if proofKey != "" {
+			var problems validate.Errors
+			problems.Add("proof.object_key", validate.CodeNotAllowed,
+				"A driver cannot attach a photograph yet. Send an exception_reason instead.")
+			return problems.Err()
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var (
+			record  Record
+			outcome Outcome
+		)
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			record, outcome, err = h.svc.RecordDriverMilestone(ctx, runner, grant, recording)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		return writeMilestone(w, r, grant.JobID, recording, record, outcome)
+	})
+}
+
+// writeMilestone is what both milestone routes answer with, and the logging both owe.
+//
+// One function rather than a copy per entry point, which is the same call [Service.recorded] makes
+// one layer down: the four outcomes and the two operational log lines are the ticket, and a second
+// copy is a second place for a driver's absorbed milestone to be answered differently from a
+// provider's.
+func writeMilestone(
+	w http.ResponseWriter,
+	r *http.Request,
+	jobID uuid.UUID,
+	recording Recording,
+	record Record,
+	outcome Outcome,
+) error {
+	// Logged when proof was recorded, for the reason [Handler.PresignProofUpload]'s line is:
+	// **the object is otherwise invisible to this service.** The bytes never came through here
+	// and the fetch never will, so this line and the store's own access log are the only two
+	// records that a photograph became evidence for this delivery — which is what somebody
+	// reconciling a bucket against the database has to work from. The URL is not logged
+	// anywhere and neither is anything derived from it; a key is a name, not a credential.
+	if recording.Proof.present() && outcome != OutcomeAlreadyRecorded {
+		httpx.LoggerFrom(r.Context()).Info("a photograph was recorded as proof of delivery",
+			slog.String("job_id", jobID.String()),
+			slog.String("milestone_id", record.ID.String()),
+			slog.String("milestone", record.Milestone.Wire()),
+			slog.String("object_key", recording.Proof.ObjectKey()))
+	}
+
+	// Logged at warning rather than info, and it is the one line here that is about operations
+	// rather than about reconciliation (SHIP-116). Docs/04 §5 puts "failed proof of delivery" in
+	// a moderation queue and **SHIP-117 is the ticket that builds one**; until it does, this line
+	// is the only trace an exception leaves anywhere outside the `proofs` table, and a delivery
+	// with no photograph is exactly what somebody should be able to find in a log while the queue
+	// is being written.
+	if recording.Exception != "" && outcome != OutcomeAlreadyRecorded {
+		httpx.LoggerFrom(r.Context()).Warn("a milestone was recorded with a reasoned exception instead of a photograph",
+			slog.String("job_id", jobID.String()),
+			slog.String("milestone_id", record.ID.String()),
+			slog.String("milestone", record.Milestone.Wire()),
+			slog.String("exception_reason", recording.Exception.String()))
+	}
+
+	switch outcome {
+	case OutcomeRecorded:
+		httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+		return nil
+
+	case OutcomeAbsorbed:
+		// Logged because it is the *only* trace absorption leaves. The row is
+		// indistinguishable from any other milestone, the job did not move, no history
+		// row was written and no event was emitted — so without this line a late
+		// milestone is invisible to operations, and Docs/02 §3.1's escalation is
+		// entirely about how long updates have been out of sync.
+		httpx.LoggerFrom(r.Context()).Info("a late milestone was absorbed as history and the job was not moved",
+			slog.String("job_id", jobID.String()),
+			slog.String("milestone", record.Milestone.Wire()),
+			slog.String("milestone_id", record.ID.String()),
+			slog.Time("recorded_at", record.ActorRecordedAt),
+			slog.Time("accepted_at", record.ServerRecordedAt))
+
+		httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+		return nil
+
+	case OutcomeAlreadyRecorded:
+		// Logged because it is the signal that the middleware's entry had gone and the
+		// database caught the retry instead. That is the mechanism working, and it is
+		// otherwise invisible: the response is indistinguishable from an ordinary one.
+		httpx.LoggerFrom(r.Context()).Info("a milestone retry was answered from the record rather than recorded again",
+			slog.String("job_id", jobID.String()),
+			slog.String("milestone", record.Milestone.Wire()),
+			slog.String("milestone_id", record.ID.String()))
+
+		httpx.WriteJSON(w, http.StatusOK, milestoneFrom(record))
+		return nil
+
+	default:
+		// The service returned no error and no outcome, which is a defect here rather
+		// than anything the caller did. Answering 201 would be the tempting default and
+		// the wrong one: it would report a recording that nothing in this function can
+		// say happened.
+		return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+			"Something went wrong at our end.").WithCause(fmt.Errorf(
+			"delivery: recording %s on %s answered %q with no error",
+			recording.Milestone, jobID, outcome))
+	}
 }
 
 // proofUploadRequest is the body of POST /v1/jobs/{id}/proof-uploads.
@@ -1192,4 +1316,292 @@ func apiError(err error) error {
 	default:
 		return err
 	}
+}
+
+// --- the delivery read shelf (SHIP-115a) --------------------------------------------------------
+
+// deliveryDetailResponse is what a party to a job is shown about who is carrying it.
+//
+// # `driver_assigned` is a field rather than the absence of the others
+//
+// A job that has been awarded and has no driver yet is an ordinary state, not a missing resource, so
+// this answers `200` with `driver_assigned: false` rather than `404`. A client that branched on a
+// missing `driver_name` would be reading the absence of a field as a fact about the delivery, which
+// is the same mistake the proof contract warns against for `download_url`.
+//
+// # `driver_mobile` is present for the provider and absent for the customer
+//
+// `omitempty`, because the domain does not hand this handler the number when the reader is the
+// customer — see [Delivery]. That is `Docs/01` §4's "minimise exposure of phone numbers" applied to
+// a person who has no account and no way to consent: the provider typed the number, and giving back
+// what somebody supplied is not exposure.
+//
+// # The job's status is not echoed
+//
+// The same call [assignmentResponse] and [driverJobResponse] make. The status vocabulary is `jobs`'
+// and a copy here would be a second list to keep in step; a client that needs it reads the job.
+type deliveryDetailResponse struct {
+	JobID string `json:"job_id"`
+
+	DriverAssigned bool `json:"driver_assigned"`
+
+	AssignmentID string `json:"assignment_id,omitempty"`
+	DriverName   string `json:"driver_name,omitempty"`
+	DriverMobile string `json:"driver_mobile,omitempty"`
+	AssignedAt   string `json:"assigned_at,omitempty"`
+}
+
+func deliveryDetailFrom(d Delivery) deliveryDetailResponse {
+	body := deliveryDetailResponse{JobID: d.JobID.String(), DriverAssigned: d.Assigned}
+	if !d.Assigned {
+		return body
+	}
+
+	body.AssignmentID = d.AssignmentID.String()
+	body.DriverName = d.DriverName
+	body.DriverMobile = d.DriverMobile
+	body.AssignedAt = timestamp(d.AssignedAt)
+	return body
+}
+
+// DeliveryDetail handles GET /v1/jobs/{id}/delivery/detail (SHIP-115a).
+//
+// # Five segments, and four would stop the process
+//
+// `GET /v1/jobs/{id}/delivery` and `GET /v1/jobs/open/{id}` both match `/v1/jobs/open/delivery` with
+// neither more specific, and Go's ServeMux panics at registration rather than serving a route that
+// answers oddly. This is the shelf SHIP-115 opened with `/delivery/proof` for exactly that reason;
+// see read.go's header.
+//
+// RequireUser, and the auth class is not the access control: it gets a caller as far as the handler,
+// and [Service.DeliveryFor] asks the database which of two parties they are. Being neither answers
+// exactly what a job that does not exist answers.
+func (h *Handler) DeliveryDetail() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		readerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		detail, err := h.svc.DeliveryFor(r.Context(), pool, readerID, jobID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, deliveryDetailFrom(detail))
+		return nil
+	})
+}
+
+// milestoneCursorFields is how many values a milestone cursor carries: the actor's clock, and the
+// identifier that breaks its ties.
+const milestoneCursorFields = 2
+
+// encodeMilestoneCursor is the cursor that resumes after this record.
+//
+// RFC 3339 with nanoseconds rather than the millisecond precision responses render, which is the
+// same call jobs' own cursor makes: this value is compared against a `timestamptz` rather than
+// displayed, and a rounded rendering would put the page boundary inside a group of rows sharing the
+// rounded value — repeating some and skipping others.
+func encodeMilestoneCursor(rec Record) string {
+	return pagination.Cursor{
+		rec.ActorRecordedAt.UTC().Format(time.RFC3339Nano),
+		rec.ID.String(),
+	}.Encode()
+}
+
+// decodeMilestoneCursor reads one back.
+//
+// pagination.Decode establishes the shape — this version, this many fields — and this establishes
+// the meaning. Only the domain knows that its ordering key is a timestamp and a UUID, and a cursor
+// whose fields decode but do not parse has to be refused here: reaching the query as a zero time
+// would silently answer with the first page, which is a client's list quietly starting again.
+func decodeMilestoneCursor(raw string) (milestoneCursor, error) {
+	fields, err := pagination.Decode(raw, milestoneCursorFields)
+	if err != nil || fields == nil {
+		return milestoneCursor{}, err
+	}
+
+	at, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		return milestoneCursor{}, invalidMilestoneCursor(err)
+	}
+	id, err := uuid.Parse(fields[1])
+	if err != nil {
+		return milestoneCursor{}, invalidMilestoneCursor(err)
+	}
+	return milestoneCursor{recordedAt: at, id: id, set: true}, nil
+}
+
+func invalidMilestoneCursor(cause error) error {
+	return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+		"The cursor is not one this endpoint issued. Ask for the first page without one.").
+		WithCause(cause)
+}
+
+// MilestonesOnJob handles GET /v1/jobs/{id}/delivery/milestones (SHIP-115a).
+//
+// Every milestone recorded on the delivery, newest by the actor's clock first, in the collection
+// envelope of Docs/10 §4.5 — which is what lets a client tell a collection from a single resource
+// without knowing the endpoint.
+//
+// **It pages and `/delivery/proof` does not**, and read.go's [Service.MilestonesFor] argues why:
+// 000601 deliberately has no uniqueness on `(job_id, milestone)`, so a delivery that goes badly
+// accumulates repeats and this collection has no domain bound to stand on.
+//
+// The same two-party check as the operation above, with the same 404 for anybody else.
+func (h *Handler) MilestonesOnJob() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		readerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		limit, err := pagination.Limit(r.URL.Query().Get("limit"))
+		if err != nil {
+			return err
+		}
+		after, err := decodeMilestoneCursor(r.URL.Query().Get("cursor"))
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		records, hasMore, err := h.svc.MilestonesFor(r.Context(), pool, readerID, jobID,
+			MilestonePage{After: after, Limit: limit})
+		if err != nil {
+			return apiError(err)
+		}
+
+		page := make([]milestoneResponse, 0, len(records))
+		for _, rec := range records {
+			page = append(page, milestoneFrom(rec))
+		}
+
+		var next string
+		if hasMore && len(records) > 0 {
+			next = encodeMilestoneCursor(records[len(records)-1])
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(page, next))
+		return nil
+	})
+}
+
+// --- reissuing a driver's link (SHIP-109) -------------------------------------------------------
+
+// driverLinkResponse is a freshly issued link, and the record of how many this assignment has had.
+//
+// **It carries a credential**, exactly as [assignmentResponse] does, and it is scoped like one: the
+// idempotency middleware stores it under `idem:v1:user:<provider>:<key>` (SHIP-44), so a replay
+// reaches only the provider who asked. The driver's name and mobile are deliberately not repeated
+// here — this operation is about the link, and the assignment is read from `/delivery/detail`.
+//
+// The URL is not assembled, for the reason [assignmentResponse] gives: the driver portal's landing
+// route is the portal's to define, and a base URL in this response would be this domain asserting a
+// path in an application it does not own.
+type driverLinkResponse struct {
+	JobID        string `json:"job_id"`
+	AssignmentID string `json:"assignment_id"`
+
+	DriverToken          string `json:"driver_token"`
+	DriverTokenExpiresAt string `json:"driver_token_expires_at"`
+
+	// IssuedAt and IssueCount are what tells a provider they are looking at a new link rather
+	// than the one they already forwarded. The count is the only trace a revocation leaves —
+	// the previous link's identifier is overwritten rather than kept (000606).
+	IssuedAt   string `json:"issued_at"`
+	IssueCount int    `json:"issue_count"`
+}
+
+func driverLinkFrom(a Assignment, token DriverToken) driverLinkResponse {
+	return driverLinkResponse{
+		JobID:        a.JobID.String(),
+		AssignmentID: a.ID.String(),
+
+		DriverToken:          token.Value,
+		DriverTokenExpiresAt: timestamp(token.ExpiresAt),
+
+		IssuedAt:   timestamp(a.LinkIssuedAt),
+		IssueCount: a.LinkIssueCount,
+	}
+}
+
+// ReissueDriverLink handles POST /v1/jobs/{id}/driver/link (SHIP-109).
+//
+// A noun under the assignment rather than a verb — `POST /jobs/{id}/driver/revoke` would name the
+// half of this that destroys and not the half that a provider actually wants, which is a working
+// link to forward. Posting to the collection of links this assignment has had is what happens: one
+// more is issued, and the previous one stops opening anything the moment this commits.
+//
+// 200 rather than 201, and that is deliberate. A link is not a resource this API serves — there is
+// no `GET /jobs/{id}/driver/link`, and there never will be, because the platform keeps no copy of a
+// token it has issued. What comes back is a credential minted for this request.
+//
+// **RequireUser, on a route whose whole subject is the driver's credential.** The caller is the
+// provider, authenticated the ordinary way; a driver cannot reissue their own link, which is the
+// point of a link a provider controls. The pairing is the same one `POST /jobs/{id}/driver` has:
+// this route mints a driver token and does not accept one.
+func (h *Handler) ReissueDriverLink() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var (
+			assignment Assignment
+			token      DriverToken
+		)
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			assignment, token, err = h.svc.ReissueDriverLink(ctx, runner, providerID, jobID)
+			return err
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Logged because a revocation is otherwise invisible: the previous identifier is
+		// overwritten rather than kept (000606), so this line and `link_issue_count` are the
+		// whole record that a link was ended. **Neither token is logged** — the outgoing one is
+		// the credential itself, and the incoming one is what a log reader could use to work out
+		// which link a driver was refused on.
+		httpx.LoggerFrom(r.Context()).Info("a driver link was reissued and the previous one stopped working",
+			slog.String("job_id", jobID.String()),
+			slog.String("assignment_id", assignment.ID.String()),
+			slog.Int("issue_count", assignment.LinkIssueCount))
+
+		httpx.WriteJSON(w, http.StatusOK, driverLinkFrom(assignment, token))
+		return nil
+	})
 }

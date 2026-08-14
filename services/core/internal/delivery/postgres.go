@@ -37,7 +37,8 @@ type postgresStore struct{}
 // unassigned_at has no COALESCE because PostgreSQL's NULL has no representation in time.Time, and
 // because the distinction it carries is the whole of [Assignment.Live].
 const assignmentColumns = `
-	id, job_id, driver_name, driver_mobile, unassigned_at, created_at, updated_at`
+	id, job_id, driver_name, driver_mobile, unassigned_at,
+	link_token_id, link_issued_at, link_issue_count, created_at, updated_at`
 
 // scanAssignment reads one row of [assignmentColumns].
 //
@@ -51,8 +52,8 @@ func scanAssignment(row pgx.Row) (Assignment, error) {
 	)
 
 	if err := row.Scan(
-		&a.ID, &a.JobID, &a.DriverName, &a.DriverMobile,
-		&unassignedAt, &a.CreatedAt, &a.UpdatedAt,
+		&a.ID, &a.JobID, &a.DriverName, &a.DriverMobile, &unassignedAt,
+		&a.LinkTokenID, &a.LinkIssuedAt, &a.LinkIssueCount, &a.CreatedAt, &a.UpdatedAt,
 	); err != nil {
 		return Assignment{}, err
 	}
@@ -402,4 +403,119 @@ func (postgresStore) accountPhone(ctx context.Context, r db.Runner, userID uuid.
 		return "", fmt.Errorf("delivery: reading the mobile on %s: %w", userID, err)
 	}
 	return phone, nil
+}
+
+// milestonesOn is a page of one job's milestones, newest by the actor's clock first (SHIP-115a).
+//
+// # Ordered by the actor's clock, which is the same call [postgresStore.proofOn] makes
+//
+// `idx_milestones_job` is `(job_id, actor_recorded_at DESC)` and 000601 says why: that is the
+// sequence the customer is shown (Docs/02 §3.1). An offline batch that syncs together shares one
+// arrival time while carrying four different recorded times, so ordering by arrival would show a
+// delivery that ran backwards.
+//
+// **The identifier breaks the tie and it is not decoration.** Milestones are UUIDv7, so `id`
+// descends with creation time, and a page boundary that fell inside a group sharing one
+// `actor_recorded_at` would otherwise repeat or skip a row — which is the failure keyset pagination
+// exists to avoid, arriving by a different route. That is also why the cursor carries both.
+//
+// One row more than asked for is fetched, so `has_more` is a fact rather than a guess: a client is
+// never told there is another page that turns out to be empty.
+//
+// **This does not check who is asking.** [Service.MilestonesFor] does, before calling it, which is
+// the division [postgresStore.proofOn] states and the reason this method is unexported.
+func (postgresStore) milestonesOn(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+	after milestoneCursor,
+	limit int,
+) ([]Record, bool, error) {
+	const q = `
+		SELECT ` + milestoneColumns + `
+		FROM milestones
+		WHERE job_id = $1
+		  AND ($2::timestamptz IS NULL
+		       OR (actor_recorded_at, id) < ($2::timestamptz, $3::uuid))
+		ORDER BY actor_recorded_at DESC, id DESC
+		LIMIT $4`
+
+	var (
+		at *time.Time
+		id *uuid.UUID
+	)
+	if after.set {
+		at, id = &after.recordedAt, &after.id
+	}
+
+	rows, err := r.Query(ctx, q, jobID, at, id, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("delivery: reading the milestones on %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	var records []Record
+	for rows.Next() {
+		rec, err := scanMilestone(rows)
+		if err != nil {
+			return nil, false, fmt.Errorf("delivery: reading a milestone row on %s: %w", jobID, err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("delivery: reading the milestones on %s: %w", jobID, err)
+	}
+
+	if len(records) > limit {
+		return records[:limit], true, nil
+	}
+	return records, false, nil
+}
+
+// linkIssued records that this assignment has been handed a new link, and makes it the only one
+// that opens it (SHIP-109).
+//
+// # One statement for both paths, and that is the design rather than a saving
+//
+// Every way a caller is handed a driver link goes through [Service.granted] and therefore through
+// here: the assignment that mints the first one, the repeated nomination that mints another, and
+// SHIP-109's explicit reissue. A second statement that initialised the column on one path and
+// updated it on another is the arrangement in which the two drift — and the drift is invisible,
+// because both rows are well formed and only the *older* link's holder notices.
+//
+// `link_issue_count` starts at 0 in the schema and is incremented here, so an assignment's count is
+// 1 with no special case anywhere.
+//
+// **Scoped to the live assignment.** A stood-down row keeps whatever identifier it had; reviving a
+// link on it would revive a driver 000600's trigger refuses to revive.
+//
+// The row is returned rather than assumed, because the caller hands the updated assignment straight
+// back to a response and a stale `link_issue_count` beside a brand-new token would be a support
+// answer that is wrong by one.
+func (postgresStore) linkIssued(
+	ctx context.Context,
+	r db.Runner,
+	assignmentID uuid.UUID,
+	tokenID string,
+) (Assignment, error) {
+	const q = `
+		UPDATE driver_assignments
+		SET link_token_id    = $2,
+		    link_issued_at   = now(),
+		    link_issue_count = link_issue_count + 1
+		WHERE id = $1 AND unassigned_at IS NULL
+		RETURNING ` + assignmentColumns
+
+	a, err := scanAssignment(r.QueryRow(ctx, q, assignmentID, tokenID))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		// The assignment was stood down between being read and being handed a link. Reported
+		// rather than absorbed: the caller is about to return a token, and a token for an
+		// assignment that is no longer live is a link that opens nothing.
+		return Assignment{}, fmt.Errorf("delivery: %s is not a live assignment: %w",
+			assignmentID, ErrDriverLinkSuperseded)
+	case err != nil:
+		return Assignment{}, fmt.Errorf("delivery: recording the link on %s: %w", assignmentID, err)
+	}
+	return a, nil
 }

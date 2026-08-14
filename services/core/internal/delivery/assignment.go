@@ -53,6 +53,28 @@ type Assignment struct {
 
 	UnassignedAt time.Time
 
+	// LinkTokenID is the `jti` of the one driver token that currently opens this assignment
+	// (SHIP-109).
+	//
+	// **This is the whole of revocation, and it is a read rather than a denylist.** A driver token
+	// is signed and stateless, so nothing can recall one; what the platform can do is stop
+	// believing it. [Service.AssignmentFor] compares the identifier inside a presented link with
+	// this value on every driver request, and a reissue overwrites it — which is what
+	// "invalidating the previous one" means with no list to grow and no cache whose flush would
+	// restore a dead link (Docs/10 §5).
+	//
+	// The previous value is overwritten rather than kept. A record of dead link identifiers is a
+	// denylist by another name, and 000606 argues why there is not one.
+	LinkTokenID string
+
+	// LinkIssuedAt is when the current link was issued, which is the assignment's own creation
+	// time until somebody reissues.
+	LinkIssuedAt time.Time
+
+	// LinkIssueCount is how many links this assignment has been given: one for the assignment
+	// itself, and one more for each reissue. It is the only trace a revocation leaves.
+	LinkIssueCount int
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

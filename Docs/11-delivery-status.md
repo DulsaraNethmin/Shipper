@@ -411,15 +411,18 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
 | **SHIP-108** | M4 | The driver token verifier and `GET /v1/driver/jobs/{id}` — the first route in the service served on something other than a mobile session. **The one-job check is the auth class**, so a driver route cannot declare the class and skip it, and both directions of the exchange invariant are now demonstrated over HTTP rather than only in Go — *see below* |
+| **SHIP-109** | M4 | `POST /v1/jobs/{id}/driver/link` — another link for the driver already on the job, **invalidating the previous one**. The mechanism is `000606`'s `driver_assignments.link_token_id`, the one `jti` that opens the assignment: revocation is a read against a column rather than a denylist, so the read route and SHIP-120a's write are covered by one check. A *repeated nomination* re-signs the identifier it already holds rather than minting a fresh one, so a retry cannot cut off a driver already holding the link. The *Done when*'s "or admin" cannot be met — there is no administrator until SHIP-147 — *see below* |
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
 | **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
 | **SHIP-115** | M4 | `proofs` and `GET /v1/jobs/{id}/delivery/proof` — an uploaded object becomes evidence for **one recorded milestone**, and the customer and the awarded provider read it back through short-lived signed URLs issued *after* an authorisation check. Because the platform is not in the upload path it **asks the store whether the object arrived** rather than believing the client, and records what the store reports — which is also what finally puts SHIP-114's upload limits under a guard inside the domain — *see below* |
+| **SHIP-115a** | M4 | The delivery read shelf — `GET /v1/jobs/{id}/delivery/detail` and `GET /v1/jobs/{id}/delivery/milestones`, both `RequireUser`, both **five segments because four would panic the router at registration**. The milestone list is the only place a recording that moved nothing can be seen, which is why it is served rather than derived from the job's status; it pages on a keyset carrying the actor's clock *and* the identifier, because an offline batch shares one timestamp. `driver_mobile` reaches the provider who typed it and not the customer, and the domain drops it rather than the handler — *see below* |
 | **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
 | **SHIP-117** | M4 | The delivery-exception moderation queue — `GET /v1/admin/moderation/exceptions`, and it is a **query over the evidence rather than a table of flags**, which is what `000604` said it would be when it built `idx_proofs_exception`. `internal/delivery` is **untouched**: a flag would have needed a cross-domain write for a fact already in the row, and a second source of truth that can drift. Takes **no position on X-6** — *see below* |
 | **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
+| **SHIP-120a** | M4 | `POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken` — **the first write in the service served on a credential that names no account**, and the route three wave-7 lanes specified and none built. It settles the idempotency scope §9 had held open since SHIP-15m: a driver's key is scoped by the job, because `uq_milestones_idempotency (job_id, idempotency_key)` already scopes it there and `000602` named this case while doing it. The `Jobs` port's four moves take a `Recorder` instead of a provider identifier, so a driver's transition is attributed to their `driver_assignments` row rather than to their provider — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
@@ -8970,6 +8973,189 @@ or the other and never both. **No budget, and the shape has nowhere to put one**
 that reads `ExceptionEntry`'s field names reflectively and fails on a future `Budget` or `ObjectKey`,
 so the invariant is enforced against the fields somebody adds later rather than against the fields
 that are there now.
+
+### SHIP-120a — the route three lanes specified and none built, and the scope decision it had to settle first
+
+`POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken`. **The first write in the
+service served on a credential that names no account**, and the reason wave 8 has a delivery track at
+all: with SHIP-115a it unblocks SHIP-101, 121, 122, 123 and 133.
+
+§9 recorded the shape of it after wave 7 — three separate lanes, the driver portal, the proof lane
+and the milestone screen, each independently wrote down the same missing route and not one of them
+built it, because it belonged to none of their tickets. What that produced was a specification rather
+than an oversight, and this ticket was built against it rather than against a blank page.
+
+**The idempotency scope §9 had held open since SHIP-15m is decided here, and the decision is the
+cheap one because the platform had already made it.** The entry offered two shapes: a second
+group-wide resolver beside `ResolveSubject` that a driver grant could also populate, or "an explicit
+decision that a job-scoped grant scopes on the job identifier already in the path, which costs
+nothing and is weaker". The second is taken, and re-reading `000602` is what settles it — the index
+is `uq_milestones_idempotency (job_id, idempotency_key)`, and that migration argued the scope in
+advance while naming this exact case: *"a subject column would be a second copy of that fact, and a
+wrong one the moment SHIP-108's driver records under the same key."* So the guarantee the *Done when*
+rests on lives in a btree that survives an eviction, a flush and two instances; Redis makes the retry
+cheap and the index makes it correct. `replayOrRefuse` fingerprints method, path and body, and the
+path carries the job, so reaching another caller's stored response means already holding their job
+identifier, their key and their exact body — the posture §6 accepts for every public route.
+
+**The first shape was not rejected on its merits; it is unbuildable from a domain branch.** The scope
+is computed group-wide, outside `Idempotent`, in `internal/httpx` and `cmd/api/routes.go`. Both are
+shared surfaces, and no guard can reach the decision from inside — which is exactly what §9 said and
+is worth confirming rather than re-deriving.
+
+**What the two entry points share and what they do not.** `Service.RecordMilestone` and
+`Service.RecordDriverMilestone` differ only in who is asking; everything after that — the evidence
+rule, the insert, the retry path, the move, the five outcomes and SHIP-136's emission — is one
+function they both call. The provider's path asks `bidding` who was awarded the job. **The driver's
+asks a row**: is the assignment this grant names still the live one, which is the same read SHIP-108
+already makes before showing a driver anything. The accepted bid is deliberately not re-checked on
+the driver's path — an assignment can only exist on a job that reached `Driver assigned`, which only
+the awarded provider can ask for, so a live assignment is the stronger statement.
+
+**The `Jobs` port was widened rather than doubled, and that is the one change that reached another
+file.** Its four milestone moves took `providerID uuid.UUID`; they now take a `delivery.Recorder`,
+which carries the `(actor_type, actor_id)` pair `000601` and `000401` already store. A driver has no
+`users` row — they *are* a `driver_assignments` row — so a transition a driver caused has to be
+attributed to that row, and passing an assignment identifier through a parameter named `providerID`
+would have compiled and written a `job_status_history` row claiming a provider did it. Eight methods
+would have let the two paths attribute differently; one parameter cannot. `cmd/api`'s adapter
+**refuses an actor it has no mapping for rather than defaulting to the provider**, which is the same
+call it already makes about an unrecognised outcome, and both the milestone row and the transition
+row are read back in `scripts/verify/70-delivery.sh` rather than inferred from a response body that
+carries neither identifier.
+
+**A driver may say there is no photograph and may not attach one, and that is a line rather than a
+gap.** The exception path needs nothing but a string, and `Docs/01` §4.4 makes it part of the same
+feature, so a driver who cannot photograph a pickup can still record the pickup. A photograph needs
+an upload URL and **there is no operation a driver can call to obtain one** — `POST
+/v1/jobs/{id}/proof-uploads` is `RequireUser` — so a key presented on this route came from somewhere
+a driver should not have been, and is refused as a field error naming the exception beside it.
+SHIP-122 builds the driver's upload and its record together and deletes the refusal. **The
+consequence is named rather than discovered: until then a driver can reach `Delivered` only through a
+reasoned exception**, which SHIP-117 will put in a moderation queue.
+
+**The handler holds no job identifier at all.** `RecordDriverMilestone` takes a `DriverGrant` and
+nothing else, which is the shape `Service.AssignmentFor` already took for the read and which matters
+more on a write: a `DriverGrant` is produced by `DriverTokenVerifier.Verify` and by nothing else, the
+guard has already compared the job in the path with the job in the token, and a handler that has no
+identifier to pass cannot widen the grant by passing the wrong one. **Wave 7's surviving mutation is
+what makes that worth stating** — a driver surface deriving the job it acted on from its own
+credential rendered another job's delivery with a 200 while twenty tests passed — and the lesson
+taken from it is the shape of the tests rather than the signature: three of them ask what the process
+answered for a request naming a job the credential does not, one in `cmd/api` through the real
+middleware chain, one in `internal/delivery` against real rows, and one in
+`scripts/verify/70-delivery.sh` against the running binary with two real deliveries.
+
+**One test in `cmd/api` guards the failure that has no other witness.** `RequireDriverToken` reads
+`{id}` and `r.PathValue` answers the empty string for a parameter a pattern never declared, so a
+driver-token route named any other way is scoped by nothing and refuses everything.
+`TestEveryDriverTokenRouteNamesItsJobInThePath` walks the manifest rather than the two routes that
+exist today.
+
+
+### SHIP-109 — revocation is a read against a column, and a retry must not cause one
+
+`POST /v1/jobs/{id}/driver/link`, `RequireUser`. Another job-scoped link for the driver already on
+the job, and **the previous one stops opening anything the moment it commits**.
+
+**The mechanism is `000606`'s `driver_assignments.link_token_id`: the one `jti` that opens this
+assignment.** SHIP-108 had already taken the position — "revocation as a read rather than a
+denylist" — and SHIP-107 had already carried the token identifier into `DriverGrant` with a comment
+saying nothing read it yet. This reads it. There is no list to grow without bound, nothing to
+expire, and no cache whose flush would restore a revoked link, which is the posture `Docs/10` §5
+takes about every control this platform has over a credential.
+
+**Two checks, not one, and the second is the ticket.** `Service.AssignmentFor` already refused a link
+whose *assignment* was no longer the live one on the job. A reissue deliberately leaves the
+assignment live and changes only which link opens it, so that comparison cannot see a revocation at
+all — the two questions are different and both are asked. Because every driver route goes through
+that one function, the read and the write are covered by the same change: a superseded link answers
+`404` on `GET /v1/driver/jobs/{id}` **and** records nothing on SHIP-120a's route, and both are
+demonstrated on the wire.
+
+**The hazard this introduced, and the shape that removes it.** `Service.granted` is the single place
+a link is handed out, and it is reached by three paths — a new assignment, an explicit reissue, and
+the *repeated nomination* `Docs/02` §3.1 describes as the phone that lost the first response. Minting
+a fresh identifier on that third path would have made an ordinary retry cut off a driver who was
+already holding the link. So `DriverTokenIssuer.IssueAs` re-signs the identifier the assignment
+already carries: the repeat hands its caller a working credential, the driver's link keeps working,
+and **only an assignment and an explicit reissue mint a fresh identifier**. That is what makes
+revocation something a provider asks for rather than something a retry causes, and
+`TestNominatingTheSameDriverAgainDoesNotRevokeTheLink` holds it. It was found by `make verify`
+failing on SHIP-108's existing section rather than by reasoning, which is the section earning its
+place.
+
+**The half of the *Done when* that cannot be met, and it is named rather than narrowed.** The row
+says "provider **or** admin". There is no administrator: `ck_users_role` refuses the role, admin
+sign-in is a separate system, and `RequireAdmin` is unmapped until SHIP-147 — a route declaring it
+stops the process at startup rather than being served open, which is SHIP-15r's arrangement working.
+Nothing was reshaped to hide it. `Service.ReissueDriverLink` is already the method a second route
+would call, and what that route adds is the audit reason `Docs/01` §3 requires of an administrator
+and does not require of a provider.
+
+**A job with no live driver answers `404` rather than a code of its own**, deliberately. There is no
+link to reissue; the caller is the provider, who knows the job exists; and what they have to do next
+is assign a driver through the endpoint that does it. A new error code would have been a third thing
+for a client to branch on saying nothing the 404 does not — and it would have meant regenerating
+`Docs/10-api-error-codes.md`, which is a file no domain branch owns.
+
+**The migration revokes every link issued before it, once.** A `jti` already handed out is recorded
+nowhere — it exists only inside the signed value the provider forwarded — so there was nothing to
+backfill from. The column defaults to a fresh random value: no token can carry it, so a link issued
+before revocation existed opens nothing, and the provider reissues. The alternative,
+NULL-means-accept-anything, is the cheaper migration and leaves exactly the state this ticket exists
+to end.
+
+### SHIP-115a — the read shelf, and the one field that differs between two parties
+
+`GET /v1/jobs/{id}/delivery/detail` and `GET /v1/jobs/{id}/delivery/milestones`, both `RequireUser`.
+With SHIP-120a this is what wave 8's delivery track existed for: SHIP-133 and SHIP-101 were waiting
+on it.
+
+**Both paths are five segments and `Docs/09`'s row names them in full for a reason that is not
+style.** `GET /v1/jobs/{id}/delivery` and `GET /v1/jobs/open/{id}` both match
+`/v1/jobs/open/delivery` with neither more specific, and Go's `ServeMux` **panics at registration** —
+`make run` dies at startup rather than an endpoint answering oddly. SHIP-115 found it and opened the
+shelf with `/delivery/proof`; this extends it. §9 still carries the structural fix, which is moving
+the open feed off the `{id}` slot, and it is nobody's ticket yet.
+
+**`/delivery/milestones` is the only place a milestone that moved nothing can be seen.** That is the
+whole reason it is served rather than derived. A driver who reaches a pickup, finds nobody there and
+sets off again records `en_route_to_pickup` twice (`Docs/02` §5); SHIP-112 absorbs a late milestone as
+history without moving the job backwards. **Neither writes a `job_status_history` row**, so neither
+appears in anything derived from the job's status — which is exactly what SHIP-77's timeline has to
+do today (§9). The verify section proves it by counting: the list is longer than the job's
+milestone-caused transitions, and the assertion fails if the fixture stops exercising the case.
+
+**It pages and `/delivery/proof` does not, and the asymmetry is a fact about the tables.** `000601`
+deliberately has no uniqueness on `(job_id, milestone)` so that a repeat can be recorded, so this
+collection has no domain bound; proof has one photograph per milestone and at most five recordable
+milestones. The cursor carries the actor's clock **and** the identifier, because an offline batch
+that syncs together shares one `actor_recorded_at` — a cursor on the timestamp alone would repeat or
+skip exactly at the page boundary, which is the failure keyset pagination exists to avoid arriving by
+another route. `TestTheMilestoneListPagesWithoutRepeatingOrSkipping` walks five rows sharing one
+clock in pages of one.
+
+**`driver_mobile` reaches the provider and not the customer, and the domain is what drops it.** A
+driver has no account and no consent surface; `Docs/01` §4 asks the platform to minimise how far a
+phone number travels, and §4.4 gives the number one stated purpose, which is support escalation. The
+provider typed it, so returning it to them is not exposure. `Service.DeliveryFor` blanks the field
+rather than leaving the handler to omit it: **a handler that never receives a number cannot render
+one**. Both views are held to a **closed set of keys** rather than searched for the field name, which
+is SHIP-83's argument and the one wave 6 proved the hard way — a search for `driver_mobile` misses
+`mobile` and `phone`.
+
+**"A stranger gets exactly what a missing job gets" is asserted as a comparison rather than as a
+status code.** Both refusals are read, the request id is stripped, and the remaining code and message
+are compared for equality — in Go and again in `scripts/verify/70-delivery.sh`. A test that checked
+only the sentinel would pass on a handler that mapped it to `403`, which is the disclosure the rule
+exists to prevent.
+
+**`Service.mayReadProof` is gone, folded into `Service.partyTo`.** SHIP-115's two-party check and
+this ticket's are the same rule, and the only difference is that one of the two callers needs to know
+*which* party rather than merely that they are one. Two copies of an authorisation rule is the shape
+where one of them gets a third caller and the other does not.
+
 
 ## 4. Partly done — do not treat these as finished
 
