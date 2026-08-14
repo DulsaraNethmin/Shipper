@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **642 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **664 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -477,6 +477,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
 | **SHIP-117** | M4 | The delivery-exception moderation queue — `GET /v1/admin/moderation/exceptions`, and it is a **query over the evidence rather than a table of flags**, which is what `000604` said it would be when it built `idx_proofs_exception`. `internal/delivery` is **untouched**: a flag would have needed a cross-domain write for a fact already in the row, and a second source of truth that can drift. Takes **no position on X-6** — *see below* |
 | **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
+| **SHIP-119** | M4 | The seventy-two hour auto-complete, and it is a **`jobs` sweep with `internal/delivery` untouched**: "a Delivered job with no dispute" is exactly "a job still in `Delivered`", because `Disputed` is a status of its own and a dispute has already moved the job out. **X-6 answered the question that held it for eight waves**, and answering it removed work rather than adding any — the claim asks about status and time and never about evidence. The deadline is derived from `job_status_history` rather than from a new `delivered_at`, so the ticket needs no column that does not already exist. `cmd/worker`'s **fifth** registered task — *see below* |
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-120a** | M4 | `POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken` — **the first write in the service served on a credential that names no account**, and the route three wave-7 lanes specified and none built. It settles the idempotency scope §9 had held open since SHIP-15m: a driver's key is scoped by the job, because `uq_milestones_idempotency (job_id, idempotency_key)` already scopes it there and `000602` named this case while doing it. The `Jobs` port's four moves take a `Recorder` instead of a provider identifier, so a driver's transition is attributed to their `driver_assignments` row rather than to their provider — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -490,6 +491,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
+| **SHIP-137** | M5 | The notification consumer — **a service of its own, `cmd/notifier`, rather than a sixth `cmd/worker` task**, because a worker pass *is* a transaction and a consumer must commit its topic offsets strictly after one. `internal/notifications` opens: the routing table, recipient resolution through a `Parties` port `cmd/notifier` fills, and dispatch that reads a channel column and knows nothing about events. Idempotence is `uq_notifications_event_recipient_channel` rather than anything the consumer remembers. **Push is declared and unsendable** — SHIP-139 and SHIP-140 do not exist, so `Rules` writes no push row rather than rows nothing can complete — *see below* |
 | **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
 | **SHIP-148** | M6 | Twelve granular permissions and three role bundles, in a **Go table rather than a grant table** — a permission model is the opposite of the thing `Docs/06` §5.3 puts server-side and changeable. Default-deny at three levels: an omitted role becomes the minimum in Go *and* in the column default, and a role with **no bundle holds nothing**. There is deliberately **no permission to delete an audit entry** — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -9397,6 +9399,302 @@ landing under them buys nothing. §9 carries it.
 **SHIP-90's narrowing of SHIP-68 and SHIP-69 was recorded, not fixed.** `Docs/02` §2 has one expiry row
 and it says `Open → Cancelled`; widening the claim means widening the document first. It is
 `Docs/09`'s SHIP-70a and §9 has the account.
+
+### SHIP-119 — the sweep is `jobs`, because a dispute has already moved the job out
+
+`cmd/worker`'s fifth registered task. A job recorded as `Delivered` becomes `Completed`
+seventy-two hours later unless a dispute has been raised (`Docs/02` §6.1), attributed to the
+platform, with a reason support and the customer's timeline can read.
+
+#### X-6 is what made it buildable, and it changed nothing about the code
+
+The ticket has been *dependency*-startable since SHIP-118 landed in wave 7. What held it was
+`Docs/09`'s "decisions still required" list, which no tool reads: whether a job delivered through
+the proof-exception path may auto-complete at all. **It was decided on 14 August 2026 — it may, on
+this ordinary rule** — and the consequence for the implementation is that there is nothing to
+exclude. The claim asks about status and time and never about evidence, which is both what the
+decision permits and what makes it impossible to get subtly wrong: there is no proof lookup to
+forget and no join to leave off.
+
+#### `internal/delivery` is not in the diff, and that is a reading rather than a convenience
+
+`Docs/11` §6 listed this ticket under `delivery`. It needed nothing from that package, and the
+argument is three lines of `Docs/02`:
+
+- §2 has `Delivered → Completed`, "customer confirms, or 72 hours pass with no dispute".
+- `Disputed` is a status in its own right (§1), with `Awarded through Delivered → Disputed` and its
+  own two ways out.
+- §3: "a dispute freezes automatic completion until an administrator resolves it."
+
+So **"a Delivered job with no dispute" is exactly "a job still in `Delivered`"** — a dispute has
+already moved the job somewhere else, and the status column is the whole answer. What is left is a
+status, a deadline and a transition, all of which are `jobs`. That is what let this be built in a
+wave where another track owned `internal/delivery`, and it is the same shape SHIP-117 found from
+the other side.
+
+#### The deadline is derived, and there is no `delivered_at`
+
+The obvious column — filled by a trigger as the job becomes `Delivered`, exactly as `000406` fills
+`expires_at` as it becomes `Open` — was refused. `000401` already records when the job entered
+`Delivered`, as `server_recorded_at` on the transition; `Docs/02` §2 has one way into that status
+and no way back to it; so the fact has exactly one statement already and a column would be a second
+that a backfill or a repair script could put out of step. `Docs/09`'s row says the ticket "needs no
+column that does not already exist", and it does not. `000408` adds an index and nothing else.
+
+The claim reads it with a lateral `max()` rather than a join. A join on `to_status = 'Delivered'`
+returns one row per matching history row, so a job that had somehow entered `Delivered` twice would
+be claimed twice and the second transition would fail on a job already `Completed` — failing the
+pass and rolling back the first. An aggregate returns one row per job whatever the history holds.
+`FOR UPDATE OF j` locks the job and not the append-only evidence beside it.
+
+#### Which clock owns which timestamp, decided rather than inherited
+
+This is the case `Docs/11` §9 names as the two-clock defect class, and a seventy-two hour window is
+exactly where it bites.
+
+| Value | Clock | Why |
+|---|---|---|
+| `job_status_history.server_recorded_at` | the **database** | `000401` defaults it from `now()` and forbids a caller to supply it: a caller who could set it could backdate a transition |
+| the instant the sweep judges against | the **Go** `internal/clock` | `Docs/10` §6.3 puts every scheduled task behind an injected clock; a query asking the database for the time is a sweep no test can move without waiting three days |
+
+A test that pinned a `clock.Fixed` to a literal date would compare the two, pass on the day it was
+written and fail permanently once `now()` had moved past the literal. So **every clock in
+`tasks_jobs_autocomplete_test.go` is built by reading the row's own `server_recorded_at` back and
+adding to it**, and there is no calendar date in the file for time to overtake. The verify section
+does the same thing from the other end: it writes the `Delivered` history row with its
+`server_recorded_at` already three days old, which is the only way to reach the state at all —
+`job_status_history` is append-only by trigger, so it cannot be aged afterwards the way
+`50-jobs.sh` ages a deadline with an `UPDATE`.
+
+#### The fifth task, and the deadline that had already passed
+
+`Docs/11` §9 set itself a trigger — settle the `--only=<task>` selector "before the fourth task
+registers" — and SHIP-89 registered the fourth in wave 8 with nobody noticing. SHIP-15t turned the
+count into `TestTheRegisteredTaskSetIsWhatItSaysItIs`, and this registration failed there until the
+name was added, which is the guard working.
+
+**Two things were checked before adding the line rather than after.** SHIP-15r's reopening trigger
+is "a task that sweeps rows due by wall-clock alone", and this is not that task: it claims what is
+*due*, on a deadline derived from the row's own history entry, so a section that leaves no job
+`Delivered` and older than seventy-two hours leaves it nothing to do. And **no existing section
+leaves such a job** — `70-delivery.sh` records milestones against jobs it created in the same run,
+and a job delivered seconds ago is not due for three days. The one section that makes a job due is
+`51-jobs-autocomplete.sh`, which creates it and owns it.
+
+#### Mutations
+
+| Mutation | Outcome |
+|---|---|
+| Drop `SKIP LOCKED` from `AutoCompleteClaim` | **Caught** — `cmd/worker.ClaimIDs` refuses the query by name, in four tests |
+| Keep the words `FOR UPDATE OF j SKIP LOCKED` in a SQL comment and remove the clause | **Caught** — `TestTwoWorkersCompleteEachDeliveryExactlyOnce` fails with "is already Completed" |
+
+**The second is the one that matters, and the comparison it licenses is worth stating plainly.**
+`ClaimIDs` reads the *source*; `TestTwoWorkersCompleteEachDeliveryExactlyOnce` runs the *code*. The
+first mutation was caught by the reader, so a green run under it would have proved only that the
+string was present — and the second mutation is the proof that the string is all the reader can see,
+because the words survive in a SQL comment while the clause does not, and the reader is satisfied.
+Only the behavioural test noticed.
+
+That is the difference between a guard that reads a query and a guard that runs one, demonstrated
+rather than argued — and it lands directly on the gap wave 9 proved on the other side of the
+repository. **`internal/bidding`'s equivalent lock has neither guard**: it lives in `cmd/`, where
+until now no Go test held a database, so removing `SKIP LOCKED` from it passes `make check` with
+zero failures. It is the strongest untested invariant on the board and this ticket is the worked
+example of what closing it costs — one race test per claim, which is roughly thirty lines.
+`cmd/notifier/parties_test.go` is the same argument applied to a query rather than a lock, and the
+same thirty lines.
+
+### SHIP-137 — a service rather than a sixth task, and the row is what makes a redelivery harmless
+
+`internal/notifications` opens. `cmd/notifier` reads every topic in the catalogue, resolves who has
+to be told, writes one row per person per channel, and dispatches them. M5 goes from 3 of 13 to
+4 of 13.
+
+#### Why it is `cmd/notifier` and not a task in `cmd/worker`
+
+`Docs/09` calls the ticket a "notification consumer service" and `Docs/11` §6 left the shape to the
+lane. Four reasons, in the order they mattered.
+
+**A `cmd/worker` pass *is* a transaction.** `scheduler.go` runs each pass inside `db.InTx` and hands
+the task the transaction. A Kafka consumer must commit its topic offsets strictly **after** the
+database transaction that recorded the messages has committed — a rollback that has already moved
+the offset leaves events nothing recorded and nobody will ever be told about. A `Work` has no
+after-commit hook, and the alternative is to commit offsets inside the pass, which is the version
+that looks fine and loses events in exactly the window `cmd/worker/outbox.go` documents from the
+other side.
+
+**The trigger shape is wrong.** Every registered task claims due rows on a ticker; a consumer blocks
+on a broker.
+
+**Blast radius.** `cmd/worker` is one binary and every start runs every registered task, so a
+consumer registered there would begin reading three topics inside every `scripts/verify` section
+that starts a worker to demonstrate job expiry. §9 lists four occasions that condition has already
+cost this repository. Here it costs nothing: **the registered task set grew by one, not two**, and
+that one is SHIP-119's.
+
+**They scale on different things** — a consumer to the partition count, a sweep to the backlog.
+
+The cost is a second lifecycle, a second signal handler and a second place that opens a pool. Around
+eighty lines, for transaction boundaries that are correct rather than nearly correct.
+
+#### The loop is four steps and the order is the whole design
+
+Fetch a bounded batch without committing; record it in one transaction; **then** commit the offsets;
+then dispatch whatever is pending. Step three after step two is what makes the guarantee
+at-least-once. Step four after step three is `Docs/01` §4.5 — a notification failure must not lose
+the event — because the rows are durable before any channel is touched, so an email provider that is
+down leaves rows at `failed` and the next pass claims them again. `failed` is deliberately not
+terminal, and what bounds the retries is somebody reading `attempts`, which is why that column is
+not a boolean and why SHIP-176 has something to count.
+
+#### Idempotence is a unique index, not something the consumer remembers
+
+`doc.go`'s rule — "delivery is at least once; every consumer is idempotent, because the alternative
+to a duplicate notification is a missing one" — is met by
+`uq_notifications_event_recipient_channel` on `(event_id, recipient_id, channel)` and an
+`ON CONFLICT DO NOTHING`. A redelivered event resolves the same recipients, produces the same
+triples, and writes nothing; two consumer instances racing on one message resolve to one row without
+coordinating. Nothing has to have remembered anything, which is what makes it hold across a restart,
+a rebalance and a redeployment.
+
+The `SELECT`-then-`INSERT` version is the one that looks equivalent and is not: two consumers both
+find nothing, both insert, and one gets the unique violation anyway.
+
+#### Recipients are resolved through a port, which is the third instance of one arrangement
+
+Two thirds of the catalogue answers "who" from the payload — every bid event carries `provider_id`,
+`job.expiry_warned` carries `customer_id` — and the rest does not: `job.status_changed` names only
+an actor, and `delivery.proof_recorded` only a job. That fact is a join of `jobs` and `bids`, two
+domains this one may not import, and `doc.go` says so from the other side: notifications "never
+reaches back into jobs, bidding, or delivery to ask what happened".
+
+So `notifications/ports.go` declares `Parties` and `cmd/notifier/parties.go` supplies the query —
+**exactly** `admin.JobParties`/`jobPartiesLookup` (SHIP-113) and `admin.ExceptionQueue` (SHIP-117),
+written the same way on purpose. `users` is read directly, because it is in the shared migration
+block that `blocks.go` calls "tables every domain reads" and five domains already do.
+
+**The query has a Go test, which is the point of `cmd/notifier/parties_test.go` existing at all.**
+§9 records that `internal/bidding`'s lock lives in `cmd/` where nothing has a database and is
+therefore covered by no Go test — so removing `SKIP LOCKED` from it passes `make check` with zero
+failures. `cmd/api` has had `pgtest` fixtures since SHIP-30 and this binary has them too.
+
+#### The routing table is a table, and an event with no rule fails the build
+
+`Rules` maps each of the thirteen registered event types to a category, an audience set and a
+channel set; `StatusRules` routes `job.status_changed` by the status it moved to. **Most of
+`StatusRules` tells nobody, on purpose**: a job reaching `Awarded` already emitted `bid.accepted`
+and a milestone already emitted `delivery.milestone_recorded`, so routing the status change as well
+would be two messages about one thing. A rule that tells nobody must carry a `Why`, and a test
+refuses one without it — an event silently routed to nobody is indistinguishable from an event
+nobody remembered to route.
+
+`cmd/api/events_notifications_test.go` holds `Rules` against the live catalogue. It is in `cmd/api`
+for the reason `events_golden.txt` is: that is the one binary linking every domain, so it is the
+only place the whole catalogue exists at once. A domain event with no routing rule is an event
+nobody is ever told about and has no other symptom.
+
+**A message the consumer cannot route is logged and skipped rather than failing the pass**, and that
+was a correction. The first version returned `ErrNoRule` and parked the partition, on the reasoning
+that silence should be seen — which on this broker is not hypothetical, because Kafka is shared
+across every worktree with no isolation possible and a topic legitimately carries messages from a
+build with an event this one does not have. One such message would stop every developer's consumer
+at once. The guard belongs where the event is *written*, which is the argument
+`internal/events/catalogue.go` already makes about the dead-letter question.
+
+#### Two suppressions, because nobody should be told what they have just done
+
+`Docs/01` §4.5 says which events generate a notification, not who for, and the obvious reading sends
+a provider an email about their own withdrawal. The actor is suppressed by identifier where the
+event names one (`actor_id` on job and delivery events) and by role where it names only a side
+(`offered_by` on bid events). One rule serves both directions of `bid.countered`, where two would
+have to agree.
+
+#### What SHIP-137 could not do, named rather than narrowed away
+
+- **Push dispatch.** `Docs/01` §4.5 makes push primary. SHIP-139 is the Firebase adapter and
+  SHIP-140 the device token registry, and neither exists — so there is no address a push row could
+  carry. `notifications.Pusher` is declared for SHIP-139 to fill, `cmd/notifier` passes `nil`, the
+  `push` value is in `ck_notifications_channel` so that ticket needs no migration, and `Rules`
+  writes no push row rather than rows nothing can complete.
+- **"Job published".** §4.5 lists it as essential and its audience is *eligible providers* — SHIP-81's
+  query over service areas and vehicle capability, a fleet-domain read this domain may not make and
+  no port here declares. It is not a rendering problem; there is no list of recipients to resolve.
+  `StatusRules["Open"]` says so in its `Why`.
+- **Account verification completed or rejected.** §4.5's first bullet. `internal/identity` emits no
+  events at all — `identity/ports.go` records that as a deliberate scope decision, because inventing
+  `user.registered` would fix a name this ticket has to honour — so there is nothing on a topic to
+  route.
+- **Real copy.** The body is a fixed headline plus the job identifier. SHIP-138 owns templates.
+
+#### SHIP-141 already holds, structurally
+
+The renderer is handed a rule's literal headline and a job identifier. It is never handed the
+payload, it never reads the job, and there is no template slot. So "no address, goods description or
+full customer name in a notification body" is true because there is nowhere for any of the three to
+come from, rather than because a redaction pass removes them. Whatever SHIP-141 replaces this with
+inherits the constraint: the day a renderer takes the job as a parameter is the day the rule becomes
+something a reviewer checks by eye. The verify section gives its job an unmistakable goods
+description and checks the body for it.
+
+The budget invariant is held the same way and in three places: no event in the catalogue carries a
+budget, the `facts` struct the consumer decodes could not hold one, and a reflective test refuses a
+`Notification` field named for it — the shape SHIP-117's `ExceptionEntry` test already uses.
+
+#### The consumer group is a shared-cluster hazard, and `-group` is the fence
+
+A Kafka consumer group is cluster-scoped exactly as a database template name is. Two worktrees
+running `make verify` at once would join `shipper-notifications`, be handed different partitions, and
+each consume the messages the other was asserting on — a false failure on a tree where nothing is
+wrong, which is the shape this harness has now paid for three times. `scripts/verify/81-notifier.sh`
+runs with a per-run group and a deployment runs with no arguments.
+
+**A flag rather than an entry in `internal/config`, and that is a precedent rather than an
+invention**: `cmd/topics -replication` was a flag for exactly this reason, and SHIP-15m later folded
+it into configuration while keeping the flag as an override. This should go the same way when
+somebody is next editing `internal/config` for a reason of their own. **Nothing else was needed from
+`internal/config`**: `Kafka.Brokers`, `Database.*`, `Log.*` and `Env` all already exist.
+
+#### Two defects found while writing the verify section, both in the loop
+
+Neither would have been caught by a unit test, and both are worth recording because they are the
+kind that look right.
+
+**The first fetch was unbounded.** `FetchMessage` on the caller's context blocks until a message
+arrives, so on an idle topic the *dispatch* half never ran — and a notification whose send had failed
+would sit at `failed` until the next unrelated event happened along. On a quiet marketplace that is
+hours, and the row exists precisely so an outage costs a delay rather than a message. Every fetch is
+bounded now and an empty return is ordinary.
+
+**The dispatch loop shadowed its context.** `ctx, cancel := context.WithTimeout(ctx, …)` inside the
+loop meant the second turn read the *cancelled* context, so a backlog drained one batch per pass
+instead of continuously. Renamed to `batchCtx`.
+
+#### The wire format moved
+
+`envelope` was a private struct in `cmd/worker/tasks_outbox.go`. The consumer runs in another binary
+and reads the same shape back, and a wire format with two independent declarations drifts silently —
+a consumer decoding a field the producer renamed gets a zero value rather than an error. It is
+`events.Envelope` now, beside the catalogue that decides what may travel, with `EnvelopeOf` and
+`DecodeEnvelope` as the two ends and the Kafka header names as constants both spell the same way.
+
+#### Mutations
+
+| Mutation | Outcome |
+|---|---|
+| Remove `ON CONFLICT (event_id, recipient_id, channel) DO NOTHING` | **Caught** — the redelivery fails with a unique violation instead of being absorbed |
+| Remove it **and** demote `uq_notifications_event_recipient_channel` to a plain index — a genuinely non-idempotent consumer | **Caught twice** — `TestTheSameEventTwiceWritesNothingTheSecondTime` reports two rows for one event, and `TestOneNotificationPerRecipientPerChannelPerEvent` reports the constraint accepting the duplicate |
+| Drop `AND b.status = 'Accepted'` from `jobPartiesLookup` | **Caught** — both `cmd/notifier` party tests fail, one naming the rejected bidder as the awarded provider |
+
+The second is the one the ticket turns on. At-least-once delivery **guarantees** duplicates rather
+than permitting them, so a consumer with no test for this is not merely untested; it is known-wrong
+on a schedule.
+
+#### Fixture phone range
+
+**Notifications claims `0418x`.** `04180` was already SHIP-134's in `80-notifications.sh`;
+`81-notifier.sh` takes `04181` and `04182`. The allocation is recorded in both section headers,
+because the harness has no other list of them and §9 records that a track lost twenty minutes to
+exactly this once.
 
 ## 4. Partly done — do not treat these as finished
 
