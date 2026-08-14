@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **646 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **661 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -9433,6 +9433,28 @@ table is append-only. So delivered rows recorded before this migration are backf
 `(not captured — recorded before SHIP-123)`, phrased so nobody reading a support screen mistakes it
 for something a driver typed, and **not** NULL, because NULL is what the constraint uses to mean
 "this is not a delivered milestone".
+
+#### Who else `000607` binds, swept rather than assumed
+
+A constraint added by one branch and a fixture written on another is a **semantic** conflict: both
+sides compile, both suites pass alone, and the failure appears only once they are on one tree.
+`git merge-tree` reports textual conflicts and reports nothing here, so the tree was swept for every
+writer of a `Delivered` milestone rather than reasoned about.
+
+- **`scripts/verify/90-admin.sh`** had one, and `make verify` found it — SHIP-117's moderation-queue
+  fixture inserts a delivered milestone in raw SQL. Two columns added, with a comment saying why. It
+  is another section's file, and the alternative was leaving `make verify` red for a rule this ticket
+  introduced.
+- **`apps/mobile`** has none and needs none: `Milestone.offered` deliberately excludes `delivered`,
+  because neither a photograph nor an exception can be captured on that device until SHIP-130 and
+  SHIP-131. **Whoever builds those adds the two fields with the capture**, and the enum's own comment
+  is where they will be looking.
+- Eleven Go tests and six verify checks in this lane's own files, all updated rather than exempted.
+
+**The lesson generalises past this ticket.** A migration that adds a `CHECK` binding an existing
+table is invisible to every merge tool this repository uses, and the only instrument that finds it is
+running the other side's fixtures against the new schema. `make verify` is that instrument, which is
+an argument for the whole-tree run rather than the per-domain one.
 
 #### "Portal becomes read-only after" needed a field, and the field is not the job's status
 

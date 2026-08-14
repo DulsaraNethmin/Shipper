@@ -724,9 +724,16 @@ queue_photo_job="$(dispute_delivered_job queuephoto)"
 queue_evidence() {
   "$PSQL" "$DATABASE_URL" -qtA -v ON_ERROR_STOP=1 -v job="$1" -v reason="$2" <<'SQL'
 BEGIN;
-INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, reason, actor_recorded_at)
+-- `recipient_name` and `delivery_note` are required on a 'Delivered' row from `000607` onwards
+-- (SHIP-123), and refused on every other milestone. `Docs/01` §4.4 requires them of a delivered job
+-- rather than of a delivery recorded through any particular route, so the constraint binds a fixture
+-- as much as an endpoint. They are distinct from `reason`, which is the optional note above.
+INSERT INTO milestones
+    (id, job_id, milestone, actor_type, actor_id, reason, actor_recorded_at,
+     recipient_name, delivery_note)
 VALUES (gen_random_uuid(), :'job', 'Delivered', 'driver', gen_random_uuid(),
-        'The recipient asked me not to photograph their door.', now());
+        'The recipient asked me not to photograph their door.', now(),
+        'R. Chen', 'Left with reception, signed for');
 
 INSERT INTO proofs (id, job_id, milestone_id, object_key, content_type, content_length, etag,
                     exception_reason)
