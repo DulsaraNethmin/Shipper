@@ -1114,3 +1114,202 @@ status="$(admin_get "/v1/admin/users?q=$search_email" "" search-nocred)"
 ok "and the search is behind the administrator credential, like every other administrative route"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-152 — searching jobs, and opening one with its full bid and status history.
+#
+# # What only this section can show
+#
+# The statements behind `admin.JobDirectory` live in **cmd/api**, because they span `jobs`,
+# `bids` and `job_status_history` — three tables belonging to two domains `internal/admin` may not
+# import. The Go suite in that package drives the handler against a directory that records what it
+# was asked for, which establishes the query translation and nothing about the SQL. **The SQL is
+# demonstrated here or nowhere**, exactly as SHIP-113's party lookup and SHIP-117's exception queue
+# are.
+#
+# # Every assertion is fenced on this run's own job
+#
+# `jobs` is shared with every other section, every previous run and every other worktree, so a count
+# would be a statement about the machine. The job is found by the id this section created and the
+# negative cases are asserted against a second job it also created.
+
+ticket "SHIP-152  an administrator searches jobs and opens one with its bids and status history"
+
+admin_clear_limits
+
+# A delivered job with an accepted bid, which gives the detail view something in both lists: seven
+# recorded transitions and one bid. dispute_delivered_job is the SHIP-163 fixture above and is
+# reused rather than copied — it is already "a job moved through the guard the way 000402 demands".
+console_job="$(dispute_delivered_job console)"
+console_other="$(dispute_draft consoleother)"
+
+# The goods description is what `q` matches, and no endpoint sets one on these fixtures — SHIP-63
+# publishes and SHIP-71 collects the details, and the fixture writes the row directly. So it is set
+# here, with a term unique to this run.
+console_term="conso1e-$$-piano"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set goods_description = '$console_term and two stools' where id = '$console_job';" >/dev/null \
+  || fail "the searchable goods description could not be set"
+
+# A support administrator, because `jobs.read` is held by every role: looking is what the
+# least-privileged one exists to be able to do, and Docs/01 §4.6 lists searching first.
+console_email="verify-admin-console-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$console_email', 'Verify Console', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the console reader could not be created"
+
+status="$(admin_signin "verify-adm-console-in-$$" "$console_email" "$admin_password" console-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-console-in.json"; fail "the console reader could not sign in ($status)"; }
+console_token="$(json "$WORKDIR/admin-console-in.json" '["token"]')"
+
+# console_finds <query-string> <job-id> <name> — 1 when the job is on the page, 0 when it is not.
+console_finds() {
+  local found
+  status="$(admin_get "/v1/admin/jobs?$1" "$console_token" "$3")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-$3.json"; fail "searching jobs returned $status, want 200"; }
+  found="$(python3 - "$WORKDIR/admin-$3.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for j in (page.get("data") or []) if j["id"] == sys.argv[2]))
+PY
+)"
+  printf '%s' "$found"
+}
+
+[[ "$(console_finds "q=$console_term" "$console_job" console-term)" == "1" ]] \
+  || fail "a job could not be found by part of its goods description"
+ok "a job is found by part of its goods description"
+
+[[ "$(console_finds "q=$console_term&status=Delivered" "$console_job" console-status)" == "1" ]] \
+  || fail "a Delivered job is not found when filtering for Delivered jobs"
+[[ "$(console_finds "q=$console_term&status=Open" "$console_job" console-status-neg)" == "0" ]] \
+  || fail "a Delivered job came back from a search filtered to Open ones"
+ok "the status filter takes Docs/02 §1's stored form and finds the jobs in that status and only those"
+
+[[ "$(console_finds "customer=$dispute_customer_id&status=Delivered" "$console_job" console-customer)" == "1" ]] \
+  || fail "a job could not be found by its customer"
+[[ "$(console_finds "customer=$dispute_provider_id" "$console_job" console-customer-neg)" == "0" ]] \
+  || fail "a job came back from a search filtered to an account that does not own it"
+ok "and the customer filter narrows to one account's jobs"
+
+# An unrecognised status is refused rather than ignored, for the reason the account search refuses
+# an unrecognised standing: ignoring it answers with every job, which reads exactly like "the whole
+# marketplace is delivered" to somebody who mistyped one. 422, because it is a field-level
+# validation failure in validate.Errors' shape and not a malformed request.
+status="$(admin_get "/v1/admin/jobs?status=Delivred" "$console_token" console-bad-status)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-console-bad-status.json"; fail "a mistyped job status returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-console-bad-status.json")" == *'"status"'* ]] \
+  || { cat "$WORKDIR/admin-console-bad-status.json"; fail "the refusal does not name the field"; }
+[[ "$(cat "$WORKDIR/admin-console-bad-status.json")" == *'En route to pickup'* ]] \
+  || { cat "$WORKDIR/admin-console-bad-status.json"; fail "the refusal does not say what the statuses are"; }
+ok "a status the platform does not have is refused, names the field and lists the twelve — rather than answering with every job"
+
+status="$(admin_get "/v1/admin/jobs?customer=not-a-uuid" "$console_token" console-bad-customer)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-console-bad-customer.json"; fail "a malformed customer filter returned $status, want 422"; }
+ok "and so is a customer filter that is not an identifier"
+
+# --- a search term is a string, not a pattern ---------------------------------------------------
+#
+# The one defect here with a security shape, and the same one the account search carries. `%` is
+# LIKE's "anything", so an unescaped term of `%` returns every job in the marketplace to the
+# least-privileged role from one character in a search box.
+
+[[ "$(console_finds "q=%25" "$console_job" console-wildcard)" == "0" ]] \
+  || fail "a bare % matched every job, so the search term is being used as a LIKE pattern"
+ok "a bare wildcard matches nothing — a search term is a string somebody typed, not a pattern"
+
+# --- opening the job, which is the half the Done when is really about ----------------------------
+
+status="$(admin_get "/v1/admin/jobs/$console_job" "$console_token" console-open)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-console-open.json"; fail "opening a job returned $status, want 200"; }
+
+[[ "$(json "$WORKDIR/admin-console-open.json" '["job"]["id"]')" == "$console_job" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the detail view answered with the wrong job"; }
+[[ "$(json "$WORKDIR/admin-console-open.json" '["job"]["status"]')" == "Delivered" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the job's status is not the stored form the console filters on"; }
+ok "any job opens — there is no ownership scope on this endpoint, which is what Docs/01 §4.6 asks for"
+
+python3 - "$WORKDIR/admin-console-open.json" "$dispute_provider_id" >"$WORKDIR/console-detail.txt" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+bids, history = d["bids"], d["history"]
+accepted = [b for b in bids if b["status"] == "Accepted" and b["provider_id"] == sys.argv[2]]
+print(len(bids))
+print(len(history))
+print(accepted[0]["amount_cents"] if accepted else "")
+print(",".join(sorted(bids[0].keys())) if bids else "")
+print(",".join(sorted(history[0].keys())) if history else "")
+print(",".join(sorted(d["job"].keys())))
+print(history[0]["from"] + ">" + history[0]["to"] if history else "")
+print(history[-1]["to"] if history else "")
+PY
+console_bids="$(sed -n '1p' "$WORKDIR/console-detail.txt")"
+console_history="$(sed -n '2p' "$WORKDIR/console-detail.txt")"
+console_amount="$(sed -n '3p' "$WORKDIR/console-detail.txt")"
+
+[[ "$console_bids" == "1" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the detail view carries $console_bids bids, want the one that was accepted"; }
+[[ "$console_amount" == "45000" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the accepted bid's amount is $console_amount cents, want 45000 — numeric(12,2) converted in SQL"; }
+ok "the full bid history is on the job, with the amount in cents — Docs/02 §4's third reader, which had no route until there was an administrator"
+
+# Six transitions, because dispute_delivered_job makes six *moves*: Draft → Open → Awarded → En
+# route to pickup → Picked up → In transit → Delivered. Seven statuses, six rows — a job_status_history
+# row records a move rather than a state, and the Draft the job started in was never moved *into*.
+# Asserted as a count *and* by both ends, so a statement returning one row per join rather than one
+# per transition fails here.
+[[ "$console_history" == "6" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the detail view carries $console_history transitions, want 6"; }
+[[ "$(sed -n '7p' "$WORKDIR/console-detail.txt")" == "Draft>Open" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the history does not start where the job did"; }
+[[ "$(sed -n '8p' "$WORKDIR/console-detail.txt")" == "Delivered" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the history is not ordered oldest first on the platform's clock"; }
+ok "and the full status history, oldest first on the platform's clock rather than the device's (Docs/02 §3.1)"
+
+# --- the closed key sets, which are where a budget would arrive ----------------------------------
+#
+# Docs/01 §4.3's invariant names providers, so an administrator is not the audience it protects the
+# customer's maximum from — leaving it out is a decision (see internal/admin/jobsearch.go) and the
+# way it is kept is a closed key set rather than a search for the word "budget". SHIP-83 established
+# the axis: a field called `max_price` passes a spelling check and leaks the same fact.
+
+console_job_keys="$(sed -n '6p' "$WORKDIR/console-detail.txt")"
+[[ "$console_job_keys" == "bid_count,created_at,customer_id,expires_at,goods_description,id,status,updated_at" ]] \
+  || fail "the administrator's view of a job carries [$console_job_keys], which is not the closed set this shape is held to"
+
+console_bid_keys="$(sed -n '4p' "$WORKDIR/console-detail.txt")"
+[[ "$console_bid_keys" == "amount_cents,created_at,deliver_by,id,message,offered_by,pickup_at,provider_id,status,superseded_by,updated_at" ]] \
+  || fail "the administrator's view of a bid carries [$console_bid_keys], which is not the closed set this shape is held to"
+
+console_event_keys="$(sed -n '5p' "$WORKDIR/console-detail.txt")"
+[[ "$console_event_keys" == "actor_id,actor_recorded_at,actor_type,from,id,reason,server_recorded_at,to" ]] \
+  || fail "the administrator's view of a transition carries [$console_event_keys], which is not the closed set this shape is held to"
+ok "the job, the bid and the transition each carry a closed set of keys — no budget, no address and no contact detail on any of the three"
+
+# --- what a missing job answers, and what an unauthenticated caller does --------------------------
+
+status="$(admin_get "/v1/admin/jobs/$(uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')" "$console_token" console-missing)"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/admin-console-missing.json"; fail "opening a job that does not exist returned $status, want 404"; }
+ok "a job that does not exist is a 404 — and unlike the same answer on dispute intake, nothing is being kept from the caller"
+
+status="$(admin_get "/v1/admin/jobs?q=$console_term" "" console-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-console-nocred.json"; fail "the job search is readable without a credential ($status)"; }
+[[ "$(cat "$WORKDIR/admin-console-nocred.json")" != *"$console_term"* ]] \
+  || fail "a refused search returned jobs anyway"
+
+status="$(admin_get "/v1/admin/jobs/$console_job" "" console-open-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-console-open-nocred.json"; fail "a job is openable without a credential ($status)"; }
+ok "both routes are behind the administrator credential, like every other administrative route"
+
+# The other fixture exists so the search is a filter rather than a passthrough: a job with no
+# description never matches a term, which is the right answer because it has none to match.
+[[ "$(console_finds "q=$console_term" "$console_other" console-other)" == "0" ]] \
+  || fail "a job with no goods description matched a search term"
+ok "a draft with no goods description matches no term — NULL ILIKE is NULL, not a match on everything"
+
+admin_clear_limits
+

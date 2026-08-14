@@ -58,51 +58,83 @@ type Handler struct {
 	creds      *Credentials
 	moderation *Moderation
 	users      *Users
+	jobs       *JobConsole
 	pool       *pgxpool.Pool
 	log        *slog.Logger
 }
 
-// NewHandler wires the handlers to the service.
+// HandlerServices is what a handler is built from, beyond the pool and the logger.
+//
+// **A struct rather than a widening parameter list, adopted at SHIP-152.** [NewHandler] took four
+// collaborators positionally and M6 has five tickets left that each add one. Six same-typed pointers
+// in a row is a call that still compiles after two of them are swapped, and the failure would be a
+// console serving one screen from another screen's service — which no test in this package would
+// notice, because each of them supplies the collaborator it is about.
+//
+// Every field is required. A nil is a wiring mistake decided once in the composition root, so the
+// constructor refuses it there rather than letting the first request to that endpoint panic.
+type HandlerServices struct {
+	// Disputes is the intake workflow (SHIP-163).
+	Disputes *Service
+
+	// Credentials is administrator sign-in and account creation (SHIP-147, SHIP-148).
+	Credentials *Credentials
+
+	// Moderation is the queues of Docs/04 §5 (SHIP-117).
+	Moderation *Moderation
+
+	// Users is the account search (SHIP-151).
+	Users *Users
+
+	// Jobs is the job and bid search (SHIP-152).
+	Jobs *JobConsole
+}
+
+// NewHandler wires the handlers to the services.
 //
 // The pool may be nil and that is not an error. The service starts with an unreachable database on
 // purpose — a rolling deployment during a failover would otherwise take every instance down at once
 // — so a nil pool is a condition the handlers answer 503 to for as long as it lasts, not a reason to
 // refuse to start.
-func NewHandler(
-	svc *Service,
-	creds *Credentials,
-	moderation *Moderation,
-	users *Users,
-	pool *pgxpool.Pool,
-	log *slog.Logger,
-) (*Handler, error) {
-	if svc == nil {
+func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handler, error) {
+	if s.Disputes == nil {
 		return nil, errors.New("admin: a handler needs a service")
 	}
-	if creds == nil {
+	if s.Credentials == nil {
 		// SHIP-147. A handler with no credentials service would serve the administrator
 		// endpoints with a nil-pointer panic rather than refuse to start, and the sign-in
 		// endpoint is the one place a missing collaborator is least visible in testing: it is
 		// the first request anybody makes and the last one anybody retries.
 		return nil, errors.New("admin: a handler needs the administrator credentials service")
 	}
-	if moderation == nil {
+	if s.Moderation == nil {
 		// SHIP-117. A nil here would make the queue endpoint panic rather than answer, and the
 		// panic would be at the first request rather than at startup — which is the wrong way
 		// round for a collaborator that is decided once, in the composition root.
 		return nil, errors.New("admin: a handler needs the moderation queue service")
 	}
-	if users == nil {
+	if s.Users == nil {
 		// SHIP-151. A nil here would make the search endpoint panic at the first request
 		// rather than at startup, which is the wrong way round for a collaborator decided once
 		// in the composition root — the same argument the queue service above records.
 		return nil, errors.New("admin: a handler needs the account search service")
 	}
+	if s.Jobs == nil {
+		// SHIP-152. Same argument again, and it now applies to a service the *validation* of a
+		// query parameter depends on: [Handler.jobQueryFrom] asks it which job statuses exist.
+		return nil, errors.New("admin: a handler needs the job and bid search service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
 	return &Handler{
-		svc: svc, creds: creds, moderation: moderation, users: users, pool: pool, log: log,
+		svc:        s.Disputes,
+		creds:      s.Credentials,
+		moderation: s.Moderation,
+		users:      s.Users,
+		jobs:       s.Jobs,
+		pool:       pool,
+		log:        log,
 	}, nil
 }
 
@@ -1158,4 +1190,350 @@ func decodeExceptionCursor(raw string) (QueueCursor, error) {
 	}
 
 	return QueueCursor{RecordedAt: recordedAt, ProofID: proofID}, nil
+}
+
+// --- SHIP-152: the administrator's job and bid search ---------------------------------------------
+
+// adminJobResponse is one job as the console sees it in a list.
+//
+// **No budget, no addresses and no contact details.** jobsearch.go's header has the argument in
+// full: nothing in the *Done when* asks for the customer's maximum, an administrator is not the
+// audience Docs/01 §4.3 protects it from but a shape that never carried one cannot leak it, and
+// Docs/01 §5.1 asks the platform to minimise exposure of addresses and delivery details.
+//
+// Held to its key set by TestTheAdminJobShapesCarryNothingPrivate, which asserts what is *present*
+// rather than searching for the word "budget" — SHIP-83's finding was that a field called
+// `max_price` passes that search and leaks the same fact.
+type adminJobResponse struct {
+	ID         string `json:"id"`
+	CustomerID string `json:"customer_id"`
+
+	// Status is Docs/02 §1's **stored** form — `En route to pickup`, not `en_route_to_pickup`.
+	//
+	// A departure from Docs/10 §4.7, taken deliberately and consistently with the one
+	// administrative endpoint that already publishes a job status: `job_status` on the
+	// exception queue (SHIP-117) is stored form too. Two reasons. The console is an operator
+	// surface, and an operator reading a screen beside a `psql` window should see one
+	// vocabulary rather than two — support is the audience that most often has both open. And
+	// the wire mapping lives in `jobs`, which this domain may not import, so translating here
+	// would mean a hand-written copy of a list generated from `contracts/statuses.yaml`
+	// (SHIP-56a) — the trade [ExceptionEntry.JobStatus] already refused.
+	//
+	// It is also what the `status` **filter** takes, which is the property that matters most: a
+	// console that displayed one vocabulary and filtered on another would make every filter a
+	// guess.
+	Status string `json:"status"`
+
+	// GoodsDescription is what the customer said they are sending. Empty on a draft that never
+	// reached the details step.
+	GoodsDescription string `json:"goods_description"`
+
+	// BidCount is how many offers the job carries, in every status. See [JobRecord.BidCount].
+	BidCount int `json:"bid_count"`
+
+	// ExpiresAt is when an unclaimed job lapses. Empty where none is set — always present, so a
+	// console that renders without checking does not crash on the ordinary case.
+	ExpiresAt string `json:"expires_at"`
+
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func adminJobFrom(j JobRecord) adminJobResponse {
+	return adminJobResponse{
+		ID:               j.ID.String(),
+		CustomerID:       j.CustomerID.String(),
+		Status:           j.Status,
+		GoodsDescription: j.GoodsDescription,
+		BidCount:         j.BidCount,
+		ExpiresAt:        timestamp(j.ExpiresAt),
+		CreatedAt:        timestamp(j.CreatedAt),
+		UpdatedAt:        timestamp(j.UpdatedAt),
+	}
+}
+
+// adminBidResponse is one offer as the console sees it.
+//
+// Docs/02 §4's third reader. Amounts are here and the customer's budget is not, which is the whole
+// distinction: a bid is what a provider offered and is visible to administrators by that document's
+// own sentence, and a budget is what the customer would pay and is visible to nobody but them.
+type adminBidResponse struct {
+	ID         string `json:"id"`
+	ProviderID string `json:"provider_id"`
+
+	// Status is Docs/02 §4's stored form, for the reason [adminJobResponse.Status] records.
+	Status string `json:"status"`
+
+	// OfferedBy is which side made this offer — `provider` or `customer`. A customer's
+	// counter-offer is a bid row like any other, and a reader who could not tell them apart
+	// would read a negotiation as one party bidding against themselves.
+	OfferedBy string `json:"offered_by"`
+
+	// AmountCents is the offer in cents. Zero where the row carries none.
+	AmountCents int64 `json:"amount_cents"`
+
+	// PickupAt and DeliverBy are the timing offered. Empty where the row carries none.
+	PickupAt  string `json:"pickup_at"`
+	DeliverBy string `json:"deliver_by"`
+
+	Message string `json:"message"`
+
+	// SupersededBy names the offer that displaced this one, so a reader can follow a negotiation
+	// in the order it happened. Empty on an offer nothing displaced.
+	SupersededBy string `json:"superseded_by"`
+
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func adminBidFrom(b BidRecord) adminBidResponse {
+	out := adminBidResponse{
+		ID:          b.ID.String(),
+		ProviderID:  b.ProviderID.String(),
+		Status:      b.Status,
+		OfferedBy:   b.OfferedBy,
+		AmountCents: b.AmountCents,
+		PickupAt:    timestamp(b.PickupAt),
+		DeliverBy:   timestamp(b.DeliverBy),
+		Message:     b.Message,
+		CreatedAt:   timestamp(b.CreatedAt),
+		UpdatedAt:   timestamp(b.UpdatedAt),
+	}
+	if b.SupersededBy != uuid.Nil {
+		out.SupersededBy = b.SupersededBy.String()
+	}
+	return out
+}
+
+// adminStatusEventResponse is one recorded transition.
+//
+// **Both clocks, never one.** Docs/02 §3.1 keeps the actor's claim apart from the platform's
+// acceptance because a driver records a milestone out of signal and the device syncs later; a
+// support timeline showing one of them cannot answer why an update arrived when it did.
+type adminStatusEventResponse struct {
+	ID string `json:"id"`
+
+	From string `json:"from"`
+	To   string `json:"to"`
+
+	// ActorType is `customer`, `provider`, `driver`, `admin` or `system`. Finer than the audit
+	// log's three kinds, which is `000401`s decision rather than this endpoint's.
+	ActorType string `json:"actor_type"`
+
+	// ActorID is the account that acted, or the driver assignment for a driver. Empty for the
+	// platform, which has no account.
+	ActorID string `json:"actor_id"`
+
+	// Reason is why, where one was given. Required of an administrator by the schema.
+	Reason string `json:"reason"`
+
+	ActorRecordedAt  string `json:"actor_recorded_at"`
+	ServerRecordedAt string `json:"server_recorded_at"`
+}
+
+func adminStatusEventFrom(e StatusEvent) adminStatusEventResponse {
+	out := adminStatusEventResponse{
+		ID:               e.ID.String(),
+		From:             e.From,
+		To:               e.To,
+		ActorType:        e.ActorType,
+		Reason:           e.Reason,
+		ActorRecordedAt:  timestamp(e.ActorRecordedAt),
+		ServerRecordedAt: timestamp(e.ServerRecordedAt),
+	}
+	if e.ActorID != uuid.Nil {
+		out.ActorID = e.ActorID.String()
+	}
+	return out
+}
+
+// adminJobDetailResponse is one job opened, with everything recorded against it.
+//
+// One shape rather than three endpoints, because the *Done when* is "open any job **with** its full
+// bid and status history" — and a console making three calls to draw one screen is three chances to
+// show a job beside somebody else's bids. [JobConsole.Open] reads all three in one snapshot for the
+// same reason.
+type adminJobDetailResponse struct {
+	Job adminJobResponse `json:"job"`
+
+	// Bids is every offer on the job, oldest first, in every status. Never nil on the wire.
+	Bids []adminBidResponse `json:"bids"`
+
+	// History is every recorded transition, oldest first. Never nil on the wire.
+	History []adminStatusEventResponse `json:"history"`
+}
+
+// SearchJobs handles GET /v1/admin/jobs (SHIP-152).
+//
+// Docs/01 §4.6's first capability, second term, behind [PermissionJobsRead] — which every role
+// holds, because looking is what the least-privileged role exists to be able to do.
+//
+// A collection, cursor paged, newest first. `q` matches the goods description, `status` narrows to
+// one of Docs/02 §1's statuses, and `customer` narrows to one account's jobs.
+func (h *Handler) SearchJobs() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionJobsRead); err != nil {
+			return err
+		}
+
+		query, err := h.jobQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so "is there another page" is answered by the rows rather
+		// than by a second COUNT — the arrangement every paged endpoint in this service uses.
+		query.Limit++
+
+		records, err := h.jobs.Search(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(records) == query.Limit {
+			last := records[len(records)-2]
+			next = pagination.Cursor{
+				timestamp(last.CreatedAt),
+				last.ID.String(),
+			}.Encode()
+			records = records[:len(records)-1]
+		}
+
+		out := make([]adminJobResponse, 0, len(records))
+		for _, j := range records {
+			out = append(out, adminJobFrom(j))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// OpenJob handles GET /v1/admin/jobs/{id} (SHIP-152).
+//
+// The second half of the *Done when* — "open any job with its full bid and status history" — and
+// **any** is the word doing the work. Every job is an administrator's to open; there is no
+// ownership scope on this endpoint and no 404 standing in for a refusal, which is the opposite of
+// every other job endpoint in the service and is exactly what Docs/01 §4.6 asks for.
+func (h *Handler) OpenJob() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionJobsRead); err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		detail, err := h.jobs.Open(r.Context(), jobID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Never nil on the wire. An absent list and an empty one are the same fact — no bids,
+		// no recorded transitions — and `null` crashes a console that iterates without
+		// checking, on the one job that had none.
+		bids := make([]adminBidResponse, 0, len(detail.Bids))
+		for _, b := range detail.Bids {
+			bids = append(bids, adminBidFrom(b))
+		}
+		history := make([]adminStatusEventResponse, 0, len(detail.History))
+		for _, e := range detail.History {
+			history = append(history, adminStatusEventFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, adminJobDetailResponse{
+			Job:     adminJobFrom(detail.Job),
+			Bids:    bids,
+			History: history,
+		})
+		return nil
+	})
+}
+
+// jobQueryFrom reads the search parameters.
+//
+// Every problem is reported rather than the first (Docs/10 §4.6) for the three fields this endpoint
+// owns; the limit and the cursor are internal/pagination's and refuse on their own, for the reason
+// [userQueryFrom] records.
+//
+// A method rather than a function, because validating `status` needs the closed list the service was
+// given by cmd/api. That is the whole reason [JobConsole] holds one — see jobsearch.go.
+func (h *Handler) jobQueryFrom(r *http.Request) (JobQuery, error) {
+	values := r.URL.Query()
+
+	var problems validate.Errors
+
+	term := strings.TrimSpace(values.Get("q"))
+	if len(term) > maxJobTermLength {
+		problems.Add("q", validate.CodeTooLong,
+			"That search term is longer than any description this could match. "+
+				"Use at most %d characters.", maxJobTermLength)
+	}
+
+	// An unrecognised status is refused rather than ignored, for the reason the account search
+	// refuses an unrecognised standing: ignoring it answers with every job, and a support
+	// engineer who mistyped `Delivred` would read the whole marketplace as delivered.
+	status := strings.TrimSpace(values.Get("status"))
+	if status != "" && !h.jobs.KnowsStatus(status) {
+		problems.Add("status", validate.CodeInvalid,
+			"That is not a job status. Use one of %s.", strings.Join(h.jobs.Statuses(), ", "))
+	}
+
+	var customerID uuid.UUID
+	if raw := strings.TrimSpace(values.Get("customer")); raw != "" {
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			problems.Add("customer", validate.CodeInvalid,
+				"That is not a valid account identifier.")
+		} else {
+			customerID = parsed
+		}
+	}
+
+	if err := problems.Err(); err != nil {
+		return JobQuery{}, err
+	}
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return JobQuery{}, err
+	}
+
+	after, err := decodeJobCursor(values.Get("cursor"))
+	if err != nil {
+		return JobQuery{}, err
+	}
+
+	return JobQuery{
+		Term: term, Status: status, CustomerID: customerID, Limit: limit, After: after,
+	}, nil
+}
+
+// decodeJobCursor reads the two fields the job search's ordering is total on.
+func decodeJobCursor(raw string) (JobCursor, error) {
+	if raw == "" {
+		return JobCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return JobCursor{}, err
+	}
+
+	createdAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return JobCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	jobID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return JobCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return JobCursor{CreatedAt: createdAt, JobID: jobID}, nil
 }

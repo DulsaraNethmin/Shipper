@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
@@ -48,6 +50,44 @@ func testModeration(t *testing.T) *Moderation {
 		t.Fatalf("building the moderation service: %v", err)
 	}
 	return m
+}
+
+// testServices is every collaborator [NewHandler] requires, built against one pool.
+//
+// **One helper rather than a call site per test, adopted with [HandlerServices] at SHIP-152.** Each
+// test in this package is about one endpoint and supplies real collaborators only for that one; the
+// rest exist because the handler serves the whole domain. Before this, adding a service to the
+// handler meant editing every construction in the package — which is the churn that makes a test
+// suite something people work around rather than extend.
+//
+// The pool may be nil. Every service in this package accepts one, because the process starts with an
+// unreachable database on purpose, and the tests that pass nil are the ones whose endpoint never
+// reaches it.
+func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool) HandlerServices {
+	t.Helper()
+
+	users, err := NewUsers(pool)
+	if err != nil {
+		t.Fatalf("building the account search: %v", err)
+	}
+
+	moderation, err := NewModeration(testExceptionQueue{}, pool)
+	if err != nil {
+		t.Fatalf("building the moderation service: %v", err)
+	}
+
+	jobs, err := NewJobConsole(&testJobDirectory{}, testJobStatuses, pool)
+	if err != nil {
+		t.Fatalf("building the job search: %v", err)
+	}
+
+	return HandlerServices{
+		Disputes:    testDisputeService(t),
+		Credentials: creds,
+		Moderation:  moderation,
+		Users:       users,
+		Jobs:        jobs,
+	}
 }
 
 // SHIP-148, and the two claims in its *Done when* checked separately.
@@ -280,7 +320,7 @@ func TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission(t *t
 		t.Fatalf("signing in: %v", err)
 	}
 
-	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), testUsers(t), nil, testLogger())
+	handler, err := NewHandler(testServices(t, creds, nil), nil, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -325,7 +365,7 @@ func TestAnOwnerCreatesAnAdministratorAndTheDefaultIsStillTheMinimum(t *testing.
 		t.Fatalf("signing in: %v", err)
 	}
 
-	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), testUsers(t), nil, testLogger())
+	handler, err := NewHandler(testServices(t, creds, nil), nil, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}

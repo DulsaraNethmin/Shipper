@@ -505,6 +505,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
+| **SHIP-152** | M6 | `GET /v1/admin/jobs` and `GET /v1/admin/jobs/{id}` — search by description, status and customer; open **any** job with every bid and every recorded transition, read in **one snapshot** so a console cannot render an `Awarded` header above a bid list with nothing accepted. The statements are in `cmd/api` because they span two other domains' tables, which is the line `postgres_users.go` drew. **Bid amounts are here and the budget is not** — Docs/02 §4 names the administrator as bid history's third reader, and leaving the budget out is a *decision* with SHIP-164 named as its revisit — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7a loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -10698,6 +10699,83 @@ selected rather than refused" answer does not transfer.
 rather than measuring, in a brief whose own baselines were measured — which is this repository's
 recurring failure mode arriving in a document meant to prevent it. The check that caught it is
 `grep` against the golden file, and it took under a minute.
+
+### SHIP-152 — the third reader Docs/02 §4 named and could not serve
+
+`GET /v1/admin/jobs` and `GET /v1/admin/jobs/{id}`, both `RequireAdmin`, both gated on `jobs.read` —
+which every role holds, because looking is what the least-privileged role exists to be able to do.
+The search matches the goods description, narrows by status and by customer, cursor paged on
+`(created_at, id)`, newest first. The detail view carries the job, **every** bid in every status, and
+**every** recorded transition.
+
+#### Docs/02 §4's third reader finally has a route
+
+"Bid history remains visible to the customer, bidding provider, and administrators." SHIP-96
+enumerated all three and could serve two: `authctx.Subject` cannot carry an administrator, so the
+third audience was reachable from the domain and exercised by test alone. It has a route now, and it
+is the only one of the three that is **not scoped to one provider's chain** — an administrator
+looking at a disputed award needs the offers it was chosen over.
+
+#### The budget is left out, and that is a decision rather than a rule
+
+Docs/01 §4.3's invariant names **providers**: "the customer's maximum budget is private; providers
+never see it". An administrator is not a provider, so nothing in the documents forbids showing one
+here. It is left out anyway, on two grounds. Nothing in the *Done when* asks for it — the ticket is
+the bid history and the status history. And a shape that never carried a budget cannot leak one: the
+ways an administrative shape reaches the wrong audience are all ways a *present* field travels.
+
+**The revisit is named rather than left to judgement: SHIP-164**, where an administrator resolving a
+dispute about price may genuinely need the number. At that point it is a field on that ticket's own
+shape, decided by that ticket.
+
+It is made structural rather than remembered. `jobs.budget` is in neither column list, there is
+nowhere on `admin.JobRecord` to put it, and the shape is held to a **closed key set** in Go and again
+in `make verify` — SHIP-83's axis, because a field named `max_price` passes a search for the word
+"budget" and leaks the same fact.
+
+#### One transaction for a read, which is not the usual answer
+
+`JobConsole.Open` wraps the three statements. Without it a console can render an `Awarded` header
+above a bid list in which nothing is accepted, or a status history whose last row the header does not
+reflect. **A support screen that contradicts itself is worse than a stale one, because somebody acts
+on it.** Read-only and no locks: a job that moves during the three statements is simply the next page
+load.
+
+#### The status vocabulary is the stored form, on the field *and* on the filter
+
+`Driver assigned`, not `driver_assigned` — a departure from Docs/10 §4.7, taken consistently with
+`job_status` on the exception queue, which was already the stored form. The console is an operator
+surface and somebody reading a screen beside a `psql` window should see one vocabulary. The wire
+mapping lives in `jobs`, which `admin` may not import, so translating would mean a hand-written copy
+of a list generated from `contracts/statuses.yaml` — the trade `ExceptionEntry.JobStatus` already
+refused.
+
+**What makes the filter safe without that copy is that the closed list is supplied rather than
+declared.** `cmd/api` has `jobs.Statuses` in scope and passes it to `NewJobConsole`; the domain
+validates against what it was given. That is the composition root doing what it already does for
+`actorFor` — the one place two vocabularies are both visible.
+
+#### `HandlerServices` replaced a widening parameter list, and it was overdue by one ticket
+
+`admin.NewHandler` took four collaborators positionally and M6 has five tickets left that each add
+one. Six same-typed pointers in a row is a call that still compiles after two are swapped, and the
+failure would be a console serving one screen from another screen's service — which no test in the
+package would notice, because each supplies the collaborator it is about.
+
+#### Where this is demonstrated, and the half that is *only* demonstrated in verify
+
+The statements behind `admin.JobDirectory` are in `cmd/api`, and no test in that package has a
+database. So the Go suite drives the handler against a directory that **records what it was asked
+for** — which establishes the query translation, the validation, the paging and the shapes — and
+`scripts/verify/90-admin.sh` exercises the SQL against the built binary. Exactly the split SHIP-113
+and SHIP-117 took, and the verify section is not optional in it: **the SQL is checked there or
+nowhere.**
+
+`make verify` found one defect: the section asserted **seven** transitions on a job moved through six
+statuses. Seven statuses, six rows — `job_status_history` records a *move*, and the `Draft` the job
+started in was never moved into.
+
+**Nothing was needed from `internal/config`.**
 
 
 ## 4. Partly done — do not treat these as finished

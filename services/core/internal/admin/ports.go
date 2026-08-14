@@ -255,3 +255,39 @@ type ExceptionEntry struct {
 	// job's status rather than an opinion about it.
 	JobStatus string
 }
+
+// --- SHIP-152: the administrator's view of jobs and their bids ------------------------------------
+
+// JobDirectory is every job, its offers and its recorded transitions.
+//
+// # Why this is a port when the account search is not
+//
+// [Users] selects from `users` directly and postgres_users.go argues why: one shared table, read by
+// the domain whose console needs it. This spans `jobs` and `job_status_history` (internal/jobs') and
+// `bids` (internal/bidding'), and `admin` may import neither — the boundary lint refuses both. So
+// the statements live in cmd/api beside [JobParties] and [ExceptionQueue], which is the only place
+// the three packages meet.
+//
+// **The vocabulary stays on the other side.** [JobRecord.Status], [BidRecord.Status] and
+// [StatusEvent.ActorType] are plain strings here for the reason [ExceptionEntry] gives: two of the
+// three are generated from `contracts/statuses.yaml` (SHIP-56a), and a copy in this package would be
+// a hand-written list shadowing a generated one. What the *filter* is validated against is supplied
+// to [NewJobConsole] by cmd/api rather than copied — see [JobConsole.Statuses].
+//
+// # Both methods take a Runner, and only one of them needs it to be a transaction
+//
+// [JobDirectory.SearchJobs] is a single statement and is handed the pool. [JobDirectory.OpenJob] is
+// three, and [JobConsole.Open] wraps them so that the job header, the bid list and the status
+// history are one snapshot — a screen showing an `Awarded` job beside a bid list with nothing
+// accepted is worse than a stale one, because somebody acts on it.
+type JobDirectory interface {
+	// SearchJobs returns one page of jobs matching the query, newest first.
+	SearchJobs(ctx context.Context, r db.Runner, q JobQuery) ([]JobRecord, error)
+
+	// OpenJob is one job with every bid and every recorded transition.
+	//
+	// found is false when there is no such job, which the caller turns into [ErrJobNotFound].
+	// **Not a disclosure decision**, unlike the identical-looking answer [JobParties] gives: the
+	// caller here is an administrator holding `jobs.read` and every job is theirs to open.
+	OpenJob(ctx context.Context, r db.Runner, jobID uuid.UUID) (detail JobDetail, found bool, err error)
+}

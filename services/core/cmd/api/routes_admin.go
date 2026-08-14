@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -121,6 +122,37 @@ func init() {
 		},
 
 		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/jobs",
+			Group:   GroupV1,
+
+			// RequireAdmin is the credential; `jobs.read` is the permission, checked in the
+			// handler (SHIP-148, SHIP-152). Every role holds it — Docs/01 §4.6 lists searching
+			// first, and looking is what the least-privileged role exists to be able to do.
+			//
+			// Under /admin rather than /jobs, and not merely because the handler is admin's.
+			// `GET /v1/jobs` is the customer's own jobs and `GET /v1/jobs/open` is the
+			// provider's eligible feed; both are scoped to the caller by construction. This
+			// one is scoped to nothing, which is a different resource wearing the same noun,
+			// and putting it under /jobs would make the scope a property of the credential
+			// rather than of the path.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).SearchJobs() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/jobs/{id}",
+			Group:   GroupV1,
+
+			// SHIP-152's second half — "open any job with its full bid and status history".
+			// One shape carrying all three, because a console making three calls to draw one
+			// screen is three chances to show a job beside somebody else's bids.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).OpenJob() },
+		},
+
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
@@ -205,7 +237,28 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin account search: " + err.Error())
 	}
 
-	handler, err := admin.NewHandler(svc, creds, moderation, users, d.Pool, d.Logger)
+	// SHIP-152. The status list is supplied rather than copied: `admin` may not import `jobs`,
+	// and the alternative to passing it here is a hand-written twelve-value list in that package
+	// shadowing one generated from `contracts/statuses.yaml` (SHIP-56a). This is the composition
+	// root, where both vocabularies are visible — the same place `actorFor` maps one domain's
+	// actor kinds onto another's.
+	statuses := make([]string, 0, len(jobs.Statuses))
+	for _, s := range jobs.Statuses {
+		statuses = append(statuses, s.String())
+	}
+
+	jobConsole, err := admin.NewJobConsole(jobDirectory{}, statuses, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin job search: " + err.Error())
+	}
+
+	handler, err := admin.NewHandler(admin.HandlerServices{
+		Disputes:    svc,
+		Credentials: creds,
+		Moderation:  moderation,
+		Users:       users,
+		Jobs:        jobConsole,
+	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
 	}
@@ -367,6 +420,7 @@ var (
 	_ admin.Jobs           = disputeLifecycle{}
 	_ admin.JobParties     = jobPartiesLookup{}
 	_ admin.ExceptionQueue = exceptionQueueLookup{}
+	_ admin.JobDirectory   = jobDirectory{}
 )
 
 // exceptionQueueLookup implements admin.ExceptionQueue over `delivery`'s evidence tables (SHIP-117).
@@ -459,4 +513,280 @@ func (exceptionQueueLookup) ExceptionsAwaitingReview(
 		return nil, fmt.Errorf("cmd/api: reading the delivery-exception queue: %w", err)
 	}
 	return out, nil
+}
+
+// --- SHIP-152: the administrator's view of jobs, bids and status history ---------------------------
+
+// jobDirectory implements admin.JobDirectory over `jobs`, `bids` and `job_status_history`.
+//
+// # Why the statements are here and not in a domain
+//
+// They span `internal/jobs`' two tables and `internal/bidding`'s one, and `admin` may import
+// neither — the boundary lint refuses both directions. The composition root is where a dependency
+// between domains is visible to somebody reading how the service is wired, rather than buried in
+// `admin/postgres.go` where `jobs` and `bids` would read as tables that domain owns.
+// jobPartiesLookup and exceptionQueueLookup are the same arrangement for the same reason, and
+// postgres_users.go records the line: a statement spanning **two other domains'** tables belongs
+// here, and one spanning a single shared table (`users`) belongs in the domain that reads it.
+//
+// # This will move, and the trigger is named
+//
+// When `bidding` grows a store at SHIP-92 the bid half becomes a method on it, and the job half
+// belongs to `jobs` — exactly as acceptedBids and jobPartiesLookup will. What stays here is the
+// composition: three reads assembled into one administrator-facing shape.
+//
+// # No budget column is selected, in either statement
+//
+// `jobs.budget` (`000405`) is not in either column list and there is nowhere on admin.JobRecord to
+// put it. Docs/01 §4.3's invariant names *providers*, so an administrator is not the audience it
+// protects the number from — this is a decision rather than a rule, argued in
+// internal/admin/jobsearch.go, and made structural here so that a later change to the response shape
+// cannot quietly acquire one. SHIP-164 is the named revisit.
+type jobDirectory struct{}
+
+// adminJobColumns is the job facts an administrator's list and detail view both carry.
+//
+// One constant rather than the same list written twice, so that a column added to the shape cannot
+// be added to one statement and forgotten in the other — the scan is shared too, which turns that
+// into a compile-time mismatch rather than a screen with an empty field on one route.
+//
+// The bid count is a correlated subquery rather than a `LEFT JOIN … GROUP BY`. It counts **every**
+// bid in every status, which is the question a list answers: whether anybody engaged with the job at
+// all, where three withdrawn offers and no offers are very different facts.
+const adminJobColumns = `j.id, j.customer_id, j.status, coalesce(j.goods_description, ''),
+	(SELECT count(*) FROM bids b WHERE b.job_id = j.id),
+	j.expires_at, j.created_at, j.updated_at`
+
+// SearchJobs returns one page of jobs, newest first.
+//
+// # The predicate
+//
+// Three optional filters, each written `$n = ” OR column = $n` rather than assembled by
+// concatenation: one statement means one plan and one place the disclosure rules can be read, and
+// building SQL from a query string is the injection parameterisation exists to make impossible.
+//
+// **The term is escaped before it becomes a LIKE pattern**, by admin.LikePattern — a bare `%` would
+// otherwise return every job in the marketplace to the least-privileged role from one character in a
+// search box. `goods_description` is nullable, and `NULL ILIKE …` is NULL rather than false, so a
+// draft that never reached the details step simply does not match a term. That is the right answer:
+// it has no description to match.
+//
+// # The ordering is total
+//
+// `(created_at DESC, id DESC)`, because `created_at` is not unique and a single-column cursor over a
+// non-unique key either skips a row or repeats one. `<` rather than `>` because the order is
+// descending: the next page is what was created *before* the last row of this one.
+func (jobDirectory) SearchJobs(
+	ctx context.Context,
+	r db.Runner,
+	q admin.JobQuery,
+) ([]admin.JobRecord, error) {
+	const query = `
+		SELECT ` + adminJobColumns + `
+		FROM jobs j
+		WHERE ($1 = '' OR j.goods_description ILIKE $2)
+		  AND ($3 = '' OR j.status = $3)
+		  AND ($4::uuid IS NULL OR j.customer_id = $4)
+		  AND ($5::timestamptz IS NULL OR (j.created_at, j.id) < ($5, $6))
+		ORDER BY j.created_at DESC, j.id DESC
+		LIMIT $7`
+
+	// A nil rather than a zero value for every absent bound. `< (NULL, …)` is NULL rather than
+	// true, so the predicate has to be skipped rather than satisfied — the trap every cursor in
+	// this service records, and the one that would work today and stop working the first time
+	// somebody backdated a fixture.
+	var after, afterID any
+	if !q.After.Zero() {
+		after, afterID = q.After.CreatedAt, q.After.JobID
+	}
+
+	var customer any
+	if q.CustomerID != uuid.Nil {
+		customer = q.CustomerID
+	}
+
+	rows, err := r.Query(ctx, query,
+		q.Term, admin.LikePattern(q.Term), q.Status, customer, after, afterID, q.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: searching jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []admin.JobRecord
+	for rows.Next() {
+		record, err := scanAdminJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: searching jobs: %w", err)
+	}
+	return out, nil
+}
+
+// OpenJob is one job with every bid and every recorded transition.
+//
+// Three statements, run inside the transaction admin.JobConsole.Open opens — so the header, the
+// offers and the history are one snapshot. A console that rendered an `Awarded` job beside a bid
+// list with nothing accepted would be worse than a stale one, because somebody acts on it.
+//
+// No locks. It is read-only, and a job that moves during the three statements is simply the next
+// page load.
+func (jobDirectory) OpenJob(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (admin.JobDetail, bool, error) {
+	const jobQuery = `SELECT ` + adminJobColumns + ` FROM jobs j WHERE j.id = $1`
+
+	var detail admin.JobDetail
+	record, err := scanAdminJob(r.QueryRow(ctx, jobQuery, jobID))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		// No such job. Unlike jobPartiesLookup's identical-looking answer this is not a
+		// disclosure decision: the caller is an administrator holding `jobs.read` and every
+		// job is theirs to open.
+		return admin.JobDetail{}, false, nil
+	case err != nil:
+		return admin.JobDetail{}, false, err
+	}
+	detail.Job = record
+
+	if detail.Bids, err = adminBidsFor(ctx, r, jobID); err != nil {
+		return admin.JobDetail{}, false, err
+	}
+	if detail.History, err = adminHistoryFor(ctx, r, jobID); err != nil {
+		return admin.JobDetail{}, false, err
+	}
+	return detail, true, nil
+}
+
+// adminBidsFor is every offer on the job, oldest first.
+//
+// **Every offer, in every status**, which is what Docs/02 §4's "bid history remains visible to the
+// customer, bidding provider, and administrators" asks for — and it is the third reader SHIP-96
+// enumerated and could not serve, because there was no administrator to serve it to. Unlike the two
+// views that ticket built, this one is not scoped to one provider's chain: an administrator looking
+// at a disputed award needs the offers it was chosen over.
+//
+// The amount is converted in SQL, `(amount * 100)::bigint`, matching internal/bidding's own store.
+// COALESCE to 0 is unambiguous because `ck_bids_amount` refuses a non-positive amount, so 0 and NULL
+// cannot be confused in either direction.
+//
+// Ordered by `(created_at, id)` and not by the supersession chain: a chain is a rendering, and two
+// offers written in the same millisecond would make an ordering that followed it non-deterministic.
+func adminBidsFor(ctx context.Context, r db.Runner, jobID uuid.UUID) ([]admin.BidRecord, error) {
+	const query = `
+		SELECT id, provider_id, status, offered_by,
+		       coalesce((amount * 100)::bigint, 0),
+		       pickup_at, deliver_by, coalesce(message, ''), superseded_by,
+		       created_at, updated_at
+		FROM bids
+		WHERE job_id = $1
+		ORDER BY created_at, id`
+
+	rows, err := r.Query(ctx, query, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the bids on %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	out := []admin.BidRecord{}
+	for rows.Next() {
+		var (
+			b                   admin.BidRecord
+			pickupAt, deliverBy *time.Time
+			supersededBy        *uuid.UUID
+		)
+		if err := rows.Scan(&b.ID, &b.ProviderID, &b.Status, &b.OfferedBy, &b.AmountCents,
+			&pickupAt, &deliverBy, &b.Message, &supersededBy,
+			&b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("cmd/api: reading a bid on %s: %w", jobID, err)
+		}
+
+		// NULL is "the row carries none", which the zero value says just as well — so there is
+		// one representation of absence rather than a pointer every reader has to check.
+		if pickupAt != nil {
+			b.PickupAt = *pickupAt
+		}
+		if deliverBy != nil {
+			b.DeliverBy = *deliverBy
+		}
+		if supersededBy != nil {
+			b.SupersededBy = *supersededBy
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the bids on %s: %w", jobID, err)
+	}
+	return out, nil
+}
+
+// adminHistoryFor is every recorded transition on the job, oldest first.
+//
+// Ordered by `(server_recorded_at, id)` — the **platform's** clock rather than the actor's.
+// Docs/02 §3.1 keeps the two apart because a driver records a milestone out of signal and the device
+// syncs later; a timeline ordered by the device's clock could be reordered by a handset with the
+// wrong time, which for a support screen means an update appearing before the one it followed.
+// Both clocks are carried, so a reader can see the gap and reason about it, which is the whole point
+// of there being two.
+func adminHistoryFor(ctx context.Context, r db.Runner, jobID uuid.UUID) ([]admin.StatusEvent, error) {
+	const query = `
+		SELECT id, from_status, to_status, actor_type, actor_id, coalesce(reason, ''),
+		       actor_recorded_at, server_recorded_at
+		FROM job_status_history
+		WHERE job_id = $1
+		ORDER BY server_recorded_at, id`
+
+	rows, err := r.Query(ctx, query, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the status history of %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	out := []admin.StatusEvent{}
+	for rows.Next() {
+		var (
+			e       admin.StatusEvent
+			actorID *uuid.UUID
+		)
+		if err := rows.Scan(&e.ID, &e.From, &e.To, &e.ActorType, &actorID, &e.Reason,
+			&e.ActorRecordedAt, &e.ServerRecordedAt); err != nil {
+			return nil, fmt.Errorf("cmd/api: reading a transition of %s: %w", jobID, err)
+		}
+
+		// NULL is the platform acting as itself, which `000401` requires to have no account.
+		if actorID != nil {
+			e.ActorID = *actorID
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the status history of %s: %w", jobID, err)
+	}
+	return out, nil
+}
+
+// scanAdminJob reads one row of [adminJobColumns].
+//
+// One function rather than the Scan written at each call site, matching admin's own scanUser: a
+// column added to the list and not here is a scan mismatch at the first call, which is the failure
+// worth having.
+func scanAdminJob(row interface{ Scan(...any) error }) (admin.JobRecord, error) {
+	var (
+		j         admin.JobRecord
+		expiresAt *time.Time
+	)
+
+	if err := row.Scan(&j.ID, &j.CustomerID, &j.Status, &j.GoodsDescription, &j.BidCount,
+		&expiresAt, &j.CreatedAt, &j.UpdatedAt); err != nil {
+		return admin.JobRecord{}, err
+	}
+	if expiresAt != nil {
+		j.ExpiresAt = *expiresAt
+	}
+	return j, nil
 }

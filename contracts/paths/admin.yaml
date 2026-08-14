@@ -1366,3 +1366,556 @@ UserAccount:
       format: date-time
       description: When the account was registered, in UTC.
       example: '2026-05-01T09:00:00.000Z'
+
+AdminJobs:
+  get:
+    operationId: adminSearchJobs
+    summary: Search jobs
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/01 §4.6's first administrative capability, second term — "search users, jobs, bids, and
+      disputes" (SHIP-152). Searching accounts is `GET /v1/admin/users` (SHIP-151).
+
+      ## What can be searched
+
+      `q` matches the **goods description**, anywhere within it. That is what a support engineer
+      holds when they are searching — a sentence off a ticket, "the piano", "two pallets of tiles".
+      Somebody holding a job identifier opens the job instead, which is `GET /v1/admin/jobs/{id}`.
+
+      `status` narrows to one of Docs/02 §1's job statuses and `customer` to one account's jobs.
+
+      ## The status vocabulary here is the stored form, not the wire form
+
+      `Driver assigned`, not `driver_assigned`. A departure from the lower snake case Docs/10 §4.7
+      puts on every other enumeration, taken deliberately and consistently with `job_status` on the
+      exception queue: the console is an operator surface, and somebody reading a screen beside a
+      `psql` window should see one vocabulary rather than two.
+
+      It applies to the `status` **filter** as well as to the field, which is the property that
+      matters most — a console displaying one vocabulary and filtering on another would make every
+      filter a guess.
+
+      ## What a job carries here, and what it never will
+
+      **No budget.** Docs/01 §4.3's invariant names providers, so an administrator is not the
+      audience it protects the customer's maximum from — leaving it out is a decision rather than a
+      rule, and the reasoning is that nothing in this capability asks for it and a shape that never
+      carried one cannot leak one. The named revisit is SHIP-164, where an administrator resolving a
+      dispute about price may genuinely need it.
+
+      **No addresses and no contact details**, per Docs/01 §5.1's "minimise exposure of phone
+      numbers, addresses, and delivery details". What identifies a job on a console screen is its
+      description, its customer, its status and its dates.
+
+      `bid_count` counts **every** bid in every status. What a scan of this list answers is whether
+      anybody engaged with the job at all, and three withdrawn offers is a very different fact from
+      no offers.
+
+      ## Ordering and paging
+
+      Newest first, like the account search and unlike the moderation queue — a search has no
+      acknowledgement target, and the jobs somebody is looking for are overwhelmingly recent. Cursor
+      paged on `(created_at, id)`; jobs published in the same instant would make a single-column
+      cursor either skip one or repeat it.
+
+      ## Permission
+
+      Needs `jobs.read`, which every administrator role holds: looking is what the least-privileged
+      role exists to be able to do. Unpublishing a job is `jobs.unpublish` on a different endpoint
+      (SHIP-160).
+    parameters:
+      - name: q
+        in: query
+        required: false
+        description: |
+          Matches the goods description, anywhere within it. Absent or empty matches every job,
+          which with the two filters below is how "every open job for this customer" is expressed.
+
+          **It is a string, not a pattern.** `%` and `_` are matched literally rather than as
+          wildcards, so a search box cannot be turned into a full read of the table.
+
+          A draft that never reached the details step has no description and matches no term.
+        schema:
+          type: string
+          maxLength: 200
+        example: piano
+      - name: status
+        in: query
+        required: false
+        description: |
+          Narrows to one job status, in Docs/02 §1's **stored** form. Absent matches every status. A
+          value that is not one of the twelve is refused rather than ignored — an ignored filter
+          answers with every job, which reads exactly like "the whole marketplace is delivered" to
+          somebody who mistyped one.
+        schema:
+          type: string
+          enum:
+            - Draft
+            - Open
+            - Negotiating
+            - Awarded
+            - Driver assigned
+            - En route to pickup
+            - Picked up
+            - In transit
+            - Delivered
+            - Completed
+            - Cancelled
+            - Disputed
+        example: Open
+      - name: customer
+        in: query
+        required: false
+        description: Narrows to one customer's jobs. Absent matches every customer.
+        schema:
+          type: string
+          format: uuid
+        example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+      - name: limit
+        in: query
+        required: false
+        description: How many jobs to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of jobs, newest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/JobSearchPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `jobs.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          A query parameter carried a value the platform does not have (`validation_failed`), with
+          one `error.details` entry per field — `status` for a status that is not one of the twelve,
+          `customer` for an identifier that is not a UUID, `q` for a term longer than any
+          description it could match.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminJob:
+  get:
+    operationId: adminOpenJob
+    summary: Open one job with its full bid and status history
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      The second half of SHIP-152 — "open **any** job with its full bid and status history" — and
+      *any* is the word doing the work. Every job is an administrator's to open; there is no
+      ownership scope on this endpoint and no `404` standing in for a refusal, which is the opposite
+      of every other job endpoint in this API and is exactly what Docs/01 §4.6 asks for.
+
+      A `404` here means the job genuinely does not exist.
+
+      ## One response rather than three endpoints
+
+      The job, every bid on it and every recorded transition, read in **one snapshot**. A console
+      making three calls to draw one screen is three chances to show a job beside somebody else's
+      bids, or an `Awarded` header above a bid list in which nothing is accepted. A support screen
+      that contradicts itself is worse than a stale one, because somebody acts on it.
+
+      ## Bid amounts are here and the customer's budget is not
+
+      Docs/02 §4: "bid history remains visible to the customer, bidding provider, and
+      administrators". This is that third reader, and unlike the two views a provider and a customer
+      get, it is not scoped to one provider's chain — an administrator looking at a disputed award
+      needs the offers it was chosen over.
+
+      The customer's maximum budget is a different fact with a different audience and is on no shape
+      in this API outside the customer's own.
+
+      ## Both clocks on every transition, never one
+
+      Docs/02 §3.1 keeps the actor's claim (`actor_recorded_at`) apart from the platform's
+      acceptance (`server_recorded_at`) because a driver records a milestone with no signal and the
+      device syncs later. The history is ordered by the **platform's** clock: a timeline ordered by
+      the device's could be reordered by a handset with the wrong time.
+
+      ## Permission
+
+      Needs `jobs.read`, which every administrator role holds.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The job to open.
+        schema:
+          type: string
+          format: uuid
+    responses:
+      '200':
+        description: The job, its bids and its recorded transitions.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminJobDetail'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `jobs.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          There is no such job (`not_found`). Unlike the same answer on the dispute endpoint, this
+          is not a disclosure decision — an administrator holding `jobs.read` may open any job, so
+          there is nothing here being kept from them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+JobSearchPage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/AdminJobSummary'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wOC0wMVQwOTowMDowMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like.
+      example: false
+
+AdminJobDetail:
+  type: object
+  additionalProperties: false
+  required: [job, bids, history]
+  description: |
+    One job as an administrator sees it, with everything recorded against it. `bids` and `history`
+    are always arrays, never `null` — an absent list and an empty one are the same fact here, and
+    `null` crashes a console that iterates without checking on the one job that had neither.
+  properties:
+    job:
+      $ref: '#/AdminJobSummary'
+    bids:
+      type: array
+      description: Every offer on the job, in every status, oldest first.
+      items:
+        $ref: '#/AdminBid'
+    history:
+      type: array
+      description: Every recorded transition, oldest first on the platform's clock.
+      items:
+        $ref: '#/AdminStatusEvent'
+
+AdminJobSummary:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - customer_id
+    - status
+    - goods_description
+    - bid_count
+    - expires_at
+    - created_at
+    - updated_at
+  description: |
+    One job as an administrator sees it. **No budget, no addresses and no contact details** — see
+    the endpoint description.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    customer_id:
+      type: string
+      format: uuid
+      description: The account that owns the job.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    status:
+      type: string
+      description: |
+        Docs/02 §1's **stored** form — `En route to pickup`, not `en_route_to_pickup`. See the
+        endpoint description for why this one enumeration departs from Docs/10 §4.7.
+      enum:
+        - Draft
+        - Open
+        - Negotiating
+        - Awarded
+        - Driver assigned
+        - En route to pickup
+        - Picked up
+        - In transit
+        - Delivered
+        - Completed
+        - Cancelled
+        - Disputed
+      example: Open
+    goods_description:
+      type: string
+      description: |
+        What the customer said they are sending. Empty on a draft that never reached the details
+        step.
+      example: An upright piano and two stools
+    bid_count:
+      type: integer
+      description: |
+        How many bids the job carries, in **every** status. Three withdrawn offers and no offers
+        are very different facts about whether anybody engaged with a job.
+      example: 3
+    expires_at:
+      type: string
+      description: |
+        When an unclaimed job lapses, in UTC. Empty where none is set. Always present, so a console
+        that renders without checking does not crash on the ordinary case.
+      example: '2026-08-20T09:00:00.000Z'
+    created_at:
+      type: string
+      format: date-time
+      description: When the job was created, in UTC.
+      example: '2026-08-01T09:00:00.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      description: When the job row last changed, in UTC.
+      example: '2026-08-02T14:30:00.000Z'
+
+AdminBid:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - provider_id
+    - status
+    - offered_by
+    - amount_cents
+    - pickup_at
+    - deliver_by
+    - message
+    - superseded_by
+    - created_at
+    - updated_at
+  description: |
+    One offer on the job. Docs/02 §4 makes bid history visible to the customer, the bidding provider
+    and administrators; this is the third of those readers, and the only one that sees every
+    provider's offers on one job.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e6
+    provider_id:
+      type: string
+      format: uuid
+      description: The provider whose offer this is.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e7
+    status:
+      type: string
+      description: Docs/02 §4's stored form.
+      enum: [Draft, Submitted, Countered, Accepted, Rejected, Withdrawn, Expired, Superseded]
+      example: Accepted
+    offered_by:
+      type: string
+      description: |
+        Which side made this offer. A customer's counter-offer is a bid row like any other, and a
+        reader who could not tell the two apart would read a negotiation as one party bidding
+        against themselves.
+      enum: [provider, customer]
+      example: provider
+    amount_cents:
+      type: integer
+      format: int64
+      description: |
+        The offer, in cents. `0` where the row carries no amount, which a draft bid may not have —
+        `ck_bids_amount` refuses a non-positive amount, so `0` and "absent" cannot be confused.
+      example: 45000
+    pickup_at:
+      type: string
+      description: The pickup time offered, in UTC. Empty where the row carries none.
+      example: '2026-08-05T07:00:00.000Z'
+    deliver_by:
+      type: string
+      description: The delivery time offered, in UTC. Empty where the row carries none.
+      example: '2026-08-06T17:00:00.000Z'
+    message:
+      type: string
+      description: The offering party's note, where they left one. Empty otherwise.
+      example: Happy to bring a second person for the stairs.
+    superseded_by:
+      type: string
+      description: |
+        The offer that displaced this one, so a reader can follow a negotiation in the order it
+        happened rather than by comparing timestamps. Empty on an offer nothing displaced.
+      example: ''
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-01T11:00:00.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      example: '2026-08-01T11:30:00.000Z'
+
+AdminStatusEvent:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - from
+    - to
+    - actor_type
+    - actor_id
+    - reason
+    - actor_recorded_at
+    - server_recorded_at
+  description: |
+    One recorded transition. **Both clocks, never one** — see the endpoint description.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e8
+    from:
+      type: string
+      description: The status the job left, in Docs/02 §1's stored form.
+      example: Open
+    to:
+      type: string
+      description: The status the job reached, in Docs/02 §1's stored form.
+      example: Awarded
+    actor_type:
+      type: string
+      description: |
+        Who moved it. Finer than the audit log's three actor kinds, because the difference between
+        a provider and the driver they nominated is exactly the distinction support needs when a
+        delivery goes wrong.
+      enum: [customer, provider, driver, admin, system]
+      example: customer
+    actor_id:
+      type: string
+      description: |
+        The account that acted, or the driver assignment for a driver. Empty for `system`, which is
+        the platform acting with no account behind it.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    reason:
+      type: string
+      description: |
+        Why, where one was given. Required of an administrator by the schema and optional for
+        everybody else.
+      example: ''
+    actor_recorded_at:
+      type: string
+      format: date-time
+      description: |
+        When the actor says they acted, in UTC. On a device with no signal this can be well before
+        the platform heard about it.
+      example: '2026-08-02T14:29:00.000Z'
+    server_recorded_at:
+      type: string
+      format: date-time
+      description: When the platform accepted it, in UTC. The trail is ordered by this.
+      example: '2026-08-02T14:30:00.000Z'
+

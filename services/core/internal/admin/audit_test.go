@@ -57,12 +57,7 @@ func newAuditFixture(t *testing.T) auditFixture {
 
 	creds, auth, pool, clk := adminAuth(t)
 
-	users, err := NewUsers(pool)
-	if err != nil {
-		t.Fatalf("building the account search: %v", err)
-	}
-
-	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), users, pool, testLogger())
+	handler, err := NewHandler(testServices(t, creds, pool), pool, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
