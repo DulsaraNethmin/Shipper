@@ -326,9 +326,17 @@ Three tests in `cmd/api` hold the contract to the service, and they are the reas
 
 ### 8.2 Status enumerations in three languages
 
-`contracts/statuses.yaml` is the source; `make codegen` produces the Go, Dart and TypeScript forms; the generated files are committed and CI asserts `git diff --exit-code` after regenerating.
+`contracts/statuses.yaml` is the source; `make codegen` produces the Go, Dart and TypeScript forms; the generated files are committed and CI fails when any of them is stale.
 
 `Docs/08` names "twelve statuses expressed in three languages" as the reason this is one repository. Generation is what makes that hold.
+
+**Built at SHIP-56a, and one sentence of this section changed when it was.** The staleness check was specified here as `git diff --exit-code` after regenerating, and what shipped is `TestGeneratedFilesAreCurrent` in `services/core/cmd/statusgen` — which renders the specification in memory and compares it with every committed output. It is strictly stronger in two ways this repository has already paid for. It **writes nothing**, so it cannot produce the false failure §7.1 and `CLAUDE.md` record a tree-rewriting gate producing on a tree where nothing was wrong, and it runs on a dirty working tree, which is where it is actually invoked. And it fails on a generated file that is **missing entirely** — a `git diff` of tracked files says nothing about one deleted and never staged, or one whose path moved in the specification and was never created. Both were demonstrated failing before the mechanism was believed.
+
+Because it is an ordinary test it needs no CI step of its own: it runs under `go test ./...`, hence under `make check`. What did need adding is the Go workflow's path filter, which now includes `apps/**/*.gen.dart` and `apps/**/*.gen.ts` — otherwise hand-editing a generated *client* file starts the Flutter or web workflow, neither of which checks it, and not the Go one, which does.
+
+**What is generated is the vocabulary, and nothing else.** The transition table of `Docs/02` §2 and `internal/bidding`'s liveness predicate stay hand-written, because `Docs/07` §3 puts every such decision on the platform — a generated copy on the device would be a second authority for a question that has one. The SQL `CHECK` constraints stay hand-written too: migrations are applied history and cannot be regenerated, and §3.4's pairing test per enumeration is unchanged by generation and quietly stronger for it, since the constants it compares the constraint against are now the specification. Actor vocabularies — `jobs.ActorType`, `bidding.Party`, Dart's `BidParty` — name a kind of person rather than a lifecycle state and are out of scope; moving them is an entry in the specification and no new mechanism.
+
+**The published contract is a fourth copy and is not yet paired with any of them.** `contracts/paths/jobs.yaml`, `bidding.yaml` and `delivery.yaml` each enumerate a status vocabulary by hand, and nothing compares those lists with `contracts/statuses.yaml` — SHIP-56a demonstrated it by deleting a value from `bidding.yaml`'s enum and watching `make check` pass. It is left open deliberately rather than overlooked: several enumerations in those fragments are *legitimate subsets* — the recordable milestones in `delivery.yaml` are four of the twelve job statuses on purpose — so a check that pairs by overlap produces false failures, and deciding which subsets are declared is a contract decision rather than a codegen one. `Docs/11` §3 carries the detail.
 
 ### 8.3 Flutter
 
