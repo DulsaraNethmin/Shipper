@@ -11,6 +11,8 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/admin"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 )
 
 // The admin domain's routes (SHIP-163 onwards).
@@ -39,6 +41,13 @@ import (
 // §5's sixth queue is where the result lands, and Docs/04 §9's controls govern what happens next.
 // SHIP-82 settled the general form of this — a route is declared where its answer is decided, not
 // where its path points.
+// # The other three routes are the first in the service to declare RequireAdmin (SHIP-147)
+//
+// They land in the same change that fills `newAdminGuard` (adminauth.go), and that is not a
+// convenience — SHIP-15r's seam makes it compulsory. A class with no guard is **absent** from the
+// map rather than mapped to something that refuses, so a route declaring RequireAdmin before the
+// guard exists stops the process at startup naming the class. Declaring the routes and filling the
+// constructor are therefore one commit or a service that will not start.
 func init() {
 	register(
 		Route{
@@ -51,6 +60,35 @@ func init() {
 			// separate credential.
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).RaiseDispute() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/admin/sessions",
+			Group:   GroupV1,
+
+			// Public, and on manifest_test.go's publicMutatingRoutes allow-list because of it.
+			// An endpoint that hands out a credential cannot require one; what makes it safe
+			// is that it is rate limited per account and per address, which is the property
+			// every entry on that list shares.
+			Auth:    Public,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).SignIn() },
+		},
+
+		Route{
+			Method:  http.MethodDelete,
+			Pattern: "/admin/sessions/current",
+			Group:   GroupV1,
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).SignOut() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/me",
+			Group:   GroupV1,
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).Me() },
 		},
 	)
 }
@@ -71,10 +109,39 @@ func init() {
 // already written as "a job service for a domain that needs to move a job but is not `jobs`", and a
 // second constructor differing only in which file it sits in is a second place for the geocoder
 // decision to be made differently.
+// The argon2id profile is d.Config.Identity.Argon2, and that is deliberate rather than borrowed.
+// SHIP-15r moved argon2id into `internal/passwords` precisely so that a second domain needing to
+// hash a password would not be the reason for a second implementation, and a second *cost knob*
+// would be the same mistake one level up: two profiles that agree by comment until somebody raises
+// one. There is one platform password cost and this is where it is configured. **The field's name
+// is now narrower than its meaning** — renaming it is a `internal/config` change and therefore a
+// shared-surface request rather than something this ticket takes on its own.
 func adminHandler(d Deps) *admin.Handler {
 	svc := admin.NewService(disputeLifecycle{jobs: newJobService(d)}, jobPartiesLookup{}, d.Clock)
 
-	handler, err := admin.NewHandler(svc, d.Pool, d.Logger)
+	hasher, err := passwords.NewHasher(passwords.Argon2Profile{
+		MemoryKiB:   d.Config.Identity.Argon2.MemoryKiB,
+		Iterations:  d.Config.Identity.Argon2.Iterations,
+		Parallelism: d.Config.Identity.Argon2.Parallelism,
+	})
+	if err != nil {
+		panic("cmd/api: admin password hasher: " + err.Error())
+	}
+
+	// The same prefix identity's limiter uses, so both live in one keyspace a person can scan;
+	// the *keys* are prefixed `admin-signin:` by the domain, so an administrator's failures and a
+	// user's failures against the same address are separate allowances.
+	limiter, err := ratelimit.New(d.Redis, "rl:v1:", d.Clock)
+	if err != nil {
+		panic("cmd/api: admin rate limiter: " + err.Error())
+	}
+
+	creds, err := admin.NewCredentials(d.Pool, hasher, limiter, d.Clock)
+	if err != nil {
+		panic("cmd/api: admin credentials: " + err.Error())
+	}
+
+	handler, err := admin.NewHandler(svc, creds, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
 	}

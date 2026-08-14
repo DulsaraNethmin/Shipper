@@ -259,7 +259,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **575 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **589 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -424,6 +424,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
+| **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -8077,6 +8078,110 @@ The topic assertions are fenced **by event id**, taken from the outbox before th
 compared as a **subset** — `shipper.bid` and `shipper.delivery` are not emptied by the harness and are
 shared with every worktree on the machine. That is SHIP-135's lesson applied without having to
 rediscover it.
+
+### SHIP-147 — the third credential system, and the two places it parts company with SHIP-39
+
+`POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, `000801`, and
+the body of `cmd/api/adminauth.go`'s `newAdminGuard`. It is the first ticket to serve a
+`RequireAdmin` route, which means it is the first to fill the seam SHIP-15r left — **and the routes
+and the guard had to land in one commit**, because a class with no guard is *absent* from the map
+rather than mapped to a refusal, so a route declaring it stops the process at startup naming the
+class. That is the seam working, met from the other side, exactly as SHIP-108 met the driver's.
+
+#### The credential is a row, not a signature, and that is the design decision
+
+`Docs/10` §5's mobile pair is a signed JWT plus an opaque refresh token. **An administrator gets
+only the second shape**: one opaque high-entropy value, stored hashed in `admin_sessions`, presented
+directly on every administrative request and read back on each one. There is no access token, no
+refresh endpoint and no rotation.
+
+| Why | Consequence |
+|---|---|
+| Revocation has to be immediate | `Docs/04` §9 asks for least-privilege administrative access. A signed token is valid until it expires whatever the database says, so a dismissed administrator would hold a working credential for the length of the window. A row is revoked in one statement |
+| A permission change has to be immediate | `Docs/10` §5 already refuses to put permissions in the mobile access token because verification state changes during a session. An administrator's *role* changes during a session too, and in the direction that matters — downwards (SHIP-148) |
+| The read costs nothing here | The argument for a stateless token is a phone on a mobile network. The console is a browser talking to one service, and one indexed primary-key read per request buys both properties above |
+
+It also makes the *Done when*'s second clause structural rather than careful. The two verifiers have
+**no shared key material and nothing to confuse**: one parses a signed JWT, the other looks up a
+digest, and neither has a path that could accept the other's credential. Where the driver pair had
+to be kept apart by an audience check written in the right order, this pair is kept apart by being
+different mechanisms.
+
+#### Where it follows SHIP-39, and the one place it deliberately reverses it
+
+SHIP-39 settled three things about `device_sessions.refresh_token_expires_at` and this took two of
+them without argument:
+
+- **an explicit column rather than a Redis TTL** — "a control a cache flush undoes is not one";
+- **a sliding window**, so a console in use does not expire under its user.
+
+**The third is reversed: there is an absolute cap** (`admin_sessions.absolute_expires_at`,
+twelve hours, beside a thirty-minute idle window). SHIP-39's reason for refusing one was a *product*
+consequence — "every user signed out on a schedule, including a driver mid-delivery" — and that
+argument does not transfer to a console. An administrator at a desk being asked to sign in again at
+the end of a shift costs one password entry, and the credential it bounds can suspend accounts and
+unpublish jobs. Twelve hours is longer than a shift, so in practice it bounds the session nobody
+closed rather than the one somebody is using.
+
+**The cap is a `CHECK` constraint, not arithmetic.** `ck_admin_sessions_idle_within_absolute` refuses
+any write that slides the idle window past the cap, so the rule survives the Go that clamps it being
+deleted — which is the mutation that would otherwise produce a privileged credential living for ever
+as long as somebody kept a tab open. The clamp exists in three places on purpose and the constraint
+is the one that is still true when the other two are gone.
+
+One further departure: **there is no rotation.** SHIP-39 rewrites the refresh token on every use and
+detects reuse, which needs `FOR UPDATE` to have exactly one winner. Nothing here does: the console
+fires several requests in parallel from several tabs, a rotation would make that a race by design,
+and the slide is a blind `UPDATE` whose value depends only on the clock. It is also **throttled** —
+`slideGranularity` is a minute, so a burst of twenty requests produces one write rather than twenty.
+
+#### What it asked of `internal/config`: nothing
+
+Stated explicitly because the seam offered it. `cmd/api/adminauth.go`'s header anticipated "signing
+material if the session is a token, a lifetime either way", and this ticket needed neither — the
+credential has no signing key, and the two lifetimes are constants in `internal/admin` for the reason
+SHIP-39's TTL and SHIP-47's limits are constants: `internal/config` is a shared surface and four
+tracks were open. **The `cfg` parameter stays and is unused**, because removing it would put
+`main.go` back in the diff, which is the one thing the seam exists to prevent.
+
+The argon2id profile is `d.Config.Identity.Argon2`, reused rather than duplicated. SHIP-15r moved
+argon2id into `internal/passwords` so that a second domain would not be the reason for a second
+implementation, and a second *cost knob* would be the same mistake one level up. **The field's name
+is now narrower than its meaning** — it is the platform's password cost, not identity's — and
+renaming it is a shared-surface request rather than something a domain branch takes.
+
+#### The bootstrap has no endpoint, deliberately
+
+The first administrator in any deployment cannot come from an authenticated administrator endpoint.
+`000801` seeds nothing — a migration that inserted one would be either a credential in the repository
+or a row with a password nobody can use — so the first account is one `INSERT` by an operator, and
+`scripts/verify/90-admin.sh` does exactly that with a committed development hash, in the same sense
+as the signing key `mint_token` already uses.
+
+#### Two edits outside this track's ownership, both forced and both recorded
+
+- **`scripts/verify/40-identity.sh`** asserted that `users.password_hash` was the *only* credential
+  column in the database. SHIP-147 adds a second, legitimately. The check is still an exact list
+  rather than a loosened pattern, because two credential columns is a fact worth stating
+  deliberately and a third should not be able to appear without somebody deciding it should.
+- **`cmd/api/manifest_test.go`**'s `publicMutatingRoutes`. An endpoint that hands out a credential
+  cannot require one, and the test's own failure message directs you to that list. It is rate
+  limited per account and per address, which is the property every entry there shares.
+
+#### A defect found in somebody else's section, and it was not this ticket's doing
+
+`scripts/verify/80-notifications.sh`'s SHIP-136 topic assertion consumed `--max-messages 500` from
+`--from-beginning`. **`shipper.bid` and `shipper.delivery` are never emptied by anything**, so they
+grow monotonically across every run of every worktree; the topic passed 500 during wave 8 with four
+trees running, and the consumer then stopped *before* reaching the tail — which is where the current
+run's events are. The assertion reported this run's own ids as missing, with a **different count on
+each run** (16, then 9), on a tree where nothing was wrong.
+
+The fence was never the problem: it is by event id, which is what `CLAUDE.md` requires of a shared
+topic. What was wrong is that **a fence protects the assertion and a bound on the read silently
+narrows what the assertion can see.** The bound is now far above anything one machine accumulates in
+a wave, and the timeout is still what ends the consumer. This is the fourth false Kafka failure on
+record and the first with a cause that is not a timestamp fence.
 
 ## 4. Partly done — do not treat these as finished
 

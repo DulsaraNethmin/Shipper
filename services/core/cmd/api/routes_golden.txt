@@ -1,4 +1,7 @@
 GET    /health                                  public       operational
+GET    /v1/admin/me                             admin        v1
+POST   /v1/admin/sessions                       public       v1
+DELETE /v1/admin/sessions/current               admin        v1
 GET    /v1/app/minimum-version                  public       v1
 POST   /v1/auth/login                           public       v1
 POST   /v1/auth/logout                          user         v1

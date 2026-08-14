@@ -357,3 +357,206 @@ ok "and one that has not happened yet is refused, while a report of something lo
 [[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$dispute_validation_job';")" == "Delivered" ]] \
   || fail "a refused validation froze the job"
 ok "neither refusal touched the job or the table"
+
+# ==========================================================================================
+# SHIP-147 — administrator sign-in, and the two directions it must not be reachable in.
+#
+# # This section rate-limits, and it clears its own keys at both ends
+#
+# `make verify` runs every request from 127.0.0.1, so the per-address bucket administrator sign-in
+# uses is shared with every other section and with every concurrent worktree. The keys are
+# `rl:v1:admin-signin:*` — a different namespace from identity's `rl:v1:signin:*`, because an
+# administrator's failed attempts and a user's are separate allowances — and they are deleted before
+# the first sign-in and after the last, exactly as 40-identity.sh does with its own.
+#
+# # The bootstrap administrator is inserted with SQL, and there is no endpoint that would do it
+#
+# The first administrator in any deployment cannot come from an authenticated administrator
+# endpoint, so it comes from an INSERT. The hash below is a **development fixture** in the same
+# sense as the signing key `mint_token` uses: it is committed on purpose, it hashes a password that
+# exists only in this file, and it is worth nothing against any database that was not seeded with
+# it. It is written at a reduced argon2id cost, which the service silently upgrades to the
+# configured profile at the first successful sign-in (SHIP-29) — a path this section exercises
+# without asserting on, because that upgrade is `internal/passwords`' to prove.
+#
+# # The fixture prefix is 0419 and no account below needs one
+#
+# Nothing here registers a marketplace user: an administrator has no `users` row, which is the whole
+# of the ticket. The one mobile token used below is minted by the harness for a subject that does
+# not exist, which is exactly right — the point being made is that the token is refused whatever it
+# claims.
+
+ticket "SHIP-147  administrator sign-in is a separate system, and a user token cannot reach it"
+
+admin_clear_limits() {
+  redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:admin-signin:*' \
+    | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+}
+admin_clear_limits
+
+# A development fixture, not a secret. See the section header.
+admin_password="verify-admin-fixture-password"
+admin_fixture_hash='$argon2id$v=19$m=8192,t=1,p=1$aV5lLp4R4eGpoUzF2u+TDw$F2Vdnh8pmtZWQShAmx1p0L2X4qWMvmSFdnqSNhOJWZA'
+
+admin_email="verify-admin-$$@example.com"
+admin_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$admin_email', 'Verify Owner', '$admin_fixture_hash', 'owner')
+   returning id;")"
+[[ -n "$admin_id" ]] || fail "the bootstrap administrator could not be created"
+
+# admin_signin <key> <email> <password> <name> — one sign-in, answering with its status.
+admin_signin() {
+  post_json "$1" /v1/admin/sessions \
+    "{\"email\":\"$2\",\"password\":\"$3\"}" "$WORKDIR/admin-$4.json"
+}
+
+# admin_get <path> <credential> <name> — one authenticated read, answering with its status.
+#
+# The credential is passed verbatim so that the two crossing checks below can present the *other*
+# system's token through exactly the same call.
+admin_get() {
+  curl -s -o "$WORKDIR/admin-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $2" "http://localhost:$VERIFY_PORT$1"
+}
+
+status="$(admin_signin "verify-adm-signin-$$" "$admin_email" "$admin_password" signin)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-signin.json"; fail "administrator sign-in returned $status, want 200"; }
+
+admin_token="$(json "$WORKDIR/admin-signin.json" '["token"]')"
+[[ -n "$admin_token" ]] || fail "sign-in returned no token"
+[[ "$(json "$WORKDIR/admin-signin.json" '["administrator"]["role"]')" == "owner" ]] \
+  || { cat "$WORKDIR/admin-signin.json"; fail "the administrator's role is not what was stored"; }
+[[ -n "$(json "$WORKDIR/admin-signin.json" '["session"]["expires_at"]')" ]] \
+  || fail "sign-in returned no expiry, so a console cannot tell when its credential dies"
+ok "an administrator signs in and is handed a session with a lifetime"
+
+# The credential is a digest in the table and the token is nowhere in it. A readable one would make
+# every backup and every replica a way into the console.
+stored_admin_hash="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select token_hash from admin_sessions where admin_user_id = '$admin_id';")"
+[[ -n "$stored_admin_hash" ]] || fail "no session row was written"
+[[ "$stored_admin_hash" != "$admin_token" ]] || fail "the session token is stored verbatim"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from admin_sessions where token_hash like '%$admin_token%';")" == "0" ]] \
+  || fail "the session token appears in admin_sessions"
+ok "what is stored is a digest, and the token itself is not in the table"
+
+status="$(admin_get /v1/admin/me "$admin_token" me)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-me.json"; fail "GET /v1/admin/me returned $status, want 200"; }
+[[ "$(json "$WORKDIR/admin-me.json" '["administrator"]["id"]')" == "$admin_id" ]] \
+  || { cat "$WORKDIR/admin-me.json"; fail "the session resolved to the wrong administrator"; }
+ok "the credential resolves on a RequireAdmin route, which is the guard SHIP-15r left unfilled"
+
+# --- the *Done when*'s second clause, on the wire, in both directions ----------------------------
+#
+# One of these is the sentence the ticket is written around. The other is the direction a plausible
+# implementation leaves open, and it is the one wave 7 found a real defect in on the driver pair.
+
+crossing_user_token="$(mint_token "$(uuidgen | tr 'A-Z' 'a-z')")"
+
+status="$(admin_get /v1/admin/me "$crossing_user_token" me-with-user-token)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/admin-me-with-user-token.json"; fail "a mobile access token reached an administrator route with $status"; }
+ok "a mobile access token does not reach an administrator route"
+
+status="$(admin_get /v1/jobs "$admin_token" jobs-with-admin-token)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/admin-jobs-with-admin-token.json"; fail "an administrator credential reached a mobile route with $status"; }
+ok "and an administrator credential does not reach a mobile route — neither can be exchanged for the other"
+
+status="$(admin_get /v1/admin/me "" me-no-credential)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-me-no-credential.json"; fail "an administrator route with no credential returned $status"; }
+ok "and presenting nothing is refused rather than served"
+
+# --- one answer for two failures, and nothing said about which ----------------------------------
+
+status="$(admin_signin "verify-adm-wrong-$$" "$admin_email" "not-the-password" wrong)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/admin-wrong.json"; fail "a wrong administrator password returned $status, want 400"; }
+wrong_code="$(json "$WORKDIR/admin-wrong.json" '["error"]["code"]')"
+
+status="$(admin_signin "verify-adm-nobody-$$" "verify-nobody-$$@example.com" "$admin_password" nobody)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/admin-nobody.json"; fail "an unknown administrator address returned $status, want 400"; }
+unknown_code="$(json "$WORKDIR/admin-nobody.json" '["error"]["code"]')"
+
+[[ "$wrong_code" == "admin_credentials_invalid" && "$unknown_code" == "admin_credentials_invalid" ]] \
+  || fail "a wrong password answers $wrong_code and an unknown address answers $unknown_code, so sign-in says which addresses are administrators"
+ok "a wrong password and an unknown address are one answer, so sign-in is not an administrator-address oracle"
+
+# --- signing out ends the session at once, and says so twice ------------------------------------
+
+status="$(curl -s -X DELETE -o "$WORKDIR/admin-signout.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $admin_token" -H "Idempotency-Key: verify-adm-signout-$$" \
+  "http://localhost:$VERIFY_PORT/v1/admin/sessions/current")"
+[[ "$status" == "204" ]] || { cat "$WORKDIR/admin-signout.json"; fail "signing out returned $status, want 204"; }
+
+status="$(admin_get /v1/admin/me "$admin_token" me-after-signout)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/admin-me-after-signout.json"; fail "a signed-out credential still works ($status)"; }
+ok "signing out ends the session immediately — the credential is a row, so there is no window"
+
+# A browser that retried the same request reuses its key, and the middleware replays the 204 it
+# already sent — from outside the guard, so the dead credential is never consulted. That is the
+# retry path this endpoint has to survive, and it is a different thing from the domain's own
+# idempotence.
+status="$(curl -s -X DELETE -o "$WORKDIR/admin-signout-replay.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $admin_token" -H "Idempotency-Key: verify-adm-signout-$$" \
+  "http://localhost:$VERIFY_PORT/v1/admin/sessions/current")"
+[[ "$status" == "204" ]] \
+  || { cat "$WORKDIR/admin-signout-replay.json"; fail "a retried sign-out returned $status, want the replayed 204"; }
+ok "a retry with the same key is replayed, so a dropped connection does not report a failed sign-out"
+
+# A *fresh* key reaches the guard, which refuses the credential the first call ended.
+status="$(curl -s -X DELETE -o "$WORKDIR/admin-signout-again.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $admin_token" -H "Idempotency-Key: verify-adm-signout2-$$" \
+  "http://localhost:$VERIFY_PORT/v1/admin/sessions/current")"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/admin-signout-again.json"; fail "a second sign-out with a dead credential returned $status, want 401"; }
+ok "and a fresh request with the credential it ended is refused by the guard"
+
+# --- a disabled account loses its live session, and is told why when it signs in ------------------
+
+disabled_email="verify-admin-disabled-$$@example.com"
+disabled_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$disabled_email', 'Verify Leaver', '$admin_fixture_hash', 'support')
+   returning id;")"
+[[ -n "$disabled_id" ]] || fail "the second administrator could not be created"
+
+status="$(admin_signin "verify-adm-disabled-in-$$" "$disabled_email" "$admin_password" disabled-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-disabled-in.json"; fail "the second administrator could not sign in ($status)"; }
+disabled_token="$(json "$WORKDIR/admin-disabled-in.json" '["token"]')"
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update admin_users set status = 'disabled' where id = '$disabled_id';" >/dev/null \
+  || fail "the account could not be disabled"
+
+status="$(admin_get /v1/admin/me "$disabled_token" me-disabled)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/admin-me-disabled.json"; fail "a disabled administrator's live session still works ($status)"; }
+ok "disabling an account ends its live sessions at once, with no second write and no waiting for an expiry"
+
+status="$(admin_signin "verify-adm-disabled-again-$$" "$disabled_email" "$admin_password" disabled-again)"
+[[ "$status" == "403" ]] || { cat "$WORKDIR/admin-disabled-again.json"; fail "a disabled account signing in returned $status, want 403"; }
+[[ "$(json "$WORKDIR/admin-disabled-again.json" '["error"]["code"]')" == "admin_account_disabled" ]] \
+  || { cat "$WORKDIR/admin-disabled-again.json"; fail "a disabled account is not told why"; }
+ok "and a fresh sign-in is told why, which is safe only because the password was proved first"
+
+# --- the idempotency middleware is in front of this endpoint like every other -------------------
+
+status="$(curl -s -X POST -o "$WORKDIR/admin-nokey.json" -w '%{http_code}' \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$admin_email\",\"password\":\"$admin_password\"}" \
+  "http://localhost:$VERIFY_PORT/v1/admin/sessions")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/admin-nokey.json"; fail "a sign-in with no Idempotency-Key returned $status, want 400"; }
+[[ "$(json "$WORKDIR/admin-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || { cat "$WORKDIR/admin-nokey.json"; fail "the refusal is not the middleware's"; }
+ok "administrator sign-in is state-changing and is refused without an idempotency key"
+
+# The buckets are shared with every section that runs after this one and with every concurrent
+# worktree, so they are emptied rather than left to refill on a timer. Deliberately at the end and
+# deliberately narrow: it removes this endpoint's keys and nothing else.
+admin_clear_limits
+[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:admin-signin:*' | wc -l | tr -d ' ')" == "0" ]] \
+  || fail "administrator sign-in buckets survived the clean-up"
+ok "the administrator sign-in buckets are cleared, so a later section is not throttled by this one"

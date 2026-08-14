@@ -29,7 +29,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,9 +52,10 @@ import (
 // for intake that is this layer: the party check, the dispute row and the status change are one
 // decision against one version of the job.
 type Handler struct {
-	svc  *Service
-	pool *pgxpool.Pool
-	log  *slog.Logger
+	svc   *Service
+	creds *Credentials
+	pool  *pgxpool.Pool
+	log   *slog.Logger
 }
 
 // NewHandler wires the handlers to the service.
@@ -60,14 +64,21 @@ type Handler struct {
 // purpose — a rolling deployment during a failover would otherwise take every instance down at once
 // — so a nil pool is a condition the handlers answer 503 to for as long as it lasts, not a reason to
 // refuse to start.
-func NewHandler(svc *Service, pool *pgxpool.Pool, log *slog.Logger) (*Handler, error) {
+func NewHandler(svc *Service, creds *Credentials, pool *pgxpool.Pool, log *slog.Logger) (*Handler, error) {
 	if svc == nil {
 		return nil, errors.New("admin: a handler needs a service")
+	}
+	if creds == nil {
+		// SHIP-147. A handler with no credentials service would serve the administrator
+		// endpoints with a nil-pointer panic rather than refuse to start, and the sign-in
+		// endpoint is the one place a missing collaborator is least visible in testing: it is
+		// the first request anybody makes and the last one anybody retries.
+		return nil, errors.New("admin: a handler needs the administrator credentials service")
 	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
-	return &Handler{svc: svc, pool: pool, log: log}, nil
+	return &Handler{svc: svc, creds: creds, pool: pool, log: log}, nil
 }
 
 // raiseDisputeRequest is the body of POST /v1/jobs/{id}/disputes.
@@ -410,7 +421,269 @@ func apiError(err error) error {
 			"This %s has already raised a different dispute on this job. Generate a new key "+
 				"for each action.", httpx.HeaderIdempotencyKey).WithCause(err)
 
+	// --- administrator authentication (SHIP-147, SHIP-148) -----------------------------------
+
+	case errors.Is(err, ErrAdminCredentialsInvalid):
+		// 400 rather than 401, matching identity's sign-in: a 401 invites the client to
+		// present a better credential for the request it just made, and the credential here
+		// *was* the body.
+		return httpx.NewError(http.StatusBadRequest, CodeAdminCredentialsInvalid,
+			"That email address and password do not match an administrator account.").WithCause(err)
+
+	case errors.Is(err, ErrAdminAccountDisabled):
+		// 403 rather than 401. The caller has proved they hold the account, so this is not a
+		// credential problem and a challenge header would be misleading — presenting a better
+		// password will not help.
+		return httpx.NewError(http.StatusForbidden, CodeAdminAccountDisabled,
+			"This administrator account has been disabled.").WithCause(err)
+
+	case errors.Is(err, ErrAdminEmailTaken):
+		return httpx.NewError(http.StatusConflict, CodeAdminEmailTaken,
+			"An administrator account already exists with that email address.").WithCause(err)
+
+	case errors.Is(err, ErrAdminPermissionDenied):
+		return httpx.NewError(http.StatusForbidden, CodeAdminPermissionDenied,
+			"This administrator account does not have permission to do that.").WithCause(err)
+
+	case errors.Is(err, ErrAdminUnavailable):
+		// 503 rather than 500: a dependency is not answering, and retrying is the right
+		// advice. The rate limiter reaches here when Redis is unreachable, which is the
+		// fail-closed direction (see Credentials.admit).
+		return httpx.NewError(http.StatusServiceUnavailable, httpx.CodeUnavailable,
+			"This cannot be completed right now. Try again shortly.").WithCause(err)
+
 	default:
+		var throttled *ThrottledError
+		if errors.As(err, &throttled) {
+			// The wait itself goes in a Retry-After header, set by the handler — see
+			// Handler.SignIn. The body says nothing about how many attempts are left,
+			// because that is a number only somebody working through passwords needs.
+			return httpx.NewError(http.StatusTooManyRequests, httpx.CodeRateLimited,
+				"Too many sign-in attempts. Wait a moment and try again.").WithCause(err)
+		}
 		return err
 	}
+}
+
+// --- administrator authentication (SHIP-147) -----------------------------------------------------
+//
+// Three endpoints and one shape between them. They are in this file rather than a second one for
+// Docs/10 §2.1's reason — a domain has one `http.go`, and "which file is this handler in" is not a
+// question anybody should have to answer twice.
+//
+// # These are the first routes in the service that declare RequireAdmin
+//
+// Everything above is called by a customer or a provider with a mobile access token. Everything
+// below is called by an administrator with a credential that system cannot produce, verified by
+// adminauth.go, and reaching a handler here with a *user* token is impossible rather than merely
+// refused: the guard resolves a digest against `admin_sessions`, and a JWT is not one.
+
+// signInRequest is the body of POST /v1/admin/sessions.
+//
+//	{"email": "moderator@shipper.example", "password": "…"}
+//
+// There is no device label. `identity` collects one because Docs/07 §3 makes every phone
+// individually revocable by its owner and a person needs to recognise the phone in a list; an
+// administrator console has no equivalent screen, and a label supplied by the client and never
+// checked would be an unauthenticated string in the audit trail.
+type signInRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// administratorResponse is an administrator as the console sees them.
+//
+// **No status field.** Every response carrying this shape is being sent to the administrator it
+// describes, and an account that is not active cannot reach any of them — sign-in refuses it and
+// the guard refuses it. A field whose value is always `active` is a field a client will one day
+// branch on and be wrong.
+//
+// **No password material of any kind**, which [Administrator] makes structural rather than
+// careful: there is no hash on the struct to leak.
+type administratorResponse struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+	Role  string `json:"role"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+func administratorFrom(a Administrator) administratorResponse {
+	return administratorResponse{
+		ID:        a.ID.String(),
+		Email:     a.Email,
+		Name:      a.Name,
+		Role:      a.Role.String(),
+		CreatedAt: timestamp(a.CreatedAt),
+	}
+}
+
+// sessionResponse is what a client needs to know about the session it is holding.
+//
+// One expiry, not two. The console has no use for the difference between "you have been idle" and
+// "this session has been open twelve hours" — it needs to know when to stop trusting the credential
+// it holds, which is [Session.ExpiresAt], the earlier of the two. Publishing both would invite a
+// client to compute the answer itself and get it wrong on the day one of the constants changes.
+type sessionResponse struct {
+	ID        string `json:"id"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+func sessionFrom(s Session) sessionResponse {
+	return sessionResponse{ID: s.ID.String(), ExpiresAt: timestamp(s.ExpiresAt())}
+}
+
+// signInResponse is the body of a successful sign-in.
+//
+// **The token appears here and nowhere else, ever.** There is no endpoint that reads it back, no
+// field on any other shape that carries it, and it is not stored in a form anything can reverse —
+// `admin_sessions.token_hash` holds a digest. A console that loses it signs in again.
+type signInResponse struct {
+	Token         string                `json:"token"`
+	Session       sessionResponse       `json:"session"`
+	Administrator administratorResponse `json:"administrator"`
+}
+
+// SignIn handles POST /v1/admin/sessions (SHIP-147).
+//
+// A collection and a POST, deliberately, rather than `POST /v1/admin/login`: what this creates is a
+// session with an identifier and a lifetime, and `DELETE /v1/admin/sessions/current` ends it. That
+// is the same reading SHIP-163 took of `POST /jobs/{id}/disputes` — the thing being created is a
+// record rather than a verb.
+//
+// **It is `Public`, and it is in cmd/api's `publicMutatingRoutes` allow-list because of that.** An
+// endpoint that hands out a credential cannot require one. The list is short, it is checked by
+// TestNoMutatingRouteIsPublic, and every entry on it is rate limited — this one twice over, per
+// account and per address (see credentials.go).
+//
+// 200 rather than 201: `identity`'s sign-in answers 200 and a console has no use for a `Location`
+// header pointing at a session it cannot fetch.
+func (h *Handler) SignIn() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		var req signInRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		issued, administrator, err := h.creds.SignIn(r.Context(), SignInCommand{
+			Email:    req.Email,
+			Password: req.Password,
+			ClientIP: clientIP(r),
+		})
+		if err != nil {
+			// Retry-After is set here rather than inside the error, because httpx.Error
+			// carries a status, a code and a message and no headers — and a throttled caller
+			// told to come back later without being told when either gives up or polls.
+			var throttled *ThrottledError
+			if errors.As(err, &throttled) {
+				w.Header().Set("Retry-After", retryAfterSeconds(throttled.RetryAfter))
+			}
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, signInResponse{
+			Token:         issued.Token,
+			Session:       sessionFrom(issued.Session),
+			Administrator: administratorFrom(administrator),
+		})
+		return nil
+	})
+}
+
+// meResponse is the body of GET /v1/admin/me.
+type meResponse struct {
+	Administrator administratorResponse `json:"administrator"`
+	Session       sessionResponse       `json:"session"`
+}
+
+// Me handles GET /v1/admin/me (SHIP-147).
+//
+// The console's first call after sign-in and after every reload: who am I, and how long is this
+// credential good for. It reads the grant the guard put on the context and touches no database of
+// its own, which is what makes it the cheapest possible demonstration that the class is enforced —
+// a 200 here means a credential was resolved against `admin_sessions`, and a 401 means it was not.
+//
+// **It deliberately does not echo the session's absolute expiry or its idle expiry separately.**
+// See [sessionResponse].
+func (h *Handler) Me() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := mustGrant(r.Context())
+		if err != nil {
+			return err
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, meResponse{
+			Administrator: administratorFrom(grant.Administrator),
+			Session: sessionResponse{
+				ID:        grant.SessionID.String(),
+				ExpiresAt: timestamp(grant.ExpiresAt),
+			},
+		})
+		return nil
+	})
+}
+
+// SignOut handles DELETE /v1/admin/sessions/current (SHIP-147).
+//
+// It ends the session the caller is presenting and no other. There is no way to name somebody
+// else's session, because there is no path parameter to name it with — "sign out that machine" is a
+// feature with an authorisation question behind it, and a ticket that has not been written.
+//
+// **Idempotent by state rather than by key**, which is stronger: a second call from a retrying
+// browser is a 204 rather than a 404, because the caller wanted the session ended and it is ended.
+// The `Idempotency-Key` the middleware requires is still required — every state-changing endpoint
+// takes one (SHIP-15) — and it is not what makes this safe to repeat.
+//
+// 204 rather than 200 with a body: there is nothing left to describe.
+func (h *Handler) SignOut() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := mustGrant(r.Context())
+		if err != nil {
+			return err
+		}
+
+		if err := h.creds.SignOut(r.Context(), grant.SessionID); err != nil {
+			return apiError(err)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+		return nil
+	})
+}
+
+// clientIP is where the request came from, as the per-address sign-in limit counts it.
+//
+// **`RemoteAddr` only. `X-Forwarded-For` is deliberately not read**, which is the position
+// `identity` took at SHIP-47 and the reasoning is unchanged: a forwarded header is whatever the
+// client wrote unless a trusted proxy overwrote it, so honouring one would let any caller pick their
+// own bucket and evade the limit — worse than no limit, because it would look like one. Behind a
+// load balancer that does not yet exist, every request arrives from one address and shares one
+// bucket, which is the other unacceptable end. The answer is a trusted-proxy configuration, and it
+// belongs with the deployment work.
+//
+// A second copy of identity's function rather than a shared one, because the two domains cannot
+// import each other and the alternative is promoting six lines into infrastructure that would then
+// own a deployment decision neither domain has made yet.
+//
+// The port is stripped, so a caller does not get a fresh bucket per connection.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	// httptest and any transport reporting a bare address land here. Returned as-is rather than
+	// as an empty string, because the domain refuses an empty address.
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+// retryAfterSeconds renders a wait for the header, rounded up.
+//
+// Up rather than to nearest: rounding 1.4 seconds down to one tells a client to retry before the
+// allowance exists, which produces a second refusal and a client that believes the header lies.
+func retryAfterSeconds(d time.Duration) string {
+	seconds := int(math.Ceil(d.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.Itoa(seconds)
 }

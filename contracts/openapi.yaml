@@ -176,6 +176,12 @@ paths:
     $ref: './paths/service.yaml#/Health'
   /v1/:
     $ref: './paths/service.yaml#/APIRoot'
+  /v1/admin/me:
+    $ref: './paths/admin.yaml#/AdminMe'
+  /v1/admin/sessions:
+    $ref: './paths/admin.yaml#/AdminSessions'
+  /v1/admin/sessions/current:
+    $ref: './paths/admin.yaml#/AdminCurrentSession'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
   /v1/auth/login:
@@ -274,6 +280,29 @@ components:
         **The driver portal's token is a different system and is never accepted here.** It
         carries its own audience and its own key material, and neither can be exchanged for the
         other (`Docs/10` §5).
+
+    BearerAdminSession:
+      type: http
+      scheme: bearer
+      description: |
+        The administrator console session (SHIP-147). **Not a JWT** — an opaque random value,
+        stored hashed against `admin_sessions` and read back on every request.
+
+        That shape is a deliberate departure from the other two, and it buys two things a signed
+        token cannot: an administrator can be signed out and stop being able to act *at once*, and
+        a role change takes effect on the next request rather than at the next expiry (`Docs/04`
+        §9's least-privilege requirement, and SHIP-148's permissions).
+
+        It is obtained from `POST /v1/admin/sessions` and ended by
+        `DELETE /v1/admin/sessions/current`. There is no refresh: the session slides while the
+        console is in use and stops after thirty minutes idle or twelve hours in total, whichever
+        comes first.
+
+        **It is a third credential system, and it cannot be exchanged with either of the others.**
+        A mobile access token on an operation secured with this answers `401`; this on an operation
+        secured with `BearerAccessToken` answers `401` as well. Neither verifier will look at the
+        other's credential — one parses a signed JWT and the other looks up a digest — so the
+        separation is a property of the construction rather than a rule somebody follows.
 
     BearerDriverToken:
       type: http

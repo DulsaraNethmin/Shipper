@@ -390,10 +390,23 @@ fi
 # Far more asked for than this run wrote, because the topic is shared and not emptied: the point is
 # to read past other worktrees' messages rather than stop at a cut. The consumer therefore always
 # ends on its no-more-messages timeout, which is a non-zero exit and not a failure.
+#
+# **The bound was 500 and that turned out to be a cut after all** (found in wave 8, on a machine
+# running four worktrees). `shipper.bid` and `shipper.delivery` are never emptied by anything, so
+# they grow monotonically across every run of every tree; once the topic passes the bound, the
+# consumer stops **before** reaching the tail, which is exactly where this run's events are. The
+# assertion then reports this run's own ids as missing — a failure that names Kafka on a tree where
+# nothing is wrong, and one whose count changes between runs because the topic is still growing.
+#
+# The fence was never the problem: it is by event id, which is right (see the note above, and
+# CLAUDE.md's rule that a fence on a shared topic must be an id and not a timestamp). What was
+# wrong is that a *fence* protects the assertion and a *bound on the read* silently narrows what the
+# assertion can see. The bound is now far above anything one machine accumulates in a wave, and the
+# timeout is still what ends the consumer.
 consume_topic() {
   "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-consumer.sh" \
     --bootstrap-server localhost:9092 --topic "$1" --from-beginning \
-    --max-messages 500 --timeout-ms 8000 2>/dev/null | tr -d '\r' >"$2" || true
+    --max-messages 50000 --timeout-ms 8000 2>/dev/null | tr -d '\r' >"$2" || true
 }
 
 consume_topic shipper.bid "$WORKDIR/bid-consumed.json"

@@ -348,3 +348,415 @@ IdempotencyKey:
     type: string
     maxLength: 255
   example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
+
+# --- administrator authentication (SHIP-147) ---------------------------------------------------
+#
+# Everything above this line is called by a customer or a provider. Everything below it is called
+# by an administrator, with a credential the mobile system cannot produce and cannot verify.
+#
+# **The credential is `BearerAdminSession` and it is not a JWT.** The reasoning is on the scheme
+# itself in openapi.yaml: it is a row rather than a signature, so a sign-out and a role change both
+# take effect on the next request. What that costs a client is nothing — it is a bearer token in the
+# ordinary header — and what it buys is that "this administrator has been stood down" is true
+# immediately.
+
+AdminSessions:
+  post:
+    operationId: adminSignIn
+    summary: Sign in to the administration console
+    tags: [Administration]
+    security: []
+    description: |
+      Exchanges an administrator's email address and password for a console session (SHIP-147).
+
+      **This is a different account system from `/v1/auth/login`.** An administrator has no `users`
+      row, no mobile session and no role from the customer/provider vocabulary; a person who is both
+      an administrator and a marketplace user has two accounts with two passwords, and neither
+      credential can be used where the other belongs.
+
+      ## What you get back
+
+      ```json
+      {
+        "token": "…",
+        "session": {"id": "0198…", "expires_at": "2026-08-14T14:12:00.000Z"},
+        "administrator": {"id": "0198…", "email": "moderator@example.com",
+                          "name": "Sam Okafor", "role": "moderator",
+                          "created_at": "2026-07-01T09:00:00.000Z"}
+      }
+      ```
+
+      **`token` is shown once and is never readable again.** The platform stores a hash of it, so
+      there is no endpoint that returns it and no way to recover it — a console that loses it signs
+      in again.
+
+      Send it as a `Bearer` credential in the standard HTTP credential header, on every
+      administrative request.
+
+      ## How long it lasts
+
+      `expires_at` is when the credential stops working, and it moves. The session slides forward
+      while the console is being used and ends after **thirty minutes of inactivity** or **twelve
+      hours in total**, whichever comes first — so `expires_at` is the earlier of the two and is
+      worth re-reading from `GET /v1/admin/me` rather than caching from sign-in.
+
+      There is no refresh endpoint. When it ends, sign in again.
+
+      ## When it is refused
+
+      | Status | `error.code` | What happened |
+      |---|---|---|
+      | `400` | `admin_credentials_invalid` | The address and password do not match an administrator account |
+      | `403` | `admin_account_disabled` | The password was right and the account is out of service |
+      | `429` | `rate_limited` | Too many attempts. `Retry-After` says when |
+
+      **`admin_credentials_invalid` is deliberately one answer for two cases** — no such
+      administrator, and the wrong password — and the platform spends the same amount of work on
+      both, so the response time does not disclose what the status code will not. Which addresses
+      are administrators is not something an unauthenticated caller may find out.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/AdminSignIn'
+    responses:
+      '200':
+        description: |
+          Signed in. The token is in the body and will not be shown again.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminSignInResult'
+      '400':
+        description: |
+          Either the request could not be understood, or the credentials do not match
+          (`admin_credentials_invalid`). The two are distinguishable by `error.code` and nothing
+          else about the failed sign-in is explained.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The password was correct and the account has been disabled (`admin_account_disabled`).
+          Signing in again will not help; the account has to be restored.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          This `Idempotency-Key` has already been used for a different request
+          (`idempotency_key_reused`), or an identical one is still in flight
+          (`idempotency_request_in_progress`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`), with one `error.details` entry
+          per field.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '429':
+        description: |
+          Too many sign-in attempts, counted per account and per network address (`rate_limited`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          Retry-After:
+            description: Seconds to wait before trying again.
+            schema:
+              type: integer
+            example: 24
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`). The rate
+          limiter is one of them: it **fails closed**, so an unreachable cache refuses sign-ins
+          rather than serving them unlimited.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminCurrentSession:
+  delete:
+    operationId: adminSignOut
+    summary: End the administrator session you are presenting
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Ends this session and no other (SHIP-147). The credential stops working immediately — it is a
+      row rather than a signature, so there is no window in which a signed-out token is still
+      accepted.
+
+      **There is no way to name somebody else's session.** Signing another machine out is a feature
+      with an authorisation question behind it and has not been built.
+
+      **Safe to repeat**, in the way that matters to a browser on a poor connection: retry with the
+      same `Idempotency-Key` and the original `204` is replayed, without the credential being
+      consulted again.
+
+      A *fresh* key on the same credential answers `401` instead, because the session it names has
+      already ended — which is the honest answer rather than a second success for something that
+      did not happen.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '204':
+        description: The session is over.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented. `admin_session_expired` means the session
+          was genuine and has ended — sign in again; `unauthenticated` means the credential was not
+          recognised at all.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          This `Idempotency-Key` has already been used for a different request
+          (`idempotency_key_reused`), or an identical one is still in flight
+          (`idempotency_request_in_progress`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminMe:
+  get:
+    operationId: adminMe
+    summary: Who this administrator session belongs to
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      The console's first call after signing in and after every reload (SHIP-147).
+
+      It answers two questions: who am I, and how long is this credential good for. Both come from
+      the session row the platform reads to authenticate the request, so the answer is current
+      rather than whatever was true at sign-in — an administrator whose role changed a minute ago
+      sees the new one here.
+
+      **`session.expires_at` moves.** The session slides forward as the console is used, so this is
+      the endpoint to re-read it from rather than caching the value sign-in returned.
+    responses:
+      '200':
+        description: The administrator this session belongs to.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminMeResult'
+      '401':
+        description: |
+          No usable administrator session was presented. `admin_session_expired` means it ended;
+          `unauthenticated` means it was never valid, or the account behind it has been disabled —
+          the platform does not distinguish those two to somebody holding only a token.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- administration schemas --------------------------------------------------------------------
+
+AdminSignIn:
+  type: object
+  additionalProperties: false
+  required: [email, password]
+  description: |
+    An administrator's credentials. There is no device label: the console has no device list to
+    show one in, and a name supplied by the client and never checked would be an unauthenticated
+    string in the audit trail.
+  properties:
+    email:
+      type: string
+      minLength: 3
+      maxLength: 320
+      description: |
+        Case-insensitive. This is the administrator account's address, which may or may not also be
+        a marketplace account — the two are unrelated.
+      example: moderator@example.com
+    password:
+      type: string
+      description: |
+        Sent as typed. Leading and trailing spaces are significant, because they may be characters
+        somebody chose.
+      example: correct-horse-battery-staple
+
+AdminSignInResult:
+  type: object
+  additionalProperties: false
+  required: [token, session, administrator]
+  properties:
+    token:
+      type: string
+      description: |
+        The session credential, sent as a `Bearer` credential in the standard HTTP credential
+        header. The `BearerAdminSession` scheme in the root document names it.
+
+        **Shown once.** The platform stores only a hash of it, so nothing can return it again.
+      example: 9dW3nP1qTzR7lK0sYbV2xC8gH4jM6oA5eF1uI3rQ7wY
+    session:
+      $ref: '#/AdminSession'
+    administrator:
+      $ref: '#/Administrator'
+
+AdminMeResult:
+  type: object
+  additionalProperties: false
+  required: [administrator, session]
+  properties:
+    administrator:
+      $ref: '#/Administrator'
+    session:
+      $ref: '#/AdminSession'
+
+AdminSession:
+  type: object
+  additionalProperties: false
+  required: [id, expires_at]
+  description: |
+    The console session this request is being served under.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: |
+        Which sign-in this is. An administrator signed in on two machines has two sessions, and
+        signing out ends only the one whose credential was presented.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e3
+    expires_at:
+      type: string
+      format: date-time
+      description: |
+        When this credential stops working, in UTC — the earlier of the idle limit and the absolute
+        one. **It moves**: using the console pushes the idle limit forward, and never past the
+        absolute one. Only one figure is published, because a client that computed the answer from
+        two would get it wrong on the day either constant changes.
+      example: '2026-08-14T14:12:00.000Z'
+
+Administrator:
+  type: object
+  additionalProperties: false
+  required: [id, email, name, role, created_at]
+  description: |
+    An administrator account.
+
+    **There is no status field.** Every response carrying this shape is being sent to the
+    administrator it describes, and an account that is not active cannot reach any of them — so a
+    status here would always read `active`, which is exactly the kind of field a client eventually
+    branches on and is wrong about.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: |
+        The administrator's identifier. This is what the audit trail records as the actor, and it is
+        **not** a `users` id — the two tables are unrelated and their identifiers are not
+        interchangeable.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    email:
+      type: string
+      example: moderator@example.com
+    name:
+      type: string
+      description: Who this is, as support and the audit trail refer to them.
+      example: Sam Okafor
+    role:
+      type: string
+      enum: [support, moderator, owner]
+      description: |
+        The named bundle of permissions this administrator holds, listed least privileged first.
+
+        - `support` — read only: search users and jobs, read the queues, read a dispute, read the
+          audit trail. This is what an account with no role stated becomes.
+        - `moderator` — support, plus acting on what it can see.
+        - `owner` — moderator, plus managing administrator accounts.
+      example: moderator
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-07-01T09:00:00.000Z'

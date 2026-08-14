@@ -2,6 +2,8 @@ package admin
 
 import (
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
@@ -142,4 +144,139 @@ var (
 	CodeDisputeAlreadyOpen = httpx.RegisterCode("admin_dispute_already_open",
 		"This job already has a dispute waiting on an outcome. Open it rather than raising "+
 			"another — one job is disputed once at a time.")
+)
+
+// The sentinels administrator authentication raises (SHIP-147, SHIP-148).
+//
+// A second block rather than additions to the one above, because they are a different subject: the
+// ones above are about a dispute a customer raised, and these are about who is allowed to be here
+// at all. `errors.Is` does not care and a reader does.
+var (
+	// ErrAdminCredentialsInvalid is every way a sign-in fails to identify an administrator.
+	//
+	// **One sentinel for two cases on purpose**: no account with that address, and the right
+	// address with the wrong password. Two would make an unauthenticated endpoint an oracle for
+	// which addresses are administrators, which is a more valuable list than which addresses have
+	// accounts. See [CodeAdminCredentialsInvalid], and see credentials.go's header for the two
+	// other halves of that disclosure — the equalised response time and the limit that counts
+	// unknown addresses.
+	ErrAdminCredentialsInvalid = errors.New("admin: those administrator credentials do not match")
+
+	// ErrAdminAccountDisabled means the password was right and the account is out of service.
+	//
+	// Disclosed at sign-in, where the caller has just proved they hold the account, and **not** at
+	// session resolution, where they hold only a token that may have been taken.
+	// [Authenticator.Resolve] keeps the sentinel and answers with the same code an unrecognised
+	// credential gets — identity.Service.Refresh takes exactly this position, for exactly this
+	// reason.
+	ErrAdminAccountDisabled = errors.New("admin: that administrator account is disabled")
+
+	// ErrAdminEmailTaken means an address already has an administrator account.
+	//
+	// This is `uq_admin_users_email` refusing the row, which is where the rule actually lives: two
+	// concurrent creations both find nothing and both insert, and only the index is right about
+	// that.
+	//
+	// It is safe to disclose here and it would not be at sign-in. The caller is an administrator
+	// holding `admins.manage`, not an anonymous request — they are entitled to know the account
+	// they are trying to create already exists, and refusing to say so would make the endpoint
+	// unusable.
+	ErrAdminEmailTaken = errors.New("admin: an administrator already exists with that address")
+
+	// ErrNoAdminSession means no credential was presented at all.
+	//
+	// Distinct from [ErrAdminSessionInvalid] because the answers differ in their challenge header:
+	// nothing presented gets a bare `Bearer`, because there is no error to report yet.
+	ErrNoAdminSession = errors.New("admin: no administrator session was presented")
+
+	// ErrAdminSessionInvalid means the credential is not one this platform recognises — or is one
+	// it has stopped recognising.
+	//
+	// Unknown, revoked, and belonging to a disabled account are all this on the wire. The Go
+	// distinction is kept where it exists so that a test can tell "the signed-out session was
+	// refused" from "the session silently stopped existing".
+	ErrAdminSessionInvalid = errors.New("admin: that administrator session is not valid")
+
+	// ErrAdminSessionExpired means the session lapsed — idle for too long, or past its cap.
+	//
+	// The one refusal worth its own code, because it is the one an administrator can act on
+	// without wondering whether something is broken: sign in again. Which of the two limits it
+	// hit is deliberately not said; it is information only somebody probing has a use for.
+	ErrAdminSessionExpired = errors.New("admin: that administrator session has expired")
+
+	// ErrAdminPermissionDenied means the administrator is known and the permission is not theirs
+	// (SHIP-148).
+	//
+	// A 403 rather than a 404: the caller is a verified administrator, the endpoint's existence is
+	// not a secret from them, and telling them "no such thing" would send them to look for a
+	// routing fault instead of asking for the permission. That is the opposite of the reasoning on
+	// [ErrNotAParty], and the difference is who is asking.
+	ErrAdminPermissionDenied = errors.New("admin: that action needs a permission this administrator does not hold")
+
+	// ErrAdminUnavailable means a dependency this request needs is not answering.
+	//
+	// PostgreSQL unreachable, or the rate limiter's Redis unreachable — the second **fails closed**
+	// (see [Credentials.SignIn]), because a limiter an attacker turns off by taking Redis down is
+	// not a limiter. 503 rather than 500 in both cases: retrying is the right advice.
+	ErrAdminUnavailable = errors.New("admin: this cannot be completed right now")
+)
+
+// ThrottledError means the caller has been refused for making too many sign-in attempts.
+//
+// It carries the wait because the handler puts it in a `Retry-After` header, and a client told to
+// come back later without being told when will either give up or poll. A struct rather than a
+// sentinel for that reason alone — everything else about it is the transport's to decide.
+type ThrottledError struct {
+	RetryAfter time.Duration
+}
+
+func (e *ThrottledError) Error() string {
+	return fmt.Sprintf("admin: too many administrator sign-in attempts; retry in %s", e.RetryAfter)
+}
+
+// The error codes administrator authentication answers with (SHIP-147, SHIP-148).
+//
+// Four rather than one, and each earns its place by leading somewhere different in the console:
+// re-enter the password, contact whoever runs the platform, sign in again, ask for a permission.
+var (
+	// CodeAdminCredentialsInvalid is every failed sign-in that is not the account's own standing.
+	//
+	// 400 rather than 401, matching identity's: 401 invites a client to present a *better*
+	// credential for the request it just made, and this request had no credential to improve —
+	// the body was the credential.
+	CodeAdminCredentialsInvalid = httpx.RegisterCode("admin_credentials_invalid",
+		"That email address and password do not match an administrator account. Deliberately one "+
+			"code for both halves, so this endpoint cannot be used to find out which addresses "+
+			"are administrators.")
+
+	// CodeAdminAccountDisabled means the password was right and the account is out of service.
+	//
+	// Said only at sign-in, after the password verified. A disabled administrator presenting an
+	// old session token gets `unauthenticated` instead — see [ErrAdminAccountDisabled].
+	CodeAdminAccountDisabled = httpx.RegisterCode("admin_account_disabled",
+		"This administrator account has been disabled. Ask whoever administers the platform to "+
+			"restore it; signing in again will not help.")
+
+	// CodeAdminSessionExpired means the administrator session lapsed.
+	//
+	// Distinct from `unauthenticated` so the console can say "your session timed out" and put the
+	// person back where they were, rather than treating it as a credential that was never any
+	// good. The same distinction delivery.CodeDriverLinkExpired makes for a driver.
+	CodeAdminSessionExpired = httpx.RegisterCode("admin_session_expired",
+		"The administrator session has ended, through inactivity or by reaching its maximum "+
+			"length. Sign in again.")
+
+	// CodeAdminEmailTaken means an administrator already exists with that address.
+	CodeAdminEmailTaken = httpx.RegisterCode("admin_email_taken",
+		"An administrator account already exists with that email address.")
+
+	// CodeAdminPermissionDenied means the administrator is authenticated and unauthorised
+	// (SHIP-148).
+	//
+	// It names no permission, and that is deliberate: the message a client shows should send
+	// somebody to ask for access rather than to enumerate what the platform can do. The
+	// permission that was missing is in the log, against the request id.
+	CodeAdminPermissionDenied = httpx.RegisterCode("admin_permission_denied",
+		"This administrator account does not have permission to do that. Ask whoever administers "+
+			"the platform if you need it.")
 )
