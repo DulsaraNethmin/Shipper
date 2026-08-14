@@ -1,8 +1,11 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/admin"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 )
@@ -80,15 +83,41 @@ import (
 // while reporting itself healthy. It refuses to start instead, beside the other configuration
 // failures.
 //
-// # What happens today
+// # What it does now (SHIP-147), and which of the three parameters it turned out to need
 //
-// It returns nil, nil. Nothing in `cmd/api` declares RequireAdmin — routes_admin.go's only route is
-// `POST /v1/jobs/{id}/disputes`, which is RequireUser because the caller is a party to the job — so
-// nothing is unserved by that, and a route that started declaring the class would stop the process
-// rather than be served open.
+// Two statements: build the session verifier over the pool and the clock, and hand back the
+// middleware `internal/admin` declares. Nothing about an administrator session is decided in this
+// package — not the credential's shape, not its lifetime, not what a verified session grants, and
+// not what a refusal answers with. That all lives in internal/admin, beside the sign-in that has to
+// agree with it.
+//
+// **cfg is unused, and that is the design rather than an omission.** The paragraph above offered it
+// for "signing material if the session is a token, a lifetime either way", and SHIP-147 chose
+// neither: the credential is an opaque random value stored hashed in `admin_sessions`, so there is
+// no key material to configure, and the two lifetimes are constants in `internal/admin` for the
+// reason SHIP-39's TTL and SHIP-47's limits are — `internal/config` is a shared surface (Docs/10
+// §9.2) and four tracks were open. **This ticket asked nothing of internal/config.**
+//
+// The parameter stays because removing it would put main.go back in the diff, which is the one
+// thing this seam exists to prevent. It is what a lifetime or a key would arrive through if either
+// is ever wanted.
+//
+// **The seam held.** `cmd/api/routes.go`, `manifest.go`, `main.go` and `Deps` are untouched by
+// SHIP-147: filling this body is what maps RequireAdmin, and `routes_admin.go` — the admin track's
+// own file — is what declares the first routes on it.
 func newAdminGuard(cfg *config.Config, pool *pgxpool.Pool, clk clock.Clock) (Guard, error) {
-	// SHIP-147: build the administrator session verifier and return the Guard that enforces it.
-	// Until then the class is unenforced and therefore unserved.
-	_, _, _ = cfg, pool, clk
-	return nil, nil
+	// cfg is deliberately unused. See the note above; an administrator session has no signing
+	// key and no configured lifetime, and the parameter is kept so that main.go stays out of the
+	// next diff that needs one.
+	_ = cfg
+
+	verifier, err := admin.NewAuthenticator(pool, clk)
+	if err != nil {
+		return nil, fmt.Errorf("administrator session verifier: %w", err)
+	}
+
+	// admin.RequireAdmin returns a func(http.Handler) http.Handler, which is Guard's underlying
+	// type — so no conversion and, more to the point, no second declaration of the middleware
+	// shape in a package every domain can see.
+	return admin.RequireAdmin(verifier), nil
 }

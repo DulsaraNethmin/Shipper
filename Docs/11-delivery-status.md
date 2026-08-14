@@ -259,7 +259,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **575 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **600 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -413,6 +413,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
 | **SHIP-115** | M4 | `proofs` and `GET /v1/jobs/{id}/delivery/proof` — an uploaded object becomes evidence for **one recorded milestone**, and the customer and the awarded provider read it back through short-lived signed URLs issued *after* an authorisation check. Because the platform is not in the upload path it **asks the store whether the object arrived** rather than believing the client, and records what the store reports — which is also what finally puts SHIP-114's upload limits under a guard inside the domain — *see below* |
 | **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
+| **SHIP-117** | M4 | The delivery-exception moderation queue — `GET /v1/admin/moderation/exceptions`, and it is a **query over the evidence rather than a table of flags**, which is what `000604` said it would be when it built `idx_proofs_exception`. `internal/delivery` is **untouched**: a flag would have needed a cross-domain write for a fact already in the row, and a second source of truth that can drift. Takes **no position on X-6** — *see below* |
 | **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -426,6 +427,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
+| **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
+| **SHIP-148** | M6 | Twelve granular permissions and three role bundles, in a **Go table rather than a grant table** — a permission model is the opposite of the thing `Docs/06` §5.3 puts server-side and changeable. Default-deny at three levels: an omitted role becomes the minimum in Go *and* in the column default, and a role with **no bundle holds nothing**. There is deliberately **no permission to delete an audit entry** — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -8327,6 +8330,282 @@ file is in this application's own temporary directory, not the photo library —
 economy `Docs/01` §5.2 asks for, and it is unguarded. `integration_test/` is where it could be caught,
 on a device, and that is not in `make flutter-check` for the reason SHIP-48 gives.
 
+
+### SHIP-147 — the third credential system, and the two places it parts company with SHIP-39
+
+`POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, `000801`, and
+the body of `cmd/api/adminauth.go`'s `newAdminGuard`. It is the first ticket to serve a
+`RequireAdmin` route, which means it is the first to fill the seam SHIP-15r left — **and the routes
+and the guard had to land in one commit**, because a class with no guard is *absent* from the map
+rather than mapped to a refusal, so a route declaring it stops the process at startup naming the
+class. That is the seam working, met from the other side, exactly as SHIP-108 met the driver's.
+
+#### The credential is a row, not a signature, and that is the design decision
+
+`Docs/10` §5's mobile pair is a signed JWT plus an opaque refresh token. **An administrator gets
+only the second shape**: one opaque high-entropy value, stored hashed in `admin_sessions`, presented
+directly on every administrative request and read back on each one. There is no access token, no
+refresh endpoint and no rotation.
+
+| Why | Consequence |
+|---|---|
+| Revocation has to be immediate | `Docs/04` §9 asks for least-privilege administrative access. A signed token is valid until it expires whatever the database says, so a dismissed administrator would hold a working credential for the length of the window. A row is revoked in one statement |
+| A permission change has to be immediate | `Docs/10` §5 already refuses to put permissions in the mobile access token because verification state changes during a session. An administrator's *role* changes during a session too, and in the direction that matters — downwards (SHIP-148) |
+| The read costs nothing here | The argument for a stateless token is a phone on a mobile network. The console is a browser talking to one service, and one indexed primary-key read per request buys both properties above |
+
+It also makes the *Done when*'s second clause structural rather than careful. The two verifiers have
+**no shared key material and nothing to confuse**: one parses a signed JWT, the other looks up a
+digest, and neither has a path that could accept the other's credential. Where the driver pair had
+to be kept apart by an audience check written in the right order, this pair is kept apart by being
+different mechanisms.
+
+#### Where it follows SHIP-39, and the one place it deliberately reverses it
+
+SHIP-39 settled three things about `device_sessions.refresh_token_expires_at` and this took two of
+them without argument:
+
+- **an explicit column rather than a Redis TTL** — "a control a cache flush undoes is not one";
+- **a sliding window**, so a console in use does not expire under its user.
+
+**The third is reversed: there is an absolute cap** (`admin_sessions.absolute_expires_at`,
+twelve hours, beside a thirty-minute idle window). SHIP-39's reason for refusing one was a *product*
+consequence — "every user signed out on a schedule, including a driver mid-delivery" — and that
+argument does not transfer to a console. An administrator at a desk being asked to sign in again at
+the end of a shift costs one password entry, and the credential it bounds can suspend accounts and
+unpublish jobs. Twelve hours is longer than a shift, so in practice it bounds the session nobody
+closed rather than the one somebody is using.
+
+**The cap is a `CHECK` constraint, not arithmetic.** `ck_admin_sessions_idle_within_absolute` refuses
+any write that slides the idle window past the cap, so the rule survives the Go that clamps it being
+deleted — which is the mutation that would otherwise produce a privileged credential living for ever
+as long as somebody kept a tab open. The clamp exists in three places on purpose and the constraint
+is the one that is still true when the other two are gone.
+
+One further departure: **there is no rotation.** SHIP-39 rewrites the refresh token on every use and
+detects reuse, which needs `FOR UPDATE` to have exactly one winner. Nothing here does: the console
+fires several requests in parallel from several tabs, a rotation would make that a race by design,
+and the slide is a blind `UPDATE` whose value depends only on the clock. It is also **throttled** —
+`slideGranularity` is a minute, so a burst of twenty requests produces one write rather than twenty.
+
+#### What it asked of `internal/config`: nothing
+
+Stated explicitly because the seam offered it. `cmd/api/adminauth.go`'s header anticipated "signing
+material if the session is a token, a lifetime either way", and this ticket needed neither — the
+credential has no signing key, and the two lifetimes are constants in `internal/admin` for the reason
+SHIP-39's TTL and SHIP-47's limits are constants: `internal/config` is a shared surface and four
+tracks were open. **The `cfg` parameter stays and is unused**, because removing it would put
+`main.go` back in the diff, which is the one thing the seam exists to prevent.
+
+The argon2id profile is `d.Config.Identity.Argon2`, reused rather than duplicated. SHIP-15r moved
+argon2id into `internal/passwords` so that a second domain would not be the reason for a second
+implementation, and a second *cost knob* would be the same mistake one level up. **The field's name
+is now narrower than its meaning** — it is the platform's password cost, not identity's — and
+renaming it is a shared-surface request rather than something a domain branch takes.
+
+#### The bootstrap has no endpoint, deliberately
+
+The first administrator in any deployment cannot come from an authenticated administrator endpoint.
+`000801` seeds nothing — a migration that inserted one would be either a credential in the repository
+or a row with a password nobody can use — so the first account is one `INSERT` by an operator, and
+`scripts/verify/90-admin.sh` does exactly that with a committed development hash, in the same sense
+as the signing key `mint_token` already uses.
+
+#### The defect this ticket shipped with: two clocks in one row
+
+**`make check` was green when this branch was committed and exit 2 two hours later, on a tree nobody
+had touched.** It is worth writing down at length because it is a *class* rather than an incident,
+and because wave 8 produced two instances of it in two tracks.
+
+`insertSession` named the two expiries and not `created_at`, so PostgreSQL's `DEFAULT now()` filled
+the latter. The expiries are computed in Go from the injected clock; `ck_admin_sessions_idle_expiry`
+compares one against the other. So the row held **an origin from one clock and a lifetime measured
+from another**, and the constraint quietly stopped asking "is this expiry after the moment the
+session started" and started asking "is this expiry after whenever the `INSERT` executed".
+
+The tests fix the clock at 09:00 UTC. While real time was inside one idle window of that instant the
+row satisfied the constraint; **at 09:30 every sign-in began violating it**. Seven tests, one cause.
+
+| Property | Why it matters |
+|---|---|
+| It is a **time bomb, not a flake** | Re-running never clears it. Two runs disagree because the wall clock moved, not because anything raced — so the usual shared-stack reflex ("run it again before investigating") is exactly wrong here |
+| It is **invisible to the author** | The gate is green for a window after every commit. Whoever runs it later sees the failure, which is how this reached the orchestrator rather than the branch |
+| The constraint's own comment was **right** | `000801` says the comparison is against `created_at` "rather than `now()`". Letting the default fill the column reintroduced `now()` through the back door — the predicate was never edited |
+
+**The rule, stated so the next domain does not rediscover it: a column that something is *measured
+from* must come from the same clock as the thing measured.** A column nothing compares may come from
+the database. On `admin_sessions` that is exactly one column, `updated_at`, which answers "when did
+this row last change" — a fact about the write rather than about the session — and the migration now
+says so beside both. `admin_users`' timestamps are the safe kind and say why: nothing compares them,
+and `insertAdministrator` reads them back with `RETURNING` rather than assembling them in Go, so
+there is one clock in the answer.
+
+The regression test is written to be **independent of when it runs**: it signs in with the clock far
+in the past *and* far in the future, so whatever "today" is, one of the two is always on the wrong
+side of `now()` and a wall-clock-dependent row cannot satisfy both. Reverting the fix fails it in
+both directions — the past subtest on the constraint, the future subtest on the stored value — and
+no choice of run date makes it pass by luck. A test pinned to a single fixed instant is what allowed
+the original defect to look green, so pinning a *second* one would have reproduced the mistake.
+
+**Track C hit the same class in the same wave** — a Flutter sync harness measuring the calendar
+because the queue ran on a fixed clock while the nudge read the host's. Two independent instances in
+one wave is what makes this a pattern worth naming rather than a bug worth fixing.
+
+#### Two edits outside this track's ownership, both forced and both recorded
+
+- **`scripts/verify/40-identity.sh`** asserted that `users.password_hash` was the *only* credential
+  column in the database. SHIP-147 adds a second, legitimately. The check is still an exact list
+  rather than a loosened pattern, because two credential columns is a fact worth stating
+  deliberately and a third should not be able to appear without somebody deciding it should.
+- **`cmd/api/manifest_test.go`**'s `publicMutatingRoutes`. An endpoint that hands out a credential
+  cannot require one, and the test's own failure message directs you to that list. It is rate
+  limited per account and per address, which is the property every entry there shares.
+
+#### A defect found in somebody else's section, and it was not this ticket's doing
+
+`scripts/verify/80-notifications.sh`'s SHIP-136 topic assertion consumed `--max-messages 500` from
+`--from-beginning`. **`shipper.bid` and `shipper.delivery` are never emptied by anything**, so they
+grow monotonically across every run of every worktree; the topic passed 500 during wave 8 with four
+trees running, and the consumer then stopped *before* reaching the tail — which is where the current
+run's events are. The assertion reported this run's own ids as missing, with a **different count on
+each run** (16, then 9), on a tree where nothing was wrong.
+
+The fence was never the problem: it is by event id, which is what `CLAUDE.md` requires of a shared
+topic. What was wrong is that **a fence protects the assertion and a bound on the read silently
+narrows what the assertion can see.** The bound is now far above anything one machine accumulates in
+a wave, and the timeout is still what ends the consumer. This is the fourth false Kafka failure on
+record and the first with a cause that is not a timestamp fence.
+
+### SHIP-148 — three levels of default-deny, and the permission that does not exist
+
+Twelve permissions, three role bundles, `Grant.Permits`, `Handler.permitted`, and one endpoint to
+put them in front of: `POST /v1/admin/administrators`, gated on `admins.manage`.
+
+#### "Granular" is a statement about the check, not about the list
+
+A model with twelve permissions and handlers that ask `if role == owner` is not granular; it is a
+list nobody consults. So the only authorisation question anything outside `permissions.go` asks is
+`Permits(p)`, and there is no exported way to ask what role somebody has *for the purpose of
+deciding anything* — the role is on the response so a console can hide buttons, which `Docs/07` §3
+allows and is careful to call a courtesy.
+
+The endpoint chosen to demonstrate it is the one that matters: **whoever can create an
+administrator can create one with any role**, which makes every other boundary in the file
+advisory. It is the only permission `owner` has that `moderator` does not.
+
+#### "Default to the minimum" is three separate mechanisms, and none of them is enough alone
+
+| Where | What it covers |
+|---|---|
+| `Credentials.Create` turns an empty role into `RoleSupport` | A request that did not say. It also *reports* the applied role back, so an owner who omits the field is told what they made rather than finding out later |
+| `000801`'s `DEFAULT 'support'` | A row written by something that never came through Go — a migration, a support script, a `psql` prompt |
+| `rolePermissions` has no fallback | A role that is **not in the table at all**: the zero value, a database that has drifted from `ck_admin_users_role`, and the fourth role somebody adds to the vocabulary and forgets here. All three hold nothing |
+
+The third is the one that makes adding a role safe, and the direction is what matters: a lookup that
+fell back to *any existing* bundle would hand an unknown role somebody else's permissions. The
+pairing test between `ck_admin_users_role` and `admin.Roles` is what stops that case being silent
+for a wave.
+
+`Roles` and `Permissions` are both ordered **least privileged first**, and the tests read
+`Roles[0]` rather than the literal `"support"` — so reordering the list, which changes what "the
+minimum" means, fails a test instead of quietly redefining a default.
+
+#### The bundles are written out rather than composed
+
+`moderator` is not "support plus five" and `owner` is not "moderator plus one", although both
+sentences are true today. Composition would mean a permission added to `support` silently reaching
+`owner` — a widening nobody reviewed, arriving through a list they were not reading. Three explicit
+lists cost a dozen lines. `owner` is a **listed set and not a wildcard** for the same reason: a
+permission added to the catalogue later reaches it by somebody writing it there.
+
+#### The permission that does not exist
+
+CLAUDE.md's invariant is that audit entries are append-only and ordinary administrators cannot
+delete them, and SHIP-148 is the ticket most able to break it, because a permission model is exactly
+where somebody adds a delete. **The catalogue has one audit permission, `audit.read`, and no
+endpoint can name a permission the catalogue does not have.**
+
+The test checks the *catalogue* rather than the bundles, deliberately: a permission that existed and
+was granted to nobody would still be an endpoint waiting to be written, and that endpoint would be
+an application rule standing where a database rule already stands — `000003`'s trigger refuses
+`UPDATE` and `DELETE` from any connection, which is what makes the invariant true of a `psql` prompt
+as well as of this service. `scripts/verify/90-admin.sh` re-asserts the trigger inside this section
+rather than relying on SHIP-149's, because this is the ticket that would have broken it.
+
+#### The demotion is the check that could only be made here
+
+`make verify` changes an administrator's role by SQL between two calls **with the same unexpired
+credential**, and the second call is refused. That is the property SHIP-147's design was chosen for
+and the only place it can be demonstrated end to end: a signed token would have carried the old role
+until it expired, and no unit test of a permission table can see the difference.
+
+### SHIP-117 — the queue is a query, which is why `internal/delivery` is not in the diff
+
+`GET /v1/admin/moderation/exceptions`. A delivery recorded with a reason in place of a photograph
+(SHIP-116) appears in Docs/04 §5's fourth queue; one recorded with a photograph does not.
+
+#### The decision was made at SHIP-116 and this ticket kept it
+
+`000604`'s header wrote it down while building the index: *"whether a job is queued for review is a
+fact about the job, and it belongs with the queue rather than with the evidence. What this migration
+owes that ticket is a cheap answer to 'which jobs completed through the exception path', and
+`idx_proofs_exception` below is it."*
+
+So there is **no flag column and nothing to write**, and two things follow:
+
+- **`internal/delivery` needed no change at all** — which is what made this buildable in a wave
+  where another track owns that package. A flag would have to be written inside the transaction that
+  records the exception, through a port that domain would have to declare, for a fact that is
+  already in the row it just wrote.
+- **The queue cannot drift from the evidence.** A flag is a second source of truth, and a repair
+  script, a backfill or a rolled-back transaction is all it takes to put two of them out of step.
+
+The port is `admin`'s own (`ExceptionQueue` in `ports.go`) and the query is `cmd/api`'s, spanning
+`proofs`, `milestones` and `jobs` — the same arrangement `jobPartiesLookup` uses for the same reason,
+and the only place three domains may be joined.
+
+#### The vocabulary stays on the other side of the port
+
+`reason`, `milestone` and `job_status` are plain strings in `admin`. `delivery.ProofExceptionReason`
+is **generated** from `contracts/statuses.yaml` (SHIP-56a) and `jobs.Status` is Docs/02 §1's own
+list, so a copy of either here would be a third list to keep in step with a generated one. This
+domain does not decide what a valid exception reason is; `ck_proofs_exception_reason` does, and this
+reports what was recorded.
+
+#### Three decisions inside the query
+
+- **Ordered by `proofs.created_at`, not by the actor's clock.** Docs/02 §3.1 keeps the two apart
+  because a driver records a milestone out of signal and the device syncs later; a queue ordered by
+  the *handset's* clock can be reordered by a handset with the wrong time, which is a queue an entry
+  can hide at the back of. Docs/04 §8's targets are measured against the platform's clock anyway.
+- **The cursor is `(created_at, id)`, not `created_at`.** Two deliveries recorded in the same
+  millisecond make a single-column cursor either repeat an entry or **skip** one, and skipping is
+  the failure a moderation queue must not have. There is a test that writes two at the same instant.
+- **No filter on the milestone kind.** Docs/01 §4.4 is about delivery, but `proofs` does not restrict
+  itself to one milestone — filtering to `Delivered` here would silently drop an exception recorded
+  against a pickup the day somebody allows one. The milestone is reported instead.
+
+#### X-6 is not decided here, and nothing here assumes an answer
+
+Whether a job completed through the exception path may auto-complete under Docs/02 §6.1 is open and
+is the owner's. A job entering this queue and a job auto-completing are **not exclusive**. The entry
+carries `job_status` for triage and it means only what it says.
+
+#### The queue is more load-bearing than two points suggest
+
+Track B established during this wave that **a driver can currently reach `Delivered` only through a
+reasoned exception**: there is no route by which a driver obtains an object key, because
+`POST /jobs/{id}/proof-uploads` is `RequireUser`, and that stands until SHIP-122. So for every
+driver-recorded delivery, this queue is not one path into moderation — **it is the only one**. That
+is a temporary consequence of the order the work landed in rather than a decision, and it is worth
+knowing while it lasts.
+
+#### What the entry deliberately cannot carry
+
+No object key and no signed URL, because by construction there is no photograph — a proof row is one
+or the other and never both. **No budget, and the shape has nowhere to put one**: there is a test
+that reads `ExceptionEntry`'s field names reflectively and fails on a future `Budget` or `ObjectKey`,
+so the invariant is enforced against the fields somebody adds later rather than against the fields
+that are there now.
 
 ## 4. Partly done — do not treat these as finished
 

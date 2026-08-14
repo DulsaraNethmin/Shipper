@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -140,4 +141,117 @@ type Jobs interface {
 	// refusal. A refusal comes back as a [JobMove] with a nil error, because "Docs/02 does not
 	// permit this" is an answer rather than a fault.
 	MoveToDisputed(ctx context.Context, r db.Runner, jobID, actorID uuid.UUID, party Party, reason string) (JobMove, error)
+}
+
+// --- SHIP-117: the delivery-exception moderation queue -------------------------------------------
+
+// ExceptionQueue is the jobs whose delivery evidence is a recorded reason rather than a photograph.
+//
+// # Why this is a port at all
+//
+// The rows live in `proofs`, which is `internal/delivery`'s table, and this domain may not import
+// that package — the boundary lint refuses it in both directions. cmd/api holds the implementation
+// and is the only place the two meet, exactly as [JobParties] spans `jobs` and `bidding`.
+//
+// **The vocabulary stays on the other side of the port.** [ExceptionEntry.Reason],
+// [ExceptionEntry.Milestone] and [ExceptionEntry.JobStatus] are plain strings here, and that is not
+// laziness: `delivery.ProofExceptionReason` is generated from `contracts/statuses.yaml` (SHIP-56a)
+// and `jobs.Status` is Docs/02 §1's own list, so a copy of either in this package would be a second
+// list to keep in step with a generated one. This domain does not decide what a valid exception
+// reason is; it reports what was recorded, and `ck_proofs_exception_reason` is what makes that a
+// closed set.
+//
+// # What "enters the moderation queue" means, and what it deliberately does not
+//
+// SHIP-117's *Done when* is that an exception-completed job **enters the moderation queue**, and the
+// queue is a *query* rather than a table somebody has to remember to write to. `000604` said so when
+// it built the index this reads through: "whether a job is queued for review is a fact about the
+// *job*", and what that migration owed this ticket was "a cheap answer to which jobs completed
+// through the exception path", which is `idx_proofs_exception`.
+//
+// A flag column would have needed `delivery` to write it — a cross-domain write, through a port that
+// domain would have to declare — and it would have been a second source of truth that a repair
+// script or a backfill could put out of step with the evidence. A query cannot drift from the rows
+// it reads.
+//
+// **X-6 — whether a job completed through this path may auto-complete — is undecided and is not
+// decided here.** A job entering this queue and a job auto-completing are not exclusive: this
+// reports what was recorded, and nothing about the entry changes if operations answers X-6 either
+// way. [ExceptionEntry.JobStatus] is carried for triage and means only what it says.
+type ExceptionQueue interface {
+	// ExceptionsAwaitingReview returns one page of entries, oldest first.
+	//
+	// Oldest first because Docs/04 §8 sets acknowledgement targets and the oldest entry is the
+	// one closest to breaching one — the same ordering `idx_disputes_open` exists for.
+	ExceptionsAwaitingReview(ctx context.Context, r db.Runner, q QueueQuery) ([]ExceptionEntry, error)
+}
+
+// QueueQuery is one page of a moderation queue.
+//
+// Cursor paged rather than offset paged, per Docs/10 §4.5: the queue grows at the end while somebody
+// is reading it, and an offset would show them the same entry twice or skip one.
+type QueueQuery struct {
+	// Limit is how many entries to return. Bounded by internal/pagination before it gets here.
+	Limit int
+
+	// After is where the previous page stopped. The zero value is the first page.
+	After QueueCursor
+}
+
+// QueueCursor is the position of the last entry a caller saw.
+//
+// Two fields, because `recorded_at` is not unique: two deliveries recorded in the same millisecond
+// would make a single-column cursor either skip one or repeat it. The identifier breaks the tie and
+// is what makes the ordering total.
+type QueueCursor struct {
+	RecordedAt time.Time
+	ProofID    uuid.UUID
+}
+
+// Zero reports whether this is the first page.
+func (c QueueCursor) Zero() bool { return c.ProofID == uuid.Nil && c.RecordedAt.IsZero() }
+
+// ExceptionEntry is one delivery that was evidenced by a reason rather than a photograph.
+//
+// **No object key, no signed URL and no photograph**, because by construction there is none — a
+// proof row is one or the other and never both (`ck_proofs_photograph_or_exception`). A moderator
+// following up reaches the delivery through the job.
+//
+// **No customer, no provider and no budget.** A queue entry is what somebody triaging needs to
+// decide whether to open the job, and a customer's budget is never exposed to a provider under any
+// circumstances — the safest way to keep an administrative shape clear of it is for it never to have
+// carried one.
+type ExceptionEntry struct {
+	// ProofID identifies the evidence row, and is what the cursor is built from.
+	ProofID uuid.UUID
+
+	// JobID is the delivery to open.
+	JobID uuid.UUID
+
+	// Milestone is which recorded claim the exception stands behind — 'Delivered' for the
+	// deliveries Docs/01 §4.4 is about, and carried rather than assumed because `proofs` does not
+	// restrict itself to one milestone kind.
+	Milestone string
+
+	// Reason is why there is no photograph, from Docs/01 §4.4's three.
+	Reason string
+
+	// Note is the actor's own words, where they left any. Empty is ordinary: `milestones.reason`
+	// is optional, and a driver who selected a reason has already said the most important part.
+	Note string
+
+	// RecordedAt is when the platform recorded the evidence, on the platform's clock.
+	//
+	// Deliberately not the actor's clock. Docs/02 §3.1 keeps the two apart because a driver
+	// records a milestone out of signal and the device syncs later; a queue ordered by the
+	// *device's* clock could be reordered by a handset with the wrong time, which is a queue an
+	// entry can hide at the back of.
+	RecordedAt time.Time
+
+	// JobStatus is where the job is now, for triage.
+	//
+	// It implies nothing about X-6. A job in this queue may or may not be eligible for the
+	// 72-hour auto-complete, that question is operations' and is open, and this field reports the
+	// job's status rather than an opinion about it.
+	JobStatus string
 }

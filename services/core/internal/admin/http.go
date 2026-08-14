@@ -28,8 +28,12 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +43,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
@@ -49,9 +54,11 @@ import (
 // for intake that is this layer: the party check, the dispute row and the status change are one
 // decision against one version of the job.
 type Handler struct {
-	svc  *Service
-	pool *pgxpool.Pool
-	log  *slog.Logger
+	svc        *Service
+	creds      *Credentials
+	moderation *Moderation
+	pool       *pgxpool.Pool
+	log        *slog.Logger
 }
 
 // NewHandler wires the handlers to the service.
@@ -60,14 +67,33 @@ type Handler struct {
 // purpose — a rolling deployment during a failover would otherwise take every instance down at once
 // — so a nil pool is a condition the handlers answer 503 to for as long as it lasts, not a reason to
 // refuse to start.
-func NewHandler(svc *Service, pool *pgxpool.Pool, log *slog.Logger) (*Handler, error) {
+func NewHandler(
+	svc *Service,
+	creds *Credentials,
+	moderation *Moderation,
+	pool *pgxpool.Pool,
+	log *slog.Logger,
+) (*Handler, error) {
 	if svc == nil {
 		return nil, errors.New("admin: a handler needs a service")
+	}
+	if creds == nil {
+		// SHIP-147. A handler with no credentials service would serve the administrator
+		// endpoints with a nil-pointer panic rather than refuse to start, and the sign-in
+		// endpoint is the one place a missing collaborator is least visible in testing: it is
+		// the first request anybody makes and the last one anybody retries.
+		return nil, errors.New("admin: a handler needs the administrator credentials service")
+	}
+	if moderation == nil {
+		// SHIP-117. A nil here would make the queue endpoint panic rather than answer, and the
+		// panic would be at the first request rather than at startup — which is the wrong way
+		// round for a collaborator that is decided once, in the composition root.
+		return nil, errors.New("admin: a handler needs the moderation queue service")
 	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
-	return &Handler{svc: svc, pool: pool, log: log}, nil
+	return &Handler{svc: svc, creds: creds, moderation: moderation, pool: pool, log: log}, nil
 }
 
 // raiseDisputeRequest is the body of POST /v1/jobs/{id}/disputes.
@@ -410,7 +436,531 @@ func apiError(err error) error {
 			"This %s has already raised a different dispute on this job. Generate a new key "+
 				"for each action.", httpx.HeaderIdempotencyKey).WithCause(err)
 
+	// --- administrator authentication (SHIP-147, SHIP-148) -----------------------------------
+
+	case errors.Is(err, ErrAdminCredentialsInvalid):
+		// 400 rather than 401, matching identity's sign-in: a 401 invites the client to
+		// present a better credential for the request it just made, and the credential here
+		// *was* the body.
+		return httpx.NewError(http.StatusBadRequest, CodeAdminCredentialsInvalid,
+			"That email address and password do not match an administrator account.").WithCause(err)
+
+	case errors.Is(err, ErrAdminAccountDisabled):
+		// 403 rather than 401. The caller has proved they hold the account, so this is not a
+		// credential problem and a challenge header would be misleading — presenting a better
+		// password will not help.
+		return httpx.NewError(http.StatusForbidden, CodeAdminAccountDisabled,
+			"This administrator account has been disabled.").WithCause(err)
+
+	case errors.Is(err, ErrAdminEmailTaken):
+		return httpx.NewError(http.StatusConflict, CodeAdminEmailTaken,
+			"An administrator account already exists with that email address.").WithCause(err)
+
+	case errors.Is(err, ErrAdminPermissionDenied):
+		return httpx.NewError(http.StatusForbidden, CodeAdminPermissionDenied,
+			"This administrator account does not have permission to do that.").WithCause(err)
+
+	case errors.Is(err, ErrAdminUnavailable):
+		// 503 rather than 500: a dependency is not answering, and retrying is the right
+		// advice. The rate limiter reaches here when Redis is unreachable, which is the
+		// fail-closed direction (see Credentials.admit).
+		return httpx.NewError(http.StatusServiceUnavailable, httpx.CodeUnavailable,
+			"This cannot be completed right now. Try again shortly.").WithCause(err)
+
 	default:
+		var throttled *ThrottledError
+		if errors.As(err, &throttled) {
+			// The wait itself goes in a Retry-After header, set by the handler — see
+			// Handler.SignIn. The body says nothing about how many attempts are left,
+			// because that is a number only somebody working through passwords needs.
+			return httpx.NewError(http.StatusTooManyRequests, httpx.CodeRateLimited,
+				"Too many sign-in attempts. Wait a moment and try again.").WithCause(err)
+		}
 		return err
 	}
+}
+
+// --- administrator authentication (SHIP-147) -----------------------------------------------------
+//
+// Three endpoints and one shape between them. They are in this file rather than a second one for
+// Docs/10 §2.1's reason — a domain has one `http.go`, and "which file is this handler in" is not a
+// question anybody should have to answer twice.
+//
+// # These are the first routes in the service that declare RequireAdmin
+//
+// Everything above is called by a customer or a provider with a mobile access token. Everything
+// below is called by an administrator with a credential that system cannot produce, verified by
+// adminauth.go, and reaching a handler here with a *user* token is impossible rather than merely
+// refused: the guard resolves a digest against `admin_sessions`, and a JWT is not one.
+
+// signInRequest is the body of POST /v1/admin/sessions.
+//
+//	{"email": "moderator@shipper.example", "password": "…"}
+//
+// There is no device label. `identity` collects one because Docs/07 §3 makes every phone
+// individually revocable by its owner and a person needs to recognise the phone in a list; an
+// administrator console has no equivalent screen, and a label supplied by the client and never
+// checked would be an unauthenticated string in the audit trail.
+type signInRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// administratorResponse is an administrator as the console sees them.
+//
+// **No status field.** Every response carrying this shape is being sent to the administrator it
+// describes, and an account that is not active cannot reach any of them — sign-in refuses it and
+// the guard refuses it. A field whose value is always `active` is a field a client will one day
+// branch on and be wrong.
+//
+// **No password material of any kind**, which [Administrator] makes structural rather than
+// careful: there is no hash on the struct to leak.
+type administratorResponse struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+	Role  string `json:"role"`
+
+	// Permissions is what the role holds, expanded (SHIP-148).
+	//
+	// **Published so the console can hide what it may not do, and never so it can decide.**
+	// Docs/07 §3 is the rule and it is a rule about every client: the app may hide or disable,
+	// the platform rules. An administrator who edited this list in a response would find every
+	// endpoint refusing them exactly as before, because the check reads the role out of the
+	// session row on each request.
+	//
+	// Sent expanded rather than left for a client to derive from `role`, because a derivation
+	// is a second copy of [rolePermissions] in TypeScript — and the copy would be the one that
+	// drifted, since nothing fails when a console shows a button that answers 403.
+	Permissions []string `json:"permissions"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+func administratorFrom(a Administrator) administratorResponse {
+	held := a.Role.Permissions()
+
+	// Never nil on the wire: a role with no permissions is a real state — that is what an
+	// unrecognised one grants — and `null` makes a console that iterates without checking crash
+	// on exactly the account it most needs to render.
+	permissions := make([]string, 0, len(held))
+	for _, p := range held {
+		permissions = append(permissions, p.String())
+	}
+
+	return administratorResponse{
+		ID:          a.ID.String(),
+		Email:       a.Email,
+		Name:        a.Name,
+		Role:        a.Role.String(),
+		Permissions: permissions,
+		CreatedAt:   timestamp(a.CreatedAt),
+	}
+}
+
+// sessionResponse is what a client needs to know about the session it is holding.
+//
+// One expiry, not two. The console has no use for the difference between "you have been idle" and
+// "this session has been open twelve hours" — it needs to know when to stop trusting the credential
+// it holds, which is [Session.ExpiresAt], the earlier of the two. Publishing both would invite a
+// client to compute the answer itself and get it wrong on the day one of the constants changes.
+type sessionResponse struct {
+	ID        string `json:"id"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+func sessionFrom(s Session) sessionResponse {
+	return sessionResponse{ID: s.ID.String(), ExpiresAt: timestamp(s.ExpiresAt())}
+}
+
+// signInResponse is the body of a successful sign-in.
+//
+// **The token appears here and nowhere else, ever.** There is no endpoint that reads it back, no
+// field on any other shape that carries it, and it is not stored in a form anything can reverse —
+// `admin_sessions.token_hash` holds a digest. A console that loses it signs in again.
+type signInResponse struct {
+	Token         string                `json:"token"`
+	Session       sessionResponse       `json:"session"`
+	Administrator administratorResponse `json:"administrator"`
+}
+
+// SignIn handles POST /v1/admin/sessions (SHIP-147).
+//
+// A collection and a POST, deliberately, rather than `POST /v1/admin/login`: what this creates is a
+// session with an identifier and a lifetime, and `DELETE /v1/admin/sessions/current` ends it. That
+// is the same reading SHIP-163 took of `POST /jobs/{id}/disputes` — the thing being created is a
+// record rather than a verb.
+//
+// **It is `Public`, and it is in cmd/api's `publicMutatingRoutes` allow-list because of that.** An
+// endpoint that hands out a credential cannot require one. The list is short, it is checked by
+// TestNoMutatingRouteIsPublic, and every entry on it is rate limited — this one twice over, per
+// account and per address (see credentials.go).
+//
+// 200 rather than 201: `identity`'s sign-in answers 200 and a console has no use for a `Location`
+// header pointing at a session it cannot fetch.
+func (h *Handler) SignIn() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		var req signInRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		issued, administrator, err := h.creds.SignIn(r.Context(), SignInCommand{
+			Email:    req.Email,
+			Password: req.Password,
+			ClientIP: clientIP(r),
+		})
+		if err != nil {
+			// Retry-After is set here rather than inside the error, because httpx.Error
+			// carries a status, a code and a message and no headers — and a throttled caller
+			// told to come back later without being told when either gives up or polls.
+			var throttled *ThrottledError
+			if errors.As(err, &throttled) {
+				w.Header().Set("Retry-After", retryAfterSeconds(throttled.RetryAfter))
+			}
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, signInResponse{
+			Token:         issued.Token,
+			Session:       sessionFrom(issued.Session),
+			Administrator: administratorFrom(administrator),
+		})
+		return nil
+	})
+}
+
+// meResponse is the body of GET /v1/admin/me.
+type meResponse struct {
+	Administrator administratorResponse `json:"administrator"`
+	Session       sessionResponse       `json:"session"`
+}
+
+// Me handles GET /v1/admin/me (SHIP-147).
+//
+// The console's first call after sign-in and after every reload: who am I, and how long is this
+// credential good for. It reads the grant the guard put on the context and touches no database of
+// its own, which is what makes it the cheapest possible demonstration that the class is enforced —
+// a 200 here means a credential was resolved against `admin_sessions`, and a 401 means it was not.
+//
+// **It deliberately does not echo the session's absolute expiry or its idle expiry separately.**
+// See [sessionResponse].
+func (h *Handler) Me() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := mustGrant(r.Context())
+		if err != nil {
+			return err
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, meResponse{
+			Administrator: administratorFrom(grant.Administrator),
+			Session: sessionResponse{
+				ID:        grant.SessionID.String(),
+				ExpiresAt: timestamp(grant.ExpiresAt),
+			},
+		})
+		return nil
+	})
+}
+
+// SignOut handles DELETE /v1/admin/sessions/current (SHIP-147).
+//
+// It ends the session the caller is presenting and no other. There is no way to name somebody
+// else's session, because there is no path parameter to name it with — "sign out that machine" is a
+// feature with an authorisation question behind it, and a ticket that has not been written.
+//
+// **Idempotent by state rather than by key**, which is stronger: a second call from a retrying
+// browser is a 204 rather than a 404, because the caller wanted the session ended and it is ended.
+// The `Idempotency-Key` the middleware requires is still required — every state-changing endpoint
+// takes one (SHIP-15) — and it is not what makes this safe to repeat.
+//
+// 204 rather than 200 with a body: there is nothing left to describe.
+func (h *Handler) SignOut() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := mustGrant(r.Context())
+		if err != nil {
+			return err
+		}
+
+		if err := h.creds.SignOut(r.Context(), grant.SessionID); err != nil {
+			return apiError(err)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+		return nil
+	})
+}
+
+// clientIP is where the request came from, as the per-address sign-in limit counts it.
+//
+// **`RemoteAddr` only. `X-Forwarded-For` is deliberately not read**, which is the position
+// `identity` took at SHIP-47 and the reasoning is unchanged: a forwarded header is whatever the
+// client wrote unless a trusted proxy overwrote it, so honouring one would let any caller pick their
+// own bucket and evade the limit — worse than no limit, because it would look like one. Behind a
+// load balancer that does not yet exist, every request arrives from one address and shares one
+// bucket, which is the other unacceptable end. The answer is a trusted-proxy configuration, and it
+// belongs with the deployment work.
+//
+// A second copy of identity's function rather than a shared one, because the two domains cannot
+// import each other and the alternative is promoting six lines into infrastructure that would then
+// own a deployment decision neither domain has made yet.
+//
+// The port is stripped, so a caller does not get a fresh bucket per connection.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	// httptest and any transport reporting a bare address land here. Returned as-is rather than
+	// as an empty string, because the domain refuses an empty address.
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+// retryAfterSeconds renders a wait for the header, rounded up.
+//
+// Up rather than to nearest: rounding 1.4 seconds down to one tells a client to retry before the
+// allowance exists, which produces a second refusal and a client that believes the header lies.
+func retryAfterSeconds(d time.Duration) string {
+	seconds := int(math.Ceil(d.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.Itoa(seconds)
+}
+
+// --- administrator management, behind a granular permission (SHIP-148) ---------------------------
+
+// createAdministratorRequest is the body of POST /v1/admin/administrators.
+//
+//	{"email": "sam@shipper.example", "name": "Sam Okafor",
+//	 "password": "…", "role": "moderator"}
+//
+// **`role` is optional and omitting it is not an error**, which is the ticket's *Done when* on the
+// wire: a request that does not say gets the least-privileged role rather than the creator's, and
+// rather than a refusal. A role the platform does not have *is* an error, because that is a
+// different mistake — see [CreateCommand.Validate].
+type createAdministratorRequest struct {
+	Email    string `json:"email"`
+	Name     string `json:"name"`
+	Password string `json:"password"`
+	Role     string `json:"role,omitempty"`
+}
+
+// CreateAdministrator handles POST /v1/admin/administrators (SHIP-147, SHIP-148).
+//
+// # This is the endpoint the permission model exists for
+//
+// Somebody who can create an administrator can create one with any role, which makes every other
+// boundary in permissions.go advisory. So it is the one endpoint gated on [PermissionAdminsManage],
+// which only [RoleOwner] holds — a `support` or `moderator` session reaching it gets a 403 naming no
+// permission, and the permission it wanted goes to the log.
+//
+// # There is no bootstrap path here, deliberately
+//
+// The first administrator in a deployment cannot come from an endpoint that requires an
+// administrator. It comes from one `INSERT` by an operator — see `000801`'s header — and this
+// endpoint is how every account after it is made. An "if there are no administrators yet, allow
+// anybody" branch would be an unauthenticated account-creation endpoint for as long as the table
+// was empty, which is every deployment's first minute and any deployment somebody has cleaned.
+//
+// 201 with the account, and the password is not echoed.
+func (h *Handler) CreateAdministrator() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionAdminsManage); err != nil {
+			return err
+		}
+
+		var req createAdministratorRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		created, err := h.creds.Create(r.Context(), CreateCommand{
+			Email:    req.Email,
+			Name:     req.Name,
+			Password: req.Password,
+			Role:     Role(req.Role),
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusCreated, administratorFrom(created))
+		return nil
+	})
+}
+
+// permitted is the authorisation check every administrative handler makes (SHIP-148).
+//
+// # Why it takes a permission and not a role
+//
+// "Granular" is the *Done when*'s first word. A handler asking `if role == owner` would make every
+// future permission a change to that condition, and a condition drifts towards whichever role
+// already worked — which is how a moderation console ends up with three roles and one of them
+// meaning anything.
+//
+// # Why the refusal names nothing
+//
+// The message sends somebody to ask for access rather than to enumerate what the platform can do,
+// and the permission that was missing goes to the log against the request id instead. An
+// administrator who needs to know which permission they lack asks the person who can grant it,
+// which is the same person who can read the log.
+//
+// # Why the grant is returned as well
+//
+// Every caller needs it immediately afterwards — to attribute an audit entry (SHIP-150), or to scope
+// a query. Returning it here means a handler cannot read the grant *without* having stated which
+// permission it was acting under, which is the property that makes an unguarded handler visible in
+// review rather than merely absent.
+func (h *Handler) permitted(r *http.Request, p Permission) (Grant, error) {
+	grant, err := mustGrant(r.Context())
+	if err != nil {
+		return Grant{}, err
+	}
+	if !grant.Permits(p) {
+		httpx.LoggerFrom(r.Context()).LogAttrs(r.Context(), slog.LevelInfo,
+			"an administrator was refused an action their role does not permit",
+			slog.String("administrator_id", grant.Administrator.ID.String()),
+			slog.String("role", grant.Administrator.Role.String()),
+			slog.String("permission", p.String()))
+
+		return Grant{}, apiError(fmt.Errorf("%w: %s needs %s",
+			ErrAdminPermissionDenied, grant.Administrator.Role, p))
+	}
+	return grant, nil
+}
+
+// --- SHIP-117: the delivery-exception moderation queue ------------------------------------------
+
+// exceptionEntryResponse is one delivery that was evidenced by a reason rather than a photograph.
+//
+// **No object key and no signed URL**, because by construction there is no photograph — a proof row
+// is one or the other and never both (`ck_proofs_photograph_or_exception`). **No customer, no
+// provider and no budget**: a queue entry is what somebody triaging needs in order to decide whether
+// to open the job, and a shape that never carried a budget cannot leak one.
+type exceptionEntryResponse struct {
+	ProofID string `json:"proof_id"`
+	JobID   string `json:"job_id"`
+
+	Milestone string `json:"milestone"`
+	Reason    string `json:"reason"`
+
+	// Note is the actor's own words, where they left any. Always present, empty when they did
+	// not — `milestones.reason` is optional, and a `null` makes a console that renders without
+	// checking crash on the ordinary case.
+	Note string `json:"note"`
+
+	// RecordedAt is the platform's clock, not the device's. See [ExceptionEntry.RecordedAt].
+	RecordedAt string `json:"recorded_at"`
+
+	// JobStatus is where the job is now. It implies nothing about whether a job completed
+	// through this path may auto-complete, which is undecided (X-6).
+	JobStatus string `json:"job_status"`
+}
+
+func exceptionEntryFrom(e ExceptionEntry) exceptionEntryResponse {
+	return exceptionEntryResponse{
+		ProofID:    e.ProofID.String(),
+		JobID:      e.JobID.String(),
+		Milestone:  e.Milestone,
+		Reason:     e.Reason,
+		Note:       e.Note,
+		RecordedAt: timestamp(e.RecordedAt),
+		JobStatus:  e.JobStatus,
+	}
+}
+
+// ExceptionQueue handles GET /v1/admin/moderation/exceptions (SHIP-117).
+//
+// The *Done when* is that an exception-completed job **enters the moderation queue**, and this is
+// the queue. It needs [PermissionModerationRead], which every role holds — reading a queue is what
+// the least-privileged role exists to be able to do, and acting on what is in it is a different
+// permission on a different endpoint.
+//
+// Oldest first, cursor paged, and it takes no filter: SHIP-157 is where this becomes a screen with
+// four kinds of exception on it, and a query parameter added now would be one that ticket has to
+// work around.
+func (h *Handler) ExceptionQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
+			return err
+		}
+
+		query, err := exceptionQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so that "is there another page" is answered by the rows
+		// rather than by a second COUNT — the same arrangement the jobs feed uses.
+		query.Limit++
+
+		entries, err := h.moderation.Exceptions(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+			next = pagination.Cursor{
+				timestamp(last.RecordedAt),
+				last.ProofID.String(),
+			}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]exceptionEntryResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, exceptionEntryFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// exceptionQueryFrom reads the page parameters.
+//
+// A malformed cursor is a bad request rather than an empty page, for the reason internal/pagination
+// gives: a client that sent one has a bug, and answering "nothing here" would let it page for ever
+// through a queue it never saw.
+func exceptionQueryFrom(r *http.Request) (QueueQuery, error) {
+	values := r.URL.Query()
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return QueueQuery{}, err
+	}
+
+	after, err := decodeExceptionCursor(values.Get("cursor"))
+	if err != nil {
+		return QueueQuery{}, err
+	}
+	return QueueQuery{Limit: limit, After: after}, nil
+}
+
+// decodeExceptionCursor reads the two fields the queue's ordering is total on.
+func decodeExceptionCursor(raw string) (QueueCursor, error) {
+	if raw == "" {
+		return QueueCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return QueueCursor{}, err
+	}
+
+	recordedAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	proofID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return QueueCursor{RecordedAt: recordedAt, ProofID: proofID}, nil
 }
