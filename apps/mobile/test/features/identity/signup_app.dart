@@ -16,6 +16,7 @@ import 'package:shipper/core/sync/queue_watch.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 import 'package:shipper/core/sync/unsynced_nudge.dart';
 import 'package:shipper/features/bidding/bidding_repository.dart';
+import 'package:shipper/features/delivery/delivery_repository.dart';
 import 'package:shipper/features/fleet/fleet_repository.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
@@ -24,6 +25,7 @@ import 'package:shipper/features/jobs/open_jobs_repository.dart';
 import '../../core/auth/fake_token_store.dart';
 import '../../core/auth/session_fixtures.dart';
 import '../bidding/fake_bidding_repository.dart';
+import '../delivery/fake_delivery_repository.dart';
 import '../fleet/fake_fleet_repository.dart';
 import '../jobs/fake_jobs_repository.dart';
 import '../jobs/fake_open_jobs_repository.dart';
@@ -46,6 +48,7 @@ Widget signupApp(
   FakeFleetRepository? fleet,
   FakeOpenJobsRepository? openJobs,
   FakeBiddingRepository? bidding,
+  FakeDeliveryRepository? delivery,
   FakeSessionEnder? ender,
   SyncWorker? worker,
   DateTime Function()? clock,
@@ -102,6 +105,11 @@ Widget signupApp(
       // open a socket by accident — and it is overridden here for the same reason as the rest,
       // which is that "no test I was thinking about reaches it" is not a property anybody checks.
       biddingRepositoryProvider.overrideWithValue(bidding ?? FakeBiddingRepository()),
+      // The customer's tracking view reads three endpoints as soon as it is drawn (SHIP-133), and
+      // it is reachable both by a button on the job screen and by a deep link. Same hazard as the
+      // four above and the same symptom when it is forgotten: a socket opened by a screen nobody in
+      // a given test was thinking about, against nothing at all on CI.
+      deliveryRepositoryProvider.overrideWithValue(delivery ?? FakeDeliveryRepository()),
       // A restored session refreshes as soon as the keychain answers (SHIP-50). None of these
       // tests starts with a stored token, so nothing refreshes — but a test that later does
       // would otherwise open a socket to whatever is listening on the local API port.

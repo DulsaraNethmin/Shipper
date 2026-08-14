@@ -8,6 +8,7 @@ import 'package:shipper/core/auth/provider_only.dart';
 import 'package:shipper/core/permissions/permission_copy.dart';
 import 'package:shipper/features/delivery/capture_proof_controller.dart';
 import 'package:shipper/features/delivery/proof_camera.dart';
+import 'package:shipper/features/delivery/proof_exception_reason.dart';
 
 /// Photographing the delivery (SHIP-130).
 ///
@@ -16,13 +17,32 @@ import 'package:shipper/features/delivery/proof_camera.dart';
 /// "never written to the photo library" is a property of this build rather than of whichever camera
 /// application the manufacturer shipped.
 ///
-/// ## What it shows when the camera will not open
+/// ## What it shows when the camera will not open (SHIP-131)
 ///
-/// `PermissionCopy.cameraDeclined` (SHIP-179), which already says the honest thing: the camera
-/// cannot be opened, a reason can be recorded instead, and settings is the way back. **The button
-/// that records the reason is SHIP-131** and is deliberately not here — `Docs/01` §4.4's exception
-/// path needs `POST /v1/jobs/{id}/milestones` with `proof.exception_reason` (SHIP-116), and offering
-/// a button that queued nothing would be a worse dead end than naming the gap.
+/// `PermissionCopy.cameraDeclined` (SHIP-179) has said the honest thing since it was written — the
+/// camera cannot be opened, a reason can be recorded instead, and settings is the way back — and the
+/// last of those three was a sentence this screen could not act on. **SHIP-131 makes the second half
+/// true**: the three reasons `Docs/01` §4.4 names are offered, one is chosen, and it is queued as
+/// `POST /v1/jobs/{id}/milestones` with `proof.exception_reason` (SHIP-116).
+///
+/// `Docs/07` §7 calls a camera flow that dead-ends on a denied permission a defect. What makes the
+/// difference between a defect and a route through the job is not the copy; it is that the button
+/// underneath it queues something.
+///
+/// ## The reason is reachable when the camera works, and that is not scope creep
+///
+/// Only one of `Docs/01` §4.4's three reasons is about the camera. `recipient_objected` and
+/// `location_unsafe` are conditions of the **delivery**, and a driver who meets either while holding
+/// a perfectly good camera has the same problem SHIP-131 exists to solve — they are standing at a
+/// delivery point unable to finish the job. So the working screen carries a quiet way to the same
+/// panel, under the shutter rather than beside it: photographing is the ordinary path and stays the
+/// obvious one.
+///
+/// ## Choosing and recording are two taps, deliberately
+///
+/// A reason cannot be taken back from this screen — `Docs/01` §4.3 requires every one to be recorded
+/// and there is no endpoint that removes one — and one-tap-per-reason is three targets a gloved
+/// thumb can hit by accident in the rain. The driver selects, reads what they selected, and records.
 ///
 /// ## The screen holds the camera, and gives it back
 ///
@@ -44,6 +64,16 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
   ProofCamera? _camera;
   ProofCameraProblem? _problem;
   var _opening = true;
+
+  /// Whether the driver has asked to record a reason instead of photographing (SHIP-131).
+  ///
+  /// Always true once the camera has refused — there is nothing else this screen can offer — and
+  /// settable from the working screen by the driver who meets one of the two reasons that are not
+  /// about the camera at all.
+  var _reasoning = false;
+
+  /// The reason selected and not yet recorded. See the note on the class about the two taps.
+  ProofExceptionReason? _chosen;
 
   @override
   void initState() {
@@ -117,22 +147,54 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
     if (!queued && mounted) await _open();
   }
 
+  /// Records the selected reason and gives the camera back (SHIP-131).
+  ///
+  /// The camera is released before the queue write rather than after it, for the reason [_shutter]
+  /// releases it before compressing: the driver has finished with the preview, and holding a camera
+  /// open through a database write is a warm handset for no purpose.
+  Future<void> _record() async {
+    final reason = _chosen;
+    if (reason == null) return;
+
+    await _camera?.stop();
+    if (mounted) setState(() => _camera = null);
+
+    await ref.read(captureProofProvider(widget.jobId).notifier).queueException(reason);
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(captureProofProvider(widget.jobId));
+
+    // Once the camera has refused there is nothing else to offer, so the reason panel is not
+    // something the driver has to ask for. `Docs/07` §7's dead end is precisely the screen that
+    // makes them.
+    final blocked = _problem != null || (!_opening && _camera == null);
 
     return Scaffold(
       appBar: AppBar(title: const Text('Photograph the delivery')),
       body: ProviderOnly(
         child: switch (state.stage) {
           ProofCaptureStage.queued => _Queued(onDone: () => Navigator.of(context).pop()),
+          ProofCaptureStage.reasonRecorded =>
+            _ReasonRecorded(onDone: () => Navigator.of(context).pop()),
           ProofCaptureStage.compressing => const _Working(),
-          _ => _CameraOrReason(
+          _ when blocked || _reasoning => _Reason(
+              // The words are `PermissionCopy.cameraDeclined` only when the camera is why. A driver
+              // whose recipient objected is not being told their camera will not open.
+              blocked: blocked,
+              chosen: _chosen,
+              failure: state.message,
+              onChoose: (reason) => setState(() => _chosen = reason),
+              onRecord: _record,
+              onBack: blocked ? null : () => setState(() => _reasoning = false),
+            ),
+          _ => _CameraOrOpening(
               opening: _opening,
-              problem: _problem,
               camera: _camera,
               failure: state.message,
               onShutter: _shutter,
+              onCannotPhotograph: () => setState(() => _reasoning = true),
             ),
         },
       ),
@@ -140,51 +202,30 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
   }
 }
 
-/// The preview and the shutter, or the sentence explaining why there is neither.
-class _CameraOrReason extends StatelessWidget {
-  const _CameraOrReason({
+/// The preview and the shutter, while there is a camera to draw one with.
+class _CameraOrOpening extends StatelessWidget {
+  const _CameraOrOpening({
     required this.opening,
-    required this.problem,
     required this.camera,
     required this.failure,
     required this.onShutter,
+    required this.onCannotPhotograph,
   });
 
   final bool opening;
-  final ProofCameraProblem? problem;
   final ProofCamera? camera;
   final String? failure;
   final Future<void> Function() onShutter;
+  final VoidCallback onCannotPhotograph;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    if (opening) {
+    if (opening || camera == null) {
       return const Center(
         key: Key('proof-capture-opening'),
         child: CircularProgressIndicator(),
-      );
-    }
-
-    final blocked = problem;
-    if (blocked != null || camera == null) {
-      return Padding(
-        key: const Key('proof-capture-blocked'),
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Icon(Icons.no_photography_outlined, color: theme.colorScheme.error),
-            const SizedBox(height: 12),
-            // SHIP-179's own words. Australian English, says what happens next, and — importantly —
-            // says the delivery can still be finished, which is what stops this being the dead end
-            // `Docs/07` §7 calls a defect. SHIP-131 is what makes the second half of the sentence
-            // true from this screen.
-            Text(PermissionCopy.cameraDeclined, style: theme.textTheme.bodyLarge),
-          ],
-        ),
       );
     }
 
@@ -202,7 +243,7 @@ class _CameraOrReason extends StatelessWidget {
             ),
           ),
         Padding(
-          padding: const EdgeInsets.all(20),
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
           child: SizedBox(
             width: double.infinity,
             child: FilledButton(
@@ -213,7 +254,182 @@ class _CameraOrReason extends StatelessWidget {
             ),
           ),
         ),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: TextButton(
+            // Quiet, and under the shutter rather than beside it: photographing is the ordinary path
+            // and stays the obvious one. It is here because only one of `Docs/01` §4.4's three
+            // reasons is about the camera — see the note on the screen.
+            key: const Key('proof-cannot-photograph'),
+            onPressed: onCannotPhotograph,
+            child: const Text('I cannot photograph this delivery'),
+          ),
+        ),
       ],
+    );
+  }
+}
+
+/// `Docs/01` §4.4's exception path: the three reasons, and the one that was chosen (SHIP-131).
+///
+/// **Not an error screen, and it must never be drawn as one.** An exception is evidence rather than
+/// the absence of it — a reason from a closed list, recorded in the same transaction and the same
+/// table as the photographs — and a driver who reads this as a failure will keep trying the camera
+/// at a door somebody is waiting behind.
+///
+/// There is deliberately **no free-text option**. `Docs/01` §4.4 wrote the list closed and `Docs/04`
+/// §5 gives the reason: a reason nobody can group is a moderation queue nobody can triage. A
+/// driver's own words are not lost — the milestone's `reason` field is optional, 500 characters and
+/// one row away, and goes beside a selection rather than instead of one. That field has no control
+/// on this screen yet, which is worth knowing and is not this ticket.
+class _Reason extends StatelessWidget {
+  const _Reason({
+    required this.blocked,
+    required this.chosen,
+    required this.failure,
+    required this.onChoose,
+    required this.onRecord,
+    required this.onBack,
+  });
+
+  /// Whether the camera is why this panel is showing, which decides the sentence at the top.
+  final bool blocked;
+
+  final ProofExceptionReason? chosen;
+  final String? failure;
+  final void Function(ProofExceptionReason) onChoose;
+  final Future<void> Function() onRecord;
+
+  /// Back to the preview, or `null` when there is no preview to go back to.
+  final VoidCallback? onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return ListView(
+      key: const Key('proof-capture-blocked'),
+      padding: const EdgeInsets.all(24),
+      children: <Widget>[
+        Icon(
+          Icons.no_photography_outlined,
+          // The camera's colour scheme, not the error one. `Docs/01` §4.4 makes this a route
+          // through the job rather than a fault, and a red icon says the opposite of the copy.
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+        const SizedBox(height: 12),
+        Text(
+          // SHIP-179's own words when the camera is why: Australian English, says what happens next,
+          // and says the delivery can still be finished. The other sentence is for a driver whose
+          // camera is working perfectly and whose problem is the delivery point.
+          blocked
+              ? PermissionCopy.cameraDeclined
+              : 'You can record why there is no photograph and finish the delivery. Shipper keeps '
+                  'the reason with the delivery, and the customer is shown it.',
+          key: const Key('proof-exception-preamble'),
+          style: theme.textTheme.bodyLarge,
+        ),
+        const SizedBox(height: 24),
+        Text(
+          'Why is there no photograph?',
+          style: theme.textTheme.titleSmall?.copyWith(color: theme.colorScheme.primary),
+        ),
+        const SizedBox(height: 8),
+        // `RadioGroup` rather than a `groupValue` on each tile: the per-tile form is deprecated
+        // after Flutter 3.32 and `make flutter-analyze` treats an `info` as a failure, so the
+        // deprecated shape would not have got past the gate.
+        RadioGroup<ProofExceptionReason>(
+          groupValue: chosen,
+          onChanged: (picked) {
+            if (picked != null) onChoose(picked);
+          },
+          child: Column(
+            children: <Widget>[
+              for (final reason in ProofExceptionReasonCopy.offered)
+                RadioListTile<ProofExceptionReason>(
+                  // Keyed by the wire form rather than the label: a test naming
+                  // `proof-exception-camera_unavailable` is naming the contract, and the label is
+                  // copy that may be reworded.
+                  key: Key('proof-exception-${reason.wireName}'),
+                  value: reason,
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(reason.driverPrompt),
+                ),
+            ],
+          ),
+        ),
+        if (failure != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            failure!,
+            key: const Key('proof-exception-failed'),
+            style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.error),
+          ),
+        ],
+        const SizedBox(height: 16),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton(
+            key: const Key('proof-exception-record'),
+            // Disabled until something is selected. Two taps, and the second is the commitment —
+            // see the note on the screen about why one is not enough.
+            onPressed: chosen == null ? null : () => unawaited(onRecord()),
+            style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 20)),
+            child: const Text('Record this and finish the delivery'),
+          ),
+        ),
+        if (onBack != null)
+          TextButton(
+            key: const Key('proof-exception-back'),
+            onPressed: onBack,
+            child: const Text('Take the photograph instead'),
+          ),
+      ],
+    );
+  }
+}
+
+/// A reason is on the device, in the queue, and there will be no photograph.
+///
+/// **Different words from [_Queued], and that is the whole reason the stage exists.** "Photograph
+/// saved" said about a recorded exception is a driver who believes they photographed a delivery they
+/// did not, and finds out weeks later in a dispute.
+class _ReasonRecorded extends StatelessWidget {
+  const _ReasonRecorded({required this.onDone});
+
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Padding(
+      key: const Key('proof-exception-recorded'),
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(Icons.check_circle_outline, color: theme.colorScheme.primary),
+          const SizedBox(height: 12),
+          Text('Reason recorded', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 8),
+          Text(
+            // The promise `Docs/07` §4 makes, said precisely: "sent" would be a lie on a phone with
+            // no signal, and the pending indicator would then contradict this screen. It also says
+            // the delivery is done, because that is the question the driver is actually asking.
+            'The delivery is recorded as complete, with the reason there is no photograph. It is on '
+            'this phone and Shipper will send it when there is a connection.',
+            style: theme.textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 24),
+          FilledButton(
+            key: const Key('proof-exception-done'),
+            onPressed: onDone,
+            child: const Text('Back to the delivery'),
+          ),
+        ],
+      ),
     );
   }
 }

@@ -463,6 +463,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-100** | M3 | Flutter provider job detail and bid placement — one job over `GET /v1/jobs/open/{id}` and an offer over `POST /v1/jobs/{id}/bids`. **The bid is sent directly and never queued**, which `Docs/07` §4 requires and SHIP-124's private `OperationKind` constructor already made impossible to get wrong; what makes a retry safe is one `ActionKey` per action against SHIP-84's stored key column. It also **closes §9's client-side budget guard** by holding every provider-facing model to a closed key set — *see below* |
+| **SHIP-101** | M3 | Flutter provider bid list — `/bids` over `GET /v1/fleet/bids`, grouped by status in `Docs/02` §4's own order, and **the ticket that closes §6's third category** after three waves in it. The endpoint offers two ways to group and both are used: picking a group **re-reads** rather than filtering, because a cursor issued for one question does not answer another. Finding: **no endpoint serves a provider the job behind a closed bid**, which is SHIP-129's gap seen from the other end. The budget mutation produced a **surviving third form** — a "budget supplied" flag with no field at all, which no existing guard could see — and the screen-level guard that now catches it — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
@@ -489,6 +490,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-127** | M4 | Flutter four-hour unsynced nudge — `Docs/02` §3.1's second rung, and **a prompt rather than a fourth line in SHIP-126's bar**: a card over a scrim, above the router, dismissed by an explicit tap and by nothing else. It measures `enqueued_at` of the oldest **pending or in-flight** operation and excludes quarantined work, because the whole content of the prompt is *go and find signal*. **No timer at all** — a published snapshot and the clock at build time, because every trigger that brings a person back to the app already publishes one. Finding: **the queue's clock and the nudge's clock have to be the same one**, which no fixture had needed until now. The four hours is a value rather than a constant and **should not stay on the device** — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
 | **SHIP-130** | M4 | Flutter camera capture with on-device compression — **`camera` and not `image_picker`**, because the one-line answer hands the capture to the manufacturer's camera application and several of those keep a copy in `DCIM/Camera`, which no Dart can prevent or observe. The negative is proved from the two places that can enforce one: **no Android media permission and no iOS photo-library string**, both asserted. Compression is **pure Dart** so a host test measures it on real JPEGs, EXIF included. It also builds the **three-request upload exchange** SHIP-125 left as an `UnimplementedError` — and corrects that comment, which named a multipart send the platform does not have. `delivered` becomes recordable from the app for the first time — *see below* |
+| **SHIP-131** | M4 | Flutter camera permission fallback — `Docs/01` §4.4's three reasons, chosen and queued as `POST /v1/jobs/{id}/milestones` with `proof.exception_reason`. **The copy was already right and the button under it did nothing**, which SHIP-130 said in as many words when it declined to offer one. Queued as `OperationKind.milestone` and not `proof` — there is no file — which is also what puts a recorded exception in the driver's own pending log. The confirmation is **its own stage**, because "Photograph saved" about an exception is a driver who believes they photographed a delivery they did not. Deliberate scope: the reason is reachable with a **working** camera, since only one of the three is about the camera at all — *see below* |
+| **SHIP-133** | M4 | Flutter customer tracking view — `/jobs/{id}/tracking` over SHIP-115a's three-endpoint shelf. **"Confirmed" needed no predicate**: everything the endpoint serves has been accepted, and what is unconfirmed is on the *provider's* handset in SHIP-124's queue, which a customer must never see. Branches on `exception_reason` and never on a missing `download_url` — the mutation draws an expired photograph as a reason nobody recorded. **Nothing is cached, because a proof response is a set of expiring credentials.** Finding: **the recipient name and the delivery note `Docs/01` §4.4 requires cannot be shown** — no column holds either, and this is the first ticket where a *customer* can see the gap — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
@@ -10316,6 +10319,386 @@ ticket takes.
 | Keep the leading zero in `phonePattern`, so a local-form number is not normalised | **Caught.** `the local form` and `spaced and bracketed` both returned nothing — which is the defect `make verify` found in the first place, now held by a test |
 
 **Nothing was needed from `internal/config`.**
+### SHIP-101 — the screen the read was written for, and the guard the invariant did not have
+
+`/bids` — every offer in every negotiation this provider is in, grouped by status, over
+`GET /v1/fleet/bids` (SHIP-101a). **It closes §6's third category**, which this ticket has been the
+sole occupant of for three waves: every dependency met, and nothing on the served surface to read.
+
+#### The grouping is the client's, and the endpoint offers two ways to do it
+
+`Docs/10` §4.5's envelope is a flat array with a cursor, so a response of named buckets would page
+each bucket separately or not at all. What SHIP-101a gave the screen instead is **both** halves:
+`?status=`, which runs in SQL, and a `status` on every row. Both are used, and which is in force is
+one field:
+
+| What the provider did | What happens |
+|---|---|
+| opened the screen | one read of every status, grouped on the device into `Docs/02` §4's order |
+| picked a group | the platform is asked for that group, from the first page |
+
+**Picking a group re-reads rather than filtering, and that is not a preference.** A cursor issued for
+one question does not answer another, so keeping it would pair a position with a list it was never a
+position in. The rows on screen are dropped in the same assignment, which is what stops one frame of
+the old group being drawn under the new heading.
+
+**The order comes from `BidStatus.values` and never from the rows.** `bid_status.gen.dart` is
+generated from `contracts/statuses.yaml` in `Docs/02` §4's own order and keeps `unknown` last
+deliberately — "so that a screen grouping by this enumeration gets that order without writing a
+second list". This is that screen, and the fixture arrives deliberately shuffled so a build that
+grouped in arrival order fails.
+
+**A status nothing is in gets no heading**, and the chips are built from what has been read rather
+than from all eight. `Draft` is the case that makes this more than tidiness: `Docs/02` §4 enumerates
+it and **no client can ever obtain one** — no endpoint creates one and none returns one — so a
+compiled-in list of eight would put a permanently empty group on every provider's screen.
+
+#### The finding: no endpoint serves a provider the job behind a closed bid
+
+A row can name its job and cannot describe it. `Bid` carries `job_id` and nothing else of the job,
+which is exactly what makes `Docs/01` §4.3 structural here — and the only job read a provider has is
+`GET /v1/jobs/open/{id}`, which answers `404` for **a job that is no longer open**. So "View the job"
+works while an offer is live and stops working the moment it is accepted, rejected or expires, which
+is the half of this screen a provider will ask about first.
+
+The screen does not try to be more specific than the platform was: the card leads to the same route
+either way and the destination shows the platform's own refusal. **This is a read gap rather than a
+rendering one** — it is the mirror of SHIP-129's, recorded in the same words: *no endpoint serves an
+awarded job to the provider delivering it*, and now *no endpoint serves a bid-on job to the provider
+who bid on it once the bidding is over*. One read closing both is the obvious shape, and it is
+nobody's ticket.
+
+#### `ProviderOnly` wraps a **widget**, not a subtree, and that is worth stating once
+
+`ProviderOnly` only *mounts* its child for a provider, so a `ref.watch(myBidsProvider)` in the
+screen's own `build` runs before the role is ever consulted — one `GET /v1/fleet/bids` issued on
+behalf of every customer who followed the link. The list is therefore a `const _MyBids()` handed
+over rather than a tree built in place. **Found by the test that asserts the fake repository recorded
+no read at all**, which is the assertion worth copying to the next provider-only surface: the pixels
+were already right.
+
+None of it is an authorisation control. `GET /v1/fleet/bids` scopes to the caller in its `WHERE`
+clause, so a customer's answer is an empty page by construction rather than by permission.
+
+#### The budget mutation, and the guard this repository did not have
+
+The wave's required mutation, run three ways with the file snapshotted and restored by checksum.
+
+| Mutation | Source scan | Closed key set | **Screen test** |
+|---|---|---|---|
+| `budget_cents` on `Bid`, rendered | **fails** | **fails** | **fails** |
+| the same field as `max_price`, neutral copy | passes | **fails** | **fails** |
+| **no field at all** — `'The customer has set a maximum for this job.'` | passes | passes | **fails** |
+
+**The third row is the finding.** `Docs/01` §4.3 forbids the budget "not as an amount, not as a band,
+and **not as a 'budget supplied' flag**", and the third clause is the one no existing guard could
+see: the source scan is a spelling check over `budgetCents|budget_cents`, and the closed key set
+holds a *model* that this mutation never touches. A provider surface can therefore disclose that a
+maximum exists — which is precisely what the clause forbids — with every guard in the repository
+green.
+
+So `my_bids_test.dart` adds the third axis: a page whose rows carry **seven spellings and three
+values** of a customer's maximum, decoded through the real `Bid.fromJson`, with the assertion made
+against **pixels** rather than against keys. It catches all three mutations, and it is the only thing
+that catches the third. The salt matches
+`budget_stays_on_the_customer_side_test.dart`'s deliberately, because the reason that file gives for
+using seven names — a search for "budget" cannot see `max_price` — applies unchanged one layer up.
+
+**The same guard is missing from `provider_job_feed_test.dart`'s budget group**, which asserts on
+values and not on the words. It was not added there: that file belongs to `features/jobs` and the
+observation is worth more written down than smuggled into another ticket's diff.
+
+#### A trap that cost a file, and nearly cost the work beside it
+
+**`perl -pi -e "s/…/…/"` with a Dart `${…}` in the replacement is a shell-interpolated string, and
+perl parses it as its own interpolation.** It died mid-file — `Undefined subroutine &main::audFromCents`
+— on a `-i` rewrite, which is a partial write to a source file with the work of an hour in it. It
+survived here, and it is the same class of hazard as the `git checkout` in `CLAUDE.md`'s revert
+recipe: a command that reads as a small edit and can truncate a file. Use the editing tool.
+
+#### Shared surfaces
+
+`Docs/11` §3 and `Docs/11-done.txt`. Nothing else: the route is declared in `app_router.dart`, which
+`Docs/10` §9.2 does **not** list as shared — the Dart router is per-app and the shared route manifest
+is the Go one.
+
+#### What is not here, and cannot be
+
+**SHIP-101 does not take revise or withdraw with it**, though `bidding_repository.dart` predicted it
+would at SHIP-100. Both end or change a commitment somebody else is relying on and want a
+confirmation flow rather than a button on a list; a `PATCH` behind a chevron is the shape where an
+offer gets revised by a mis-tap on a moving train.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **833 host tests**, up from 809, the analyzer clean, and the environment
+test per build flavour. `make verify` does not cover this ticket — that script exercises HTTP
+endpoints and this one adds none. What is held by widget test is the whole journey: the session, the
+router, the guard, the shell, the button on the feed, the grouping, the paging, the narrowing, the
+two failure states, the customer's refusal, and the budget.
+
+### SHIP-133 — the customer's side of a delivery, and the two things "confirmed" turns out to mean
+
+`/jobs/{id}/tracking`, over the three-endpoint shelf SHIP-115 and SHIP-115a built:
+`/delivery/detail`, `/delivery/milestones` and `/delivery/proof`, read together and drawn in one
+frame.
+
+#### "The latest confirmed milestone" needed no predicate, and finding that out is the ticket
+
+The *Done when* reads as though a client has to tell confirmed milestones from unconfirmed ones.
+**It does not, and the reason is worth writing down because it is the shape of the whole feature:**
+this endpoint *is* the platform's record. Every row carries `accepted_at`, which is when the platform
+received it and is `required` in the contract, so a row cannot be on this list without having been
+confirmed. `latest` is `milestones.first` and nothing else.
+
+**What is genuinely unconfirmed is on the other party's handset**, in SHIP-124's durable queue, and
+`DeliveryScreen` is the screen that shows it — marked pending in a word, an icon and a sentence,
+because `Docs/02` §3.1 requires exactly that of optimistic local state. So `features/delivery` now
+holds both parties' views of one delivery, and the distinction between them is the distinction
+between a claim and a record. **A customer must never be shown the first**: a milestone recorded in a
+valley an hour ago is not a fact about their delivery.
+
+`first` rather than a search or a sort, because the endpoint orders by the **actor's** clock, newest
+first — deliberately not arrival order, since a batch recorded through a morning with no signal
+arrives all at once and the sync order would show a delivery that ran backwards. A client with a
+second opinion about that order is a client showing the wrong thing.
+
+#### The fifth milestone is readable and is still not recordable
+
+`Milestone` is four values, deliberately: it is *the milestones this app records*, and
+`driver_assigned` has an endpoint of its own that the milestone endpoint refuses with a `422`
+pointing there. `/delivery/milestones` serves **all five**, so a customer's screen needs a name for
+the one the enumeration does not have.
+
+**A fifth enum value was the wrong fix** and is worth recording as a near miss: `Milestone.offered`
+is derived as `values.where((m) => !m.needsProof)`, so adding `driverAssigned` would have put a
+button for it in front of a driver unless a second flag were added to take it out again. The answer
+is `milestoneLabel(wire)` beside the enumeration — four labels **derived** from it and therefore
+unable to drift, and the fifth named once. An unrecognised sixth is returned unaltered rather than
+dropped, which is `Docs/07` §6's rule applied to a value rather than to a field.
+
+#### Every path on the shelf has five segments, and the four-segment form is not a 404
+
+`GET /v1/jobs/{id}/delivery` and `GET /v1/jobs/open/{id}` both match `/v1/jobs/open/delivery` with
+neither more specific, and Go's `ServeMux` **panics at registration** — the service does not start.
+`delivery_repository_test.dart`'s first three tests assert the URL rather than the response for that
+reason: the mistake this client could make is one the platform cannot answer, so no integration test
+would ever catch it.
+
+#### `download_url` is a credential, and three decisions follow from that
+
+**Branch on `exception_reason`, never on a missing URL.** The contract says so and the mutation shows
+why: flipping the branch to `downloadUrl == null` draws an *expired photograph* as a reasoned
+exception — inventing a reason nobody recorded — and passes every other test in the file.
+
+**Nothing is cached.** A cached proof response is a cache of expiring links, so the controller holds
+one in memory for the life of the screen, the provider is auto-disposed, and leaving and returning
+re-reads. The endpoint mints fresh URLs per request, so that is the supported path rather than a
+workaround.
+
+**A further page of milestones does not re-read the proof.** It would re-sign every photograph
+already on screen and reload each one. Asserted by counting the reads on the fake rather than by
+looking at pixels, because the pixels would be identical.
+
+**An expired link is copy, not an error.** `flutter_test` answers every HTTP request `400`, so
+`Image.network` lands in its `errorBuilder` in every host test — which is not an obstacle but the
+exact path a customer meets when a short-lived link runs out. The words name both causes the customer
+cannot distinguish and give the one action that fixes either.
+
+#### The finding: two fields `Docs/01` §4.4 requires cannot be shown
+
+**The recipient's name and the delivery note.** §4.4 requires a delivered job to carry both alongside
+its proof, `Docs/02` §3 repeats it naming §4.4 as authoritative, and **no column holds either** —
+`Docs/11` §4 has carried SHIP-118 as partly done for this since wave 7, and `000605`'s own comment
+names SHIP-123. This screen does not model them, draw them, or leave a space where they would go: a
+customer surface implying a field the platform cannot supply is worse than one honestly short of it.
+**SHIP-133 is now the second ticket blocked by that gap**, and the first that a customer can see.
+
+#### `driver_mobile` is not modelled, which is the client's half of a platform decision
+
+The platform sends it to the provider and **blanks it in the service** for the customer, rather than
+leaving the handler to omit it — "a handler that never receives a number cannot render one"
+(SHIP-115a). `DeliveryDriver` is read by a customer's screen, so the field is one that can never
+arrive, and modelling it would put a permanent null on a customer surface that a later screen could
+draw the day something else populated it. That is the one-shape-with-a-flag arrangement the platform
+declined twice — once for the budget, once for this.
+
+#### The button is on every job, and the platform is what makes that safe
+
+The obvious refinement is to hide "Track this delivery" until a job is awarded. **Not taken**, for the
+reason `app_router.dart` gives about role-aware redirects: a rule on the device about when a screen
+is worth showing is a copy of `Docs/02` §2's table living where nobody maintains it.
+
+`Service.partyTo` asks whether the caller is the job's **customer** before it asks anything about
+status, so the shelf answers a draft's owner with `driver_assigned: false` and two empty lists rather
+than a refusal — read out of `internal/delivery/read.go` rather than assumed. The tracking screen's
+empty state is written for exactly that case.
+
+#### Mutations
+
+| Mutation | Outcome |
+|---|---|
+| branch on `downloadUrl == null` instead of `exception_reason` | **fails** — an exception drawn for a photograph that had no link |
+| draw `accepted_at` where `recorded_at` belongs | **fails** — the fixture puts the two clocks three days apart |
+| `latest` reads `milestones.last` | **fails** — the newest row is not the one at the end |
+
+The second is the one worth keeping: a fixture whose two clocks are equal would pass all three, which
+is the same trap wave 8 recorded twice in the shape of a fixture reading two *different* clocks. Here
+it is the inverse — one clock written into two fields — and it is just as invisible.
+
+#### Shared surfaces
+
+`Docs/11` §3 and `Docs/11-done.txt`. No route manifest, no migration, no `$ref`: this ticket consumes
+three endpoints that already exist and adds none.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **866 host tests**, up from 833, the analyzer clean, and the environment
+test per build flavour. `make verify` does not cover it — no endpoint is added. The journey is walked
+from the customer's own job screen through the button, which is what makes the missing
+`_signedInPatterns` entry a failing test rather than a link that silently lands on the home shell.
+
+### SHIP-131 — the sentence that was already right, and the button under it that did nothing
+
+`Docs/01` §4.4's exception path, from the capture screen: the three reasons, one chosen, queued as
+`POST /v1/jobs/{id}/milestones` with `proof.exception_reason`.
+
+**The copy was written two tickets ago and was never the problem.** `PermissionCopy.cameraDeclined`
+(SHIP-179) has said the honest thing since it was written — the camera cannot be opened, a reason can
+be recorded instead, settings is the way back — and SHIP-130's own header says why the second clause
+was not actionable: "offering a button that queued nothing would be a worse dead end than naming the
+gap". That is the whole ticket. **What makes the difference between `Docs/07` §7's defect and a route
+through the job is not the sentence; it is that the button under it queues something.**
+
+`ProofExceptionReason` was generated at SHIP-56a and imported by nothing, with a comment naming this
+ticket as its first reader. It was, and the vocabulary needed no change.
+
+#### The reason is offered when the camera *works*, and that is deliberate scope
+
+**Only one of `Docs/01` §4.4's three reasons is about the camera.** `recipient_objected` and
+`location_unsafe` are conditions of the delivery, and a driver who meets either while holding a
+perfectly good camera has exactly the problem this ticket exists to solve — standing at a delivery
+point unable to finish the job. A build that offered the exception path only on a *denied permission*
+would satisfy the *Done when* as written and leave two thirds of §4.4 unreachable.
+
+So the working screen carries a quiet way to the same panel, under the shutter rather than beside it:
+photographing stays the obvious path. **The two entrances say different things**, which is the half
+worth testing — a driver whose camera is fine must not be told it will not open, which is a support
+call made out of a reused string.
+
+#### Two taps, and the second is the commitment
+
+A reason cannot be taken back from this screen: `Docs/01` §4.3 requires every one to be recorded and
+no endpoint removes one. Three one-tap targets are three ways for a gloved thumb in the rain to
+finish a delivery by accident, so the driver selects, reads what they selected, and records. The
+mutation that enables the button with nothing chosen fails.
+
+#### `OperationKind.milestone`, not `OperationKind.proof`, and the reason is structural
+
+There is no file. `proof` exists because SHIP-130 queues an image the sync worker uploads in a
+three-request exchange; an exception uploads nothing, contacts no object store, and is one `POST`. So
+it is a milestone operation with `attachmentPath` null — **and that is also what puts it in the
+delivery screen's own log**, which reads `OperationKind.milestone` rows on the job's ordering key and
+now shows the recorded exception as a pending `Delivered`. A driver has to be able to see that what
+they recorded is on the device and not yet sent, and that came free from choosing the right kind.
+
+The mutation to `OperationKind.proof` fails in two files, which is the shape of a good one: the queue
+row is wrong *and* the log the driver reads goes empty.
+
+#### The confirmation is its own stage, because the words are the last thing a driver reads
+
+`ProofCaptureStage.reasonRecorded` rather than a flag beside `queued`. **"Photograph saved" said
+about a recorded exception is a driver who believes they photographed a delivery they did not**, and
+finds out weeks later in a dispute. Both stages confirm the same queue state and are different facts
+about the world.
+
+The wording is also careful that this is not a failure. An exception is evidence rather than the
+absence of it — a reason from a closed list, in the same transaction and the same table as the
+photographs — so the icon is the primary colour rather than the error one and the sentence says the
+delivery is complete.
+
+#### `RadioGroup` rather than `groupValue`, which the gate decided
+
+The per-tile `groupValue`/`onChanged` pair is deprecated after Flutter 3.32, and
+`make flutter-analyze` treats an analyzer `info` as a failure — so the obvious shape does not pass
+the gate. Worth knowing before the next screen with a choice on it; it was found by removing two
+`// ignore:` comments to check whether they were load-bearing, which they were.
+
+#### What is still missing, and it is one field rather than a design
+
+**The driver's own words have no control on this screen.** `MilestoneRecording.reason` is optional,
+500 characters, and goes *beside* a selected reason rather than instead of one — the contract says so
+in as many words, and `Docs/04` §5's argument for a closed list assumes it. "The recipient asked me
+not to photograph their door" is the sentence that makes a moderation queue triageable, and there is
+nowhere to type it. A text field and one line in the body; it is not this ticket and it should be
+one.
+
+#### Mutations
+
+| Mutation | Outcome |
+|---|---|
+| `OperationKind.proof` instead of `milestone` | **fails**, in two tests — the row and the driver's log |
+| confirm with `_Queued`'s "Photograph saved" | **fails** |
+| record enabled with nothing selected | **fails** |
+
+#### Shared surfaces
+
+`Docs/11` §3 and `Docs/11-done.txt`. No route — the panel is a state of the screen SHIP-130 already
+declared, reached from the same `deliveryProof` location.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **871 host tests**, up from 866, the analyzer clean, and the environment
+test per build flavour. The journey runs through the real router and SHIP-124's real queue over a
+real SQLite file, with a **sender that never succeeds** — an accepted operation is deleted, so a
+queue emptied by success would make every "it was queued" assertion pass against a build that queued
+nothing. The camera is *refused* rather than absent, which is what a revoked permission looks like
+from Dart, and it is still supplied: under `testWidgets`' fake clock a platform-channel reply is
+never delivered, so the real `availableCameras()` does not throw — it never completes.
+
+### SHIP-102 is **not done**, and is here because it is §6's third category again
+
+**Nothing was built for it and nothing should have been.** It was dispatched to wave 9's Flutter
+track and trimmed on the first hour's reading, on the same grounds SHIP-101 was struck for three
+waves and SHIP-114 for five: **every dependency met, and unbuildable in fact.** It is recorded in
+this section rather than in §6 so that the evidence sits beside the ticket that found it; the row
+itself belongs to whoever next reconciles §6.
+
+Its *Done when* is "customer compares price, timing, provider profile, and vehicle side by side", and
+**all four clauses are unserved**. Measured against `services/core/cmd/api/routes_golden.txt` and the
+contracts at `ac62673`, not inferred from the domain:
+
+| What the screen needs | What serves it |
+|---|---|
+| the bids on one job | **nothing.** Line 36 is `POST /v1/jobs/{id}/bids`; the only `GET` under that tree is line 39, `…/bids/{bid_id}/history`, which needs a bid id the customer would have to hold already |
+| price and timing | on the `Bid` shape — and reachable only through the list that does not exist |
+| the provider's profile | **nothing.** `GET /v1/fleet/profile` is the *caller's own* |
+| the vehicle offered | **nothing.** `GET /v1/fleet/vehicles` is likewise the caller's own |
+
+**Both dependencies are on the done list, which is what makes this the third category rather than an
+ordinary block.** SHIP-77 landed and SHIP-96 landed — and SHIP-96's own entry above records that it
+shipped "no migration, no route, no `$ref`, no `routes_golden.txt` line", because what it built was
+the visibility *rules* over SHIP-88's existing read. A dependency column cannot see that.
+
+**Two files predicted this and neither is a route.** `routes_bidding.go` reserves
+`GET /v1/jobs/{id}/bids` for SHIP-102 in three separate comments, from SHIP-84 onwards; and
+`contracts/paths/fleet.yaml` says, of the provider profile, "the customer's view of a provider is a
+separate schema arriving with SHIP-96". **A reservation is not a route and a forward reference is not
+a schema**, and both read exactly like a commitment that was met.
+
+**What would close it is one read ticket** — call it SHIP-102a, in the shape SHIP-15r used for
+SHIP-101a, SHIP-115a and SHIP-120a: `GET /v1/jobs/{id}/bids`, `RequireUser`, the customer's view of
+every offer on their own job, whose element carries the bid **plus** a customer-facing provider
+summary and the vehicle the offer is made with. The privacy rule on it is a different one from
+`Bid`'s and needs stating rather than inheriting: this response crosses providers, so what one
+provider may learn about another through it is the question, and `GET /v1/fleet/bids`'s "never
+selected rather than refused" answer does not transfer.
+
+**The wave-9 dispatch brief listed `GET /v1/jobs/{id}/bids` as served.** It was written by asserting
+rather than measuring, in a brief whose own baselines were measured — which is this repository's
+recurring failure mode arriving in a document meant to prevent it. The check that caught it is
+`grep` against the golden file, and it took under a minute.
+
 
 ## 4. Partly done — do not treat these as finished
 

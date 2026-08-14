@@ -1,16 +1,19 @@
 /// Bidding — bids, counter-offers, negotiation, award (`Docs/07` §2).
 ///
-/// ## What is here (SHIP-100)
+/// ## What is here (SHIP-100, SHIP-101)
 ///
-/// `Docs/01` §4.2's first verb, and only the first: a provider offers to carry a job, for a price
-/// and against two commitments about timing, over `POST /v1/jobs/{id}/bids` (SHIP-84).
+/// `Docs/01` §4.2's first verb, and what became of it: a provider offers to carry a job, for a price
+/// and against two commitments about timing, over `POST /v1/jobs/{id}/bids` (SHIP-84) — and reads
+/// back every offer in every negotiation they are in over `GET /v1/fleet/bids` (SHIP-101a).
 ///
 /// - `bid.dart` — the `Bid` schema from `contracts/paths/bidding.yaml`, and `BidPlacement`, which
 ///   is an offer on its way *to* the platform.
 /// - `bid_status.dart` — the eight bid states of `Docs/02` §4, in their wire form.
-/// - `bidding_repository.dart` — the one endpoint a screen calls, and what is deliberately absent.
+/// - `bidding_repository.dart` — the two endpoints a screen calls, and what is deliberately absent.
 /// - `place_bid_controller.dart` — one offer, one idempotency key, and no queue.
 /// - `place_bid_panel.dart` — the form, the platform's answer, and the offer it recorded.
+/// - `my_bids_controller.dart` — the provider's own offers, and the two ways to group them.
+/// - `my_bids_screen.dart` — the list, grouped by status, with no field a budget could be in.
 ///
 /// ## Deliberately **not** offline-capable, and now enforced rather than stated
 ///
@@ -47,6 +50,13 @@
 ///
 /// Revising, withdrawing, countering and reading a negotiation's history are **served and
 /// deliberately not modelled**. An endpoint no screen calls is dead code that nothing holds to the
-/// contract; each arrives with the screen that needs it — the provider's own bid list for the first
-/// two, and the negotiation screens for the rest.
+/// contract; each arrives with the screen that needs it, and the negotiation screens (SHIP-103) are
+/// where the last three belong. SHIP-101 deliberately did **not** take revise and withdraw with it:
+/// both are writes that end or change a commitment somebody else is relying on, and both want a
+/// confirmation flow rather than a button on a list.
+///
+/// **The customer's half of bidding is not here and cannot be built.** SHIP-102 compares every
+/// offer on one job side by side, and no endpoint serves it: `routes_golden.txt` has no `GET`
+/// collection of a job's bids, and `contracts/paths/fleet.yaml` says in as many words that a
+/// customer's view of a provider is a schema that does not exist yet. See `Docs/11` §3.
 library;
