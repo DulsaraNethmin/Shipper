@@ -1320,3 +1320,353 @@ DriverMilestones:
           application/json:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- the delivery read shelf (SHIP-115a) --------------------------------------------------------
+
+DeliveryDetail:
+  get:
+    operationId: deliveryDetail
+    summary: Who is driving this delivery
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      The driver currently carrying the job (SHIP-115a). With `/delivery/milestones` and
+      `/delivery/proof` it is the whole of what the two parties to a job can read about how it is
+      being executed.
+
+      ## Who may call it
+
+      Two parties, and being either is decided from the job rather than from your role: **the
+      customer who owns the job**, and **the provider whose bid they accepted**. Anybody else gets
+      `404`, identical to a job that does not exist.
+
+      The assigned driver is not a reader here. They have `GET /v1/driver/jobs/{id}`, which serves
+      the one delivery their link grants.
+
+      ## A job with no driver yet answers 200, not 404
+
+      `driver_assigned` is `false` and the other fields are absent. An awarded job that nobody has
+      been put on is an ordinary state and both parties are entitled to see it — branch on
+      `driver_assigned`, never on a missing `driver_name`.
+
+      ## The live driver, not every driver the job has had
+
+      A provider replacing a driver ends one assignment and creates another, because a milestone is
+      attributed to the assignment that recorded it and re-pointing that would rewrite who did what.
+      This answers with whoever is carrying the goods now. The history is a support and dispute
+      question and no operation serves it.
+
+      ## `driver_mobile` reaches the provider and not the customer
+
+      The provider typed the number, so giving it back to them is not exposure. A driver has no
+      account and no way to consent, and `Docs/01` §4 asks the platform to minimise how far phone
+      numbers travel — the number is captured for support escalation, which is not a customer-facing
+      purpose. A customer's response simply does not carry the field.
+
+      ## The path has five segments and that is not cosmetic
+
+      `GET /v1/jobs/{id}/delivery` cannot be served: it and `GET /v1/jobs/open/{id}` both match
+      `/v1/jobs/open/delivery` with neither more specific, and the router refuses the pair at
+      startup. Every read on this shelf is therefore `/delivery/<something>`.
+    parameters:
+      - $ref: '#/JobID'
+    responses:
+      '200':
+        description: |
+          The driver on this delivery, or that there is not one yet.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DeliveryDetailView'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+DeliveryDetailView:
+  type: object
+  additionalProperties: false
+  required: [job_id, driver_assigned]
+  description: |
+    Who is carrying this delivery. Only `job_id` and `driver_assigned` are always present.
+  properties:
+    job_id:
+      type: string
+      format: uuid
+    driver_assigned:
+      type: boolean
+      description: |
+        Whether anybody is driving the job yet. When it is `false` no other field is present, and
+        that is a complete answer rather than a missing one.
+    assignment_id:
+      type: string
+      format: uuid
+      description: |
+        The assignment record. A driver has no account, so this is their identity for the length of
+        one job — it is what their milestones are attributed to.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    driver_name:
+      type: string
+      description: The name the transport provider wrote down.
+      example: Sam Patel
+    driver_mobile:
+      type: string
+      description: |
+        The driver's mobile in E.164. **Present for the transport provider and absent for the
+        customer** — see the operation. Do not treat its absence as a fact about the delivery.
+      example: '+61412345678'
+    assigned_at:
+      type: string
+      format: date-time
+      description: When the driver was put on the job, on the platform's clock, in UTC.
+      example: '2026-08-12T04:15:30.000Z'
+
+DeliveryMilestones:
+  get:
+    operationId: deliveryMilestones
+    summary: Every milestone recorded on this delivery
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      The delivery timeline (SHIP-115a): every milestone anybody has recorded on this job, whoever
+      recorded it and whether or not it moved the job.
+
+      ## This is the only place a milestone that moved nothing can be seen
+
+      A milestone is a claim that somebody did something, and it need not move the job. A driver who
+      reaches a pickup, finds nobody there and sets off again records `en_route_to_pickup` twice; a
+      queued update that syncs after the delivery has moved on is recorded as history without moving
+      the job backwards. **Neither writes a status change**, so neither appears in anything derived
+      from the job's status. Both appear here.
+
+      ## Who may call it
+
+      The same two parties as `/delivery/detail`, with the same `404` for anybody else.
+
+      ## Ordering, and why it is not arrival order
+
+      Newest first by `recorded_at` — the actor's clock, when they say they acted. That is
+      deliberately not the order the platform received them in: a batch recorded through the morning
+      in a yard with no signal arrives all at once, and showing the sync order would show a delivery
+      that ran backwards.
+
+      ## It pages, and `/delivery/proof` does not
+
+      Proof is bounded by the delivery — at most one photograph per milestone. Milestones are not:
+      repeats are a legitimate outcome, so this is an ordinary cursor collection. Pass `limit` and
+      the `next_cursor` you were given; `has_more` says whether there is another page, and a cursor
+      this endpoint did not issue is refused with `bad_request`.
+    parameters:
+      - $ref: '#/JobID'
+      - name: limit
+        in: query
+        required: false
+        description: |
+          How many milestones to return. Above the platform's maximum it is narrowed rather than
+          refused; a value that is not a positive whole number is refused.
+        schema:
+          type: integer
+          minimum: 1
+        example: 20
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          The `next_cursor` from the previous page. Omit it for the first page. It is opaque —
+          decoding one, or building one, is not something a client should do.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: |
+          A page of milestones, which may be empty — a job nobody has recorded anything on yet
+          answers `data: []` rather than `404`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/MilestonePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+MilestonePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/Milestone'
+    next_cursor:
+      type: string
+      description: |
+        Pass this back as `?cursor=` for the next page. Absent on the last page — read `has_more`
+        rather than inferring from its absence, because the first request looks the same.
+    has_more:
+      type: boolean
+
+# --- reissuing a driver's link (SHIP-109) -------------------------------------------------------
+
+DriverLink:
+  post:
+    operationId: reissueDriverLink
+    summary: Issue a new link for this delivery's driver
+    tags: [Delivery]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Another job-scoped link for the driver already on this job, **ending the previous one**
+      (SHIP-109). Call it when a driver has lost their link, when it has reached the wrong person,
+      or when the one you were given has expired.
+
+      Only the transport provider whose bid was accepted may call it. A driver cannot reissue their
+      own link — that is the point of a credential the provider controls.
+
+      ## What changes and what does not
+
+      Only the link. The driver, the assignment record and every milestone recorded against it stay
+      exactly where they are, and the job does not move. **Replacing a driver is a different act**:
+      an assignment's identity is fixed because milestones are attributed to it, so a new driver is
+      a new assignment rather than an edit to this one.
+
+      ## The previous link stops working immediately
+
+      The moment this returns, the link you were given before answers `404` on every driver
+      operation — the same answer a job that does not exist gives, because telling a holder that
+      their link *used* to work says something about a delivery they are no longer on.
+
+      There is nothing to un-revoke. Reissue again if you need another.
+
+      ## The response carries a credential
+
+      `driver_token` is the link itself. Forward it to your driver through whatever channel you
+      already use; Shipper sends no SMS. It is stored against your idempotency key for replay, so a
+      retry of *this* request returns the same token rather than minting a third one — but the key
+      protects the request, not the link, and a genuinely new call always supersedes.
+
+      ## A job with no driver
+
+      `404`. There is no link to reissue; assign a driver with `POST /v1/jobs/{id}/driver` first.
+      A job awarded to somebody else and a job that does not exist answer the same way.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '200':
+        description: |
+          A new link. The previous one no longer opens anything.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DriverLinkView'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          An identical request is still being handled (`idempotency_request_in_progress`), or this
+          key has already been used for a different request (`idempotency_key_reused`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+DriverLinkView:
+  type: object
+  additionalProperties: false
+  required: [job_id, assignment_id, driver_token, driver_token_expires_at, issued_at, issue_count]
+  description: |
+    A freshly issued driver link. The driver's name and number are not repeated here — this is about
+    the link, and the assignment is read from `/delivery/detail`.
+  properties:
+    job_id:
+      type: string
+      format: uuid
+    assignment_id:
+      type: string
+      format: uuid
+      description: The assignment this link opens. Unchanged by a reissue.
+    driver_token:
+      type: string
+      description: |
+        **The credential.** Anybody holding it can open this delivery until it expires. Forward it
+        to your driver and do not log it or store it anywhere it can be read back.
+    driver_token_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When this link stops working, in UTC. Read it rather than decoding the token, which is a
+        thing a client should never do.
+      example: '2026-08-19T04:15:30.000Z'
+    issued_at:
+      type: string
+      format: date-time
+      description: When this link was issued, in UTC. Not the assignment's creation time.
+      example: '2026-08-14T02:10:00.000Z'
+    issue_count:
+      type: integer
+      minimum: 1
+      description: |
+        How many links this assignment has been given, counting the one issued when the driver was
+        assigned. It is the only record a reissue leaves — the platform keeps no copy of a link it
+        has replaced.
+      example: 2

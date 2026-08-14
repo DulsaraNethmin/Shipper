@@ -384,14 +384,54 @@ func (s *Service) granted(
 		}
 	}
 
+	// **A new assignment mints a link; a repeated nomination re-signs the one it already has**
+	// (SHIP-109). Which of the two matters, because `driver_assignments.link_token_id` names the
+	// single link that opens the assignment and minting a fresh identifier is what ends the
+	// previous one.
+	//
+	// A repeat wrote no row, moved no job and emitted no event — it is the phone that lost the
+	// first response and asked again — so it must not revoke either. Re-signing hands that
+	// provider a working credential and leaves a driver already holding the link alone. See
+	// [DriverTokenIssuer.IssueAs].
+	if !created {
+		token, err := s.tokens.IssueAs(a.JobID, a.ID, a.LinkTokenID)
+		if err != nil {
+			return s.refused(fmt.Errorf("delivery: re-signing the link for %s on %s: %w",
+				a.ID, a.JobID, err))
+		}
+		return a, token, false, nil
+	}
+
+	assignment, token, err := s.issueLink(ctx, r, a)
+	if err != nil {
+		return s.refused(err)
+	}
+	return assignment, token, true, nil
+}
+
+// issueLink mints a link, makes it the only one that opens the assignment, and answers with both
+// (SHIP-109).
+//
+// The two callers are a new assignment and an explicit reissue, and they are the *only* two things
+// that revoke — which is what "invalidating the previous one" means as a property of the platform
+// rather than of one endpoint.
+//
+// In the caller's transaction, so a link that was returned but not recorded cannot exist. The
+// failure direction if the write were omitted is the bad one: the token would verify, the column
+// would still name the previous link, and the driver would be handed a credential that opens
+// nothing.
+func (s *Service) issueLink(ctx context.Context, r db.Runner, a Assignment) (Assignment, DriverToken, error) {
 	token, err := s.tokens.Issue(a.JobID, a.ID)
 	if err != nil {
-		// Inside the transaction, so this rolls the assignment back. An assignment that
-		// committed without a link would leave a driver on a job they cannot open, and nothing
-		// downstream would notice: the row is complete and the status is right.
-		return s.refused(fmt.Errorf("delivery: minting the link for %s on %s: %w", a.ID, a.JobID, err))
+		return Assignment{}, DriverToken{}, fmt.Errorf(
+			"delivery: minting the link for %s on %s: %w", a.ID, a.JobID, err)
 	}
-	return a, token, created, nil
+
+	issued, err := s.store.linkIssued(ctx, r, a.ID, token.ID)
+	if err != nil {
+		return Assignment{}, DriverToken{}, err
+	}
+	return issued, token, nil
 }
 
 // refused is the empty answer, so that a refusal cannot accidentally carry a token.
@@ -928,13 +968,99 @@ func (s *Service) AssignmentFor(ctx context.Context, r db.Runner, grant DriverGr
 		return Assignment{}, err
 	}
 
-	// One answer for two states, deliberately: a job with no live driver and a job whose live
-	// driver is somebody else both mean this link no longer opens anything, and telling them apart
-	// would say something about the job to a holder who is no longer on it.
-	if !hasDriver || live.ID != grant.AssignmentID {
+	// One answer for three states, deliberately: a job with no live driver, a job whose live
+	// driver is somebody else, and a link that has been reissued all mean this credential no
+	// longer opens anything. Telling them apart would say something about the delivery to a
+	// holder who is no longer on it — and the third is the one a stood-down driver's *browser*
+	// would report, because a driver portal keeps the link in session storage (SHIP-120).
+	//
+	// **The third clause is SHIP-109 and it is the reason the grant carries a token id at all.**
+	// SHIP-108 wrote that field with "nothing reads it yet"; this reads it. A reissue leaves the
+	// assignment live and changes only which link opens it, so the assignment comparison above
+	// cannot see a revocation — the two checks answer different questions and both are needed.
+	switch {
+	case !hasDriver || live.ID != grant.AssignmentID:
 		return Assignment{}, fmt.Errorf("delivery: %s is not the live assignment on %s: %w",
 			grant.AssignmentID, grant.JobID, ErrDriverLinkSuperseded)
+
+	case grant.TokenID == "" || grant.TokenID != live.LinkTokenID:
+		// The empty case is not reachable through the verifier — `jti` is a required claim —
+		// and is refused rather than compared, so that a token minted by something that
+		// stopped setting it cannot match a column that is also somehow empty.
+		return Assignment{}, fmt.Errorf("delivery: the link on %s has been reissued since %q: %w",
+			grant.JobID, grant.TokenID, ErrDriverLinkSuperseded)
 	}
 
 	return live, nil
+}
+
+// ReissueDriverLink mints a fresh link for the driver already on a job, ending the previous one
+// (SHIP-109).
+//
+// # What it does not do
+//
+// It does not change the driver, and it does not move the job. A provider replacing a *driver* ends
+// one assignment and creates another — 000600 makes an assignment's identity immutable because
+// `milestones.actor_id` names it — and a provider whose driver has lost the link needs neither. The
+// row stands, every milestone already recorded against it stands, and only the credential changes.
+//
+// # Who may ask, and the half of the *Done when* that cannot be met yet
+//
+// The awarded provider, checked against the accepted bid like every other write in this domain.
+// SHIP-109's *Done when* says "provider **or admin**", and **there is no administrator to ask**:
+// `ck_users_role` refuses the role, admin sign-in is a separate system, and the auth class that
+// would carry one is unmapped until SHIP-147. Nothing here would need changing when it lands beyond
+// a second route declaring RequireAdmin over the same service method with an audit reason — which
+// is Docs/01 §3's requirement of an administrator and not of a provider. Docs/11 §3 records it.
+//
+// # A job with no live driver is refused as a missing delivery
+//
+// There is no link to reissue, and the answer is [ErrJobNotFound] — one 404, the same one a
+// superseded link gets, and the same words. That is deliberately not a code of its own: the caller
+// is the provider, who knows the job exists, and what they have to do next is assign a driver
+// through the endpoint that does it. A new code would be a third thing for a client to branch on
+// and would say nothing the 404 does not.
+//
+// r must be a transaction. The link and the count it increments are one act, and
+// [Service.granted] emits nothing here — a reissue is a credential rotation rather than a state
+// change to the delivery, so no consumer of `shipper.delivery` has anything to do with it.
+func (s *Service) ReissueDriverLink(
+	ctx context.Context,
+	r db.Runner,
+	providerID, jobID uuid.UUID,
+) (Assignment, DriverToken, error) {
+	if _, inTx := r.(pgx.Tx); !inTx {
+		return Assignment{}, DriverToken{}, fmt.Errorf(
+			"delivery: reissuing the link on %s: %w", jobID, ErrNotInTransaction)
+	}
+
+	awarded, isAwarded, err := s.awards.AwardedProvider(ctx, r, jobID)
+	if err != nil {
+		return Assignment{}, DriverToken{}, err
+	}
+	if !isAwarded {
+		return Assignment{}, DriverToken{}, fmt.Errorf(
+			"delivery: %s has no accepted bid: %w", jobID, ErrJobNotFound)
+	}
+	if awarded != providerID {
+		return Assignment{}, DriverToken{}, fmt.Errorf(
+			"delivery: %s was awarded to %s, not %s: %w",
+			jobID, awarded, providerID, ErrNotAwardedProvider)
+	}
+
+	live, hasDriver, err := s.store.liveAssignment(ctx, r, jobID)
+	if err != nil {
+		return Assignment{}, DriverToken{}, err
+	}
+	if !hasDriver {
+		return Assignment{}, DriverToken{}, fmt.Errorf(
+			"delivery: %s has no driver to reissue a link for: %w", jobID, ErrJobNotFound)
+	}
+
+	// Through [Service.issueLink] rather than minting here, which is the point of that function:
+	// it is the one place a fresh link identifier reaches the column, so the two things that
+	// revoke cannot drift apart. Nothing is emitted — a reissue is a credential rotation rather
+	// than a state change to the delivery, and no consumer of `shipper.delivery` has anything to
+	// do about it.
+	return s.issueLink(ctx, r, live)
 }

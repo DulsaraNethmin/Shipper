@@ -57,6 +57,28 @@ func init() {
 		},
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/driver/link",
+			Group:   GroupV1,
+
+			// SHIP-109: another link for the driver already on the job, ending the previous one.
+			//
+			// RequireUser, and the same pairing as the route above: it mints a driver token and
+			// does not accept one. **A driver cannot reissue their own link**, which is the whole
+			// point of a credential the provider controls — a forwarded link that reached the
+			// wrong person could otherwise be used to keep itself alive.
+			//
+			// # Why this is not a method on /jobs/{id}/driver
+			//
+			// PUT there would say a second call replaces the driver, and it deliberately does
+			// not: 000600 makes an assignment's identity immutable because `milestones.actor_id`
+			// names it, and replacing a driver is ending one row and inserting another. This
+			// replaces the *link* and leaves the driver, the row and every milestone recorded
+			// against it exactly where they are.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).ReissueDriverLink() },
+		},
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/jobs/{id}/milestones",
 			Group:   GroupV1,
 
@@ -133,6 +155,45 @@ func init() {
 			// driver who can actually capture proof in front of it.
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).ProofOnJob() },
+		},
+		Route{
+			Method: http.MethodGet,
+
+			// **Five segments, and four would stop the process** (SHIP-115a). This is the shelf
+			// the route above opened, extended by the ticket `Docs/09` wrote for it — and the
+			// row in that document names both paths in full rather than describing a shelf,
+			// precisely because building either as `GET /jobs/{id}/delivery` is not a failing
+			// test but a ServeMux panic at registration: `make run` dies at startup.
+			//
+			// # Two operations rather than one composite
+			//
+			// The alternative was one `GET /jobs/{id}/delivery` answering both, which the
+			// segment constraint forbids anyway — but it would also have been wrong on its own
+			// terms. The assignment is a single resource and the milestones are a collection
+			// that pages; putting a paging collection inside a resource means a client asking
+			// for the second page re-fetches the resource, and the envelope of Docs/10 §4.5 has
+			// nowhere to sit.
+			Pattern: "/jobs/{id}/delivery/detail",
+			Group:   GroupV1,
+
+			// RequireUser, and the class is not the access control here either: the handler
+			// asks the database which of the two parties the caller is, and being neither
+			// answers exactly what a missing job answers.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DeliveryDetail() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs/{id}/delivery/milestones",
+			Group:   GroupV1,
+
+			// The second half of SHIP-115a, and the one that has no other source. **A milestone
+			// that moved nothing appears here and nowhere else**: a repeated pickup attempt
+			// (Docs/02 §5) and SHIP-112's absorbed late milestone each write a `milestones` row
+			// and no `job_status_history` row, so a timeline derived from the job's status —
+			// which is what SHIP-77 has to do today (Docs/11 §9) — cannot show either.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).MilestonesOnJob() },
 		},
 		Route{
 			Method:  http.MethodGet,

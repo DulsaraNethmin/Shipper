@@ -104,6 +104,7 @@ func driverOnJob(t *testing.T, pool *pgxpool.Pool, provider, jobID uuid.UUID) (A
 	return assignment, DriverGrant{
 		JobID:        jobID,
 		AssignmentID: assignment.ID,
+		TokenID:      token.ID,
 		ExpiresAt:    token.ExpiresAt,
 	}, token
 }
@@ -229,7 +230,7 @@ func TestADriverGrantRecordsOnNoOtherJob(t *testing.T) {
 	_, _, _ = driverOnJob(t, pool, provider, other)
 
 	// The grant a widened token would produce: this driver's assignment, somebody else's job.
-	forged := DriverGrant{JobID: other, AssignmentID: assignment.ID}
+	forged := DriverGrant{JobID: other, AssignmentID: assignment.ID, TokenID: uuid.New().String()}
 
 	_, _, err := recordAsDriver(t, pool, newTestService(), forged, enRoute(theKey))
 	if !errors.Is(err, ErrDriverLinkSuperseded) {
@@ -390,7 +391,8 @@ func TestRecordDriverMilestoneRefusesAPool(t *testing.T) {
 	pool := pgtest.DB(t)
 
 	_, _, err := newTestService().RecordDriverMilestone(t.Context(), pool,
-		DriverGrant{JobID: uuid.New(), AssignmentID: uuid.New()}, enRoute(theKey))
+		DriverGrant{JobID: uuid.New(), AssignmentID: uuid.New(), TokenID: uuid.New().String()},
+		enRoute(theKey))
 	if !errors.Is(err, ErrNotInTransaction) {
 		t.Fatalf("RecordDriverMilestone() on a pool = %v, want ErrNotInTransaction", err)
 	}

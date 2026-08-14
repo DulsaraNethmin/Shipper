@@ -234,12 +234,18 @@ paths:
     $ref: './paths/bidding.yaml#/WithdrawBid'
   /v1/jobs/{id}/cancel:
     $ref: './paths/jobs.yaml#/CancelJob'
+  /v1/jobs/{id}/delivery/detail:
+    $ref: './paths/delivery.yaml#/DeliveryDetail'
+  /v1/jobs/{id}/delivery/milestones:
+    $ref: './paths/delivery.yaml#/DeliveryMilestones'
   /v1/jobs/{id}/delivery/proof:
     $ref: './paths/delivery.yaml#/ProofOnJob'
   /v1/jobs/{id}/disputes:
     $ref: './paths/admin.yaml#/Disputes'
   /v1/jobs/{id}/driver:
     $ref: './paths/delivery.yaml#/AssignDriver'
+  /v1/jobs/{id}/driver/link:
+    $ref: './paths/delivery.yaml#/DriverLink'
   /v1/jobs/{id}/extend:
     $ref: './paths/jobs.yaml#/ExtendJob'
   /v1/jobs/{id}/milestones:
