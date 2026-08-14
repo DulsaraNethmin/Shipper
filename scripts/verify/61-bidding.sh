@@ -42,8 +42,10 @@
 # No check here signs in, so SHIP-47's per-address bucket (rl:v1:signin:*, shared across sections and
 # across runs from 127.0.0.1) is untouched by this file.
 #
-# Nothing here reads Kafka or the outbox, so no fence is needed: placing a bid emits no event
-# (SHIP-136 owns bidding's events) and moves no job.
+# Nothing here reads Kafka, and nothing here starts the worker. **The last section does read the
+# outbox** — SHIP-136 gave this domain its events — and it is fenced on the two providers registered
+# below rather than counted over the table, because this database persists between runs. Its rows are
+# left unpublished on purpose, for 80-notifications.sh to drain.
 
 # --- the accounts and the job these checks run against -----------------------------------------
 
@@ -1840,3 +1842,90 @@ ok "the database holds exactly one accepted offer and nothing still live, which 
   "select count(*) from job_status_history where job_id = '$race_job_id' and to_status = 'Awarded';")" == "1" ]] \
   || fail "the job was moved to Awarded more than once — the losing award ran the transition as well"
 ok "and the job was moved to Awarded exactly once, through the guarded transition"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-136  every bid state change emits its event from the domain, into the outbox"
+
+# Docs/01 §4.5: "new bid, counter-offer, withdrawal, or bid expiry" and "bid accepted".
+#
+# # What is demonstrated here and what is demonstrated by tests
+#
+# internal/bidding/events_test.go holds the payloads, the retry paths that must emit *once*, and the
+# rolled-back transaction that must emit nothing. cmd/api/events_domain_test.go holds the half of the
+# *Done when* that is about where the emit lives. None of that needs a running service.
+#
+# **What only this can show is that every offer, counter, withdrawal and award made through the
+# served binary above left its event behind.** Every row asserted below was written by a real
+# endpoint in an earlier section of this file, through cmd/api's own wiring rather than through a
+# fixture's — which is the one thing a Go test in the package cannot reach. 80-notifications.sh takes
+# them the rest of the way onto `shipper.bid`.
+#
+# # The fence
+#
+# `bids.provider_id` is the provider a negotiation is *with*, so every row this file wrote — including
+# the customer's counter-offers, which carry the same provider id (000502) — belongs to one of the two
+# providers registered at the top. Both are registered fresh with `$$` in the address, so the fence
+# names this run and nothing else. **A count over `aggregate_type = 'bid'` would include every
+# previous `make verify` on this database**, which persists between runs.
+#
+# Nothing here reads Kafka, and nothing here starts the worker: these rows are deliberately left
+# unpublished for 80-notifications.sh to drain.
+
+bid_event_fence="aggregate_type = 'bid' AND aggregate_id IN (
+  SELECT id FROM bids WHERE provider_id IN ('$bid_provider_id', '$bid_rival_id'))"
+
+# bid_events_of <event_type> — how many of one event type this run's offers produced.
+bid_events_of() {
+  "$PSQL" "$DATABASE_URL" -tAc \
+    "select count(*) from outbox where $bid_event_fence and event_type = '$1';"
+}
+
+for bid_event in bid.placed bid.revised bid.withdrawn bid.countered bid.accepted bid.rejected; do
+  [[ "$(bid_events_of "$bid_event")" -ge 1 ]] \
+    || fail "no $bid_event reached the outbox, and this file made one through the served endpoint"
+done
+ok "a placement, a revision, a withdrawal, a counter, an award and its rejection sweep each emitted their event"
+
+# Deliberately absent, and said out loud rather than left as a gap somebody reads as coverage:
+# `bid.expired`. Nothing in this platform writes 'Expired' — SHIP-89's scheduled task is the ticket
+# that starts, and its *Done when* already names the event.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where status = 'Expired';")" == "0" ]] \
+  || fail "something wrote an Expired bid, so bid.expired is now a state change with no event (SHIP-89)"
+ok "and bid.expired is not among them because no bid expires yet — SHIP-89 owns that pair"
+
+# The aggregate is the bid, which is what makes one offer's events ordered against each other on the
+# topic. An event whose payload named a different row from its aggregate id would key onto the wrong
+# partition and be read by nobody looking for it.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox where $bid_event_fence and payload->>'bid_id' <> aggregate_id::text;")" == "0" ]] \
+  || fail "a bid event is keyed on an aggregate its payload does not name"
+ok "each event is keyed on the bid it is about, so one offer's events share a partition and keep their order"
+
+# The award, specifically: the accepted offer and every offer it closed, from the one transaction —
+# and the job's own transition beside them, emitted by `jobs` from inside the same transaction
+# through a port, with neither domain importing the other.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox where aggregate_id = '$race_bid_a' and event_type in ('bid.accepted','bid.rejected');")" == "1" ]] \
+  || fail "the first racer's offer has no accepted or rejected event"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox where aggregate_id = '$race_bid_b' and event_type in ('bid.accepted','bid.rejected');")" == "1" ]] \
+  || fail "the second racer's offer has no accepted or rejected event"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'job' and aggregate_id = '$race_job_id' and event_type = 'job.status_changed';")" -ge 1 ]] \
+  || fail "the award moved the job and `jobs` emitted nothing about it"
+ok "an award emits the acceptance, one rejection per offer it closed, and the job's own transition — one transaction, two domains"
+
+# CLAUDE.md's budget invariant, applied to the copy of a job that travels furthest. The fixture jobs
+# above all carry a budget, so this is a real assertion rather than one over rows that have none.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox where $bid_event_fence and payload::text ilike '%budget%';")" == "0" ]] \
+  || fail "a bid event payload mentions a budget — an event travels past every point a response body could have redacted it"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from jobs where id = '$race_job_id' and budget is not null;")" == "1" ]] \
+  || fail "the fixture job carries no budget, so the check above proves nothing"
+ok "and no bid event carries the customer's budget, on jobs that have one"
+
+unset bid_event bid_event_fence
+unset -f bid_events_of

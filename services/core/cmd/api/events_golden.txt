@@ -1,3 +1,12 @@
+shipper.bid        bid.accepted           v1   16384  amount_cents:int64 bid_id:string customer_id:string deliver_by:time.Time job_id:string pickup_at:time.Time provider_id:string
+shipper.bid        bid.countered          v1   16384  amount_cents:int64 bid_id:string deliver_by:time.Time job_id:string offered_by:string pickup_at:time.Time provider_id:string superseded_bid_id:string
+shipper.bid        bid.placed             v1   16384  amount_cents:int64 bid_id:string deliver_by:time.Time job_id:string offered_by:string pickup_at:time.Time provider_id:string
+shipper.bid        bid.rejected           v1   16384  bid_id:string job_id:string offered_by:string provider_id:string status:string
+shipper.bid        bid.revised            v1   16384  amount_cents:int64 bid_id:string deliver_by:time.Time job_id:string offered_by:string pickup_at:time.Time provider_id:string
+shipper.bid        bid.withdrawn          v1   16384  bid_id:string job_id:string offered_by:string provider_id:string status:string
+shipper.delivery   delivery.driver_assigned v1   16384  assignment_id:string job_id:string provider_id:string
+shipper.delivery   delivery.milestone_recorded v1   16384  actor_id:string actor_recorded_at:time.Time actor_type:string job_id:string job_moved:bool milestone:string milestone_id:string reason:string server_recorded_at:time.Time
+shipper.delivery   delivery.proof_recorded v1   16384  content_type:string exception_reason:string is_exception:bool job_id:string milestone_id:string proof_id:string
 shipper.job        job.expiry_extended    v1   16384  customer_id:string expires_at:time.Time extended_at:time.Time job_id:string previous_expires_at:time.Time
 shipper.job        job.expiry_warned      v1   16384  customer_id:string expires_at:time.Time job_id:string warned_at:time.Time
 shipper.job        job.status_changed     v1   16384  actor_id:string actor_recorded_at:time.Time actor_type:string from:string job_id:string reason:string server_recorded_at:time.Time to:string

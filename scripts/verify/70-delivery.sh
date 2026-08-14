@@ -26,6 +26,13 @@
 # The tokens are minted by the runner and every one of them claims `role: customer`. That is the
 # right thing to exercise: this endpoint decides from the accepted bid, not from a claim in a token.
 # It also means nothing here signs in, so SHIP-47's per-address bucket is untouched by this file.
+#
+# # The last section reads the outbox, and nothing here reads Kafka or starts the worker
+#
+# SHIP-136 gave this domain its events. That section is fenced on the **job identifiers this file
+# created** — which are the aggregate ids of a delivery event — rather than counted over the table,
+# because this database persists between runs. Its rows are left unpublished on purpose, for
+# 80-notifications.sh to drain.
 
 # --- the accounts and the awarded job these checks run against ---------------------------------
 
@@ -1380,3 +1387,108 @@ ok "and a delivery evidenced by a photograph is accepted the same way — both h
    mc rm --force "local/'"$STORAGE_BUCKET/$deliv_key"'" >/dev/null 2>&1 || true' \
   || fail "could not remove the object this section uploaded"
 ok "the object this section uploaded was removed from $STORAGE_BUCKET"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-136  every delivery state change emits its event from the domain, into the outbox"
+
+# Docs/01 §4.5's "delivery status changes", read to include everything Docs/01 §4.4 asks an actor to
+# record — which is more than the job's status carries.
+#
+# # What is demonstrated here and what is demonstrated by tests
+#
+# internal/delivery/events_test.go holds the payloads, the retry and absorption paths, the ordering of
+# the milestone event and the evidence event, and the rolled-back transaction that emits nothing.
+# cmd/api/events_domain_test.go holds the half of the *Done when* that is about where the emit lives.
+#
+# **What only this can show is that every assignment, milestone and piece of evidence recorded through
+# the served binary above left its event behind** — through cmd/api's own wiring rather than a
+# fixture's. 80-notifications.sh takes them the rest of the way onto `shipper.delivery`.
+#
+# # The fence, and why it is by job identifier
+#
+# The aggregate id of a delivery event is the **job**, so this section's jobs are its own fence: each
+# is created by `delivery_awarded_job` in this run and named nowhere else. A count over
+# `aggregate_type = 'delivery'` would include every previous `make verify` on this database, which
+# persists between runs.
+#
+# Nothing here reads Kafka and nothing here starts the worker: these rows are deliberately left
+# unpublished.
+
+# delivery_events_on <job> <event_type> — how many of one event type a job produced.
+delivery_events_on() {
+  "$PSQL" "$DATABASE_URL" -tAc \
+    "select count(*) from outbox
+      where aggregate_type = 'delivery' and aggregate_id = '$1' and event_type = '$2';"
+}
+
+# The assignment. `$delivery_job` had a driver put on it by the first section of this file.
+[[ "$(delivery_events_on "$delivery_job" delivery.driver_assigned)" -ge 1 ]] \
+  || fail "assigning a driver through the endpoint emitted no delivery.driver_assigned"
+ok "putting a driver on a job emits its event, alongside the job's own transition"
+
+# **And the driver's name and mobile are not on it.** Docs/01 §5.1: an event travels through the
+# outbox onto a topic with seven days of retention and into every consumer there will ever be. The
+# assignment above nominated "Sam Patel" on +61412345678, so this is a real assertion.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$delivery_job'
+       and (payload::text ilike '%Patel%' or payload::text like '%41234567%');")" == "0" ]] \
+  || fail "an assignment event carries the driver's name or number — Docs/01 §5.1 keeps both off the wire"
+ok "and it carries neither the driver's name nor their number, which a consumer reads from the row"
+
+# The milestone. `$milestone_job` had several recorded against it, including one the job had already
+# moved past — which writes a row, moves nothing, and therefore emits **no** job.status_changed.
+# Before this ticket that recording was invisible to everything downstream.
+[[ "$(delivery_events_on "$milestone_job" delivery.milestone_recorded)" -ge 1 ]] \
+  || fail "recording a milestone through the endpoint emitted no delivery.milestone_recorded"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$milestone_job'
+       and event_type = 'delivery.milestone_recorded' and (payload->>'job_moved')::boolean is false;")" -ge 1 ]] \
+  || fail "no milestone event reports job_moved false, and this file recorded one the job had moved past"
+ok "a milestone emits its event whether or not the job moved, and says which — the case job.status_changed cannot report"
+
+# One event per row, which is what the milestone table is the authority on. A count that disagreed
+# would mean either a recording that emitted twice or one that emitted not at all.
+[[ "$(delivery_events_on "$milestone_job" delivery.milestone_recorded)" \
+   == "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" ]] \
+  || fail "the milestone events and the milestone rows on $milestone_job do not agree"
+ok "and there is exactly one event per recorded milestone — a retry answered from the record emits nothing"
+
+# The evidence, both kinds. `$deliv_job` was delivered on a reasoned exception and
+# `$deliv_photo_job` on a photograph, both through the endpoint.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select payload->>'exception_reason' from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$deliv_job'
+       and event_type = 'delivery.proof_recorded' and (payload->>'is_exception')::boolean;")" == "location_unsafe" ]] \
+  || fail "the exception-completed delivery emitted no proof event naming its reason"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$deliv_photo_job'
+       and event_type = 'delivery.proof_recorded' and (payload->>'is_exception')::boolean is false;")" -ge 1 ]] \
+  || fail "the photographed delivery emitted no proof event"
+ok "a photograph and a reasoned exception each emit the same event, told apart by is_exception — Docs/04 §5's queue reads the second"
+
+# **And the object key is not on it.** Where the bytes are is a storage locator, and who may look at
+# them is decided by GET /v1/jobs/{id}/delivery/proof after an authorisation check — which is not a
+# decision a consumer of a topic is in a position to make.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$deliv_photo_job'
+       and payload::text like '%$deliv_key%';")" == "0" ]] \
+  || fail "a proof event carries the object key; a signed URL is issued after an authorisation check, not from a topic"
+ok "and no proof event carries the object key — the photograph is reached through the endpoint that checks who is asking"
+
+# The order, which on this aggregate is a guarantee rather than a preference: both events are about
+# the job, so both key onto one partition and Kafka keeps their order. Evidence naming a milestone a
+# consumer has not seen yet is what this avoids.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select event_type from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$deliv_photo_job'
+       and event_type in ('delivery.milestone_recorded','delivery.proof_recorded')
+     order by id desc limit 1;")" == "delivery.proof_recorded" ]] \
+  || fail "the evidence event was written before the milestone it stands behind"
+ok "the evidence follows the claim it stands behind, in the outbox and therefore on the partition"
+
+unset deliv_key
+unset -f delivery_events_on

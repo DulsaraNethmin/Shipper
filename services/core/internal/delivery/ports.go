@@ -7,7 +7,26 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 )
+
+// EventSink is where this domain's events go (SHIP-136).
+//
+// Declared here rather than taken as *events.Outbox for the reason jobs.EventSink is: Docs/06 §4.1
+// makes the consuming domain the one that names the interface. The concrete writer is
+// infrastructure and this domain may import it either way — what the interface buys is that a test
+// can watch what was emitted without a table, and that the publisher can change the writer without
+// touching a domain.
+//
+// Emit takes the same db.Runner the state change is using, and that is the entire point of the
+// outbox: an event written in a different transaction from the change it describes can commit when
+// the change does not (Docs/06 §4.0, Docs/10 §6.1). This domain's transactions are the ones where
+// that is hardest to see, because SHIP-112's absorption *commits* a milestone whose move was
+// refused — so an event written outside the transaction would be right about the milestone and
+// wrong about the job on precisely the path where the two disagree.
+type EventSink interface {
+	Emit(ctx context.Context, r db.Runner, e events.Event) error
+}
 
 // What this domain needs of other domains, declared by the consumer (Docs/06 §4.1, Docs/10 §2.3).
 //
