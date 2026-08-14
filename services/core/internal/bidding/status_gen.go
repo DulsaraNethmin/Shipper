@@ -39,17 +39,25 @@ const (
 
 	// StatusCountered is an offer that has been answered with a different price or timing.
 	//
-	// Nothing writes it, and SHIP-87 decided that deliberately rather than by omission. Docs/02
-	// §4 lists it beside Superseded and describes the two in almost the same words — one
-	// offer "answered with a different price or timing", the other "displaced by a counter from
-	// either party" — which are the same event seen from its two ends. A platform writing both
-	// would be writing two statuses for one transition, and would then have to say which of them
-	// a client branches on.
+	// A retained synonym for Superseded, which is the one the platform writes. That is now
+	// Docs/02 §4's own position rather than an implementation decision waiting for one.
+	//
+	// SHIP-87 chose it deliberately rather than by omission. Docs/02 §4 lists Countered beside
+	// Superseded and describes the two in almost the same words — one offer "answered with a
+	// different price or timing", the other "displaced by a counter from either party" — which
+	// are the same event seen from its two ends. A platform writing both would be writing two
+	// statuses for one transition, and would then have to say which of them a client branches
+	// on.
 	//
 	// Superseded is the one written, for a reason outside this vocabulary: the bid-closed error
 	// code and the BidNoLongerYours response in contracts/paths/bidding.yaml have both
 	// enumerated "rejected, expired, superseded" as the closed statuses since SHIP-85, and
 	// neither names Countered. The published contract had already made the choice.
+	//
+	// SHIP-96 closed the question from the other side, which is what turned a report into a
+	// decision. Rendering the offer chain to its three audiences, nothing acts on the
+	// distinction — so the alternative, giving the two statuses a difference they are actually
+	// for, would have cost a ticket to produce a value no audience reads.
 	//
 	// It stays in the list because Docs/02 §4 has it and Docs/10 §3.4 pairs the list with
 	// ck_bids_status in both directions — and because a value omitted from a client's enum
