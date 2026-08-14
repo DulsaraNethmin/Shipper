@@ -3,6 +3,7 @@ package delivery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -51,38 +52,52 @@ func (j testJobs) MoveToDriverAssigned(ctx context.Context, r db.Runner, jobID, 
 	})
 }
 
-func (j testJobs) MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
-	return j.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusEnRouteToPickup,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: at,
-	})
+func (j testJobs) MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, at time.Time) (JobMove, error) {
+	return j.moveBy(ctx, r, jobID, jobs.StatusEnRouteToPickup, by, at)
 }
 
-func (j testJobs) MoveToPickedUp(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
-	return j.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusPickedUp,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: at,
-	})
+func (j testJobs) MoveToPickedUp(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, at time.Time) (JobMove, error) {
+	return j.moveBy(ctx, r, jobID, jobs.StatusPickedUp, by, at)
 }
 
-func (j testJobs) MoveToInTransit(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
-	return j.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusInTransit,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: at,
-	})
+func (j testJobs) MoveToInTransit(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, at time.Time) (JobMove, error) {
+	return j.moveBy(ctx, r, jobID, jobs.StatusInTransit, by, at)
 }
 
-func (j testJobs) MoveToDelivered(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
+func (j testJobs) MoveToDelivered(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, at time.Time) (JobMove, error) {
+	return j.moveBy(ctx, r, jobID, jobs.StatusDelivered, by, at)
+}
+
+// moveBy is cmd/api/routes_delivery.go's actor translation, copied here for the reason this file's
+// header gives about the rest of the adapter (SHIP-120a).
+//
+// An actor with no mapping is an error rather than a default, exactly as the production copy makes
+// it. That is the half worth duplicating faithfully: defaulting to the provider would let a driver's
+// milestone write a history row saying a provider moved the job, and both copies would agree about
+// it.
+func (j testJobs) moveBy(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+	to jobs.Status,
+	by Recorder,
+	at time.Time,
+) (JobMove, error) {
+	var kind jobs.ActorType
+	switch by.Type {
+	case ActorProvider:
+		kind = jobs.ActorProvider
+	case ActorDriver:
+		kind = jobs.ActorDriver
+	default:
+		return JobMoveUnrecognised, fmt.Errorf(
+			"delivery: %q is not an actor this adapter can attribute a transition to", by.Type)
+	}
+
 	return j.move(ctx, r, jobs.Move{
 		JobID:      jobID,
-		To:         jobs.StatusDelivered,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		To:         to,
+		Actor:      jobs.User(kind, by.ID),
 		RecordedAt: at,
 	})
 }
@@ -156,19 +171,19 @@ func (s staticJobs) MoveToDriverAssigned(context.Context, db.Runner, uuid.UUID, 
 	return s.move, s.err
 }
 
-func (s staticJobs) MoveToEnRouteToPickup(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+func (s staticJobs) MoveToEnRouteToPickup(context.Context, db.Runner, uuid.UUID, Recorder, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 
-func (s staticJobs) MoveToPickedUp(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+func (s staticJobs) MoveToPickedUp(context.Context, db.Runner, uuid.UUID, Recorder, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 
-func (s staticJobs) MoveToInTransit(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+func (s staticJobs) MoveToInTransit(context.Context, db.Runner, uuid.UUID, Recorder, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 
-func (s staticJobs) MoveToDelivered(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+func (s staticJobs) MoveToDelivered(context.Context, db.Runner, uuid.UUID, Recorder, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 

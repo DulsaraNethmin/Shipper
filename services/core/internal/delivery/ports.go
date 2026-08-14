@@ -322,6 +322,23 @@ func (m JobMove) String() string {
 // was pointing in; telling them apart is a second question about the same job, asked of the same
 // domain, in the same transaction. It is asked in the composition root because that is the only
 // place a `jobs.Status` may be named at all.
+//
+// # The four milestone moves take a [Recorder] and not a provider identifier (SHIP-120a)
+//
+// They took `providerID uuid.UUID` while the awarded provider was the only caller who could reach
+// them. `POST /v1/driver/jobs/{id}/milestones` is the second, on a credential that names no account
+// at all — a driver *is* a `driver_assignments` row (000600) — and the transition it causes has to
+// be attributed to that row with `actor_type = 'driver'`, exactly as 000401 declared and 000601
+// follows.
+//
+// **Widening the parameter rather than adding four more methods is the decision**, and it is the
+// narrower of the two: eight methods would let an implementation attribute the driver's move
+// differently from the provider's, which is the kind of drift that compiles, passes its own test,
+// and only shows up in a support query months later asking who moved a job. One parameter carrying
+// the pair the database already stores cannot.
+//
+// [MoveToDriverAssigned] keeps its `providerID`, because only a provider assigns a driver — a
+// driver holding a link cannot put themselves on a job they are already on.
 type Jobs interface {
 	// MoveToDriverAssigned runs the guarded transition on behalf of the provider, inside the
 	// caller's transaction. providerID is the actor recorded against it.
@@ -336,10 +353,10 @@ type Jobs interface {
 	// Two `from` statuses and one method, because the caller is not choosing between them:
 	// a provider driving the job themselves sets off from Awarded without nominating anybody,
 	// and the guard is what knows that both are permitted.
-	MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+	MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, recordedAt time.Time) (JobMove, error)
 
 	// MoveToPickedUp is `En route to pickup → Picked up`.
-	MoveToPickedUp(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+	MoveToPickedUp(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, recordedAt time.Time) (JobMove, error)
 
 	// MoveToInTransit is `Picked up → In transit`.
 	//
@@ -348,7 +365,7 @@ type Jobs interface {
 	// something does it will be a task in cmd/worker rather than a request, so this method stays
 	// the actor's path and is not widened to carry an actor type it would only ever be given one
 	// value of.
-	MoveToInTransit(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+	MoveToInTransit(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, recordedAt time.Time) (JobMove, error)
 
 	// MoveToDelivered is `In transit → Delivered` (SHIP-118).
 	//
@@ -371,5 +388,5 @@ type Jobs interface {
 	// exception recorded" — is deliberately not `jobs`' to check. The transition table says which
 	// moves exist; what a delivery must carry is this domain's, and asking `jobs` to know about
 	// `proofs` would be the import the lint refuses.
-	MoveToDelivered(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+	MoveToDelivered(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, recordedAt time.Time) (JobMove, error)
 }

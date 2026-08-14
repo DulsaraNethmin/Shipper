@@ -165,6 +165,41 @@ func init() {
 			Auth:    RequireDriverToken,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DriverJob() },
 		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/driver/jobs/{id}/milestones",
+			Group:   GroupV1,
+
+			// **The first write in the service served on a credential that names no account**
+			// (SHIP-120a), and the route three separate lanes of wave 7 each specified and none
+			// built — every one of them correctly finding it belonged to another lane's ticket
+			// (Docs/11 §9). A gap three independent readings arrive at is a specification.
+			//
+			// # Why a second route rather than a second auth class on POST /jobs/{id}/milestones
+			//
+			// That one is RequireUser and always will be. Serving both classes on one path would
+			// put two credential systems on one URL, where presenting the wrong one reads as a
+			// permissions problem rather than as the wrong door — and the manifest allows one
+			// class per method in any case. So the driver's route sits under `/driver` beside the
+			// read, and the two entry points meet in `internal/delivery`'s service rather than in
+			// a guard that has been taught to accept either credential.
+			//
+			// # The idempotency scope, which Docs/11 §9 has held open since SHIP-15m for this route
+			//
+			// `anonymous`, and **nothing declared here can change it**: the scope is computed
+			// group-wide outside the middleware while this class is enforced per route inside it.
+			// The decision is argued in [delivery.Handler.RecordDriverMilestone] and it is §9's
+			// second option — the platform's "once per key" guarantee is
+			// `uq_milestones_idempotency (job_id, idempotency_key)`, which 000602 scoped to the
+			// job in advance and named this exact case while doing it.
+			//
+			// **Unlike POST /jobs/{id}/proof-uploads, this response carries no credential**, which
+			// is the whole reason this route can be served today and the driver's upload cannot: a
+			// replay hands back a milestone that both parties to the delivery may read anyway,
+			// not a URL that writes into the evidence bucket.
+			Auth:    RequireDriverToken,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordDriverMilestone() },
+		},
 	)
 }
 
@@ -351,43 +386,31 @@ func (l jobLifecycle) MoveToDriverAssigned(
 func (l jobLifecycle) MoveToEnRouteToPickup(
 	ctx context.Context,
 	r db.Runner,
-	jobID, providerID uuid.UUID,
+	jobID uuid.UUID,
+	by delivery.Recorder,
 	recordedAt time.Time,
 ) (delivery.JobMove, error) {
-	return l.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusEnRouteToPickup,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: recordedAt,
-	})
+	return l.moveBy(ctx, r, jobID, jobs.StatusEnRouteToPickup, by, recordedAt)
 }
 
 func (l jobLifecycle) MoveToPickedUp(
 	ctx context.Context,
 	r db.Runner,
-	jobID, providerID uuid.UUID,
+	jobID uuid.UUID,
+	by delivery.Recorder,
 	recordedAt time.Time,
 ) (delivery.JobMove, error) {
-	return l.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusPickedUp,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: recordedAt,
-	})
+	return l.moveBy(ctx, r, jobID, jobs.StatusPickedUp, by, recordedAt)
 }
 
 func (l jobLifecycle) MoveToInTransit(
 	ctx context.Context,
 	r db.Runner,
-	jobID, providerID uuid.UUID,
+	jobID uuid.UUID,
+	by delivery.Recorder,
 	recordedAt time.Time,
 ) (delivery.JobMove, error) {
-	return l.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusInTransit,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: recordedAt,
-	})
+	return l.moveBy(ctx, r, jobID, jobs.StatusInTransit, by, recordedAt)
 }
 
 // MoveToDelivered is `In transit → Delivered` (SHIP-118).
@@ -399,13 +422,59 @@ func (l jobLifecycle) MoveToInTransit(
 func (l jobLifecycle) MoveToDelivered(
 	ctx context.Context,
 	r db.Runner,
-	jobID, providerID uuid.UUID,
+	jobID uuid.UUID,
+	by delivery.Recorder,
 	recordedAt time.Time,
 ) (delivery.JobMove, error) {
+	return l.moveBy(ctx, r, jobID, jobs.StatusDelivered, by, recordedAt)
+}
+
+// moveBy is the four methods above with their one difference — the target status — as an argument,
+// and the actor translation in one place (SHIP-120a).
+//
+// # This is the second vocabulary this file translates, and it is translated exactly once
+//
+// The first is the milestone-to-status mapping the four methods are: `delivery` names milestones,
+// this names statuses, and Docs/02 §2's table is visible from neither side alone. The second is
+// who acted. A [delivery.Recorder] carries `(actor_type, actor_id)` in the delivery domain's own
+// vocabulary; `jobs.Actor` carries the same pair in its own, and 000401 and 000601 already agree
+// about what each value means — a `users` row for a provider, a `driver_assignments` row for a
+// driver, because a driver has no account.
+//
+// **An actor this function has no mapping for is an error rather than a default**, which is the
+// same call [jobLifecycle.move] makes about an unrecognised outcome. Defaulting to the provider
+// would compile, pass every test written today, and write `job_status_history` rows saying a
+// provider moved a job their driver moved — a false attribution that nothing downstream could
+// detect, because the row would be perfectly well formed.
+//
+// [delivery.ActorSystem] and [delivery.ActorAdmin] fall into that refusal today and deliberately:
+// the platform's automatic `Picked up → In transit` (Docs/02 §2) will be a worker rather than a
+// request, and an administrator's move owes an audit reason that `jobs.Move.validate` requires and
+// this signature has nowhere to carry. Both are a method here when somebody writes the ticket.
+func (l jobLifecycle) moveBy(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+	to jobs.Status,
+	by delivery.Recorder,
+	recordedAt time.Time,
+) (delivery.JobMove, error) {
+	var kind jobs.ActorType
+	switch by.Type {
+	case delivery.ActorProvider:
+		kind = jobs.ActorProvider
+	case delivery.ActorDriver:
+		kind = jobs.ActorDriver
+	default:
+		return delivery.JobMoveUnrecognised, fmt.Errorf(
+			"cmd/api: moving %s to %s: %q is not an actor this adapter can attribute a transition to",
+			jobID, to, by.Type)
+	}
+
 	return l.move(ctx, r, jobs.Move{
 		JobID:      jobID,
-		To:         jobs.StatusDelivered,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		To:         to,
+		Actor:      jobs.User(kind, by.ID),
 		RecordedAt: recordedAt,
 	})
 }

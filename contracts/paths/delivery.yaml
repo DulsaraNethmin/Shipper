@@ -1150,3 +1150,173 @@ DriverAssignment:
         It is returned rather than left to be decoded out of the credential, which is a thing a
         client should never do.
       example: '2026-08-19T04:15:30.000Z'
+
+DriverMilestones:
+  post:
+    operationId: recordDriverMilestone
+    summary: Record a delivery milestone from a driver's link
+    tags: [Delivery]
+    security:
+      - BearerDriverToken: []
+    description: |
+      The driver's own way to record what happened on the delivery their link opens (SHIP-120a). It
+      is the same act as `POST /v1/jobs/{id}/milestones` and reaches the same record; what differs
+      is who is holding the credential, and therefore who the milestone is attributed to.
+
+      ## It is a separate route because the credentials are separate systems
+
+      That operation takes a mobile access token and this one takes a driver's link, and **neither
+      is accepted on the other**: a session presented here answers `401`, and a link presented there
+      answers `401`. Nothing can be exchanged for the other in either direction, so a driver has no
+      account to sign in to and a provider cannot spend their driver's link.
+
+      ## The link grants this job and nothing else
+
+      The token names one job inside its signature. Presenting it on any other job answers `404` —
+      the same answer a job that does not exist gives — and the platform compares the job in the
+      path with the job in the token before this operation runs. There is no request shape that
+      widens the grant.
+
+      A link whose assignment is no longer the live one on the job answers `404` as well. A driver
+      who has been stood down keeps a credential that still verifies; what has gone is the
+      assignment behind it, and the platform reads the row rather than the token to find out.
+
+      ## What is recorded, and who it says did it
+
+      The same body as the provider's operation — see `MilestoneRecording` — with the same two
+      clocks, the same treatment of a late or an early milestone, and the same idempotency
+      behaviour. Send `recorded_at` whenever you acted before you were able to send this; a mobile
+      browser in a yard with no signal is the case the field exists for.
+
+      The response's `recorded_by` is `driver`, and the milestone is attributed to your assignment
+      rather than to an account, because a driver has none.
+
+      ## A photograph cannot be attached here yet
+
+      Send `proof.exception_reason` when there is no photograph to take — the three reasons are the
+      same ones the provider selects from. **`proof.object_key` is refused** with
+      `validation_failed`: there is no operation a driver can call to obtain one, so a key presented
+      here came from somewhere it should not have. The driver's upload arrives with SHIP-122 and
+      this refusal goes with it.
+
+      The consequence is worth knowing before you build against it: until then, a driver recording
+      `delivered` must send an `exception_reason`, because `delivered` requires evidence and the
+      exception is the only kind a driver can produce.
+
+      ## Retries
+
+      Every request carries an `Idempotency-Key`, and a driver on a mobile browser is exactly the
+      caller that rule exists for. A retry with the same key answers `200` with the milestone the
+      first attempt recorded, whether it arrives a second or a day later — the guarantee is a unique
+      index on `(job, key)` in the database rather than a cached response, so it survives a
+      reconnection after any length of time.
+
+      That namespace is shared with the provider on the same job, deliberately: one key records one
+      milestone on one delivery, whichever of you sent it.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/MilestoneRecording'
+    responses:
+      '201':
+        description: |
+          The milestone is recorded. The job has moved too, unless it was already where this
+          milestone would have put it, or has already moved past it.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Milestone'
+      '200':
+        description: |
+          This `Idempotency-Key` had already recorded this milestone. Nothing was written and the
+          original is returned.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Milestone'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          The link was missing, unreadable, or has run out.
+
+          | `error.code` | What happened |
+          |---|---|
+          | `unauthenticated` | No link was presented, or the one presented is not valid here. A mobile access token is one of the cases, and which check refused it is deliberately not said |
+          | `delivery_driver_link_expired` | The link was genuine and its window has closed. **There is nothing to refresh** — ask the transport provider to send a new one |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          This link does not open this job (`not_found`) — either it grants a different one, or the
+          assignment behind it is no longer the live one. Both answer exactly what a job that does
+          not exist answers.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          One of four, and they lead to four different places:
+
+          | `error.code` | What happened |
+          |---|---|
+          | `delivery_milestone_not_permitted` | The delivery has not reached this milestone yet. Keep the update and retry it once it has |
+          | `delivery_proof_required` | `delivered` was sent with no `exception_reason`. Send one; retrying unchanged will not help |
+          | `idempotency_key_reused` | This key already recorded a *different* milestone on this job. Generate a new one |
+          | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field, with the JSON path the client sent — including `proof.object_key`, which this
+          operation does not accept.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'

@@ -415,6 +415,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
 | **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
+| **SHIP-120a** | M4 | `POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken` — **the first write in the service served on a credential that names no account**, and the route three wave-7 lanes specified and none built. It settles the idempotency scope §9 had held open since SHIP-15m: a driver's key is scoped by the job, because `uq_milestones_idempotency (job_id, idempotency_key)` already scopes it there and `000602` named this case while doing it. The `Jobs` port's four moves take a `Recorder` instead of a provider identifier, so a driver's transition is attributed to their `driver_assignments` row rather than to their provider — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
@@ -8077,6 +8078,85 @@ The topic assertions are fenced **by event id**, taken from the outbox before th
 compared as a **subset** — `shipper.bid` and `shipper.delivery` are not emptied by the harness and are
 shared with every worktree on the machine. That is SHIP-135's lesson applied without having to
 rediscover it.
+
+### SHIP-120a — the route three lanes specified and none built, and the scope decision it had to settle first
+
+`POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken`. **The first write in the
+service served on a credential that names no account**, and the reason wave 8 has a delivery track at
+all: with SHIP-115a it unblocks SHIP-101, 121, 122, 123 and 133.
+
+§9 recorded the shape of it after wave 7 — three separate lanes, the driver portal, the proof lane
+and the milestone screen, each independently wrote down the same missing route and not one of them
+built it, because it belonged to none of their tickets. What that produced was a specification rather
+than an oversight, and this ticket was built against it rather than against a blank page.
+
+**The idempotency scope §9 had held open since SHIP-15m is decided here, and the decision is the
+cheap one because the platform had already made it.** The entry offered two shapes: a second
+group-wide resolver beside `ResolveSubject` that a driver grant could also populate, or "an explicit
+decision that a job-scoped grant scopes on the job identifier already in the path, which costs
+nothing and is weaker". The second is taken, and re-reading `000602` is what settles it — the index
+is `uq_milestones_idempotency (job_id, idempotency_key)`, and that migration argued the scope in
+advance while naming this exact case: *"a subject column would be a second copy of that fact, and a
+wrong one the moment SHIP-108's driver records under the same key."* So the guarantee the *Done when*
+rests on lives in a btree that survives an eviction, a flush and two instances; Redis makes the retry
+cheap and the index makes it correct. `replayOrRefuse` fingerprints method, path and body, and the
+path carries the job, so reaching another caller's stored response means already holding their job
+identifier, their key and their exact body — the posture §6 accepts for every public route.
+
+**The first shape was not rejected on its merits; it is unbuildable from a domain branch.** The scope
+is computed group-wide, outside `Idempotent`, in `internal/httpx` and `cmd/api/routes.go`. Both are
+shared surfaces, and no guard can reach the decision from inside — which is exactly what §9 said and
+is worth confirming rather than re-deriving.
+
+**What the two entry points share and what they do not.** `Service.RecordMilestone` and
+`Service.RecordDriverMilestone` differ only in who is asking; everything after that — the evidence
+rule, the insert, the retry path, the move, the five outcomes and SHIP-136's emission — is one
+function they both call. The provider's path asks `bidding` who was awarded the job. **The driver's
+asks a row**: is the assignment this grant names still the live one, which is the same read SHIP-108
+already makes before showing a driver anything. The accepted bid is deliberately not re-checked on
+the driver's path — an assignment can only exist on a job that reached `Driver assigned`, which only
+the awarded provider can ask for, so a live assignment is the stronger statement.
+
+**The `Jobs` port was widened rather than doubled, and that is the one change that reached another
+file.** Its four milestone moves took `providerID uuid.UUID`; they now take a `delivery.Recorder`,
+which carries the `(actor_type, actor_id)` pair `000601` and `000401` already store. A driver has no
+`users` row — they *are* a `driver_assignments` row — so a transition a driver caused has to be
+attributed to that row, and passing an assignment identifier through a parameter named `providerID`
+would have compiled and written a `job_status_history` row claiming a provider did it. Eight methods
+would have let the two paths attribute differently; one parameter cannot. `cmd/api`'s adapter
+**refuses an actor it has no mapping for rather than defaulting to the provider**, which is the same
+call it already makes about an unrecognised outcome, and both the milestone row and the transition
+row are read back in `scripts/verify/70-delivery.sh` rather than inferred from a response body that
+carries neither identifier.
+
+**A driver may say there is no photograph and may not attach one, and that is a line rather than a
+gap.** The exception path needs nothing but a string, and `Docs/01` §4.4 makes it part of the same
+feature, so a driver who cannot photograph a pickup can still record the pickup. A photograph needs
+an upload URL and **there is no operation a driver can call to obtain one** — `POST
+/v1/jobs/{id}/proof-uploads` is `RequireUser` — so a key presented on this route came from somewhere
+a driver should not have been, and is refused as a field error naming the exception beside it.
+SHIP-122 builds the driver's upload and its record together and deletes the refusal. **The
+consequence is named rather than discovered: until then a driver can reach `Delivered` only through a
+reasoned exception**, which SHIP-117 will put in a moderation queue.
+
+**The handler holds no job identifier at all.** `RecordDriverMilestone` takes a `DriverGrant` and
+nothing else, which is the shape `Service.AssignmentFor` already took for the read and which matters
+more on a write: a `DriverGrant` is produced by `DriverTokenVerifier.Verify` and by nothing else, the
+guard has already compared the job in the path with the job in the token, and a handler that has no
+identifier to pass cannot widen the grant by passing the wrong one. **Wave 7's surviving mutation is
+what makes that worth stating** — a driver surface deriving the job it acted on from its own
+credential rendered another job's delivery with a 200 while twenty tests passed — and the lesson
+taken from it is the shape of the tests rather than the signature: three of them ask what the process
+answered for a request naming a job the credential does not, one in `cmd/api` through the real
+middleware chain, one in `internal/delivery` against real rows, and one in
+`scripts/verify/70-delivery.sh` against the running binary with two real deliveries.
+
+**One test in `cmd/api` guards the failure that has no other witness.** `RequireDriverToken` reads
+`{id}` and `r.PathValue` answers the empty string for a parameter a pattern never declared, so a
+driver-token route named any other way is scoped by nothing and refuses everything.
+`TestEveryDriverTokenRouteNamesItsJobInThePath` walks the manifest rather than the two routes that
+exist today.
+
 
 ## 4. Partly done — do not treat these as finished
 

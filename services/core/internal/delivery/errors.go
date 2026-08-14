@@ -198,6 +198,16 @@ var (
 	// reply that invents an answer.
 	ErrMilestoneVanished = errors.New("delivery: a milestone was refused as a duplicate of a row that is not there")
 
+	// ErrUnknownRecorder means a milestone was being written for an actor this domain cannot
+	// attribute it to (SHIP-120a).
+	//
+	// A defect here rather than anything a caller did: every entry point builds the [Recorder]
+	// itself, from a credential the guard has already verified, so a zero or unmapped one means a
+	// path was added without deciding whose row `actor_id` names. It is refused in front of the
+	// insert because the alternative is ck_milestones_actor_type answering with a constraint name
+	// and a 500, three frames further in and after a row has been attempted.
+	ErrUnknownRecorder = errors.New("delivery: a milestone was recorded for an actor this domain cannot attribute")
+
 	// ErrInvalidKeyset means the driver token signing material cannot be used to sign anything
 	// (SHIP-107).
 	//

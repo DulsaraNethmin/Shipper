@@ -270,6 +270,50 @@ type Record struct {
 	ServerRecordedAt time.Time
 }
 
+// Recorder is who is recording a milestone: which kind of actor, and which row identifies them
+// (SHIP-120a).
+//
+// # It exists because a driver is not a provider, and both rows a milestone writes have to say so
+//
+// SHIP-111 had one caller and passed a bare `providerID` through the domain and out to [Jobs].
+// SHIP-120a adds a second entry point on a credential that names no account at all, and the pair
+// `(actor_type, actor_id)` is what 000601 and 000401 both use to say which — a `users` row for a
+// provider, a `driver_assignments` row for a driver, because a driver has none. Passing an
+// assignment identifier through a parameter named `providerID` would have compiled and written a
+// history row claiming a provider did it.
+//
+// So this is the vocabulary both tables already speak, carried as one value rather than as two
+// arguments that can be swapped. It is the whole of what the [Jobs] port gained.
+//
+// # Only two of the four [ActorType] values can appear here
+//
+// [ActorProvider] and [ActorDriver] are the two that can present a credential. [ActorAdmin] is
+// SHIP-113's and owes a reason with it; [ActorSystem] is the automatic presentation change
+// Docs/02 §2 permits, which a worker will write rather than a request. Neither is constructed
+// anywhere yet, and cmd/api's adapter refuses an actor it has no mapping for rather than
+// defaulting to one — see routes_delivery.go.
+type Recorder struct {
+	Type ActorType
+
+	// ID is the row that identifies the actor: a `users` row for a provider, a
+	// `driver_assignments` row for a driver.
+	ID uuid.UUID
+}
+
+// valid reports whether this recorder names an actor that could have made a request.
+//
+// [ActorSystem] is deliberately not valid here even though the column accepts it: nothing
+// unattended records a milestone today, and the zero [Recorder] — which is what a caller that
+// forgot to build one holds — must not be mistaken for the platform acting on its own.
+func (rec Recorder) valid() bool {
+	switch rec.Type {
+	case ActorProvider, ActorDriver:
+		return rec.ID != uuid.Nil
+	default:
+		return false
+	}
+}
+
 // Outcome is what the platform did with a recording (SHIP-112).
 //
 // # It replaced a bool, and the third value is the reason
