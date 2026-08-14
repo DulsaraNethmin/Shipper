@@ -51,6 +51,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
@@ -866,6 +867,159 @@ func (h *Handler) History() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, chainFrom(offers, truncated))
 		return nil
 	})
+}
+
+// Mine handles GET /v1/fleet/bids (SHIP-101a).
+//
+// SHIP-101a's *Done when*: "a provider lists every bid they have placed, grouped by status,
+// paginated, and sees no other provider's; the response carries no customer budget in any form."
+//
+// # Why it is under /v1/fleet and not under /v1/jobs
+//
+// **The resource is the caller's own bids across every job**, which is not a collection under any
+// one job. routes_bidding.go reserved `/v1/jobs/{id}/bids` for SHIP-102's customer comparison at
+// SHIP-84 and has said since then that a provider's list "is a different resource — the caller's own
+// bids across every job — rather than a filter on this one".
+//
+// `/v1/fleet` is where a provider's own things already live: their vehicles, their declared service
+// area, their profile. A provider asking "what have I bid on" is asking about their operation rather
+// than about a job, and the URL says so. It also sidesteps `net/http`'s routing constraint entirely
+// rather than taking another shelf under `/v1/jobs/` — `GET /v1/jobs/open/{id}` already exists, so a
+// four-segment `GET /v1/jobs/{id}/<literal>` panics the mux at registration.
+//
+// # Every response key is one this API already promises a provider
+//
+// The element type is the same [bidResponse] the four write endpoints and the history answer with,
+// which is what keeps the closed key set one list rather than two. Nothing of the job travels in it
+// beyond the identifier, so Docs/01 §4.3 is structurally true here rather than remembered — there is
+// no budget field to omit because there is no job in the shape.
+//
+// Read-only, so no `Idempotency-Key`: the middleware lets safe methods through untouched.
+//
+// **A customer calling it gets an empty page rather than a refusal**, and that is deliberate. There
+// is no role check here for the reason `fleet`'s own list endpoints have none: the query is scoped to
+// the caller's own id, so a customer's answer is empty by construction rather than by permission, and
+// a 403 would make the client special-case a screen it never shows. Docs/11 §9 carries the wider
+// question about `fleet`'s missing role checks; this endpoint discloses nothing either way.
+func (h *Handler) Mine() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		query, err := bidQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		page, err := h.svc.Bids(r.Context(), pool, providerID, query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		bids := make([]bidResponse, 0, len(page.Bids))
+		for _, bid := range page.Bids {
+			bids = append(bids, bidFrom(bid))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(bids, encodeBidCursor(page.Next)))
+		return nil
+	})
+}
+
+// bidQueryFrom reads `?status=`, `?limit=` and `?cursor=`, which is every parameter this list has.
+//
+// Every failure is bad_request rather than validation_failed, which is httpx's own division: a query
+// parameter is part of how the request was addressed rather than data a person typed into a form, and
+// `?cursor=` in particular is a token the client was handed rather than a value it composed.
+//
+// An unknown parameter is passed over rather than refused, unlike an unknown *body* field. Docs/07
+// §6's strictness is about bodies: a URL picks up parameters from link trackers and proxies that no
+// client typed. What matters is the other direction — neither parameter this endpoint reads can
+// widen the scope, and the provider is not one of them.
+func bidQueryFrom(r *http.Request) (BidQuery, error) {
+	values := r.URL.Query()
+
+	var query BidQuery
+
+	if wanted := strings.TrimSpace(values.Get("status")); wanted != "" {
+		status, known := StatusFromWire(wanted)
+		if !known {
+			// The valid values are not listed in the message. There are eight, the contract
+			// publishes them, and a message that enumerated them would be a fourth copy of the
+			// list to keep in step (Docs/10 §3.4).
+			return BidQuery{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+				"%q is not a bid status.", wanted)
+		}
+		query.Status = status
+	}
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return BidQuery{}, err
+	}
+	query.Limit = limit
+
+	if query.After, err = decodeBidCursor(values.Get("cursor")); err != nil {
+		return BidQuery{}, err
+	}
+	return query, nil
+}
+
+// bidCursorFields is how many parts a bid cursor has: the created_at it is positioned at, and the id
+// that breaks ties on it.
+const bidCursorFields = 2
+
+// encodeBidCursor renders a position for a client to hand back, in the encoding
+// `internal/pagination` owns. The zero cursor is the empty string, which is also what "no cursor"
+// looks like on the way in.
+func encodeBidCursor(c BidCursor) string {
+	if c.IsZero() {
+		return ""
+	}
+	return pagination.Cursor{
+		c.CreatedAt.UTC().Format(time.RFC3339Nano),
+		c.ID.String(),
+	}.Encode()
+}
+
+// decodeBidCursor reads one back.
+//
+// pagination.Decode establishes the shape — this version, this many fields — and this establishes the
+// meaning. Only the domain knows that its ordering key is a timestamp and a UUID, and a cursor whose
+// fields decode but do not parse has to be refused here rather than reaching the query as a zero
+// time, which would silently answer with the first page.
+//
+// **Nanoseconds, not the millisecond precision responses render.** A cursor is compared against
+// created_at rather than displayed, and a rendering that rounded would put the boundary in the wrong
+// place — repeating an offer at every page edge, or dropping one.
+func decodeBidCursor(raw string) (BidCursor, error) {
+	fields, err := pagination.Decode(raw, bidCursorFields)
+	if err != nil || fields == nil {
+		return BidCursor{}, err
+	}
+
+	at, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		return BidCursor{}, invalidBidCursor(err)
+	}
+	id, err := uuid.Parse(fields[1])
+	if err != nil {
+		return BidCursor{}, invalidBidCursor(err)
+	}
+	return BidCursor{CreatedAt: at, ID: id}, nil
+}
+
+func invalidBidCursor(cause error) error {
+	return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+		"The cursor is not one this endpoint issued. Ask for the first page without one.").
+		WithCause(cause)
 }
 
 // pathIDs reads both identifiers a bid is addressed by.

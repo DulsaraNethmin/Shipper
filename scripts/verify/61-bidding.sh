@@ -1982,6 +1982,155 @@ ok "the database holds exactly one accepted offer and nothing still live, which 
 ok "and the job was moved to Awarded exactly once, through the guarded transition"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-101a  GET /v1/fleet/bids — a provider reads their own bids, and nobody else's"
+
+# SHIP-101a's *Done when*: "a provider lists every bid they have placed, grouped by status,
+# paginated, and sees no other provider's; the response carries no customer budget in any form."
+#
+# The read SHIP-101's screen had nothing to work from without. Docs/11 §6 struck that ticket for two
+# waves as "every dependency met and unbuildable in fact", because the only bidding read on the
+# served surface needed a job identifier and a bid identifier the provider would have to hold
+# already.
+#
+# # What only this can show
+#
+# internal/bidding/read_test.go holds the scope, the status filter, the keyset and the closed key
+# set. **What only this can show is the route being served at all** — under `/v1/fleet` rather than
+# under a job, past the real auth class, against rows every earlier section in this file placed
+# through real endpoints.
+#
+# Both providers registered at the top have bid on several jobs by now, which is what makes the
+# "sees no other provider's" check a real one rather than a comparison of two empty lists.
+
+bid_list() {
+  curl -s -o "$WORKDIR/bid-list-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" "http://localhost:$VERIFY_PORT/v1/fleet/bids$2"
+}
+
+status="$(curl -s -o "$WORKDIR/bid-list-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/fleet/bids")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-list-anon.json"; fail "an unauthenticated bid list returned $status, want 401"; }
+ok "it cannot be reached without a credential — the provider is the token's, not a parameter's"
+
+status="$(bid_list "$bid_provider_token" "" mine)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-list-mine.json"; fail "listing a provider's own bids returned $status"; }
+
+python3 - "$WORKDIR/bid-list-mine.json" <<'PY' || fail "the bid list is not the collection envelope"
+import json, sys
+
+page = json.load(open(sys.argv[1]))
+if sorted(page) not in (["data", "has_more"], ["data", "has_more", "next_cursor"]):
+    sys.exit("the envelope carries %s" % sorted(page))
+if not isinstance(page["data"], list) or not page["data"]:
+    sys.exit("the list is empty, and this provider has bid several times through this file")
+PY
+ok "it answers the collection envelope of Docs/10 §4.5, with the offers this file placed in it"
+
+# **Every row belongs to the calling provider.** This is the one endpoint in the domain that answers
+# with a *set* rather than a row somebody named, so the scope is the query rather than a refusal —
+# delete `provider_id` from its WHERE clause and nothing else in this file notices.
+mine_ids="$(python3 -c '
+import json, sys
+print(" ".join(row["id"] for row in json.load(open(sys.argv[1]))["data"]))
+' "$WORKDIR/bid-list-mine.json")"
+for listed in $mine_ids; do
+  [[ "$("$PSQL" "$DATABASE_URL" -tAc "select provider_id from bids where id = '$listed';")" == "$bid_provider_id" ]] \
+    || fail "the list carries $listed, which belongs to another provider — Docs/01 §4.3 keeps a competitor's price private"
+done
+
+status="$(bid_list "$bid_rival_token" "" rival)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-list-rival.json"; fail "the rival's list returned $status"; }
+rival_ids="$(python3 -c '
+import json, sys
+print(" ".join(row["id"] for row in json.load(open(sys.argv[1]))["data"]))
+' "$WORKDIR/bid-list-rival.json")"
+[[ -n "$rival_ids" ]] || fail "the rival's list is empty, so the comparison below proves nothing"
+for listed in $rival_ids; do
+  case " $mine_ids " in
+    *" $listed "*) fail "$listed is in both providers' lists" ;;
+  esac
+done
+ok "each provider's list holds only their own negotiations, and the two do not overlap"
+
+# The customer's counter-offers are in the provider's list and are told apart by `offered_by`, which
+# is the reading read.go argues: a counter carries the provider's id and is the row waiting for an
+# answer from them.
+python3 - "$WORKDIR/bid-list-mine.json" <<'PY' || fail "the list does not distinguish who made each offer"
+import json, sys
+
+rows = json.load(open(sys.argv[1]))["data"]
+parties = {row["offered_by"] for row in rows}
+if not parties <= {"provider", "customer"}:
+    sys.exit("offered_by holds %s" % sorted(parties))
+if not all("status" in row for row in rows):
+    sys.exit("a row carries no status, so a client cannot group by one")
+PY
+ok "every row says which party offered it and what status it is in — enough to group by status client-side"
+
+# Grouping, the other way round: ask the platform for one group.
+status="$(bid_list "$bid_provider_token" "?status=withdrawn" withdrawn)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-list-withdrawn.json"; fail "?status=withdrawn returned $status"; }
+python3 - "$WORKDIR/bid-list-withdrawn.json" <<'PY' || fail "?status= did not narrow the list"
+import json, sys
+
+rows = json.load(open(sys.argv[1]))["data"]
+if not rows:
+    sys.exit("the withdrawn group is empty, and this file withdrew an offer through the endpoint")
+wrong = {row["status"] for row in rows} - {"withdrawn"}
+if wrong:
+    sys.exit("the withdrawn group also holds %s" % sorted(wrong))
+PY
+ok "?status= narrows to one group, and the filter runs in the query rather than over the page"
+
+status="$(bid_list "$bid_provider_token" "?status=haggling" badstatus)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-list-badstatus.json"; fail "an unknown status returned $status, want 400"; }
+[[ "$(json "$WORKDIR/bid-list-badstatus.json" '["error"]["code"]')" == "bad_request" ]] \
+  || fail "an unknown status answered $(json "$WORKDIR/bid-list-badstatus.json" '["error"]["code"]')"
+status="$(bid_list "$bid_provider_token" "?cursor=not-a-cursor" badcursor)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-list-badcursor.json"; fail "a mangled cursor returned $status, want 400"; }
+ok "an unknown status and a cursor this endpoint never issued are both refused rather than ignored"
+
+# Paging, over rows this file created: one at a time, following the cursor, with nothing repeated
+# and nothing dropped. The tie-break is the half worth having — several of these offers were written
+# in the same second.
+status="$(bid_list "$bid_provider_token" "?limit=1" page1)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-list-page1.json"; fail "the first page returned $status"; }
+[[ "$(json "$WORKDIR/bid-list-page1.json" '["has_more"]')" == "True" ]] \
+  || fail "a one-row page over several offers reports no further pages"
+page_cursor="$(json "$WORKDIR/bid-list-page1.json" '["next_cursor"]')"
+[[ -n "$page_cursor" ]] || fail "the first page carries no cursor"
+
+status="$(bid_list "$bid_provider_token" "?limit=1&cursor=$page_cursor" page2)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-list-page2.json"; fail "the second page returned $status"; }
+[[ "$(json "$WORKDIR/bid-list-page2.json" '["data"][0]["id"]')" != "$(json "$WORKDIR/bid-list-page1.json" '["data"][0]["id"]')" ]] \
+  || fail "the second page repeated the first page's row"
+ok "it pages by cursor, and the second page starts after the first rather than repeating it"
+
+# CLAUDE.md's budget invariant, on the newest provider-facing response. The fixture jobs all carry
+# one, which is what makes this a real assertion rather than a search over rows with nothing to leak.
+python3 - "$WORKDIR/bid-list-mine.json" <<'PY' || fail "a listed bid carries something of the customer's"
+import json, sys
+
+# The same closed key set the single-bid checks above use. A field named `max_price` is a budget and
+# does not contain the word, which is the axis a search for "budget" cannot have.
+permitted = {
+    "id", "job_id", "status", "offered_by", "amount_cents",
+    "pickup_at", "deliver_by", "message", "superseded_by", "created_at", "updated_at",
+}
+for row in json.load(open(sys.argv[1]))["data"]:
+    extra = set(row) - permitted
+    if extra:
+        sys.exit("a listed bid carries %s" % sorted(extra))
+PY
+case "$(tr 'A-Z' 'a-z' <"$WORKDIR/bid-list-mine.json")" in
+  *budget*|*432199*|*4321.99*) fail "the bid list body mentions the customer's budget" ;;
+esac
+ok "and no row carries the customer's budget in any form, on jobs that all have one"
+
+unset mine_ids rival_ids page_cursor listed
+unset -f bid_list
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-89  a bid expires on its own terms, and the sweep is the real worker binary"
 
 # Docs/01 §4.2 bounds a provider's three verbs "until it is accepted or expires", and SHIP-89 is

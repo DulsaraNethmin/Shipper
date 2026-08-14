@@ -84,6 +84,24 @@ import (
 // claims `provider` is still recognised as the customer of their own job, which is what CLAUDE.md
 // means by no authorisation decision on the device.
 //
+// # The provider's own bids are under `/v1/fleet`, which is the one route here not under a job
+//
+// SHIP-101a, and it is the shape this file predicted at SHIP-84: "SHIP-101's provider list is a
+// different resource — the caller's own bids across every job — rather than a filter on this one".
+// `/v1/fleet` is where a provider's own things already live — their vehicles, their service area,
+// their profile — and a provider asking what they have bid on is asking about their operation rather
+// than about any one job.
+//
+// **It also sidesteps `net/http`'s routing constraint rather than working around it.** A
+// four-segment `GET /v1/jobs/{id}/<literal>` panics the mux at registration while
+// `GET /v1/jobs/open/{id}` exists, so a provider list under the job tree would have had to take a
+// fifth segment or a different verb. This resource does not belong there anyway, which is the
+// happier of the two reasons.
+//
+// `RequireUser` and not a role, for the fifth time. The list is scoped to the caller's own id in the
+// `WHERE` clause, so a customer's answer is an empty page by construction rather than by permission —
+// there is no parameter that widens it and nothing to refuse.
+//
 // # And the history is a `GET` under the same offer
 //
 // SHIP-88's "full chain remains readable". It is deliberately **not** `GET /v1/jobs/{id}/bids`, which
@@ -146,6 +164,13 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).History() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/fleet/bids",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).Mine() },
 		},
 	)
 }

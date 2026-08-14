@@ -665,3 +665,76 @@ func (postgresStore) chain(
 	}
 	return offers, nil
 }
+
+// bidsFor is one page of a provider's own negotiations, newest first (SHIP-101a).
+//
+// # The scope is one column and there is no parameter that widens it
+//
+// `provider_id = $1`, taken from the authenticated subject. Another provider's offer is not refused
+// by this query — it is never selected, which is the strongest available form of Docs/01 §4.3's
+// second privacy rule and the same construction `fleet`'s vehicle list uses. **The `WHERE` clause is
+// the whole of the rule here**, unlike the addressed reads above where ownership is judged in Go:
+// there is no identifier a caller supplied to tell "somebody else's" from "nobody's" about, so there
+// is nothing for a comparison in Go to be more precise about.
+//
+// `idx_bids_provider` is `(provider_id, created_at DESC)` from 000500, which is this predicate and
+// this order exactly.
+//
+// # The keyset, and why the tuple comparison rather than two clauses
+//
+// `(created_at, id) < ($3, $4)` is a row-value comparison, which PostgreSQL can answer straight off
+// the index. Written as `created_at < $3 OR (created_at = $3 AND id < $4)` it is the same rows and a
+// worse plan, and it is the form somebody eventually gets wrong by dropping the parenthesis.
+//
+// Descending on both, because the list is newest first: a cursor names the last row of the previous
+// page and the next page is everything **before** it.
+//
+// # The status filter is optional and is applied in SQL rather than after the page is cut
+//
+// A filter applied in Go would page over the unfiltered set and hand back short pages — the failure
+// that makes `has_more` a lie. `$2` is the empty string when no status was asked for, and the clause
+// is written so that PostgreSQL sees a constant-false disjunct rather than a second query.
+func (postgresStore) bidsFor(
+	ctx context.Context,
+	r db.Runner,
+	providerID uuid.UUID,
+	status Status,
+	after BidCursor,
+	limit int,
+) ([]Bid, error) {
+	const q = `
+		SELECT ` + bidColumns + `
+		FROM bids
+		WHERE provider_id = $1
+		  AND ($2 = '' OR status = $2)
+		  AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4))
+		ORDER BY created_at DESC, id DESC
+		LIMIT $5`
+
+	var (
+		at *time.Time
+		id *uuid.UUID
+	)
+	if !after.IsZero() {
+		at, id = &after.CreatedAt, &after.ID
+	}
+
+	rows, err := r.Query(ctx, q, providerID, string(status), at, id, limit)
+	if err != nil {
+		return nil, fmt.Errorf("bidding: reading %s's bids: %w", providerID, err)
+	}
+	defer rows.Close()
+
+	bids := make([]Bid, 0, limit)
+	for rows.Next() {
+		bid, err := scanBid(rows)
+		if err != nil {
+			return nil, fmt.Errorf("bidding: reading one of %s's bids: %w", providerID, err)
+		}
+		bids = append(bids, bid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bidding: reading %s's bids: %w", providerID, err)
+	}
+	return bids, nil
+}

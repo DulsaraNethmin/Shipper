@@ -403,6 +403,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-94** | M3 | Award idempotency — **two mechanisms, and the ticket is settling which does which work.** Redis replays the response while its entry lives; the accepted offer answers every retry it cannot, including one under a fresh key. They disagree on exactly one request — a key reused for a *different* offer — and the middleware refuses it, rightly. **No key column, no migration, no handler change**: what it adds is the proof, and the two retries nobody had tested — the one that runs after SHIP-93's sweep, and the one that arrives after the delivery has started — *see below* |
 | **SHIP-95** | M3 | The award concurrency suite — Docs/08's four races, **written adversarially from the documents by an agent that did not read the implementation**, and every one of them observed racing rather than assumed to: a transaction is held open and `pg_blocking_pids` is polled until PostgreSQL confirms the other is waiting on it. Three properties no existing test could see are now pinned — that the job row is held, that it is held *before* the bid, and that an offer which stopped being live mid-award is not accepted — each demonstrated by breaking the implementation and watching a named test fail. It also found the liveness rule is kept **twice**, and that either guard alone is invisible — *see below* |
 | **SHIP-96** | M3 | Bid history visibility rules — Docs/02 §4's **three** readers enumerated in one file, with an administrator added to SHIP-88's two. It also settles §9's unmapped 500 on the award path, by ruling that it is intended. **The administrator has no route**: `authctx.Subject` cannot carry one, so the third audience is reachable from the domain and exercised by test until SHIP-147 — *see below* |
+| **SHIP-101a** | M3 | `GET /v1/fleet/bids` — a provider's own bids across every job, paged by cursor and narrowable to one status. **Off the `/v1/jobs/` tree deliberately**: the resource crosses jobs, and it sidesteps the `ServeMux` constraint rather than taking another shelf. It unstrikes SHIP-101, which had every dependency met and nothing to read — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-100** | M3 | Flutter provider job detail and bid placement — one job over `GET /v1/jobs/open/{id}` and an offer over `POST /v1/jobs/{id}/bids`. **The bid is sent directly and never queued**, which `Docs/07` §4 requires and SHIP-124's private `OperationKind` constructor already made impossible to get wrong; what makes a retry safe is one `ActionKey` per action against SHIP-84's stored key column. It also **closes §9's client-side budget guard** by holding every provider-facing model to a closed key set — *see below* |
@@ -5060,6 +5061,79 @@ against the request id, which is what a defect actually needs.
 §3's check count, and nothing else. **No migration, no route, no `$ref`, no `routes_golden.txt`
 line**: the endpoint SHIP-88 built is the endpoint SHIP-96 governs, and what changed is who may reach
 it.
+
+### SHIP-101a — the read SHIP-101 had nothing to work from without
+
+`GET /v1/fleet/bids` — every offer in every negotiation the calling provider is in, newest first,
+paged by cursor and narrowable to one status.
+
+**It unstrikes SHIP-101.** §6 carried that ticket for two waves as its third category — "every
+dependency met and unbuildable in fact" — because `routes_golden.txt` held no list-my-bids route in
+any form and the only bidding read on the served surface needed a job identifier and a bid identifier
+the provider would have to hold already.
+
+#### Under `/v1/fleet`, and the routing constraint is the second reason rather than the first
+
+`routes_bidding.go` predicted the shape at SHIP-84: "SHIP-101's provider list is a different resource —
+the caller's own bids across every job — rather than a filter on this one". `/v1/fleet` is where a
+provider's own things already live: their vehicles, their service area, their profile. A provider
+asking what they have bid on is asking about their operation.
+
+**It also sidesteps `ServeMux`'s constraint entirely rather than working around it.** A four-segment
+`GET /v1/jobs/{id}/<literal>` panics the mux at registration while `GET /v1/jobs/open/{id}` exists, so
+a list under the job tree would have needed a fifth segment or a different verb. The resource does not
+belong there anyway, which is the happier of the two reasons.
+
+#### "Their own bids" is scoped by `provider_id`, and that reading is wider than the phrase
+
+`bids.provider_id` means **the provider a negotiation is with** rather than the author of any one row —
+000502 reinterpreted it and said why. So a customer's counter-offer carries it, and this list includes
+those rows.
+
+**That is deliberate and it is the more useful answer.** The screen has to show four things: which
+offers are live, which were accepted, which lost, and **which are waiting for an answer from this
+provider** — and the fourth is a customer's counter. A list of the provider's own rows alone would hide
+the one row that needs an action. Every row carries `offered_by`, so nothing is ambiguous, and the
+provider could already read those rows one negotiation at a time through `…/history`.
+
+**It is never wider than that.** The provider comes from the authenticated subject and there is no
+parameter that widens the scope, so another provider's offer is not refused — it is never selected.
+This is the one endpoint in the domain that answers with a **set** rather than a row somebody named, so
+the `WHERE` clause *is* the privacy rule: delete `provider_id = $1` and nothing else in the package
+notices, which is why `TestAProviderNeverSeesAnotherProvidersBid` asserts it in both directions.
+
+#### "Grouped by status" is the client's grouping, and the platform's job is to make it possible
+
+`Docs/10` §4.5's collection envelope is a flat array with a cursor, so a response of named buckets
+would have to page each bucket separately or abandon paging. What the platform owes the screen is the
+ability to **ask for one group** — `?status=`, the shape `GET /v1/jobs` already has — and the status on
+every row so a client can group four live offers without asking twice. Both work; the endpoint has no
+opinion about which.
+
+The filter runs in SQL rather than over the page, which is the half worth pinning: applied after the
+cut it would produce short pages and a `has_more` that lied about them.
+
+#### Keyset, and the tie is not theoretical
+
+`(created_at, id) < ($3, $4)` as a row-value comparison, which PostgreSQL answers straight off
+`idx_bids_provider`. Two fields because a provider placing offers in one sitting writes rows in the
+same millisecond, and a cursor that could not break that tie would repeat or drop an offer at exactly
+the page boundary — the failure keyset pagination exists to avoid, arriving by a different route.
+
+#### The budget, structurally rather than by redaction
+
+The element type is the same `bidResponse` the four write endpoints and the history answer with, so the
+closed key set stays one list rather than two. Nothing of the job travels in it beyond the identifier,
+so `Docs/01` §4.3 is true here by construction — there is no budget field to omit because there is no
+job in the shape — and `TestTheBidListCarriesNothingOfTheCustomers` holds the whole serialised page,
+envelope included, to that set.
+
+#### Shared surfaces
+
+One `$ref` pair in `contracts/openapi.yaml`, one line in `cmd/api/routes_golden.txt` — regenerated
+rather than typed — and §3's check count. **No migration**: the list reads columns 000500 and 000501
+already added, through the index 000500 already created. No `internal/boundaries` edit, no `Deps`
+field, and no new port.
 
 ### SHIP-98 — the first provider surface, and the endpoint that does not refuse a customer
 
