@@ -8,7 +8,23 @@
 # contracts/** is in the filter because SHIP-17a's tests read contracts/openapi.yaml and
 # validate live handler responses against it. Without it, editing a contract fragment — which
 # is how every domain will publish its endpoints — would not run the one test that checks the
-# fragment against the service.
+# fragment against the service. It now also covers contracts/statuses.yaml, the one source
+# SHIP-56a generates three languages from.
+#
+# apps/**/*.gen.dart and apps/**/*.gen.ts are the other half of that (SHIP-56a), and they are the
+# only entries here naming a file outside services/core. The reason is where the staleness check
+# lives: TestGeneratedFilesAreCurrent renders contracts/statuses.yaml and compares it with every
+# committed output, the Dart and TypeScript ones included, and it is a Go test. Without these two
+# globs, hand-editing a generated Dart file would start the Flutter workflow — which does not
+# check it — and not this one, which does. SHIP-56a's criterion is "CI fails if a generated file
+# is stale", and that either holds for all three languages or it holds for one.
+#
+# **This costs no macOS minutes and cannot.** Every job in every workflow here is ubuntu-latest;
+# the iOS and Android builds that need a real runner are SHIP-24…27, blocked on X-2 and X-3. What
+# .github/workflows/README.md forbids is a Go-only change starting a client pipeline, and that is
+# unchanged: a change under services/core/ still starts this workflow alone. The globs are narrow
+# on purpose — a hand-written Dart or TypeScript file matches neither, so ordinary client work
+# does not start this job either.
 name: Go
 
 on:
@@ -17,6 +33,8 @@ on:
     paths:
       - "services/core/**"
       - "contracts/**"
+      - "apps/**/*.gen.dart"
+      - "apps/**/*.gen.ts"
       - ".github/workflows/go.yml"
       - "Makefile"
       - "mk/**"
@@ -24,6 +42,8 @@ on:
     paths:
       - "services/core/**"
       - "contracts/**"
+      - "apps/**/*.gen.dart"
+      - "apps/**/*.gen.ts"
       - ".github/workflows/go.yml"
       - "Makefile"
       - "mk/**"

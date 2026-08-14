@@ -561,58 +561,17 @@ func keyBelongsToJob(key string, jobID uuid.UUID) bool {
 // Docs/02 §6.1 at all; **nothing here presumes either answer**, and SHIP-119 can branch on the row
 // in whichever direction operations settles it.
 
-// ProofExceptionReason is why a recorded milestone carries no photograph (SHIP-116).
+// The three proof exception reasons are generated (SHIP-56a).
 //
-// # A closed list, and Docs/01 §4.4 wrote it
+// contracts/statuses.yaml is the source and proofexception_gen.go beside this file is the Go form:
+// ProofExceptionReason, its constants, ProofExceptionReasons, Valid, String, Wire and
+// ProofExceptionReasonFromWire. Docs/01 §4.4's three clauses moved into the specification with the
+// values they justify, which is where they can reach a driver's phone and a driver's browser as
+// well as this package.
 //
-// The three below are that paragraph's own three, and there is deliberately no `other`. A reason
-// nobody can group is a moderation queue nobody can triage (Docs/04 §5), and a driver's own words
-// are not lost by leaving them out: `milestones.reason` is optional, 500 characters, and one row
-// away — "the recipient asked me not to photograph their door" goes there, beside a selected
-// reason rather than instead of one.
-//
-// The values are lower snake case and the stored form is the wire form, which is [ActorType]'s
-// arrangement rather than [Milestone]'s. Milestones store Docs/02 §1's exact strings because a
-// document fixes them (Docs/10 §3.4); no document fixes these, so a second spelling would be a
-// translation table with nothing on the other side of it.
-//
-// Paired with ck_proofs_exception_reason by TestProofExceptionConstraintMatchesTheGoConstants, in
-// both directions, which is what Docs/10 §3.4 asks of every enumeration.
-type ProofExceptionReason string
-
-const (
-	// ExceptionRecipientObjected is Docs/01 §4.4's first: "the recipient objects to being
-	// photographed".
-	ExceptionRecipientObjected ProofExceptionReason = "recipient_objected"
-
-	// ExceptionCameraUnavailable is its second: "the camera permission is denied or the hardware
-	// is unavailable".
-	//
-	// **This is the one SHIP-131 exists for** — "a denied permission offers the exception path
-	// instead of a dead end" — and it is why that ticket depends on this one.
-	ExceptionCameraUnavailable ProofExceptionReason = "camera_unavailable"
-
-	// ExceptionLocationUnsafe is its third: "the delivery point is unlit or unsafe to
-	// photograph".
-	ExceptionLocationUnsafe ProofExceptionReason = "location_unsafe"
-)
-
-// ProofExceptionReasons is every reason a photograph may be missing.
-//
-// Ordered as Docs/01 §4.4 lists them, which is also the order a client should offer them in: the
-// first is the one a driver meets most often and the third is the one they meet in the dark.
-var ProofExceptionReasons = []ProofExceptionReason{
-	ExceptionRecipientObjected,
-	ExceptionCameraUnavailable,
-	ExceptionLocationUnsafe,
-}
-
-// Valid reports whether r is one of the three.
-func (r ProofExceptionReason) Valid() bool {
-	return slices.Contains(ProofExceptionReasons, r)
-}
-
-func (r ProofExceptionReason) String() string { return string(r) }
+// The stored form is the wire form here, unlike the job and bid statuses. Nothing about that
+// changed: it is written out per value in the specification, both columns the same, rather than
+// being a case the generator knows about.
 
 // proofExceptionWire is every accepted reason, for the message a client is refused with.
 //

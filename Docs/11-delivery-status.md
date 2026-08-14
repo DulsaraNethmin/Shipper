@@ -259,7 +259,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **560 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **575 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -366,6 +366,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-54** | M1 | Flutter phone verification — a code on opening, and a resend the platform's interval throttles — *see below* |
 | **SHIP-55** | M1 | Flutter sign-in — closes M1, deletes the development session stand-in, and settles biometric unlock as out of the MVP — *see below* |
 | **SHIP-56** | M2 | `jobs` — the twelve statuses of `Docs/02` §1 as a `CHECK`, held to the Go constants by test |
+| **SHIP-56a** | M2 | `contracts/statuses.yaml` produces the Go, Dart and TypeScript forms of all three status vocabularies, and a test fails when any of the seven generated files is stale — *see below* |
 | **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
@@ -1228,6 +1229,140 @@ and registers no `httpx` codes yet. Nothing serves them, and a published code is
 store build on somebody's phone is already branching on. The first endpoint (SHIP-61, SHIP-64)
 maps `ErrTransitionNotPermitted`, `ErrAlreadyInStatus` and `ErrJobNotFound` to codes and
 regenerates `Docs/10-api-error-codes.md`.
+
+### SHIP-56a — one source for three languages, and the reading the documents had already taken
+
+`contracts/statuses.yaml` is the source. `make codegen` writes seven files from it: the Go form of
+each vocabulary beside the domain that owns it, the Dart form beside the feature that shows it, and
+one TypeScript module in the driver portal.
+
+**The decision was not open, and finding that out was most of the work.** The ticket's *Done when* —
+"one source produces all three" — reads two ways: a neutral specification producing all three, or Go
+being the source with the other two derived from it. `Docs/10` §8.2 had settled it before the ticket
+was written, in one sentence naming this exact file, and three source files carried comments
+promising it: `internal/jobs/model.go`, `job_status.dart` and `bid_status.dart` each said "this is
+the *N* copy until SHIP-56a lands". `CLAUDE.md` is explicit that a contradiction with a document is
+resolved in the document first and never silently in code, so the second reading would have needed
+`Docs/10` §8.2 changed and an argument for changing it. There was none: the objections to a neutral
+source were that the SQL pairing and the documentation would be at risk, and neither turned out to
+be true — see both below.
+
+It is also the reading that leaves nothing lying. Under the alternative, the argument for why nothing
+writes the `Countered` bid status keeps existing twice — once as a paragraph explaining a Go
+constant, once as a paragraph explaining a Dart enum member, in almost the same words, which is how
+it was actually written. It is now one entry in the specification, rendered into all three.
+
+**The SQL pairing survived untouched and got stronger for free.** Nothing generates SQL: migrations
+are applied history and cannot be regenerated. `ck_jobs_status`, `ck_bids_status` and
+`ck_proofs_exception_reason` are hand-written exactly as they were, and `Docs/10` §3.4's pairing test
+per enumeration reads each out of `pg_constraint` and holds it to the Go constants in both
+directions. Not one of those tests changed. What changed is what they now pair: the constants are
+generated, so the constraint is being compared with the specification. Adding a status to the
+specification and regenerating fails three constraints at once — demonstrated, below.
+
+**What is generated is the vocabulary and nothing else**, and the line is "would a second language
+want a copy of it?":
+
+| Generated | Not generated, and why |
+|---|---|
+| The type, its values, the ordered list, `Valid`, `String`, `Wire`, `FromWire` | `Docs/02` §2's transition table and `bidding`'s liveness predicate. Decisions, not names — `Docs/07` §3 puts every such decision on the platform, so a copy on the device would be a second authority for a question that has one |
+| The Dart enum, its `@JsonValue` wire forms, `wireName`, `label`, and the `unknown` sentinel | The SQL `CHECK` constraints. Applied history; the §3.4 pairing test is the mechanism and it is unchanged |
+| One TypeScript module: a `const` object, a union type, the ordered values, the labels, a type guard | Actor vocabularies — `jobs.ActorType`, `bidding.Party`, Dart's `BidParty`. They name a kind of person rather than a lifecycle state. Moving them later is an entry in the specification and no new mechanism |
+
+**Two forms per value are written out and neither is derived.** Go used to derive the wire form from
+the stored form by lower-casing and replacing spaces, arguing that "a transformation cannot disagree
+with its input" where a hand-written table beside the constants can. That was right about
+hand-written tables and does not survive generation — a table produced from the same source as the
+constants cannot disagree with them either. What the derivation cost was visibility: both strings are
+published contracts with different audiences, `stored` to `ck_jobs_status` and to anybody reading the
+database, `wire` to a build already installed on a phone. A rule hides the second, and the first
+status that did not fit the rule would be renamed on the wire by a change nobody read as a rename.
+
+**The generated Dart file is not the file anything imports, and that is deliberate.** It is
+`<name>.gen.dart`, with a hand-written `<name>.dart` exporting it. The first draft generated
+`bid_status.dart` outright and deleted `isLive` and `BidParty` — which is the failure mode of
+generating over hand-written code, found in the first run rather than in a later one. Every consumer
+still imports the name it always imported, and no import site in `apps/mobile` changed.
+`build_runner` was re-run and produced no diff at all: the enum moving files is invisible to
+`json_serializable`.
+
+**`{{n}}` in a doc renders as the value count, spelled out.** Prose saying "one of the twelve" is a
+hand-maintained scalar, and §3 above records what those do here — the `make verify` figure conflicted
+in four consecutive merges and was wrong in three of them. The specification says `{{n}}` and the
+generator counts.
+
+#### The half that is easy to under-build, and how it was demonstrated
+
+"CI fails if a generated file is stale" is not a `make` target that regenerates.
+`TestGeneratedFilesAreCurrent` in `services/core/cmd/statusgen` renders the specification in memory
+and compares it with every committed output, so it runs under `go test ./...` — under `make test`,
+under `make check`, and in the Go workflow, with no CI step of its own. `make codegen` exists to fix
+what it finds; `make codegen-check` reports without writing and is deliberately not in `CHECKS`.
+
+A test rather than the `git diff --exit-code` after regenerating that `Docs/10` §8.2 sketched, and
+that sentence has been corrected. It is strictly stronger in two ways this repository has paid for.
+It **writes nothing**, so it cannot produce the false failure a tree-rewriting gate produced in
+wave 5 on a tree where nothing was wrong, and it works on a dirty tree, which is where it is run. And
+it fails on a generated file that is **missing entirely**, which a diff of tracked files does not see.
+
+Eight mutations were applied and restored from a tar snapshot, each confirmed with a checksum:
+
+| Mutation | Caught by |
+|---|---|
+| Rename a status in the specification, do not regenerate | The staleness test, naming all three languages and the first differing line in each |
+| Hand-edit a label in a generated Dart file | The staleness test |
+| Hand-edit a wire string in a generated Go file | The staleness test |
+| Delete a value from the TypeScript only | The staleness test |
+| Delete a generated file entirely | The staleness test — the case `git diff` would not see |
+| Add a status to the specification and regenerate, with no migration | `ck_jobs_status`, `ck_job_status_history_from_status` and `ck_job_status_history_to_status`, all three |
+| A wire form in the wrong case | The specification's own validation, refusing to generate at all |
+| Hand-edit a generated Dart file, then run `make check` | `make check` exits 2 — the CI command itself, not a proxy for it |
+
+The one link not demonstrated locally is the workflow trigger. `.github/workflows/go.yml` gained
+`apps/**/*.gen.dart` and `apps/**/*.gen.ts`, because the staleness check is a Go test and without
+them a hand-edited generated *client* file would start the Flutter or web workflow — neither of which
+checks it — and not the Go one, which does. GitHub's path matcher cannot be run here, so that glob
+rests on documented `**` semantics rather than on a demonstration. **It costs no macOS minutes and
+cannot:** every job in every workflow in this repository is `ubuntu-latest`, the runners that need a
+real machine are SHIP-24…27 and blocked on X-2 and X-3, and a change under `services/core/` still
+starts the Go workflow alone. The globs are narrow on purpose — a hand-written Dart or TypeScript
+file matches neither.
+
+#### A mutation that survived, and it was not this ticket's to fix
+
+**The published contract is a fourth copy of the vocabulary and nothing pairs it with the other
+three.** `contracts/paths/jobs.yaml` enumerates the twelve job statuses, `bidding.yaml` the eight bid
+statuses, and `delivery.yaml` the three proof exception reasons — all by hand. Deleting `countered`
+from `bidding.yaml`'s enum and running `make check` **passes**. So a status added to
+`contracts/statuses.yaml` reaches Go, Dart, TypeScript and — through the pairing test — the database,
+and does not reach the document clients are generated from.
+
+It is left open on purpose rather than overlooked, and the reason is the shape of the fix. Several
+enumerations in those fragments are **legitimate subsets**: `delivery.yaml`'s recordable milestones
+are four of the twelve job statuses deliberately, and its actor list is a fifth vocabulary again. A
+check that pairs by overlap would fail on every one of them, which is the false-failure pattern this
+repository warns hardest about. Making it work needs each fragment to declare *which* vocabulary each
+enum is and whether it is the whole of it — a contract decision, belonging to whoever owns the
+`cmd/api` contract tests, not smuggled into a two-point codegen ticket. `Docs/10` §8.2 records it.
+
+**Nothing else in the sweep survived, and that is the weaker evidence of the two.** Seven of the
+eight mutations attack the same mechanism from different sides — a byte comparison between a render
+and a file — so catching all seven says that comparison works and very little else. The mutation that
+found something real was the one aimed at a *different* mechanism, which is the one that had not been
+built.
+
+#### Notes for whoever adds the next status
+
+Edit `contracts/statuses.yaml` and run `make codegen`. The generator refuses a value with no
+documentation, a wire form that is not lower snake case, two values sharing a wire form or collapsing
+to one identifier, and a doc written as a sentence rather than a phrase — that last one because Go
+opens a comment with the identifier it documents and the other two languages want a sentence, so one
+lower-case phrase serves all three and "StatusSubmitted is A live offer" was the first draft.
+
+Then write the migration. The specification cannot, and the §3.4 pairing test is what will tell you
+so. **`internal/config` was not needed and is not expected to be** — nothing here is configurable,
+and a status vocabulary that could be changed by an environment variable would be a vocabulary the
+database constraint disagrees with.
 
 ### What SHIP-67a built, and the table it deliberately does not have
 
