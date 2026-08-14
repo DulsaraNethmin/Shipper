@@ -153,6 +153,14 @@ notif_group="shipper-notifications-verify-$$"
 #
 # Stopped before anything is asserted, so a failed assertion cannot leave a consumer running and
 # holding a group membership.
+#
+# **The budget is two minutes rather than the thirty seconds this file's other waits use, and the
+# reason is `shipper.bid`.** A group of its own starts at the beginning of every topic, and that
+# topic is deliberately padded to eighteen hundred messages as the standing demonstration that
+# SHIP-15t's run-start fence works. The consumer has to walk all of it before it is caught up —
+# most of those events are about jobs this database does not hold and resolve to nobody, which is
+# cheap, but a hundred at a time is still eighteen transactions. Only the first call pays it; the
+# rest resume on a committed offset.
 run_notifier() {
   local log="$1" predicate="$2" pid
   SHIPPER_ENV=development \
@@ -163,7 +171,7 @@ run_notifier() {
   KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
     "$WORKDIR/shipper-notifier" -group "$notif_group" >"$log" 2>&1 &
   pid=$!
-  for _ in $(seq 1 150); do
+  for _ in $(seq 1 600); do
     [[ "$("$PSQL" "$DATABASE_URL" -tAc "$predicate")" == "t" ]] && break
     sleep 0.2
   done
