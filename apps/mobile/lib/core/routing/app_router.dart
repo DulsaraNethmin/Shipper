@@ -9,6 +9,7 @@ import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
 import 'package:shipper/features/bidding/place_bid_panel.dart';
 import 'package:shipper/features/delivery/delivery_screen.dart';
+import 'package:shipper/features/delivery/proof_capture_screen.dart';
 import 'package:shipper/features/fleet/add_vehicle_screen.dart';
 import 'package:shipper/features/fleet/fleet_screen.dart';
 import 'package:shipper/features/fleet/vehicle_screen.dart';
@@ -132,6 +133,16 @@ abstract final class Routes {
   /// [delivery] for one job.
   static String deliveryFor(String jobId) => '/jobs/$jobId/delivery';
 
+  /// Photographing one delivery (SHIP-130).
+  ///
+  /// Under [delivery] rather than beside it, because it is a step of that screen's job and not a
+  /// second way in: it is reached from the Delivered button and by nothing else. Three segments, so
+  /// it collides with neither [jobDetail] nor [delivery].
+  static const deliveryProof = '/jobs/:id/delivery/proof';
+
+  /// [deliveryProof] for one job.
+  static String deliveryProofFor(String jobId) => '/jobs/$jobId/delivery/proof';
+
   /// The provider's own fleet (SHIP-98).
   ///
   /// `/fleet/vehicles` rather than `/fleet`, because the fleet is not the only thing that domain
@@ -238,6 +249,12 @@ final _signedInPatterns = <RegExp>[
   // makes forgetting this line a link that silently lands on the home shell rather than a card that
   // does nothing.
   RegExp(r'^/jobs/[^/]+/delivery$'),
+
+  // Photographing that delivery (SHIP-130). A fourth pattern for the third time and for the same
+  // reason: the segments after the id are fixed, so this admits exactly one more location. It is
+  // pushed from the delivery screen rather than deep-linked, which makes forgetting this line a
+  // button that appears to do nothing.
+  RegExp(r'^/jobs/[^/]+/delivery/proof$'),
 
   // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
   // route reachable only through an identifier looks, from the outside, like a card that does
@@ -417,6 +434,14 @@ final routerProvider = Provider<GoRouter>((ref) {
       // Before `jobDetail` as well, and it does not collide either — `/jobs/:id` is one segment
       // and this is two. Declared here so that "everything more specific under /jobs comes before
       // /jobs/:id" keeps holding for whoever adds the next one.
+      // Before `delivery` as well: go_router takes the first route that matches, and three
+      // segments declared after two is a path that never wins.
+      GoRoute(
+        path: Routes.deliveryProof,
+        builder: (context, state) => ProofCaptureScreen(
+          jobId: state.pathParameters['id'] ?? '',
+        ),
+      ),
       GoRoute(
         path: Routes.delivery,
         builder: (context, state) => DeliveryScreen(

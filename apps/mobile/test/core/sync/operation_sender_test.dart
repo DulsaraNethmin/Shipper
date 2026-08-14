@@ -6,6 +6,7 @@
 // minted its own would break without failing anything else.
 
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -38,14 +39,38 @@ class _StubAdapter implements HttpClientAdapter {
   void close({bool force = false}) {}
 }
 
-({ApiOperationSender sender, _StubAdapter adapter}) _senderAnswering(
-  ResponseBody Function(RequestOptions options) respond,
-) {
+/// An uploader that remembers what it was asked to put where, and can be told to fail.
+///
+/// It stands in for the **object store**, which is a different host from the API (`Docs/06` §5.2)
+/// and reachable through no adapter this client installs. That separation is the thing worth
+/// asserting rather than mocking away: nothing that goes to the store may carry this session's
+/// bearer token.
+class _RecordingUploader implements ObjectUploader {
+  _RecordingUploader({this.fail});
+
+  /// Thrown instead of uploading, when set.
+  final Object? fail;
+
+  final puts = <({String url, String contentType, int length})>[];
+
+  @override
+  Future<void> put(String url, {required String contentType, required Uint8List bytes}) async {
+    puts.add((url: url, contentType: contentType, length: bytes.length));
+    final failure = fail;
+    if (failure != null) throw failure;
+  }
+}
+
+({ApiOperationSender sender, _StubAdapter adapter, _RecordingUploader uploader}) _senderAnswering(
+  ResponseBody Function(RequestOptions options) respond, {
+  _RecordingUploader? uploader,
+}) {
   final adapter = _StubAdapter(respond);
   final dio = buildDio(baseUrl: 'https://api.example.test');
   dio.httpClientAdapter = adapter;
 
-  return (sender: ApiOperationSender(ApiClient(dio)), adapter: adapter);
+  final store = uploader ?? _RecordingUploader();
+  return (sender: ApiOperationSender(ApiClient(dio), store), adapter: adapter, uploader: store);
 }
 
 ResponseBody _json(Object body, {int status = 200}) => ResponseBody.fromString(
@@ -55,6 +80,28 @@ ResponseBody _json(Object body, {int status = 200}) => ResponseBody.fromString(
         Headers.contentTypeHeader: [Headers.jsonContentType],
       },
     );
+
+/// A proof photograph, queued: the same recording, with a file beside it (SHIP-130).
+QueuedOperation _proof({
+  String key = 'key-1',
+  int attempts = 1,
+  required String attachmentPath,
+}) {
+  return QueuedOperation(
+    id: 1,
+    idempotencyKey: key,
+    kind: OperationKind.proof,
+    orderingKey: 'job:job-a',
+    method: 'POST',
+    path: '/v1/jobs/job-a/milestones',
+    body: const <String, dynamic>{'milestone': 'delivered'},
+    attachmentPath: attachmentPath,
+    recordedAt: DateTime.utc(2026, 8, 13, 6, 15),
+    enqueuedAt: DateTime.utc(2026, 8, 13, 6, 15),
+    state: QueueState.pending,
+    attempts: attempts,
+  );
+}
 
 QueuedOperation _milestone({
   String key = 'key-1',
@@ -143,21 +190,139 @@ void main() {
     dio.httpClientAdapter = _ThrowingAdapter();
 
     await expectLater(
-      ApiOperationSender(ApiClient(dio)).send(_milestone()),
+      ApiOperationSender(ApiClient(dio), _RecordingUploader()).send(_milestone()),
       throwsA(isA<ApiUnreachable>()),
     );
   });
 
-  test('a proof photograph is refused rather than sent without its image', () async {
-    // Not an ApiFailure, deliberately: the worker reads anything that is not one as "this build
-    // cannot send this", quarantines it, and does not loop. SHIP-130 removes the throw.
-    final answering = _senderAnswering((_) => _json({'ok': true}));
+  group('a proof photograph, which is three requests and two of them are the platform\'s', () {
+    /// A file on disk, because the sender reads one and the size it reads is what it declares.
+    File imageFile(List<int> bytes) {
+      final directory = Directory.systemTemp.createTempSync('shipper_proof_send');
+      addTearDown(() {
+        if (directory.existsSync()) directory.deleteSync(recursive: true);
+      });
+      final file = File('${directory.path}/proof.jpg')..writeAsBytesSync(bytes);
+      return file;
+    }
 
-    await expectLater(
-      answering.sender.send(_milestone(attachmentPath: '/var/mobile/proof-1.jpg')),
-      throwsA(isA<UnimplementedError>()),
-    );
-    expect(answering.adapter.requests, isEmpty, reason: 'nothing half-formed was sent');
+    ResponseBody presignThen(RequestOptions options) {
+      if (options.path.endsWith('/proof-uploads')) {
+        return _json({
+          'object_key': 'proof/job-1/0198f2c1',
+          'upload_url': 'https://objects.example.test/proof/job-1/0198f2c1?X-Amz-Signature=abc',
+          'method': 'PUT',
+          'content_type': 'image/jpeg',
+          'content_length': 4,
+          'expires_at': '2026-08-13T09:15:00Z',
+        });
+      }
+      return _json({'id': 'milestone-1'}, status: 201);
+    }
+
+    test('presign, put, then record the milestone with the key the platform issued', () async {
+      final file = imageFile(const [1, 2, 3, 4]);
+      final answering = _senderAnswering(presignThen);
+
+      await answering.sender.send(
+        _proof(key: 'key-9', attachmentPath: file.path, attempts: 1),
+      );
+
+      expect(answering.adapter.requests, hasLength(2), reason: 'the PUT is not the API\'s');
+
+      final presign = answering.adapter.requests.first;
+      expect(
+        presign.path,
+        '/v1/jobs/job-a/proof-uploads',
+        reason: 'derived from the recording path, so a route renamed on the platform fails here '
+            'rather than on a handset',
+      );
+      expect(presign.data, {'content_type': 'image/jpeg', 'content_length': 4});
+      expect(
+        presign.headers[ApiHeaders.idempotencyKey],
+        'key-9.upload.1',
+        reason: 'reusing the row\'s key here replays a URL whose expiry is already running down, '
+            'so an operation that failed once would re-receive a dead one for hours',
+      );
+
+      expect(answering.uploader.puts, hasLength(1));
+      expect(
+        answering.uploader.puts.single.url,
+        'https://objects.example.test/proof/job-1/0198f2c1?X-Amz-Signature=abc',
+      );
+      expect(
+        answering.uploader.puts.single.contentType,
+        'image/jpeg',
+        reason: 'the type the platform signed, echoed back verbatim',
+      );
+      expect(answering.uploader.puts.single.length, 4);
+
+      final record = answering.adapter.requests.last;
+      expect(record.path, '/v1/jobs/job-a/milestones');
+      expect(record.headers[ApiHeaders.idempotencyKey], 'key-9', reason: 'the row\'s own key');
+      expect(record.data, {
+        'milestone': 'delivered',
+        'proof': {'object_key': 'proof/job-1/0198f2c1'},
+      });
+    });
+
+    test('the file is removed once the platform has it, and only then', () async {
+      final file = imageFile(const [1, 2, 3, 4]);
+
+      final failing = _senderAnswering(
+        presignThen,
+        uploader: _RecordingUploader(fail: const ApiUnreachable()),
+      );
+      await expectLater(
+        failing.sender.send(_proof(attachmentPath: file.path)),
+        throwsA(isA<ApiUnreachable>()),
+      );
+      expect(file.existsSync(), isTrue, reason: 'an upload that failed is retried from this file');
+
+      await _senderAnswering(presignThen).sender.send(_proof(attachmentPath: file.path));
+      expect(file.existsSync(), isFalse);
+    });
+
+    test('a file that has gone is quarantined rather than retried for ever', () async {
+      // Not an ApiFailure, deliberately: the worker reads anything that is not one as "this build
+      // cannot send this", quarantines it where a person can see it, and does not loop. A missing
+      // file does not come back, which is the case `queued_operation.dart` predicted.
+      final answering = _senderAnswering(presignThen);
+
+      await expectLater(
+        answering.sender.send(_proof(attachmentPath: '/var/mobile/gone.jpg')),
+        throwsA(isA<StateError>()),
+      );
+      expect(answering.adapter.requests, isEmpty, reason: 'nothing half-formed was sent');
+    });
+
+    test('an attachment on a kind that declares none is quarantined, not guessed at', () async {
+      // The other half of the content type living on `OperationKind`: a row that should never
+      // exist is refused loudly rather than uploaded as whatever the file happens to be.
+      final file = imageFile(const [1, 2, 3, 4]);
+      final answering = _senderAnswering(presignThen);
+
+      await expectLater(
+        answering.sender.send(_milestone(attachmentPath: file.path)),
+        throwsA(isA<StateError>()),
+      );
+      expect(answering.adapter.requests, isEmpty);
+    });
+
+    test('a presign response missing a field is retried, not quarantined', () async {
+      final file = imageFile(const [1, 2, 3, 4]);
+      final answering = _senderAnswering((options) {
+        if (options.path.endsWith('/proof-uploads')) return _json({'object_key': 'k'});
+        return _json({'id': 'milestone-1'}, status: 201);
+      });
+
+      await expectLater(
+        answering.sender.send(_proof(attachmentPath: file.path)),
+        throwsA(isA<ApiMalformedResponse>()),
+      );
+      expect(answering.uploader.puts, isEmpty);
+      expect(file.existsSync(), isTrue, reason: 'the photograph survives a bad answer');
+    });
   });
 }
 

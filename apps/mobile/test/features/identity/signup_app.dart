@@ -1,5 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+// `Override` is the type of a provider override and is exported from `misc.dart` rather than from
+// the package's main library in Riverpod 3. Named here because these helpers pass a list of them
+// through, which is what lets a test override on the **root** scope instead of wrapping a screen in
+// a second `ProviderScope` — the arrangement `main.dart` explains is not a test of the app at all.
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/session_ender.dart';
@@ -9,6 +14,7 @@ import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/device/device_label.dart';
 import 'package:shipper/core/sync/queue_watch.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
+import 'package:shipper/core/sync/unsynced_nudge.dart';
 import 'package:shipper/features/bidding/bidding_repository.dart';
 import 'package:shipper/features/fleet/fleet_repository.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
@@ -42,9 +48,20 @@ Widget signupApp(
   FakeBiddingRepository? bidding,
   FakeSessionEnder? ender,
   SyncWorker? worker,
+  DateTime Function()? clock,
+  List<Override> extra = const <Override>[],
 }) {
   return ProviderScope(
     overrides: [
+      // Whatever the test is actually about. Last, so a test can replace one of the defaults below
+      // — Riverpod takes the final override for a provider — and on the **root** scope, which is
+      // the whole reason this helper exists rather than a second `ProviderScope` round a screen.
+      ...extra,
+      // The four-hour nudge (SHIP-127) is `now − enqueued_at`, and both halves have to come off
+      // **one** clock: the queue stamps the row from the handset's, so a test whose queue runs on a
+      // fixed 2026 date while the nudge reads the real one measures the calendar rather than the
+      // queue. Left alone this is `DateTime.now`, exactly as in production.
+      if (clock != null) nudgeClockProvider.overrideWithValue(clock),
       // The delivery screen records through the sync worker (SHIP-129). **It is left unwired
       // unless a test asks for one**, which is SHIP-124's objection kept rather than overruled:
       // `syncWorkerProvider` builds a Drift database in the platform's application-support

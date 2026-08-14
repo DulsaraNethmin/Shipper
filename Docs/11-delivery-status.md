@@ -418,7 +418,9 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
+| **SHIP-127** | M4 | Flutter four-hour unsynced nudge — `Docs/02` §3.1's second rung, and **a prompt rather than a fourth line in SHIP-126's bar**: a card over a scrim, above the router, dismissed by an explicit tap and by nothing else. It measures `enqueued_at` of the oldest **pending or in-flight** operation and excludes quarantined work, because the whole content of the prompt is *go and find signal*. **No timer at all** — a published snapshot and the clock at build time, because every trigger that brings a person back to the app already publishes one. Finding: **the queue's clock and the nudge's clock have to be the same one**, which no fixture had needed until now. The four hours is a value rather than a constant and **should not stay on the device** — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
+| **SHIP-130** | M4 | Flutter camera capture with on-device compression — **`camera` and not `image_picker`**, because the one-line answer hands the capture to the manufacturer's camera application and several of those keep a copy in `DCIM/Camera`, which no Dart can prevent or observe. The negative is proved from the two places that can enforce one: **no Android media permission and no iOS photo-library string**, both asserted. Compression is **pure Dart** so a host test measures it on real JPEGs, EXIF included. It also builds the **three-request upload exchange** SHIP-125 left as an `UnimplementedError` — and corrects that comment, which named a multipart send the platform does not have. `delivered` becomes recordable from the app for the first time — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
 | **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
@@ -8077,6 +8079,254 @@ The topic assertions are fenced **by event id**, taken from the outbox before th
 compared as a **subset** — `shipper.bid` and `shipper.delivery` are not emptied by the harness and are
 shared with every worktree on the machine. That is SHIP-135's lesson applied without having to
 rediscover it.
+
+### SHIP-127 — the nudge, the clock it turned out to share, and the number that should not be on the device
+
+`Docs/02` §3.1's ladder has three rungs. SHIP-126 built the first, SHIP-128 is the third and is
+server-side, and this is the middle one: *"4 hours — the provider is nudged, so someone who can find
+signal knows to."*
+
+#### A prompt, not a louder indicator, and that distinction is the whole ticket
+
+The tempting two-point version of this is a fourth line in SHIP-126's bar. It is the wrong answer for
+a reason the ticket states in its own wording: an **escalation**. That bar has been on the screen
+since the first update was recorded, and the driver has had four hours to learn to read past it.
+Adding a sentence to it changes nothing about whether they notice.
+
+So the nudge interrupts. `UnsyncedNudge` wraps `ShipperApp`'s builder — outside the router, like the
+indicator and inside `VersionGate` — and draws a card over a scrim. It is dismissed by an explicit
+tap on **Got it** and by nothing else: the scrim is a `ModalBarrier` with `dismissible: false`, so a
+stray tap cannot buy four hours of silence. It is weaker than the version gate, which *replaces* the
+application rather than covering it, and that is the right strength: the 24-hour rung is where
+somebody other than the driver is told.
+
+**There is no Try again button, deliberately.** The worker already retries on six triggers including
+every resume, so a button would do nothing the phone is not already doing — and one that failed in
+front of the driver reads as the work having been lost. What `Docs/02` §3.1 asks for is a *physical*
+action, so the copy asks for that instead: nothing has been lost, it is all still on this phone, and
+getting to somewhere with coverage is what will clear it.
+
+#### It measures `enqueued_at`, excludes quarantined work, and leaves one gap on purpose
+
+SHIP-124 wrote the column for exactly this and said so: `enqueued_at` is "what `Docs/02` §3.1's
+four-hour and 24-hour escalations measure". `recorded_at` is the actor's clock and is what a customer
+is shown; the two are deliberately different, and the fixtures set them an hour apart so that reading
+the wrong one fails rather than passes.
+
+Blocked operations are excluded, which continues SHIP-125's exclusion and SHIP-126's. An operation
+the platform refused is waiting for a person, not for a connection, and the entire content of this
+prompt is *go and find signal* — sending a driver up a hill about an update that will be refused
+again at the top is worse than saying nothing.
+
+**The gap that leaves is real and is not closed here.** A blocked operation holds its own ordering
+key, so a *pending* operation queued behind one on the same job ages, nudges, and is not fixable by
+finding signal. It is recorded rather than narrowed away because closing it needs SHIP-132's
+acknowledgement to exist first: today there is nothing the driver could do about it even if the
+prompt said so.
+
+#### No timer, and the reasoning is about who is looking rather than about cost
+
+The decision is a function of the last published `QueueSnapshot` and the clock at build time. Nothing
+arms a wake-up for the instant the threshold is crossed.
+
+A prompt nobody is looking at is not a prompt. Every trigger that brings a person back to the
+application already publishes a snapshot — `SyncSignals` drains on resume, and the worker publishes
+at the end of every pass — and while there is claimable work the worker keeps its own schedule,
+ceilinged at five minutes. So a phone left open is told within one backoff interval, and a phone in a
+pocket is told when it comes out of it, which is the only moment it could be. A `Timer` would also
+have to be cancelled correctly in every widget test that mounts `ShipperApp` over a live queue, and
+one left pending fails a widget test outright — a real cost for granularity nobody can perceive on a
+four-hour rule.
+
+#### The finding: the queue's clock and the nudge's clock have to be the same clock
+
+The nudge is `now − enqueued_at`. In the application both halves are `DateTime.now`, so they agree by
+construction. **In the test suite they did not**, and the first full run said so: `SyncHarness` runs
+the queue on a fixed `2026-08-13 09:00`, and the nudge was reading the host's real clock, so every
+existing test using a harness recorded a milestone that was instantly hours old. Two wave-7 tests
+failed — `pending_updates_persist_test.dart` and `record_milestone_test.dart` — with the scrim
+swallowing their second tap.
+
+That was worth more than the fix. The fixture had been measuring the calendar: those tests would have
+started behaving differently as the real date moved past the fixed one, with nothing to say why. So
+`SyncHarness` now exposes its clock, `openDelivery` hands it to the nudge, and a test that is
+*about* the nudge passes a second clock running ahead of the queue's — which is what "recorded before
+breakfast, still unsent at lunchtime" looks like from inside the app, and is hermetic in a way the
+real clock never was.
+
+#### Four hours is a value and not a constant, and it should not stay on the device
+
+`CLAUDE.md` is explicit that anything expected to change under operational pressure lives server-side
+and that Flutter has no over-the-air path for Dart code. A tuning knob on an escalation ladder is
+exactly that kind of number, and moving this one currently needs a store release.
+
+It is compiled in because **it cannot be fetched at the moment it is needed** — the prompt fires on a
+handset with no connection, which is the premise. What was available is the shape `QueuePolicy`
+already uses: a default injected through `nudgePolicyProvider` rather than a `const` somebody has to
+find. What is wanted is for a client-policy endpoint to carry it, so the app caches the current value
+while it still has signal; `GET /v1/app/minimum-version` (SHIP-167) is the endpoint already shaped
+like that one, and `internal/config` already carries the precedent in `Storage.MaxUploadBytes`. §9
+has the item.
+
+#### Mutations
+
+Seven applied to `unsynced_nudge.dart`, each restored from a copy and checksummed. Caught: the
+threshold moved to zero and to a week, quarantined work counted as unsynced, `recorded_at` read
+instead of `enqueued_at`, a dismissal that silences for ever, a scrim that dismisses on any tap, and
+no scrim at all.
+
+**One survived, and it is worth knowing rather than fixing.** Flipping `dismissible: false` to `true`
+on the `ModalBarrier` changes nothing any test can see — the barrier is mounted *outside* the router's
+navigator, so there is no route for it to pop and the flag is inert. The property the tests do hold
+is the one that can actually be broken: replacing the barrier with a tap handler that dismisses fails
+immediately. The flag stays because it states the intent, and because it would matter the day this
+widget is mounted somewhere with a navigator above it.
+
+### SHIP-130 — the camera, the compressor, and proving a negative
+
+Five points, of which the *Done when*'s last clause — "and **never written to the photo library**" —
+decided most of the design. It is a privacy control rather than a detail, and it is the half most
+easily built wrong by accident.
+
+#### `camera`, not `image_picker`, and that is the whole of the last clause
+
+`ImagePicker().pickImage(source: ImageSource.camera)` is one line and needs no preview. On Android it
+hands the job to whichever camera application the manufacturer shipped, through an
+`ACTION_IMAGE_CAPTURE` intent — and several of those write a copy of every photograph into
+`DCIM/Camera` regardless of the output the caller asked for. Nothing in Dart can prevent that or even
+observe it, so the *Done when* would have been true on iOS, false on some Android handsets, and
+untestable on both.
+
+`camera` gives the application the capture surface — CameraX and AVFoundation — and `takePicture()`
+writes into this app's own temporary directory. Nothing in the path touches `MediaStore` or
+`PHPhotoLibrary`, so the property is structural. It is also the better screen: one large shutter for
+a gloved thumb rather than an OEM camera with its own filters, timers and share sheet.
+
+**The store consequence.** Nothing new is *collected* — the app already uploads proof photographs
+(SHIP-114), so "Photos and videos" was on the Play data-safety declaration and the Apple privacy
+labels already. `NSCameraUsageDescription` and Android's `CAMERA` permission both existed from
+SHIP-179. CameraX needs minSdk 21, below this project's floor of 24, so the floor that exists for
+`flutter_secure_storage` does not move.
+
+**The one risk this ticket takes, named rather than absorbed.** The plugin's README asks for
+`NSMicrophoneUsageDescription` beside the camera string. This build passes `enableAudio: false`, so no
+microphone is ever opened, and neither that string nor Android's `RECORD_AUDIO` is declared — a
+purpose string for a microphone the app does not use is worse than its absence, to a reviewer and to
+the person reading the prompt. If App Review ever asks, the test that holds all three facts together
+says exactly where to add it. That decision belongs with X-2/X-3.
+
+#### `image` and not `flutter_image_compress`, because the clause that matters has to be measurable
+
+A native compressor is a method channel with nothing behind it in a host test, and "compressed" would
+then be an assertion about a mock. `image` is pure Dart, so `proof_image_test.dart` decodes and
+re-encodes real JPEGs on the host and measures the result: smaller than the original, downscaled
+rather than merely re-encoded, JPEG whatever went in, and **no EXIF block** — which is a privacy
+statement as well as a size one, since a proof photograph of somebody's front door should not carry
+where the door is. It has no native footprint at all, so unlike `camera` it moves neither store
+declaration.
+
+The cost is CPU. It is bounded by capturing at 1080p rather than at the sensor's maximum, and it runs
+through `Isolate.run` so the shutter never freezes. If field measurement shows it is still too slow,
+`flutter_image_compress` is the swap and the seam is one function.
+
+**The EXIF strip is explicit and not a side effect of the resize**, which a mutation confirmed was
+worth the line: an image already inside `longestEdge` is never resized, so relying on `copyResize` to
+drop the metadata would have stripped large photographs and left small ones tagged — the one
+behaviour of the three nobody would notice.
+
+#### How the negative is actually proved
+
+Four guards, and only one of them is code in this feature:
+
+- **Android cannot.** Under scoped storage an app with no `WRITE_EXTERNAL_STORAGE` and no
+  `READ_MEDIA_IMAGES` cannot write to the shared media collections whatever code it runs. The
+  manifest declares neither, and the test fails if one appears.
+- **iOS cannot.** `PHPhotoLibrary` writes require `NSPhotoLibraryAddUsageDescription`, and App Review
+  rejects a binary that calls the API without one. Neither photo-library key is in `Info.plist`.
+- **Nothing asks.** No gallery package is a dependency, no gallery symbol appears in `lib/`, `ios/` or
+  `android/`, and — after a mutation found the gap — no gallery package is *imported* either, which
+  is the state a diff is in before `flutter pub add` has been run.
+- **The destination is not a parameter.** `ProofStore.write` takes a **bare name**, not a path, so
+  there is no argument that could name `DCIM/Camera` even if the permissions were there.
+
+#### It also had to build the upload, because "queued" would otherwise mean "quarantined in a second"
+
+SHIP-125 left `attachmentPath` handling as an `UnimplementedError` and named this ticket. Without it a
+captured photograph would be claimed by the worker immediately, throw, and be quarantined — work the
+driver believes they recorded, waiting for a person. So the sender now performs the three-request
+exchange: presign, `PUT` to the object store on **a second transport carrying no bearer token**, then
+record the milestone with `proof.object_key`.
+
+**SHIP-125's comment named "the multipart send", and that name was wrong.** There is no multipart
+anywhere in this exchange and the API never sees the image; the comment predates SHIP-114 and is
+corrected rather than carried forward.
+
+**Two keys, and only one of them is the operation's.** The milestone carries the stored key, unchanged
+on every attempt — that is the one that stops a replay recording a second delivery. The presign
+carries a key **of its own, per attempt**, and reusing the stored one there would have looked tidier
+and stranded the operation: SHIP-15's middleware replays a stored response, so every retry would
+receive the same URL with its expiry already run down, and an operation that failed after being issued
+one would re-receive a dead URL until Redis evicted the entry hours later. `internal/delivery/proof.go`
+is explicit that a fresh URL is affordable — nothing durable was written, so at most one unreferenced
+object is left in the bucket.
+
+The stored file is deleted **only** after the platform has accepted the milestone, and that is the
+only place anything deletes it: the worker removes the row and nothing else knows the row pointed at a
+megabyte.
+
+#### `delivered` becomes recordable, for the first time
+
+SHIP-129 named the milestone and offered no button, because every `delivered` without proof is refused
+(SHIP-118) and would have queued an operation whose only outcome was a quarantined row. It is now a
+route to the capture screen rather than a fourth recording — `Milestone.offered` still excludes it and
+`RecordMilestoneController` still refuses a plain one, which is the invariant, unchanged.
+
+What is still missing is the reasoned exception (SHIP-116 on the platform, SHIP-131 here). A driver
+whose camera is refused reaches `PermissionCopy.cameraDeclined` — SHIP-179's words, which already say
+a reason can be recorded instead — and not yet a button that records one. That is named on the screen
+rather than hidden, because a button that queued nothing would be a worse dead end.
+
+#### Two findings for anybody writing a Flutter test near a plugin
+
+**A platform-channel reply never arrives under `testWidgets`' fake clock.** `availableCameras()` does
+not throw `MissingPluginException` there — it never completes, and the capture screen sits on its
+opening spinner until `pumpAndSettle` times out. So **every widget test that can reach
+`ProofCaptureScreen` must supply a camera**, including one that is only passing through it;
+`proof_fixture.dart` says so once and `record_milestone_test.dart` is the test that had to learn it.
+
+**Real `dart:io` async does not complete under that clock either.** `ProofStore.write` creates a
+directory and writes half a megabyte, and the journey test only settles because it steps outside the
+fake clock with `tester.runAsync` between pumps. Drift's queue works without that because its FFI
+calls resolve on microtasks; file I/O does not.
+
+Both of these are also why the screen now treats *any* error from the camera as "unavailable" rather
+than only a `CameraException` — an unhandled one leaves a spinner running for ever, which is the only
+outcome worse than telling the driver the camera cannot be opened.
+
+#### Mutations
+
+Sixteen applied across the four files, each restored from a copy and checksummed. Caught: an
+`image_picker` import, `ImageSource.camera` named in code, the store accepting a path, compression
+skipped, the EXIF strip removed, the quality ladder reduced to one rung, the idempotency key dropped
+at enqueue, the attachment path dropped at enqueue, the presign key reused from the row, the milestone
+sent without its object key, and the file deleted before the platform accepted it.
+
+**Three findings, two of which are survivors worth keeping.**
+
+The first was not a survivor but a bad guard, and it is fixed: flipping `enableAudio: false` to `true`
+**passed**, because the assertion read the whole file and the phrase also appears in that library's
+doc comment. A rule a comment can satisfy is a rule about documentation. Comments are stripped now.
+
+**Survivor one: the resolved-path backstop in `ProofStore.write`.** Removing it changes nothing any
+test can see, because the bare-name check already refuses everything thrown at it. It is belt and
+braces by construction and exists to survive a change to the check in front of it — kept knowingly.
+
+**Survivor two: `PlatformProofCamera` keeping the raw capture file.** Commenting out the delete passes
+the whole suite, because no host test can drive a real camera. It does not break the *Done when* — the
+file is in this application's own temporary directory, not the photo library — but it is the data
+economy `Docs/01` §5.2 asks for, and it is unguarded. `integration_test/` is where it could be caught,
+on a device, and that is not in `make flutter-check` for the reason SHIP-48 gives.
+
 
 ## 4. Partly done — do not treat these as finished
 

@@ -87,6 +87,61 @@ dependencies:
   # question worth asking, because that floor is the reason that package is pinned at 10.x.
   package_info_plus: ^10.2.1
   url_launcher: ^6.3.2
+  # SHIP-130. Three packages for one *Done when*: "photo captured, compressed, queued, and **never
+  # written to the photo library**." The last clause is what chose the first two, so the reasoning is
+  # here rather than being reconstructed later from a version bump.
+  #
+  # ## `camera` and not `image_picker`, which is the one-line answer and the wrong one
+  #
+  # `ImagePicker().pickImage(source: ImageSource.camera)` needs no preview and no lifecycle. On
+  # Android it hands the capture to whichever camera application the manufacturer shipped, through an
+  # `ACTION_IMAGE_CAPTURE` intent — and several of those write a copy of every photograph into
+  # `DCIM/Camera` regardless of the output the caller asked for. Nothing in Dart can prevent that or
+  # even observe it, so the *Done when* would be true on iOS, false on some Android handsets, and
+  # untestable on both. `camera` gives the application the capture surface — CameraX and
+  # AVFoundation — and `takePicture()` writes into this app's own temporary directory, so nothing in
+  # the path touches `MediaStore` or `PHPhotoLibrary`.
+  #
+  # **The store consequence, since Docs/11 §9 asks for it about anything with a native
+  # integration.** Nothing new is *collected*: the app already uploads proof photographs (SHIP-114),
+  # so "Photos and videos" was on the Play data-safety declaration and the Apple privacy labels
+  # before this. What changes is one line each: `NSCameraUsageDescription` already exists (SHIP-179)
+  # and Android's `CAMERA` permission is already declared, with `uses-feature required="false"` so
+  # Play does not hide the app from handsets without one.
+  #
+  # **The one risk this ticket takes, named rather than absorbed.** The plugin's README asks for
+  # `NSMicrophoneUsageDescription` beside the camera string. This build passes `enableAudio: false`,
+  # so no microphone is ever opened, and neither string nor Android's `RECORD_AUDIO` is declared — a
+  # purpose string for a microphone the app does not use is worse than its absence, to a reviewer and
+  # to the person reading the prompt. `proof_never_reaches_the_gallery_test.dart` holds all three
+  # facts together. If App Review ever asks for the string, that is the moment to add it, and the
+  # test says where. CameraX needs minSdk 21, below this project's floor of 24, so the floor that
+  # exists for `flutter_secure_storage` does not move.
+  #
+  # ## `image` and not `flutter_image_compress`, which is faster and cannot be tested here
+  #
+  # A native compressor is a method channel with nothing behind it in a host test, and the
+  # *Done when*'s "compressed" clause would then be an assertion about a mock. `image` is pure Dart,
+  # so `proof_image_test.dart` decodes and re-encodes real JPEGs on the host and measures the result
+  # — including that the EXIF block, coordinates included, does not survive. It has **no native
+  # footprint at all**, so unlike `camera` it moves neither store declaration.
+  #
+  # The cost is CPU: a full-resolution decode, resize and re-encode is hundreds of milliseconds. It
+  # is bounded by capturing at 1080p rather than at the sensor's maximum, and it runs through
+  # `Isolate.run` so the shutter never freezes. If field measurement shows it is still too slow,
+  # `flutter_image_compress` is the swap and the seam is one function — `proofCompressorProvider`.
+  #
+  # ## `path_provider`, which is already in the lockfile
+  #
+  # A queued proof photograph may sit on the handset for hours, so it is written to
+  # `getApplicationSupportDirectory()` and not to the cache directory, which the operating system may
+  # purge — losing a driver's proof is exactly the silent drop Docs/07 §4 forbids. `drift_flutter`
+  # already depends on this transitively and its pubspec note above says as much, so **no new native
+  # code enters the build**; what changes is that the dependency is now declared by the package that
+  # imports it, which `depend_on_referenced_packages` is right to insist on.
+  camera: ^0.12.0+2
+  image: ^4.9.1
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:
