@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:shipper/core/api/page.dart';
 import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
 import 'package:shipper/features/bidding/bidding_repository.dart';
@@ -43,6 +44,9 @@ Bid aBid({
 
 /// One recorded placement.
 typedef PlacementCall = ({String jobId, BidPlacement bid, String idempotencyKey});
+
+/// One recorded read of the provider's own bids (SHIP-101).
+typedef MyBidsCall = ({BidStatus? status, String? cursor});
 
 /// A [BiddingRepository] that answers from a script and records what it was asked.
 ///
@@ -93,5 +97,48 @@ class FakeBiddingRepository implements BiddingRepository {
     if (thrown != null) throw thrown;
 
     return placed;
+  }
+
+  // --- SHIP-101: the provider's own bids ------------------------------------------------------
+
+  /// Every read of the bid list, in order, with what it asked for.
+  ///
+  /// The **status** is the half worth recording: `?status=` runs in SQL on the platform, so a screen
+  /// that narrowed on the device instead would still draw the right rows and would silently be
+  /// asking a different question — one whose `has_more` is about a list the provider is not looking
+  /// at. Asserting the parameter is what tells the two apart.
+  final reads = <MyBidsCall>[];
+
+  /// The pages [myBids] answers with, in order. The last is repeated once exhausted, which is what
+  /// a refresh of a one-page list looks like.
+  List<ApiPage<Bid>> pages = <ApiPage<Bid>>[const ApiPage<Bid>(data: <Bid>[])];
+
+  /// Answers for one group only, when a test is about `?status=` narrowing server-side.
+  ///
+  /// Keyed by the status asked for; a status with no entry falls back to [pages]. It exists because
+  /// the narrowing is a **different request** rather than a predicate over the same rows, and a fake
+  /// that filtered [pages] itself would make a screen that narrowed on the device pass.
+  Map<BidStatus, List<ApiPage<Bid>>> groups = <BidStatus, List<ApiPage<Bid>>>{};
+
+  /// Thrown by [myBids] instead of answering, on every call until it is cleared.
+  Object? readFailure;
+
+  /// Held open until completed, so a test can assert what the screen shows mid-read.
+  Completer<void>? readGate;
+
+  @override
+  Future<ApiPage<Bid>> myBids({BidStatus? status, String? cursor}) async {
+    final index = reads.where((call) => call.status == status).length;
+    reads.add((status: status, cursor: cursor));
+
+    final held = readGate;
+    if (held != null) await held.future;
+
+    final thrown = readFailure;
+    if (thrown != null) throw thrown;
+
+    final script = status == null ? pages : (groups[status] ?? pages);
+    if (script.isEmpty) return const ApiPage<Bid>(data: <Bid>[]);
+    return script[index < script.length ? index : script.length - 1];
   }
 }

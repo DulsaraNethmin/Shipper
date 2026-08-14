@@ -7,6 +7,7 @@ import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
+import 'package:shipper/features/bidding/my_bids_screen.dart';
 import 'package:shipper/features/bidding/place_bid_panel.dart';
 import 'package:shipper/features/delivery/delivery_screen.dart';
 import 'package:shipper/features/delivery/proof_capture_screen.dart';
@@ -143,6 +144,19 @@ abstract final class Routes {
   /// [deliveryProof] for one job.
   static String deliveryProofFor(String jobId) => '/jobs/$jobId/delivery/proof';
 
+  /// The provider's own bids, across every job (SHIP-101).
+  ///
+  /// `/bids` rather than `/fleet/bids`, and the divergence from the endpoint's own path is
+  /// deliberate. `GET /v1/fleet/bids` sits under `/v1/fleet` because that is where a provider's own
+  /// **records** live on the platform — their vehicles, their service area, their profile — and
+  /// because a four-segment `GET /v1/jobs/{id}/<literal>` panics Go's `ServeMux` while
+  /// `GET /v1/jobs/open/{id}` exists. Neither reason is a fact about this app's navigation: [fleet]
+  /// here means the vehicles screen, so `/fleet/bids` would read as a third thing under the
+  /// vehicles, which is what it is not.
+  ///
+  /// A URL is a person's map of the product. This is a top-level place a provider goes.
+  static const myBids = '/bids';
+
   /// The provider's own fleet (SHIP-98).
   ///
   /// `/fleet/vehicles` rather than `/fleet`, because the fleet is not the only thing that domain
@@ -218,6 +232,7 @@ const _signedOutLocations = <String>{
 const _signedInLocations = <String>{
   Routes.home,
   Routes.newJob,
+  Routes.myBids,
   Routes.fleet,
   Routes.newVehicle,
 };
@@ -455,6 +470,10 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (context, state) => JobDetailScreen(
           jobId: state.pathParameters['id'] ?? '',
         ),
+      ),
+      GoRoute(
+        path: Routes.myBids,
+        builder: (context, state) => const MyBidsScreen(),
       ),
       GoRoute(
         path: Routes.fleet,

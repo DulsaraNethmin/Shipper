@@ -96,7 +96,7 @@ class ProviderJobFeed extends ConsumerWidget {
         style: theme.textTheme.bodyMedium,
       ),
       const SizedBox(height: 12),
-      const _YourVehicles(),
+      const _ProviderShortcuts(),
       const SizedBox(height: 16),
 
       // A failure with a feed already on screen is a banner above it, not a replacement for it.
@@ -134,32 +134,51 @@ class ProviderJobFeed extends ConsumerWidget {
   }
 }
 
-/// The way to the fleet, from the screen that explains why it matters.
+/// The two places a provider goes that are not a job: their vehicles, and their offers.
 ///
-/// It sits at the top rather than at the bottom because it is the answer to the question the
+/// They sit at the top rather than at the bottom because the first is the answer to the question the
 /// **empty** feed raises — a provider with no vehicle in service is eligible for nothing, and the
-/// platform reports that as an empty page rather than as a problem it can name.
+/// platform reports that as an empty page rather than as a problem it can name — and the second is
+/// what a provider opening the app most often came to check.
 ///
 /// Inside this widget rather than on the shell's `Scaffold`, which is the decision SHIP-98 took for
-/// the same affordance: everything provider-only lives inside a surface only a provider is shown,
+/// the fleet's affordance: everything provider-only lives inside a surface only a provider is shown,
 /// so the role is read in one place instead of two that can get out of step.
-class _YourVehicles extends StatelessWidget {
-  const _YourVehicles();
+///
+/// **Both `push` rather than `go`**, so the back gesture returns to the feed where it was rather
+/// than rebuilding the shell — which would re-read the feed and lose the scroll position and the
+/// provider's narrowing.
+///
+/// `Routes` is `core/routing`, so naming a location in `features/bidding` from `features/jobs` is
+/// not a feature importing a feature: the constant is `core`'s and the screen behind it is supplied
+/// by the router, which is the same composition `Docs/07` §2 requires and SHIP-100 already used for
+/// the bid panel.
+class _ProviderShortcuts extends StatelessWidget {
+  const _ProviderShortcuts();
 
   @override
   Widget build(BuildContext context) {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: OutlinedButton.icon(
-        // The key SHIP-98 gave this affordance, unchanged: "a provider can reach their fleet from
-        // the shell" is the same fact whether the half around it is a placeholder or a feed.
-        key: const Key('manage-vehicles'),
-        // `push` rather than `go`, so the back gesture returns to the feed where it was rather
-        // than rebuilding the shell — which would re-read the feed and lose the scroll position.
-        onPressed: () => context.push(Routes.fleet),
-        icon: const Icon(Icons.local_shipping_outlined),
-        label: const Text('Your vehicles'),
-      ),
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        OutlinedButton.icon(
+          // The key SHIP-98 gave this affordance, unchanged: "a provider can reach their fleet from
+          // the shell" is the same fact whether the half around it is a placeholder or a feed.
+          key: const Key('manage-vehicles'),
+          onPressed: () => context.push(Routes.fleet),
+          icon: const Icon(Icons.local_shipping_outlined),
+          label: const Text('Your vehicles'),
+        ),
+        OutlinedButton.icon(
+          // SHIP-101. The list has no entry point anywhere else, so forgetting this button is a
+          // screen nobody can reach without a deep link.
+          key: const Key('your-bids'),
+          onPressed: () => context.push(Routes.myBids),
+          icon: const Icon(Icons.gavel_outlined),
+          label: const Text('Your bids'),
+        ),
+      ],
     );
   }
 }

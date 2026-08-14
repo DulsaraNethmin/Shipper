@@ -407,6 +407,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-100** | M3 | Flutter provider job detail and bid placement — one job over `GET /v1/jobs/open/{id}` and an offer over `POST /v1/jobs/{id}/bids`. **The bid is sent directly and never queued**, which `Docs/07` §4 requires and SHIP-124's private `OperationKind` constructor already made impossible to get wrong; what makes a retry safe is one `ActionKey` per action against SHIP-84's stored key column. It also **closes §9's client-side budget guard** by holding every provider-facing model to a closed key set — *see below* |
+| **SHIP-101** | M3 | Flutter provider bid list — `/bids` over `GET /v1/fleet/bids`, grouped by status in `Docs/02` §4's own order, and **the ticket that closes §6's third category** after three waves in it. The endpoint offers two ways to group and both are used: picking a group **re-reads** rather than filtering, because a cursor issued for one question does not answer another. Finding: **no endpoint serves a provider the job behind a closed bid**, which is SHIP-129's gap seen from the other end. The budget mutation produced a **surviving third form** — a "budget supplied" flag with no field at all, which no existing guard could see — and the screen-level guard that now catches it — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
@@ -9155,6 +9156,124 @@ exists to prevent.
 this ticket's are the same rule, and the only difference is that one of the two callers needs to know
 *which* party rather than merely that they are one. Two copies of an authorisation rule is the shape
 where one of them gets a third caller and the other does not.
+
+### SHIP-101 — the screen the read was written for, and the guard the invariant did not have
+
+`/bids` — every offer in every negotiation this provider is in, grouped by status, over
+`GET /v1/fleet/bids` (SHIP-101a). **It closes §6's third category**, which this ticket has been the
+sole occupant of for three waves: every dependency met, and nothing on the served surface to read.
+
+#### The grouping is the client's, and the endpoint offers two ways to do it
+
+`Docs/10` §4.5's envelope is a flat array with a cursor, so a response of named buckets would page
+each bucket separately or not at all. What SHIP-101a gave the screen instead is **both** halves:
+`?status=`, which runs in SQL, and a `status` on every row. Both are used, and which is in force is
+one field:
+
+| What the provider did | What happens |
+|---|---|
+| opened the screen | one read of every status, grouped on the device into `Docs/02` §4's order |
+| picked a group | the platform is asked for that group, from the first page |
+
+**Picking a group re-reads rather than filtering, and that is not a preference.** A cursor issued for
+one question does not answer another, so keeping it would pair a position with a list it was never a
+position in. The rows on screen are dropped in the same assignment, which is what stops one frame of
+the old group being drawn under the new heading.
+
+**The order comes from `BidStatus.values` and never from the rows.** `bid_status.gen.dart` is
+generated from `contracts/statuses.yaml` in `Docs/02` §4's own order and keeps `unknown` last
+deliberately — "so that a screen grouping by this enumeration gets that order without writing a
+second list". This is that screen, and the fixture arrives deliberately shuffled so a build that
+grouped in arrival order fails.
+
+**A status nothing is in gets no heading**, and the chips are built from what has been read rather
+than from all eight. `Draft` is the case that makes this more than tidiness: `Docs/02` §4 enumerates
+it and **no client can ever obtain one** — no endpoint creates one and none returns one — so a
+compiled-in list of eight would put a permanently empty group on every provider's screen.
+
+#### The finding: no endpoint serves a provider the job behind a closed bid
+
+A row can name its job and cannot describe it. `Bid` carries `job_id` and nothing else of the job,
+which is exactly what makes `Docs/01` §4.3 structural here — and the only job read a provider has is
+`GET /v1/jobs/open/{id}`, which answers `404` for **a job that is no longer open**. So "View the job"
+works while an offer is live and stops working the moment it is accepted, rejected or expires, which
+is the half of this screen a provider will ask about first.
+
+The screen does not try to be more specific than the platform was: the card leads to the same route
+either way and the destination shows the platform's own refusal. **This is a read gap rather than a
+rendering one** — it is the mirror of SHIP-129's, recorded in the same words: *no endpoint serves an
+awarded job to the provider delivering it*, and now *no endpoint serves a bid-on job to the provider
+who bid on it once the bidding is over*. One read closing both is the obvious shape, and it is
+nobody's ticket.
+
+#### `ProviderOnly` wraps a **widget**, not a subtree, and that is worth stating once
+
+`ProviderOnly` only *mounts* its child for a provider, so a `ref.watch(myBidsProvider)` in the
+screen's own `build` runs before the role is ever consulted — one `GET /v1/fleet/bids` issued on
+behalf of every customer who followed the link. The list is therefore a `const _MyBids()` handed
+over rather than a tree built in place. **Found by the test that asserts the fake repository recorded
+no read at all**, which is the assertion worth copying to the next provider-only surface: the pixels
+were already right.
+
+None of it is an authorisation control. `GET /v1/fleet/bids` scopes to the caller in its `WHERE`
+clause, so a customer's answer is an empty page by construction rather than by permission.
+
+#### The budget mutation, and the guard this repository did not have
+
+The wave's required mutation, run three ways with the file snapshotted and restored by checksum.
+
+| Mutation | Source scan | Closed key set | **Screen test** |
+|---|---|---|---|
+| `budget_cents` on `Bid`, rendered | **fails** | **fails** | **fails** |
+| the same field as `max_price`, neutral copy | passes | **fails** | **fails** |
+| **no field at all** — `'The customer has set a maximum for this job.'` | passes | passes | **fails** |
+
+**The third row is the finding.** `Docs/01` §4.3 forbids the budget "not as an amount, not as a band,
+and **not as a 'budget supplied' flag**", and the third clause is the one no existing guard could
+see: the source scan is a spelling check over `budgetCents|budget_cents`, and the closed key set
+holds a *model* that this mutation never touches. A provider surface can therefore disclose that a
+maximum exists — which is precisely what the clause forbids — with every guard in the repository
+green.
+
+So `my_bids_test.dart` adds the third axis: a page whose rows carry **seven spellings and three
+values** of a customer's maximum, decoded through the real `Bid.fromJson`, with the assertion made
+against **pixels** rather than against keys. It catches all three mutations, and it is the only thing
+that catches the third. The salt matches
+`budget_stays_on_the_customer_side_test.dart`'s deliberately, because the reason that file gives for
+using seven names — a search for "budget" cannot see `max_price` — applies unchanged one layer up.
+
+**The same guard is missing from `provider_job_feed_test.dart`'s budget group**, which asserts on
+values and not on the words. It was not added there: that file belongs to `features/jobs` and the
+observation is worth more written down than smuggled into another ticket's diff.
+
+#### A trap that cost a file, and nearly cost the work beside it
+
+**`perl -pi -e "s/…/…/"` with a Dart `${…}` in the replacement is a shell-interpolated string, and
+perl parses it as its own interpolation.** It died mid-file — `Undefined subroutine &main::audFromCents`
+— on a `-i` rewrite, which is a partial write to a source file with the work of an hour in it. It
+survived here, and it is the same class of hazard as the `git checkout` in `CLAUDE.md`'s revert
+recipe: a command that reads as a small edit and can truncate a file. Use the editing tool.
+
+#### Shared surfaces
+
+`Docs/11` §3 and `Docs/11-done.txt`. Nothing else: the route is declared in `app_router.dart`, which
+`Docs/10` §9.2 does **not** list as shared — the Dart router is per-app and the shared route manifest
+is the Go one.
+
+#### What is not here, and cannot be
+
+**SHIP-101 does not take revise or withdraw with it**, though `bidding_repository.dart` predicted it
+would at SHIP-100. Both end or change a commitment somebody else is relying on and want a
+confirmation flow rather than a button on a list; a `PATCH` behind a chevron is the shape where an
+offer gets revised by a mis-tap on a moving train.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **833 host tests**, up from 809, the analyzer clean, and the environment
+test per build flavour. `make verify` does not cover this ticket — that script exercises HTTP
+endpoints and this one adds none. What is held by widget test is the whole journey: the session, the
+router, the guard, the shell, the button on the feed, the grouping, the paging, the narrowing, the
+two failure states, the customer's refusal, and the budget.
 
 
 ## 4. Partly done — do not treat these as finished

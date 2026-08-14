@@ -268,4 +268,127 @@ void main() {
       );
     });
   });
+
+  group('GET /v1/fleet/bids — the provider’s own offers (SHIP-101)', () {
+    ({BiddingRepository repo, _StubAdapter adapter}) list(Object body, {int status = 200}) {
+      final adapter = _StubAdapter((_) => _json(body, status: status));
+      final dio = buildDio(baseUrl: 'http://localhost:8092')..httpClientAdapter = adapter;
+      return (repo: ApiBiddingRepository(ApiClient(dio)), adapter: adapter);
+    }
+
+    const page = <String, Object?>{
+      'data': [_bid],
+      'next_cursor': 'MR9yZWNvcmQ',
+      'has_more': true,
+    };
+
+    test('it is under /v1/fleet and not under a job', () async {
+      // The route is off the `/v1/jobs/` tree deliberately (SHIP-101a): this is the caller's own
+      // bids across every job, and a four-segment `GET /v1/jobs/{id}/<literal>` would also panic
+      // Go's ServeMux while `GET /v1/jobs/open/{id}` exists. A fake repository cannot notice a
+      // client that put it back under a job; this can.
+      final wired = list(page);
+      await wired.repo.myBids();
+
+      expect(wired.adapter.requests.single.method, 'GET');
+      expect(wired.adapter.requests.single.path, '/v1/fleet/bids');
+    });
+
+    test('it carries no idempotency key, because a read changes nothing', () async {
+      final wired = list(page);
+      await wired.repo.myBids();
+
+      expect(
+        wired.adapter.requests.single.headers.containsKey(ApiHeaders.idempotencyKey),
+        isFalse,
+      );
+    });
+
+    test('a first read sends no parameters at all', () async {
+      // No `limit`: the page size is server configuration (`Docs/10` §4.5), and a number compiled
+      // in here could not be corrected without a store release. No `status`: every group.
+      final wired = list(page);
+      await wired.repo.myBids();
+
+      expect(wired.adapter.requests.single.queryParameters, isEmpty);
+    });
+
+    test('a group is asked for by its wire name, and a cursor goes back unchanged', () async {
+      final wired = list(page);
+      await wired.repo.myBids(status: BidStatus.superseded, cursor: 'MR9yZWNvcmQ');
+
+      expect(
+        wired.adapter.requests.single.queryParameters,
+        <String, dynamic>{'status': 'superseded', 'cursor': 'MR9yZWNvcmQ'},
+      );
+    });
+
+    test('BidStatus.unknown is never sent, because the endpoint refuses it', () async {
+      // `unknown` is this client's own value for a status it has never heard of — the thing that
+      // makes an old build degrade rather than throw (`Docs/07` §6). It is not one of Docs/02 §4's
+      // eight, so sending it is a `400 bad_request`: a build that survived decoding a ninth status
+      // would otherwise be unable to make the request that follows it.
+      final wired = list(page);
+      await wired.repo.myBids(status: BidStatus.unknown);
+
+      expect(wired.adapter.requests.single.queryParameters, isEmpty);
+    });
+
+    test('the envelope is read, cursor and all', () async {
+      final read = await list(page).repo.myBids();
+
+      expect(read.data, hasLength(1));
+      expect(read.data.single.status, BidStatus.submitted);
+      expect(read.nextCursor, 'MR9yZWNvcmQ');
+      expect(read.hasMore, isTrue);
+    });
+
+    test('the last page carries no cursor and says so', () async {
+      final read = await list(<String, Object?>{
+        'data': [_bid],
+        'has_more': false,
+      }).repo.myBids();
+
+      expect(read.nextCursor, isNull);
+      expect(read.hasMore, isFalse);
+    });
+
+    test('a provider who has never bid gets an empty page and not a failure', () async {
+      // `200` with `[]`, which also covers a customer calling it: the scope is the token's and the
+      // answer is empty by construction rather than by refusal.
+      final read = await list(<String, Object?>{'data': <Object?>[], 'has_more': false})
+          .repo
+          .myBids();
+
+      expect(read.data, isEmpty);
+      expect(read.isEmpty, isTrue);
+    });
+
+    test('an unknown status or a mangled cursor is the platform’s 400, surfaced as one', () async {
+      final repo = list(<String, Object?>{
+        'error': {'code': 'bad_request', 'message': 'unknown status'},
+      }, status: 400).repo;
+
+      await expectLater(
+        repo.myBids(cursor: 'not-a-cursor'),
+        throwsA(isA<ApiErrorResponse>().having((f) => f.code, 'code', 'bad_request')),
+      );
+    });
+
+    test('no listed offer carries anything of the customer’s', () async {
+      // Docs/01 §4.3 on the newest provider-facing response, at the point the bytes become a model.
+      // The element is the same `Bid` every other bidding endpoint answers with, so the closed key
+      // set stays one list rather than two — see `budget_stays_on_the_customer_side_test.dart`.
+      final read = await list(<String, Object?>{
+        'data': [
+          <String, Object?>{..._bid, 'budget_cents': 8675309, 'max_price': 8675309},
+        ],
+        'has_more': false,
+      }).repo.myBids();
+
+      final row = read.data.single.toJson();
+      expect(row.keys.any((k) => k.contains('budget') || k.contains('price')), isFalse);
+      expect(jsonEncode(row), isNot(contains('8675309')));
+    });
+  });
 }
