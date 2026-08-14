@@ -259,7 +259,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **596 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **600 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -413,6 +413,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
 | **SHIP-115** | M4 | `proofs` and `GET /v1/jobs/{id}/delivery/proof` — an uploaded object becomes evidence for **one recorded milestone**, and the customer and the awarded provider read it back through short-lived signed URLs issued *after* an authorisation check. Because the platform is not in the upload path it **asks the store whether the object arrived** rather than believing the client, and records what the store reports — which is also what finally puts SHIP-114's upload limits under a guard inside the domain — *see below* |
 | **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
+| **SHIP-117** | M4 | The delivery-exception moderation queue — `GET /v1/admin/moderation/exceptions`, and it is a **query over the evidence rather than a table of flags**, which is what `000604` said it would be when it built `idx_proofs_exception`. `internal/delivery` is **untouched**: a flag would have needed a cross-domain write for a fact already in the row, and a second source of truth that can drift. Takes **no position on X-6** — *see below* |
 | **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -8246,6 +8247,66 @@ rather than relying on SHIP-149's, because this is the ticket that would have br
 credential**, and the second call is refused. That is the property SHIP-147's design was chosen for
 and the only place it can be demonstrated end to end: a signed token would have carried the old role
 until it expired, and no unit test of a permission table can see the difference.
+
+### SHIP-117 — the queue is a query, which is why `internal/delivery` is not in the diff
+
+`GET /v1/admin/moderation/exceptions`. A delivery recorded with a reason in place of a photograph
+(SHIP-116) appears in Docs/04 §5's fourth queue; one recorded with a photograph does not.
+
+#### The decision was made at SHIP-116 and this ticket kept it
+
+`000604`'s header wrote it down while building the index: *"whether a job is queued for review is a
+fact about the job, and it belongs with the queue rather than with the evidence. What this migration
+owes that ticket is a cheap answer to 'which jobs completed through the exception path', and
+`idx_proofs_exception` below is it."*
+
+So there is **no flag column and nothing to write**, and two things follow:
+
+- **`internal/delivery` needed no change at all** — which is what made this buildable in a wave
+  where another track owns that package. A flag would have to be written inside the transaction that
+  records the exception, through a port that domain would have to declare, for a fact that is
+  already in the row it just wrote.
+- **The queue cannot drift from the evidence.** A flag is a second source of truth, and a repair
+  script, a backfill or a rolled-back transaction is all it takes to put two of them out of step.
+
+The port is `admin`'s own (`ExceptionQueue` in `ports.go`) and the query is `cmd/api`'s, spanning
+`proofs`, `milestones` and `jobs` — the same arrangement `jobPartiesLookup` uses for the same reason,
+and the only place three domains may be joined.
+
+#### The vocabulary stays on the other side of the port
+
+`reason`, `milestone` and `job_status` are plain strings in `admin`. `delivery.ProofExceptionReason`
+is **generated** from `contracts/statuses.yaml` (SHIP-56a) and `jobs.Status` is Docs/02 §1's own
+list, so a copy of either here would be a third list to keep in step with a generated one. This
+domain does not decide what a valid exception reason is; `ck_proofs_exception_reason` does, and this
+reports what was recorded.
+
+#### Three decisions inside the query
+
+- **Ordered by `proofs.created_at`, not by the actor's clock.** Docs/02 §3.1 keeps the two apart
+  because a driver records a milestone out of signal and the device syncs later; a queue ordered by
+  the *handset's* clock can be reordered by a handset with the wrong time, which is a queue an entry
+  can hide at the back of. Docs/04 §8's targets are measured against the platform's clock anyway.
+- **The cursor is `(created_at, id)`, not `created_at`.** Two deliveries recorded in the same
+  millisecond make a single-column cursor either repeat an entry or **skip** one, and skipping is
+  the failure a moderation queue must not have. There is a test that writes two at the same instant.
+- **No filter on the milestone kind.** Docs/01 §4.4 is about delivery, but `proofs` does not restrict
+  itself to one milestone — filtering to `Delivered` here would silently drop an exception recorded
+  against a pickup the day somebody allows one. The milestone is reported instead.
+
+#### X-6 is not decided here, and nothing here assumes an answer
+
+Whether a job completed through the exception path may auto-complete under Docs/02 §6.1 is open and
+is the owner's. A job entering this queue and a job auto-completing are **not exclusive**. The entry
+carries `job_status` for triage and it means only what it says.
+
+#### What the entry deliberately cannot carry
+
+No object key and no signed URL, because by construction there is no photograph — a proof row is one
+or the other and never both. **No budget, and the shape has nowhere to put one**: there is a test
+that reads `ExceptionEntry`'s field names reflectively and fails on a future `Budget` or `ObjectKey`,
+so the invariant is enforced against the fields somebody adds later rather than against the fields
+that are there now.
 
 ## 4. Partly done — do not treat these as finished
 

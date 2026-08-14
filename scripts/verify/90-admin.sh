@@ -695,3 +695,133 @@ fi
 ok "no administrator can delete an audit entry — there is no permission for it and the trigger refuses it from any connection"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-117 — an exception-completed job enters the moderation queue.
+#
+# # Everything here is fenced by the proof id this section wrote
+#
+# The queue is a query over every exception in the database, and `make verify` runs against a
+# database that is not reset between runs — so it contains SHIP-116's fixtures, SHIP-118's, every
+# previous run's, and every other worktree's. A count would be a statement about the machine. The
+# entry is found by its own id and the negative case is asserted on a photograph this section wrote,
+# which is the same fencing rule the Kafka sections follow for the same reason.
+#
+# # The fixture is written with SQL because no endpoint reaches this state from here
+#
+# Recording an exception needs a driver token issued against an assignment (SHIP-107, SHIP-116), and
+# 70-delivery.sh already demonstrates that path end to end. What this section needs is a *known* row
+# to look for, so it writes one — in **one transaction**, because 000605's constraint trigger is
+# deferred and a 'Delivered' milestone is checked for its evidence at COMMIT.
+
+ticket "SHIP-117  an exception-completed job enters the moderation queue"
+
+queue_job="$(dispute_delivered_job queue)"
+queue_photo_job="$(dispute_delivered_job queuephoto)"
+
+# queue_evidence <job> <reason-or-empty> — writes a milestone and its proof, answering with the
+# proof id. An empty reason writes a photograph, which is the row that must NOT appear.
+queue_evidence() {
+  "$PSQL" "$DATABASE_URL" -qtA -v ON_ERROR_STOP=1 -v job="$1" -v reason="$2" <<'SQL'
+BEGIN;
+INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, reason, actor_recorded_at)
+VALUES (gen_random_uuid(), :'job', 'Delivered', 'driver', gen_random_uuid(),
+        'The recipient asked me not to photograph their door.', now());
+
+INSERT INTO proofs (id, job_id, milestone_id, object_key, content_type, content_length, etag,
+                    exception_reason)
+SELECT gen_random_uuid(), :'job', m.id,
+       CASE WHEN :'reason' = '' THEN 'proof/' || m.id || '.jpg' END,
+       CASE WHEN :'reason' = '' THEN 'image/jpeg' END,
+       CASE WHEN :'reason' = '' THEN 12345 END,
+       CASE WHEN :'reason' = '' THEN 'etag-' || m.id END,
+       CASE WHEN :'reason' = '' THEN NULL ELSE :'reason' END
+  FROM milestones m
+ WHERE m.job_id = :'job' AND m.milestone = 'Delivered'
+ ORDER BY m.server_recorded_at DESC
+ LIMIT 1;
+
+SELECT p.id FROM proofs p WHERE p.job_id = :'job' ORDER BY p.created_at DESC LIMIT 1;
+COMMIT;
+SQL
+}
+
+queue_proof_id="$(queue_evidence "$queue_job" recipient_objected | tr -d '[:space:]')"
+[[ -n "$queue_proof_id" ]] || fail "the exception fixture was not written"
+
+queue_photo_id="$(queue_evidence "$queue_photo_job" "" | tr -d '[:space:]')"
+[[ -n "$queue_photo_id" ]] || fail "the photograph fixture was not written"
+
+# A support administrator, because reading a queue is what the least-privileged role exists to do.
+queue_email="verify-admin-queue-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$queue_email', 'Verify Moderator', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the queue reader could not be created"
+
+status="$(admin_signin "verify-adm-queue-in-$$" "$queue_email" "$admin_password" queue-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-queue-in.json"; fail "the queue reader could not sign in ($status)"; }
+queue_token="$(json "$WORKDIR/admin-queue-in.json" '["token"]')"
+
+# Paged through until the fixture is found or the pages run out, because the queue holds every
+# exception this database has ever seen and the entry is fenced by id rather than by position.
+queue_found=""
+queue_photo_seen=""
+queue_cursor=""
+for _ in $(seq 1 40); do
+  path="/v1/admin/moderation/exceptions?limit=50"
+  [[ -n "$queue_cursor" ]] && path="$path&cursor=$queue_cursor"
+
+  status="$(admin_get "$path" "$queue_token" queue-page)"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-queue-page.json"; fail "reading the exception queue returned $status"; }
+
+  python3 - "$WORKDIR/admin-queue-page.json" "$queue_proof_id" "$queue_photo_id" >"$WORKDIR/queue-scan.txt" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+items = page.get("data") or []
+found = next((i for i in items if i["proof_id"] == sys.argv[2]), None)
+photo = any(i["proof_id"] == sys.argv[3] for i in items)
+print(json.dumps(found) if found else "")
+print("photo" if photo else "")
+print(page.get("next_cursor") or "")
+PY
+  queue_entry="$(sed -n '1p' "$WORKDIR/queue-scan.txt")"
+  [[ -n "$(sed -n '2p' "$WORKDIR/queue-scan.txt")" ]] && queue_photo_seen="yes"
+  queue_cursor="$(sed -n '3p' "$WORKDIR/queue-scan.txt")"
+
+  [[ -n "$queue_entry" ]] && { queue_found="$queue_entry"; break; }
+  [[ -n "$queue_cursor" ]] || break
+done
+
+[[ -n "$queue_found" ]] || fail "the exception-completed job never appeared in the moderation queue"
+printf '%s' "$queue_found" >"$WORKDIR/queue-entry.json"
+
+[[ "$(json "$WORKDIR/queue-entry.json" '["job_id"]')" == "$queue_job" ]] \
+  || { cat "$WORKDIR/queue-entry.json"; fail "the entry names the wrong job"; }
+[[ "$(json "$WORKDIR/queue-entry.json" '["reason"]')" == "recipient_objected" ]] \
+  || { cat "$WORKDIR/queue-entry.json"; fail "the entry does not carry the reason that was recorded"; }
+[[ "$(json "$WORKDIR/queue-entry.json" '["milestone"]')" == "Delivered" ]] \
+  || { cat "$WORKDIR/queue-entry.json"; fail "the entry does not say which claim the exception stands behind"; }
+[[ -n "$(json "$WORKDIR/queue-entry.json" '["note"]')" ]] \
+  || { cat "$WORKDIR/queue-entry.json"; fail "the driver's own words are not carried"; }
+ok "a delivery evidenced by a reason rather than a photograph is in the moderation queue — SHIP-117's Done when, on the wire"
+
+[[ -z "$queue_photo_seen" ]] \
+  || fail "a delivery evidenced by a photograph is in the exception queue, so the queue is every delivery"
+ok "and one evidenced by a photograph is not — Docs/04 §5's fourth queue is failed proof of delivery, not every delivery"
+
+# Nothing about money, and nothing about the photograph that does not exist. A queue entry is what
+# somebody triaging needs, and a customer's budget is never exposed to anybody through any endpoint.
+for forbidden in budget amount price object_key url; do
+  [[ "$(cat "$WORKDIR/queue-entry.json")" != *"\"$forbidden\""* ]] \
+    || { cat "$WORKDIR/queue-entry.json"; fail "the queue entry carries a $forbidden field"; }
+done
+ok "the entry carries no budget and no object key — there is no photograph to point at, which is why the row exists"
+
+# The permission, on the wire. Every role holds moderation.read, so what is being shown here is that
+# the check is in front of the endpoint at all — the demotion case above is where a refusal is shown.
+status="$(admin_get /v1/admin/moderation/exceptions "" queue-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-queue-nocred.json"; fail "the queue is readable without a credential ($status)"; }
+ok "and the queue is behind the administrator credential like every other administrative route"
+
+admin_clear_limits

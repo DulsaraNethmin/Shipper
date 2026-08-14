@@ -28,6 +28,17 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// testModeration is a queue service with no pool, for the same reason as [testDisputeService]:
+// [NewHandler] requires one and no test below reaches the queue endpoint.
+func testModeration(t *testing.T) *Moderation {
+	t.Helper()
+	m, err := NewModeration(testExceptionQueue{}, nil)
+	if err != nil {
+		t.Fatalf("building the moderation service: %v", err)
+	}
+	return m
+}
+
 // SHIP-148, and the two claims in its *Done when* checked separately.
 //
 // "Permissions are granular and default to the minimum" fails in two unrelated ways. Granularity
@@ -258,7 +269,7 @@ func TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission(t *t
 		t.Fatalf("signing in: %v", err)
 	}
 
-	handler, err := NewHandler(testDisputeService(t), creds, nil, testLogger())
+	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), nil, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -303,7 +314,7 @@ func TestAnOwnerCreatesAnAdministratorAndTheDefaultIsStillTheMinimum(t *testing.
 		t.Fatalf("signing in: %v", err)
 	}
 
-	handler, err := NewHandler(testDisputeService(t), creds, nil, testLogger())
+	handler, err := NewHandler(testDisputeService(t), creds, testModeration(t), nil, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}

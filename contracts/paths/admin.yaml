@@ -937,3 +937,192 @@ Administrator:
       type: string
       format: date-time
       example: '2026-07-01T09:00:00.000Z'
+
+# --- the delivery-exception moderation queue (SHIP-117) -----------------------------------------
+
+AdminExceptionQueue:
+  get:
+    operationId: adminExceptionQueue
+    summary: Deliveries evidenced by a reason rather than a photograph
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §5's fourth moderation queue, in the part of it this ticket builds: **failed proof of
+      delivery** (SHIP-117). Overdue pickup and delayed delivery join it at SHIP-157.
+
+      A delivery reaches this list by being recorded with a reason in place of a photograph — the
+      exception path of Docs/01 §4.4, which exists so that a driver standing at a delivery point is
+      never unable to finish the job. Three reasons are possible and no others: `recipient_objected`,
+      `camera_unavailable`, `location_unsafe`.
+
+      **The queue is a query over the evidence, not a table of flags.** There is nothing to mark as
+      read, nothing to claim and nothing to tick off — Docs/04 §6's process ends in a recorded
+      decision rather than in an entry disappearing. An entry stays here for as long as the row it
+      describes exists, which is for ever.
+
+      ## What an entry does and does not carry
+
+      There is no photograph and no signed URL, because by construction there is none — a proof row
+      is a photograph or a reason and never both. There is no customer, no provider and **no
+      budget**: an entry is what somebody triaging needs in order to decide whether to open the job.
+
+      `job_status` is where the job is now, for triage. It implies nothing about whether a delivery
+      completed this way may auto-complete after 72 hours; that question is open.
+
+      `recorded_at` is the platform's clock, not the driver's device's. A queue ordered by a
+      handset's clock could be reordered by a handset with the wrong time, which is a queue an entry
+      can hide at the back of.
+
+      ## Ordering and paging
+
+      Oldest first, because Docs/04 §8 sets acknowledgement targets and the oldest entry is the one
+      closest to breaching one. Cursor paged: the queue grows at the end while somebody is reading
+      it, and an offset would show the same entry twice or skip one.
+
+      ## Permission
+
+      Needs `moderation.read`, which every administrator role holds. Acting on what is in the queue
+      is a different permission on a different endpoint.
+    parameters:
+      - name: limit
+        in: query
+        required: false
+        description: How many entries to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page — a client that sent one has a bug, and
+          answering "nothing here" would let it page for ever through a queue it never saw.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of the queue, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ExceptionQueuePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `moderation.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ExceptionQueuePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/ExceptionQueueEntry'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wOC0xNFQwMjoxNTozMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like and a client should not have to know the difference.
+      example: false
+
+ExceptionQueueEntry:
+  type: object
+  additionalProperties: false
+  required: [proof_id, job_id, milestone, reason, note, recorded_at, job_status]
+  description: |
+    One delivery recorded with a reason in place of a photograph.
+  properties:
+    proof_id:
+      type: string
+      format: uuid
+      description: The evidence row. Also what the cursor is built from.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    job_id:
+      type: string
+      format: uuid
+      description: The delivery to open.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    milestone:
+      type: string
+      description: |
+        Which recorded claim the exception stands behind — `Delivered` for the deliveries Docs/01
+        §4.4 is about. Reported rather than assumed, so an exception recorded against another
+        milestone is visible rather than silently dropped.
+      example: Delivered
+    reason:
+      type: string
+      enum: [recipient_objected, camera_unavailable, location_unsafe]
+      description: |
+        Why there is no photograph, from Docs/01 §4.4's three. There is deliberately no `other`: a
+        reason nobody can group is a queue nobody can triage.
+      example: recipient_objected
+    note:
+      type: string
+      description: |
+        The actor's own words, where they left any. Always present and frequently empty — the
+        milestone's note is optional, and a driver who selected a reason has already said the most
+        important part.
+      example: The recipient asked me not to photograph their door.
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform recorded the evidence, in UTC, on the platform's clock — **not** the
+        driver's device's. See the operation description.
+      example: '2026-08-14T02:15:30.000Z'
+    job_status:
+      type: string
+      description: |
+        Where the job is now, for triage. It implies nothing about whether a delivery completed
+        this way may auto-complete.
+      example: Delivered

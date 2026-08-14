@@ -43,6 +43,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
@@ -53,10 +54,11 @@ import (
 // for intake that is this layer: the party check, the dispute row and the status change are one
 // decision against one version of the job.
 type Handler struct {
-	svc   *Service
-	creds *Credentials
-	pool  *pgxpool.Pool
-	log   *slog.Logger
+	svc        *Service
+	creds      *Credentials
+	moderation *Moderation
+	pool       *pgxpool.Pool
+	log        *slog.Logger
 }
 
 // NewHandler wires the handlers to the service.
@@ -65,7 +67,13 @@ type Handler struct {
 // purpose — a rolling deployment during a failover would otherwise take every instance down at once
 // — so a nil pool is a condition the handlers answer 503 to for as long as it lasts, not a reason to
 // refuse to start.
-func NewHandler(svc *Service, creds *Credentials, pool *pgxpool.Pool, log *slog.Logger) (*Handler, error) {
+func NewHandler(
+	svc *Service,
+	creds *Credentials,
+	moderation *Moderation,
+	pool *pgxpool.Pool,
+	log *slog.Logger,
+) (*Handler, error) {
 	if svc == nil {
 		return nil, errors.New("admin: a handler needs a service")
 	}
@@ -76,10 +84,16 @@ func NewHandler(svc *Service, creds *Credentials, pool *pgxpool.Pool, log *slog.
 		// the first request anybody makes and the last one anybody retries.
 		return nil, errors.New("admin: a handler needs the administrator credentials service")
 	}
+	if moderation == nil {
+		// SHIP-117. A nil here would make the queue endpoint panic rather than answer, and the
+		// panic would be at the first request rather than at startup — which is the wrong way
+		// round for a collaborator that is decided once, in the composition root.
+		return nil, errors.New("admin: a handler needs the moderation queue service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
-	return &Handler{svc: svc, creds: creds, pool: pool, log: log}, nil
+	return &Handler{svc: svc, creds: creds, moderation: moderation, pool: pool, log: log}, nil
 }
 
 // raiseDisputeRequest is the body of POST /v1/jobs/{id}/disputes.
@@ -813,4 +827,140 @@ func (h *Handler) permitted(r *http.Request, p Permission) (Grant, error) {
 			ErrAdminPermissionDenied, grant.Administrator.Role, p))
 	}
 	return grant, nil
+}
+
+// --- SHIP-117: the delivery-exception moderation queue ------------------------------------------
+
+// exceptionEntryResponse is one delivery that was evidenced by a reason rather than a photograph.
+//
+// **No object key and no signed URL**, because by construction there is no photograph — a proof row
+// is one or the other and never both (`ck_proofs_photograph_or_exception`). **No customer, no
+// provider and no budget**: a queue entry is what somebody triaging needs in order to decide whether
+// to open the job, and a shape that never carried a budget cannot leak one.
+type exceptionEntryResponse struct {
+	ProofID string `json:"proof_id"`
+	JobID   string `json:"job_id"`
+
+	Milestone string `json:"milestone"`
+	Reason    string `json:"reason"`
+
+	// Note is the actor's own words, where they left any. Always present, empty when they did
+	// not — `milestones.reason` is optional, and a `null` makes a console that renders without
+	// checking crash on the ordinary case.
+	Note string `json:"note"`
+
+	// RecordedAt is the platform's clock, not the device's. See [ExceptionEntry.RecordedAt].
+	RecordedAt string `json:"recorded_at"`
+
+	// JobStatus is where the job is now. It implies nothing about whether a job completed
+	// through this path may auto-complete, which is undecided (X-6).
+	JobStatus string `json:"job_status"`
+}
+
+func exceptionEntryFrom(e ExceptionEntry) exceptionEntryResponse {
+	return exceptionEntryResponse{
+		ProofID:    e.ProofID.String(),
+		JobID:      e.JobID.String(),
+		Milestone:  e.Milestone,
+		Reason:     e.Reason,
+		Note:       e.Note,
+		RecordedAt: timestamp(e.RecordedAt),
+		JobStatus:  e.JobStatus,
+	}
+}
+
+// ExceptionQueue handles GET /v1/admin/moderation/exceptions (SHIP-117).
+//
+// The *Done when* is that an exception-completed job **enters the moderation queue**, and this is
+// the queue. It needs [PermissionModerationRead], which every role holds — reading a queue is what
+// the least-privileged role exists to be able to do, and acting on what is in it is a different
+// permission on a different endpoint.
+//
+// Oldest first, cursor paged, and it takes no filter: SHIP-157 is where this becomes a screen with
+// four kinds of exception on it, and a query parameter added now would be one that ticket has to
+// work around.
+func (h *Handler) ExceptionQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
+			return err
+		}
+
+		query, err := exceptionQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so that "is there another page" is answered by the rows
+		// rather than by a second COUNT — the same arrangement the jobs feed uses.
+		query.Limit++
+
+		entries, err := h.moderation.Exceptions(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+			next = pagination.Cursor{
+				timestamp(last.RecordedAt),
+				last.ProofID.String(),
+			}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]exceptionEntryResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, exceptionEntryFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// exceptionQueryFrom reads the page parameters.
+//
+// A malformed cursor is a bad request rather than an empty page, for the reason internal/pagination
+// gives: a client that sent one has a bug, and answering "nothing here" would let it page for ever
+// through a queue it never saw.
+func exceptionQueryFrom(r *http.Request) (QueueQuery, error) {
+	values := r.URL.Query()
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return QueueQuery{}, err
+	}
+
+	after, err := decodeExceptionCursor(values.Get("cursor"))
+	if err != nil {
+		return QueueQuery{}, err
+	}
+	return QueueQuery{Limit: limit, After: after}, nil
+}
+
+// decodeExceptionCursor reads the two fields the queue's ordering is total on.
+func decodeExceptionCursor(raw string) (QueueCursor, error) {
+	if raw == "" {
+		return QueueCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return QueueCursor{}, err
+	}
+
+	recordedAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	proofID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return QueueCursor{RecordedAt: recordedAt, ProofID: proofID}, nil
 }

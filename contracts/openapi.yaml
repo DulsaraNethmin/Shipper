@@ -180,6 +180,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminAdministrators'
   /v1/admin/me:
     $ref: './paths/admin.yaml#/AdminMe'
+  /v1/admin/moderation/exceptions:
+    $ref: './paths/admin.yaml#/AdminExceptionQueue'
   /v1/admin/sessions:
     $ref: './paths/admin.yaml#/AdminSessions'
   /v1/admin/sessions/current:
