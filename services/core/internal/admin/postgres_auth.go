@@ -121,14 +121,37 @@ func (postgresStore) insertAdministrator(
 //
 // The hash is a parameter rather than a field on [Session] so that no struct in this package can
 // carry a credential, in either direction — see [Issued].
+//
+// # created_at is supplied, and leaving it to the column default was a defect
+//
+// **Every timestamp in this row comes from the injected clock, and that is a correctness
+// requirement rather than a preference.** `ck_admin_sessions_idle_expiry` and
+// `ck_admin_sessions_absolute_expiry` both compare an expiry against `created_at`, and the expiries
+// are computed in Go from [clock.Clock]. Letting `DEFAULT now()` fill `created_at` puts the
+// *database's* clock on one side of that comparison and the *caller's* on the other — so the
+// constraint stops asking "is this expiry after the moment the session started" and starts asking
+// "is this expiry after whenever the INSERT happened to execute".
+//
+// That is the same `now()` the constraint's own comment in `000801` says it is avoiding, reaching
+// the comparison through the column instead of through the predicate.
+//
+// It shipped, and it failed **two hours later**: the tests fix the clock at 09:00 UTC, so the row
+// held an expiry of 09:30 against a `created_at` that moved with the wall clock, and every sign-in
+// began violating the constraint the moment real time passed 09:30. A gate run before that instant
+// is green and a gate run after it is not, on a tree nobody has touched.
+//
+// The column keeps its default as a safety net for a writer that supplies nothing. What a writer
+// may not do is supply the *expiries* and not the origin they are measured from.
 func (postgresStore) insertSession(ctx context.Context, r db.Runner, s Session, tokenHash string) error {
 	const q = `
 		INSERT INTO admin_sessions
-			(id, admin_user_id, token_hash, idle_expires_at, absolute_expires_at, last_used_at)
-		VALUES ($1, $2, $3, $4, $5, $6)`
+			(id, admin_user_id, token_hash, idle_expires_at, absolute_expires_at,
+			 last_used_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
 	if _, err := r.Exec(ctx, q,
-		s.ID, s.AdminID, tokenHash, s.IdleExpiresAt, s.AbsoluteExpiresAt, s.LastUsedAt,
+		s.ID, s.AdminID, tokenHash, s.IdleExpiresAt, s.AbsoluteExpiresAt,
+		s.LastUsedAt, s.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("admin: recording an administrator session: %w", err)
 	}

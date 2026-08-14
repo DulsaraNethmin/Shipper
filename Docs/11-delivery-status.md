@@ -8160,6 +8160,46 @@ or a row with a password nobody can use — so the first account is one `INSERT`
 `scripts/verify/90-admin.sh` does exactly that with a committed development hash, in the same sense
 as the signing key `mint_token` already uses.
 
+#### The defect this ticket shipped with: two clocks in one row
+
+**`make check` was green when this branch was committed and exit 2 two hours later, on a tree nobody
+had touched.** It is worth writing down at length because it is a *class* rather than an incident,
+and because wave 8 produced two instances of it in two tracks.
+
+`insertSession` named the two expiries and not `created_at`, so PostgreSQL's `DEFAULT now()` filled
+the latter. The expiries are computed in Go from the injected clock; `ck_admin_sessions_idle_expiry`
+compares one against the other. So the row held **an origin from one clock and a lifetime measured
+from another**, and the constraint quietly stopped asking "is this expiry after the moment the
+session started" and started asking "is this expiry after whenever the `INSERT` executed".
+
+The tests fix the clock at 09:00 UTC. While real time was inside one idle window of that instant the
+row satisfied the constraint; **at 09:30 every sign-in began violating it**. Seven tests, one cause.
+
+| Property | Why it matters |
+|---|---|
+| It is a **time bomb, not a flake** | Re-running never clears it. Two runs disagree because the wall clock moved, not because anything raced — so the usual shared-stack reflex ("run it again before investigating") is exactly wrong here |
+| It is **invisible to the author** | The gate is green for a window after every commit. Whoever runs it later sees the failure, which is how this reached the orchestrator rather than the branch |
+| The constraint's own comment was **right** | `000801` says the comparison is against `created_at` "rather than `now()`". Letting the default fill the column reintroduced `now()` through the back door — the predicate was never edited |
+
+**The rule, stated so the next domain does not rediscover it: a column that something is *measured
+from* must come from the same clock as the thing measured.** A column nothing compares may come from
+the database. On `admin_sessions` that is exactly one column, `updated_at`, which answers "when did
+this row last change" — a fact about the write rather than about the session — and the migration now
+says so beside both. `admin_users`' timestamps are the safe kind and say why: nothing compares them,
+and `insertAdministrator` reads them back with `RETURNING` rather than assembling them in Go, so
+there is one clock in the answer.
+
+The regression test is written to be **independent of when it runs**: it signs in with the clock far
+in the past *and* far in the future, so whatever "today" is, one of the two is always on the wrong
+side of `now()` and a wall-clock-dependent row cannot satisfy both. Reverting the fix fails it in
+both directions — the past subtest on the constraint, the future subtest on the stored value — and
+no choice of run date makes it pass by luck. A test pinned to a single fixed instant is what allowed
+the original defect to look green, so pinning a *second* one would have reproduced the mistake.
+
+**Track C hit the same class in the same wave** — a Flutter sync harness measuring the calendar
+because the queue ran on a fixed clock while the nudge read the host's. Two independent instances in
+one wave is what makes this a pattern worth naming rather than a bug worth fixing.
+
 #### Two edits outside this track's ownership, both forced and both recorded
 
 - **`scripts/verify/40-identity.sh`** asserted that `users.password_hash` was the *only* credential

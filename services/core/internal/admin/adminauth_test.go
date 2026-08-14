@@ -717,3 +717,118 @@ func TestASubjectOnTheContextIsNotAnAdministrator(t *testing.T) {
 		})
 	}
 }
+
+// TestASessionIsInternallyConsistentWhateverTheWallClockSays is the test that would have caught the
+// defect this file shipped with, and it is written to be **independent of when it runs**.
+//
+// # What went wrong
+//
+// [postgresStore.insertSession] named the two expiries and not `created_at`, so `DEFAULT now()`
+// filled the latter. The expiries came from the injected clock and the origin they are measured
+// from came from PostgreSQL's — two clocks in one row, on either side of
+// `ck_admin_sessions_idle_expiry`.
+//
+// Every test above fixes the clock at 09:00 UTC on the day they were written. While real time was
+// before 09:30 the row satisfied the constraint and the suite was green; **after 09:30 every
+// sign-in violated it**. The gate passed at 07:00 and failed at 10:40 on a tree nobody had touched.
+// That is a time bomb rather than a flake: re-running never clears it, and the two runs disagree
+// because the wall clock moved rather than because anything raced.
+//
+// # Why this test cannot rot the same way
+//
+// It signs in at a clock **far in the past and far in the future**, so at least one of the two is
+// always on the wrong side of `now()` whenever the suite runs. A row that depended on the wall clock
+// could not satisfy both, and no choice of "today" makes this pass by luck.
+//
+// It then asserts the stored `created_at` **is** the injected instant, which is the property the
+// constraint actually rests on: the origin and the expiries measured from it come from one clock.
+func TestASessionIsInternallyConsistentWhateverTheWallClockSays(t *testing.T) {
+	creds, _, pool, clk := adminAuth(t)
+	anAdministrator(t, creds, "clocks@example.com", RoleSupport)
+
+	for name, instant := range map[string]time.Time{
+		"long before now": time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+		"long after now":  time.Date(2039, 11, 12, 13, 14, 15, 0, time.UTC),
+	} {
+		t.Run(name, func(t *testing.T) {
+			clk.Instant = instant
+
+			issued, _, err := signIn(t, creds, "clocks@example.com", testPassword, "10.0.12.1")
+			if err != nil {
+				t.Fatalf("signing in with the clock at %s: %v\n"+
+					"A session row must be consistent with the clock that produced it. A "+
+					"timestamp left to a column default puts the database's clock on one side "+
+					"of ck_admin_sessions_idle_expiry and the caller's on the other, and the "+
+					"row then satisfies the constraint only while real time happens to fall "+
+					"inside one idle window of the injected instant.", instant, err)
+			}
+
+			var createdAt, idleExpiresAt, absoluteExpiresAt, lastUsedAt time.Time
+			if err := pool.QueryRow(t.Context(), `
+				SELECT created_at, idle_expires_at, absolute_expires_at, last_used_at
+				FROM admin_sessions WHERE id = $1`, issued.Session.ID,
+			).Scan(&createdAt, &idleExpiresAt, &absoluteExpiresAt, &lastUsedAt); err != nil {
+				t.Fatalf("reading the session row: %v", err)
+			}
+
+			// Every timestamp on the row comes from the one clock. `updated_at` deliberately
+			// does not and is deliberately not read here — see the note below.
+			for field, got := range map[string]time.Time{
+				"created_at":          createdAt,
+				"last_used_at":        lastUsedAt,
+				"idle_expires_at":     idleExpiresAt.Add(-idleWindow),
+				"absolute_expires_at": absoluteExpiresAt.Add(-absoluteLifetime),
+			} {
+				if !got.Equal(instant) {
+					t.Errorf("%s implies an origin of %s, want the injected %s",
+						field, got.UTC(), instant)
+				}
+			}
+		})
+	}
+}
+
+// TestOnlyTheBookkeepingColumnUsesTheDatabaseClock names the one timestamp that is meant to come
+// from PostgreSQL, so that "which clock owns which column" is written down rather than rediscovered.
+//
+// `updated_at` answers *when did this row last change*, which is a fact about the write rather than
+// about the session, and it is maintained by the `set_updated_at` trigger exactly as
+// `device_sessions` maintains its own. **Nothing compares it to anything**, which is what makes it
+// safe for it to disagree with the injected clock — and is precisely the property `created_at`
+// lacked.
+//
+// The check is that a slide moves it. If a later change ever put `updated_at` into a constraint or
+// into a lifetime, this test would still pass and the one above would start failing, which is the
+// right way round.
+func TestOnlyTheBookkeepingColumnUsesTheDatabaseClock(t *testing.T) {
+	creds, auth, pool, clk := adminAuth(t)
+	anAdministrator(t, creds, "bookkeeping@example.com", RoleSupport)
+
+	issued, _, err := signIn(t, creds, "bookkeeping@example.com", testPassword, "10.0.13.1")
+	if err != nil {
+		t.Fatalf("signing in: %v", err)
+	}
+
+	var before time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT updated_at FROM admin_sessions WHERE id = $1`, issued.Session.ID).Scan(&before); err != nil {
+		t.Fatalf("reading updated_at: %v", err)
+	}
+
+	// Far enough that the slide is worth a write (see slideGranularity).
+	clk.Advance(5 * time.Minute)
+	if _, err := auth.Resolve(t.Context(), issued.Token); err != nil {
+		t.Fatalf("resolving: %v", err)
+	}
+
+	var after time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT updated_at FROM admin_sessions WHERE id = $1`, issued.Session.ID).Scan(&after); err != nil {
+		t.Fatalf("reading updated_at: %v", err)
+	}
+
+	if !after.After(before) {
+		t.Errorf("updated_at did not move when the session slid: %s then %s.\n"+
+			"It is the trigger's column and it answers when the row last changed.", before, after)
+	}
+}

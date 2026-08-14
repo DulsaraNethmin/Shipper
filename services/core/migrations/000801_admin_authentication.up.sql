@@ -117,6 +117,11 @@ CREATE TABLE admin_users (
     -- keeps that history after the subject is gone.
     status text NOT NULL DEFAULT 'active',
 
+    -- Both the database's clock, and safely so: **no constraint on this table compares them to
+    -- anything**, and insertAdministrator reads them back with RETURNING rather than assembling
+    -- them in Go — so the value a caller is told is the value stored, and there is one clock in the
+    -- answer. Contrast admin_sessions.created_at below, where an expiry is measured *from* the
+    -- column and the two clocks therefore have to be one.
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
 
@@ -185,13 +190,31 @@ CREATE TABLE admin_sessions (
     -- survives, and because a row that can vanish cannot be reasoned about after the fact.
     revoked_at timestamptz,
 
+    -- **The DEFAULT is a safety net and not the intended writer, and the difference is load
+    -- bearing.** The two CHECKs below compare an expiry against this column, and the expiries are
+    -- computed in Go from the injected clock — so a writer that supplies them and leaves this to
+    -- the default puts two different clocks on the two sides of one comparison. The constraint then
+    -- stops asking "is this expiry after the moment the session started" and starts asking "is this
+    -- expiry after whenever the INSERT executed", which is the very now() the note below says it is
+    -- avoiding, reaching the predicate through the column instead.
+    --
+    -- SHIP-147 shipped with exactly that split and it failed two hours later, on a tree nobody had
+    -- touched. See insertSession in internal/admin/postgres_auth.go, and Docs/11 §3.
     created_at timestamptz NOT NULL DEFAULT now(),
+
+    -- The one column on this table that is deliberately the *database's* clock. It answers "when
+    -- did this row last change", which is a fact about the write rather than about the session, it
+    -- is maintained by the trigger below, and **nothing compares it to anything** — which is what
+    -- makes it safe for it to disagree with the caller's clock, and is precisely the property
+    -- created_at above does not have.
     updated_at timestamptz NOT NULL DEFAULT now(),
 
     -- An expiry at or before the moment of issue is a session nobody can ever use: a clock or
     -- configuration mistake, worth catching where it happens rather than as a sign-in loop.
     -- Compared against created_at rather than now(), for 000103's reason — the row is rewritten on
-    -- every slide, and a now() comparison would refuse any correction of a historic row.
+    -- every slide, and a now() comparison would refuse any correction of a historic row. That
+    -- reasoning holds only while created_at comes from the clock that computed the expiries, which
+    -- is why the note on that column is where it is.
     CONSTRAINT ck_admin_sessions_idle_expiry CHECK (idle_expires_at > created_at),
     CONSTRAINT ck_admin_sessions_absolute_expiry CHECK (absolute_expires_at > created_at),
 
