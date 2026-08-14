@@ -9496,6 +9496,49 @@ nothing. The camera is *refused* rather than absent, which is what a revoked per
 from Dart, and it is still supplied: under `testWidgets`' fake clock a platform-channel reply is
 never delivered, so the real `availableCameras()` does not throw — it never completes.
 
+### SHIP-102 is **not done**, and is here because it is §6's third category again
+
+**Nothing was built for it and nothing should have been.** It was dispatched to wave 9's Flutter
+track and trimmed on the first hour's reading, on the same grounds SHIP-101 was struck for three
+waves and SHIP-114 for five: **every dependency met, and unbuildable in fact.** It is recorded in
+this section rather than in §6 so that the evidence sits beside the ticket that found it; the row
+itself belongs to whoever next reconciles §6.
+
+Its *Done when* is "customer compares price, timing, provider profile, and vehicle side by side", and
+**all four clauses are unserved**. Measured against `services/core/cmd/api/routes_golden.txt` and the
+contracts at `ac62673`, not inferred from the domain:
+
+| What the screen needs | What serves it |
+|---|---|
+| the bids on one job | **nothing.** Line 36 is `POST /v1/jobs/{id}/bids`; the only `GET` under that tree is line 39, `…/bids/{bid_id}/history`, which needs a bid id the customer would have to hold already |
+| price and timing | on the `Bid` shape — and reachable only through the list that does not exist |
+| the provider's profile | **nothing.** `GET /v1/fleet/profile` is the *caller's own* |
+| the vehicle offered | **nothing.** `GET /v1/fleet/vehicles` is likewise the caller's own |
+
+**Both dependencies are on the done list, which is what makes this the third category rather than an
+ordinary block.** SHIP-77 landed and SHIP-96 landed — and SHIP-96's own entry above records that it
+shipped "no migration, no route, no `$ref`, no `routes_golden.txt` line", because what it built was
+the visibility *rules* over SHIP-88's existing read. A dependency column cannot see that.
+
+**Two files predicted this and neither is a route.** `routes_bidding.go` reserves
+`GET /v1/jobs/{id}/bids` for SHIP-102 in three separate comments, from SHIP-84 onwards; and
+`contracts/paths/fleet.yaml` says, of the provider profile, "the customer's view of a provider is a
+separate schema arriving with SHIP-96". **A reservation is not a route and a forward reference is not
+a schema**, and both read exactly like a commitment that was met.
+
+**What would close it is one read ticket** — call it SHIP-102a, in the shape SHIP-15r used for
+SHIP-101a, SHIP-115a and SHIP-120a: `GET /v1/jobs/{id}/bids`, `RequireUser`, the customer's view of
+every offer on their own job, whose element carries the bid **plus** a customer-facing provider
+summary and the vehicle the offer is made with. The privacy rule on it is a different one from
+`Bid`'s and needs stating rather than inheriting: this response crosses providers, so what one
+provider may learn about another through it is the question, and `GET /v1/fleet/bids`'s "never
+selected rather than refused" answer does not transfer.
+
+**The wave-9 dispatch brief listed `GET /v1/jobs/{id}/bids` as served.** It was written by asserting
+rather than measuring, in a brief whose own baselines were measured — which is this repository's
+recurring failure mode arriving in a document meant to prevent it. The check that caught it is
+`grep` against the golden file, and it took under a minute.
+
 
 ## 4. Partly done — do not treat these as finished
 
