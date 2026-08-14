@@ -6,6 +6,7 @@ import 'package:shipper/core/queue/operation_queue.dart';
 import 'package:shipper/core/queue/queued_operation.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 import 'package:shipper/features/delivery/milestone.dart';
+import 'package:shipper/features/delivery/proof_exception_reason.dart';
 import 'package:shipper/features/delivery/proof_image.dart';
 import 'package:shipper/shared/formatting/dates.dart';
 
@@ -23,6 +24,18 @@ enum ProofCaptureStage {
 
   /// On the device, in the queue, waiting for a connection.
   queued,
+
+  /// **A reason** is on the device, in the queue, and there will be no photograph (SHIP-131).
+  ///
+  /// Its own stage rather than a flag beside [queued], because the two are different things to
+  /// confirm to a driver and the confirmation is the last thing they read before walking away. "Your
+  /// photograph is saved" said about a recorded exception is a driver who believes they photographed
+  /// a delivery they did not, and finds out weeks later in a dispute.
+  ///
+  /// It is **not** a failure and must never be drawn as one. `Docs/01` §4.4 makes the photograph and
+  /// the reason the same feature — delivered requires one or the other, never neither — so a reason
+  /// is evidence rather than the absence of it, and this delivery is as finished as any other.
+  reasonRecorded,
 
   /// It could not be stored. [ProofCaptureState.message] says what a person can do about it.
   failed,
@@ -170,6 +183,76 @@ class CaptureProofController extends Notifier<ProofCaptureState> {
 
     if (!ref.mounted) return true;
     state = const ProofCaptureState(stage: ProofCaptureStage.queued);
+    return true;
+  }
+
+  /// Records why this delivery carries no photograph, and queues it (SHIP-131).
+  ///
+  /// ## This is the other half of `Docs/01` §4.4 rather than a hole in it
+  ///
+  /// That paragraph makes photo proof mandatory and, **in the same paragraph**, makes the exception
+  /// path part of the same feature — because what must never happen is a driver standing at a
+  /// delivery point unable to finish the job. `Docs/07` §7 calls a camera flow that dead-ends on a
+  /// denied permission a defect in as many words. So this is not a way around the rule; it is the
+  /// rule's second branch, and the platform enforces exactly one of the two arriving:
+  /// `000605`'s deferred constraint trigger refuses at `COMMIT` a `Delivered` milestone carrying
+  /// neither, and `ck_proofs_evidence` refuses one carrying both.
+  ///
+  /// ## The request is the milestone, with the reason inside it
+  ///
+  /// `POST /v1/jobs/{id}/milestones` with `proof.exception_reason` and **no** `object_key` — the
+  /// contract's "send exactly one of the two", and sending both is refused with `validation_failed`.
+  /// Nothing is uploaded and the object store is not contacted, which is why this is
+  /// `OperationKind.milestone` and not `OperationKind.proof`: there is no file, so there is no
+  /// attachment, and the operation the sync worker has to perform is one request rather than three.
+  ///
+  /// It shares [Milestone.delivered] and the `job:<id>` ordering key with everything else on this
+  /// delivery, so a driver's recorded sequence reaches the platform in the order they recorded it
+  /// (SHIP-124) — and it appears in the delivery screen's own log as a pending `Delivered`, because
+  /// that log reads `OperationKind.milestone` rows on this key.
+  ///
+  /// ## The key is the queue's, not this method's
+  ///
+  /// Unlike [queueFrom], no key is minted here: [queueFrom] mints one because the **file** is named
+  /// after it, and there is no file. The queue mints one at enqueue and every attempt reuses it
+  /// unchanged (SHIP-124, SHIP-125), which is what makes a retry after a day in a valley a retry
+  /// rather than a second `Delivered` on the customer's timeline.
+  ///
+  /// Returns once the row is **committed**, which is when the screen may confirm it.
+  Future<bool> queueException(ProofExceptionReason reason) async {
+    if (state.isBusy) return false;
+
+    // `unknown` is this client's own value for a reason a later build wrote — see
+    // `ProofExceptionReasonCopy.offered`, which is why the screen cannot offer it. Refused here as
+    // well, because the platform's `enum` is exactly three and it would come back as
+    // `validation_failed` naming `proof.exception_reason`: a driver told their reason is not a
+    // reason, hours later, from a quarantined row.
+    if (reason == ProofExceptionReason.unknown) return false;
+
+    final at = DateTime.now();
+
+    try {
+      await ref.read(syncWorkerProvider).record(
+            kind: OperationKind.milestone,
+            orderingKey: 'job:$jobId',
+            method: 'POST',
+            path: '/v1/jobs/$jobId/milestones',
+            body: <String, dynamic>{
+              'milestone': milestone.wire,
+              // The actor's clock with the device's offset on it, for the reason
+              // `record_milestone_controller.dart` sets out at length: omitting it would have the
+              // platform stamp a delivery that happened in a valley with the time it arrived.
+              'recorded_at': rfc3339(at),
+              'proof': <String, dynamic>{'exception_reason': reason.wireName},
+            },
+            recordedAt: at,
+          );
+    } on QueueRefusal catch (refusal) {
+      return _failed(_refusalCopy(refusal));
+    }
+
+    if (!ref.mounted) return true;
+    state = const ProofCaptureState(stage: ProofCaptureStage.reasonRecorded);
     return true;
   }
 

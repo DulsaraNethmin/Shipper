@@ -430,6 +430,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-127** | M4 | Flutter four-hour unsynced nudge — `Docs/02` §3.1's second rung, and **a prompt rather than a fourth line in SHIP-126's bar**: a card over a scrim, above the router, dismissed by an explicit tap and by nothing else. It measures `enqueued_at` of the oldest **pending or in-flight** operation and excludes quarantined work, because the whole content of the prompt is *go and find signal*. **No timer at all** — a published snapshot and the clock at build time, because every trigger that brings a person back to the app already publishes one. Finding: **the queue's clock and the nudge's clock have to be the same one**, which no fixture had needed until now. The four hours is a value rather than a constant and **should not stay on the device** — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
 | **SHIP-130** | M4 | Flutter camera capture with on-device compression — **`camera` and not `image_picker`**, because the one-line answer hands the capture to the manufacturer's camera application and several of those keep a copy in `DCIM/Camera`, which no Dart can prevent or observe. The negative is proved from the two places that can enforce one: **no Android media permission and no iOS photo-library string**, both asserted. Compression is **pure Dart** so a host test measures it on real JPEGs, EXIF included. It also builds the **three-request upload exchange** SHIP-125 left as an `UnimplementedError` — and corrects that comment, which named a multipart send the platform does not have. `delivered` becomes recordable from the app for the first time — *see below* |
+| **SHIP-131** | M4 | Flutter camera permission fallback — `Docs/01` §4.4's three reasons, chosen and queued as `POST /v1/jobs/{id}/milestones` with `proof.exception_reason`. **The copy was already right and the button under it did nothing**, which SHIP-130 said in as many words when it declined to offer one. Queued as `OperationKind.milestone` and not `proof` — there is no file — which is also what puts a recorded exception in the driver's own pending log. The confirmation is **its own stage**, because "Photograph saved" about an exception is a driver who believes they photographed a delivery they did not. Deliberate scope: the reason is reachable with a **working** camera, since only one of the three is about the camera at all — *see below* |
 | **SHIP-133** | M4 | Flutter customer tracking view — `/jobs/{id}/tracking` over SHIP-115a's three-endpoint shelf. **"Confirmed" needed no predicate**: everything the endpoint serves has been accepted, and what is unconfirmed is on the *provider's* handset in SHIP-124's queue, which a customer must never see. Branches on `exception_reason` and never on a missing `download_url` — the mutation draws an expired photograph as a reason nobody recorded. **Nothing is cached, because a proof response is a set of expiring credentials.** Finding: **the recipient name and the delivery note `Docs/01` §4.4 requires cannot be shown** — no column holds either, and this is the first ticket where a *customer* can see the gap — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
@@ -9396,6 +9397,104 @@ three endpoints that already exist and adds none.
 test per build flavour. `make verify` does not cover it — no endpoint is added. The journey is walked
 from the customer's own job screen through the button, which is what makes the missing
 `_signedInPatterns` entry a failing test rather than a link that silently lands on the home shell.
+
+### SHIP-131 — the sentence that was already right, and the button under it that did nothing
+
+`Docs/01` §4.4's exception path, from the capture screen: the three reasons, one chosen, queued as
+`POST /v1/jobs/{id}/milestones` with `proof.exception_reason`.
+
+**The copy was written two tickets ago and was never the problem.** `PermissionCopy.cameraDeclined`
+(SHIP-179) has said the honest thing since it was written — the camera cannot be opened, a reason can
+be recorded instead, settings is the way back — and SHIP-130's own header says why the second clause
+was not actionable: "offering a button that queued nothing would be a worse dead end than naming the
+gap". That is the whole ticket. **What makes the difference between `Docs/07` §7's defect and a route
+through the job is not the sentence; it is that the button under it queues something.**
+
+`ProofExceptionReason` was generated at SHIP-56a and imported by nothing, with a comment naming this
+ticket as its first reader. It was, and the vocabulary needed no change.
+
+#### The reason is offered when the camera *works*, and that is deliberate scope
+
+**Only one of `Docs/01` §4.4's three reasons is about the camera.** `recipient_objected` and
+`location_unsafe` are conditions of the delivery, and a driver who meets either while holding a
+perfectly good camera has exactly the problem this ticket exists to solve — standing at a delivery
+point unable to finish the job. A build that offered the exception path only on a *denied permission*
+would satisfy the *Done when* as written and leave two thirds of §4.4 unreachable.
+
+So the working screen carries a quiet way to the same panel, under the shutter rather than beside it:
+photographing stays the obvious path. **The two entrances say different things**, which is the half
+worth testing — a driver whose camera is fine must not be told it will not open, which is a support
+call made out of a reused string.
+
+#### Two taps, and the second is the commitment
+
+A reason cannot be taken back from this screen: `Docs/01` §4.3 requires every one to be recorded and
+no endpoint removes one. Three one-tap targets are three ways for a gloved thumb in the rain to
+finish a delivery by accident, so the driver selects, reads what they selected, and records. The
+mutation that enables the button with nothing chosen fails.
+
+#### `OperationKind.milestone`, not `OperationKind.proof`, and the reason is structural
+
+There is no file. `proof` exists because SHIP-130 queues an image the sync worker uploads in a
+three-request exchange; an exception uploads nothing, contacts no object store, and is one `POST`. So
+it is a milestone operation with `attachmentPath` null — **and that is also what puts it in the
+delivery screen's own log**, which reads `OperationKind.milestone` rows on the job's ordering key and
+now shows the recorded exception as a pending `Delivered`. A driver has to be able to see that what
+they recorded is on the device and not yet sent, and that came free from choosing the right kind.
+
+The mutation to `OperationKind.proof` fails in two files, which is the shape of a good one: the queue
+row is wrong *and* the log the driver reads goes empty.
+
+#### The confirmation is its own stage, because the words are the last thing a driver reads
+
+`ProofCaptureStage.reasonRecorded` rather than a flag beside `queued`. **"Photograph saved" said
+about a recorded exception is a driver who believes they photographed a delivery they did not**, and
+finds out weeks later in a dispute. Both stages confirm the same queue state and are different facts
+about the world.
+
+The wording is also careful that this is not a failure. An exception is evidence rather than the
+absence of it — a reason from a closed list, in the same transaction and the same table as the
+photographs — so the icon is the primary colour rather than the error one and the sentence says the
+delivery is complete.
+
+#### `RadioGroup` rather than `groupValue`, which the gate decided
+
+The per-tile `groupValue`/`onChanged` pair is deprecated after Flutter 3.32, and
+`make flutter-analyze` treats an analyzer `info` as a failure — so the obvious shape does not pass
+the gate. Worth knowing before the next screen with a choice on it; it was found by removing two
+`// ignore:` comments to check whether they were load-bearing, which they were.
+
+#### What is still missing, and it is one field rather than a design
+
+**The driver's own words have no control on this screen.** `MilestoneRecording.reason` is optional,
+500 characters, and goes *beside* a selected reason rather than instead of one — the contract says so
+in as many words, and `Docs/04` §5's argument for a closed list assumes it. "The recipient asked me
+not to photograph their door" is the sentence that makes a moderation queue triageable, and there is
+nowhere to type it. A text field and one line in the body; it is not this ticket and it should be
+one.
+
+#### Mutations
+
+| Mutation | Outcome |
+|---|---|
+| `OperationKind.proof` instead of `milestone` | **fails**, in two tests — the row and the driver's log |
+| confirm with `_Queued`'s "Photograph saved" | **fails** |
+| record enabled with nothing selected | **fails** |
+
+#### Shared surfaces
+
+`Docs/11` §3 and `Docs/11-done.txt`. No route — the panel is a state of the screen SHIP-130 already
+declared, reached from the same `deliveryProof` location.
+
+#### How it was demonstrated
+
+`make flutter-check` green: **871 host tests**, up from 866, the analyzer clean, and the environment
+test per build flavour. The journey runs through the real router and SHIP-124's real queue over a
+real SQLite file, with a **sender that never succeeds** — an accepted operation is deleted, so a
+queue emptied by success would make every "it was queued" assertion pass against a build that queued
+nothing. The camera is *refused* rather than absent, which is what a revoked permission looks like
+from Dart, and it is still supplied: under `testWidgets`' fake clock a platform-channel reply is
+never delivered, so the real `availableCameras()` does not throw — it never completes.
 
 
 ## 4. Partly done — do not treat these as finished
