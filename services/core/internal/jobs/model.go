@@ -1,110 +1,23 @@
 package jobs
 
 import (
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// Status is one of the twelve job states in Docs/02 §1.
+// The twelve job statuses are generated (SHIP-56a).
 //
-// The values are the document's own strings — spaces and sentence case included — because
-// Docs/10 §3.4 requires it, and the reason is that three languages hold a copy of this list. Go,
-// Dart and TypeScript can each be diffed against Docs/02 rather than against one another, and a
-// value that has drifted is visible without holding two files side by side. SHIP-56a generates
-// the other two from contracts/statuses.yaml; this is the Go copy until it does.
+// contracts/statuses.yaml is the source and status_gen.go beside this file is the Go form:
+// Status, its constants, Statuses, Valid, String, Wire and StatusFromWire. Docs/10 §8.2 named
+// that arrangement long before there was a generator, and three files carried a comment
+// promising it.
 //
-// The wire form is deliberately not here. Docs/10 §4.7 puts enum values on the wire in lower
-// snake case even where the stored form has spaces, and the mapping between the two belongs with
-// the generator that has to produce it in three languages, not with the first language to need
-// it.
-type Status string
-
-const (
-	StatusDraft           Status = "Draft"
-	StatusOpen            Status = "Open"
-	StatusNegotiating     Status = "Negotiating"
-	StatusAwarded         Status = "Awarded"
-	StatusDriverAssigned  Status = "Driver assigned"
-	StatusEnRouteToPickup Status = "En route to pickup"
-	StatusPickedUp        Status = "Picked up"
-	StatusInTransit       Status = "In transit"
-	StatusDelivered       Status = "Delivered"
-	StatusCompleted       Status = "Completed"
-	StatusCancelled       Status = "Cancelled"
-	StatusDisputed        Status = "Disputed"
-)
-
-// Statuses is every status, in the order Docs/02 §1 lists them.
-//
-// Ordered rather than a set because the order is the lifecycle, and because it is what
-// TestJobStatusConstraintMatchesTheGoConstants compares against ck_jobs_status. Docs/10 §3.4
-// requires that pairing for every enumeration: the constraint is read out of pg_constraint and
-// held to this list, which is what stops the twelve statuses and the eight bid statuses drifting
-// when they are built on separate branches.
-var Statuses = []Status{
-	StatusDraft,
-	StatusOpen,
-	StatusNegotiating,
-	StatusAwarded,
-	StatusDriverAssigned,
-	StatusEnRouteToPickup,
-	StatusPickedUp,
-	StatusInTransit,
-	StatusDelivered,
-	StatusCompleted,
-	StatusCancelled,
-	StatusDisputed,
-}
-
-// Valid reports whether s is one of the twelve.
-func (s Status) Valid() bool {
-	for _, known := range Statuses {
-		if s == known {
-			return true
-		}
-	}
-	return false
-}
-
-func (s Status) String() string { return string(s) }
-
-// Wire is the status as it appears in a response body.
-//
-// Docs/10 §4.7 puts enum values on the wire in lower snake case even where the stored form has
-// spaces, so "En route to pickup" is `en_route_to_pickup` to a client. The comment above said this
-// mapping belonged with SHIP-56a's generator rather than with the first language to need it, and
-// that deferral held until SHIP-61 became the first endpoint that has to serialise a status. It is
-// here now, and SHIP-56a takes it over for all three languages when it lands.
-//
-// **Derived rather than tabulated**, which is the part that matters. A twelve-entry table beside
-// the twelve constants is a second list that can disagree with the first — exactly the drift
-// Docs/10 §3.4 pairs every enumeration with a test to prevent. A transformation cannot disagree
-// with its input. TestStatusWireFormsAreStableAndDistinct still writes all twelve out, because
-// these strings are published: a client already branching on `driver_assigned` cannot have it
-// renamed underneath it, and the test is what makes a change to this function visible as a change
-// to the contract.
-func (s Status) Wire() string {
-	return strings.ReplaceAll(strings.ToLower(string(s)), " ", "_")
-}
-
-// StatusFromWire is [Status.Wire] read backwards: the status a client named, or false.
-//
-// Derived from the same twelve constants rather than tabulated, for the reason Wire is. A lookup
-// table beside the list is a second list that can disagree with the first, and here it would
-// disagree in the direction that matters most — a status a client can filter on but the platform
-// no longer recognises, answering "no jobs" rather than "no such status".
-//
-// Needed from SHIP-66, where `?status=` is the one query parameter with a domain vocabulary.
-func StatusFromWire(wire string) (Status, bool) {
-	for _, known := range Statuses {
-		if known.Wire() == wire {
-			return known, true
-		}
-	}
-	return "", false
-}
+// **What stayed here is the part a second language must not have a copy of.** The transition
+// table below is a decision rather than a vocabulary: Docs/07 §3 puts every authorisation and
+// permission decision on the platform, so a generated copy on the phone would be a second
+// authority for a question that has exactly one. The same line keeps ActorType hand-written —
+// it names a kind of person rather than a lifecycle state, and no client enumerates it.
 
 // permitted is the transition table of Docs/02 §2, which that document calls authoritative for
 // the guard.
