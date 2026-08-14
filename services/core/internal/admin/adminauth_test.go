@@ -655,3 +655,65 @@ func TestOneAdministratorPerAddress(t *testing.T) {
 		t.Errorf("error = %v, want ErrAdminEmailTaken", err)
 	}
 }
+
+// TestASubjectOnTheContextIsNotAnAdministrator is the test SHIP-147's mutation sweep found missing,
+// and the one that closes the *Done when*'s second clause where it is actually reachable.
+//
+// # Why the other tests in this file cannot see this
+//
+// They exercise [Authenticator.Resolve] directly, or they drive [RequireAdmin] over a bare request.
+// Neither has an [authctx.Subject] on the context — but **every request the real service serves
+// does**: `httpx.ResolveSubject` runs group-wide, outside the per-route guard (cmd/api/routes.go),
+// and it never rejects. So a signed-in customer's subject is sitting on the context of every
+// administrative request they make, waiting for somebody to read it.
+//
+// The mutation is five lines and entirely plausible: resolve the session, and *if that fails*, fall
+// back to the subject already there. It is the "one helper function later" CLAUDE.md names, and it
+// passed every Go test in the repository before this one existed. `make verify` caught it, because
+// it presents a real mobile access token to `/v1/admin/me` through the real chain — but a defect
+// that only a shell script can see is a defect that reaches a branch nobody ran the harness on.
+//
+// The subject here claims `role: admin`, which is the strongest form of the temptation: it is a
+// claim `ck_users_role` does not permit and `identity` refuses to issue, so the only way one could
+// exist is if somebody had already joined the two systems somewhere else.
+func TestASubjectOnTheContextIsNotAnAdministrator(t *testing.T) {
+	creds, auth, _, _ := adminAuth(t)
+	anAdministrator(t, creds, "real@example.com", RoleOwner)
+
+	guarded := RequireAdmin(auth)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		grant, _ := grantFrom(r.Context())
+		t.Errorf("a request carrying only a mobile subject reached an administrator handler as "+
+			"%s with role %q.\nCLAUDE.md: the credential systems are separate and neither can be "+
+			"exchanged for the other. httpx.ResolveSubject puts a subject on every request in the "+
+			"/v1 group, so a fallback to it hands the console to every signed-in account.",
+			grant.Administrator.ID, grant.Administrator.Role)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for name, credential := range map[string]string{
+		"with no credential at all":  "",
+		"with an unrecognised one":   "Bearer " + strings.Repeat("Z", 43),
+		"with a mobile access token": "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/admin/me", nil)
+			if credential != "" {
+				req.Header.Set(httpx.HeaderAuthorization, credential)
+			}
+
+			// Exactly what the served chain does before the guard runs.
+			req = req.WithContext(authctx.WithSubject(req.Context(), authctx.Subject{
+				UserID:    "0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0",
+				Role:      "admin",
+				SessionID: "0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1",
+			}))
+
+			rec := httptest.NewRecorder()
+			guarded.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body)
+			}
+		})
+	}
+}

@@ -263,3 +263,50 @@ func TestTheMobileAuthenticatorNeverResolvesAnAdministratorCredentialIntoASubjec
 		t.Errorf("the refusal still produced subject material: %+v", subject)
 	}
 }
+
+// TestTheAdminGuardRefusesRatherThanAdmitting is the test SHIP-147's mutation sweep found missing.
+//
+// Every other test in this file is about the *seam* — whether the class reaches the map, whether an
+// absent guard panics — and none of them asks what the guard newAdminGuard builds actually does.
+// Replacing its body with `func(next http.Handler) http.Handler { return next }` therefore passed
+// every Go test in the repository. `make verify` caught it, but only as a 500, because the handler
+// behind the route refuses to run without a grant; a route whose handler did not need one would
+// have been served open to anybody.
+//
+// **A guard is not allowed to reach its handler on a credential it has not verified.** With no pool
+// the honest answer is 503 — the service starts with an unreachable database on purpose — and the
+// one answer that must never appear is a success. That is what this asserts, and it needs no
+// database to assert it, which is what makes it a CI test rather than a verify check.
+func TestTheAdminGuardRefusesRatherThanAdmitting(t *testing.T) {
+	guard := testAdminGuard()
+	if guard == nil {
+		t.Fatal("newAdminGuard supplies no guard, so RequireAdmin is unserved")
+	}
+
+	guarded := guard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the administrator guard passed a request through to its handler.\n" +
+			"Nothing verified the credential: the pool is nil, so no session could have been " +
+			"resolved. A guard that admits is worse than one that is absent, because absence " +
+			"stops the process and this serves the administrative surface to anybody.")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for name, header := range map[string]string{
+		"no credential":                      "",
+		"an administrator-shaped credential": "Bearer " + anAdministratorShapedCredential,
+		"a mobile access token":              "Bearer " + strings.Repeat("e", 40) + ".x.y",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/admin/me", nil)
+			if header != "" {
+				req.Header.Set(httpx.HeaderAuthorization, header)
+			}
+			rec := httptest.NewRecorder()
+			guarded.ServeHTTP(rec, req)
+
+			if rec.Code < 400 {
+				t.Fatalf("status = %d; the guard admitted a request it verified nothing about", rec.Code)
+			}
+		})
+	}
+}
