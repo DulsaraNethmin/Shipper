@@ -191,6 +191,23 @@ Because history is not squashed, `git log --oneline` shows every individual comm
 git log --first-parent develop
 ```
 
+### Reverting a mutation
+
+Breaking a mechanism deliberately to confirm a test fails is how this repository establishes that a guard is real rather than believed — every `Docs/11` §3 entry that claims one carries the mutation and its outcome. The applying is easy. **Undoing it is where two lanes in wave 7 destroyed an hour of uncommitted work each, in the same way.**
+
+**Never revert a mutation with `git checkout <file>`.** It is the first command anybody reaches for and it is wrong on an unstaged tree: it restores the file *from the index*, which discards every uncommitted change in that file — the mutation and the work sitting beside it, indistinguishably. The mutation is deliberate and reversible; the hour of work next to it is neither.
+
+The recipe:
+
+1. **Copy the file aside before applying anything** — `cp path/to/file /tmp/snap/`, or tar-snapshot the tree if the mutation touches several. Record its checksum at the same time.
+2. Apply the mutation, run the test, read the failure.
+3. **Restore from the copy, not from git** — `cp /tmp/snap/file path/to/file`.
+4. **Confirm with `git diff` *and* the checksum.**
+
+**Step 4's checksum is the part that is easy to drop and is the whole reason the recipe works.** After a destructive `git checkout` the file matches the index exactly, so `git diff` reports nothing — which reads as success and is in fact the signature of the failure. Only a checksum against the copy you took distinguishes "restored" from "reverted to the last commit".
+
+The same argument bans `git stash` here twice over: the worktree table above rules it out because the stash is shared through one `.git`, and it is the wrong instrument for this regardless.
+
 ### Never commit
 
 Signing keys, keystores, provisioning profiles, service-account JSON, `.env` files, or any credential. These belong in the CI secret store (`Docs/06` §5.2). `.gitignore` covers the known cases, but check the diff — a leaked signing key means rotating it everywhere it was trusted.

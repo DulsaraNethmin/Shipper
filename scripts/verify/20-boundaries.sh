@@ -59,3 +59,48 @@ grep -q "domain imports domain" "$WORKDIR/lint.log" \
 grep -q "adapter imports domain" "$WORKDIR/lint.log" \
   || { cat "$WORKDIR/lint.log"; fail "an adapter importing a domain was not reported"; }
 ok "a domain importing a domain, and an adapter importing a domain, both fail the build"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-15r  argon2id has one implementation, and it is not inside a domain"
+
+# SHIP-147 gives an administrator a password, and internal/admin may not import internal/identity —
+# so the alternatives were this package or a second argon2id inside admin. Docs/10 §3.4 refuses the
+# second: two implementations agree by comment about a security parameter, and the failure is
+# silent in both directions because the cost parameters travel in the PHC string.
+#
+# Checked over the tree rather than by reading the package, because what has to stay true is a
+# *negative* — that no domain derives a key of its own — and a package existing says nothing about
+# that. `grep` over internal/, excluding the one package allowed to.
+pushd "$ROOT/services/core" >/dev/null
+
+argon_dirs="$(grep -rl 'argon2\.' --include='*.go' internal/ \
+  | grep -v '^internal/passwords/' | sort -u || true)"
+[[ -z "$argon_dirs" ]] \
+  || { echo "$argon_dirs"; fail "argon2 is derived outside internal/passwords, so the platform has two profiles that agree only by comment"; }
+ok "internal/passwords is the only package under internal/ that derives an argon2 key"
+
+grep -q '"passwords":' internal/boundaries/boundaries.go \
+  || fail "internal/passwords is not registered as infrastructure, so the lint would refuse it as unclassified"
+ok "and it is registered as infrastructure, so every domain may sit on it and it may import none"
+
+popd >/dev/null
+
+# The lint's fourth rule, aimed at the package this ticket created: infrastructure imports neither a
+# domain nor an adapter. Shown failing, on the same fixture principle as the two rules above — a
+# rule nobody has watched refuse is a rule nobody knows is enforced.
+mkdir -p "$fixture/internal/passwords"
+printf 'package passwords\n\nimport _ "github.com/DulsaraNethmin/Shipper/services/core/internal/identity"\n' \
+  >"$fixture/internal/passwords/pkg.go"
+
+pushd "$fixture" >/dev/null
+"$WORKDIR/lintboundaries" >"$WORKDIR/lint-passwords.log" 2>&1 && {
+  popd >/dev/null
+  cat "$WORKDIR/lint-passwords.log"
+  fail "the lint passed internal/passwords importing a domain"
+}
+popd >/dev/null
+
+grep -q "infrastructure imports domain" "$WORKDIR/lint-passwords.log" \
+  || { cat "$WORKDIR/lint-passwords.log"; fail "internal/passwords importing a domain was not reported"; }
+ok "and internal/passwords importing a domain fails the build — every domain sits on it, so one such edge couples all eight"
+

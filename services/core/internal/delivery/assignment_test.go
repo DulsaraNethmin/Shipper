@@ -842,7 +842,8 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 		{"no way to read an object back", func(c *collaborators) { c.objects = nil }},
 		{"no size limit", func(c *collaborators) { c.policy.MaxBytes = 0 }},
 		{"no accepted content types", func(c *collaborators) { c.policy.AcceptedContentTypes = nil }},
-		{"no URL lifetime", func(c *collaborators) { c.policy.URLTTL = 0 }},
+		{"no upload lifetime", func(c *collaborators) { c.policy.UploadTTL = 0 }},
+		{"no download lifetime", func(c *collaborators) { c.policy.DownloadTTL = 0 }},
 		{"no clock", func(c *collaborators) { c.clk = nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -50,6 +50,43 @@
 # A file that is not named NN-<name>.sh is refused rather than skipped. A section that is
 # silently not run is the same defect as a route dropped in a merge — no error, no failure,
 # and an acceptance criterion that has quietly stopped being demonstrated.
+#
+# # Starting cmd/worker from a section — read this before writing one that does
+#
+# **cmd/worker is one binary, and every start runs every registered task.** There is no way to
+# start one: the scheduler builds the whole manifest and runs a pass of each immediately at
+# start-up, which is what makes a start cheap enough to demonstrate anything with. So a section
+# that runs the worker to show job expiry also drains the outbox, also sweeps for expiry warnings,
+# and will also run whatever the next ticket registers.
+#
+# Three tasks are registered today — `job-expiry` and `job-expiry-warning` (tasks_jobs.go) and
+# `outbox-publisher` (tasks_outbox.go) — and SHIP-89 and SHIP-119 each add one.
+#
+# **SHIP-15r settled how a section deals with that, and the answer is a convention rather than a
+# selector on the binary.** The reasoning is in Docs/11 §3; the rule is two lines and a section
+# author has to follow both:
+#
+#   1. **Fence what you assert on.** Every query must be keyed to a row this section created — a
+#      job id, a bid id, an object key. Never a count over a table, never a window over
+#      `published_at`, never "the most recent". Another section's worker start, another worktree's
+#      `make verify` and this run's own second pass are all in the same database and the same Kafka
+#      topic, and none of them is ordered against you.
+#   2. **Own what you assert about.** Before starting the worker, know what your fixtures look like
+#      to every *other* registered task, because fencing protects an assertion and not a fixture. A
+#      job left `Open` an hour from its deadline is claimed by the expiry-warning sweep whether or
+#      not the section mentions warnings. Leave nothing due that you are not demonstrating.
+#
+# The instances that produced the rule are worth knowing. SHIP-134's outbox assertion was a count
+# over every job event the database had ever held, and SHIP-68's section broke it at the wave-4
+# merge by draining the outbox as a side effect; two wave-5 sections then met the same shape from
+# the other direction. All three resolved to fencing on ids, and it has held every time since.
+#
+# **The alternative was a `--only=<task>` flag on the binary**, and it was rejected for two
+# reasons. A section demonstrating one task alone stops demonstrating that the tasks coexist, which
+# is the deployment's actual shape and the only place a claim-loop interaction would ever surface.
+# And it would be a mechanism with one consumer at a time, in a repository whose recurring defect —
+# Docs/11 §9 lists four — is a documented mechanism nothing exercises. Reopen it if a task ever
+# sweeps rows that are due by wall-clock alone, because that is the one case fencing cannot cover.
 
 set -euo pipefail
 

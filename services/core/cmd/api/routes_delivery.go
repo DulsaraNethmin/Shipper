@@ -198,7 +198,8 @@ func deliveryHandler(d Deps) *delivery.Handler {
 		delivery.UploadPolicy{
 			MaxBytes:             d.Config.Storage.MaxUploadBytes,
 			AcceptedContentTypes: d.Config.Storage.AcceptedContentTypes,
-			URLTTL:               d.Config.Storage.PresignTTL,
+			UploadTTL:            d.Config.Storage.PresignTTL,
+			DownloadTTL:          d.Config.Storage.DownloadTTL,
 		},
 		d.Clock,
 	)
@@ -220,12 +221,16 @@ func deliveryHandler(d Deps) *delivery.Handler {
 // assertion at the foot of this file — which is, as with the two ports above, the only place in the
 // build where that can be established at all.
 //
-// # Three of the nine configured values are read here and the other three in the policy above
+// # Six of the ten configured values are read here and the other four in the policy above
 //
 // The split is not arbitrary: everything below describes the *store* — where it is, what it is
 // called, how to authenticate to it — and everything in [delivery.UploadPolicy] describes what the
-// platform will allow into it. The first is the adapter's business and the second is the domain's,
-// which is Docs/06 §4.1's division written as two structs.
+// platform will allow into it, and for how long. The first is the adapter's business and the second
+// is the domain's, which is Docs/06 §4.1's division written as two structs.
+//
+// The tenth arrived at SHIP-15r: STORAGE_DOWNLOAD_TTL, which is the policy's rather than the
+// adapter's for the same reason the upload lifetime is — how long a link to a photograph stays live
+// is a decision about evidence, and the signer will sign whatever window it is handed.
 //
 // It panics for the reason driverTokenIssuer does: it runs during attach, from a Handler closure
 // with nowhere to put an error, and every failure it can report is a configuration fault that will

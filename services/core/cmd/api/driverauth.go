@@ -19,11 +19,17 @@ import (
 // filled in the body.
 //
 // **The one thing the seam did not carry is the test callers.** newRouter takes the guard as an
-// argument, so every test that builds a router passes one — seventeen call sites across five files
-// passed `nil` while nothing declared the class, and all seventeen had to become a real guard the
-// moment a route did. None of those files is shared in the Docs/10 §9.2 sense and the edit is
-// mechanical, but it is the part of the seam that was not free, and it is recorded in Docs/11 §3
-// rather than left for the next class to rediscover.
+// argument, so every test that builds a router passes one — **fifteen** call sites across five files
+// passed `nil` while nothing declared the class, and all fifteen had to become a real guard the
+// moment a route did: ten in routes_identity_test.go, two in auth_test.go, and one each in
+// manifest_test.go, routes_app_test.go and routes_test.go. None of those files is shared in the
+// Docs/10 §9.2 sense and the edit is mechanical, but it is the part of the seam that was not free,
+// and it is recorded in Docs/11 §3 rather than left for the next class to rediscover.
+//
+// **This paragraph said seventeen until SHIP-15r counted them**, and the wrong figure had reached
+// Docs/11 §6 and a dispatch brief from here. SHIP-15r absorbed the same churn for RequireAdmin ahead
+// of SHIP-147 — see testAdminGuard in routes_test.go — so the next class to be filled costs one
+// function body rather than fifteen call sites.
 //
 // # What SHIP-108 replaced, and what it must not do
 //

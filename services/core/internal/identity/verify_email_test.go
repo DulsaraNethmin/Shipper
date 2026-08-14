@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -21,7 +22,7 @@ func newVerifiableService(t *testing.T, clk clock.Clock) (*Service, *pgxpool.Poo
 
 	pool := pgtest.DB(t)
 
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}

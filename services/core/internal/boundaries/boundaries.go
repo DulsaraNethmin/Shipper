@@ -109,6 +109,13 @@ const AdapterRoot = "internal/platform"
 // into this file — which matters because two domains can be under construction at once, and
 // this file is shared (Docs/10 §9.2). An entry that is still unused is a commitment already
 // made, not an oversight.
+//
+// `passwords` is the first entry added the other way round: not seeded ahead of a consumer, but
+// registered at SHIP-15r because a *second* consumer arrived. It had been inside internal/identity
+// since SHIP-29, and SHIP-147 gives an administrator a password in a domain that may not import
+// identity. The alternative was two argon2id implementations agreeing by comment about a security
+// parameter, which is what Docs/10 §3.4 exists to refuse — so the code moved rather than being
+// copied, and the entry records that this list grows for a reason somebody wrote down.
 var infrastructure = map[string]string{
 	"authctx":     "the authenticated subject, readable by every domain",
 	"boundaries":  "this lint",
@@ -122,6 +129,7 @@ var infrastructure = map[string]string{
 	"logging":     "structured logger construction",
 	"money":       "minor-unit arithmetic in AUD",
 	"pagination":  "cursor encoding, shared by every list endpoint",
+	"passwords":   "argon2id password storage, shared by identity and admin",
 	"ratelimit":   "the Redis token bucket behind every limited route",
 	"testsupport": "real-database and real-Redis test harnesses",
 	"validate":    "field-level validation returning the error contract's shape",

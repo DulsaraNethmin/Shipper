@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 )
 
 // The machine-readable error codes this domain raises (SHIP-30).
@@ -135,11 +136,25 @@ var (
 // deciding what to do about a failure has one file to read. The codes above are what a *client*
 // sees; these are for Go callers, and http.go is where one becomes the other.
 var (
+	// The three password errors are internal/passwords' values, bound to the names this domain
+	// has published since SHIP-29 (SHIP-15r).
+	//
+	// **They are the same values, not translations of them**, and that is the whole of why the
+	// move was safe: `errors.Is(err, identity.ErrMalformedPasswordHash)` and
+	// `errors.Is(err, passwords.ErrMalformedHash)` answer identically because there is one
+	// `errors.New` behind both. A fresh sentinel here plus a mapping somewhere in between would be
+	// two values agreeing by convention, and the first path that forgot the mapping would report an
+	// unreadable stored hash as an unmapped 500 — collapsing exactly the distinction the third of
+	// them exists to keep.
+	//
+	// Kept rather than deleted because Docs/10 §2.1 makes this file the one place a caller reads to
+	// decide what to do about a failure, and [Service.SignIn] can return all three.
+
 	// ErrEmptyPassword is returned rather than hashing the empty string, which would
 	// otherwise produce a perfectly valid hash that any empty submission then matches.
 	// Length and strength rules are the registration endpoint's (SHIP-30); this is only the
 	// floor below which hashing is meaningless.
-	ErrEmptyPassword = errors.New("identity: the password is empty")
+	ErrEmptyPassword = passwords.ErrEmptyPassword
 
 	// ErrMalformedPasswordHash means the stored PHC string could not be read: a truncated
 	// column, a hash written by something else, or a value someone has edited.
@@ -147,12 +162,12 @@ var (
 	// It is deliberately distinct from "the password did not match". A wrong password is an
 	// ordinary event; an unreadable hash is a data defect, and answering "wrong password" to
 	// it would hide the defect behind a sign-in failure the owner cannot explain.
-	ErrMalformedPasswordHash = errors.New("identity: the stored password hash is malformed")
+	ErrMalformedPasswordHash = passwords.ErrMalformedHash
 
-	// ErrInvalidArgon2Profile means the cost parameters are outside the range this package
+	// ErrInvalidArgon2Profile means the cost parameters are outside the range internal/passwords
 	// will run — either configured that way, or read out of a hash that has been tampered
-	// with. See argon2Bounds for why the range exists.
-	ErrInvalidArgon2Profile = errors.New("identity: the argon2id profile is out of range")
+	// with. See that package's argon2Bounds for why the range exists.
+	ErrInvalidArgon2Profile = passwords.ErrInvalidProfile
 
 	// ErrNoSigningKey means the keyset does not hold the key a token needs: an active key
 	// identifier naming a key that was never supplied, or a token presenting a kid that has

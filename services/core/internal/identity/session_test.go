@@ -12,6 +12,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
@@ -44,7 +45,7 @@ func newSessionService(t *testing.T, clk clock.Clock) (*Service, *pgxpool.Pool, 
 
 	pool := pgtest.DB(t)
 
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -537,7 +538,7 @@ func TestStartSessionRecordsLastSeen(t *testing.T) {
 // TestRefreshWithoutADatabaseIsUnavailable, for the reason Register's equivalent gives: 503
 // tells a mobile client to retry and 500 tells it to give up.
 func TestRefreshWithoutADatabaseIsUnavailable(t *testing.T) {
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -555,7 +556,7 @@ func TestRefreshWithoutADatabaseIsUnavailable(t *testing.T) {
 // TestAServiceWithNoIssuerIsRefused. A service that could create a session without an issuer
 // would hand out a refresh token the caller cannot exchange for anything.
 func TestAServiceWithNoIssuerIsRefused(t *testing.T) {
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
@@ -569,7 +570,7 @@ func TestAServiceWithNoIssuerIsRefused(t *testing.T) {
 // legitimate — it refuses everything, which is the fail-closed direction — but no limiter at all
 // is a service that would serve sign-in with nothing counting the guesses.
 func TestAServiceWithNoRateLimiterIsRefused(t *testing.T) {
-	hasher, err := NewPasswordHasher(testProfile)
+	hasher, err := passwords.NewHasher(testProfile)
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}

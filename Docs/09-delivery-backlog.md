@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**208 tickets, 645 points.**
+**212 tickets, 659 points.**
 
 ## How to read this
 
@@ -24,7 +24,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 
 **Depends on** lists real blockers only, not merely earlier tickets. Where a ticket has no dependency it can genuinely be pulled forward if you want a change of pace.
 
-**Dependencies point backwards, with exactly three exceptions — do not write a parser that assumes otherwise.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, and `SHIP-15m` depends on `SHIP-44` and `SHIP-135` — all because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Every one of those targets is long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
+**Dependencies point backwards, with exactly four forward edges across three tickets — do not write a parser that assumes otherwise, and count edges rather than rows.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, and `SHIP-15m` depends on `SHIP-44` **and** `SHIP-135` — two edges from one row, which is where a count of three comes from and why this sentence now says which unit it is counting. All of them exist because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Every one of those targets is long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
 
 **The two totals above are maintained by hand and the rows are the truth.** `scripts/delivery-status.sh` parses the rows, so `make status` is unaffected by a stale header — which is precisely why one drifted unnoticed after SHIP-15e was added. If the two disagree, correct the header.
 
@@ -35,15 +35,15 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 37 | 101 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 38 | 106 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 26 | 78 |
-| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 27 | 95 |
-| **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 29 | 101 |
+| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 28 | 98 |
+| **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 31 | 107 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 13 | 45 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 20 | 65 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 19 | 56 |
-| | | **207** | **642** |
+| | | **212** | **659** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -67,7 +67,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 37 tickets, 101 points
+**Size:** 38 tickets, 106 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -94,6 +94,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-15i | Wave-5 shared surfaces: the measured verify count, the tracker index check, the cause of an unmapped 500 | 3 | Two tracks can start wave 5 without either needing an edit to a file the other owns | SHIP-15g |
 | SHIP-15m | Wave-6 shared surfaces: the driver-token guard seam, the Kafka replication factor, three parallel-working rules | 3 | SHIP-108 can supply the RequireDriverToken middleware without editing cmd/api/routes.go, manifest.go or Deps, and a route declaring the class still refuses to start while nothing supplies one; the replication factor is configuration with the flag kept as an override | SHIP-44, SHIP-135 |
 | SHIP-15p | Wave-7 shared surfaces: object storage in the local stack, the STORAGE_* configuration section, the app test fixture | 3 | Two tracks can start wave 7 without either needing an edit to a file the other owns: `make reset && make up` brings an S3-compatible store up healthy with a usable bucket and no manual step, internal/config exposes the storage settings and deploy/.env.example documents them, and a new configuration section no longer breaks routes_app_test.go | SHIP-15m |
+| SHIP-15r | Wave-8 shared surfaces: the RequireAdmin guard seam, argon2id promoted out of a domain, the download URL's own lifetime, and the rule for starting cmd/worker from a verify section | 5 | Four tracks can start wave 8 without any of them needing an edit to a file another owns: SHIP-147 supplies the administrator guard by filling newAdminGuard alone and hashes a password without importing another domain, a proof download is signed for STORAGE_DOWNLOAD_TTL rather than the upload's, and a verify section that starts cmd/worker has one written rule to follow | SHIP-15p |
 | SHIP-16 | Flutter project scaffold for iOS and Android | 2 | App builds and runs on both simulators | SHIP-1 |
 | SHIP-17 | Flutter feature-folder structure and state management choice | 3 | Structure matches Docs 07 §2 and the state approach is documented | SHIP-16 |
 | SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |
@@ -186,7 +187,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M3 — Bidding and award
 
 **Goal:** Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one.  
-**Size:** 27 tickets, 95 points
+**Size:** 28 tickets, 98 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -214,14 +215,19 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-99 | Flutter provider job feed | 3 | Provider sees eligible open jobs with filters | SHIP-98, SHIP-82 |
 | SHIP-100 | Flutter provider job detail and bid placement | 3 | Provider can review a job and submit a bid | SHIP-99, SHIP-84 |
 | SHIP-101 | Flutter provider bid list | 3 | Provider sees their own bids grouped by status | SHIP-100 |
+| SHIP-101a | A provider reads their own bids — `GET /v1/fleet/bids`, auth class `RequireUser` | 3 | A provider lists every bid they have placed, grouped by status, paginated, and sees no other provider's; the response carries no customer budget in any form | SHIP-88, SHIP-66 |
 | SHIP-102 | Flutter customer bid comparison | 5 | Customer compares price, timing, provider profile, and vehicle side by side | SHIP-77, SHIP-96 |
 | SHIP-103 | Flutter negotiation and messaging UI | 5 | Both parties exchange messages and counter-offers against a job | SHIP-102, SHIP-97 |
 | SHIP-104 | Flutter award confirmation flow | 3 | Customer awards a bid with explicit confirmation and sees the result | SHIP-102, SHIP-92 |
 
+**SHIP-101a sorts after SHIP-101 and is its prerequisite, which is the one place in this milestone where the table's order is not the build order.** A letter suffix sorts immediately after its parent (see *How to read this*), and the read the screen needs was found after the screen was written: `Docs/11` §6 struck SHIP-101 as "every dependency met and unbuildable in fact" because nothing on the served surface lists a provider their own bids. Build SHIP-101a first. Its own dependency column points backwards, as every row's must; SHIP-101's is left naming SHIP-100 rather than rewritten, because the ticket it depends on for *data* is a different question from the one it depends on for *sequence*, and no tool computes the second.
+
+**The route is `GET /v1/fleet/bids` rather than anything under `/v1/jobs/`, and that is a constraint rather than a preference.** `GET /v1/jobs/open/{id}` puts a literal in the `{id}` position, so it and any `GET /v1/jobs/{id}/<literal>` both match `/v1/jobs/open/<literal>` with neither more specific — Go's `ServeMux` panics at registration and the process does not start. A provider's own bids are a fleet-side collection anyway, beside `/v1/fleet/vehicles`.
+
 ## M4 — Delivery execution
 
 **Goal:** A driver completes a delivery with proof, offline, through a link that needs no account.  
-**Size:** 29 tickets, 101 points
+**Size:** 31 tickets, 107 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -236,11 +242,13 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-113 | Administrative conflict resolution | 3 | A queued update contradicting an admin action loses and is retained with its reason | SHIP-112 |
 | SHIP-114 | Object storage bucket and pre-signed upload endpoint | 5 | Client receives a short-lived pre-signed URL and uploads directly | SHIP-8 |
 | SHIP-115 | Proof metadata record | 3 | Uploaded proof is linked to a job and milestone with access control | SHIP-114, SHIP-110 |
+| SHIP-115a | Delivery read shelf — `GET /v1/jobs/{id}/delivery/detail` and `GET /v1/jobs/{id}/delivery/milestones`, auth class `RequireUser`. **Both paths are five segments and must stay so** — see the note below the table | 3 | Both parties to a job read the driver assignment from `/delivery/detail` and every recorded milestone from `/delivery/milestones`; a stranger gets exactly what a missing job gets | SHIP-111, SHIP-115 |
 | SHIP-116 | Proof exception reason capture | 3 | A reasoned exception can be recorded in place of a photo | SHIP-115 |
 | SHIP-117 | Exception flags the job for moderation | 2 | An exception-completed job enters the moderation queue | SHIP-116 |
 | SHIP-118 | Delivered validation requires proof or exception | 3 | Delivered is rejected without either; verified by test | SHIP-116, SHIP-57 |
 | SHIP-119 | 72-hour auto-complete task | 3 | A Delivered job with no dispute becomes Completed after 72 hours | SHIP-118, SHIP-67a |
 | SHIP-120 | Driver portal token landing and job view | 5 | Opening the link shows only that job's delivery detail | SHIP-23, SHIP-108 |
+| SHIP-120a | `POST /v1/driver/jobs/{id}/milestones` — a driver records a milestone on the job-scoped token, auth class `RequireDriverToken` | 3 | A driver holding a job-scoped token records a milestone on that job and on no other; a mobile access token is refused on the route and the driver token is refused on `POST /v1/jobs/{id}/milestones` | SHIP-108, SHIP-111 |
 | SHIP-121 | Driver portal milestone controls | 3 | Large touch targets record each milestone from a mobile browser | SHIP-120, SHIP-111 |
 | SHIP-122 | Driver portal photo capture and upload | 5 | Browser camera captures proof and uploads via pre-signed URL | SHIP-121, SHIP-114 |
 | SHIP-123 | Driver portal delivery completion form | 3 | Recipient name, note, and proof captured; portal becomes read-only after | SHIP-122, SHIP-118 |
@@ -254,6 +262,12 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-131 | Flutter camera permission fallback | 3 | A denied permission offers the exception path instead of a dead end | SHIP-130, SHIP-116 |
 | SHIP-132 | Flutter offline conflict reconciliation UI | 3 | The user is shown clearly when a queued update lost to server state | SHIP-125, SHIP-113 |
 | SHIP-133 | Flutter customer tracking view | 3 | Customer sees the latest confirmed milestone and proof of delivery | SHIP-77, SHIP-115 |
+
+**SHIP-115a's two paths are five segments, and building it as four does not fail a test — it stops the process.** `GET /v1/jobs/{id}/delivery` is four (`v1 / jobs / {id} / delivery`) and so is `GET /v1/jobs/open/{id}`. Both match `/v1/jobs/open/delivery`, neither is more specific, and Go's `ServeMux` **panics at registration**: `make run` dies at startup rather than a route answering a 404 somebody debugs. So the row names `GET /v1/jobs/{id}/delivery/detail` and `GET /v1/jobs/{id}/delivery/milestones` rather than describing a shelf and leaving the shape to whoever builds it.
+
+Five segments or more are safe, because the literal route has only three after `/v1` — which is exactly why SHIP-115's `GET /v1/jobs/{id}/delivery/proof` works and is the shelf this row extends. `Docs/11` §9 carries the structural fix, moving the open feed off the `{id}` slot, and it is not this ticket's.
+
+**SHIP-120a exists because three separate lanes specified it in wave 7 and none built it**, each correctly finding it belonged to another lane's ticket. The auth class is in the row for that reason: `RequireDriverToken` is the whole of why the route is separate from `POST /v1/jobs/{id}/milestones`, which is `RequireUser` and always will be. Neither token may be exchanged for the other, so the driver's route is a second entry point to the same milestone service rather than a relaxation of the first one's guard. SHIP-121 is the driver portal's screen over it.
 
 ## M5 — Notifications
 
