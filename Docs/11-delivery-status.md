@@ -9488,10 +9488,21 @@ and a job delivered seconds ago is not due for three days. The one section that 
 | Drop `SKIP LOCKED` from `AutoCompleteClaim` | **Caught** — `cmd/worker.ClaimIDs` refuses the query by name, in four tests |
 | Keep the words `FOR UPDATE OF j SKIP LOCKED` in a SQL comment and remove the clause | **Caught** — `TestTwoWorkersCompleteEachDeliveryExactlyOnce` fails with "is already Completed" |
 
-The second is the one that matters. `ClaimIDs` is a text check and is satisfied by the words
-appearing anywhere, so a green run under the first mutation would have proved only that the string
-was present. `Docs/11` §9 records that `internal/bidding`'s equivalent lock has **neither** check;
-this one has both.
+**The second is the one that matters, and the comparison it licenses is worth stating plainly.**
+`ClaimIDs` reads the *source*; `TestTwoWorkersCompleteEachDeliveryExactlyOnce` runs the *code*. The
+first mutation was caught by the reader, so a green run under it would have proved only that the
+string was present — and the second mutation is the proof that the string is all the reader can see,
+because the words survive in a SQL comment while the clause does not, and the reader is satisfied.
+Only the behavioural test noticed.
+
+That is the difference between a guard that reads a query and a guard that runs one, demonstrated
+rather than argued — and it lands directly on the gap wave 9 proved on the other side of the
+repository. **`internal/bidding`'s equivalent lock has neither guard**: it lives in `cmd/`, where
+until now no Go test held a database, so removing `SKIP LOCKED` from it passes `make check` with
+zero failures. It is the strongest untested invariant on the board and this ticket is the worked
+example of what closing it costs — one race test per claim, which is roughly thirty lines.
+`cmd/notifier/parties_test.go` is the same argument applied to a query rather than a lock, and the
+same thirty lines.
 
 ### SHIP-137 — a service rather than a sixth task, and the row is what makes a redelivery harmless
 
