@@ -91,7 +91,15 @@ final class TestSignals implements SyncSignals {
 
 /// One handset: a queue on disk, a scripted network, a clock the test moves, and a worker.
 final class SyncHarness {
-  SyncHarness._(this.storage, this.queue, this.worker, this.sender, this.alarm, this.signals);
+  SyncHarness._(
+    this.storage,
+    this.queue,
+    this.worker,
+    this.sender,
+    this.alarm,
+    this.signals,
+    this.now,
+  );
 
   /// [roll] is the jitter draw, fixed so a test asserts on an exact delay rather than a range.
   /// `1` is the top of the jittered window, which is the nominal delay.
@@ -121,7 +129,7 @@ final class SyncHarness {
     );
     addTearDown(worker.dispose);
 
-    return SyncHarness._(files, queue, worker, scripted, alarm, signals);
+    return SyncHarness._(files, queue, worker, scripted, alarm, signals, now);
   }
 
   final QueueFixture storage;
@@ -130,6 +138,16 @@ final class SyncHarness {
   final ScriptedSender sender;
   final TestAlarm alarm;
   final TestSignals signals;
+
+  /// This handset's clock, as the queue and the worker read it.
+  ///
+  /// Exposed for SHIP-127, which needs the **same** clock the queue stamped `enqueued_at` from: the
+  /// nudge is `now − enqueuedAt`, and two clocks make that difference an artefact of the fixture
+  /// rather than of the queue. It is the more interesting half of that: until this was wired, every
+  /// test using a harness measured a fixed 2026 date against the real one, so the nudge fired in
+  /// tests that had never heard of it — and would have gone on firing differently as the calendar
+  /// moved past the fixture's date.
+  final DateTime Function() now;
 
   /// Closes everything and opens it again over the same bytes on disk. The app being restarted.
   ///

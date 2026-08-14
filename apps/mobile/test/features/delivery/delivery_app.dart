@@ -24,11 +24,16 @@ import '../identity/signup_app.dart';
 /// sends the provider one. Pushing the screen directly would skip the router's guard, which is
 /// exactly where a missing entry in `_signedInPatterns` would show up, and a route that lands on
 /// the home shell instead looks from the outside like a link that does nothing.
+/// [nudgeClock] is what SHIP-127 measures `enqueued_at` against, and it defaults to the handset's
+/// own — so a test that is not about the four-hour nudge never sees one, however old the fixture's
+/// fixed date has become. A test that *is* about it hands over a clock running ahead of the queue's,
+/// which is what "recorded before breakfast, still unsent at lunchtime" looks like from inside.
 Future<void> openDelivery(
   WidgetTester tester, {
   required SyncHarness harness,
   required String jobId,
   UserRole role = UserRole.provider,
+  DateTime Function()? nudgeClock,
 }) async {
   // A phone-shaped surface rather than the 800×600 default, and a tall one: three large buttons
   // and a log of what was recorded should scroll rather than be reported as overflowing.
@@ -38,7 +43,9 @@ Future<void> openDelivery(
 
   final identity = FakeIdentityRepository()..tokens = aTokenPair(role: role);
 
-  await tester.pumpWidget(signupApp(identity, worker: harness.worker));
+  await tester.pumpWidget(
+    signupApp(identity, worker: harness.worker, clock: nudgeClock ?? harness.now),
+  );
   await tester.pumpAndSettle();
 
   await signInThrough(tester);

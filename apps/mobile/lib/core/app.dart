@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/core/sync/pending_updates_indicator.dart';
+import 'package:shipper/core/sync/unsynced_nudge.dart';
 import 'package:shipper/core/version/version_gate.dart';
 import 'package:shipper/shared/design_system/app_theme.dart';
 
@@ -36,6 +37,19 @@ import 'package:shipper/shared/design_system/app_theme.dart';
 /// It costs a test nothing for the same reason and by the same mechanism: `runningBuildProvider` is
 /// `null` until `main.dart` supplies it, and with no build number there is nothing to compare, so
 /// the gate makes no request and draws its child. `version_gate.dart` holds both halves.
+///
+/// ## The third thing outside the navigator, and why it wraps rather than sits beside (SHIP-127)
+///
+/// [UnsyncedNudge] is `Docs/02` §3.1's second rung, and it **wraps** the column above rather than
+/// joining it. The first rung is a row of the screen; this one is a card over the whole of it,
+/// including over the row — an escalation that appeared as a fourth line inside the bar the driver
+/// has been reading past for four hours would not be one. It is inside [VersionGate] rather than
+/// outside it for the same reason the indicator is: below the build floor the application is
+/// replaced, and a nudge about syncing on top of a barrier saying this build cannot talk to the
+/// platform is two answers to one question.
+///
+/// It costs a test nothing by the same mechanism again — it reads the queue snapshot, which is
+/// empty until `main.dart` supplies the worker, so it draws its child and opens no database.
 class ShipperApp extends ConsumerWidget {
   const ShipperApp({super.key});
 
@@ -51,11 +65,13 @@ class ShipperApp extends ConsumerWidget {
       // Below the content rather than over it. An overlay would sit on whatever a screen put in the
       // bottom corner, and on the customer shell that is the button which publishes a delivery.
       builder: (context, child) => VersionGate(
-        child: Column(
-          children: <Widget>[
-            Expanded(child: child ?? const SizedBox.shrink()),
-            const PendingUpdatesIndicator(),
-          ],
+        child: UnsyncedNudge(
+          child: Column(
+            children: <Widget>[
+              Expanded(child: child ?? const SizedBox.shrink()),
+              const PendingUpdatesIndicator(),
+            ],
+          ),
         ),
       ),
     );

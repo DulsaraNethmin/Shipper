@@ -418,6 +418,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
+| **SHIP-127** | M4 | Flutter four-hour unsynced nudge — `Docs/02` §3.1's second rung, and **a prompt rather than a fourth line in SHIP-126's bar**: a card over a scrim, above the router, dismissed by an explicit tap and by nothing else. It measures `enqueued_at` of the oldest **pending or in-flight** operation and excludes quarantined work, because the whole content of the prompt is *go and find signal*. **No timer at all** — a published snapshot and the clock at build time, because every trigger that brings a person back to the app already publishes one. Finding: **the queue's clock and the nudge's clock have to be the same one**, which no fixture had needed until now. The four hours is a value rather than a constant and **should not stay on the device** — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
 | **SHIP-134** | M5 | The transactional outbox publisher — a Kafka producer in `cmd/worker`, and the aggregate is the unit of division — *see below* |
 | **SHIP-135** | M5 | The topic set and the event catalogue — three topics applied by `cmd/topics` like a migration, and **no dead-letter path, because a permanently unpublishable row is now unwritable** — *see below* |
@@ -8077,6 +8078,108 @@ The topic assertions are fenced **by event id**, taken from the outbox before th
 compared as a **subset** — `shipper.bid` and `shipper.delivery` are not emptied by the harness and are
 shared with every worktree on the machine. That is SHIP-135's lesson applied without having to
 rediscover it.
+
+### SHIP-127 — the nudge, the clock it turned out to share, and the number that should not be on the device
+
+`Docs/02` §3.1's ladder has three rungs. SHIP-126 built the first, SHIP-128 is the third and is
+server-side, and this is the middle one: *"4 hours — the provider is nudged, so someone who can find
+signal knows to."*
+
+#### A prompt, not a louder indicator, and that distinction is the whole ticket
+
+The tempting two-point version of this is a fourth line in SHIP-126's bar. It is the wrong answer for
+a reason the ticket states in its own wording: an **escalation**. That bar has been on the screen
+since the first update was recorded, and the driver has had four hours to learn to read past it.
+Adding a sentence to it changes nothing about whether they notice.
+
+So the nudge interrupts. `UnsyncedNudge` wraps `ShipperApp`'s builder — outside the router, like the
+indicator and inside `VersionGate` — and draws a card over a scrim. It is dismissed by an explicit
+tap on **Got it** and by nothing else: the scrim is a `ModalBarrier` with `dismissible: false`, so a
+stray tap cannot buy four hours of silence. It is weaker than the version gate, which *replaces* the
+application rather than covering it, and that is the right strength: the 24-hour rung is where
+somebody other than the driver is told.
+
+**There is no Try again button, deliberately.** The worker already retries on six triggers including
+every resume, so a button would do nothing the phone is not already doing — and one that failed in
+front of the driver reads as the work having been lost. What `Docs/02` §3.1 asks for is a *physical*
+action, so the copy asks for that instead: nothing has been lost, it is all still on this phone, and
+getting to somewhere with coverage is what will clear it.
+
+#### It measures `enqueued_at`, excludes quarantined work, and leaves one gap on purpose
+
+SHIP-124 wrote the column for exactly this and said so: `enqueued_at` is "what `Docs/02` §3.1's
+four-hour and 24-hour escalations measure". `recorded_at` is the actor's clock and is what a customer
+is shown; the two are deliberately different, and the fixtures set them an hour apart so that reading
+the wrong one fails rather than passes.
+
+Blocked operations are excluded, which continues SHIP-125's exclusion and SHIP-126's. An operation
+the platform refused is waiting for a person, not for a connection, and the entire content of this
+prompt is *go and find signal* — sending a driver up a hill about an update that will be refused
+again at the top is worse than saying nothing.
+
+**The gap that leaves is real and is not closed here.** A blocked operation holds its own ordering
+key, so a *pending* operation queued behind one on the same job ages, nudges, and is not fixable by
+finding signal. It is recorded rather than narrowed away because closing it needs SHIP-132's
+acknowledgement to exist first: today there is nothing the driver could do about it even if the
+prompt said so.
+
+#### No timer, and the reasoning is about who is looking rather than about cost
+
+The decision is a function of the last published `QueueSnapshot` and the clock at build time. Nothing
+arms a wake-up for the instant the threshold is crossed.
+
+A prompt nobody is looking at is not a prompt. Every trigger that brings a person back to the
+application already publishes a snapshot — `SyncSignals` drains on resume, and the worker publishes
+at the end of every pass — and while there is claimable work the worker keeps its own schedule,
+ceilinged at five minutes. So a phone left open is told within one backoff interval, and a phone in a
+pocket is told when it comes out of it, which is the only moment it could be. A `Timer` would also
+have to be cancelled correctly in every widget test that mounts `ShipperApp` over a live queue, and
+one left pending fails a widget test outright — a real cost for granularity nobody can perceive on a
+four-hour rule.
+
+#### The finding: the queue's clock and the nudge's clock have to be the same clock
+
+The nudge is `now − enqueued_at`. In the application both halves are `DateTime.now`, so they agree by
+construction. **In the test suite they did not**, and the first full run said so: `SyncHarness` runs
+the queue on a fixed `2026-08-13 09:00`, and the nudge was reading the host's real clock, so every
+existing test using a harness recorded a milestone that was instantly hours old. Two wave-7 tests
+failed — `pending_updates_persist_test.dart` and `record_milestone_test.dart` — with the scrim
+swallowing their second tap.
+
+That was worth more than the fix. The fixture had been measuring the calendar: those tests would have
+started behaving differently as the real date moved past the fixed one, with nothing to say why. So
+`SyncHarness` now exposes its clock, `openDelivery` hands it to the nudge, and a test that is
+*about* the nudge passes a second clock running ahead of the queue's — which is what "recorded before
+breakfast, still unsent at lunchtime" looks like from inside the app, and is hermetic in a way the
+real clock never was.
+
+#### Four hours is a value and not a constant, and it should not stay on the device
+
+`CLAUDE.md` is explicit that anything expected to change under operational pressure lives server-side
+and that Flutter has no over-the-air path for Dart code. A tuning knob on an escalation ladder is
+exactly that kind of number, and moving this one currently needs a store release.
+
+It is compiled in because **it cannot be fetched at the moment it is needed** — the prompt fires on a
+handset with no connection, which is the premise. What was available is the shape `QueuePolicy`
+already uses: a default injected through `nudgePolicyProvider` rather than a `const` somebody has to
+find. What is wanted is for a client-policy endpoint to carry it, so the app caches the current value
+while it still has signal; `GET /v1/app/minimum-version` (SHIP-167) is the endpoint already shaped
+like that one, and `internal/config` already carries the precedent in `Storage.MaxUploadBytes`. §9
+has the item.
+
+#### Mutations
+
+Seven applied to `unsynced_nudge.dart`, each restored from a copy and checksummed. Caught: the
+threshold moved to zero and to a week, quarantined work counted as unsynced, `recorded_at` read
+instead of `enqueued_at`, a dismissal that silences for ever, a scrim that dismisses on any tap, and
+no scrim at all.
+
+**One survived, and it is worth knowing rather than fixing.** Flipping `dismissible: false` to `true`
+on the `ModalBarrier` changes nothing any test can see — the barrier is mounted *outside* the router's
+navigator, so there is no route for it to pop and the flag is inert. The property the tests do hold
+is the one that can actually be broken: replacing the barrier with a tap handler that dismisses fails
+immediately. The flag stays because it states the intent, and because it would matter the day this
+widget is mounted somewhere with a navigator above it.
 
 ## 4. Partly done — do not treat these as finished
 
