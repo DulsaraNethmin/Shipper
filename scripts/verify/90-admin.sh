@@ -1313,3 +1313,192 @@ ok "a draft with no goods description matches no term — NULL ILIKE is NULL, no
 
 admin_clear_limits
 
+# ==========================================================================================
+# SHIP-165 — the immutable history, searchable by actor, target and date.
+#
+# # What only this section can show
+#
+# The Go suite drives the reader against a real database and is the stronger of the two — it writes
+# entries through the real [Auditor] and reads them back through the real statement. **What it cannot
+# show is that the wiring in cmd/api hands the handler a trail at all**: `adminHandler` builds one
+# from `d.Pool` and passes it in the services struct, and a change that passed a nil, or that built
+# the reader against a different pool, compiles and passes every Go test in the domain.
+#
+# It also shows the half that matters most operationally: the entries this **running service** wrote
+# for its own administrative actions are the ones the endpoint returns. A reader over a table nothing
+# populates would pass every filter test ever written.
+#
+# # Everything is fenced on this run's own administrator
+#
+# `audit_log` holds every previous run's entries and every other worktree's, so a count over the
+# table would be a statement about the machine. Every assertion below is on entries whose actor is an
+# account this section created.
+
+ticket "SHIP-165  the audit trail is searchable by actor, target and date"
+
+admin_clear_limits
+
+# An owner, because this section needs to *cause* audit entries as well as read them — and creating
+# an administrator is the one action that needs `admins.manage`. Reading needs only `audit.read`,
+# which the support administrator below is used to prove.
+trail_email="verify-admin-trail-$$@example.com"
+trail_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$trail_email', 'Verify Trail', '$admin_fixture_hash', 'owner')
+   returning id;")"
+[[ -n "$trail_id" ]] || fail "the trail fixture administrator could not be created"
+
+status="$(admin_signin "verify-adm-trail-in-$$" "$trail_email" "$admin_password" trail-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-trail-in.json"; fail "the trail fixture could not sign in ($status)"; }
+trail_token="$(json "$WORKDIR/admin-trail-in.json" '["token"]')"
+
+# One administrator created, which is the entry with a target and metadata worth reading back.
+trail_made_email="verify-admin-trail-made-$$@example.com"
+status="$(curl -s -X POST -o "$WORKDIR/admin-trail-made.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $trail_token" -H "Idempotency-Key: verify-adm-trail-made-$$" \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$trail_made_email\",\"name\":\"Trail Made\",\"password\":\"$admin_password\",\"role\":\"moderator\"}" \
+  "http://localhost:$VERIFY_PORT/v1/admin/administrators")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/admin-trail-made.json"; fail "creating an administrator returned $status, want 201"; }
+trail_made_id="$(json "$WORKDIR/admin-trail-made.json" '["id"]')"
+
+# A support administrator does the reading, because `audit.read` is held by every role: a trail only
+# the people it records can read is not a control.
+trail_reader_email="verify-admin-trail-reader-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$trail_reader_email', 'Verify Reader', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the trail reader could not be created"
+
+status="$(admin_signin "verify-adm-trail-read-$$" "$trail_reader_email" "$admin_password" trail-read)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-trail-read.json"; fail "the trail reader could not sign in ($status)"; }
+trail_reader_token="$(json "$WORKDIR/admin-trail-read.json" '["token"]')"
+
+# trail_actions <query-string> <name> — the actions on the page, comma separated, deduplicated.
+trail_actions() {
+  status="$(admin_get "/v1/admin/audit?$1" "$trail_reader_token" "$2")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-$2.json"; fail "reading the audit trail returned $status, want 200"; }
+  python3 - "$WORKDIR/admin-$2.json" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(",".join(sorted({e["action"] for e in (page.get("data") or [])})))
+PY
+}
+
+# --- by actor, which is the first question anybody asks of a trail --------------------------------
+
+trail_seen="$(trail_actions "actor=$trail_id&limit=50" trail-actor)"
+[[ "$trail_seen" == "administrator.created,administrator.signed_in" ]] \
+  || { cat "$WORKDIR/admin-trail-actor.json"; fail "a search by actor returned [$trail_seen], want this run's sign-in and creation and nothing else"; }
+ok "the trail is searchable by actor, and returns exactly what that administrator did — including the entries this running service wrote for its own actions"
+
+# The negative direction, which is the half a filter that does nothing would still pass. The reader
+# has signed in and so has an entry of its own; it must not appear under another actor.
+python3 - "$WORKDIR/admin-trail-actor.json" "$trail_id" >"$WORKDIR/trail-foreign.txt" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for e in (page.get("data") or []) if e["actor_id"] != sys.argv[2]))
+PY
+[[ "$(cat "$WORKDIR/trail-foreign.txt")" == "0" ]] \
+  || { cat "$WORKDIR/admin-trail-actor.json"; fail "a search by actor returned another administrator's entries, so the filter does nothing"; }
+ok "and only that administrator's — the other accounts this run signed in are not on the page"
+
+# --- by target ------------------------------------------------------------------------------------
+
+trail_seen="$(trail_actions "target=$trail_made_id&limit=50" trail-target)"
+[[ "$trail_seen" == "administrator.created" ]] \
+  || { cat "$WORKDIR/admin-trail-target.json"; fail "a search by target returned [$trail_seen], want the creation of that account alone"; }
+ok "and by target, which answers 'everything that ever happened to this' without the caller knowing what kind of thing it is"
+
+# --- by action, and by date -----------------------------------------------------------------------
+
+trail_seen="$(trail_actions "actor=$trail_id&action=administrator.created&limit=50" trail-action)"
+[[ "$trail_seen" == "administrator.created" ]] \
+  || { cat "$WORKDIR/admin-trail-action.json"; fail "a search by action returned [$trail_seen]"; }
+ok "and by action — the column 000003 made a stable identifier rather than a sentence, so that this search exists"
+
+# Today, as a bare day. A support engineer types a date and a console sends an instant, and both are
+# accepted; `from` is inclusive and `to` is exclusive so consecutive days tile without overlapping.
+trail_today="$("$PSQL" "$DATABASE_URL" -qtAc "select to_char(now() at time zone 'utc', 'YYYY-MM-DD');")"
+trail_tomorrow="$("$PSQL" "$DATABASE_URL" -qtAc "select to_char((now() at time zone 'utc') + interval '1 day', 'YYYY-MM-DD');")"
+
+trail_seen="$(trail_actions "actor=$trail_id&from=$trail_today&to=$trail_tomorrow&limit=50" trail-today)"
+[[ "$trail_seen" == "administrator.created,administrator.signed_in" ]] \
+  || { cat "$WORKDIR/admin-trail-today.json"; fail "a search bounded to today returned [$trail_seen]"; }
+
+trail_seen="$(trail_actions "actor=$trail_id&from=$trail_tomorrow&limit=50" trail-tomorrow)"
+[[ -z "$trail_seen" ]] \
+  || { cat "$WORKDIR/admin-trail-tomorrow.json"; fail "a search starting tomorrow returned [$trail_seen], so the lower bound does nothing"; }
+ok "and by date, as a bare day — the bounds are half-open, so nothing written today falls inside a window that starts tomorrow"
+
+# --- what an entry carries, and that it is exactly what was written --------------------------------
+
+status="$(admin_get "/v1/admin/audit?target=$trail_made_id" "$trail_reader_token" trail-entry)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-trail-entry.json"; fail "reading the audit trail returned $status"; }
+
+python3 - "$WORKDIR/admin-trail-entry.json" "$trail_id" "$trail_made_id" >"$WORKDIR/trail-entry.txt" <<'PY'
+import json, sys
+e = (json.load(open(sys.argv[1])).get("data") or [None])[0]
+if e is None:
+    print("MISSING"); raise SystemExit
+print(",".join(sorted(e.keys())))
+print(e["actor_type"])
+print("actor-ok" if e["actor_id"] == sys.argv[2] else "actor-" + str(e["actor_id"]))
+print("target-ok" if e["target_id"] == sys.argv[3] else "target-" + str(e["target_id"]))
+print(e["target_type"])
+print(json.dumps(e["metadata"], sort_keys=True))
+PY
+trail_keys="$(sed -n '1p' "$WORKDIR/trail-entry.txt")"
+[[ "$trail_keys" == "action,actor_id,actor_type,created_at,id,metadata,reason,target_id,target_type" ]] \
+  || { cat "$WORKDIR/admin-trail-entry.json"; fail "an audit entry carries [$trail_keys], which is not every column of the row"; }
+[[ "$(sed -n '2p' "$WORKDIR/trail-entry.txt")" == "admin" ]] || fail "the entry does not say an administrator acted"
+[[ "$(sed -n '3p' "$WORKDIR/trail-entry.txt")" == "actor-ok" ]] || fail "the entry does not name the administrator who acted"
+[[ "$(sed -n '4p' "$WORKDIR/trail-entry.txt")" == "target-ok" ]] || fail "the entry does not name the account that was created"
+[[ "$(sed -n '5p' "$WORKDIR/trail-entry.txt")" == "administrator" ]] || fail "the entry does not say what kind of thing it names"
+[[ "$(sed -n '6p' "$WORKDIR/trail-entry.txt")" == '{"role": "moderator"}' ]] \
+  || { cat "$WORKDIR/admin-trail-entry.json"; fail "the metadata is not the object that was written: $(sed -n '6p' "$WORKDIR/trail-entry.txt")"; }
+ok "an entry carries every column of the row, including the metadata as the object that was written — a viewer that redacted would be a second record"
+
+# --- the filters are refused rather than ignored ---------------------------------------------------
+#
+# The direction that matters most for this endpoint. An ignored filter answers with the whole trail,
+# and a support engineer who mistyped an action would read "no entries" as "it never happened".
+
+status="$(admin_get "/v1/admin/audit?action=administrator.deleted" "$trail_reader_token" trail-bad-action)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-trail-bad-action.json"; fail "an action nothing records returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-trail-bad-action.json")" == *'"action"'* ]] \
+  || { cat "$WORKDIR/admin-trail-bad-action.json"; fail "the refusal does not name the field"; }
+
+status="$(admin_get "/v1/admin/audit?from=last%20Tuesday" "$trail_reader_token" trail-bad-date)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-trail-bad-date.json"; fail "a date that is not a date returned $status, want 422"; }
+
+status="$(admin_get "/v1/admin/audit?from=$trail_tomorrow&to=$trail_today" "$trail_reader_token" trail-bad-range)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-trail-bad-range.json"; fail "an inverted range returned $status, want 422"; }
+ok "an action nothing records, a date that is not a date and a range that ends before it starts are each refused and name their field"
+
+# --- the invariant this ticket is most able to break -----------------------------------------------
+#
+# CLAUDE.md: audit entries are append-only and ordinary administrators cannot delete them. SHIP-165
+# is the ticket that gives the trail a reader, and the obvious next thing somebody adds is a way to
+# correct one. There is no such route, and the four verbs are refused on the path that exists.
+
+for verb in POST PUT PATCH DELETE; do
+  status="$(curl -s -X "$verb" -o "$WORKDIR/admin-trail-$verb.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $trail_reader_token" -H "Idempotency-Key: verify-adm-trail-$verb-$$" \
+    -H 'Content-Type: application/json' -d '{}' \
+    "http://localhost:$VERIFY_PORT/v1/admin/audit")"
+  [[ "$status" == "404" || "$status" == "405" ]] \
+    || { cat "$WORKDIR/admin-trail-$verb.json"; fail "$verb on the audit trail returned $status; the trail is append-only and no route may change it"; }
+done
+ok "no verb but GET is served on the trail — entries are written by the actions that cause them, in the transaction that performs them, and never by a request"
+
+status="$(admin_get "/v1/admin/audit" "" trail-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-trail-nocred.json"; fail "the audit trail is readable without a credential ($status)"; }
+[[ "$(cat "$WORKDIR/admin-trail-nocred.json")" != *"$trail_id"* ]] \
+  || fail "a refused request returned entries anyway"
+ok "and the trail is behind the administrator credential — without one it would be a public list of who runs the platform and what they touch"
+
+admin_clear_limits

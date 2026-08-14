@@ -506,6 +506,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
 | **SHIP-152** | M6 | `GET /v1/admin/jobs` and `GET /v1/admin/jobs/{id}` — search by description, status and customer; open **any** job with every bid and every recorded transition, read in **one snapshot** so a console cannot render an `Awarded` header above a bid list with nothing accepted. The statements are in `cmd/api` because they span two other domains' tables, which is the line `postgres_users.go` drew. **Bid amounts are here and the budget is not** — Docs/02 §4 names the administrator as bid history's third reader, and leaving the budget out is a *decision* with SHIP-164 named as its revisit — *see below* |
+| **SHIP-165** | M6 | `GET /v1/admin/audit` — the trail SHIP-150 writes, searchable by actor, target, date and **action**. The reader is a **second type** rather than a method on `Auditor`, so one can only append and the other can only read; there is no `UPDATE` or `DELETE` anywhere in the package and no verb but `GET` on the path. The date bounds are **half-open** so consecutive days tile, and the cursor is two-column because every entry in one transaction shares an instant **by design** — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7a loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -10775,7 +10776,74 @@ nowhere.**
 statuses. Seven statuses, six rows — `job_status_history` records a *move*, and the `Draft` the job
 started in was never moved into.
 
-**Nothing was needed from `internal/config`.**
+### SHIP-165 — the trail gets a reader, and the reader cannot write
+
+`GET /v1/admin/audit`, `RequireAdmin`, gated on `audit.read` — the permission SHIP-148 declared and
+nothing served for two waves. §4 could have recorded it as a gap and did not, because the permission
+existed and the endpoint was a scheduled ticket rather than a missing half.
+
+Searchable by `actor`, `target`, `from`/`to` — the *Done when*'s three — and by `action`, which is a
+fourth. `000003` built the column as "a stable identifier rather than a sentence … free text would
+make the log unsearchable by action, which is how support will use it", and a column created for a
+search with no way to search it would have been the odd omission.
+
+#### The reader is a second type, and that is what keeps the invariant structural
+
+`Auditor` has one verb and it appends. `AuditTrail` has one verb and it reads. Neither can update or
+delete, no permission authorises it, no route offers a verb but `GET`, and `000003`'s triggers refuse
+both from any connection. **Four places, and only the last is a database guarantee** — which is why
+the Go halves are shaped so that writing the wrong thing needs a new type rather than a new method.
+
+`postgres_audit.go`'s header claimed of itself that "there is exactly one statement here … no SELECT,
+no UPDATE, no DELETE", and named this ticket as the one that would want a read. Putting the SELECT
+there would have satisfied the ticket by falsifying the header. It went in
+`postgres_audit_search.go` instead.
+
+#### The date bounds are half-open, and the cursor is two-column for a reason peculiar to this table
+
+`from` inclusive, `to` exclusive: the only pair on which consecutive days tile. A reader asking for
+the 3rd and then the 4th must not be shown an entry twice, and an inclusive upper bound at midnight
+shows every entry written in that instant on both days.
+
+Both accept a **day** or a **full instant**. A support engineer types `2026-08-14` and a console
+sends `2026-08-14T09:30:00Z`; accepting only the second makes the endpoint unusable by hand, which is
+most of what an audit viewer is for. A bare day is UTC midnight, because the column holds the
+platform's clock and reading it in the server's local zone would move the boundary whenever the
+deployment moved.
+
+**`created_at` is emphatically not unique here, and unlike every other cursor in this service that is
+by design rather than by coincidence.** `Auditor.Record` gives every entry written in one transaction
+the same injected instant, so a single-column cursor would skip an entry or repeat one on exactly the
+rows most worth reading together. The identifier breaks the tie and is a v7, so entries appended in
+one transaction come back in the order they were appended.
+
+#### Nothing is redacted, and the reason is upstream of this endpoint
+
+Every column of the row, metadata included, passed through as **raw JSON** rather than decoded and
+re-encoded — a round trip reorders keys and turns every number into a float, which in the one table
+whose value is being trusted is a gratuitous difference between the record and the report of it.
+
+A viewer that showed a filtered version would be a second record, and the one somebody checks would
+be the wrong one. What makes publishing the whole row safe is that **nothing commercial is ever
+written into an entry**: a ticket tempted to put a budget in one has made the mistake a layer earlier
+than this file.
+
+#### Every filter is refused rather than ignored, and here that matters more than elsewhere
+
+An ignored filter answers with the whole trail. "Everything" and "the seventeen entries for this
+action" are indistinguishable to somebody who mistyped one — **who then concludes the action never
+happened**, which is the one wrong answer an audit search must not give. A mistyped action, a
+malformed identifier, a date that is not a date and a range that ends before it starts are each a 422
+naming their field, and every problem is reported at once (Docs/10 §4.6).
+
+#### No index was added, and that is measured rather than assumed
+
+`000003` created `idx_audit_log_actor`, `idx_audit_log_target` and `idx_audit_log_created` — exactly
+the three axes the *Done when* names. The fourth filter, action, has none and is applied over a set
+the other three have already narrowed. A migration adding one belongs to whoever has a row count to
+point at.
+
+**Nothing was needed from `internal/config` by either ticket.**
 
 
 ## 4. Partly done — do not treat these as finished

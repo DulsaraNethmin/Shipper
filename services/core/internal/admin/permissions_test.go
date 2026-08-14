@@ -81,12 +81,18 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool) HandlerS
 		t.Fatalf("building the job search: %v", err)
 	}
 
+	trail, err := NewAuditTrail(pool)
+	if err != nil {
+		t.Fatalf("building the audit trail: %v", err)
+	}
+
 	return HandlerServices{
 		Disputes:    testDisputeService(t),
 		Credentials: creds,
 		Moderation:  moderation,
 		Users:       users,
 		Jobs:        jobs,
+		Trail:       trail,
 	}
 }
 

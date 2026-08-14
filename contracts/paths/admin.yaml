@@ -1919,3 +1919,301 @@ AdminStatusEvent:
       description: When the platform accepted it, in UTC. The trail is ordered by this.
       example: '2026-08-02T14:30:00.000Z'
 
+AdminAudit:
+  get:
+    operationId: adminSearchAuditLog
+    summary: Search the immutable audit trail
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/01 §4.6's last administrative capability — "view an immutable history of important
+      actions" (SHIP-165) — and the read side of SHIP-150, which writes the entries.
+
+      ## The trail is append-only, and this API offers no other verb on it
+
+      There is no `POST`, no `PATCH` and no `DELETE` on this path, and there will not be. Docs/04 §9
+      requires that ordinary administrators cannot delete audit history; the permission catalogue
+      has no permission that would authorise it, and the database refuses `UPDATE` and `DELETE` on
+      `audit_log` by trigger — from **any** connection, including a `psql` prompt, so the guarantee
+      does not depend on this service.
+
+      Entries are written by the actions that cause them, in the same transaction, never by a
+      request to this endpoint. An action whose entry cannot be written does not happen.
+
+      ## What can be searched
+
+      `actor` is what one administrator did, and it is the first question anybody asks of a trail.
+      `target` is everything that happened to one thing — an administrator, a user, a job — and it
+      reads across kinds deliberately, because an identifier is already unique and a caller should
+      not have to know which kind it is. `from` and `to` bound it by date.
+
+      `action` is a fourth and is not in the ticket's wording. It is here because the table was built
+      around it: the column holds a **stable identifier rather than a sentence**, precisely so the
+      log is searchable by action, and a column created for a search with no way to search it would
+      be the odd omission.
+
+      Every filter is refused rather than ignored when it carries a value the platform does not
+      have. An ignored filter answers with the whole trail, and "everything" and "the seventeen
+      entries for this action" are indistinguishable to somebody who mistyped one — who then
+      concludes the action never happened.
+
+      ## `from` is inclusive and `to` is exclusive
+
+      The only pair that makes consecutive days tile without overlapping: somebody asking for the
+      3rd and then the 4th must not be shown an entry twice, and an inclusive upper bound at
+      midnight shows every entry written in that instant on both days.
+
+      Both accept a **day** (`2026-08-14`) or a **full instant** (`2026-08-14T09:30:00Z`). A support
+      engineer types the first and a console sends the second; accepting only the second would make
+      the endpoint unusable by hand, which is most of what it is for. A bare day is read as UTC
+      midnight, because the column holds the platform's clock and reading it in the server's local
+      zone would move the boundary whenever the deployment moved.
+
+      ## Ordering and paging
+
+      Newest first — somebody opening a trail is almost always asking what happened recently. Cursor
+      paged on `(created_at, id)`, and here the second field is not a nicety: every entry written in
+      one transaction shares the same instant **by design**, so a single-column cursor would skip an
+      entry or repeat one on exactly the rows most worth reading together. The identifier is
+      time-ordered, so entries appended in one transaction come back in the order they were
+      appended.
+
+      ## Permission
+
+      Needs `audit.read`, which every administrator role holds including the least privileged. A
+      trail only the people it records can read is not a control.
+    parameters:
+      - name: actor
+        in: query
+        required: false
+        description: |
+          Narrows to what one account did. Absent matches every actor. Entries written by the
+          platform itself have no actor and are matched by no value here.
+        schema:
+          type: string
+          format: uuid
+        example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+      - name: target
+        in: query
+        required: false
+        description: |
+          Narrows to everything done to one thing, whatever kind of thing it is. Absent matches
+          every target.
+        schema:
+          type: string
+          format: uuid
+        example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+      - name: action
+        in: query
+        required: false
+        description: |
+          Narrows to one kind of entry. Absent matches every action. A value the platform does not
+          record is refused rather than ignored.
+
+          The list grows one value per ticket that adds a privileged action, so a client should not
+          hard-code it — the refusal names the current set.
+        schema:
+          type: string
+        example: administrator.created
+      - name: from
+        in: query
+        required: false
+        description: |
+          The earliest instant to include, **inclusive**. A day or a full instant; a day is read as
+          UTC midnight. Absent is unbounded.
+        schema:
+          type: string
+        example: '2026-08-14'
+      - name: to
+        in: query
+        required: false
+        description: |
+          The instant to stop before, **exclusive**. A day or a full instant. Absent is unbounded.
+          A range that ends before it starts is refused rather than answered with an empty page.
+        schema:
+          type: string
+        example: '2026-08-15'
+      - name: limit
+        in: query
+        required: false
+        description: How many entries to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of the trail, newest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AuditPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `audit.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          A query parameter carried a value the platform does not have (`validation_failed`), with
+          one `error.details` entry per field — `action` for an action nothing records, `actor` or
+          `target` for something that is not an identifier, `from` or `to` for something that is not
+          a date, and `to` for a range that ends before it starts.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AuditPage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/AuditEntry'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wOC0xNFQwOTowMDowMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like.
+      example: false
+
+AuditEntry:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - actor_type
+    - actor_id
+    - action
+    - target_type
+    - target_id
+    - reason
+    - metadata
+    - created_at
+  description: |
+    One thing that happened, exactly as it was recorded. **Nothing is withheld and nothing is
+    redacted** — a viewer showing a filtered version of the record would be a second record, and the
+    one somebody checks would be the wrong one. What keeps that safe is that nothing commercial is
+    ever written into an entry in the first place.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: |
+        Time-ordered, so entries appended in one transaction sort in the order they were appended
+        even though they share an instant.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    actor_type:
+      type: string
+      description: |
+        What kind of thing acted. `system` is the platform acting with nobody behind it — the expiry
+        sweep, the auto-complete timer.
+      enum: [admin, user, system]
+      example: admin
+    actor_id:
+      type: string
+      description: |
+        The account that acted. Empty for `system`, which has none — and the schema requires exactly
+        that, so an empty value here is a fact rather than a missing one.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    action:
+      type: string
+      description: |
+        What was done, as a stable identifier rather than a sentence. Free text would make the log
+        unsearchable by action, which is how support uses it.
+      example: administrator.created
+    target_type:
+      type: string
+      description: |
+        What kind of thing it was done to. Not a closed set: the trail outlives its subjects, so it
+        has to be able to name a kind of thing that no longer exists.
+      example: administrator
+    target_id:
+      type: string
+      format: uuid
+      description: |
+        What it was done to. Deliberately not a foreign key in the schema — an entry outlives its
+        subject — so nothing guarantees the row still exists, or ever did.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e6
+    reason:
+      type: string
+      description: |
+        Why, where the action recorded one. Empty where it has none: creating an administrator has
+        no reason beyond the act, and the actions that need one are refused without it.
+      example: ''
+    metadata:
+      type: object
+      additionalProperties: true
+      description: |
+        The extra facts the action recorded — the role granted, the standing set, the status a job
+        moved to. Always an object, never `null`; `{}` where the action recorded nothing beyond
+        itself.
+      example:
+        role: moderator
+    created_at:
+      type: string
+      format: date-time
+      description: |
+        When the action committed, on the platform's clock, in UTC. Supplied by the service rather
+        than by the column default, so an entry sorts correctly against the session, dispute and
+        status-history rows it describes.
+      example: '2026-08-14T09:00:00.000Z'

@@ -27,12 +27,14 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -59,6 +61,7 @@ type Handler struct {
 	moderation *Moderation
 	users      *Users
 	jobs       *JobConsole
+	trail      *AuditTrail
 	pool       *pgxpool.Pool
 	log        *slog.Logger
 }
@@ -88,6 +91,9 @@ type HandlerServices struct {
 
 	// Jobs is the job and bid search (SHIP-152).
 	Jobs *JobConsole
+
+	// Trail is the audit log viewer (SHIP-165).
+	Trail *AuditTrail
 }
 
 // NewHandler wires the handlers to the services.
@@ -124,6 +130,13 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// query parameter depends on: [Handler.jobQueryFrom] asks it which job statuses exist.
 		return nil, errors.New("admin: a handler needs the job and bid search service")
 	}
+	if s.Trail == nil {
+		// SHIP-165. The same argument again, and here it guards the read side of the one
+		// table this platform cannot reconstruct: a trail that answers 500 to every request
+		// is a control nobody can exercise, and the failure would arrive at the first
+		// support question rather than at startup.
+		return nil, errors.New("admin: a handler needs the audit trail reader")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
@@ -133,6 +146,7 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		moderation: s.Moderation,
 		users:      s.Users,
 		jobs:       s.Jobs,
+		trail:      s.Trail,
 		pool:       pool,
 		log:        log,
 	}, nil
@@ -1536,4 +1550,263 @@ func decodeJobCursor(raw string) (JobCursor, error) {
 	}
 
 	return JobCursor{CreatedAt: createdAt, JobID: jobID}, nil
+}
+
+// --- SHIP-165: the audit log viewer ---------------------------------------------------------------
+
+// auditEntryResponse is one entry as the console reads it.
+//
+// **Every column, and nothing withheld.** The trail is what holds administrators to account
+// (Docs/04 §9), and a viewer showing a filtered version of the record would be a second record — the
+// one somebody checks would be the wrong one. What keeps that safe is upstream: nothing commercial is
+// ever written into an entry, and a ticket tempted to put a budget in one has made the mistake a
+// layer earlier than this shape.
+type auditEntryResponse struct {
+	ID string `json:"id"`
+
+	// ActorType is `admin`, `user` or `system` (`000003`). Coarser than the job history's five
+	// kinds, which is that table's decision rather than this endpoint's.
+	ActorType string `json:"actor_type"`
+
+	// ActorID is the account that acted. Empty for `system`, which has none — and
+	// `ck_audit_log_actor_id` requires exactly that, so an empty string here is a fact rather
+	// than a missing value.
+	ActorID string `json:"actor_id"`
+
+	Action string `json:"action"`
+
+	TargetType string `json:"target_type"`
+	TargetID   string `json:"target_id"`
+
+	// Reason is why, where the action recorded one. Empty where it has none: creating an
+	// administrator has no reason beyond the act, and the actions that need one are refused
+	// without it.
+	Reason string `json:"reason"`
+
+	// Metadata is the extra facts the action recorded, as the object that was written.
+	//
+	// Passed through as raw JSON rather than decoded and re-encoded, so what a reader sees is
+	// byte for byte what the platform wrote. A round trip through `map[string]any` reorders keys
+	// and turns every number into a float — a gratuitous difference between the record and the
+	// report of it, in the one table whose value is being trusted. Never `null`: the column is
+	// NOT NULL and the writer supplies `{}` for nothing.
+	Metadata json.RawMessage `json:"metadata"`
+
+	// CreatedAt is the platform's clock at the moment the action committed, in UTC.
+	CreatedAt string `json:"created_at"`
+}
+
+func auditEntryFrom(e AuditRecord) auditEntryResponse {
+	out := auditEntryResponse{
+		ID:         e.ID.String(),
+		ActorType:  e.ActorType.String(),
+		Action:     e.Action.String(),
+		TargetType: e.TargetType,
+		TargetID:   e.TargetID.String(),
+		Reason:     e.Reason,
+		Metadata:   json.RawMessage(e.Metadata),
+		CreatedAt:  timestamp(e.CreatedAt),
+	}
+	if e.ActorID != uuid.Nil {
+		out.ActorID = e.ActorID.String()
+	}
+	if len(out.Metadata) == 0 {
+		// Defensive rather than expected: the column is NOT NULL DEFAULT '{}' and
+		// [marshalMetadata] writes an object for nothing. An empty json.RawMessage would
+		// serialise as invalid JSON and take the whole page down, which is not the failure
+		// mode an audit viewer should have.
+		out.Metadata = json.RawMessage("{}")
+	}
+	return out
+}
+
+// AuditTrail handles GET /v1/admin/audit (SHIP-165).
+//
+// Docs/01 §4.6's last capability — "view an immutable history of important actions" — and the read
+// side of SHIP-150. It needs [PermissionAuditRead], which every role holds including the least
+// privileged: a trail only the people it records can read is not a control.
+//
+// **There is no write, update or delete on this route or any other.** CLAUDE.md's invariant is that
+// audit entries are append-only and ordinary administrators cannot delete them; permissions.go has
+// no permission that would authorise it, [AuditTrail] has no method, and `000003`s triggers refuse
+// both from any connection.
+func (h *Handler) AuditTrail() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionAuditRead); err != nil {
+			return err
+		}
+
+		query, err := auditQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so "is there another page" is answered by the rows rather
+		// than by a second COUNT — the arrangement every paged endpoint in this service uses.
+		query.Limit++
+
+		records, err := h.trail.Search(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(records) == query.Limit {
+			last := records[len(records)-2]
+			next = pagination.Cursor{
+				timestamp(last.CreatedAt),
+				last.ID.String(),
+			}.Encode()
+			records = records[:len(records)-1]
+		}
+
+		out := make([]auditEntryResponse, 0, len(records))
+		for _, e := range records {
+			out = append(out, auditEntryFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// auditQueryFrom reads the search parameters.
+//
+// Every problem is reported rather than the first (Docs/10 §4.6) for the five fields this endpoint
+// owns; the limit and the cursor are internal/pagination's and refuse on their own, for the reason
+// [userQueryFrom] records.
+func auditQueryFrom(r *http.Request) (AuditQuery, error) {
+	values := r.URL.Query()
+
+	var problems validate.Errors
+
+	actorID := uuidParam(&problems, values, "actor",
+		"That is not a valid account identifier.")
+	targetID := uuidParam(&problems, values, "target",
+		"That is not a valid identifier.")
+
+	// An unrecognised action is refused rather than ignored, for the reason every filter in this
+	// console is: an ignored filter answers with the whole trail, and "everything" and "the
+	// seventeen entries for this action" are indistinguishable to somebody who mistyped one —
+	// who then concludes the action never happened, which is the failure an audit search has.
+	action := AuditAction(strings.TrimSpace(values.Get("action")))
+	if action != "" && !action.Valid() {
+		problems.Add("action", validate.CodeInvalid,
+			"That is not an action this platform records. Use one of %s.",
+			strings.Join(auditActionNames(), ", "))
+	}
+
+	from := instantParam(&problems, values, "from")
+	to := instantParam(&problems, values, "to")
+	if !from.IsZero() && !to.IsZero() && !to.After(from) {
+		// Refused rather than answered with an empty page. An inverted range is a console bug
+		// or a person's slip, and both are better served by being told than by reading "no
+		// administrator did anything that week".
+		problems.Add("to", validate.CodeInvalid,
+			"The end of the range must be after its start. `from` is inclusive and `to` is "+
+				"exclusive, so consecutive days tile without overlapping.")
+	}
+
+	if err := problems.Err(); err != nil {
+		return AuditQuery{}, err
+	}
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return AuditQuery{}, err
+	}
+
+	after, err := decodeAuditCursor(values.Get("cursor"))
+	if err != nil {
+		return AuditQuery{}, err
+	}
+
+	return AuditQuery{
+		ActorID: actorID, TargetID: targetID, Action: action,
+		From: from, To: to, Limit: limit, After: after,
+	}, nil
+}
+
+// auditActionNames is [AuditActions] as strings, for a validation message.
+func auditActionNames() []string {
+	out := make([]string, 0, len(AuditActions))
+	for _, a := range AuditActions {
+		out = append(out, a.String())
+	}
+	return out
+}
+
+// uuidParam reads an optional identifier, recording a field-level problem rather than refusing.
+//
+// A helper rather than the same six lines three times: every administrative search takes at least
+// one identifier filter, and Docs/10 §4.6 wants every problem reported rather than the first — which
+// means each one has to add to the list rather than return.
+func uuidParam(problems *validate.Errors, values url.Values, field, message string) uuid.UUID {
+	raw := strings.TrimSpace(values.Get(field))
+	if raw == "" {
+		return uuid.Nil
+	}
+
+	parsed, err := uuid.Parse(raw)
+	if err != nil {
+		problems.Add(field, validate.CodeInvalid, "%s", message)
+		return uuid.Nil
+	}
+	return parsed
+}
+
+// instantParam reads an optional date or date-time bound.
+//
+// **Two accepted forms, and that is a deliberate accommodation rather than laziness.** A support
+// engineer types a date — `2026-08-14` — and a console sends an instant. Accepting only the second
+// would make the endpoint unusable by hand, which for an audit viewer is most of its use; accepting
+// only the first would round away the precision a console has. A bare date is read as UTC midnight,
+// which with the inclusive-from and exclusive-to rule makes consecutive days tile exactly.
+//
+// UTC rather than a local zone, and that is the only defensible reading: the column is `timestamptz`
+// holding the platform's clock, and interpreting a bare date in the *server's* zone would move the
+// boundary whenever the deployment moved.
+func instantParam(problems *validate.Errors, values url.Values, field string) time.Time {
+	raw := strings.TrimSpace(values.Get(field))
+	if raw == "" {
+		return time.Time{}
+	}
+
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.UTC()
+	}
+	if t, err := time.Parse(time.DateOnly, raw); err == nil {
+		return t.UTC()
+	}
+
+	problems.Add(field, validate.CodeInvalid,
+		"That is not a date. Use a day such as 2026-08-14, or a full instant such as "+
+			"2026-08-14T09:30:00Z.")
+	return time.Time{}
+}
+
+// decodeAuditCursor reads the two fields the trail's ordering is total on.
+func decodeAuditCursor(raw string) (AuditCursor, error) {
+	if raw == "" {
+		return AuditCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return AuditCursor{}, err
+	}
+
+	createdAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return AuditCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	entryID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return AuditCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return AuditCursor{CreatedAt: createdAt, EntryID: entryID}, nil
 }

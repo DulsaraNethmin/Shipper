@@ -153,6 +153,24 @@ func init() {
 		},
 
 		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/audit",
+			Group:   GroupV1,
+
+			// RequireAdmin is the credential; `audit.read` is the permission, checked in the
+			// handler (SHIP-148, SHIP-165). Every role holds it, including the least
+			// privileged — a trail only the people it records can read is not a control.
+			//
+			// **A GET and nothing else, for ever.** There is no POST, PATCH or DELETE on this
+			// path and no permission that would authorise one: CLAUDE.md's invariant is that
+			// audit entries are append-only and ordinary administrators cannot delete them,
+			// and `000003`s triggers refuse both from any connection. Entries are written by
+			// the actions that cause them, in the same transaction, never by a route.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).AuditTrail() },
+		},
+
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
@@ -252,12 +270,22 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin job search: " + err.Error())
 	}
 
+	// SHIP-165. It takes the pool alone: `audit_log` is a shared table this domain writes and
+	// now reads, and there is no port to supply. Deliberately a *second* type rather than a
+	// method on the auditor above — one can only append and the other can only read, which is
+	// what makes the append-only invariant structural rather than a habit.
+	trail, err := admin.NewAuditTrail(d.Pool)
+	if err != nil {
+		panic("cmd/api: admin audit trail: " + err.Error())
+	}
+
 	handler, err := admin.NewHandler(admin.HandlerServices{
 		Disputes:    svc,
 		Credentials: creds,
 		Moderation:  moderation,
 		Users:       users,
 		Jobs:        jobConsole,
+		Trail:       trail,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())

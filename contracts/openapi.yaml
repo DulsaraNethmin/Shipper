@@ -178,6 +178,8 @@ paths:
     $ref: './paths/service.yaml#/APIRoot'
   /v1/admin/administrators:
     $ref: './paths/admin.yaml#/AdminAdministrators'
+  /v1/admin/audit:
+    $ref: './paths/admin.yaml#/AdminAudit'
   /v1/admin/jobs:
     $ref: './paths/admin.yaml#/AdminJobs'
   /v1/admin/jobs/{id}:
