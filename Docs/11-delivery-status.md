@@ -491,6 +491,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
+| **SHIP-137** | M5 | The notification consumer — **a service of its own, `cmd/notifier`, rather than a sixth `cmd/worker` task**, because a worker pass *is* a transaction and a consumer must commit its topic offsets strictly after one. `internal/notifications` opens: the routing table, recipient resolution through a `Parties` port `cmd/notifier` fills, and dispatch that reads a channel column and knows nothing about events. Idempotence is `uq_notifications_event_recipient_channel` rather than anything the consumer remembers. **Push is declared and unsendable** — SHIP-139 and SHIP-140 do not exist, so `Rules` writes no push row rather than rows nothing can complete — *see below* |
 | **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
 | **SHIP-148** | M6 | Twelve granular permissions and three role bundles, in a **Go table rather than a grant table** — a permission model is the opposite of the thing `Docs/06` §5.3 puts server-side and changeable. Default-deny at three levels: an omitted role becomes the minimum in Go *and* in the column default, and a role with **no bundle holds nothing**. There is deliberately **no permission to delete an audit entry** — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
@@ -9491,6 +9492,198 @@ The second is the one that matters. `ClaimIDs` is a text check and is satisfied 
 appearing anywhere, so a green run under the first mutation would have proved only that the string
 was present. `Docs/11` §9 records that `internal/bidding`'s equivalent lock has **neither** check;
 this one has both.
+
+### SHIP-137 — a service rather than a sixth task, and the row is what makes a redelivery harmless
+
+`internal/notifications` opens. `cmd/notifier` reads every topic in the catalogue, resolves who has
+to be told, writes one row per person per channel, and dispatches them. M5 goes from 3 of 13 to
+4 of 13.
+
+#### Why it is `cmd/notifier` and not a task in `cmd/worker`
+
+`Docs/09` calls the ticket a "notification consumer service" and `Docs/11` §6 left the shape to the
+lane. Four reasons, in the order they mattered.
+
+**A `cmd/worker` pass *is* a transaction.** `scheduler.go` runs each pass inside `db.InTx` and hands
+the task the transaction. A Kafka consumer must commit its topic offsets strictly **after** the
+database transaction that recorded the messages has committed — a rollback that has already moved
+the offset leaves events nothing recorded and nobody will ever be told about. A `Work` has no
+after-commit hook, and the alternative is to commit offsets inside the pass, which is the version
+that looks fine and loses events in exactly the window `cmd/worker/outbox.go` documents from the
+other side.
+
+**The trigger shape is wrong.** Every registered task claims due rows on a ticker; a consumer blocks
+on a broker.
+
+**Blast radius.** `cmd/worker` is one binary and every start runs every registered task, so a
+consumer registered there would begin reading three topics inside every `scripts/verify` section
+that starts a worker to demonstrate job expiry. §9 lists four occasions that condition has already
+cost this repository. Here it costs nothing: **the registered task set grew by one, not two**, and
+that one is SHIP-119's.
+
+**They scale on different things** — a consumer to the partition count, a sweep to the backlog.
+
+The cost is a second lifecycle, a second signal handler and a second place that opens a pool. Around
+eighty lines, for transaction boundaries that are correct rather than nearly correct.
+
+#### The loop is four steps and the order is the whole design
+
+Fetch a bounded batch without committing; record it in one transaction; **then** commit the offsets;
+then dispatch whatever is pending. Step three after step two is what makes the guarantee
+at-least-once. Step four after step three is `Docs/01` §4.5 — a notification failure must not lose
+the event — because the rows are durable before any channel is touched, so an email provider that is
+down leaves rows at `failed` and the next pass claims them again. `failed` is deliberately not
+terminal, and what bounds the retries is somebody reading `attempts`, which is why that column is
+not a boolean and why SHIP-176 has something to count.
+
+#### Idempotence is a unique index, not something the consumer remembers
+
+`doc.go`'s rule — "delivery is at least once; every consumer is idempotent, because the alternative
+to a duplicate notification is a missing one" — is met by
+`uq_notifications_event_recipient_channel` on `(event_id, recipient_id, channel)` and an
+`ON CONFLICT DO NOTHING`. A redelivered event resolves the same recipients, produces the same
+triples, and writes nothing; two consumer instances racing on one message resolve to one row without
+coordinating. Nothing has to have remembered anything, which is what makes it hold across a restart,
+a rebalance and a redeployment.
+
+The `SELECT`-then-`INSERT` version is the one that looks equivalent and is not: two consumers both
+find nothing, both insert, and one gets the unique violation anyway.
+
+#### Recipients are resolved through a port, which is the third instance of one arrangement
+
+Two thirds of the catalogue answers "who" from the payload — every bid event carries `provider_id`,
+`job.expiry_warned` carries `customer_id` — and the rest does not: `job.status_changed` names only
+an actor, and `delivery.proof_recorded` only a job. That fact is a join of `jobs` and `bids`, two
+domains this one may not import, and `doc.go` says so from the other side: notifications "never
+reaches back into jobs, bidding, or delivery to ask what happened".
+
+So `notifications/ports.go` declares `Parties` and `cmd/notifier/parties.go` supplies the query —
+**exactly** `admin.JobParties`/`jobPartiesLookup` (SHIP-113) and `admin.ExceptionQueue` (SHIP-117),
+written the same way on purpose. `users` is read directly, because it is in the shared migration
+block that `blocks.go` calls "tables every domain reads" and five domains already do.
+
+**The query has a Go test, which is the point of `cmd/notifier/parties_test.go` existing at all.**
+§9 records that `internal/bidding`'s lock lives in `cmd/` where nothing has a database and is
+therefore covered by no Go test — so removing `SKIP LOCKED` from it passes `make check` with zero
+failures. `cmd/api` has had `pgtest` fixtures since SHIP-30 and this binary has them too.
+
+#### The routing table is a table, and an event with no rule fails the build
+
+`Rules` maps each of the thirteen registered event types to a category, an audience set and a
+channel set; `StatusRules` routes `job.status_changed` by the status it moved to. **Most of
+`StatusRules` tells nobody, on purpose**: a job reaching `Awarded` already emitted `bid.accepted`
+and a milestone already emitted `delivery.milestone_recorded`, so routing the status change as well
+would be two messages about one thing. A rule that tells nobody must carry a `Why`, and a test
+refuses one without it — an event silently routed to nobody is indistinguishable from an event
+nobody remembered to route.
+
+`cmd/api/events_notifications_test.go` holds `Rules` against the live catalogue. It is in `cmd/api`
+for the reason `events_golden.txt` is: that is the one binary linking every domain, so it is the
+only place the whole catalogue exists at once. A domain event with no routing rule is an event
+nobody is ever told about and has no other symptom.
+
+**A message the consumer cannot route is logged and skipped rather than failing the pass**, and that
+was a correction. The first version returned `ErrNoRule` and parked the partition, on the reasoning
+that silence should be seen — which on this broker is not hypothetical, because Kafka is shared
+across every worktree with no isolation possible and a topic legitimately carries messages from a
+build with an event this one does not have. One such message would stop every developer's consumer
+at once. The guard belongs where the event is *written*, which is the argument
+`internal/events/catalogue.go` already makes about the dead-letter question.
+
+#### Two suppressions, because nobody should be told what they have just done
+
+`Docs/01` §4.5 says which events generate a notification, not who for, and the obvious reading sends
+a provider an email about their own withdrawal. The actor is suppressed by identifier where the
+event names one (`actor_id` on job and delivery events) and by role where it names only a side
+(`offered_by` on bid events). One rule serves both directions of `bid.countered`, where two would
+have to agree.
+
+#### What SHIP-137 could not do, named rather than narrowed away
+
+- **Push dispatch.** `Docs/01` §4.5 makes push primary. SHIP-139 is the Firebase adapter and
+  SHIP-140 the device token registry, and neither exists — so there is no address a push row could
+  carry. `notifications.Pusher` is declared for SHIP-139 to fill, `cmd/notifier` passes `nil`, the
+  `push` value is in `ck_notifications_channel` so that ticket needs no migration, and `Rules`
+  writes no push row rather than rows nothing can complete.
+- **"Job published".** §4.5 lists it as essential and its audience is *eligible providers* — SHIP-81's
+  query over service areas and vehicle capability, a fleet-domain read this domain may not make and
+  no port here declares. It is not a rendering problem; there is no list of recipients to resolve.
+  `StatusRules["Open"]` says so in its `Why`.
+- **Account verification completed or rejected.** §4.5's first bullet. `internal/identity` emits no
+  events at all — `identity/ports.go` records that as a deliberate scope decision, because inventing
+  `user.registered` would fix a name this ticket has to honour — so there is nothing on a topic to
+  route.
+- **Real copy.** The body is a fixed headline plus the job identifier. SHIP-138 owns templates.
+
+#### SHIP-141 already holds, structurally
+
+The renderer is handed a rule's literal headline and a job identifier. It is never handed the
+payload, it never reads the job, and there is no template slot. So "no address, goods description or
+full customer name in a notification body" is true because there is nowhere for any of the three to
+come from, rather than because a redaction pass removes them. Whatever SHIP-141 replaces this with
+inherits the constraint: the day a renderer takes the job as a parameter is the day the rule becomes
+something a reviewer checks by eye. The verify section gives its job an unmistakable goods
+description and checks the body for it.
+
+The budget invariant is held the same way and in three places: no event in the catalogue carries a
+budget, the `facts` struct the consumer decodes could not hold one, and a reflective test refuses a
+`Notification` field named for it — the shape SHIP-117's `ExceptionEntry` test already uses.
+
+#### The consumer group is a shared-cluster hazard, and `-group` is the fence
+
+A Kafka consumer group is cluster-scoped exactly as a database template name is. Two worktrees
+running `make verify` at once would join `shipper-notifications`, be handed different partitions, and
+each consume the messages the other was asserting on — a false failure on a tree where nothing is
+wrong, which is the shape this harness has now paid for three times. `scripts/verify/81-notifier.sh`
+runs with a per-run group and a deployment runs with no arguments.
+
+**A flag rather than an entry in `internal/config`, and that is a precedent rather than an
+invention**: `cmd/topics -replication` was a flag for exactly this reason, and SHIP-15m later folded
+it into configuration while keeping the flag as an override. This should go the same way when
+somebody is next editing `internal/config` for a reason of their own. **Nothing else was needed from
+`internal/config`**: `Kafka.Brokers`, `Database.*`, `Log.*` and `Env` all already exist.
+
+#### Two defects found while writing the verify section, both in the loop
+
+Neither would have been caught by a unit test, and both are worth recording because they are the
+kind that look right.
+
+**The first fetch was unbounded.** `FetchMessage` on the caller's context blocks until a message
+arrives, so on an idle topic the *dispatch* half never ran — and a notification whose send had failed
+would sit at `failed` until the next unrelated event happened along. On a quiet marketplace that is
+hours, and the row exists precisely so an outage costs a delay rather than a message. Every fetch is
+bounded now and an empty return is ordinary.
+
+**The dispatch loop shadowed its context.** `ctx, cancel := context.WithTimeout(ctx, …)` inside the
+loop meant the second turn read the *cancelled* context, so a backlog drained one batch per pass
+instead of continuously. Renamed to `batchCtx`.
+
+#### The wire format moved
+
+`envelope` was a private struct in `cmd/worker/tasks_outbox.go`. The consumer runs in another binary
+and reads the same shape back, and a wire format with two independent declarations drifts silently —
+a consumer decoding a field the producer renamed gets a zero value rather than an error. It is
+`events.Envelope` now, beside the catalogue that decides what may travel, with `EnvelopeOf` and
+`DecodeEnvelope` as the two ends and the Kafka header names as constants both spell the same way.
+
+#### Mutations
+
+| Mutation | Outcome |
+|---|---|
+| Remove `ON CONFLICT (event_id, recipient_id, channel) DO NOTHING` | **Caught** — the redelivery fails with a unique violation instead of being absorbed |
+| Remove it **and** demote `uq_notifications_event_recipient_channel` to a plain index — a genuinely non-idempotent consumer | **Caught twice** — `TestTheSameEventTwiceWritesNothingTheSecondTime` reports two rows for one event, and `TestOneNotificationPerRecipientPerChannelPerEvent` reports the constraint accepting the duplicate |
+| Drop `AND b.status = 'Accepted'` from `jobPartiesLookup` | **Caught** — both `cmd/notifier` party tests fail, one naming the rejected bidder as the awarded provider |
+
+The second is the one the ticket turns on. At-least-once delivery **guarantees** duplicates rather
+than permitting them, so a consumer with no test for this is not merely untested; it is known-wrong
+on a schedule.
+
+#### Fixture phone range
+
+**Notifications claims `0418x`.** `04180` was already SHIP-134's in `80-notifications.sh`;
+`81-notifier.sh` takes `04181` and `04182`. The allocation is recorded in both section headers,
+because the harness has no other list of them and §9 records that a track lost twenty minutes to
+exactly this once.
 
 ## 4. Partly done — do not treat these as finished
 

@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
@@ -209,30 +208,13 @@ func closeWriter(ctx context.Context, w *kafka.Writer) error {
 // about this function from here is that the producer does not get to decide topics.
 func topicFor(aggregateType string) string { return events.TopicFor(aggregateType) }
 
-// envelope is the wire form of an event.
+// The wire form moved to internal/events at SHIP-137.
 //
-// Self-describing rather than the bare payload, because the identifier a consumer deduplicates
-// on has to survive being read by something that does not also read the headers — and because a
-// message on a topic somebody is debugging should say what it is. The same identifiers are
-// repeated as Kafka headers so a consumer can filter without deserialising the body at all.
-//
-// **SchemaVersion is SHIP-135's, and it is read out of the stored payload rather than looked up in
-// the catalogue.** The distinction matters exactly once, and that once is the case the versioning
-// exists for: a row written before a deployment and drained after one carries the version it was
-// written under, while the catalogue by then holds a different answer. Looking it up here would
-// relabel that row as the newer shape — a stale event accepted as meaning something else, which is
-// the failure internal/pagination's cursor prefix was built against and this is built against too.
-// Zero, omitted from both the envelope and the headers, means the row was written by hand or
-// predates its schema; that is a true statement and a better one than a guess.
-type envelope struct {
-	ID            uuid.UUID       `json:"id"`
-	Type          string          `json:"type"`
-	SchemaVersion int             `json:"schema_version,omitempty"`
-	AggregateType string          `json:"aggregate_type"`
-	AggregateID   uuid.UUID       `json:"aggregate_id"`
-	OccurredAt    time.Time       `json:"occurred_at"`
-	Payload       json.RawMessage `json:"payload"`
-}
+// It was a private `envelope` struct here, declared beside the producer that writes it. SHIP-137's
+// consumer runs in another binary and has to read the same shape back, and a wire format with two
+// independent declarations drifts silently — a consumer decoding a field the producer renamed gets
+// a zero value rather than an error. events.Envelope is now the one declaration, beside the
+// catalogue that decides what may travel, and events.EnvelopeOf is this half of it.
 
 // kafkaEventPublisher is the EventPublisher the worker actually runs with.
 type kafkaEventPublisher struct{ w *kafka.Writer }
@@ -248,31 +230,23 @@ func (p kafkaEventPublisher) Publish(ctx context.Context, batch []events.Event) 
 	for i, e := range batch {
 		version := events.SchemaVersionOf(e.Payload)
 
-		body, err := json.Marshal(envelope{
-			ID:            e.ID,
-			Type:          e.Type,
-			SchemaVersion: version,
-			AggregateType: e.AggregateType,
-			AggregateID:   e.AggregateID,
-			OccurredAt:    e.OccurredAt,
-			Payload:       e.Payload,
-		})
+		body, err := json.Marshal(events.EnvelopeOf(e))
 		if err != nil {
 			return fmt.Errorf("marshalling %s (%s): %w", e.Type, e.ID, err)
 		}
 
 		headers := []kafka.Header{
-			{Key: "event-id", Value: []byte(e.ID.String())},
-			{Key: "event-type", Value: []byte(e.Type)},
-			{Key: "aggregate-type", Value: []byte(e.AggregateType)},
-			{Key: "aggregate-id", Value: []byte(e.AggregateID.String())},
+			{Key: events.HeaderEventID, Value: []byte(e.ID.String())},
+			{Key: events.HeaderEventType, Value: []byte(e.Type)},
+			{Key: events.HeaderAggregateType, Value: []byte(e.AggregateType)},
+			{Key: events.HeaderAggregateID, Value: []byte(e.AggregateID.String())},
 		}
 		if version > 0 {
 			// A consumer routes on this without deserialising the body, which is what
 			// makes "refuse a version I was not built for" a cheap thing to do rather
 			// than a thing everybody skips.
 			headers = append(headers,
-				kafka.Header{Key: "schema-version", Value: []byte(strconv.Itoa(version))})
+				kafka.Header{Key: events.HeaderSchemaVersion, Value: []byte(strconv.Itoa(version))})
 		}
 
 		messages[i] = kafka.Message{
