@@ -87,7 +87,10 @@ notif_job="$(json "$WORKDIR/notif-job.json" '["id"]')"
 # The actor is the platform, so nobody is suppressed: notifications.resolve does not tell somebody
 # what they have just done, and a customer-initiated completion would legitimately reach only the
 # provider.
-notif_event_id="$("$PSQL" "$DATABASE_URL" -tAc "
+# -q as well as -tA: without it psql prints its "INSERT 0 1" command tag on a second line, and
+# `tr -d ' '` then glues it onto the identifier as INSERT01. A SELECT has no tag, which is why every
+# other capture in this harness gets away with -tAc alone.
+notif_event_id="$("$PSQL" "$DATABASE_URL" -tAqc "
 INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
 VALUES (gen_random_uuid(), 'job', '$notif_job', 'job.status_changed',
         jsonb_build_object(
@@ -100,7 +103,7 @@ VALUES (gen_random_uuid(), 'job', '$notif_job', 'job.status_changed',
             'actor_recorded_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ'),
             'server_recorded_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ')),
         now())
-RETURNING id;" | tr -d ' ')"
+RETURNING id;" | tr -d ' ' | head -1)"
 [[ -n "$notif_event_id" ]] || fail "could not write the event the consumer is meant to read"
 ok "a job.status_changed event is in the outbox, about a job whose customer the payload never names"
 
@@ -238,7 +241,7 @@ ok "the body names the job and carries no goods description, address or price"
 # Waiting on a marker rather than on a timeout is the difference between a check and a sleep. There
 # is nothing to wait *for* in the redelivery itself, because the correct outcome is that nothing
 # happens.
-notif_marker_id="$("$PSQL" "$DATABASE_URL" -tAc "
+notif_marker_id="$("$PSQL" "$DATABASE_URL" -tAqc "
 INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
 VALUES (gen_random_uuid(), 'job', '$notif_job', 'job.expiry_warned',
         jsonb_build_object(
@@ -248,7 +251,7 @@ VALUES (gen_random_uuid(), 'job', '$notif_job', 'job.expiry_warned',
             'expires_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ'),
             'warned_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ')),
         now())
-RETURNING id;" | tr -d ' ')"
+RETURNING id;" | tr -d ' ' | head -1)"
 
 publish_outbox "$WORKDIR/notif-republish.log" "$notif_marker_id"
 ok "the same event is republished onto the topic, which is the at-least-once window the outbox names"
