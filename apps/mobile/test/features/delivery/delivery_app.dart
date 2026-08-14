@@ -7,6 +7,11 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+// `Override` is the type of a provider override and is exported from `misc.dart` rather than from
+// the package's main library in Riverpod 3. Named here because these helpers pass a list of them
+// through, which is what lets a test override on the **root** scope instead of wrapping a screen in
+// a second `ProviderScope` — the arrangement `main.dart` explains is not a test of the app at all.
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/user_role.dart';
@@ -34,6 +39,7 @@ Future<void> openDelivery(
   required String jobId,
   UserRole role = UserRole.provider,
   DateTime Function()? nudgeClock,
+  List<Override> overrides = const <Override>[],
 }) async {
   // A phone-shaped surface rather than the 800×600 default, and a tall one: three large buttons
   // and a log of what was recorded should scroll rather than be reported as overflowing.
@@ -44,7 +50,12 @@ Future<void> openDelivery(
   final identity = FakeIdentityRepository()..tokens = aTokenPair(role: role);
 
   await tester.pumpWidget(
-    signupApp(identity, worker: harness.worker, clock: nudgeClock ?? harness.now),
+    signupApp(
+      identity,
+      worker: harness.worker,
+      clock: nudgeClock ?? harness.now,
+      extra: overrides,
+    ),
   );
   await tester.pumpAndSettle();
 
