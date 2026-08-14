@@ -1113,10 +1113,12 @@ Bid:
         answered, only read. `accepted` and `rejected` are the two halves of one award: the offer the
         customer chose, and every offer that was still live on that job when they chose it.
 
-        `expired` waits on the ticket that gives an offer its own terms. `draft` is not written by any
-        endpoint — an offer you send is live when you send it — and `countered` is in the list because
-        Docs/02 §4 names it; nothing writes it, because `superseded` is the one status this platform
-        gives a displaced offer.
+        `expired` is an offer that ran out on its own terms (SHIP-89), and **its terms are the
+        collection time it committed to**: once `pickup_at` has passed, a scheduled sweep closes the
+        offer, because an offer to collect in the past is one nobody can accept. Revise it before then
+        if you still want the work. `draft` is not written by any endpoint — an offer you send is live
+        when you send it — and `countered` is in the list because Docs/02 §4 names it; nothing writes
+        it, because `superseded` is the one status this platform gives a displaced offer.
       example: submitted
     offered_by:
       type: string

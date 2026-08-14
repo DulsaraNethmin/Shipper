@@ -395,6 +395,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-86** | M3 | `POST /v1/jobs/{id}/bids/{bid_id}/withdraw` — the offer becomes `Withdrawn` and the row survives as record. **Idempotent by state rather than by key**, which is stronger than a stored key and is why this endpoint needed neither a column nor a migration — *see below* |
 | **SHIP-87** | M3 | `POST /v1/jobs/{id}/bids/{bid_id}/counter` — **the first endpoint in this domain a customer may call**, and one route for both directions because Docs/02 §4's two sentences describe one act. Each counter is a new row and the offer it answers becomes `Superseded`; a counter inherits the terms it does not restate, which is the choice `000501` deferred to it — *see below* |
 | **SHIP-88** | M3 | The supersede chain — `superseded_by` on the **displaced** row, which is what turns "only the latest valid offer is acceptable" into a column `CHECK` SHIP-92 cannot violate rather than a rule it must remember. Plus `GET …/history`, because a chain nobody can read is not one that remains readable — *see below* |
+| **SHIP-89** | M3 | Bid expiry — **an offer's own terms turn out to be the collection time it committed to**, so the ticket needed no column and `000502`'s prediction that it would is corrected rather than met. The fourth scheduled task, `bid.expired` registered in the same commit as the first row that makes it true, and the tripwire SHIP-136 left in `61-bidding.sh` replaced by the positive assertion — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-92** | M3 | `POST /v1/jobs/{id}/award` — one offer accepted and the job moved, in one transaction, against the lock ordering SHIP-88 wrote down rather than one invented here. **A verb on the job, so the bid travels in the body**, and the one rule no constraint can express — that the offer was live when it was accepted — is the only thing application logic checks. Idempotent by **state**, so it needs no key column and no migration — *see below* |
 | **SHIP-93** | M3 | The rejection sweep — every offer still live on the awarded job becomes `Rejected` in the award's own transaction, and every offer that had **already** closed keeps the status saying how it closed. One `UPDATE` at step 4 of the recorded lock ordering, no `id <> winner` in it, and the refusal order changed so that a second award still answers `conflict` rather than `bidding_bid_closed` — *see below* |
@@ -3779,6 +3780,102 @@ editing one that had already been applied.
 
 No `internal/boundaries` edit, no `Deps` field, and no new port — the chain read uses the
 [Negotiation] seam SHIP-87 introduced, asking `CustomerOf` and deliberately not `AwardableBy`.
+
+### SHIP-89 — an offer's own terms were already stored, and the column `000502` predicted is not there
+
+SHIP-89's *Done when* is "bids expire on their own terms and emit an event". Both halves are done and
+the interesting one is the first, because **the terms turned out to need no new fact**.
+
+`000502`'s header predicted this ticket: "bid expiry 'on their own terms', which needs a column saying
+what those terms are". It does not. **A live offer already names the moment it commits to
+collecting**, and once that instant has passed the offer is one nobody can act on — awarding it would
+commit a provider to collecting in the past, which is exactly what `Offer.validate` refuses on a
+placement and on a revision. So expiry is that same rule read at a later instant rather than a second
+rule with a second source of truth, and it is the shape `Docs/02` §6.3 gives the job the offer hangs
+under: "the earlier of 14 days or the pickup date passing", with the fourteen-day half belonging to
+the job's publication and having no counterpart on an offer.
+
+**The alternative was `bids.expires_at` defaulting to a fixed lifetime — "this quote is good for 48
+hours" — and it is rejected because that is product policy no document has decided.** A column would
+have made the decision by defaulting: whatever value the migration chose would become the rule,
+unargued, in the place nobody re-reads. `pickup_at` is a commitment the provider actually made.
+`000502`'s prediction is therefore corrected rather than met, and the migration comment says so.
+
+**`000503` is an index and nothing else**: `idx_bids_live_expiry`, partial on `status = 'Submitted'`,
+ordered by `pickup_at`. The same trade `idx_jobs_open_expiry` makes — the sweep reads the live market
+rather than every offer the marketplace has ever carried — and `Submitted` is the whole of "live" by
+construction rather than by convention, because `ck_bids_superseded_is_not_live` makes the live offer
+and the head of its chain the same row.
+
+#### What the sweep must not take, which is where the tests are
+
+`Expired` over `Withdrawn`, `Superseded`, `Rejected` or `Accepted` would replace the record of *how*
+an offer ended with the record of *when*, and **no constraint refuses that write** — the same gap
+SHIP-93's sweep documents from the other side. The claim's `status = 'Submitted'` is the only thing
+standing between the sweep and a rewritten history, so there is a case per closed status rather than
+one for the shape, in the domain and again over the wire.
+
+The second omission is `pickup_at IS NOT NULL`. No endpoint can produce such a row, and the column is
+nullable with no constraint saying otherwise — `ck_bids_offer_has_timing` was removed by `000501` and
+§9 still carries it. A claim that relied on a validator holding would sweep a row whose terms it
+cannot read the first time some other writer skipped one.
+
+#### The event, and the tripwire SHIP-136 left on purpose
+
+SHIP-136 registered **no** `bid.expired` schema, on the reasoning that a line in `events_golden.txt`
+describing a payload no code marshals reads as coverage when it is not — and it put an assertion in
+`scripts/verify/61-bidding.sh` that **no bid is `Expired`**, so that the day something wrote the first
+one the run would fail and name this ticket. **That is exactly what happened, and the handoff is now
+closed in both places**: the schema is registered in the same commit as the writer, and the check is
+the positive form — `bid.expired` reaches the outbox from a sweep the section ran through the real
+worker binary, fenced on this run's two providers.
+
+The payload is `bidClosed`, the shape a withdrawal and a rejection already carry. The three are one
+fact from three causes, and the event *type* is what a consumer branches on to decide who to tell.
+
+#### The fourth scheduled task, and what it does to a verify section
+
+`bid-expiry`, in `cmd/worker/tasks_bidding.go` — a file added with **no edit to anything shared**,
+which is the arrangement `manifest.go` set up before there was a second task. Nothing was added to
+`Deps`. One task rather than two, unlike `jobs`': there is no warning to split off, because
+`Docs/02` §6.3 gives the *job* a warning and an extension and an offer has neither — a provider whose
+offer is about to run out revises it.
+
+**It does not reopen SHIP-15r's task-selector decision.** The trigger that section names is "a task
+that sweeps rows due by wall-clock alone, which is the one case fencing cannot cover". This is not
+that task: every offer the API can create is **not due when it is created**, because the validator
+refuses a `pickup_at` that is not in the future, so a section leaves nothing due by writing its
+fixtures the only way the endpoint permits. What it does mean is that a database kept between runs
+accumulates offers whose collection time has since passed, so an assertion about *this* run's
+expiries is fenced on ids.
+
+**`outbox-publisher` is that task, though, and it has been since wave 4.** Writing SHIP-89's verify
+section is where that became concrete. The convention says a section leaves nothing *due* before it
+starts the worker; the outbox publisher has no "not due" state, because **every unpublished row is
+due the moment it is written**. So a worker start in section 61 drains the bid and delivery rows
+`80-notifications.sh` captures by id *before* its own worker start, and that section's `shipper.bid`
+assertion would quietly stop covering anything — the same shape as SHIP-135's section deleting a
+topic another section reads, which the harness resolves by ordering. Ordering cannot help here: this
+is section 61 and that is section 80.
+
+The section therefore points the worker at a broker that is not there, so every outbox pass fails
+legibly and leaves each row claimable — `outboxDrain`'s documented behaviour under an unreachable
+broker rather than a trick, asserted by SHIP-134's own test. The three tasks that matter are claims
+against PostgreSQL and need no broker. **§9 carries the finding**: the convention is sufficient for
+every task that claims what is due, and `outbox-publisher` is not one of them.
+
+#### Shared surfaces
+
+One line in `cmd/api/events_golden.txt`, regenerated rather than typed; one entry in
+`TestEveryEventTypeTheServiceNamesIsRegistered`'s literal list, which is the one place that test
+asks to be edited by whoever adds an event; the status description in
+`contracts/paths/bidding.yaml`, which had said `expired` "waits on the ticket that gives an offer its
+own terms"; and §3's check count, written by `make verify-update`.
+
+**No route, so no `$ref` and no `routes_golden.txt` line** — an expiry is something the platform does
+to an offer rather than something a client asks for. No `internal/boundaries` edit, no `Deps` field on
+either binary, and no new port: the sweep consults none of the three `bidding` already declares, and
+`cmd/worker` passes `nil` for all of them deliberately.
 
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 

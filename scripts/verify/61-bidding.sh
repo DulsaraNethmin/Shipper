@@ -42,10 +42,15 @@
 # No check here signs in, so SHIP-47's per-address bucket (rl:v1:signin:*, shared across sections and
 # across runs from 127.0.0.1) is untouched by this file.
 #
-# Nothing here reads Kafka, and nothing here starts the worker. **The last section does read the
-# outbox** — SHIP-136 gave this domain its events — and it is fenced on the two providers registered
-# below rather than counted over the table, because this database persists between runs. Its rows are
-# left unpublished on purpose, for 80-notifications.sh to drain.
+# Nothing here reads Kafka. **Two of the last three sections do more than send requests**, and both
+# say so where they sit: SHIP-89's starts the real `cmd/worker` binary, and SHIP-136's reads the
+# outbox. Both are fenced on the accounts registered below rather than counted over a table, because
+# this database persists between runs.
+#
+# **The outbox rows this file writes are left unpublished on purpose**, for 80-notifications.sh to
+# drain and read off `shipper.bid`. That is why the worker start in the SHIP-89 section is pointed at
+# a broker that is not there — a drain here would publish them early and quietly empty another
+# section's assertion. The reasoning is written out in full in that section's own header.
 
 # --- the accounts and the job these checks run against -----------------------------------------
 
@@ -1844,6 +1849,215 @@ ok "the database holds exactly one accepted offer and nothing still live, which 
 ok "and the job was moved to Awarded exactly once, through the guarded transition"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-89  a bid expires on its own terms, and the sweep is the real worker binary"
+
+# Docs/01 §4.2 bounds a provider's three verbs "until it is accepted or expires", and SHIP-89 is
+# what makes the second half true. **An offer's own terms are the collection time it committed
+# to**: once `pickup_at` has passed, awarding the offer would commit a provider to collecting in
+# the past, which is what the placement validator already refuses. Migration 000503 argues down the
+# alternative — a `bids.expires_at` with a fixed lifetime — and internal/bidding/expiry.go carries
+# the reasoning.
+#
+# # What is demonstrated here and what is demonstrated by tests
+#
+# internal/bidding/expiry_test.go holds which offers are due, the event, and every closed status
+# the sweep must leave alone. cmd/worker/tasks_bidding_test.go holds the pass: the registration,
+# the claim, two workers dividing the work, and a failed pass releasing everything.
+#
+# **What only this can show is the real binary sweeping rows the served API wrote**, and the
+# consequence a client meets afterwards — an expired offer that can be neither revised nor awarded,
+# through the same endpoints that would have taken it an hour earlier.
+#
+# # Two rules from the harness header apply, and the second one is where this section had to think
+#
+# **Fence what you assert on.** Every query below names a bid or a job this section created. This
+# database persists between runs, so a count over `bids WHERE status = 'Expired'` would include
+# every earlier run's sweep.
+#
+# **Own what you assert about.** cmd/worker is one binary and a start runs *every* registered task,
+# so this start also runs `job-expiry`, `job-expiry-warning` and `outbox-publisher`. The two job
+# sweeps are safe by construction: both jobs below are published with no pickup window, so 000406
+# gives them the fourteen-day backstop and neither is due nor inside the warning window.
+#
+# **`outbox-publisher` is not**, and that is worth stating rather than working around silently.
+# 80-notifications.sh reads the bid and delivery rows this file and 70-delivery.sh deliberately
+# leave unpublished, captured by id *before* its own worker start. A drain here would publish them
+# early and that section's `shipper.bid` assertion would quietly stop covering anything — the same
+# shape as SHIP-135's section deleting a topic another section reads, which the harness resolves by
+# ordering. Ordering cannot help here: this is section 61 and that is section 80.
+#
+# So the worker below is pointed at a broker that is not there. Every outbox pass then fails
+# legibly and leaves each row claimable, which is `outboxDrain`'s documented behaviour under an
+# unreachable broker rather than a trick — SHIP-134's own test asserts it. The three tasks that
+# matter here are claims against PostgreSQL and need no broker at all.
+#
+# **The finding behind that paragraph belongs in Docs/11 §9 rather than only here.** SHIP-15r's
+# convention says a section leaves nothing *due*; `outbox-publisher` has no "not due" state,
+# because every unpublished row is due the moment it is written. It is already the case §9 named as
+# the reopening trigger, and it has been since wave 4.
+
+bid_expiry_pickup="$(date -u -v+2d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '+2 days' '+%Y-%m-%dT%H:%M:%SZ')"
+bid_expiry_deliver="$(date -u -v+3d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '+3 days' '+%Y-%m-%dT%H:%M:%SZ')"
+bid_expiry_body="{\"amount_cents\":51000,\"pickup_at\":\"$bid_expiry_pickup\",\"deliver_by\":\"$bid_expiry_deliver\"}"
+
+# new_bid_job <name> — one Open job of this section's own, with no pickup window.
+#
+# No window on purpose: 000406 then gives the job the fourteen-day backstop rather than a deadline
+# two days out, which is what keeps the two job sweeps in the same binary away from it.
+new_bid_job() {
+  local status
+  status="$(bid_post "$bid_customer_token" "verify-bid-expiry-job-$1-$$" /v1/jobs \
+    '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+      "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+      "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+      "budget_cents":432199}' "expiry-job-$1")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-expiry-job-$1.json"; fail "creating the $1 job returned $status"; }
+  local id
+  id="$(json "$WORKDIR/bid-expiry-job-$1.json" '["id"]')"
+  move_job "$id" Draft Open
+  printf '%s' "$id"
+}
+
+# age_offer <bid> — move an offer's collection time an hour into the past.
+#
+# Written with SQL because **no endpoint can produce a due offer**: the validator refuses a
+# `pickup_at` that is not in the future, on a placement and on a revision alike. That refusal is
+# the reason this sweep is safe to register at all, and it is also why a section demonstrating the
+# sweep has to age a row rather than write one. `deliver_by` moves with it, because
+# ck_bids_timing_is_ordered wants delivery after collection.
+age_offer() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+    "update bids set pickup_at = now() - interval '1 hour', deliver_by = now() + interval '7 hours'
+       where id = '$1';"
+}
+
+bid_expiry_job="$(new_bid_job due)"
+bid_untouched_job="$(new_bid_job live)"
+
+status="$(bid_post "$bid_provider_token" "verify-bid-expiry-due-$$" \
+  "/v1/jobs/$bid_expiry_job/bids" "$bid_expiry_body" expiry-due)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-expiry-due.json"; fail "placing the offer to expire returned $status"; }
+bid_expiry_due="$(json "$WORKDIR/bid-expiry-due.json" '["id"]')"
+
+status="$(bid_post "$bid_rival_token" "verify-bid-expiry-gone-$$" \
+  "/v1/jobs/$bid_expiry_job/bids" "$bid_expiry_body" expiry-gone)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-expiry-gone.json"; fail "placing the offer to withdraw returned $status"; }
+bid_expiry_gone="$(json "$WORKDIR/bid-expiry-gone.json" '["id"]')"
+
+status="$(bid_post "$bid_rival_token" "verify-bid-expiry-live-$$" \
+  "/v1/jobs/$bid_untouched_job/bids" "$bid_expiry_body" expiry-live)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-expiry-live.json"; fail "placing the live offer returned $status"; }
+bid_expiry_live="$(json "$WORKDIR/bid-expiry-live.json" '["id"]')"
+
+# Withdrawn *before* it is aged, so the sweep meets a closed offer whose collection time has also
+# passed. That is the case with no constraint behind it: nothing in the schema refuses `Expired`
+# over `Withdrawn`, and overwriting it would replace the record of *how* the offer ended with the
+# record of when.
+status="$(bid_post "$bid_rival_token" "verify-bid-expiry-wdraw-$$" \
+  "/v1/jobs/$bid_expiry_job/bids/$bid_expiry_gone/withdraw" '{}' expiry-withdraw)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-expiry-withdraw.json"; fail "withdrawing returned $status"; }
+
+age_offer "$bid_expiry_due"
+age_offer "$bid_expiry_gone"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where id in ('$bid_expiry_due', '$bid_expiry_gone', '$bid_expiry_live')
+     and status in ('Submitted', 'Withdrawn');")" == "3" ]] \
+  || fail "the expiry fixture is not in the state the sweep is about to be judged on"
+
+pushd "$ROOT/services/core" >/dev/null
+go build -o "$WORKDIR/shipper-worker-bids" ./cmd/worker
+popd >/dev/null
+ok "the worker builds with the bidding domain's task registered"
+
+# KAFKA_BROKERS names a port nothing listens on, deliberately — see the note above. The outbox pass
+# fails and leaves every row claimable for 80-notifications.sh; the three claim-based tasks run
+# normally.
+SHIPPER_ENV=development \
+LOG_FORMAT=json \
+LOG_LEVEL=debug \
+DATABASE_URL="$DATABASE_URL" \
+REDIS_URL="$REDIS_URL" \
+KAFKA_BROKERS=localhost:1 \
+  "$WORKDIR/shipper-worker-bids" >"$WORKDIR/worker-bids.log" 2>&1 &
+bid_worker_pid=$!
+
+for _ in $(seq 1 100); do
+  bid_expiry_status="$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$bid_expiry_due';")"
+  [[ "$bid_expiry_status" == "Expired" ]] && break
+  sleep 0.2
+done
+
+kill -TERM "$bid_worker_pid" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  kill -0 "$bid_worker_pid" 2>/dev/null || break
+  sleep 0.2
+done
+wait "$bid_worker_pid" 2>/dev/null || true
+
+[[ "$bid_expiry_status" == "Expired" ]] \
+  || { cat "$WORKDIR/worker-bids.log"; fail "the offer past its collection time is $bid_expiry_status after a pass, want Expired"; }
+ok "one pass of the real worker expires the offer whose collection time has passed"
+
+grep -q '"task":"bid-expiry"' "$WORKDIR/worker-bids.log" \
+  || { cat "$WORKDIR/worker-bids.log"; fail "the bidding domain's task did not register in the manifest"; }
+ok "and it is registered as bid-expiry, the fourth task in a binary that runs all of them"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$bid_expiry_live';")" == "Submitted" ]] \
+  || fail "the sweep took an offer collecting in two days"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$bid_expiry_gone';")" == "Withdrawn" ]] \
+  || fail "the sweep wrote Expired over a withdrawn offer, replacing the record of how it ended"
+ok "it leaves alone an offer that is not yet due, and one that has already closed some other way"
+
+# The event, fenced on the one bid rather than counted over the topic or the table.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+    where aggregate_type = 'bid' and aggregate_id = '$bid_expiry_due' and event_type = 'bid.expired';")" == "1" ]] \
+  || fail "the expiry emitted no bid.expired event, which is the half of SHIP-89's Done when nothing else here would catch"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select payload->>'status' from outbox
+    where aggregate_type = 'bid' and aggregate_id = '$bid_expiry_due' and event_type = 'bid.expired';")" == "Expired" ]] \
+  || fail "the bid.expired payload does not carry the status the row now has"
+ok "and it emits bid.expired from the domain, in the transaction that wrote the status"
+
+# What a client meets afterwards. Both refusals go through [Status.live], so neither names expiry —
+# which is the point: an expired offer is over in exactly the way a withdrawn or superseded one is.
+status="$(curl -s -X PATCH -o "$WORKDIR/bid-expiry-revise.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" -H "Idempotency-Key: verify-bid-expiry-revise-$$" \
+  -H 'Content-Type: application/json' -d '{"amount_cents":40000}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$bid_expiry_job/bids/$bid_expiry_due")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-expiry-revise.json"; fail "revising an expired offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-expiry-revise.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || fail "revising an expired offer answered $(json "$WORKDIR/bid-expiry-revise.json" '["error"]["code"]')"
+
+status="$(bid_post "$bid_customer_token" "verify-bid-expiry-award-$$" \
+  "/v1/jobs/$bid_expiry_job/award" "{\"bid_id\":\"$bid_expiry_due\"}" expiry-award)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/bid-expiry-award.json"; fail "awarding an expired offer returned $status, want 409"; }
+[[ "$(json "$WORKDIR/bid-expiry-award.json" '["error"]["code"]')" == "bidding_bid_closed" ]] \
+  || fail "awarding an expired offer answered $(json "$WORKDIR/bid-expiry-award.json" '["error"]["code"]')"
+ok "an expired offer can be neither revised nor awarded, and both refusals are the closed-offer code"
+
+# The wire form, read through the endpoint a provider actually has for it.
+status="$(curl -s -o "$WORKDIR/bid-expiry-history.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$bid_expiry_job/bids/$bid_expiry_due/history")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-expiry-history.json"; fail "reading the history returned $status"; }
+[[ "$(json "$WORKDIR/bid-expiry-history.json" '["data"][0]["status"]')" == "expired" ]] \
+  || fail "the expired offer reads as $(json "$WORKDIR/bid-expiry-history.json" '["data"][0]["status"]') on the wire"
+ok "and it reads as \"expired\" in the lower snake case Docs/10 §4.7 requires"
+
+# uq_bids_one_submitted_per_provider_per_job is partial on Submitted, so an expired offer leaves the
+# predicate — which is what 000502 predicted this ticket would need and why it needed no change to
+# the constraint. The same property a withdrawal has had since SHIP-86.
+status="$(bid_post "$bid_provider_token" "verify-bid-expiry-again-$$" \
+  "/v1/jobs/$bid_expiry_job/bids" "$bid_expiry_body" expiry-again)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-expiry-again.json"; fail "bidding again after an expiry returned $status, want 201"; }
+ok "and the provider whose offer expired may place another, exactly as a withdrawal frees them to"
+
+unset bid_expiry_pickup bid_expiry_deliver bid_expiry_body bid_expiry_status bid_worker_pid
+unset -f new_bid_job age_offer
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-136  every bid state change emits its event from the domain, into the outbox"
 
 # Docs/01 §4.5: "new bid, counter-offer, withdrawal, or bid expiry" and "bid accepted".
@@ -1886,13 +2100,21 @@ for bid_event in bid.placed bid.revised bid.withdrawn bid.countered bid.accepted
 done
 ok "a placement, a revision, a withdrawal, a counter, an award and its rejection sweep each emitted their event"
 
-# Deliberately absent, and said out loud rather than left as a gap somebody reads as coverage:
-# `bid.expired`. Nothing in this platform writes 'Expired' — SHIP-89's scheduled task is the ticket
-# that starts, and its *Done when* already names the event.
+# **The sixth line of Docs/01 §4.5's bid list, and the handoff SHIP-136 left working.** This used to
+# be the opposite assertion — that no bid is 'Expired' — placed here so that the day something wrote
+# the first one it would fail and name SHIP-89. That is exactly what happened, and the check is now
+# the positive form: the fourth event type reaches the outbox from a sweep the section above ran
+# through the real worker binary.
+#
+# Fenced by the same two providers as the loop above rather than counted over `bids`, because this
+# database persists between runs and every earlier run's sweep is still in the table.
+[[ "$(bid_events_of bid.expired)" -ge 1 ]] \
+  || fail "no bid.expired reached the outbox, and the SHIP-89 section above expired an offer through the worker"
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
-  "select count(*) from bids where status = 'Expired';")" == "0" ]] \
-  || fail "something wrote an Expired bid, so bid.expired is now a state change with no event (SHIP-89)"
-ok "and bid.expired is not among them because no bid expires yet — SHIP-89 owns that pair"
+  "select count(*) from bids
+     where provider_id in ('$bid_provider_id', '$bid_rival_id') and status = 'Expired';")" -ge 1 ]] \
+  || fail "no offer of this run's is Expired, so the check above is asserting against an older run"
+ok "and bid.expired is among them, from the scheduled sweep rather than from an endpoint"
 
 # The aggregate is the bid, which is what makes one offer's events ordered against each other on the
 # topic. An event whose payload named a different row from its aggregate id would key onto the wrong

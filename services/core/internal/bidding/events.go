@@ -19,16 +19,15 @@ import (
 // half for — the catalogue is a table it holds, not a list it writes, and a domain declares its own
 // events in the same way it declares its own routes and its own ports.
 //
-// # Docs/01 §4.5's bid line is "new bid, counter-offer, withdrawal, or bid expiry", and this covers
-// three of the four
+// # Docs/01 §4.5's bid line is "new bid, counter-offer, withdrawal, or bid expiry", and all four
+// are here since SHIP-89
 //
-// A placement, a counter and a withdrawal all emit here. **Bid expiry does not, because no bid
-// expires**: [StatusExpired] is declared, `ck_bids_status` accepts it, and nothing in this platform
-// writes it — SHIP-89's scheduled task is the ticket that starts, and its *Done when* already reads
-// "bids expire on their own terms and emit an event". A schema registered here for an event nothing
-// emits would put a line in cmd/api/events_golden.txt describing a payload no code marshals, which
-// is the sort of thing that reads as covered when it is not. Docs/11 §3 records it rather than the
-// catalogue implying it.
+// A placement, a counter, a withdrawal and an expiry all emit here. **The fourth arrived last and
+// deliberately so.** SHIP-136 registered no `bid.expired` schema, because [StatusExpired] was
+// declared and `ck_bids_status` accepted it and nothing in this platform wrote it — a line in
+// cmd/api/events_golden.txt describing a payload no code marshals is the sort of thing that reads
+// as covered when it is not. SHIP-89's sweep is the writer, and the schema landed with it in the
+// same commit rather than ahead of it.
 //
 // Two more are emitted that §4.5 does not name in the bid line, and both are its "bid accepted"
 // sentence read to its end: [EventBidAccepted] for the offer the customer chose, and
@@ -100,6 +99,21 @@ const (
 	// EventBidAccepted is the offer the customer awarded (SHIP-92).
 	EventBidAccepted = "bid.accepted"
 
+	// EventBidExpired is an offer that ran out on its own terms (SHIP-89).
+	//
+	// **The fourth of Docs/01 §4.5's bid line, and the one this file recorded as missing.** The
+	// paragraph above used to say a schema registered for an event nothing emits "reads as
+	// covered when it is not"; SHIP-89 writes the first 'Expired' row, so the schema and the
+	// writer arrive together. `scripts/verify/61-bidding.sh` carried the other half of that
+	// handoff — an assertion that no bid is 'Expired' — and it now proves the expiry instead of
+	// its absence.
+	//
+	// Its payload is [bidClosed], the same shape a withdrawal and a rejection carry, because the
+	// three are one fact from three causes: an offer that is over, and the status saying how.
+	// The **event type** is what a consumer branches on to decide who to tell, which is the
+	// argument [bidClosed] already makes for carrying the status as well.
+	EventBidExpired = "bid.expired"
+
 	// EventBidRejected is an offer closed because the job was awarded elsewhere (SHIP-93).
 	//
 	// One per closed offer rather than one event listing them, because each names a different
@@ -133,6 +147,13 @@ func init() {
 
 	events.Register(events.Schema{
 		Type:      EventBidWithdrawn,
+		Aggregate: events.AggregateBid,
+		Version:   1,
+		Payload:   bidClosed{},
+	})
+
+	events.Register(events.Schema{
+		Type:      EventBidExpired,
 		Aggregate: events.AggregateBid,
 		Version:   1,
 		Payload:   bidClosed{},
@@ -276,7 +297,7 @@ func (s *Service) emitCountered(ctx context.Context, r db.Runner, counter Bid, s
 	})
 }
 
-// emitClosed writes [EventBidWithdrawn] or [EventBidRejected].
+// emitClosed writes [EventBidWithdrawn], [EventBidExpired] or [EventBidRejected].
 func (s *Service) emitClosed(ctx context.Context, r db.Runner, eventType string, b Bid) error {
 	return s.emit(ctx, r, eventType, b.ID, b.UpdatedAt, bidClosed{
 		BidID:      b.ID.String(),

@@ -164,12 +164,13 @@ func TestEveryEventTypeTheServiceNamesIsRegistered(t *testing.T) {
 	want := []string{
 		"job.status_changed", "job.expiry_warned", "job.expiry_extended",
 
-		// SHIP-136. `bid.expired` is deliberately absent: bidding.StatusExpired is declared and
-		// nothing writes it, and SHIP-89's scheduled task is the ticket that both starts writing
-		// it and emits its event. A schema registered here for an event nothing emits would put a
-		// line in the golden file describing a payload no code marshals, which reads as covered.
+		// SHIP-136, and `bid.expired` from SHIP-89. That one was deliberately absent for a
+		// wave: bidding.StatusExpired was declared and nothing wrote it, and a schema
+		// registered for an event nothing emits puts a line in the golden file describing a
+		// payload no code marshals — which reads as covered when it is not. The scheduled
+		// sweep is the writer, and the schema landed in the same commit as the first row.
 		"bid.placed", "bid.revised", "bid.withdrawn",
-		"bid.countered", "bid.accepted", "bid.rejected",
+		"bid.countered", "bid.accepted", "bid.rejected", "bid.expired",
 
 		"delivery.driver_assigned", "delivery.milestone_recorded", "delivery.proof_recorded",
 	}

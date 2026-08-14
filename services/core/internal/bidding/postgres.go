@@ -346,6 +346,52 @@ func (postgresStore) withdrawBid(ctx context.Context, r db.Runner, id uuid.UUID)
 	return bid, nil
 }
 
+// expireBid moves an offer past its own collection time to Expired (SHIP-89).
+//
+// # It is a compare-and-set, and the deadline is inside the `WHERE` rather than in the caller
+//
+// `status = 'Submitted' AND pickup_at IS NOT NULL AND pickup_at <= $3` is the claim's predicate
+// written a second time, which is deliberate and is the one redundancy in this file that has a
+// mutation behind it. `cmd/worker` chooses *which* rows to sweep; this refuses to expire a row
+// that is not due whichever query found it. Delete the deadline from
+// [ExpiryClaim] and this statement matches nothing, so the pass reports a row it could not expire
+// rather than quietly killing every live offer on the marketplace.
+//
+// `superseded_by IS NULL` is redundant against `ck_bids_superseded_is_not_live` — a displaced row
+// cannot be 'Submitted' — and is written for [postgresStore.acceptBid]'s reason: a displaced offer
+// should *match nothing* rather than raise a constraint violation that aborts the pass's
+// transaction and releases every other claimed row with it.
+//
+// The status is a parameter rather than a literal so the value comes from [StatusExpired] — Docs/02
+// §4's own string, held to `ck_bids_status` by TestEveryBidStatusConstraintMatchesTheGoConstants —
+// rather than from a second spelling of it in SQL. `updated_at` is left to `bids_set_updated_at`
+// (000500), which is what makes "this pass moved it" observable.
+func (postgresStore) expireBid(
+	ctx context.Context,
+	r db.Runner,
+	id uuid.UUID,
+	now time.Time,
+) (Bid, bool, error) {
+	const q = `
+		UPDATE bids
+		SET status = $2
+		WHERE id = $1
+		  AND status = $4
+		  AND superseded_by IS NULL
+		  AND pickup_at IS NOT NULL
+		  AND pickup_at <= $3
+		RETURNING ` + bidColumns
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id, string(StatusExpired), now, string(StatusSubmitted)))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Bid{}, false, nil
+	case err != nil:
+		return Bid{}, false, fmt.Errorf("bidding: expiring bid %s: %w", id, err)
+	}
+	return bid, true, nil
+}
+
 // supersedeHead moves the offer being answered out of the live predicate (SHIP-87).
 //
 // # It is a compare-and-set, and the WHERE clause is the whole of that
