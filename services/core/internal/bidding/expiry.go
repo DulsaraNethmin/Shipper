@@ -136,5 +136,13 @@ func (s *Service) Expire(ctx context.Context, r db.Runner, bidID uuid.UUID) (Bid
 	if err := s.emitClosed(ctx, r, EventBidExpired, expired); err != nil {
 		return Bid{}, err
 	}
+
+	// The job, last (SHIP-90). Docs/02 §2's `Negotiating → Open` names three causes and this is
+	// the first of them: "all active bids **expire**, are withdrawn, or are rejected". The job row
+	// is taken without waiting — see [Presentation.LeaveNegotiation] — which is what keeps a sweep
+	// holding claimed `bids` rows out of a deadlock with an award holding the `jobs` row.
+	if err := s.leaveNegotiationIfEmpty(ctx, r, expired.JobID); err != nil {
+		return Bid{}, err
+	}
 	return expired, nil
 }

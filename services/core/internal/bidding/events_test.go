@@ -556,5 +556,5 @@ func TestNewServiceRefusesAMissingSink(t *testing.T) {
 	}()
 
 	c := newTestService().clock
-	NewService(nil, nil, nil, nil, c)
+	NewService(nil, nil, nil, nil, nil, c)
 }

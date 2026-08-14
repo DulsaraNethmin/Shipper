@@ -104,7 +104,18 @@ forget_the_cached_response() {
 # SHIP-63's publish endpoint does not exist yet, so the guard is satisfied directly rather than
 # bypassed. The same helper 60-fleet.sh defines, with this section's customer as the actor — repeated
 # rather than reused so that neither file's fixture can be broken by an edit to the other's.
+#
+# **`<from>` may be `-`, meaning "wherever it is now" (SHIP-90).** Every call in this file named its
+# own `from` and every one of them was right until offers started moving jobs to Negotiating; after
+# that a fixture closing a job it had already bid on failed inside the helper, on a guard message
+# about a history row, which is a long way from the cause. A call that is arranging a job *before*
+# any offer exists still names the status, because there the `from` is the point.
 move_job() {
+  local from="$2"
+  if [[ "$from" == "-" ]]; then
+    from="$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$1';" | tr -d ' ')"
+  fi
+  set -- "$1" "$from" "$3"
   "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<SQL
 DO \$do\$
 DECLARE entry uuid := gen_random_uuid();
@@ -371,7 +382,7 @@ ok "a customer is refused, including the customer who owns the job"
 # A job that exists and is no longer biddable answers exactly what a job that never existed answers.
 # 403 would confirm the job is there, and what became of work a provider was not given is not
 # something this API discloses.
-move_job "$bid_job_id" Open Cancelled
+move_job "$bid_job_id" - Cancelled
 status="$(bid_post "$bid_rival_token" "verify-bid-closed-$$" "/v1/jobs/$bid_job_id/bids" "$bid_body" closed)"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/bid-closed.json"; fail "a bid on a cancelled job returned $status, want 404"; }
 
@@ -397,37 +408,50 @@ status="$(bid_post "$bid_rival_token" "verify-bid-unverified-$$" "/v1/jobs/$retr
 ok "an unverified provider is refused — the eligibility filter is SHIP-81's, read through a port rather than copied"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-84  Docs/02 §1 makes two statuses biddable, and both are exercised"
+ticket "SHIP-90  a job with active offers presents as Negotiating, without closing to new bids"
 
-# **Negotiating remains open to eligible bids.** Docs/02 §1: "'Negotiating' is a useful presentation
-# status. Technically, the job remains available for eligible bids unless the customer closes it or
-# awards a bid."
+# SHIP-90's *Done when*, and the second half is the ticket. Docs/02 §1: "'Negotiating' is a useful
+# presentation status. Technically, the job remains available for eligible bids unless the customer
+# closes it or awards a bid."
 #
-# Nothing can reach Negotiating until SHIP-90, so a filter accepting only Open would pass every other
-# check in this file and surface months from now as jobs silently refusing bids the moment somebody
-# negotiated. The status is set here directly because no endpoint can yet.
-move_job "$retry_job" Open Negotiating
+# $retry_job has carried the retry section's offer since above, so it is already at Negotiating — put
+# there by the platform when that offer was placed, rather than by `move_job` as this check used to
+# do. **The status is read before anything else here**, because a filter accepting only Open would
+# pass every other check in this file and surface months from now as jobs silently refusing bids the
+# moment somebody negotiated.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$retry_job';")" == "Negotiating" ]] \
+  || fail "the job is $("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$retry_job';") after an offer was placed on it, want Negotiating"
+ok "an offer moved the job to Negotiating, and nothing in this file asked it to"
 
 status="$(bid_post "$bid_rival_token" "verify-bid-negotiating-$$" "/v1/jobs/$retry_job/bids" "$bid_body" negotiating)"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/bid-negotiating.json"; fail "a Negotiating job refused a bid ($status). Docs/02 §1 keeps it open to eligible bids."; }
-ok "a job at Negotiating still accepts a bid from an eligible provider"
+ok "and a second eligible provider still bids on it — Negotiating does not close a job to offers"
+
+# The move is the platform's and it went through the guard, which is the half a status read cannot
+# see: 000402 refuses a status write with no job_status_history row describing it, so a move made any
+# other way would have failed rather than arrived quietly.
+negotiating_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select from_status || ' ' || actor_type || ' ' || (actor_id is null)::text || ' ' || (reason is not null)::text
+     from job_status_history where job_id = '$retry_job' and to_status = 'Negotiating';")"
+[[ "$negotiating_row" == "Open system true true" ]] \
+  || fail "the recorded move is '$negotiating_row', want 'Open system true true' — the platform, with no account behind it and a reason"
+ok "recorded through the SHIP-57 guard as the platform, with a reason a customer's timeline can show"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-84  placing a bid does not move the job — Open → Negotiating is SHIP-90's"
+ticket "SHIP-90  a second offer does not move the job again, and a rival's offer keeps it there"
 
-# $second_job has carried two live offers since the privacy section above. A job with active bids
-# presents as Negotiating in Docs/02 §1, and moving it there is **SHIP-90's** ticket, which depends on
-# SHIP-87 and SHIP-57. It is deliberately not done here: a bid is not a status transition, so it
-# leaves no job_status_history row either — and the history count is the half that would catch a move
-# made through some other path.
+# $second_job has carried two live offers since the privacy section above. Docs/02 §2 says "**first**
+# bid or counter-offer submitted", and the word is load-bearing: Docs/02 §2 has no
+# `Negotiating → Negotiating` row and the guarded transition refuses one, so a platform moving the job
+# per bid would fail on the second offer rather than ignore it.
 after="$("$PSQL" "$DATABASE_URL" -tAc \
   "select j.status || ' ' || (select count(*) from bids where job_id = j.id)::text || ' '
           || (select count(*) from job_status_history where job_id = j.id)::text
      from jobs j where j.id = '$second_job';")"
-[[ "$after" == "Open 2 1" ]] \
-  || fail "the job reads '$after' (status, bids, history rows), want 'Open 2 1' — two offers must leave it Open with only its Draft → Open row"
-ok "a job with two live offers is still Open, with no history row beyond the one that published it"
+[[ "$after" == "Negotiating 2 2" ]] \
+  || fail "the job reads '$after' (status, bids, history rows), want 'Negotiating 2 2' — two offers, and one move rather than two"
+ok "two live offers leave the job at Negotiating with exactly one move recorded, not one per bid"
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-84  price and timing are required, and every bad field is named at once"
@@ -737,15 +761,30 @@ ok "a provider who withdrew may place a new offer — a fat-fingered price is no
   || fail "the withdrawn offer did not survive alongside the replacement"
 ok "and both rows stand — the withdrawn one as record, the new one as the live offer"
 
-# Neither verb is a job transition. Docs/02 §2 has `Negotiating → Open` on bids being withdrawn, and
-# that is SHIP-90's in both directions; the history count is the half that would catch a move made
-# through some other path.
-after="$("$PSQL" "$DATABASE_URL" -tAc \
-  "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
-     from jobs j where j.id = '$revise_job';")"
-[[ "$after" == "Open 1" ]] \
-  || fail "the job reads '$after' (status, history rows), want 'Open 1' — revising and withdrawing move no job"
-ok "the job is still Open with only the row that published it — Negotiating is SHIP-90's, both ways"
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-90  the last offer leaving returns the job to Open, and the next one moves it back"
+
+# Docs/02 §2's second presentation row: `Negotiating → Open` on "all active bids expire, are
+# withdrawn, or are rejected". $revise_job has now been round the whole loop through real endpoints
+# and nothing else — published, offered on, revised, withdrawn, offered on again — so its history is
+# the round trip written down.
+#
+# **Read as the ordered list rather than as a count**, because a count would pass on a job that
+# moved to Negotiating twice and never came back. A revision is deliberately absent from it: it
+# neither adds a live offer nor removes one, so the job's standing cannot have changed.
+round_trip="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(from_status || '->' || to_status, ' ' order by actor_recorded_at, id)
+     from job_status_history where job_id = '$revise_job';")"
+[[ "$round_trip" == "Draft->Open Open->Negotiating Negotiating->Open Open->Negotiating" ]] \
+  || fail "the job's history is '$round_trip', want 'Draft->Open Open->Negotiating Negotiating->Open Open->Negotiating'"
+ok "an offer moves the job to Negotiating, withdrawing the last one returns it to Open, and the next moves it back"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history
+     where job_id = '$revise_job' and to_status = 'Open' and from_status = 'Negotiating'
+       and actor_type = 'system' and actor_id is null and reason is not null;")" == "1" ]] \
+  || fail "the return to Open was not recorded as the platform with a reason"
+ok "and the return is the platform's too — nobody asked for it, the last live offer simply left"
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-87  POST /v1/jobs/{id}/bids/{bid_id}/counter — either party answers the other's offer"
@@ -1033,17 +1072,22 @@ ok "one new link at the end of all three — the key is a column, not only a cac
 ok "a provider's counter at the head of the chain is awardable — the customer waits for the offer rather than awarding their own"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-87  countering does not move the job — Open → Negotiating is still SHIP-90's"
+ticket "SHIP-90  a counter moves nothing, because the offer it answers already did"
 
-# Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted", which reads like
-# an instruction to this ticket more than it did to SHIP-84. It is SHIP-90's, which depends on this
-# one. The history count is the half that catches a move made through some other path.
+# Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted", and the second
+# half of that sentence reads like an instruction to the counter endpoint. It is not one, and the
+# reason is "first": a counter answers a *live* offer, and a live offer is one a placement wrote — so
+# the job moved when that placement happened and there is nothing left for a counter to do. A counter
+# does not end the negotiation either: it supersedes one live offer and inserts another.
+#
+# Five rounds, and exactly one move: the history count is the half that catches a move made and then
+# reversed through some other path.
 after="$("$PSQL" "$DATABASE_URL" -tAc \
   "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
      from jobs j where j.id = '$counter_job';")"
-[[ "$after" == "Open 1" ]] \
-  || fail "the job reads '$after' (status, history rows), want 'Open 1' — a counter moves no job"
-ok "a job with five rounds of negotiation on it is still Open, with only the row that published it"
+[[ "$after" == "Negotiating 2" ]] \
+  || fail "the job reads '$after' (status, history rows), want 'Negotiating 2' — its publication and the one move the first offer made"
+ok "a job with five rounds of negotiation on it has moved exactly once, and that was the first offer"
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-88  GET /v1/jobs/{id}/bids/{bid_id}/history — the full chain stays readable"
@@ -1155,7 +1199,7 @@ ok "a competing provider cannot read it at all — a whole negotiation in one re
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-88  the record outlives the job, and a chain cannot fork"
 
-move_job "$counter_job" Open Cancelled
+move_job "$counter_job" - Cancelled
 
 status="$(bid_get "$bid_customer_token" "$history_path" histover)"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/bid-histover.json"; fail "the history on a cancelled job returned $status"; }
@@ -1206,6 +1250,11 @@ award_stranger_token="$(mint_token "$(json "$WORKDIR/award-stranger.json" '["id"
 # move_job writes `$bid_customer_id` as the actor, so the award job needs its own mover: a history row
 # attributing this customer's publication to a different account would be a fixture that lies.
 move_award_job() {
+  local from="$2"
+  if [[ "$from" == "-" ]]; then
+    from="$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$1';" | tr -d ' ')"
+  fi
+  set -- "$1" "$from" "$3"
   "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<SQL
 DO \$do\$
 DECLARE entry uuid := gen_random_uuid();
@@ -1295,14 +1344,15 @@ ok "the customer awards one offer and is answered with it, accepted"
 # Both tables, in one query, because the *Done when* is one transaction: an accepted bid on a job that
 # did not move, or a job at Awarded with nothing accepted, are the two half-states this is here to
 # refuse. The history count is the third: 000402 will not let the status move without a row describing
-# the move, so 'Awarded 1 2' is a transition that went through the guard rather than around it.
+# the move, so 'Awarded 1 3' is a transition that went through the guard rather than around it — three
+# being the publication, the move to Negotiating the first offer made (SHIP-90), and the award.
 stored="$("$PSQL" "$DATABASE_URL" -tAc \
   "select j.status
           || ' ' || (select count(*) from bids where job_id = j.id and status = 'Accepted')::text
           || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
      from jobs j where j.id = '$award_job';")"
-[[ "$stored" == "Awarded 1 2" ]] \
-  || fail "the job reads '$stored' (status, accepted bids, history rows), want 'Awarded 1 2'"
+[[ "$stored" == "Awarded 1 3" ]] \
+  || fail "the job reads '$stored' (status, accepted bids, history rows), want 'Awarded 1 3'"
 ok "the job is Awarded with exactly one accepted bid and a recorded transition — one act, one transaction"
 
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
@@ -1376,9 +1426,13 @@ replayed_from_redis awfresh && fail "the request under a fresh key was answered 
   || fail "the repeated award wrote to the row again"
 ok "and one under a fresh key is still 200 with the same bid, having written nothing — idempotent by state, not by key"
 
+# Counted on the award's own row rather than on the whole history, because the job has three
+# transitions since SHIP-90 — its publication, the move to Negotiating the offer made, and this — and
+# a total would have to be re-derived every time the lifecycle grows a step. What is being asserted
+# is that three awards produced one award.
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
-  "select count(*) from job_status_history where job_id = '$award_job';")" == "2" ]] \
-  || fail "three awards left more than one transition on the job"
+  "select count(*) from job_status_history where job_id = '$award_job' and to_status = 'Awarded';")" == "1" ]] \
+  || fail "three awards left more than one Awarded transition on the job"
 ok "three awards, one transition — the job moved once"
 
 # A **different** offer on the job that has been awarded — the rival's, placed before the award. Since
@@ -1475,11 +1529,13 @@ gone_bid="$(json "$WORKDIR/bid-awgone.json" '["id"]')"
 # which is the only endpoint in this domain where the two come from two different places.
 status="$(award "$award_customer_token" "verify-award-cross-$$" "$gone_job" "$award_bid" awcross)"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/bid-awcross.json"; fail "a bid on another job was awarded: $status"; }
-[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$gone_job';")" == "Open" ]] \
+# Negotiating rather than Open since SHIP-90: the offer placed on it two statements ago moved it
+# there. What is being asserted is that the *refused* award left it wherever the offer had.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$gone_job';")" == "Negotiating" ]] \
   || fail "the cross-job award moved the job"
 ok "a real offer paired with the wrong job names nothing — the job in the path is checked, not decorative"
 
-move_award_job "$gone_job" Open Cancelled
+move_award_job "$gone_job" - Cancelled
 
 status="$(award "$award_customer_token" "verify-award-cancelled-$$" "$gone_job" "$gone_bid" awcancelled)"
 [[ "$status" == "409" ]] || { cat "$WORKDIR/bid-awcancelled.json"; fail "a cancelled job was awarded: $status"; }
@@ -1610,15 +1666,21 @@ live_and_accepted="$("$PSQL" "$DATABASE_URL" -tAc \
      from bids where job_id = '$sweep_job';")"
 [[ "$live_and_accepted" == "0 1" ]] \
   || fail "the awarded job reads '$live_and_accepted' (live, accepted), want '0 1'"
+# Three since SHIP-90: the publication, the move to Negotiating the first of the five offers made,
+# and the award. What the count is for is unchanged — a job at Awarded with a history that does not
+# describe getting there is a status written round 000402's guard.
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
   "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
-     from jobs j where j.id = '$sweep_job';")" == "Awarded 2" ]] \
+     from jobs j where j.id = '$sweep_job';")" == "Awarded 3" ]] \
   || fail "the sweep did not happen inside the award's own transaction"
 ok "nothing is left live on the awarded job, and the whole act is still one transition — Docs/02 §3's 'atomically', both halves"
 
 [[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$sweep_bystander_bid';")" == "Submitted" ]] \
   || fail "the sweep closed an offer on another job entirely"
-[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$bystander_job';")" == "Open" ]] \
+# Negotiating rather than Open since SHIP-90: the bystander has an offer of its own, which is what
+# makes it a bystander worth having. The assertion is that this award reached neither its offer nor
+# its status.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$bystander_job';")" == "Negotiating" ]] \
   || fail "the award moved a job it was not made on"
 ok "a live offer on another job is untouched — the sweep is scoped to the job that was awarded, and nothing would have said so if it were not"
 
@@ -1723,8 +1785,8 @@ ok "with the cached response gone the request runs again, reaches the transactio
   || fail "the retry ran the rejection sweep a second time"
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
   "select j.status || ' ' || (select count(*) from job_status_history where job_id = j.id)::text
-     from jobs j where j.id = '$idem_job';")" == "Awarded 2" ]] \
-  || fail "the retries left more than one transition on the job"
+     from jobs j where j.id = '$idem_job';")" == "Awarded 3" ]] \
+  || fail "the retries left more than one Awarded transition on the job — three is its publication, the move to Negotiating an offer made (SHIP-90), and the award"
 ok "and it recorded nothing further — not the accept, not the sweep, not a second transition"
 
 # 4. The two mechanisms disagreeing, which is the case worth naming. The **same key** carrying a

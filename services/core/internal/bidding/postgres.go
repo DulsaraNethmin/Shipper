@@ -561,6 +561,29 @@ func (postgresStore) rejectCompeting(ctx context.Context, r db.Runner, jobID uui
 	return closed, nil
 }
 
+// liveOffers is how many offers on a job are still open for either party to act on (SHIP-90).
+//
+// **The predicate is [Status.live]'s, written in SQL**, and the two have to agree: Docs/02 §2 has
+// `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", so a count that
+// treated some closed status as live would leave a job at Negotiating with nothing in it, and one
+// that treated a live status as closed would reopen a job somebody is still negotiating on.
+// `status = 'Submitted'` is the whole of it for the reason [postgresStore.rejectCompeting] gives:
+// `ck_bids_superseded_is_not_live` makes the live offer and the head of its chain the same row, so
+// this predicate misses no live offer. TestTheLivePredicateIsOneRule holds the pair together.
+//
+// A count rather than an existence check, because the caller acts on "none" and the number is what
+// a failure message can report. No lock: the caller has already written the row that changed the
+// answer, inside this transaction, so what this reads is that transaction's own view.
+func (postgresStore) liveOffers(ctx context.Context, r db.Runner, jobID uuid.UUID) (int, error) {
+	const q = `SELECT count(*) FROM bids WHERE job_id = $1 AND status = $2`
+
+	var live int
+	if err := r.QueryRow(ctx, q, jobID, string(StatusSubmitted)).Scan(&live); err != nil {
+		return 0, fmt.Errorf("bidding: counting the live offers on %s: %w", jobID, err)
+	}
+	return live, nil
+}
+
 // linkSuccessor records which offer displaced this one, completing the chain (SHIP-88).
 //
 // The third statement of a counter and the one that makes the history readable. `superseded_by IS

@@ -36,7 +36,7 @@ import (
 func (m market) sweepAt(t *testing.T, at time.Time) (int, error) {
 	t.Helper()
 
-	service := NewService(events.NewOutbox(), nil, nil, nil, clock.NewFixed(at))
+	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(at)), clock.NewFixed(at))
 
 	var claimed int
 	err := db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
@@ -228,7 +228,7 @@ func TestAnExpiryOutsideATransactionIsRefused(t *testing.T) {
 		t.Fatalf("placing the offer: %v", err)
 	}
 
-	service := NewService(events.NewOutbox(), nil, nil, nil, clock.NewFixed(pastCollection))
+	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(pastCollection)), clock.NewFixed(pastCollection))
 	if _, err := service.Expire(t.Context(), m.pool, bid.ID); !errors.Is(err, ErrNotInTransaction) {
 		t.Fatalf("expiring on the pool answered %v, want ErrNotInTransaction", err)
 	}
@@ -252,7 +252,7 @@ func TestExpiringAnOfferThatIsNotDueIsReportedRatherThanDone(t *testing.T) {
 	}
 
 	// Judged an hour after placement, when the offer collects in forty-seven hours' time.
-	service := NewService(events.NewOutbox(), nil, nil, nil, clock.NewFixed(testInstant.Add(time.Hour)))
+	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(testInstant.Add(time.Hour))), clock.NewFixed(testInstant.Add(time.Hour)))
 	err = db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
 		_, err := service.Expire(ctx, r, bid.ID)
 		return err
@@ -314,7 +314,7 @@ func TestTheExpirySweepFreesTheProviderToBidAgain(t *testing.T) {
 	// time — so its own timing is in the future and the validator accepts it.
 	at := clock.NewFixed(pastCollection)
 	later := NewService(events.NewOutbox(), fleet.NewService(at),
-		newTestNegotiation(at), newTestAwarding(at), at)
+		newTestNegotiation(at), newTestAwarding(at), newTestPresentation(at), at)
 
 	second := Offer{
 		AmountCents: 47000,
@@ -331,5 +331,72 @@ func TestTheExpirySweepFreesTheProviderToBidAgain(t *testing.T) {
 	}
 	if got := m.bids(t, m.provider, m.job); got != 2 {
 		t.Errorf("the provider has %d rows on the job, want the expired offer and its replacement", got)
+	}
+}
+
+// TestAnExpiryThatTakesTheLastOfferReturnsTheJobToOpen is SHIP-90's second direction, reached by
+// the cause Docs/02 §2 lists first: "all active bids **expire**, are withdrawn, or are rejected".
+//
+// It is the case a withdrawal cannot cover, because the withdrawal path holds no `bids` lock it did
+// not take itself. Here the row was locked by the *claim*, before this domain was reached at all —
+// which is why [Presentation.LeaveNegotiation] takes the job row without waiting.
+func TestAnExpiryThatTakesTheLastOfferReturnsTheJobToOpen(t *testing.T) {
+	m := newMarket(t)
+
+	if _, _, err := m.place(t, m.provider, m.job, offer("expiry-reopens")); err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+	if status, _ := m.jobStatus(t, m.job); status != "Negotiating" {
+		t.Fatalf("the placement left the job at %q, so this test is not about a return", status)
+	}
+
+	if _, err := m.sweepAt(t, pastCollection); err != nil {
+		t.Fatalf("the sweep failed: %v", err)
+	}
+
+	status, changes := m.jobStatus(t, m.job)
+	if status != "Open" {
+		t.Errorf("the job is %q after its only offer expired, want Open", status)
+	}
+	if changes != 3 {
+		t.Errorf("the job has %d transitions, want three: publication, Negotiating, and back", changes)
+	}
+}
+
+// TestAnExpiryLeavesAJobWithAnotherLiveOfferAlone is the "all" in "all active bids expire".
+//
+// Two offers, one due and one not: the job loses one and is still a negotiation. Without the count
+// the sweep would reopen a job the customer is still choosing on, and the provider whose offer
+// survived would find their job back in the feed as though nobody had bid.
+func TestAnExpiryLeavesAJobWithAnotherLiveOfferAlone(t *testing.T) {
+	m := newMarket(t)
+
+	if _, _, err := m.place(t, m.provider, m.job, offer("expiry-one-of-two")); err != nil {
+		t.Fatalf("the first offer: %v", err)
+	}
+
+	// The rival's offer collects a week out, so the sweep below is not due to take it.
+	rival := m.rival(t, 9089)
+	later := offer("expiry-two-of-two")
+	later.PickupAt = testInstant.Add(7 * 24 * time.Hour)
+	later.DeliverBy = testInstant.Add(8 * 24 * time.Hour)
+	survivor, _, err := m.place(t, rival, m.job, later)
+	if err != nil {
+		t.Fatalf("the second offer: %v", err)
+	}
+
+	claimed, err := m.sweepAt(t, pastCollection)
+	if err != nil {
+		t.Fatalf("the sweep failed: %v", err)
+	}
+	if claimed != 1 {
+		t.Fatalf("the sweep claimed %d offers, want the one that was due", claimed)
+	}
+	if got := m.row(t, survivor.ID).status; got != string(StatusSubmitted) {
+		t.Fatalf("the surviving offer is %s, want Submitted", got)
+	}
+
+	if status, _ := m.jobStatus(t, m.job); status != "Negotiating" {
+		t.Errorf("the job is %q with a live offer still on it, want Negotiating", status)
 	}
 }

@@ -396,6 +396,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-87** | M3 | `POST /v1/jobs/{id}/bids/{bid_id}/counter` — **the first endpoint in this domain a customer may call**, and one route for both directions because Docs/02 §4's two sentences describe one act. Each counter is a new row and the offer it answers becomes `Superseded`; a counter inherits the terms it does not restate, which is the choice `000501` deferred to it — *see below* |
 | **SHIP-88** | M3 | The supersede chain — `superseded_by` on the **displaced** row, which is what turns "only the latest valid offer is acceptable" into a column `CHECK` SHIP-92 cannot violate rather than a rule it must remember. Plus `GET …/history`, because a chain nobody can read is not one that remains readable — *see below* |
 | **SHIP-89** | M3 | Bid expiry — **an offer's own terms turn out to be the collection time it committed to**, so the ticket needed no column and `000502`'s prediction that it would is corrected rather than met. The fourth scheduled task, `bid.expired` registered in the same commit as the first row that makes it true, and the tripwire SHIP-136 left in `61-bidding.sh` replaced by the positive assertion — *see below* |
+| **SHIP-90** | M3 | The `Negotiating` presentation status, in both directions — **a placement moves the job and a counter deliberately does not**, because a counter answers a live offer and can never be first. The return to Open takes the job row **without waiting**, which is what keeps the expiry sweep out of a deadlock with an award. Four §3 entries had deferred to this ticket and every one of their tripwires was inverted rather than deleted — *see below* |
 | **SHIP-91** | M3 | The one-accepted-bid constraint — **met by SHIP-80 rather than built separately**, and declared done by the owner rather than claimed by a commit — *see below* |
 | **SHIP-92** | M3 | `POST /v1/jobs/{id}/award` — one offer accepted and the job moved, in one transaction, against the lock ordering SHIP-88 wrote down rather than one invented here. **A verb on the job, so the bid travels in the body**, and the one rule no constraint can express — that the offer was live when it was accepted — is the only thing application logic checks. Idempotent by **state**, so it needs no key column and no migration — *see below* |
 | **SHIP-93** | M3 | The rejection sweep — every offer still live on the awarded job becomes `Rejected` in the award's own transaction, and every offer that had **already** closed keeps the status saying how it closed. One `UPDATE` at step 4 of the recorded lock ordering, no `id <> winner` in it, and the refusal order changed so that a second award still answers `conflict` rather than `bidding_bid_closed` — *see below* |
@@ -3876,6 +3877,118 @@ own terms"; and §3's check count, written by `make verify-update`.
 to an offer rather than something a client asks for. No `internal/boundaries` edit, no `Deps` field on
 either binary, and no new port: the sweep consults none of the three `bidding` already declares, and
 `cmd/worker` passes `nil` for all of them deliberately.
+
+### SHIP-90 — a counter can never be first, and the return to Open must not wait
+
+SHIP-90's *Done when* is "a job with active offers presents as Negotiating **without closing to new
+bids**", and the second half is the ticket. Docs/02 §1 settles it in as many words — "'Negotiating'
+is a useful presentation status. Technically, the job remains available for eligible bids unless the
+customer closes it or awards a bid" — and `fleet.biddableStatuses` has held both statuses since
+SHIP-81 **against exactly this day**, with a comment saying the defect would otherwise "surface
+months from now as jobs vanishing from every provider's feed the instant somebody bid on them". The
+two finally meet, and `TestANegotiatingJobStillTakesBids` is where.
+
+**No new status.** Docs/02 §1's twelve names are exact and generated from `contracts/statuses.yaml`
+since SHIP-56a; this ticket writes one of them that nothing had written.
+
+#### Only a placement enters the negotiation, and "first" is why
+
+Docs/02 §2's row reads "first bid **or counter-offer** submitted", and four entries in this section
+have read the second half as an instruction to `CounterOffer`. It is not one. **A counter answers a
+*live* offer, a live offer is one `PlaceBid` wrote, and that placement already moved the job** — so a
+counter can never be the first thing to happen in a negotiation, which is what "first" is doing in
+that sentence. `TestACounterMovesNothing` asserts it and says so.
+
+That is not only tidiness. A counter locks a `bids` row before it does anything else, so a `jobs`
+lock taken from inside it would be `bids` → `jobs` against the award's `jobs` → `bids` — the cycle
+Docs/11 §3's SHIP-88 entry records the ordering to avoid.
+
+#### The entry closes a window SHIP-95 named, and that is a side effect worth having
+
+`EnterNegotiation` sits **between eligibility and the insert**. Eligibility is read without a lock,
+so a job awarded in the window between the two could acquire a fresh offer; under the lock, Docs/02
+§2 answers `JobPresentationClosed` for a job that is neither Open nor Negotiating, and the placement
+is refused with the same 404 an ineligible provider gets. The window is not gone — a job can still
+be cancelled after the offer commits — but the read that authorises the write is now followed by a
+lock rather than by nothing.
+
+#### The return does not wait for the job row, and that is the whole concurrency story
+
+`Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected". The third cause
+never reaches this path — an award closes the others and moves the job to `Awarded` — so the two
+that do are a withdrawal and an expiry.
+
+**The expiry is the hard one.** A sweep claims its offers with `FOR UPDATE SKIP LOCKED` and holds
+those `bids` rows for the rest of its transaction, so a blocking `jobs` lock afterwards is `bids` →
+`jobs`, and the first deadlock is between a sweep and a customer awarding a job. So
+`LeaveNegotiation` takes the row **`FOR UPDATE SKIP LOCKED`** and reports `JobPresentationHeld`
+rather than queueing. A lock attempt that cannot wait cannot deadlock.
+
+**Skipping is the right answer and not merely the safe one.** Whatever holds a `jobs` row is making
+a real change — an award, a cancellation, an expiry, a publication, an extension — and Docs/02 §1's
+own sentence licenses the rule: this is presentation, and a presentation change must not overwrite or
+delay a real one. **The cost is stated rather than hidden**: under contention a job can sit at
+Negotiating with no live offer until the next thing happens to it. It is then biddable by everybody
+and awardable by nobody, which is what Negotiating means anyway.
+
+`liveOffers` is the count that decides, taken after the write and inside the same transaction, so it
+cannot see a state the caller has not reached. Its predicate is `Status.live`'s written in SQL, and
+`TestTheLivePredicateIsOneRule` holds the pair over all eight statuses — the drift is silent in both
+directions, and Docs/10 §3.4 wants every such pair held by a test.
+
+#### One port, two methods, three copies of the adapter
+
+`bidding.Presentation`, declared by the consumer as every port in this domain is. Two methods rather
+than a `MoveTo(status)`, for `Awarding`'s reason: a port shaped that way would be Docs/02 §2's table
+acquiring a second opinion through the back door.
+
+**Three copies of the adapter, and each is deliberate.** `cmd/api` has one, `cmd/worker` has one
+because the sweep runs there and the two binaries do not import each other, and
+`internal/bidding`'s fixtures have a third because the composition roots are not importable from a
+domain's tests. Every copy runs the real `jobs.Service` and the real `SKIP LOCKED` statement; a stub
+answering "moved" would make every test in this ticket pass against a service that never moved a job.
+
+#### The tripwires this ticket inverted, and one it did not
+
+Four entries in this section deferred to SHIP-90 and each left an assertion behind. All four are now
+the positive form rather than deleted: `TestPlacingABidNeverMovesTheJob` became
+`TestTheFirstOfferMovesTheJobToNegotiating`, `TestCounteringNeverMovesTheJob` became
+`TestACounterMovesNothing` with the reason rewritten, `TestNeitherRevisingNorWithdrawingMovesTheJob`
+split into `TestARevisionMovesNothing` and `TestTheLastOfferLeavingReturnsTheJobToOpen`, and
+`scripts/verify/61-bidding.sh`'s three "does not move the job" checks are now three SHIP-90 sections.
+
+**A revision is the one that did not invert.** Docs/02 §2's presentation rows are about offers
+arriving and offers leaving; a revision is the same live offer at a different number, so the set of
+live offers is unchanged and the job's standing cannot be.
+
+**Two fixture helpers grew a "wherever it is now" form** — `market.moveJob` in Go and `move_job`'s
+`-` argument in the verify section. Every call that named its own `from` was right until offers
+started moving jobs, and after that a fixture closing a job it had already bid on failed *inside the
+helper*, on 000402's guard message about a history row. That is a long way from the cause, and the
+next lifecycle step would have done it again.
+
+#### What this ticket takes away from `jobs`' expiry sweep, which is a finding rather than a fix
+
+**`jobs.ExpiryClaim` and `jobs.ExpiryWarningClaim` both filter `status = 'Open'`.** Until now no job
+could be anywhere else while it was live, so those two claims covered the whole market. After this
+ticket a job with one unanswered offer sits at `Negotiating` and **neither sweep can see it** — so
+`Docs/02` §6.3's deadline stops being enforced on exactly the jobs somebody has bid on.
+
+It is not a job stuck forever, and the reason is the pair of tickets on this branch: every live offer
+runs out at its own collection time (SHIP-89), the last one leaving returns the job to Open, and the
+next job-expiry pass takes it. So the deadline is **delayed rather than lost**, by at most the
+longest-dated live offer on the job.
+
+**It is reported rather than fixed, and §9 carries it.** Docs/02 §2 has one expiry row and it says
+`Open → Cancelled`; widening the claim means widening that row too, and `CLAUDE.md` is explicit that
+a contradiction with a document is not resolved silently in code. It is also `internal/jobs`, which
+this branch does not own.
+
+#### Shared surfaces
+
+§3's check count, written by `make verify-update`, and nothing else. **No migration, no route, no
+`$ref`, no `routes_golden.txt` line, no `internal/boundaries` edit and no `Deps` field**: the whole
+ticket is a port, two adapters and a status somebody was already allowed to write.
 
 ### SHIP-91 — delivered by SHIP-80, and closed by a ruling rather than by a commit
 

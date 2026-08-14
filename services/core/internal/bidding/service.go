@@ -68,12 +68,13 @@ const (
 // the database is not abstracted, and the partial unique indexes this file is built against are
 // PostgreSQL's.
 type Service struct {
-	events      EventSink
-	eligibility Eligibility
-	negotiation Negotiation
-	awarding    Awarding
-	store       postgresStore
-	clock       clock.Clock
+	events       EventSink
+	eligibility  Eligibility
+	negotiation  Negotiation
+	awarding     Awarding
+	presentation Presentation
+	store        postgresStore
+	clock        clock.Clock
 }
 
 // NewService wires the domain to what it cannot decide for itself.
@@ -98,6 +99,7 @@ func NewService(
 	eligibility Eligibility,
 	negotiation Negotiation,
 	awarding Awarding,
+	presentation Presentation,
 	c clock.Clock,
 ) *Service {
 	if sink == nil {
@@ -106,11 +108,12 @@ func NewService(
 			"(Docs/01 §4.5, Docs/10 §6.1)")
 	}
 	return &Service{
-		events:      sink,
-		eligibility: eligibility,
-		negotiation: negotiation,
-		awarding:    awarding,
-		clock:       c,
+		events:       sink,
+		eligibility:  eligibility,
+		negotiation:  negotiation,
+		awarding:     awarding,
+		presentation: presentation,
+		clock:        c,
 	}
 }
 
@@ -123,7 +126,7 @@ func NewService(
 // against one version of the world: a job can be cancelled, expire, or be awarded between two
 // statements, and a bid written against a stale "yes" is a bid nobody checked.
 //
-// # The order of the four steps is the design, and each one is in front of the next for a reason
+// # The order of the five steps is the design, and each one is in front of the next for a reason
 //
 //  1. **The retry is answered before anything else.** A request carrying a key that already placed
 //     an offer is answered from that row without consulting eligibility at all — because by the time
@@ -132,22 +135,33 @@ func NewService(
 //     happened to my request", and the answer to that does not change when the world does.
 //  2. **Eligibility, which is fleet's and not this domain's.** See [Eligibility]. A job this
 //     provider may not bid on is indistinguishable from one that does not exist.
-//  3. **The insert, written as though the middleware were not there.** ON CONFLICT DO NOTHING
+//  3. **The job, held and moved to Negotiating if this offer is the first** (SHIP-90). See below.
+//  4. **The insert, written as though the middleware were not there.** ON CONFLICT DO NOTHING
 //     against uq_bids_idempotency absorbs the concurrent duplicate that step 1 cannot see — two
 //     requests carrying one key, arriving together, both finding nothing.
-//  4. **A second live offer is the database's refusal, not a check.** There is no SELECT asking
+//  5. **A second live offer is the database's refusal, not a check.** There is no SELECT asking
 //     whether this provider has already bid. uq_bids_one_submitted_per_provider_per_job raises, and
 //     the raise is translated to [ErrAlreadyBid]. A check-then-insert would be correct in a
 //     single-threaded reading and wrong under two taps on one phone.
 //
-// # What this does not do: it does not move the job
+// # It moves the job, and that is SHIP-90's half of this method
 //
-// Docs/02 §2 has `Open → Negotiating` on "first bid or counter-offer submitted", and that is
-// **SHIP-90's** ticket, which depends on SHIP-87 and SHIP-57. It is deliberately not done here.
-// Negotiating is a presentation status — Docs/02 §1 says so in as many words — and moving the job
-// would change nothing about what may happen to it, since a Negotiating job "remains open to
-// eligible bids". Doing it early would also make every bid a status transition, with a
-// job_status_history row and a lock on the job, for a change nobody reads yet.
+// Docs/02 §2 has `Open → Negotiating` on "first bid or counter-offer submitted", and a placement
+// is the only thing that can be first — a counter answers a live offer, which is one this method
+// wrote. So the move is here and nowhere else; [Presentation] argues that at length.
+//
+// **It happens between eligibility and the insert, which is a position rather than an ordering
+// detail.** Docs/11 §3's SHIP-88 entry records that everything in this domain apart from the award
+// locks only its own `bids` rows, so that `jobs` → `bids` runs in one direction; this takes a
+// `jobs` lock, and taking it before the insert is what keeps that true. It also closes a window
+// SHIP-95 named: the eligibility answer is read without a lock, so a job awarded in between used
+// to be able to acquire a fresh offer. Under the lock, Docs/02 §2 answers
+// [JobPresentationClosed] for a job no bid may be placed on, and this refuses it with the same 404
+// an ineligible provider gets.
+//
+// **A retry never reaches it**, because step 1 returns first. A request that already placed its
+// offer already moved the job, and asking again would be asking the world a question a retry is
+// not entitled to (see step 1).
 func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID uuid.UUID, o Offer) (Bid, bool, error) {
 	if providerID == uuid.Nil {
 		return Bid{}, false, fmt.Errorf("bidding: an offer names no provider: %w", ErrJobNotOffered)
@@ -172,7 +186,8 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 		return existing, false, nil
 	}
 
-	// 2. Eligibility, which is fleet's answer and not this domain's.
+	// 2. Eligibility, which is fleet's answer and not this domain's. Read without a lock; step 3
+	//    is what holds the job still for the rest of the transaction.
 	permitted, err := s.eligibility.EligibleFor(ctx, r, providerID, jobID)
 	if err != nil {
 		return Bid{}, false, fmt.Errorf("bidding: deciding whether %s may bid on %s: %w", providerID, jobID, err)
@@ -181,12 +196,17 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 		return Bid{}, false, ErrJobNotOffered
 	}
 
+	// 3. The job, held and moved to Negotiating if this is the first offer on it (SHIP-90).
+	if err := s.enterNegotiation(ctx, r, jobID); err != nil {
+		return Bid{}, false, err
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return Bid{}, false, fmt.Errorf("bidding: generating a bid id: %w", err)
 	}
 
-	// 3 and 4. The insert, and the two indexes that answer for it.
+	// 4 and 5. The insert, and the two indexes that answer for it.
 	bid, created, err := s.store.insertBid(ctx, r, Bid{
 		ID:          id,
 		JobID:       jobID,
@@ -346,13 +366,20 @@ func (s *Service) ReviseBid(
 // answers. SHIP-81's filter governs what a provider may *offer*; it has no business governing what
 // they may stop offering.
 //
-// # It does not move the job
+// # It returns the job to Open when it took the last live offer with it (SHIP-90)
 //
-// Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", and
-// nothing reaches Negotiating until **SHIP-90**, which owns that presentation status in both
-// directions. Job status is never a settable field in any case (Docs/02 §2, CLAUDE.md): a move passes
-// one guarded function and leaves a `job_status_history` row in the same transaction, and inventing
-// half of that here would be inventing the half without the record.
+// Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected",
+// and a withdrawal is the middle one. The condition is a fact about `bids`, so this domain is the
+// only thing that can know when it holds — and the status is still `jobs`', written through the one
+// guarded function inside this transaction (see [Presentation]).
+//
+// **Only when nothing live is left.** A job with two offers, one of them withdrawn, is still a
+// negotiation. [postgresStore.liveOffers] is the count, taken after the write and inside the same
+// transaction, so it cannot see a state the withdrawal has not reached.
+//
+// **A withdrawal that wrote nothing moves nothing**, which is the early return above: withdrawing
+// an already-withdrawn offer is the caller asking for an outcome that holds, and the job's standing
+// was settled when the offer actually closed.
 func (s *Service) WithdrawBid(
 	ctx context.Context,
 	r db.Runner,
@@ -383,7 +410,81 @@ func (s *Service) WithdrawBid(
 	if err := s.emitClosed(ctx, r, EventBidWithdrawn, withdrawn); err != nil {
 		return Bid{}, err
 	}
+
+	// The job, last (SHIP-90). After the event rather than before it, because the event is about
+	// the offer and is true the moment the row moved, while this is about what the offer leaving
+	// did to the job — and `jobs` emits its own transition event from inside the same transaction.
+	if err := s.leaveNegotiationIfEmpty(ctx, r, withdrawn.JobID); err != nil {
+		return Bid{}, err
+	}
 	return withdrawn, nil
+}
+
+// enterNegotiation moves the job to Negotiating if this is the first offer on it (SHIP-90).
+//
+// One place rather than a switch at the call site, so that "what an unrecognised answer means" is
+// decided once. [JobPresentationClosed] is the only refusal: a job Docs/02 §2 will not move to
+// Negotiating from is one that is neither Open nor already Negotiating, which is a job no offer may
+// be placed on — answered with [ErrJobNotOffered], the 404 an ineligible provider gets, so that a
+// provider cannot tell "somebody else won this" from "there is no such job".
+//
+// A nil port is a programming mistake rather than a runtime condition, and it is reported as an
+// error rather than skipped: a placement that silently declined to move the job would leave Docs/02
+// §2's first row unenforced in whichever binary forgot to wire it.
+func (s *Service) enterNegotiation(ctx context.Context, r db.Runner, jobID uuid.UUID) error {
+	if s.presentation == nil {
+		return fmt.Errorf("bidding: placing an offer on %s: no Presentation port is wired", jobID)
+	}
+
+	switch moved, err := s.presentation.EnterNegotiation(ctx, r, jobID); {
+	case err != nil:
+		return fmt.Errorf("bidding: moving %s to Negotiating: %w", jobID, err)
+	case moved == JobPresentationMoved, moved == JobPresentationAlreadyThere:
+		return nil
+	case moved == JobPresentationClosed:
+		return fmt.Errorf("bidding: %s cannot take an offer: %w", jobID, ErrJobNotOffered)
+	default:
+		// JobPresentationUnrecognised, or JobPresentationHeld from a method that does not skip.
+		// Reported rather than read as permission: the zero value is first in the enumeration
+		// precisely so that a half-written adapter cannot look like a job that moved.
+		return fmt.Errorf("bidding: moving %s to Negotiating answered %q", jobID, moved)
+	}
+}
+
+// leaveNegotiationIfEmpty returns the job to Open when the offer that just closed was the last live
+// one (SHIP-90).
+//
+// The count and the move are one act inside the caller's transaction: a count taken outside it
+// could be answered by a state the caller has not committed, and a move made without the count
+// would reopen a job that still has offers standing.
+//
+// **Every answer but an error is success**, including [JobPresentationHeld] and
+// [JobPresentationClosed]. Held is the ordinary contended case and [Presentation] argues why it is
+// skipped rather than waited on; Closed means the job has gone somewhere this move has no opinion
+// about — awarded, cancelled, expired — which is a job that has left the negotiation by a route
+// that is not this one's business. Neither is a reason to fail a withdrawal that has already been
+// recorded.
+func (s *Service) leaveNegotiationIfEmpty(ctx context.Context, r db.Runner, jobID uuid.UUID) error {
+	if s.presentation == nil {
+		return fmt.Errorf("bidding: closing an offer on %s: no Presentation port is wired", jobID)
+	}
+
+	live, err := s.store.liveOffers(ctx, r, jobID)
+	if err != nil {
+		return err
+	}
+	if live > 0 {
+		return nil
+	}
+
+	switch moved, err := s.presentation.LeaveNegotiation(ctx, r, jobID); {
+	case err != nil:
+		return fmt.Errorf("bidding: returning %s to Open: %w", jobID, err)
+	case moved == JobPresentationUnrecognised:
+		return fmt.Errorf("bidding: returning %s to Open answered %q", jobID, moved)
+	default:
+		return nil
+	}
 }
 
 // CounterOffer answers the other party's offer with different terms (SHIP-87, SHIP-88).

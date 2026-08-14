@@ -190,6 +190,7 @@ func biddingHandler(d Deps) *bidding.Handler {
 		fleet.NewService(d.Clock),
 		negotiatedJobs{jobs: newJobService(d)},
 		awardableJobs{jobs: newJobService(d)},
+		presentedJobs{jobs: newJobService(d)},
 		d.Clock,
 	)
 
@@ -387,14 +388,137 @@ func (a awardableJobs) MoveToAwarded(
 	}
 }
 
-// Compile-time proof that the three adapters satisfy the ports bidding declared.
+// presentedJobs implements bidding.Presentation, which is Docs/02 §1's Negotiating status (SHIP-90).
+//
+// The fourth seam this file joins, and the third that needed a type. It is `awardableJobs` in
+// shape — a lock, a reading of Docs/02 §2's table, and the guarded transition — with one difference
+// that is the whole of the ticket's concurrency story: see [presentedJobs.LeaveNegotiation].
+//
+// **The actor is the platform in both directions.** Docs/02 §1 calls Negotiating "a useful
+// presentation status" in as many words, and these moves are the platform's reading of a condition
+// in `bids` rather than an act anybody performed: a provider placing an offer asked for their offer
+// to exist, not for the job to move, and `job_status_history` records who acted rather than who
+// caused. `jobs.System()` is the same actor SHIP-68's expiry sweep records, and each move carries a
+// reason for the same reason that one does — it is read by support and shown in the customer's
+// status timeline.
+type presentedJobs struct {
+	jobs *jobs.Service
+}
+
+// The two reasons, in the shape jobs.ExpiryReason has: fixed strings rather than formatted ones, so
+// that support can search for them and a customer's timeline reads the same on every job.
+const (
+	negotiationOpenedReason = "An offer was made on the job (Docs/02 §2)."
+	negotiationEndedReason  = "The last live offer on the job was withdrawn or expired (Docs/02 §2)."
+)
+
+// EnterNegotiation runs `Open → Negotiating`, taking the job row for the rest of the transaction.
+//
+// An ordinary blocking lock, because `bidding` calls it before it has touched a `bids` row — which
+// is what keeps Docs/11 §3's `jobs` → `bids` ordering in one direction. `jobs.Service.Transition`
+// takes the lock itself, so there is no separate statement here.
+//
+// The translation is of errors into outcomes, exactly as `jobLifecycle.move` and
+// `awardableJobs.MoveToAwarded` do it: everything `jobs` treats as a refusal becomes an outcome
+// with a nil error, and everything else stays an error because a failing database is not an answer.
+func (p presentedJobs) EnterNegotiation(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (bidding.JobPresentation, error) {
+	return p.move(p.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusNegotiating,
+		Actor:  jobs.System(),
+		Reason: negotiationOpenedReason,
+	}))
+}
+
+// LeaveNegotiation runs `Negotiating → Open`, and **does not wait for the job row**.
+//
+// `FOR UPDATE SKIP LOCKED` first, and the transition only if it was obtained. `bidding` calls this
+// once the offer has closed, which is after a `bids` row is locked — and in the expiry sweep the
+// bid was locked by the *claim*, before the domain was reached at all. A blocking lock would be
+// `bids` → `jobs` against the award's `jobs` → `bids`, and the first deadlock would be between a
+// sweep and an award. A lock attempt that cannot wait cannot deadlock.
+//
+// **Skipping is also the right answer rather than merely the safe one.** Whatever holds the row is
+// making a real change — an award, a cancellation, an expiry, a publication, an extension — and a
+// presentation change must not overwrite or delay it. bidding.Presentation carries the cost that
+// follows: under contention a job can sit at Negotiating with no live offer until the next thing
+// happens to it.
+//
+// The status is read under the lock as well, so that a job somebody moved between the caller's
+// count and this statement is answered rather than transitioned. That read costs nothing — the row
+// is already in hand — and it is what makes [bidding.JobPresentationClosed] a real answer here
+// rather than a translation of a refusal.
+func (p presentedJobs) LeaveNegotiation(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (bidding.JobPresentation, error) {
+	const q = `SELECT status FROM jobs WHERE id = $1 FOR UPDATE SKIP LOCKED`
+
+	var status jobs.Status
+	switch err := r.QueryRow(ctx, q, jobID).Scan(&status); {
+	case errors.Is(err, db.ErrNoRows):
+		// Either there is no such job or somebody is holding it. `SKIP LOCKED` cannot tell the
+		// two apart in one statement, and a second statement to find out would be a read whose
+		// only product is the knowledge that a row exists — which is the disclosure every port
+		// in this file declines to make. Held is the answer that says "no change was
+		// attempted", which is true of both.
+		return bidding.JobPresentationHeld, nil
+	case err != nil:
+		return bidding.JobPresentationUnrecognised,
+			fmt.Errorf("cmd/api: holding %s to leave Negotiating: %w", jobID, err)
+	}
+
+	if !jobs.Permitted(status, jobs.StatusOpen) {
+		// Docs/02 §2's table rather than a comparison against 'Negotiating' written here. The
+		// row that matters is `Negotiating → Open`; `Awarded / Driver assigned → Open` is also
+		// in the table and is SHIP-116's provider cancellation, which reaches this transition
+		// through its own path and never through a closing offer.
+		if status == jobs.StatusOpen {
+			return bidding.JobPresentationAlreadyThere, nil
+		}
+		return bidding.JobPresentationClosed, nil
+	}
+
+	return p.move(p.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusOpen,
+		Actor:  jobs.System(),
+		Reason: negotiationEndedReason,
+	}))
+}
+
+// move is the translation, in one place, so that a third presentation row added later cannot treat
+// `jobs.ErrAlreadyInStatus` differently from these two.
+func (presentedJobs) move(_ jobs.Job, err error) (bidding.JobPresentation, error) {
+	switch {
+	case err == nil:
+		return bidding.JobPresentationMoved, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return bidding.JobPresentationAlreadyThere, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted), errors.Is(err, jobs.ErrJobNotFound):
+		// One outcome for both, which is the collapse every port here makes: a job that cannot
+		// take this move and a job that does not exist are one answer, and telling them apart
+		// would disclose that somebody else's job exists.
+		return bidding.JobPresentationClosed, nil
+	default:
+		return bidding.JobPresentationUnrecognised, err
+	}
+}
+
+// Compile-time proof that the four adapters satisfy the ports bidding declared.
 //
 // This is the only place in the build where that can be established — `bidding` names neither `fleet`
 // nor `jobs`, and neither names `bidding`, so nothing else links them. If any of them ever part
 // company, these lines are what say so, at compile time and in the file whose job it is to know about
 // all three.
 var (
-	_ bidding.Eligibility = (*fleet.Service)(nil)
-	_ bidding.Negotiation = negotiatedJobs{}
-	_ bidding.Awarding    = awardableJobs{}
+	_ bidding.Eligibility  = (*fleet.Service)(nil)
+	_ bidding.Negotiation  = negotiatedJobs{}
+	_ bidding.Awarding     = awardableJobs{}
+	_ bidding.Presentation = presentedJobs{}
 )

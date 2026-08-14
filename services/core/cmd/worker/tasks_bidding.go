@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/bidding"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 )
 
 // The bidding domain's scheduled work (SHIP-89).
@@ -38,14 +43,21 @@ func init() {
 		// event would be a state change nobody downstream hears about, which is the one
 		// thing bidding.NewService panics rather than tolerates.
 		//
-		// The three ports are nil, and that is a supported state here rather than a gap.
-		// This pass calls exactly one method — bidding.Service.Expire — and it consults
-		// none of them: an offer running out on its own terms is not a question about
-		// whether a provider may bid, whether an account owns a job, or whether a job can
-		// still be awarded. Handing the worker a fleet filter and two job adapters it
-		// would never call would be three dependencies in a process that has no reason for
-		// any of them, which is tasks_jobs.go's argument for passing a nil geocoder.
-		service := bidding.NewService(events.NewOutbox(), nil, nil, nil, d.Clock)
+		// Three of the four ports are nil, and that is a supported state here rather than
+		// a gap. This pass calls exactly one method — bidding.Service.Expire — and it
+		// consults none of the three: an offer running out on its own terms is not a
+		// question about whether a provider may bid, whether an account owns a job, or
+		// whether a job can still be awarded. Handing the worker a fleet filter and two
+		// job adapters it would never call would be three dependencies in a process that
+		// has no reason for any of them, which is tasks_jobs.go's argument for passing a
+		// nil geocoder.
+		//
+		// **The fourth is not optional (SHIP-90).** Docs/02 §2's `Negotiating → Open` names
+		// "all active bids expire" first, so an expiry that took the last live offer on a
+		// job has to return that job to Open — through `jobs`' one guarded function, in the
+		// transaction that closed the offer.
+		service := bidding.NewService(events.NewOutbox(), nil, nil, nil,
+			presentedJobs{jobs: jobs.NewService(events.NewOutbox(), d.Clock, nil)}, d.Clock)
 
 		return Task{
 			Name:    "bid-expiry",
@@ -126,3 +138,97 @@ func expireBids(d Deps, service *bidding.Service) Work {
 		return len(due), nil
 	}
 }
+
+// presentedJobs implements bidding.Presentation over the real `jobs` service (SHIP-90).
+//
+// **A second copy of cmd/api/routes_bidding.go's adapter of the same name**, and the duplication is
+// deliberate rather than an oversight. The two composition roots are two binaries; neither imports
+// the other, and `internal/bidding` names neither `jobs` nor this type. What keeps the copies
+// honest is that both satisfy one interface and both are exercised — that one by the served
+// endpoints and `scripts/verify/61-bidding.sh`, this one by cmd/worker/tasks_bidding_test.go
+// running the registered task against a real database. internal/bidding's own fixtures keep a third
+// copy for the same reason and say so.
+//
+// Only `LeaveNegotiation` is ever called from here: a sweep closes offers and never opens one.
+// `EnterNegotiation` is implemented because the interface has it, and because a partial
+// implementation would be a type that compiles into the wrong shape the day a second bidding task
+// is registered.
+type presentedJobs struct {
+	jobs *jobs.Service
+}
+
+// The two reasons, matching cmd/api's exactly. Support searches for these strings and a customer's
+// status timeline shows them, so a job that reached Open through the sweep and one that reached it
+// through a withdrawal must read the same.
+const (
+	negotiationOpenedReason = "An offer was made on the job (Docs/02 §2)."
+	negotiationEndedReason  = "The last live offer on the job was withdrawn or expired (Docs/02 §2)."
+)
+
+func (p presentedJobs) EnterNegotiation(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (bidding.JobPresentation, error) {
+	return p.move(p.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusNegotiating,
+		Actor:  jobs.System(),
+		Reason: negotiationOpenedReason,
+	}))
+}
+
+// LeaveNegotiation takes the job row `FOR UPDATE SKIP LOCKED` and moves it only if it got it.
+//
+// **This is the method the sweep needs and the reason it cannot block.** A pass claims its offers
+// with `FOR UPDATE SKIP LOCKED` and holds those `bids` rows for the rest of its transaction, so a
+// blocking lock on `jobs` here would be `bids` → `jobs` against the award's `jobs` → `bids` — and
+// the first deadlock would be between a sweep and a customer awarding a job. bidding.Presentation
+// carries the full reasoning and the cost.
+func (p presentedJobs) LeaveNegotiation(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (bidding.JobPresentation, error) {
+	const q = `SELECT status FROM jobs WHERE id = $1 FOR UPDATE SKIP LOCKED`
+
+	var status jobs.Status
+	switch err := r.QueryRow(ctx, q, jobID).Scan(&status); {
+	case errors.Is(err, db.ErrNoRows):
+		return bidding.JobPresentationHeld, nil
+	case err != nil:
+		return bidding.JobPresentationUnrecognised,
+			fmt.Errorf("worker: holding %s to leave Negotiating: %w", jobID, err)
+	}
+
+	if !jobs.Permitted(status, jobs.StatusOpen) {
+		if status == jobs.StatusOpen {
+			return bidding.JobPresentationAlreadyThere, nil
+		}
+		return bidding.JobPresentationClosed, nil
+	}
+
+	return p.move(p.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusOpen,
+		Actor:  jobs.System(),
+		Reason: negotiationEndedReason,
+	}))
+}
+
+func (presentedJobs) move(_ jobs.Job, err error) (bidding.JobPresentation, error) {
+	switch {
+	case err == nil:
+		return bidding.JobPresentationMoved, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return bidding.JobPresentationAlreadyThere, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted), errors.Is(err, jobs.ErrJobNotFound):
+		return bidding.JobPresentationClosed, nil
+	default:
+		return bidding.JobPresentationUnrecognised, err
+	}
+}
+
+// Compile-time proof that the adapter satisfies the port bidding declared, in the binary that uses
+// it. cmd/api carries the same line for its own copy.
+var _ bidding.Presentation = presentedJobs{}
