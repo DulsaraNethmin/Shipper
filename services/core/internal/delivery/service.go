@@ -714,8 +714,15 @@ func (s *Service) record(
 		Actor:   by.Type,
 		ActorID: by.ID,
 
-		Reason:          recording.Reason,
-		Key:             recording.Key,
+		Reason: recording.Reason,
+		Key:    recording.Key,
+
+		// Docs/01 §4.4's other two required facts about a delivered job (SHIP-123). Empty on
+		// every other milestone, which `ck_milestones_delivery_details` makes the only permitted
+		// state there — the insert writes NULL for an empty string.
+		RecipientName: recording.RecipientName,
+		DeliveryNote:  recording.DeliveryNote,
+
 		ActorRecordedAt: recordedAt.UTC(),
 	})
 	if err != nil {
@@ -992,6 +999,32 @@ func (s *Service) AssignmentFor(ctx context.Context, r db.Runner, grant DriverGr
 	}
 
 	return live, nil
+}
+
+// DeliveryFinishedFor is when the delivery a driver's link opens was recorded as delivered, if it
+// has been (SHIP-123).
+//
+// # It takes a grant and no job identifier, like everything else a driver reaches
+//
+// The same signature [Service.AssignmentFor] and [Service.RecordDriverMilestone] take, for the same
+// reason: the only job this can answer about is the one inside a signature.
+//
+// # It is a second question rather than a field on the assignment
+//
+// [Assignment] is a `driver_assignments` row and this is a fact about `milestones`. Putting it on
+// that struct would mean every reader of an assignment paying for a second query, including
+// [Service.RecordDriverMilestone], which asks for the assignment on every write and has no use for
+// this at all.
+//
+// **The link keeps working after the delivery is finished, and that is deliberate.** A driver whose
+// last act was recording a delivery may reasonably reopen the page to check what they recorded, and
+// a link that stopped opening would send them back to the provider for a new one. What changes is
+// what the page offers, which is a presentation decision the portal makes from this field — not an
+// authorisation decision, which stays where Docs/07 §3 puts it.
+//
+// r is a reader rather than a transaction: one statement, no writes.
+func (s *Service) DeliveryFinishedFor(ctx context.Context, r db.Runner, grant DriverGrant) (time.Time, bool, error) {
+	return s.store.deliveredAt(ctx, r, grant.JobID)
 }
 
 // ReissueDriverLink mints a fresh link for the driver already on a job, ending the previous one

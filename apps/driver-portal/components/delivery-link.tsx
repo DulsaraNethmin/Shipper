@@ -1,11 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
-import { REFUSALS, type Delivery, type Evidence, type Refusal } from "@/lib/delivery";
+import {
+  REFUSALS,
+  type Completion as Finished,
+  type Delivery,
+  type Evidence,
+  type Refusal,
+} from "@/lib/delivery";
 import { dayFirst } from "@/lib/format";
 import { EXCEPTION_COPY, MILESTONES, type Milestone } from "@/lib/milestones";
 import { capturePhotograph, openLink, recordStep, type Opened, type Told } from "@/lib/open";
@@ -174,6 +180,12 @@ function Detail({ jobId, delivery }: { jobId: string; delivery: Delivery }) {
   const assigned = dayFirst(delivery.assigned_at);
   const expires = dayFirst(delivery.link_expires_at);
 
+  // Seeded from the platform and updated when this page view finishes the job (SHIP-123). The
+  // platform's answer is what survives a reload; the state is what makes the controls disappear the
+  // moment the delivery is recorded, without a second round trip to be told something this page
+  // already knows.
+  const [deliveredAt, setDeliveredAt] = useState<string>(delivery.delivered_at ?? "");
+
   return (
     <Frame>
       <header className="flex flex-col gap-1">
@@ -183,7 +195,11 @@ function Detail({ jobId, delivery }: { jobId: string; delivery: Delivery }) {
         </p>
       </header>
 
-      <Progress jobId={jobId} />
+      {deliveredAt === "" ? (
+        <Progress jobId={jobId} onDelivered={setDeliveredAt} />
+      ) : (
+        <Finished at={deliveredAt} />
+      )}
 
       <Card>
         <CardHeader>
@@ -268,7 +284,7 @@ function Detail({ jobId, delivery }: { jobId: string; delivery: Delivery }) {
  * only that a button in flight cannot be tapped again — which is a courtesy to the driver rather
  * than the guarantee, because the guarantee has to survive a reload and a component cannot.
  */
-function Progress({ jobId }: { jobId: string }) {
+function Progress({ jobId, onDelivered }: { jobId: string; onDelivered: (at: string) => void }) {
   const [steps, setSteps] = useState<Record<string, StepState>>({});
   const [completing, setCompleting] = useState(false);
   const live = useRef(true);
@@ -292,7 +308,13 @@ function Progress({ jobId }: { jobId: string }) {
       (told) => {
         if (!live.current) return;
         setSteps((held) => ({ ...held, [wire]: stepFrom(told) }));
-        if (told.kind === "recorded") setCompleting(false);
+        if (told.kind === "recorded") {
+          setCompleting(false);
+          // The page goes read-only on the milestone the platform *recorded*, and on its recorded
+          // time rather than the local clock — a retry answered from an earlier attempt comes back
+          // with that attempt's time, which is the honest one to show.
+          if (told.recorded.milestone === "delivered") onDelivered(told.recorded.recorded_at);
+        }
       },
       () => {
         // Both chains resolve rather than reject, exactly as openLink does. A browser that
@@ -302,15 +324,17 @@ function Progress({ jobId }: { jobId: string }) {
         }
       },
     );
-  }, []);
+  }, [onDelivered]);
 
   const record = useCallback(
-    (wire: string, evidence?: Evidence) => settle(wire, recordStep(jobId, wire, { evidence })),
+    (wire: string, evidence?: Evidence, completion?: Finished) =>
+      settle(wire, recordStep(jobId, wire, { evidence, completion })),
     [jobId, settle],
   );
 
   const capture = useCallback(
-    (wire: string, photograph: Blob) => settle(wire, capturePhotograph(jobId, wire, photograph)),
+    (wire: string, photograph: Blob, completion: Finished) =>
+      settle(wire, capturePhotograph(jobId, wire, photograph, { completion })),
     [jobId, settle],
   );
 
@@ -338,8 +362,10 @@ function Progress({ jobId }: { jobId: string }) {
         {completing ? (
           <Completion
             recording={at("delivered").kind === "recording"}
-            onPhotograph={(photograph) => capture("delivered", photograph)}
-            onException={(reason) => record("delivered", { exception_reason: reason })}
+            onPhotograph={(photograph, finished) => capture("delivered", photograph, finished)}
+            onException={(reason, finished) =>
+              record("delivered", { exception_reason: reason }, finished)
+            }
             onCancel={() => setCompleting(false)}
           />
         ) : null}
@@ -402,41 +428,50 @@ function Step({
 }
 
 /**
- * Finishing the delivery, which needs evidence (`Docs/01` §4.4, and `CLAUDE.md` calls it an
- * invariant).
+ * Finishing the delivery: who took it, what was left where, and the evidence (SHIP-122, SHIP-123).
  *
- * # Both halves, and the order they are offered in is the decision
+ * # `Docs/01` §4.4's field set, in the order a driver fills it in
+ *
+ * That paragraph requires four things of a delivered job: a recipient name, a delivery timestamp, a
+ * delivery note, and photo proof. The timestamp is the tap. The other three are this form, and the
+ * two text fields come **before** the camera because that is the order the moment happens in — the
+ * driver is standing in front of the person who took it, and the photograph is of where they left it.
+ *
+ * # Both halves of the evidence rule are on one screen, and that is not a layout preference
  *
  * `Docs/01` §4.4 makes photo proof mandatory **and**, in the same paragraph, makes the exception path
- * "part of the same feature… built with it, not after". The reason it gives is operational: "what
- * must never happen is a driver standing at a delivery point unable to finish the job — that
- * converts a UI constraint into an operational failure and a support call".
+ * "part of the same feature… built with it, not after", because "what must never happen is a driver
+ * standing at a delivery point unable to finish the job — that converts a UI constraint into an
+ * operational failure and a support call". A driver whose camera permission has just been denied is
+ * exactly the person who must not have to go looking, and `camera_unavailable` is one of the three
+ * reasons for precisely that case. So the camera is first and largest, and the three reasons are
+ * under it rather than behind another tap.
  *
- * So the camera is first and largest, and the three reasons sit under it in the same sheet rather
- * than behind another tap. A driver whose camera permission has just been denied is exactly the
- * person who must not have to go looking, and `camera_unavailable` is one of the three reasons for
- * precisely that case.
+ * # The name and the note gate both paths, and the gate is local
  *
- * # The camera is a file input and not a media stream, and that is deliberate on this surface
+ * Neither button does anything until both fields are filled in, which is presentation rather than
+ * authorisation: the platform refuses a `delivered` without them, naming the field, and this only
+ * saves the driver a round trip and a lost photograph. **`Docs/07` §3's rule is about who may act,
+ * not about whether a form is complete** — and the failure this avoids is real, because a capture
+ * that reached the platform and was refused would have uploaded the photograph first.
  *
- * `capture="environment"` on `<input type="file" accept="image/*">` asks the handset to open the
- * rear camera directly. It costs no permission prompt of its own on iOS and Android — the picker is
- * the permission — it needs no `getUserMedia`, no video element, no canvas and no secure-context
- * fallback, and **a browser that does not honour the attribute degrades to the photo library**,
- * which is a working path rather than a dead end. A `MediaDevices` implementation would be more
- * control and four more failure modes on a device this application cannot test on.
+ * There is deliberately **no exception path for the two text fields**. `Docs/01` §4.4 gives three
+ * reasons a photograph can be impossible and none for a name or a note, because a driver can always
+ * write what they see: "unattended" is a recipient and "left at the front door" is a note.
  *
- * The file is handed straight to `capturePhotograph` as a `Blob`. **Nothing here compresses it**:
- * SHIP-130's on-device compression budget is the Flutter client's, and the platform's size limit is
- * server-side and comes back in the refusal message, which is where a client learns the current one.
- * A photograph over the limit is a `rejected` with the limit in it, and the exception path is on the
- * same screen.
+ * # The camera is a file input and not a media stream
  *
- * # The reasons are generated and not typed out
+ * `capture="environment"` on `<input type="file" accept="image/*">` asks the handset to open the rear
+ * camera directly. It costs no permission prompt of its own on iOS or Android — the picker is the
+ * permission — it needs no `getUserMedia`, no video element, no canvas and no secure-context
+ * fallback, and **a browser that does not honour the attribute degrades to the photo library**, which
+ * is a working path rather than a dead end. A `MediaDevices` implementation would be more control and
+ * four more failure modes on devices this application cannot test on.
  *
- * `lib/statuses.gen.ts` renders them from `contracts/statuses.yaml`, which is where `Docs/01` §4.4's
- * three clauses live, and `EXCEPTION_COPY` is keyed by that generated union — so a fourth reason is
- * a build failure here rather than a button that never appears.
+ * **Nothing here compresses it**: SHIP-130's on-device compression budget is the Flutter client's,
+ * and the platform's size limit is server-side and comes back in the refusal message, which is where
+ * a client learns the current one. A photograph over the limit is a `rejected` with the limit in it,
+ * and the exception path is on the same screen.
  */
 function Completion({
   recording,
@@ -445,21 +480,57 @@ function Completion({
   onCancel,
 }: {
   recording: boolean;
-  onPhotograph: (photograph: Blob) => void;
-  onException: (reason: string) => void;
+  onPhotograph: (photograph: Blob, finished: Finished) => void;
+  onException: (reason: string, finished: Finished) => void;
   onCancel: () => void;
 }) {
   const camera = useRef<HTMLInputElement | null>(null);
+  const [recipientName, setRecipientName] = useState("");
+  const [deliveryNote, setDeliveryNote] = useState("");
+
+  const finished = useMemo<Finished>(
+    () => ({ recipientName: recipientName.trim(), deliveryNote: deliveryNote.trim() }),
+    [recipientName, deliveryNote],
+  );
+  // Trimmed before it is judged, because the platform trims before it judges: a name of spaces is
+  // refused as required there, and a form that accepted one here would upload a photograph first.
+  const ready = finished.recipientName !== "" && finished.deliveryNote !== "";
 
   return (
     <div className="border-border flex flex-col gap-3 rounded-lg border p-3">
       <div className="flex flex-col gap-1">
         <p className="text-sm font-medium">Finish the delivery</p>
         <p className="text-muted-foreground text-xs">
-          A delivery is recorded with a photograph of the goods where you left them, or with a
-          reason there is none. Either one finishes the job.
+          Who took it and what you did with it, then a photograph of where you left it — or a reason
+          there is no photograph. Either one finishes the job.
         </p>
       </div>
+
+      <label className="flex flex-col gap-1.5">
+        <span className="text-sm font-medium">Who took the delivery?</span>
+        <input
+          className="border-border bg-background focus-visible:border-ring focus-visible:ring-ring/50 h-12 w-full rounded-lg border px-3 text-base outline-none focus-visible:ring-3"
+          value={recipientName}
+          onChange={(event) => setRecipientName(event.target.value)}
+          maxLength={120}
+          autoComplete="off"
+          enterKeyHint="next"
+          placeholder="Their name, or “unattended”"
+          disabled={recording}
+        />
+      </label>
+
+      <label className="flex flex-col gap-1.5">
+        <span className="text-sm font-medium">What did you do with it?</span>
+        <textarea
+          className="border-border bg-background focus-visible:border-ring focus-visible:ring-ring/50 min-h-20 w-full rounded-lg border px-3 py-2 text-base outline-none focus-visible:ring-3"
+          value={deliveryNote}
+          onChange={(event) => setDeliveryNote(event.target.value)}
+          maxLength={500}
+          placeholder="Left with reception, signed for"
+          disabled={recording}
+        />
+      </label>
 
       <input
         ref={camera}
@@ -474,18 +545,25 @@ function Completion({
           // The value is cleared so that taking the same photograph twice — which a driver does
           // after a failed upload — fires `change` again. Without it the second attempt is silent.
           event.target.value = "";
-          if (photograph !== undefined) onPhotograph(photograph);
+          if (photograph !== undefined) onPhotograph(photograph, finished);
         }}
       />
 
       <Button
         size="lg"
         className="h-14 w-full justify-center text-base"
-        disabled={recording}
+        disabled={recording || !ready}
         onClick={() => camera.current?.click()}
       >
         {recording ? "Finishing…" : "Take a photograph"}
       </Button>
+
+      {ready ? null : (
+        <p className="text-muted-foreground text-xs" role="status">
+          Fill both in first. A delivered job records who took it and what you did with it, as well
+          as the photograph.
+        </p>
+      )}
 
       <p className="text-muted-foreground text-xs">Or say why there is no photograph:</p>
 
@@ -495,8 +573,8 @@ function Completion({
           size="lg"
           variant="outline"
           className="h-14 w-full justify-center px-3 text-center text-base whitespace-normal"
-          disabled={recording}
-          onClick={() => onException(reason)}
+          disabled={recording || !ready}
+          onClick={() => onException(reason, finished)}
         >
           {EXCEPTION_COPY[reason]}
         </Button>
@@ -512,5 +590,48 @@ function Completion({
         Not yet
       </Button>
     </div>
+  );
+}
+
+/**
+ * The delivery is finished, and the page says so and offers nothing (SHIP-123).
+ *
+ * # "Read-only after" is a property of this page and not of the platform
+ *
+ * The link keeps opening, and the endpoints keep answering. That is deliberate: a driver's last act
+ * was recording a delivery, and reopening the page to check what they recorded is a reasonable thing
+ * to do — a link that stopped working would send them back to the transport provider for a new one
+ * over nothing. What is gone is the controls, because there is nothing left to record.
+ *
+ * **It is presentation, and the platform is still the one deciding.** A milestone recorded on a
+ * delivered job is refused by the transition guard exactly as it was before this page existed;
+ * `Docs/07` §3's rule is that the app may hide or disable and the platform decides, and this is the
+ * hiding half. The fact it hides on — `delivered_at` — is the platform's answer rather than
+ * something this page remembered.
+ */
+function Finished({ at }: { at: string }) {
+  const when = dayFirst(at);
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Delivered</CardTitle>
+        <CardDescription>
+          {when === null
+            ? "This delivery is recorded as delivered."
+            : `Recorded as delivered at ${when}.`}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="text-muted-foreground flex flex-col gap-2 text-sm">
+        <p>
+          There is nothing more to record. The transport provider and the customer can both see what
+          you recorded, including the photograph or the reason there was none.
+        </p>
+        <p>
+          If something about it was wrong, tell the transport provider who sent you this link — a
+          delivery record is kept as it was made rather than corrected in place.
+        </p>
+      </CardContent>
+    </Card>
   );
 }

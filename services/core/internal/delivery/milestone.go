@@ -162,7 +162,40 @@ type Recording struct {
 
 	Proof     VerifiedProof
 	Exception ProofExceptionReason
+
+	// RecipientName and DeliveryNote are Docs/01 §4.4's other two required facts about a
+	// delivered job, and they arrive with the claim for the reason [VerifiedProof] does
+	// (SHIP-123).
+	//
+	// **Required on 'Delivered' and refused on every other milestone**, which is
+	// `ck_milestones_delivery_details` in Go — see [Recording.problems]. The second half is the
+	// one that is easy to leave out and is worth as much: a recipient name attached to a
+	// `picked_up` would be recording a handover that did not happen.
+	//
+	// **Neither has an exception path, and that is deliberate.** Docs/01 §4.4 gives three reasons
+	// a *photograph* can be impossible — a camera, a recipient who objects, an unlit place — and
+	// gives none for a name or a note, because a driver can always type what they see. "Left with
+	// reception" is a delivery note and "unattended" is a recipient. What that paragraph does not
+	// contemplate is a delivery with no recipient at all; Docs/11 §9 records it as a question for
+	// operations rather than answering it here.
+	//
+	// DeliveryNote is not [Recording.Reason]. Reason is the optional note any milestone may carry
+	// — Docs/02 §5's "the gate was locked and I am returning at four" — and a row may carry both,
+	// meaning different things. Docs/11 §4 refused the reuse before this ticket existed.
+	RecipientName string
+	DeliveryNote  string
 }
+
+// maxRecipientName and maxDeliveryNote bound the two fields a delivered milestone carries.
+//
+// The same call [maxMilestoneReason] makes: a bound against a runaway text field rather than a
+// judgement about what may be said. Both are paired with `ck_milestones_delivery_details`, which
+// carries the identical numbers — Docs/10 §3.4's rule that a limit the database enforces and a
+// validator states must be one limit.
+const (
+	maxRecipientName = 120
+	maxDeliveryNote  = 500
+)
 
 // hasEvidence reports whether this recording carries a photograph or a reasoned exception.
 //
@@ -174,6 +207,8 @@ func (rec Recording) hasEvidence() bool { return rec.Proof.present() || rec.Exce
 // normalise trims what the client sent into what the columns should hold.
 func (rec Recording) normalise() Recording {
 	rec.Reason = collapse(rec.Reason)
+	rec.RecipientName = collapse(rec.RecipientName)
+	rec.DeliveryNote = collapse(rec.DeliveryNote)
 	return rec
 }
 
@@ -204,6 +239,34 @@ func (rec Recording) problems() validate.Errors {
 
 	if rec.Reason != "" {
 		e.Length("reason", rec.Reason, 1, maxMilestoneReason)
+	}
+
+	// Docs/01 §4.4's field set for a delivered job, in both directions (SHIP-123).
+	//
+	// Checked here as well as by `ck_milestones_delivery_details`, for the reason Docs/10 §4.6
+	// gives about validation generally and SHIP-118 gives about its own rule: a constraint name in
+	// a 500 explains nothing, and this is the layer a client can act on. The database is the layer
+	// that does not depend on which function did the writing.
+	//
+	// The refusal on a non-delivered milestone names the field the client sent rather than the
+	// milestone, because that is the thing to remove.
+	if rec.Milestone == MilestoneDelivered {
+		if e.Required("recipient_name", rec.RecipientName) {
+			e.Length("recipient_name", rec.RecipientName, 1, maxRecipientName)
+		}
+		if e.Required("delivery_note", rec.DeliveryNote) {
+			e.Length("delivery_note", rec.DeliveryNote, 1, maxDeliveryNote)
+		}
+	} else {
+		if rec.RecipientName != "" {
+			e.Add("recipient_name", validate.CodeNotAllowed,
+				"Only a delivered milestone names who received the goods.")
+		}
+		if rec.DeliveryNote != "" {
+			e.Add("delivery_note", validate.CodeNotAllowed,
+				"Only a delivered milestone carries a delivery note. Use reason for a note on any "+
+					"other milestone.")
+		}
 	}
 
 	// The evidence, checked here as well as at the wire (SHIP-116).
@@ -265,6 +328,12 @@ type Record struct {
 
 	Reason string
 	Key    string
+
+	// RecipientName and DeliveryNote are set on a 'Delivered' row and empty on every other
+	// (SHIP-123). `ck_milestones_delivery_details` permits no other combination, so a reader that
+	// checks one has checked both.
+	RecipientName string
+	DeliveryNote  string
 
 	ActorRecordedAt  time.Time
 	ServerRecordedAt time.Time

@@ -62,6 +62,24 @@ export interface Delivery {
   driver_name: string;
   assigned_at: string;
   link_expires_at: string;
+
+  /**
+   * When this delivery was recorded as delivered, on the actor's clock (SHIP-123).
+   *
+   * **Absent until it has been**, which is the whole of how this page becomes read-only after a
+   * reload. Component state does not survive one, and a driver on one bar of signal reloads; holding
+   * it in `sessionStorage` would be the page inventing a fact about the delivery rather than reading
+   * one. So the platform answers it, which is where `Docs/07` §3 puts every question of this shape.
+   *
+   * **It is not the job's status.** That vocabulary belongs to `jobs` and a driver's link cannot
+   * reach it. What this reports is a fact about the delivery's own record — that a `delivered`
+   * milestone exists — and the two are genuinely different questions, because a milestone can be
+   * recorded without the job moving.
+   *
+   * Optional in this interface and **not** checked by `isDelivery`, deliberately: it is the one
+   * field of the six whose absence is an ordinary state rather than a broken contract.
+   */
+  delivered_at?: string;
 }
 
 /**
@@ -345,6 +363,23 @@ export type RecordOutcome =
  */
 export type Evidence = { object_key: string } | { exception_reason: string };
 
+/**
+ * Who took the goods and what was left where — `Docs/01` §4.4's other two required facts about a
+ * delivered job (SHIP-123).
+ *
+ * Required together and only on `delivered`, which is why they travel as one value rather than two
+ * optional arguments: a caller holding one and not the other is a caller the platform will refuse,
+ * and the type says so before the request goes out.
+ *
+ * **Neither has an exception path**, unlike the photograph. `Docs/01` §4.4 gives three reasons a
+ * photograph can be impossible and none for a name or a note, because a driver can always write what
+ * they see.
+ */
+export interface Completion {
+  recipientName: string;
+  deliveryNote: string;
+}
+
 /** Whether a parsed body is a recorded milestone. Checked rather than asserted, as the read is. */
 function isRecorded(value: unknown): value is Recorded {
   if (typeof value !== "object" || value === null) return false;
@@ -391,13 +426,27 @@ export async function recordMilestone(
   token: string,
   milestone: string,
   key: string,
-  options: { evidence?: Evidence; recordedAt?: string; signal?: AbortSignal } = {},
+  options: {
+    evidence?: Evidence;
+    completion?: Completion;
+    recordedAt?: string;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<RecordOutcome> {
   const body: Record<string, unknown> = {
     milestone,
     recorded_at: options.recordedAt ?? new Date().toISOString(),
   };
   if (options.evidence !== undefined) body.proof = options.evidence;
+
+  // Sent only when the caller has them, which in practice means only on `delivered`. The platform
+  // refuses either field on any other milestone, so a page that attached them everywhere would turn
+  // every pickup into a `422` — and the refusal is right: a recipient name on a pickup is a handover
+  // that did not happen.
+  if (options.completion !== undefined) {
+    body.recipient_name = options.completion.recipientName;
+    body.delivery_note = options.completion.deliveryNote;
+  }
 
   let response: Response;
   try {

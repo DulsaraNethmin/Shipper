@@ -259,7 +259,7 @@ func TestADriverPhotographsADelivery(t *testing.T) {
 	}
 
 	record, outcome, err := recordAsDriver(t, pool, svc, grant,
-		Recording{Milestone: MilestoneDelivered, Key: "drvup5-delivered", Proof: proof})
+		Recording{Milestone: MilestoneDelivered, Key: "drvup5-delivered", Proof: proof, RecipientName: "R. Chen", DeliveryNote: "Left with reception"})
 	if err != nil {
 		t.Fatalf("recording a photographed delivery: %v", err)
 	}

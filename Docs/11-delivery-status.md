@@ -481,6 +481,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-120a** | M4 | `POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken` — **the first write in the service served on a credential that names no account**, and the route three wave-7 lanes specified and none built. It settles the idempotency scope §9 had held open since SHIP-15m: a driver's key is scoped by the job, because `uq_milestones_idempotency (job_id, idempotency_key)` already scopes it there and `000602` named this case while doing it. The `Jobs` port's four moves take a `Recorder` instead of a provider identifier, so a driver's transition is attributed to their `driver_assignments` row rather than to their provider — *see below* |
 | **SHIP-121** | M4 | Driver portal milestone controls — four 56-pixel full-width targets over SHIP-120a's route, and **no platform change at all**. The decision worth reading is the idempotency key: one per action, minted from a CSPRNG, held in `sessionStorage` across a reload, and discarded only when the platform **answers** — so a retry in a shed reuses it and `Docs/02` §5's second pickup attempt does not. The portal's proxy grew a second outbound call and stayed narrow by becoming **a file per upstream endpoint**; `surface.test.ts` now holds each route file to exactly one `/v1/` template. `make verify` reads the portal's hand-written milestone list out of its own source and records every value in it against the running service — *see below*
 | **SHIP-122** | M4 | `POST /v1/driver/jobs/{id}/proof-uploads`, auth class `RequireDriverToken`, plus the portal's camera. **It is the route that made a driver-recorded delivery something other than a moderation case**: until it existed a driver could reach `Delivered` only through a reasoned exception, so SHIP-117's queue was the only path rather than one of two. It answers the scope question `routes_delivery.go` held the route shut for a wave over — the stored response is a credential, and what a replay of it can and cannot reach is written out in the handler. Both domain functions take a grant and **no job identifier**, and the browser's PUT to the store carries no credential at all — *see below*
+| **SHIP-123** | M4 | Migration `000607` and the completion form over it. **It closes `Docs/11` §4's SHIP-118 row**: `Docs/01` §4.4 requires a delivered job to carry a recipient name and a delivery note, and until now no column held either — `000605`'s own comment named this ticket while declining to do it. `ck_milestones_delivery_details` requires both on `Delivered` **and refuses both everywhere else**, which binds the provider's route as much as the driver's. "Read-only after" needed a field that is not the job's status, and `delivered_at` on the driver's read is it — presentation rather than authorisation, which `make verify` asserts by recording a milestone afterwards and finding it absorbed — *see below*
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
@@ -9380,6 +9381,101 @@ repository to hold a test against, so §9 records it against the first deploymen
 it to be discovered by a driver.
 
 
+### SHIP-123 — the two columns `000605` named eighteen months of comments ago, and the read-only page over them
+
+Migration `000607`, the domain and API changes under it, and the driver portal's completion form.
+**It closes `Docs/11` §4's SHIP-118 row**, which has said since wave 8 that `Docs/01` §4.4 requires a
+delivered job to carry a recipient name and a delivery note and that *no column holds either*.
+`000605`'s own comment named this ticket while declining to do it: "SHIP-123 is the ticket whose
+*Done when* names them, and it depends on SHIP-118".
+
+`Docs/01` §4.4 requires four things of a delivered job — recipient name, delivery timestamp, delivery
+note, and photo proof. The timestamp was always `actor_recorded_at` and the proof became mandatory at
+SHIP-118. These are the other two, and the field set is now closed end to end.
+
+#### The rule is in both directions, and the second half is the one a first draft leaves out
+
+`ck_milestones_delivery_details` requires both on `Delivered` **and refuses both everywhere else**.
+Required is what the document asks for. Refused elsewhere is what stops the columns becoming a
+general-purpose pair somebody attaches to a pickup — which would be recording a handover that did not
+happen, in a column nothing else would question. Both halves live in the domain, where a client is
+told which field is wrong, and in the constraint, where the rule stops depending on which function
+did the writing: the same division `000605` and `000600` both argue about themselves.
+
+It is a `CASE` rather than a pair of implications, because three-valued logic is where a constraint
+like this goes quietly wrong — `milestone <> 'Delivered' OR recipient_name IS NOT NULL` is *true*
+when the milestone is NULL. The Go bounds and the SQL bounds are paired by a test that reads
+`pg_get_constraintdef` and matches each number against its **column**, so swapping 120 and 500 is
+caught rather than only their presence.
+
+#### It binds two existing writers, not just the new form, and that is the coherent reading
+
+`POST /v1/jobs/{id}/milestones` and `POST /v1/driver/jobs/{id}/milestones` both record `Delivered`.
+`Docs/01` §4.4 says "delivered jobs require", not "jobs delivered through the driver portal require",
+so both paths supply the fields from `000607` onwards. **The blast radius was eleven tests and six
+verify checks**, every one of them a fixture recording a delivery, and each was updated rather than
+exempted. Two were updated with a comment saying why: the tests that exercise the *evidence* rule now
+supply the field set, because validation runs before the evidence rule and without them the refusal
+would be a `422` on `recipient_name` and the test would pass for a reason it is not about.
+
+**Neither field has an exception path, and that is a decision rather than an omission.** `Docs/01`
+§4.4 gives three reasons a *photograph* can be impossible and none for a name or a note, because a
+driver can always write what they see — "unattended" is a recipient and "left at the front door" is a
+note. What that paragraph does not contemplate is a delivery with no recipient at all; §9 records it
+as a question for operations rather than answering it in a constraint.
+
+#### The backfill is a deliberate lie of the least harmful kind
+
+A `CHECK` added with `ALTER TABLE` validates existing rows, so this migration would refuse to apply
+to any database that has ever recorded a delivery — which is every database `make verify` has run
+against. There is no true value to write and no way to obtain one: the driver has gone home and the
+table is append-only. So delivered rows recorded before this migration are backfilled with
+`(not captured — recorded before SHIP-123)`, phrased so nobody reading a support screen mistakes it
+for something a driver typed, and **not** NULL, because NULL is what the constraint uses to mean
+"this is not a delivered milestone".
+
+#### "Portal becomes read-only after" needed a field, and the field is not the job's status
+
+The other half of the *Done when*, and the part with a design question in it. A driver reloads — that
+is the premise of the whole portal — so component state cannot carry it, and `sessionStorage` would
+be the page inventing a fact about the delivery rather than reading one. There is no driver-readable
+milestone list: `GET /v1/jobs/{id}/delivery/milestones` is `RequireUser`.
+
+So `GET /v1/driver/jobs/{id}` grew **`delivered_at`**, and the care went into it not being the job's
+status under another name. The status vocabulary stays `jobs`', this domain still holds no copy of
+it, and what the field reports is a fact about `milestones` — that a `Delivered` milestone exists on
+this job. Those are genuinely different questions, because SHIP-112 records milestones that move
+nothing. It is the **earliest** such milestone, not the latest: a delivery can be recorded delivered
+twice, and what a driver is shown is when it was completed rather than when somebody last pressed a
+button.
+
+**It is presentation and not authorisation, and `make verify` asserts that rather than stating it.**
+The link keeps opening after the delivery is finished — a driver may reasonably reopen the page to
+check what they recorded, and a link that stopped working would send them back to the provider for a
+new one over nothing. A milestone recorded after delivery is still *absorbed* by the platform exactly
+as SHIP-112 made it, which the section demonstrates by recording one and finding the job unmoved.
+`delivered_at` hides controls and decides nothing, which is `Docs/07` §3's division exactly.
+
+**A sixth field on a shape whose closed set was the point**, and both guards were updated rather than
+worked around. SHIP-108 held the response to five fields in a Go test and a `make verify` check
+because "what may a driver see" is a decision the response *is*. `delivered_at` is `omitempty`, so an
+undelivered job still answers with exactly those five — which is what keeps the closed set meaningful
+— and the delivered case is asserted separately, in both places.
+
+#### The form asks for the two fields before it opens the camera
+
+That is the order the moment happens in: the driver is standing in front of the person who took it,
+and the photograph is of where they left it. Neither the camera nor the three exception reasons do
+anything until both fields are filled in, which saves a round trip and — on the photographed path — a
+photograph uploaded before a refusal. That gate is presentation: the platform refuses a `delivered`
+without them and names the field, and `Docs/07` §3's rule is about who may act rather than about
+whether a form is complete.
+
+The values are trimmed before the page judges them, because the platform trims before it judges: a
+name of spaces is `required` there, and a form that accepted one here would upload a photograph
+first.
+
+
 ### SHIP-109 — revocation is a read against a column, and a retry must not cause one
 
 `POST /v1/jobs/{id}/driver/link`, `RequireUser`. Another job-scoped link for the driver already on
@@ -9666,33 +9762,27 @@ and it says `Open → Cancelled`; widening the claim means widening the document
 |---|---|---|
 | **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
-| **SHIP-118** | `Delivered` recordable and refused without evidence, enforced in the domain and by `000605`'s deferred constraint trigger | The **recipient name** and the **delivery note**. `Docs/01` §4.4 requires a delivered job to carry both alongside proof and `Docs/02` §3 repeats it, naming `01` §4.4 as authoritative for the field set — and **no column holds either**. `milestones` has `job_id`, `milestone`, `actor_type`, `actor_id`, `reason` and the two clocks; `proofs` has the object metadata and `exception_reason`. See below |
+| ~~**SHIP-118**~~ | ~~`Delivered` recordable and refused without evidence~~ | **Closed by SHIP-123 — see §3.** `000607` adds `recipient_name` and `delivery_note`, required on `Delivered` and refused on every other milestone, in the domain and in `ck_milestones_delivery_details`. `Docs/01` §4.4's field set is closed end to end |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 
 **SHIP-65 has left this table.** Its *Done when* — "returns full job including budget" — was met
 but for the budget for two waves, and SHIP-67 closed it with the column and the proof together.
-§10's note that a ticket can be both done and partly done still stands, and SHIP-77 and SHIP-118 are
-the two live examples of it.
+§10's note that a ticket can be both done and partly done still stands. **SHIP-118 left this table at
+wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67, so SHIP-77 and SHIP-149 are
+the live examples now.
 
-**SHIP-118 is here on the ticket's own recommendation, and it differs from the other two rows in one
-way worth stating.** SHIP-65's and SHIP-77's missing halves belonged to work that did not exist —
-SHIP-65's budget column had no ticket until SHIP-67 was written for it, and SHIP-77's status-history
-endpoint still has none. **SHIP-118's has an owner: SHIP-123**, whose *Done when* is "recipient name,
-note, and proof captured; portal becomes read-only after" and which depends on SHIP-118 directly. So
-the field set is *behind* this ticket in build order, and capturing it here would have been building
-SHIP-123's API half inside SHIP-118. §3's SHIP-118 entry calls this "a gap with an owner, not an
-undecided question", and that is why it sits here as documentation ahead of code rather than in §9 as
-a recommendation waiting on a ruling.
+**SHIP-118 has left this table, and it left the way this shape is supposed to end.** Its missing half
+had an *owner* rather than being work that did not exist — SHIP-123, whose *Done when* names the two
+fields and which depended on SHIP-118 directly — so the gap sat here as documentation ahead of code
+rather than in §9 as a recommendation waiting on a ruling. Wave 9 built SHIP-123 and closed it:
+`000607` adds both columns, required on `Delivered` and refused on every other milestone, in the
+domain and in the schema. **`milestones.reason` was not reused for the delivery note**, as this row
+insisted it should not be — it is the actor's optional note on any milestone, and a delivered row may
+now carry both, meaning different things.
 
-**What it means in practice, said plainly so nobody reads `Docs/01` §4.4 as a description of today.**
-A `Delivered` milestone can be recorded right now with a photograph and nothing else. That satisfies
-`CLAUDE.md`'s invariant, which is the clause SHIP-118 was judged on and which is closed end to end;
-it does not satisfy `Docs/01` §4.4's field set, which is three fields wide. **`milestones.reason` was
-deliberately not reused for the delivery note** — it is the actor's optional note on any milestone,
-and making it mean a second specific thing on one milestone is the one-column-two-meanings `Docs/10`
-§3.3 already refuses. Whoever takes SHIP-123 adds both columns and makes them required for
-`Delivered`, beside the evidence rule rather than instead of it. SHIP-123 is two hops back — SHIP-121
-then SHIP-122 — and SHIP-121 is startable today (§6).
+**SHIP-65 and SHIP-118 are now two worked examples of the same ending**, and they are worth reading
+together by whoever next wants to put a row here: a missing half with a named owner closes, and a
+missing half with none does not. SHIP-77 is the remaining example of the second kind.
 
 **SHIP-77 is the SHIP-65 shape exactly, which is why it is here rather than being argued about.**
 The screen landed, it is named by a commit subject, it is in `Docs/11-done.txt`, and one clause of
@@ -10768,6 +10858,106 @@ that whoever sees the first slow feed does not rediscover it: **the index is kno
 known, and the only open question is when.**
 
 ---
+
+**`make verify` cannot safely be run by two worktrees at once, and prep's fence did not fix it —
+because there are two problems and the fence addresses only one.** Found by wave 9's Track A and
+Track C independently, both by **id** rather than by timing.
+
+`80-notifications.sh` **deletes and recreates** `shipper.job` on every run, and the SHIP-135 section
+deletes `shipper.delivery` twice more. Topics are shared across every worktree on this machine —
+`COMPOSE_PROJECT_NAME` is pinned, so there is one broker — so with two harnesses live, one lane's
+delete lands in the middle of another's run. That is deterministic rather than flaky. **Two failure
+modes come out of it, and they are not the same bug:**
+
+| | What happens | Why fencing does not fix it |
+|---|---|---|
+| **Another tree deletes your topic** | Your published events are gone before you read them. A **subset** check fails, reporting your own ids as missing | The run-start offsets the fence captured no longer exist. `kafka_consume_fenced` handles a reset (`start > end` → 0) and cannot recover messages that were destroyed |
+| **Another tree publishes into your topic** | Messages you did not write are on it. An **equality** check fails, reporting ids the outbox does not claim | **No fence can fix this.** Fencing narrows where you start reading; it says nothing about what else arrives. The assertion itself has to change |
+
+The evidence, so the next reader does not re-derive it. Track A: two consecutive runs failed in two
+*different* checks — `SHIP-136` with "36 of 86 events are on neither topic", then `SHIP-134` with
+**five extra ids on `shipper.job`**, and `select id … from outbox where id in (…)` against its own
+database returned **zero rows** for all five, with `ps` showing two other `verify-foundation.sh`
+processes live. Track C: a `job.status_changed` on the topic whose aggregate does not exist in its
+database, while its own event was nowhere on it.
+
+**The residue is one harness constraint and one assertion-design ticket.** The constraint —
+`make verify` is not concurrency-safe across worktrees and runs must be serialised — belongs in
+`CLAUDE.md`'s "Working in more than one branch at once" table, whose Kafka row currently says a fence
+must be an id and does not say that a *delete* defeats any fence. The ticket is `80-notifications.sh`'s
+SHIP-134 check, which is `consumed_sorted == outbox_sorted`: making it concurrency-safe means
+subset-plus-completeness scoped by this run's own ids rather than set equality over a shared topic,
+and **that is a change to what a guard asserts, so it wants its own ticket and somebody thinking about
+what completeness means there** rather than a lane weakening it in passing. Neither was changed by
+wave 9's driver-portal lane, deliberately: `80-notifications.sh` is nobody's this wave.
+
+**A driver's pre-signed upload URL is stored under `idem:v1:anonymous:<key>`, and the mechanism that
+would close it properly is an `internal/httpx` change (SHIP-122).**
+
+`httpx.Idempotent` wraps the whole `/v1` group while an auth class is applied per route **inside** it,
+so on a repeated key the middleware replays the stored response *before* `RequireDriverToken` runs.
+On `POST /v1/driver/jobs/{id}/milestones` that is accepted, and §6's reasoning covers it: the stored
+body is a milestone both parties to the delivery may read anyway. **On
+`POST /v1/driver/jobs/{id}/proof-uploads` the stored body is a credential**, which is why
+`routes_delivery.go` held that route shut for a wave.
+
+SHIP-122 shipped it with the exposure written out in the handler rather than left implicit — what a
+replay requires (the job identifier, the photograph's exact byte length, and a key the portal mints
+with `crypto.randomUUID`), and the four things it still cannot do: make the object evidence, read it,
+write anything of another size or type, or overwrite recorded proof undetectably. **That is a bounded
+position and not a closed one.** The close is §9's *first* option from the SHIP-15m entry below — a
+second group-wide resolver beside `ResolveSubject` that a driver grant can populate, with
+`SubjectScope` widened to read either — and it is a shared-surface change no domain branch may make.
+**A prep ticket owns it, and the trigger is named: the second driver-token route whose response
+carries anything the platform issued.**
+
+**The object store needs CORS for the driver portal's direct upload, and nothing in this repository
+can test it (SHIP-122).** The browser PUTs the photograph straight to the store, which is
+cross-origin from the portal's own origin. MinIO permits it in development, so `make verify` passes;
+an S3 bucket needs a CORS configuration allowing `PUT` from the portal's origin with `Content-Type`
+among the allowed headers, and without one every driver's upload fails in the browser before the
+store sees it. **Decide with the deployment work**, alongside the `X-Forwarded-For` entry above,
+which is the other thing on this list that is true of a deployment rather than of the code.
+
+**Milestones are the one enumeration `contracts/statuses.yaml` does not generate, and the driver
+portal now holds a hand-written copy (SHIP-121).** `internal/delivery/milestone.go` declares its own
+five and records why — they are a different list from `jobs.Status`, with a different membership and
+`ck_milestones_milestone` behind them, and SHIP-56a "has no opinion about this one". SHIP-121 needed
+four of them in TypeScript and wrote them out in `apps/driver-portal/lib/milestones.ts` rather than
+add a fourth enumeration to a **shared file** mid-wave and rewrite a domain's hand-written type.
+
+Meanwhile the copy is held to the running service: `make verify`'s SHIP-121 section reads the wire
+forms **out of the TypeScript source** and records every one of them against the binary. **The
+trigger for generating them is the second surface that needs the milestone vocabulary** — the Flutter
+client's SHIP-129 screen has its own strings today, so a third copy is what should pay for the
+generator rather than the second.
+
+**A driver cannot see which milestones they have already recorded, and no ticket owns the route that
+would fix it (SHIP-121).** The portal's buttons start at rest on every page view and a reload forgets
+what the last one did. Persisting it needs the platform to serve a driver their own milestone list,
+and `GET /v1/jobs/{id}/delivery/milestones` is `RequireUser`; `GET /v1/driver/jobs/{id}/milestones`
+under `RequireDriverToken` is the shape, and `Docs/09` names no such row.
+
+It costs a driver nothing they cannot recover from — tapping a milestone twice is safe, and `Docs/02`
+§5 makes a repeat an ordinary recording — so this is a usability gap rather than a correctness one,
+and it is recorded here rather than built because it is a fourth route on a surface whose narrowness
+is its security property. **It is the same shape as the three lettered read tickets §6 describes**: a
+client ticket's real precondition is a route on the served surface, and the dependency column does
+not record that.
+
+**`Docs/01` §4.4 has no answer for a delivery with no recipient, and `000607` now requires one
+(SHIP-123).** That paragraph requires a recipient name of every delivered job and gives three reasons
+a *photograph* can be impossible and none for a name — reasonably, because a driver can always write
+what they see. But an unattended delivery is an ordinary thing in road freight, and what a driver
+types then is a placeholder: the portal's own field suggests "unattended", which is a convention
+rather than a decision.
+
+**Reported rather than resolved.** Two options and neither is expensive: `Docs/01` §4.4 gains a
+sentence saying an unattended delivery records the word the platform publishes for it, at which point
+the value belongs in `contracts/statuses.yaml` beside the exception reasons; or it gains a fourth
+proof-exception-shaped vocabulary for *who received it*, which is a bigger change and probably wrong.
+**Owner: operations**, with the same standing as X-6 — a decision somebody can make in an afternoon,
+which nothing is blocked on today because the column accepts whatever the driver types.
 
 **One more, found at SHIP-15m while building the `RequireDriverToken` seam.**
 

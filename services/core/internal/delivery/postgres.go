@@ -121,26 +121,30 @@ func (postgresStore) liveAssignment(ctx context.Context, r db.Runner, jobID uuid
 // it, which is not a rule this file has to remember: there is no statement below that could.
 const milestoneColumns = `
 	id, job_id, milestone, actor_type, actor_id, reason, idempotency_key,
-	actor_recorded_at, server_recorded_at`
+	recipient_name, delivery_note, actor_recorded_at, server_recorded_at`
 
 // scanMilestone reads one row of [milestoneColumns].
 func scanMilestone(row pgx.Row) (Record, error) {
 	var (
-		rec     Record
-		actorID *uuid.UUID
-		reason  *string
-		key     *string
+		rec       Record
+		actorID   *uuid.UUID
+		reason    *string
+		key       *string
+		recipient *string
+		note      *string
 	)
 
 	if err := row.Scan(
 		&rec.ID, &rec.JobID, &rec.Milestone, &rec.Actor, &actorID, &reason, &key,
-		&rec.ActorRecordedAt, &rec.ServerRecordedAt,
+		&recipient, &note, &rec.ActorRecordedAt, &rec.ServerRecordedAt,
 	); err != nil {
 		return Record{}, err
 	}
 
-	// Three nullable columns, and each null means something the zero value says just as well:
-	// nobody (the platform acting alone), no reason given, and no request behind the row.
+	// Five nullable columns, and each null means something the zero value says just as well:
+	// nobody (the platform acting alone), no reason given, no request behind the row, and — on
+	// every milestone that is not 'Delivered' — no recipient and no note, which
+	// `ck_milestones_delivery_details` makes the only permitted state there (SHIP-123).
 	if actorID != nil {
 		rec.ActorID = *actorID
 	}
@@ -149,6 +153,12 @@ func scanMilestone(row pgx.Row) (Record, error) {
 	}
 	if key != nil {
 		rec.Key = *key
+	}
+	if recipient != nil {
+		rec.RecipientName = *recipient
+	}
+	if note != nil {
+		rec.DeliveryNote = *note
 	}
 	return rec, nil
 }
@@ -179,14 +189,16 @@ func scanMilestone(row pgx.Row) (Record, error) {
 func (postgresStore) insertMilestone(ctx context.Context, r db.Runner, rec Record) (Record, bool, error) {
 	const q = `
 		INSERT INTO milestones
-			(id, job_id, milestone, actor_type, actor_id, reason, idempotency_key, actor_recorded_at)
-		VALUES ($1, $2, $3, $4, $5, nullif($6, ''), nullif($7, ''), $8)
+			(id, job_id, milestone, actor_type, actor_id, reason, idempotency_key,
+			 recipient_name, delivery_note, actor_recorded_at)
+		VALUES ($1, $2, $3, $4, $5, nullif($6, ''), nullif($7, ''),
+		        nullif($8, ''), nullif($9, ''), $10)
 		ON CONFLICT (job_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING ` + milestoneColumns
 
 	created, err := scanMilestone(r.QueryRow(ctx, q,
 		rec.ID, rec.JobID, string(rec.Milestone), string(rec.Actor), rec.ActorID,
-		rec.Reason, rec.Key, rec.ActorRecordedAt))
+		rec.Reason, rec.Key, rec.RecipientName, rec.DeliveryNote, rec.ActorRecordedAt))
 	switch {
 	case errors.Is(err, db.ErrNoRows):
 		return Record{}, false, nil
@@ -195,6 +207,43 @@ func (postgresStore) insertMilestone(ctx context.Context, r db.Runner, rec Recor
 			rec.Milestone, rec.JobID, err)
 	}
 	return created, true, nil
+}
+
+// deliveredAt is when the delivery was recorded as delivered, on the actor's clock (SHIP-123).
+//
+// # Why this exists at all, when the job's status already says so
+//
+// It says so to a *client with a session*. A driver has neither, and `GET /v1/driver/jobs/{id}`
+// deliberately serves no job status — that vocabulary is `jobs`' and a copy in this domain would be
+// a second list to keep in step. So the portal has no way to know the delivery is finished after a
+// reload, and "the portal becomes read-only after" is half of SHIP-123's *Done when*.
+//
+// What this answers is a fact about **this domain's own table**: is there a 'Delivered' milestone on
+// this job. That is not the status vocabulary borrowed by another name — a milestone can be recorded
+// without the job moving (SHIP-112), and this reports the recording rather than the transition,
+// which is the correct thing for a page whose job is to stop offering the button that records it.
+//
+// **The earliest, not the latest.** A delivery can be recorded delivered more than once — a repeat is
+// `JobAlreadyInStatus`, recorded and moving nothing — and what a driver is shown is when the delivery
+// was completed, not when somebody last pressed the button.
+//
+// One statement, no lock: `milestones` is append-only, so a row that is there stays there.
+func (postgresStore) deliveredAt(ctx context.Context, r db.Runner, jobID uuid.UUID) (time.Time, bool, error) {
+	const q = `
+		SELECT actor_recorded_at FROM milestones
+		 WHERE job_id = $1 AND milestone = 'Delivered'
+		 ORDER BY actor_recorded_at, id
+		 LIMIT 1`
+
+	var at time.Time
+	err := r.QueryRow(ctx, q, jobID).Scan(&at)
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return time.Time{}, false, nil
+	case err != nil:
+		return time.Time{}, false, fmt.Errorf("delivery: reading whether %s has been delivered: %w", jobID, err)
+	}
+	return at, true, nil
 }
 
 // milestoneRecordedBy is what a key already recorded on a job, if anything.

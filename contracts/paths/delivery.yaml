@@ -477,6 +477,10 @@ MilestoneRecording:
 
         `delivered` requires `proof` — a photograph or a reasoned exception — and is refused with
         `409 delivery_proof_required` without one. The other three accept it and do not require it.
+
+        `delivered` also requires `recipient_name` and `delivery_note`, and the other three refuse
+        both (SHIP-123). Those two are `Docs/01` §4.4's field set for a delivered job, along with the
+        proof and the recorded time.
       example: picked_up
     recorded_at:
       type: string
@@ -498,6 +502,27 @@ MilestoneRecording:
         say — "nobody at the gate, returning at four". It is kept with the record and shown to
         support.
       example: nobody at the gate, returning at four
+    recipient_name:
+      type: string
+      maxLength: 120
+      description: |
+        Who took the goods, as you would write it on a docket. **Required on `delivered` and refused
+        on every other milestone** — a recipient name on a pickup would be recording a handover that
+        did not happen.
+
+        There is no exception path for it, unlike the photograph: `Docs/01` §4.4 gives three reasons
+        a photograph can be impossible and none for a name, because a driver can always write what
+        they see. "Unattended" is a recipient name.
+      example: R. Chen
+    delivery_note:
+      type: string
+      maxLength: 500
+      description: |
+        What was left where. **Required on `delivered` and refused on every other milestone.**
+
+        It is not `reason`, and a delivered milestone may carry both: `reason` is the optional note
+        any milestone accepts, and this is the record of the handover.
+      example: Left with reception, signed for
     proof:
       $ref: '#/ProofAttachment'
 
@@ -595,6 +620,17 @@ Milestone:
       type: string
       description: Present only when one was given.
       example: nobody at the gate, returning at four
+    recipient_name:
+      type: string
+      description: |
+        Who took the goods. Present on a `delivered` milestone and absent on every other — the two
+        states are total, so a client that checks one has checked both.
+      example: R. Chen
+    delivery_note:
+      type: string
+      description: |
+        What was left where. Present on a `delivered` milestone and absent on every other.
+      example: Left with reception, signed for
     recorded_at:
       type: string
       format: date-time
@@ -1150,6 +1186,23 @@ DriverAssignment:
         It is returned rather than left to be decoded out of the credential, which is a thing a
         client should never do.
       example: '2026-08-19T04:15:30.000Z'
+    delivered_at:
+      type: string
+      format: date-time
+      description: |
+        When this delivery was recorded as delivered, on the **actor's** clock, in UTC (SHIP-123).
+        **Absent until it has been**, which is how a portal knows to stop offering the controls that
+        record one.
+
+        It is not the job's status. This API keeps that vocabulary on the job resource, and a driver
+        holding a link has no way to read it; what this reports is a fact about the delivery's own
+        record — that a `delivered` milestone exists on this job.
+
+        **The link keeps working afterwards**, deliberately: a driver may reopen the page to check
+        what they recorded. What this field changes is what a client offers, not what it may reach —
+        recording a milestone on a delivered job is refused by the transition guard, as it always
+        was.
+      example: '2026-08-14T06:22:11.000Z'
 
 DriverMilestones:
   post:

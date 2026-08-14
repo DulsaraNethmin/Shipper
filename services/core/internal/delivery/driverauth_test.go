@@ -450,6 +450,11 @@ func TestTheDriverEndpointAnswersWithTheAssignmentTheLinkGrants(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("the response is not JSON: %v", err)
 	}
+	// **`delivered_at` is deliberately absent here and is not missing from this set** (SHIP-123).
+	// It is `omitempty` and this fixture's delivery has not been delivered, so an undelivered job
+	// still answers with exactly five fields — which is what makes the closed set worth keeping
+	// after a sixth field was added to the shape. `TestTheDriverIsToldWhenTheDeliveryIsFinished`
+	// holds the other side: delivered, and the sixth key appears.
 	want := map[string]bool{
 		"job_id": true, "assignment_id": true, "driver_name": true,
 		"assigned_at": true, "link_expires_at": true,

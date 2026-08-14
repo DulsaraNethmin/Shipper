@@ -488,8 +488,9 @@ func TestADeliveredMilestoneCannotBeWrittenWithoutEvidence(t *testing.T) {
 
 		id, _ := uuid.NewV7()
 		if _, err := tx.Exec(t.Context(), `
-			INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
-			VALUES ($1, $2, 'Delivered', 'driver', $3, now())`, id, job, driver); err != nil {
+			INSERT INTO milestones
+				(id, job_id, milestone, actor_type, actor_id, actor_recorded_at, recipient_name, delivery_note)
+			VALUES ($1, $2, 'Delivered', 'driver', $3, now(), 'R. Chen', 'Left with reception')`, id, job, driver); err != nil {
 			// The insert must *not* be what fails: the trigger is deferred precisely so that a
 			// milestone can exist before the row that points at it.
 			t.Fatalf("inserting the delivered milestone: %v", err)

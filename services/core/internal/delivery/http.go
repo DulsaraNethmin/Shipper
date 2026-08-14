@@ -285,6 +285,25 @@ type recordMilestoneRequest struct {
 	Reason     string `json:"reason"`
 
 	Proof *proofRequest `json:"proof"`
+
+	// RecipientName and DeliveryNote are Docs/01 §4.4's other two required facts about a
+	// delivered job (SHIP-123):
+	//
+	//	{"milestone": "delivered", "recipient_name": "R. Chen",
+	//	 "delivery_note": "Left with reception, signed for",
+	//	 "proof": {"object_key": "proof/<job>/<uuid>"}}
+	//
+	// **Flat rather than nested, unlike `proof`.** That object exists because its two keys are
+	// *alternatives* to one question — a photograph or a reason there is none — and a nested
+	// object is what makes "exactly one of" expressible. These two are not alternatives to
+	// anything: they are required together, on one milestone, and a `delivery` object holding
+	// them would be a wrapper whose only job is to be present.
+	//
+	// Sent on any other milestone they are refused rather than ignored, which is the same call
+	// `ck_milestones_delivery_details` makes in the database: a recipient name on a `picked_up`
+	// would be recording a handover that did not happen.
+	RecipientName string `json:"recipient_name"`
+	DeliveryNote  string `json:"delivery_note"`
 }
 
 // proofRequest is the evidence for this milestone: what the client uploaded, or why it could not.
@@ -338,6 +357,16 @@ type milestoneResponse struct {
 
 	Reason string `json:"reason,omitempty"`
 
+	// RecipientName and DeliveryNote are present on a delivered milestone and absent on every
+	// other (SHIP-123). `omitempty` for the reason [proofResponse]'s fields are: an absent field
+	// says nothing, while an empty string would say that nobody received the goods.
+	//
+	// They are served to the same readers the rest of the row is — both parties to the delivery,
+	// through `GET /v1/jobs/{id}/delivery/milestones` — which is Docs/01 §4.4's acceptance measure
+	// for the customer ("a customer can see the latest delivery milestone and proof of delivery").
+	RecipientName string `json:"recipient_name,omitempty"`
+	DeliveryNote  string `json:"delivery_note,omitempty"`
+
 	RecordedAt string `json:"recorded_at"`
 	AcceptedAt string `json:"accepted_at"`
 }
@@ -350,6 +379,9 @@ func milestoneFrom(rec Record) milestoneResponse {
 		Milestone:  rec.Milestone.Wire(),
 		RecordedBy: string(rec.Actor),
 		Reason:     rec.Reason,
+
+		RecipientName: rec.RecipientName,
+		DeliveryNote:  rec.DeliveryNote,
 
 		RecordedAt: timestamp(rec.ActorRecordedAt),
 		AcceptedAt: timestamp(rec.ServerRecordedAt),
@@ -1097,9 +1129,39 @@ type driverJobResponse struct {
 	// (Docs/01 §4.5 calls it a link throughout). It is returned rather than left to be decoded out
 	// of the credential, which is what the contract already tells clients not to do.
 	LinkExpiresAt string `json:"link_expires_at"`
+
+	// DeliveredAt is when this delivery was recorded as delivered, on the actor's clock, and is
+	// absent until it has been (SHIP-123).
+	//
+	// # A sixth field on a shape whose closed set was the point
+	//
+	// SHIP-108 held this response to five fields and a test and a `make verify` check both say so,
+	// because "what may a driver see" is a decision the endpoint's response *is*. This is an
+	// additive change (Docs/07 §6) made on purpose and with both guards updated, not around them.
+	//
+	// # It is not the job's status wearing a different name
+	//
+	// The status vocabulary stays `jobs`', and this domain still holds no copy of it. What this
+	// reports is a fact about `milestones`, which is this domain's own table: whether a 'Delivered'
+	// milestone has been recorded on this job. The two are not the same question — SHIP-112 records
+	// milestones that move nothing — and this is the one the portal needs.
+	//
+	// # Why the portal cannot do without it
+	//
+	// SHIP-123's *Done when* ends "portal becomes read-only after", and a driver reloads. Component
+	// state does not survive that, `sessionStorage` would be the page inventing a fact about the
+	// delivery, and there is no driver-readable milestone list. So the platform answers it, which is
+	// also where Docs/07 §3 puts every question of this kind: the app may hide or disable, and the
+	// platform decides.
+	//
+	// **It is presentation rather than authorisation.** The link keeps opening the page and the
+	// endpoints keep answering after a delivery is finished — a driver may reasonably reopen it to
+	// check what they recorded, and recording a milestone on a delivered job is still refused by the
+	// transition guard rather than by this field.
+	DeliveredAt string `json:"delivered_at,omitempty"`
 }
 
-func driverJobFrom(a Assignment, grant DriverGrant) driverJobResponse {
+func driverJobFrom(a Assignment, grant DriverGrant, deliveredAt time.Time) driverJobResponse {
 	return driverJobResponse{
 		JobID:        a.JobID.String(),
 		AssignmentID: a.ID.String(),
@@ -1108,6 +1170,7 @@ func driverJobFrom(a Assignment, grant DriverGrant) driverJobResponse {
 
 		AssignedAt:    timestamp(a.CreatedAt),
 		LinkExpiresAt: timestamp(grant.ExpiresAt),
+		DeliveredAt:   timestamp(deliveredAt),
 	}
 }
 
@@ -1161,7 +1224,15 @@ func (h *Handler) DriverJob() http.Handler {
 			return apiError(err)
 		}
 
-		httpx.WriteJSON(w, http.StatusOK, driverJobFrom(assignment, grant))
+		// Asked after the assignment and never before it: a caller whose link no longer opens the
+		// delivery is refused by the line above, and this must not become a way to learn that a job
+		// has been delivered by presenting a superseded link.
+		deliveredAt, _, err := h.svc.DeliveryFinishedFor(r.Context(), pool, grant)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, driverJobFrom(assignment, grant, deliveredAt))
 		return nil
 	})
 }
@@ -1266,6 +1337,13 @@ func recordingFrom(req recordMilestoneRequest, key string) (Recording, string, e
 		Reason:     req.Reason,
 		Key:        key,
 		Exception:  exception,
+
+		// Read and passed through untrimmed: [Recording.normalise] collapses whitespace and
+		// [Recording.problems] judges what is left, so a name that is only spaces is refused as
+		// required rather than stored. Deciding either here would put the rule in the decoder,
+		// where a second caller would not get it.
+		RecipientName: req.RecipientName,
+		DeliveryNote:  req.DeliveryNote,
 	}, proofKey, nil
 }
 

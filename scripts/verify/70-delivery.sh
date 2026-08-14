@@ -586,7 +586,11 @@ status="$(milestone_request "$delivery_provider_token" "$milestone_key-transit" 
   || fail "the job did not follow its milestones"
 ok "the delivery runs through its milestones, each one a named move on the port rather than a status the domain chose"
 
-status="$(milestone_request "$delivery_provider_token" "$milestone_key-delivered" '{"milestone":"delivered"}' delivered)"
+# The two fields Docs/01 §4.4 also requires are supplied (SHIP-123), because this check is about
+# the *evidence* rule. Without them the refusal would be a 422 naming recipient_name — validation
+# runs before the evidence rule — and the check would pass for a reason it is not about.
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-delivered" \
+  '{"milestone":"delivered","recipient_name":"R. Chen","delivery_note":"Left with reception"}' delivered)"
 [[ "$status" == "409" ]] || { cat "$WORKDIR/ms-delivered.json"; fail "delivered returned $status, want 409"; }
 [[ "$(json "$WORKDIR/ms-delivered.json" '["error"]["code"]')" == "delivery_proof_required" ]] \
   || { cat "$WORKDIR/ms-delivered.json"; fail "expected code=delivery_proof_required"; }
@@ -729,6 +733,10 @@ json_keys() { python3 -c 'import json,sys; print(",".join(sorted(json.load(open(
 # The response held to a closed set of keys rather than searched for the field it must not carry,
 # which is SHIP-83's argument: a search for driver_mobile catches driver_mobile and misses `phone`.
 driver_response_keys="$(json_keys "$WORKDIR/driver-own.json")"
+# **Five keys on an undelivered job, and `delivered_at` is deliberately not among them** (SHIP-123).
+# It is omitempty, so a delivery in progress answers with exactly the five SHIP-108 closed this set
+# at — which is what keeps the closed set meaningful after a sixth field was added to the shape. The
+# SHIP-123 section below asserts the other side: delivered, and the sixth key appears.
 [[ "$driver_response_keys" == "assigned_at,assignment_id,driver_name,job_id,link_expires_at" ]] \
   || fail "the driver's view carries '$driver_response_keys', want exactly assigned_at,assignment_id,driver_name,job_id,link_expires_at"
 ok "and answers with five fields and no sixth — no mobile number, and no delivery detail, which is SHIP-120's"
@@ -1639,7 +1647,7 @@ delivery_move "$deliv_job" "Picked up" "In transit"
 # --- neither, which is the refusal the invariant is ---------------------------------------------
 
 status="$(record_milestone_on "$deliv_job" "verify-p118-neither-$$" \
-  '{"milestone":"delivered"}' deliv-neither)"
+  '{"milestone":"delivered","recipient_name":"R. Chen","delivery_note":"Left with reception"}' deliv-neither)"
 [[ "$status" == "409" ]] \
   || { cat "$WORKDIR/p115-deliv-neither.json"; fail "a delivery with nothing behind it answered $status, want 409"; }
 [[ "$(json "$WORKDIR/p115-deliv-neither.json" '["error"]["code"]')" == "delivery_proof_required" ]] \
@@ -1655,8 +1663,10 @@ ok "a delivery recorded with neither a photograph nor a reason is refused, the j
 # ever be written second.
 if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
 BEGIN;
-INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
-VALUES (gen_random_uuid(), '$deliv_job', 'Delivered', 'provider', '$delivery_provider_id', now());
+INSERT INTO milestones
+    (id, job_id, milestone, actor_type, actor_id, actor_recorded_at, recipient_name, delivery_note)
+VALUES (gen_random_uuid(), '$deliv_job', 'Delivered', 'provider', '$delivery_provider_id', now(),
+        'R. Chen', 'Left with reception');
 COMMIT;
 SQL
 then
@@ -1669,7 +1679,7 @@ ok "and the same row is refused in raw SQL at COMMIT — the rule holds for a wr
 # --- a reasoned exception, which is the whole of Docs/01 §4.4's second path ---------------------
 
 status="$(record_milestone_on "$deliv_job" "verify-p118-exc-$$" \
-  '{"milestone":"delivered","reason":"handed over at the loading dock","proof":{"exception_reason":"location_unsafe"}}' \
+  '{"milestone":"delivered","reason":"handed over at the loading dock","recipient_name":"R. Chen","delivery_note":"Left with reception","proof":{"exception_reason":"location_unsafe"}}' \
   deliv-exc)"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/p115-deliv-exc.json"; fail "a delivery evidenced by a reasoned exception answered $status, want 201"; }
@@ -1699,7 +1709,7 @@ deliv_key="$(proof_url_for "$deliv_photo_job" deliv "$WORKDIR/p118-url.json")"
 upload_to "$WORKDIR/p118-url.json" "$WORKDIR/p115-proof.bin"
 
 status="$(record_milestone_on "$deliv_photo_job" "verify-p118-photo-$$" \
-  "{\"milestone\":\"delivered\",\"proof\":{\"object_key\":\"$deliv_key\"}}" deliv-photo)"
+  "{\"milestone\":\"delivered\",\"recipient_name\":\"R. Chen\",\"delivery_note\":\"Left with reception\",\"proof\":{\"object_key\":\"$deliv_key\"}}" deliv-photo)"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/p115-deliv-photo.json"; fail "a photographed delivery answered $status, want 201"; }
 [[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$deliv_photo_job';")" == "Delivered" ]] \
@@ -1885,7 +1895,7 @@ while read -r ms_wire; do
 
   ms_body="{\"milestone\":\"$ms_wire\"}"
   if [[ "$ms_wire" == "delivered" ]]; then
-    ms_body="{\"milestone\":\"delivered\",\"proof\":{\"exception_reason\":\"recipient_objected\"}}"
+    ms_body="{\"milestone\":\"delivered\",\"recipient_name\":\"R. Chen\",\"delivery_note\":\"Left with reception\",\"proof\":{\"exception_reason\":\"recipient_objected\"}}"
   fi
 
   status="$(ms_record "$ms_token" "$ms_job" "verify-portalms-$ms_step-$$" "$ms_body" "$ms_step")"
@@ -1999,7 +2009,7 @@ for drvpx_step in en_route_to_pickup picked_up in_transit; do
 done
 
 status="$(drvpx_post "$drvpx_token" "$drvpx_job" milestones "verify-drvpx-delivered-$$" \
-  "{\"milestone\":\"delivered\",\"proof\":{\"object_key\":\"$drvpx_key\"}}" delivered)"
+  "{\"milestone\":\"delivered\",\"recipient_name\":\"R. Chen\",\"delivery_note\":\"Left with reception\",\"proof\":{\"object_key\":\"$drvpx_key\"}}" delivered)"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/drvpx-delivered.json"; fail "a driver could not record a photographed delivery: $status"; }
 drvpx_milestone="$(json "$WORKDIR/drvpx-delivered.json" '["id"]')"
@@ -2100,3 +2110,135 @@ ok "the same policy applies to a driver's upload as to a provider's — one limi
 unset drvpx_job drvpx_token drvpx_assignment drvpx_other_job drvpx_other_token drvpx_key drvpx_url
 unset drvpx_stored drvpx_step drvpx_milestone drvpx_row drvpx_elsewhere drvpx_elsewhere_key
 unset -f drvpx_post
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-123  a delivered job records who took it and what was done with it, and the link goes read-only"
+
+# # What this closes, and it had been named in a migration since SHIP-118
+#
+# Docs/01 §4.4 requires four things of a delivered job: recipient name, delivery timestamp, delivery
+# note, and photo proof. Three were reachable before this ticket. `000605`'s own comment named
+# SHIP-123 as the one that would close the other two — "no column holds either yet" — and Docs/11 §4
+# has carried the gap as documentation ahead of code ever since.
+#
+# # What only this section can show
+#
+# internal/delivery drives both layers of the rule against a real database: the domain's field errors
+# and `ck_milestones_delivery_details` in raw SQL. **What only the running binary can show is that
+# the fields survive the wire in both directions** — sent on a driver's link and read back out of the
+# platform's own response — and that `GET /v1/driver/jobs/{id}` grew the one field a portal needs to
+# become read-only without growing any of the ones SHIP-108 kept off it.
+
+comp_job="$(delivery_awarded_job comp)"
+status="$(delivery_request "$delivery_provider_token" "verify-comp-assign-$$" \
+  "/v1/jobs/$comp_job/driver" '{"driver_name":"Mei Lin","driver_mobile":"+61417000124"}' \
+  "$WORKDIR/comp-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/comp-assign.json"; fail "assigning the driver returned $status, want 201"; }
+comp_token="$(json "$WORKDIR/comp-assign.json" '["driver_token"]')"
+
+# comp_post <suffix> <key> <body> <name> — one driver request on this section's own delivery.
+comp_post() {
+  curl -s -X POST -o "$WORKDIR/comp-$4.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $comp_token" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$3" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$comp_job/$1"
+}
+
+# comp_read <name> — what the driver's link opens, right now.
+comp_read() {
+  curl -s -o "$WORKDIR/comp-read-$1.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $comp_token" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$comp_job"
+}
+
+for comp_step in en_route_to_pickup picked_up in_transit; do
+  status="$(comp_post milestones "verify-comp-$comp_step-$$" "{\"milestone\":\"$comp_step\"}" "$comp_step")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/comp-$comp_step.json"; fail "recording $comp_step answered $status"; }
+done
+
+# --- the field set, refused one field at a time -------------------------------------------------
+
+status="$(comp_post milestones "verify-comp-noname-$$" \
+  '{"milestone":"delivered","delivery_note":"Left with reception","proof":{"exception_reason":"recipient_objected"}}' noname)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/comp-noname.json"; fail "a delivery with no recipient answered $status, want 422"; }
+[[ "$(json "$WORKDIR/comp-noname.json" '["error"]["details"][0]["field"]')" == "recipient_name" ]] \
+  || { cat "$WORKDIR/comp-noname.json"; fail "the refusal does not name recipient_name"; }
+
+status="$(comp_post milestones "verify-comp-nonote-$$" \
+  '{"milestone":"delivered","recipient_name":"R. Chen","proof":{"exception_reason":"recipient_objected"}}' nonote)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/comp-nonote.json"; fail "a delivery with no note answered $status, want 422"; }
+[[ "$(json "$WORKDIR/comp-nonote.json" '["error"]["details"][0]["field"]')" == "delivery_note" ]] \
+  || { cat "$WORKDIR/comp-nonote.json"; fail "the refusal does not name delivery_note"; }
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$comp_job';")" == "In transit" ]] \
+  || fail "a job reached Delivered without Docs/01 §4.4's field set"
+ok "a delivery is refused without the recipient or the note, each named as the field it is, and the job does not move"
+
+# The other half of the rule: the two fields belong to a delivered milestone and to no other.
+status="$(comp_post milestones "verify-comp-onpickup-$$" \
+  '{"milestone":"picked_up","recipient_name":"R. Chen","delivery_note":"Left with reception"}' onpickup)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/comp-onpickup.json"; fail "a pickup carrying a recipient answered $status, want 422"; }
+[[ "$(json "$WORKDIR/comp-onpickup.json" '["error"]["details"][0]["field"]')" == "recipient_name" ]] \
+  || { cat "$WORKDIR/comp-onpickup.json"; fail "the refusal does not name recipient_name"; }
+ok "and neither field may be attached to any other milestone — a recipient name on a pickup is a handover that did not happen"
+
+# --- before: the link opens a delivery that is not finished --------------------------------------
+
+status="$(comp_read before)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/comp-read-before.json"; fail "the driver's read answered $status"; }
+comp_before_keys="$(json_keys "$WORKDIR/comp-read-before.json")"
+[[ "$comp_before_keys" == "assigned_at,assignment_id,driver_name,job_id,link_expires_at" ]] \
+  || fail "an undelivered job answers with '$comp_before_keys'; delivered_at is omitempty and must be absent until there is one"
+ok "a delivery in progress carries no delivered_at, so SHIP-108's closed set of five is unchanged for every job that is still running"
+
+# --- the delivery itself, on the driver's own link ------------------------------------------------
+
+status="$(comp_post milestones "verify-comp-delivered-$$" \
+  '{"milestone":"delivered","recipient_name":"R. Chen","delivery_note":"Left with reception, signed for","proof":{"exception_reason":"recipient_objected"}}' delivered)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/comp-delivered.json"; fail "the completed delivery answered $status, want 201"; }
+comp_milestone="$(json "$WORKDIR/comp-delivered.json" '["id"]')"
+
+[[ "$(json "$WORKDIR/comp-delivered.json" '["recipient_name"]')" == "R. Chen" ]] \
+  || fail "the response does not carry the recipient back"
+[[ "$(json "$WORKDIR/comp-delivered.json" '["delivery_note"]')" == "Left with reception, signed for" ]] \
+  || fail "the response does not carry the delivery note back"
+
+comp_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select recipient_name || '|' || delivery_note from milestones where id = '$comp_milestone';")"
+[[ "$comp_row" == "R. Chen|Left with reception, signed for" ]] \
+  || fail "the row holds '$comp_row'"
+ok "a driver completes the delivery with the recipient and the note, and both are in the row and in the response — Docs/01 §4.4's field set, closed end to end"
+
+# Both parties read them on the delivery shelf, which is where a customer's tracking view gets them.
+status="$(curl -s -o "$WORKDIR/comp-shelf.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_customer_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$comp_job/delivery/milestones")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/comp-shelf.json"; fail "the customer's milestone read answered $status"; }
+grep -q '"recipient_name":"R. Chen"' "$WORKDIR/comp-shelf.json" \
+  || { cat "$WORKDIR/comp-shelf.json"; fail "the customer cannot see who took the delivery"; }
+ok "and the customer reads both on /delivery/milestones — Docs/01 §4.4's acceptance measure is theirs, not only the driver's"
+
+# --- after: the link still opens, and says the delivery is finished --------------------------------
+
+status="$(comp_read after)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/comp-read-after.json"; fail "the link stopped opening once the delivery finished: $status"; }
+comp_after_keys="$(json_keys "$WORKDIR/comp-read-after.json")"
+[[ "$comp_after_keys" == "assigned_at,assignment_id,delivered_at,driver_name,job_id,link_expires_at" ]] \
+  || fail "a delivered job answers with '$comp_after_keys', want the five plus delivered_at"
+[[ "$(json "$WORKDIR/comp-read-after.json" '["delivered_at"]')" == *Z ]] \
+  || fail "delivered_at is not UTC"
+ok "the link still opens afterwards and now reports delivered_at — which is what makes the portal read-only across a reload, from the platform rather than from the page's memory"
+
+# **And it is presentation rather than authorisation**, which is the half a field like this invites
+# somebody to get wrong. The platform refuses a further milestone because Docs/02 §2 has no row out
+# of Delivered, not because a client was told to stop asking.
+status="$(comp_post milestones "verify-comp-again-$$" '{"milestone":"in_transit"}' again)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/comp-again.json"; fail "a late milestone after delivery answered $status, want 201 — SHIP-112 absorbs it"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$comp_job';")" == "Delivered" ]] \
+  || fail "an absorbed milestone moved a delivered job backwards"
+ok "a milestone recorded after delivery is still absorbed by the platform rather than refused by the page — delivered_at hides controls and decides nothing"
+
+unset comp_job comp_token comp_step comp_milestone comp_row comp_before_keys comp_after_keys
+unset -f comp_post comp_read

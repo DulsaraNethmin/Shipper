@@ -451,7 +451,7 @@ func TestDeliveredWithNeitherProofNorExceptionIsRefused(t *testing.T) {
 		jobs.StatusEnRouteToPickup, jobs.StatusPickedUp, jobs.StatusInTransit)
 
 	_, _, err := recordMilestone(t, pool, newTestService(), provider, jobID,
-		Recording{Milestone: MilestoneDelivered, Key: theKey})
+		Recording{Milestone: MilestoneDelivered, Key: theKey, RecipientName: "R. Chen", DeliveryNote: "Left with reception"})
 	if !errors.Is(err, ErrProofRequired) {
 		t.Fatalf("RecordMilestone(delivered) = %v, want ErrProofRequired", err)
 	}
@@ -693,7 +693,7 @@ func TestAbsorptionCannotReachDelivered(t *testing.T) {
 		jobs.StatusDelivered, jobs.StatusCompleted)
 
 	_, _, err := recordMilestone(t, pool, newTestService(), provider, jobID,
-		Recording{Milestone: MilestoneDelivered, RecordedAt: testInstant.Add(-time.Hour), Key: theKey})
+		Recording{Milestone: MilestoneDelivered, RecordedAt: testInstant.Add(-time.Hour), Key: theKey, RecipientName: "R. Chen", DeliveryNote: "Left with reception"})
 	if !errors.Is(err, ErrProofRequired) {
 		t.Fatalf("RecordMilestone(late delivered) = %v, want ErrProofRequired — absorption must "+
 			"not become a second way to record a delivery with nothing behind it", err)

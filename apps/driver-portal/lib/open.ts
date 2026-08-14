@@ -4,6 +4,7 @@ import {
   putPhotograph,
   recordMilestone,
   requestUpload,
+  type Completion,
   type Delivery,
   type Evidence,
   type RecordOutcome,
@@ -116,7 +117,7 @@ export type Told = RecordOutcome | { kind: "missing" };
 export async function recordStep(
   jobId: string,
   milestone: string,
-  options: { evidence?: Evidence; signal?: AbortSignal } = {},
+  options: { evidence?: Evidence; completion?: Completion; signal?: AbortSignal } = {},
 ): Promise<Told> {
   if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
 
@@ -126,6 +127,7 @@ export async function recordStep(
   const scope = `${jobId}.${milestone}`;
   const outcome = await recordMilestone(jobId, token, milestone, keyFor(scope), {
     evidence: options.evidence,
+    completion: options.completion,
     signal: options.signal,
   });
 
@@ -175,7 +177,7 @@ export async function capturePhotograph(
   jobId: string,
   milestone: string,
   photograph: Blob,
-  options: { signal?: AbortSignal } = {},
+  options: { completion?: Completion; signal?: AbortSignal } = {},
 ): Promise<Told> {
   if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
 
@@ -202,6 +204,7 @@ export async function capturePhotograph(
 
   return recordStep(jobId, milestone, {
     evidence: { object_key: asked.upload.object_key },
+    completion: options.completion,
     signal: options.signal,
   });
 }

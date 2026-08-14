@@ -355,7 +355,7 @@ func TestADriverCannotRecordDeliveredWithNothingToShowForIt(t *testing.T) {
 	_, grant, _ := driverOnJob(t, pool, provider, jobID)
 
 	_, _, err := recordAsDriver(t, pool, newTestService(), grant,
-		Recording{Milestone: MilestoneDelivered, Key: theKey})
+		Recording{Milestone: MilestoneDelivered, Key: theKey, RecipientName: "R. Chen", DeliveryNote: "Left with reception"})
 	if !errors.Is(err, ErrProofRequired) {
 		t.Fatalf("a driver recorded Delivered with no evidence: %v, want ErrProofRequired", err)
 	}

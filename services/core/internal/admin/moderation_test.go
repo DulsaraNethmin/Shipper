@@ -112,8 +112,11 @@ func recordEvidence(
 		// the actor's clock.
 		if _, err := r.Exec(ctx, `
 			INSERT INTO milestones
-				(id, job_id, milestone, actor_type, actor_id, reason, actor_recorded_at)
-			VALUES ($1, $2, $3, 'driver', gen_random_uuid(), $4, $5)`,
+				(id, job_id, milestone, actor_type, actor_id, reason, actor_recorded_at,
+				 recipient_name, delivery_note)
+			VALUES ($1, $2, $3, 'driver', gen_random_uuid(), $4, $5,
+			        CASE WHEN $3 = 'Delivered' THEN 'R. Chen' END,
+			        CASE WHEN $3 = 'Delivered' THEN 'Left with reception' END)`,
 			milestoneID, jobID, milestone, noteValue, at,
 		); err != nil {
 			return fmt.Errorf("recording a milestone: %w", err)
