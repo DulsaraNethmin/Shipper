@@ -142,6 +142,7 @@ type Credentials struct {
 	hasher  *passwords.Hasher
 	limiter *ratelimit.Limiter
 	clock   clock.Clock
+	audit   *Auditor
 	store   postgresStore
 }
 
@@ -149,13 +150,19 @@ type Credentials struct {
 //
 // The pool may be nil — the process starts with an unreachable database on purpose — and everything
 // else is required. None may be defaulted to something harmless: a nil hasher is a sign-in that
-// verifies nothing, a nil limiter is a password endpoint with nothing counting the guesses, and a
-// nil clock is a session with no lifetime.
+// verifies nothing, a nil limiter is a password endpoint with nothing counting the guesses, a nil
+// clock is a session with no lifetime, and a nil auditor is three privileged actions with no record
+// that they happened (SHIP-150).
+//
+// **The auditor is a constructor argument rather than something built inside**, which is the same
+// arrangement the clock has and for the same reason: a service that made its own would make one with
+// whatever clock was to hand, and the entries would then disagree with the rows they describe.
 func NewCredentials(
 	pool *pgxpool.Pool,
 	hasher *passwords.Hasher,
 	limiter *ratelimit.Limiter,
 	clk clock.Clock,
+	auditor *Auditor,
 ) (*Credentials, error) {
 	if hasher == nil {
 		return nil, errors.New("admin: administrator sign-in needs a password hasher")
@@ -169,7 +176,15 @@ func NewCredentials(
 	if clk == nil {
 		return nil, errors.New("admin: administrator sign-in needs a clock (Docs/10 §6.3)")
 	}
-	return &Credentials{pool: pool, hasher: hasher, limiter: limiter, clock: clk}, nil
+	if auditor == nil {
+		// SHIP-150. Refused rather than treated as "auditing is off": every state change this
+		// type makes is a privileged action, and a deployment that quietly recorded none of them
+		// would look identical to one that recorded all of them until somebody went looking.
+		return nil, errors.New("admin: administrator sign-in needs an audit writer (SHIP-150)")
+	}
+	return &Credentials{
+		pool: pool, hasher: hasher, limiter: limiter, clock: clk, audit: auditor,
+	}, nil
 }
 
 // SignInCommand is one administrator sign-in request, in the domain's own terms.
@@ -314,6 +329,26 @@ func (c *Credentials) signIn(ctx context.Context, r db.Runner, cmd SignInCommand
 	if err != nil {
 		return Issued{}, Administrator{}, err
 	}
+
+	// SHIP-150, in the same transaction as the session row. A console session that exists with
+	// no record of it starting is the gap a support timeline is least able to work around: every
+	// later entry names an administrator, and this is the only thing that says when they arrived.
+	//
+	// The session identifier goes in the metadata rather than in `target_id`, so that a query for
+	// everything about this administrator returns their sign-ins alongside the actions they then
+	// took. See AuditActionAdministratorSignedIn.
+	if _, err := c.audit.Record(ctx, r, AuditEntry{
+		Actor:      AdminActor(administrator.ID),
+		Action:     AuditActionAdministratorSignedIn,
+		TargetType: AuditTargetAdministrator,
+		TargetID:   administrator.ID,
+		Metadata: map[string]any{
+			"session_id": issued.Session.ID.String(),
+			"role":       administrator.Role.String(),
+		},
+	}); err != nil {
+		return Issued{}, Administrator{}, err
+	}
 	return issued, administrator, nil
 }
 
@@ -397,11 +432,41 @@ func (c *Credentials) startSession(ctx context.Context, r db.Runner, adminID uui
 // **Idempotent by state rather than by key.** Signing out a session that is already revoked is a
 // success: the caller wanted it ended and it is ended. A second call from a retrying browser must
 // not be a 404, which would tell somebody their sign-out failed when it had not.
-func (c *Credentials) SignOut(ctx context.Context, sessionID uuid.UUID) error {
+//
+// # The audit entry is written every time, including on the repeat
+//
+// SHIP-150, and it is the one place the idempotence and the trail pull against each other. The
+// revocation is a no-op the second time — `revoked_at IS NULL` in the WHERE keeps the recorded
+// instant truthful — while the *entry* is appended again, because a person pressed sign out again
+// and an append-only table has no way to say "the same thing, once more". A reader sees two entries
+// a second apart and one revocation, which is what happened.
+//
+// The alternative was to read the row back and skip the entry when nothing changed. It was rejected
+// because it makes the trail depend on a race: two tabs signing out together would record one entry
+// or two depending on which committed first, and a trail that is sometimes missing an action is
+// worse than one that occasionally repeats it.
+func (c *Credentials) SignOut(ctx context.Context, adminID, sessionID uuid.UUID) error {
 	if c.pool == nil {
 		return ErrAdminUnavailable
 	}
-	return c.store.revokeSession(ctx, c.pool, sessionID, c.clock.Now().UTC())
+
+	// One transaction, so the revocation and the record of it commit together. Two statements
+	// auto-committed would leave a session ended with nothing saying who ended it, in exactly the
+	// case worth recording: something failed between them.
+	return db.InTx(ctx, c.pool, func(ctx context.Context, r db.Runner) error {
+		if err := c.store.revokeSession(ctx, r, sessionID, c.clock.Now().UTC()); err != nil {
+			return err
+		}
+
+		_, err := c.audit.Record(ctx, r, AuditEntry{
+			Actor:      AdminActor(adminID),
+			Action:     AuditActionAdministratorSignedOut,
+			TargetType: AuditTargetAdministrator,
+			TargetID:   adminID,
+			Metadata:   map[string]any{"session_id": sessionID.String()},
+		})
+		return err
+	})
 }
 
 // CreateCommand is a new administrator account.
@@ -422,6 +487,19 @@ type CreateCommand struct {
 
 	// Role is what the new administrator may do. Empty means [RoleSupport].
 	Role Role
+
+	// ActorID is the administrator doing the creating (SHIP-150).
+	//
+	// **On the command rather than read from a grant inside**, because this domain must be able
+	// to record who acted without depending on how the caller was authenticated — and because a
+	// required field is the cheapest way to make an unattributed account creation impossible.
+	// [CreateCommand.Validate] deliberately does not check it: it is not something a client sends
+	// and a validation error naming it would be a field the console cannot fix. It is refused in
+	// [Credentials.Create] as the wiring mistake it would be.
+	//
+	// The first administrator in a deployment has no actor and is not created through here — see
+	// the note on Create and `000801`'s header.
+	ActorID uuid.UUID
 }
 
 // Normalise puts the command into the form the stored row is in.
@@ -475,6 +553,14 @@ func (c *Credentials) Create(ctx context.Context, cmd CreateCommand) (Administra
 	if err := cmd.Validate(); err != nil {
 		return Administrator{}, err
 	}
+	if cmd.ActorID == uuid.Nil {
+		// Not a validation error, because no client sends this — the handler takes it from the
+		// grant the guard resolved. Reaching here without one means a caller built the command
+		// by hand, and creating the most privileged kind of account with nobody named for it is
+		// precisely the entry SHIP-150 exists to make impossible to omit.
+		return Administrator{}, errors.New(
+			"admin: creating an administrator needs the administrator doing it (SHIP-150)")
+	}
 	if c.pool == nil {
 		return Administrator{}, ErrAdminUnavailable
 	}
@@ -505,8 +591,34 @@ func (c *Credentials) Create(ctx context.Context, cmd CreateCommand) (Administra
 		Status: StatusActive,
 	}
 
-	created, err := c.store.insertAdministrator(ctx, c.pool, administrator, hash)
-	if err != nil {
+	// One transaction, so the account and the record of who created it commit together
+	// (SHIP-150). An administrator account that exists with nothing saying who made it is the
+	// worst single hole this trail could have: it is the action that grants every other
+	// permission, and Docs/04 §9 asks for least-privilege administrative access, which is
+	// unenforceable if nobody can say where an account came from.
+	var created Administrator
+	if err := db.InTx(ctx, c.pool, func(ctx context.Context, r db.Runner) error {
+		var err error
+		created, err = c.store.insertAdministrator(ctx, r, administrator, hash)
+		if err != nil {
+			return err
+		}
+
+		// The role goes in the metadata because it is the field that makes the entry worth
+		// reading. "An account was created" is half a fact; "an account was created that can
+		// create accounts" is the one somebody reviewing this trail is looking for.
+		_, err = c.audit.Record(ctx, r, AuditEntry{
+			Actor:      AdminActor(cmd.ActorID),
+			Action:     AuditActionAdministratorCreated,
+			TargetType: AuditTargetAdministrator,
+			TargetID:   created.ID,
+			Metadata: map[string]any{
+				"email": created.Email,
+				"role":  created.Role.String(),
+			},
+		})
+		return err
+	}); err != nil {
 		return Administrator{}, err
 	}
 	return created, nil

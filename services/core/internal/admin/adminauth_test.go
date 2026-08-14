@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
@@ -64,7 +65,12 @@ func adminAuth(t *testing.T) (*Credentials, *Authenticator, *pgxpool.Pool, *cloc
 		t.Fatalf("building the rate limiter: %v", err)
 	}
 
-	creds, err := NewCredentials(pool, hasher, limiter, clk)
+	auditor, err := NewAuditor(clk)
+	if err != nil {
+		t.Fatalf("building the audit writer: %v", err)
+	}
+
+	creds, err := NewCredentials(pool, hasher, limiter, clk, auditor)
 	if err != nil {
 		t.Fatalf("building the credentials service: %v", err)
 	}
@@ -76,12 +82,36 @@ func adminAuth(t *testing.T) (*Credentials, *Authenticator, *pgxpool.Pool, *cloc
 	return creds, auth, pool, clk
 }
 
-// anAdministrator creates one through the domain's own path.
+// bootstrapActor stands for the operator who created the first administrator by hand.
+//
+// SHIP-150 requires [CreateCommand] to name whoever is creating the account, and the fixtures below
+// create the *first* administrator in an empty database — which has no creator inside the platform.
+// `000801`'s header records that the first account comes from one INSERT by an operator; this is
+// that operator, given an identifier so the audit entry can name somebody.
+//
+// A fixed value rather than a fresh one per call, so that a test reading the trail can tell a
+// fixture's own bookkeeping from an entry the ticket is about. `audit_log.actor_id` deliberately has
+// no foreign key — an entry outlives its subject (Docs/05 §3.1) — so it need not resolve to a row.
+var bootstrapActor = uuid.MustParse("00000000-0000-4000-8000-0000000b0074")
+
+// anAdministrator creates one through the domain's own path, attributed to the bootstrap operator.
 func anAdministrator(t *testing.T, creds *Credentials, email string, role Role) Administrator {
+	t.Helper()
+	return anAdministratorCreatedBy(t, creds, bootstrapActor, email, role)
+}
+
+// anAdministratorCreatedBy is the same, with the creator named.
+func anAdministratorCreatedBy(
+	t *testing.T,
+	creds *Credentials,
+	actorID uuid.UUID,
+	email string,
+	role Role,
+) Administrator {
 	t.Helper()
 
 	a, err := creds.Create(t.Context(), CreateCommand{
-		Email: email, Name: "A Person", Password: testPassword, Role: role,
+		Email: email, Name: "A Person", Password: testPassword, Role: role, ActorID: actorID,
 	})
 	if err != nil {
 		t.Fatalf("creating %s: %v", email, err)
@@ -292,7 +322,7 @@ func TestADisabledAccountIsToldSoAtSignInAndNotAtResolve(t *testing.T) {
 // there is no interval in which a signed-out credential still works.
 func TestSigningOutEndsTheSessionImmediatelyAndIsSafeToRepeat(t *testing.T) {
 	creds, auth, _, _ := adminAuth(t)
-	anAdministrator(t, creds, "signout@example.com", RoleSupport)
+	administrator := anAdministrator(t, creds, "signout@example.com", RoleSupport)
 
 	issued, _, err := signIn(t, creds, "signout@example.com", testPassword, "10.0.3.1")
 	if err != nil {
@@ -302,7 +332,7 @@ func TestSigningOutEndsTheSessionImmediatelyAndIsSafeToRepeat(t *testing.T) {
 		t.Fatalf("the session did not resolve before sign-out: %v", err)
 	}
 
-	if err := creds.SignOut(t.Context(), issued.Session.ID); err != nil {
+	if err := creds.SignOut(t.Context(), administrator.ID, issued.Session.ID); err != nil {
 		t.Fatalf("signing out: %v", err)
 	}
 	if _, err := auth.Resolve(t.Context(), issued.Token); !errors.Is(err, ErrAdminSessionInvalid) {
@@ -310,7 +340,7 @@ func TestSigningOutEndsTheSessionImmediatelyAndIsSafeToRepeat(t *testing.T) {
 	}
 
 	// A retrying browser must not be told its sign-out failed when it had not.
-	if err := creds.SignOut(t.Context(), issued.Session.ID); err != nil {
+	if err := creds.SignOut(t.Context(), administrator.ID, issued.Session.ID); err != nil {
 		t.Errorf("signing out twice: %v", err)
 	}
 }
@@ -596,6 +626,7 @@ func TestCreatingAnAdministratorDefaultsToTheLeastPrivilegedRole(t *testing.T) {
 
 	created, err := creds.Create(t.Context(), CreateCommand{
 		Email: "unspecified@example.com", Name: "A Person", Password: testPassword,
+		ActorID: bootstrapActor,
 	})
 	if err != nil {
 		t.Fatalf("creating an administrator with no role: %v", err)
@@ -621,6 +652,7 @@ func TestAnUnrecognisedRoleIsRefusedRatherThanQuietlyMinimised(t *testing.T) {
 
 	_, err := creds.Create(t.Context(), CreateCommand{
 		Email: "bogus@example.com", Name: "A Person", Password: testPassword, Role: "administrator",
+		ActorID: bootstrapActor,
 	})
 	if err == nil {
 		t.Fatal("an unrecognised role was accepted")
@@ -650,6 +682,7 @@ func TestOneAdministratorPerAddress(t *testing.T) {
 
 	_, err := creds.Create(t.Context(), CreateCommand{
 		Email: "Duplicate@example.com", Name: "Another Person", Password: testPassword,
+		ActorID: bootstrapActor,
 	})
 	if !errors.Is(err, ErrAdminEmailTaken) {
 		t.Errorf("error = %v, want ErrAdminEmailTaken", err)

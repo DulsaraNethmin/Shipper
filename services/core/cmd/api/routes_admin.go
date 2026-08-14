@@ -162,7 +162,15 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin rate limiter: " + err.Error())
 	}
 
-	creds, err := admin.NewCredentials(d.Pool, hasher, limiter, d.Clock)
+	// SHIP-150. Built from d.Clock rather than from a clock of its own, which is the whole of
+	// Docs/11 §9's "one row, one clock": an audit entry has to sort against the session row and the
+	// status-history row it describes, and both of those take this clock.
+	auditor, err := admin.NewAuditor(d.Clock)
+	if err != nil {
+		panic("cmd/api: admin audit writer: " + err.Error())
+	}
+
+	creds, err := admin.NewCredentials(d.Pool, hasher, limiter, d.Clock, auditor)
 	if err != nil {
 		panic("cmd/api: admin credentials: " + err.Error())
 	}

@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **642 checks across 13 sections**, and `make check` green. Since
+Verified by `make verify` — **649 checks across 13 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -492,6 +492,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
 | **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
 | **SHIP-148** | M6 | Twelve granular permissions and three role bundles, in a **Go table rather than a grant table** — a permission model is the opposite of the thing `Docs/06` §5.3 puts server-side and changeable. Default-deny at three levels: an omitted role becomes the minimum in Go *and* in the column default, and a role with **no bundle holds nothing**. There is deliberately **no permission to delete an audit entry** — *see below* |
+| **SHIP-150** | M6 | Every admin mutation writes an audit entry — and the ticket had to **build SHIP-149's missing write helper first**, because no Go code in the repository wrote to `audit_log` at all. The entry commits **in the same transaction as the mutation**, so a refused action leaves nothing and a failed entry fails the action. Completeness is checked from both ends: the domain drives every mutation and reads the row back, and `cmd/api` holds the **served surface** to the catalogue. `created_at` takes the **injected clock**, deliberately — *see below* |
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
@@ -9398,11 +9399,138 @@ landing under them buys nothing. §9 carries it.
 and it says `Open → Cancelled`; widening the claim means widening the document first. It is
 `Docs/09`'s SHIP-70a and §9 has the account.
 
+### SHIP-150 — the ticket had to build SHIP-149's half before it could apply it
+
+**The *Done when* is "all admin mutations write an audit entry; verified by test", and on arrival
+there was nothing to write with.** §4 recorded SHIP-149 as partly done — table and triggers yes, "the
+Go write helper its title names" no — and that row was exactly right. Measured on `7d7caf0`: the
+**only** `INSERT INTO audit_log` statements in the repository were **four in
+`migrations/schema_test.go`**, and the three non-test files that mention the table
+(`identity/session.go:447`, `admin/dispute.go:27` and `:327`, `jobs/model.go:77`) mention it only in
+comments. **No Go code wrote an audit entry.**
+
+So the shape is wave 8's SHIP-130 again — a ticket discovering it owns its dependency's unbuilt
+half — and it is named here rather than absorbed, because that is how §4 eventually closes honestly.
+
+#### What "all admin mutations" turned out to bound
+
+Three, and the number is worth stating because it is smaller than the ticket sounds. `permissions.go`
+has **six mutating permissions** and only one of them — `admins.manage` — has an endpoint;
+`verifications.decide`, `users.restrict`, `jobs.unpublish`, `notes.write` and `disputes.resolve` are
+SHIP-154, 161, 160, 162 and 164, none built. Measured against `routes_golden.txt`, the administrator's
+served surface is five routes and **three change state**:
+
+| Action | Entry | Actor | Target |
+|---|---|---|---|
+| `POST /v1/admin/sessions` | `administrator.signed_in` | the administrator | themselves |
+| `DELETE /v1/admin/sessions/current` | `administrator.signed_out` | the administrator | themselves |
+| `POST /v1/admin/administrators` | `administrator.created` | the creator | the account created |
+
+**Sign-in and sign-out are audited on a deliberate reading rather than an obvious one.** `Docs/01`
+§5.1 asks for "audit logs for privileged actions" and `Docs/04` §6 step 6 wants the actor and the
+timestamp of a decision recorded — a decision has a person behind it, and the only record that the
+person was present is the session. A trail with sign-ins and no sign-outs makes every session look
+open until it expired, which is wrong about exactly the accounts that were being careful.
+
+**Two things are deliberately not audited, and both are decisions.** `POST /v1/jobs/{id}/disputes` is
+a customer or a provider reporting a problem with their own delivery — not privileged by any reading,
+and already recorded twice in `disputes` and `job_status_history`. And **a failed sign-in cannot be**:
+`ck_audit_log_actor_id` requires a non-NULL actor for a non-system entry, and a failure against an
+unknown address has no account to name. Recording it as `system` would put every address anybody has
+guessed into a table support reads — the enumeration oracle `credentials.go` spends an argon2id
+derivation to avoid, moved from the response time into the trail, where it lasts longer.
+
+#### The entry commits with the thing it describes
+
+`Auditor.Record` takes a `db.Runner`, so it joins the caller's transaction (`Docs/10` §3.2), and a
+failure to write **fails the mutation**. That is the opposite of the usual instinct about logging and
+is right for this table specifically: `Docs/09` puts SHIP-149 and SHIP-150 on the do-not-cut list
+because audit is "impossible to backfill", and the entries most worth having are from the moments
+something was going wrong. Two call sites became transactions that were not: `Credentials.Create` and
+`Credentials.SignOut`.
+
+`CreateCommand` gained a required `ActorID`, which makes an unattributed administrator creation
+**unexpressible** rather than merely discouraged — the most privileged action in the console cannot be
+the one entry nobody can trace.
+
+#### `created_at` takes the injected clock, and the alternative was live
+
+`audit_log.created_at` is `DEFAULT now()` — the database's clock — and §9 named this exact hazard
+after this package produced it one table along: `admin_sessions.created_at` took the default while its
+expiries came from the Go clock, so the suite agreed for one idle window and then failed permanently.
+**A time bomb rather than a flake.**
+
+The choice was between supplying the instant and taking the default while never asserting on it. The
+second was rejected on a specific ground: an audit trail is read by ordering it, and an entry has to
+sort against the session row, the dispute row and the status-history row it describes — all of which
+take the injected clock already. Two clocks across those rows make a support timeline that disagrees
+with itself. The column keeps its default for writers that never come through Go: the operator's
+`psql` prompt, and `scripts/verify/90-admin.sh`, which both insert directly.
+`TestAnAuditEntryTakesTheInjectedClockWhateverTheWallClockSays` records at a clock far in the past
+**and** far in the future, so whenever the suite runs at least one is on the wrong side of `now()` —
+which is what makes it unable to rot the way its predecessor did.
+
+**§9's paragraph is now stale in one half and it is worth saying so.** It reads "neither instance is
+fixed here — both are live code in `internal/admin` and `apps/mobile`". The `internal/admin` instance
+**was** fixed: `postgres_auth.go` supplies `created_at` from the clock and carries a long note about
+it, and `TestASessionIsInternallyConsistentWhateverTheWallClockSays` is the guard. The `apps/mobile`
+half was not checked by this lane.
+
+#### Completeness is checked from both ends, because neither end can see the other
+
+The *Done when*'s value is entirely in the word "all". A suite checking two of three mutations proves
+nothing about the third.
+
+- **`internal/admin/audit_test.go`** holds a table of every mutation, each driven **through the
+  handler and `RequireAdmin`** against a real database. It snapshots the log in the instant before
+  the act — the fixtures are themselves audited, so a snapshot taken earlier would make the
+  assertion "some entries were written", which a mutation writing none satisfies — and asserts
+  **exactly one** new entry with the right action, actor, target and instant. "Exactly one" catches
+  both directions: nothing written, and an action recorded twice.
+- The same test pairs the table against `AuditActions`, so an action in the catalogue that nothing
+  exercises fails, and a mutation declaring an action outside it fails.
+- **`cmd/api/routes_admin_test.go`** holds the **served surface** to the catalogue, which the domain
+  cannot see: a route lives in `cmd/api` and nothing in `internal/admin` names it, so an
+  administrative endpoint could be declared, served, and never appear in the domain's suite at all.
+  It is a tripwire rather than a proof — a person can add a row — and the file says so.
+
+#### The mutations, and the one that survived
+
+| Mutation | Outcome |
+|---|---|
+| Remove the audit write from **sign-out** — the least obvious of the three | **Caught.** `TestEveryAdminMutationWritesAnAuditEntry/signing_out` fails with "signing out wrote 0 audit entries, want exactly 1", and `scripts/verify/90-admin.sh` fails on the wire |
+| Take `created_at` from the column default instead of the injected clock | **Caught**, twice — the per-mutation clock assertion, and the past/future test |
+| Move the entry outside the transaction in `Credentials.Create` (write it before the insert) | **Caught** by `TestAMutationThatFailsLeavesNoAuditEntry`, in its duplicate-address half — the refusal that happens *inside* the transaction, which is the case a best-effort write gets wrong |
+| Return `nil` from `Auditor.Record` when the insert fails | **Caught** — the entry is absent and the mutation reports success, which the same test sees as a missing row |
+| Drop the `admins.manage` check from `CreateAdministrator` while keeping the audit write | **Survived this suite**, and is caught by SHIP-148's `TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission`. Recorded because it is the one plausible edit that makes an audited action *more* reachable, and the guard for it is in another file |
+
+**The one that survived is the entry to read.** SHIP-150's suite establishes that every mutation is
+recorded; it establishes nothing about whether the mutation should have been permitted, and a reader
+of this section should not infer otherwise. The two guards are separate on purpose and both are real.
+
+#### Where it lives, and the trigger for moving it
+
+`audit_log` is in the **shared** migration block and `migrations/blocks.go` calls it a table every
+domain reads, so `internal/audit` as infrastructure is arguable. It is in `admin` for two reasons and
+only one is architectural: everything audited today is an administrative action and the vocabulary is
+administrative — and a new package under `internal/` needs a line in `internal/boundaries/boundaries.go`,
+which a domain branch may not edit. **The revisit trigger is named rather than left to judgement: the
+first ticket outside `admin` that needs to append an entry** — SHIP-119's auto-complete and SHIP-68's
+expiry sweep are the candidates, both acting as `system`, which is why that constant exists with
+nothing writing it.
+
+`migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing SHIP-149 could not write, because there
+was no Go vocabulary to pair: `ck_audit_log_actor_type` against `AuditActorTypes`, both directions. It
+also asserts `action` and `target_type` carry **no** CHECK — a deliberate absence, so that adding one
+later is a deliberate act rather than a convenience that turns a widened catalogue into an outage.
+
+**Nothing was needed from `internal/config`.** The clock is already on `Deps`.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
 |---|---|---|
-| **SHIP-149** | `audit_log` table, append-only triggers, tests | The Go write helper its title names |
+| ~~**SHIP-149**~~ | ~~`audit_log` table, append-only triggers, tests~~ | **Closed.** SHIP-150 built the write helper — see §3. On `7d7caf0` the only `INSERT INTO audit_log` in the repository was four statements in `migrations/schema_test.go`, and no Go code wrote an entry; `internal/admin/audit.go` and `postgres_audit.go` now do, and `migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing that could not be written while there was no Go vocabulary to pair |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | **SHIP-118** | `Delivered` recordable and refused without evidence, enforced in the domain and by `000605`'s deferred constraint trigger | The **recipient name** and the **delivery note**. `Docs/01` §4.4 requires a delivered job to carry both alongside proof and `Docs/02` §3 repeats it, naming `01` §4.4 as authoritative for the field set — and **no column holds either**. `milestones` has `job_id`, `milestone`, `actor_type`, `actor_id`, `reason` and the two clocks; `proofs` has the object metadata and `exception_reason`. See below |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |

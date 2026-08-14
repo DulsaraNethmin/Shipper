@@ -682,7 +682,10 @@ func (h *Handler) SignOut() http.Handler {
 			return err
 		}
 
-		if err := h.creds.SignOut(r.Context(), grant.SessionID); err != nil {
+		// The administrator and the session, because SHIP-150 records who signed out as well as
+		// which session ended. Both come from the grant the guard resolved rather than from the
+		// request, so there is no way to attribute a sign-out to somebody else.
+		if err := h.creds.SignOut(r.Context(), grant.Administrator.ID, grant.SessionID); err != nil {
 			return apiError(err)
 		}
 
@@ -765,7 +768,12 @@ type createAdministratorRequest struct {
 // 201 with the account, and the password is not echoed.
 func (h *Handler) CreateAdministrator() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
-		if _, err := h.permitted(r, PermissionAdminsManage); err != nil {
+		// The grant is used rather than discarded, which is what [Handler.permitted]'s note
+		// says it is returned for: SHIP-150 attributes the entry to whoever acted, and taking
+		// the actor from the grant means a handler cannot record one without having stated the
+		// permission it was acting under.
+		grant, err := h.permitted(r, PermissionAdminsManage)
+		if err != nil {
 			return err
 		}
 
@@ -779,6 +787,7 @@ func (h *Handler) CreateAdministrator() http.Handler {
 			Name:     req.Name,
 			Password: req.Password,
 			Role:     Role(req.Role),
+			ActorID:  grant.Administrator.ID,
 		})
 		if err != nil {
 			return apiError(err)
