@@ -380,24 +380,33 @@ ticket "SHIP-136  bid and delivery events reach their own topics, keyed on their
 # file does not wipe them. So the assertion is a **subset**: every id this run published is on the
 # topic. A count, or an equality against everything on the topic, would be a statement about whatever
 # else the machine is doing. Docs/11 §3's SHIP-135 entry has the run that proved it.
+#
+# **And the consumer is fenced as well as the assertion**, which is the correction wave 9 made. A
+# subset check over ids is only as good as what the consumer was allowed to see, and reading from the
+# beginning of a topic nothing ever empties meant this run's events eventually fell outside the read.
+# See `kafka_consume_fenced` below and the harness's own note.
 
 if [[ -z "$ship136_ids" ]]; then
   fail "no bid or delivery events were waiting to be published; 61-bidding.sh and 70-delivery.sh emit them, so this check is proving nothing"
 fi
 
-# consume_topic <topic> <file> — everything on a topic, one JSON message per line.
+# Read from the harness's run-start fence rather than from the beginning of the topic.
 #
-# Far more asked for than this run wrote, because the topic is shared and not emptied: the point is
-# to read past other worktrees' messages rather than stop at a cut. The consumer therefore always
-# ends on its no-more-messages timeout, which is a non-zero exit and not a failure.
-consume_topic() {
-  "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-consumer.sh" \
-    --bootstrap-server localhost:9092 --topic "$1" --from-beginning \
-    --max-messages 500 --timeout-ms 8000 2>/dev/null | tr -d '\r' >"$2" || true
-}
-
-consume_topic shipper.bid "$WORKDIR/bid-consumed.json"
-consume_topic shipper.delivery "$WORKDIR/delivery-consumed.json"
+# **This is where the fencing rule had to be extended from the assertion to the consumer.** The
+# assertion below was always fenced — a subset check over the ids this run published — and it was
+# still not enough, because `--from-beginning --max-messages 500` reads the *oldest* five hundred
+# messages and `shipper.bid` is emptied by nothing. Every worktree's bid events accumulate on it
+# forever, so once it passes five hundred this run's own events sit past the cut and the check below
+# reports them missing. That is a **monotonic** failure rather than one of this harness's
+# concurrency flakes: it gets worse every run and never clears, and because 80 sorts before 90 a run
+# that dies here never reaches `90-admin.sh` at all. Three wave-8 lanes met it independently.
+#
+# Raising the bound is the wrong instrument — a bound narrows what the assertion can see and says
+# nothing about where this run's events begin. `kafka_consume_fenced` starts each partition at the
+# offset the harness recorded before any product section ran, and derives its own bound from
+# `end - fence`. `scripts/verify-foundation.sh` carries the full reasoning.
+kafka_consume_fenced shipper.bid "$WORKDIR/bid-consumed.json"
+kafka_consume_fenced shipper.delivery "$WORKDIR/delivery-consumed.json"
 cat "$WORKDIR/bid-consumed.json" "$WORKDIR/delivery-consumed.json" >"$WORKDIR/ship136-consumed.json"
 
 printf '%s\n' "$ship136_ids" >"$WORKDIR/ship136-ids.txt"
@@ -436,6 +445,15 @@ ok "every bid and delivery event this run emitted is on shipper.bid or shipper.d
 # The type and the version, off the wire. Both halves matter: a consumer branches on `type`, and
 # `schema_version` is what lets it refuse a shape it was not built for. The types are listed rather
 # than counted, so a section that quietly stopped exercising one is reported.
+#
+# **There are ten bid and delivery event types and this enumerates nine of them.** `bid.expired`
+# arrived with SHIP-89, after this list was written. It is not missing coverage: the row is in
+# `$ship136_ids` like every other, so it is read off the topic and the version loop below holds it to
+# `1 / 1` exactly as it holds the nine — and 61-bidding.sh already asserts its existence and its
+# payload, fenced on the one bid. What the list does is assert *presence*, which is a statement about
+# the sections upstream still emitting each type, and it is left at the nine SHIP-136's *Done when*
+# names rather than widened here. Adding `"bid.expired"` to the set below is a one-line change and a
+# strictly stronger check; it belongs to whoever wants SHIP-89's presence guarded from this file too.
 python3 - "$WORKDIR/ship136-ids.txt" "$WORKDIR/ship136-consumed.json" <<'PY' \
   || fail "the events on the topic are not the ones SHIP-136 says this platform emits"
 import json, sys
@@ -473,8 +491,6 @@ if grep -qi 'budget' "$WORKDIR/ship136-consumed.json"; then
   fail "a message on shipper.bid or shipper.delivery mentions a budget"
 fi
 ok "and nothing on either topic mentions a budget, which is the last point at which it could have been redacted"
-
-unset -f consume_topic
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-135  topics exist with a versioned schema for each domain event"

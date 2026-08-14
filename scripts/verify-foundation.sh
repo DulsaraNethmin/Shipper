@@ -218,6 +218,104 @@ wait_for_health() {
   return 1
 }
 
+# --- reading a shared Kafka topic ------------------------------------------------------------
+#
+# **A fence has to protect the consumer, not only the assertion.**
+#
+# The existing rule — fence on an id, never a timestamp — is about what a check *asserts*. It says
+# nothing about what the consumer is allowed to *see*, and that turned out to be the other half of
+# the same problem. `shipper.bid` is shared by every worktree on this machine and **nothing deletes
+# it**: 80-notifications.sh recreates `shipper.job` on every run and SHIP-135's section recreates
+# `shipper.delivery`, and no section has ever touched `shipper.bid`. So it grows, run after run,
+# forever.
+#
+# A consumer reading `--from-beginning --max-messages 500` therefore reads the *oldest* five hundred
+# messages on it. Once the topic passes five hundred, this run's own events are past the cut and the
+# section fails — and it fails on a tree where nothing is wrong. **This failure is monotonic rather
+# than intermittent**, which is what distinguishes it from the concurrency false-failures elsewhere
+# in this file: it gets worse with every run and never better, and three separate lanes in wave 8
+# each hit it and each read it as a flake. Because 80 sorts before 90, a run that dies there never
+# reaches `90-admin.sh` at all, so a check count from such a run says nothing about admin.
+#
+# **Raising `--max-messages` is the wrong instrument and was tried.** A bound narrows what the
+# assertion can see; it does not say where this run's events start. Wave 8 raised it to fifty
+# thousand and reverted it, correctly.
+#
+# **The fence is the topic's end offsets, captured before any product section runs.** Everything
+# this run publishes lands after them, so a consumer starting there reads a superset of this run's
+# events and nothing that predates it — and the assertions stay subset checks over ids, because
+# another worktree publishing concurrently is still not ordered against this one.
+#
+# It is captured at run start rather than at the top of the section that reads, and that is a
+# deliberate margin rather than a necessity today. Today the only producer onto those two topics is
+# 80-notifications.sh's own worker run: 61-bidding.sh points its worker at `localhost:1` precisely so
+# the outbox pass fails and leaves the rows for that section, and 50-jobs.sh's worker runs before any
+# bid or delivery row exists. **One future task registered in `cmd/worker` changes that**, and a fence
+# taken at the top of the reading section would then be behind the events it needs, silently. Taking
+# it at run start costs one command and cannot go stale that way.
+#
+# `kafka-get-offsets.sh` is the instrument that answers this. `GetOffsetShell` through
+# `kafka-run-class` returns nothing usable — do not reach for it.
+
+# kafka_end_offsets <topic> — "<partition> <end-offset>" per line, ascending by partition.
+#
+# Prints nothing at all for a topic that does not exist, which is the right answer: a topic that did
+# not exist when the fence was taken holds nothing this run has to read past.
+#
+# The `|| true` is load-bearing under this file's `set -o pipefail`. `kafka-get-offsets.sh` exits
+# non-zero for a topic the broker does not have, and a bare pipeline would propagate that and end the
+# run — which is exactly the case the empty output is meant to handle. Braced so the failure is
+# swallowed at the producing end rather than by the pipeline as a whole, where it would also mask a
+# broken `awk`.
+kafka_end_offsets() {
+  { "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-get-offsets.sh" \
+      --bootstrap-server localhost:9092 --topic "$1" --time -1 </dev/null 2>/dev/null || true; } \
+    | tr -d '\r' | awk -F: 'NF == 3 && $3 ~ /^[0-9]+$/ { print $2, $3 }' | sort -n
+}
+
+# kafka_fence <topic>… — record where each topic ends now.
+kafka_fence() {
+  local topic
+  for topic in "$@"; do
+    kafka_end_offsets "$topic" >"$WORKDIR/kafka-fence-$topic.txt"
+  done
+}
+
+# kafka_consume_fenced <topic> <outfile> — every message appended to <topic> since its fence,
+# one per line, across every partition.
+#
+# **The bound is derived rather than chosen.** Each partition is read for exactly
+# `end - fence` messages, recomputed from the broker at read time, so the consumer stops as soon as
+# it has them instead of sitting out a timeout — and a partition with nothing new is not read at
+# all. Messages another worktree appends after that end offset are simply not read, which is
+# harmless: every assertion over this file is a subset check on ids this run created.
+#
+# Only one partition can be read per invocation, so a three-partition topic is three reads. `-T`
+# still attaches stdin, hence `</dev/null` on the consumer — without it the console consumer eats
+# the loop's own input and the second partition is never read.
+kafka_consume_fenced() {
+  local topic="$1" out="$2" fence="$WORKDIR/kafka-fence-$1.txt"
+  local partition end start count
+  : >"$out"
+  while read -r partition end; do
+    start=0
+    if [[ -f "$fence" ]]; then
+      start="$(awk -v p="$partition" '$1 == p { print $2 }' "$fence")"
+      start="${start:-0}"
+    fi
+    # A topic deleted and recreated since the fence restarts at zero, so a fence beyond the end is
+    # a fence for a topic that no longer exists. Read the whole partition rather than nothing.
+    (( start > end )) && start=0
+    count=$((end - start))
+    (( count > 0 )) || continue
+    "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-consumer.sh" \
+      --bootstrap-server localhost:9092 --topic "$topic" \
+      --partition "$partition" --offset "$start" \
+      --max-messages "$count" --timeout-ms 15000 </dev/null 2>/dev/null \
+      | tr -d '\r' >>"$out" || true
+  done < <(kafka_end_offsets "$topic")
+}
+
 # --- the sections --------------------------------------------------------------------------
 
 # Every entry is checked before anything runs, so a misnamed file is a message rather than a
@@ -245,6 +343,13 @@ run_sections() {
 }
 
 run_sections 0 9
+
+# The Kafka fence, taken here because 00-stack.sh has just proved the broker is up and because
+# nothing that follows has published anything yet. `shipper.job` is not fenced: 80-notifications.sh
+# deletes and recreates it, so `--from-beginning` there is already a statement about this run.
+# See "reading a shared Kafka topic" above for why this is at run start rather than in the section
+# that reads.
+kafka_fence shipper.bid shipper.delivery
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-5  service builds and listens on a configured port"
