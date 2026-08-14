@@ -550,11 +550,25 @@ func (m market) jobStatus(t *testing.T, job uuid.UUID) (string, int) {
 	return status, changes
 }
 
-// chain reads one negotiation's history, on the pool rather than in a transaction — which is what
-// [Service.Chain] is built for and what the handler passes it.
+// chain reads one negotiation's history as an ordinary account, on the pool rather than in a
+// transaction — which is what [Service.Chain] is built for and what the handler passes it.
+//
+// The audience is dropped here and asserted by the tests that are about it (visibility_test.go), so
+// that the twenty callers who only want the rows are not rewritten every time SHIP-96 adds a reader.
 func (m market) chain(t *testing.T, caller, job, bid uuid.UUID) ([]Bid, bool, error) {
 	t.Helper()
-	return m.svc.Chain(t.Context(), m.pool, caller, job, bid)
+
+	offers, _, truncated, err := m.svc.Chain(t.Context(), m.pool, Viewer{ID: caller}, job, bid)
+	return offers, truncated, err
+}
+
+// chainAs reads one negotiation's history as a named viewer, and reports which of Docs/02 §4's
+// readers the platform decided they are (SHIP-96).
+func (m market) chainAs(t *testing.T, v Viewer, job, bid uuid.UUID) ([]Bid, Audience, error) {
+	t.Helper()
+
+	offers, audience, _, err := m.svc.Chain(t.Context(), m.pool, v, job, bid)
+	return offers, audience, err
 }
 
 // counterOf is a counter-offer changing the price alone, which is the ordinary shape.

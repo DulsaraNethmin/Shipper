@@ -819,6 +819,30 @@ func (s *Service) AwardBid(
 		// statements ago. Reported rather than papered over, because continuing would move the job
 		// to 'Awarded' with nothing accepted — a job two parties believe is committed and no row
 		// says who to.
+		//
+		// # The opaque 500 this becomes is the intended answer, and Docs/11 §9 asked for a ruling
+		//
+		// §9 carried this as "an unmapped `internal_error` sits on a reachable award path", with two
+		// ways out: a sentinel with a mapped code, or a comment saying the 500 is intended and why.
+		// **It is intended, and this is the why.**
+		//
+		// A code exists so a client can *branch* on it (Docs/10 §4.4), and there is nothing for a
+		// client to do differently here. Every state this could describe is one two guards already
+		// answer legibly: an offer that stopped being live is [ErrBidClosed], an offer that was
+		// already accepted is this method's own retry branch, and a job that moved on is
+		// [ErrJobNotAwardable]. Reaching this line means the row was read as `Submitted` under a
+		// lock this transaction still holds and then did not match on the same conditions — which
+		// is not a state the platform has, so a code naming it would be a code describing a defect.
+		// SHIP-95 established that the liveness rule is kept **twice**, here and at the locking
+		// re-read; this is the second guard reporting that the first was wrong about the world.
+		//
+		// A 500 is therefore the honest answer: the client retries, and `httpx.WriteError` logs the
+		// cause against the request id (SHIP-15i) so the defect is findable. What a mapped code
+		// would buy is a client branch on a condition that should never occur, which is the shape
+		// that makes a real defect look handled.
+		//
+		// The same reading covers [postgresStore.supersedeHead]'s and [Awarding.MoveToAwarded]'s
+		// equivalents in this file, for the same reason and by the same argument.
 		return Bid{}, fmt.Errorf("bidding: %s was live when it was locked and is not now", bid.ID)
 	}
 
@@ -903,12 +927,13 @@ func acceptable(b Bid) error {
 //
 // # Who may read it, and the two rules that are not the same rule
 //
-// **Both parties to the negotiation, and nobody else.** The provider it is with, and the customer who
-// owns the job — the two Docs/02 §4 names, less the administrator, whose view is SHIP-96's along with
-// the rest of the visibility rules. A *competing* provider is refused with the 404 a bid that does not
-// exist gets, which is Docs/01 §4.3's second line: another provider's price, timing and counters are
-// private, and this endpoint is the one place a competitor could otherwise read a whole negotiation
-// at once.
+// **The three readers Docs/02 §4 names, and nobody else** — the provider the negotiation is with,
+// the customer who owns the job, and an administrator (SHIP-96). visibility.go holds that list and
+// argues each of the three; the administrator has no route until SHIP-147 supplies an admin session,
+// and that is recorded there rather than left as an absence. A *competing* provider is refused with
+// the 404 a bid that does not exist gets, which is Docs/01 §4.3's second line: another provider's
+// price, timing and counters are private, and this endpoint is the one place a competitor could
+// otherwise read a whole negotiation at once.
 //
 // **The customer's budget is not in this shape**, because no shape in this package carries anything
 // of the job. What *is* here and is new is an amount the customer chose — their counter — reaching a
@@ -925,26 +950,50 @@ func acceptable(b Bid) error {
 //
 // No transaction and no lock. This is a read, and a chain that changed under it would produce an
 // older row beside a newer one rather than an inconsistent one.
+// It returns the audience the platform decided the caller is, so that a caller cannot be served by
+// one rule and reported under another — and so that SHIP-102's comparison screen and SHIP-101's
+// provider list, which are two screens over these rows, can be told apart by the platform rather
+// than guessed at by the client.
 func (s *Service) Chain(
 	ctx context.Context,
 	r db.Runner,
-	callerID, jobID, bidID uuid.UUID,
-) ([]Bid, bool, error) {
-	answered, err := s.reachableBid(ctx, r, callerID, jobID, bidID, false)
+	viewer Viewer,
+	jobID, bidID uuid.UUID,
+) ([]Bid, Audience, bool, error) {
+	if bidID == uuid.Nil || jobID == uuid.Nil || viewer.ID == uuid.Nil {
+		return nil, AudienceNone, false, fmt.Errorf("bidding: %s on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	bid, err := s.store.readBid(ctx, r, bidID)
 	if err != nil {
-		return nil, false, err
+		return nil, AudienceNone, false, err
+	}
+	if bid.JobID != jobID {
+		// The job in the path is compared for [Service.reachableBid]'s reason: a bid is addressed
+		// under its own job, so a client pairing a real bid with the wrong one is naming something
+		// that does not exist.
+		return nil, AudienceNone, false, fmt.Errorf("bidding: %s is not on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	audience, err := s.audienceFor(ctx, r, viewer, bid)
+	if err != nil {
+		return nil, AudienceNone, false, err
+	}
+	if !audience.permitted() {
+		return nil, AudienceNone, false, fmt.Errorf(
+			"bidding: %s is none of Docs/02 §4's readers of %s: %w", viewer.ID, bidID, ErrNotBidOwner)
 	}
 
 	// One more than the cap, so that "there are more" is read off the query rather than off a second
 	// count that could disagree with it.
-	offers, err := s.store.chain(ctx, r, answered.bid.JobID, answered.bid.ProviderID, maxChainLength+1)
+	offers, err := s.store.chain(ctx, r, bid.JobID, bid.ProviderID, maxChainLength+1)
 	if err != nil {
-		return nil, false, err
+		return nil, AudienceNone, false, err
 	}
 	if len(offers) > maxChainLength {
-		return offers[:maxChainLength], true, nil
+		return offers[:maxChainLength], audience, true, nil
 	}
-	return offers, false, nil
+	return offers, audience, false, nil
 }
 
 // reached is a bid the caller may act on, and which side of the negotiation they are.

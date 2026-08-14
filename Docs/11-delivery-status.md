@@ -402,6 +402,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-93** | M3 | The rejection sweep — every offer still live on the awarded job becomes `Rejected` in the award's own transaction, and every offer that had **already** closed keeps the status saying how it closed. One `UPDATE` at step 4 of the recorded lock ordering, no `id <> winner` in it, and the refusal order changed so that a second award still answers `conflict` rather than `bidding_bid_closed` — *see below* |
 | **SHIP-94** | M3 | Award idempotency — **two mechanisms, and the ticket is settling which does which work.** Redis replays the response while its entry lives; the accepted offer answers every retry it cannot, including one under a fresh key. They disagree on exactly one request — a key reused for a *different* offer — and the middleware refuses it, rightly. **No key column, no migration, no handler change**: what it adds is the proof, and the two retries nobody had tested — the one that runs after SHIP-93's sweep, and the one that arrives after the delivery has started — *see below* |
 | **SHIP-95** | M3 | The award concurrency suite — Docs/08's four races, **written adversarially from the documents by an agent that did not read the implementation**, and every one of them observed racing rather than assumed to: a transaction is held open and `pg_blocking_pids` is polled until PostgreSQL confirms the other is waiting on it. Three properties no existing test could see are now pinned — that the job row is held, that it is held *before* the bid, and that an offer which stopped being live mid-award is not accepted — each demonstrated by breaking the implementation and watching a named test fail. It also found the liveness rule is kept **twice**, and that either guard alone is invisible — *see below* |
+| **SHIP-96** | M3 | Bid history visibility rules — Docs/02 §4's **three** readers enumerated in one file, with an administrator added to SHIP-88's two. It also settles §9's unmapped 500 on the award path, by ruling that it is intended. **The administrator has no route**: `authctx.Subject` cannot carry one, so the third audience is reachable from the domain and exercised by test until SHIP-147 — *see below* |
 | **SHIP-98** | M3 | Flutter provider fleet — the first provider-only surface in the app, and the list endpoint answers a customer `200` rather than refusing them, which is why the device has to say whose surface it is — *see below* |
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-100** | M3 | Flutter provider job detail and bid placement — one job over `GET /v1/jobs/open/{id}` and an offer over `POST /v1/jobs/{id}/bids`. **The bid is sent directly and never queued**, which `Docs/07` §4 requires and SHIP-124's private `OperationKind` constructor already made impossible to get wrong; what makes a retry safe is one `ActionKey` per action against SHIP-84's stored key column. It also **closes §9's client-side budget guard** by holding every provider-facing model to a closed key set — *see below* |
@@ -4980,6 +4981,85 @@ does not decay. `ratelimit` and `pagination` are the evidence it works.
 **§3's table is not generated, per above.** Both refusals are recorded here rather than left
 implicit, because the wave-4 notes recommended one of them and a reader who finds the
 recommendation but not the refusal will do it.
+
+### SHIP-96 — three readers, one record, and a ruling on the 500 §9 had been holding
+
+SHIP-96's *Done when* is "customer, bidding provider, and admin each see only what `Docs/02` §4
+permits". That section's last line is the whole rule — "bid history remains visible to the customer,
+bidding provider, and administrators" — and SHIP-88 built the read, served the first two, and named
+this ticket for the third and for the rules in full.
+
+**Four rules, in one file rather than as branches in a lookup.** `internal/bidding/visibility.go`
+holds them: the customer reads every negotiation on their job, the provider reads the negotiations
+they are in, an administrator reads any, and **nobody else reads anything** — with the competing
+provider as the case that matters, because they hold a real credential and the negotiation they are
+asking for is the one thing `Docs/01` §4.3 most needs kept from them.
+
+**There is no field-level half to any of it, and saying so is part of the finding.** No shape in this
+package carries anything of the job beyond its identifier, so the customer's budget is not in a chain
+to be redacted from one audience and shown to another; the amounts that *are* there are what each
+party deliberately offered the other. What the three audiences differ in is which negotiations they
+can **reach**, not what a row shows them — so `visibility.go` decides reachability and nothing else,
+and `Audience` is returned to the caller rather than kept private, because SHIP-101's provider list
+and SHIP-102's customer comparison are two screens over these rows and a later ticket asking "which
+of them is this" wants an answer rather than three predicates.
+
+#### The administrator's third is real in the domain and unreachable on the wire
+
+`authctx.Subject` cannot carry an administrator and says so in its own comment: `Docs/06` §5.2 and
+SHIP-147 make admin sign-in a separate system that a user token cannot reach, so `authctx.Role` has
+two values and neither is one. `cmd/api` therefore builds every `Viewer` with `Administrator` false,
+and **that is a fact about the auth class rather than a stub** — there is no credential in this
+platform that could make it true, and `TestTheServedRouteCanNeverBuildAnAdministrator` asserts the
+refusal an outsider still gets over the wire.
+
+So the third audience is exercised by `visibility_test.go` against a real database and by nothing on
+the served surface. **SHIP-147 supplies the session and SHIP-152 the endpoint**, and what each of them
+then needs from this package is one field on a struct rather than a rule to re-derive. This is
+recorded rather than narrowed away, in the file, in the verify section, and here — the arrangement
+SHIP-65 established when its *Done when* named a column that could not exist yet.
+
+#### `Docs/02` §4's `Countered` is still not resolved, and this ticket is where it was meant to be
+
+§9 named SHIP-96's owner as the natural resolver, "because they are the first person who has to render
+a chain to three audiences and will notice immediately if a distinction was wanted". **They did not.**
+Rendering the chain to a third audience changed nothing about the question: an administrator reading a
+negotiation needs to know an offer was displaced, which `Superseded` says, and there is no second
+thing `Countered` could mean that any of the three readers would act on differently.
+
+**The recommendation is therefore the cheap option, unchanged and now argued from the position §9
+wanted it argued from**: `Docs/02` §4 gains a sentence saying `Countered` is a synonym retained for the
+vocabulary and `Superseded` is what the platform writes. It is **not taken here**, and the reason is
+that it has become a **two-file shared edit** rather than a one-line one: SHIP-56a moved the vocabulary
+into `contracts/statuses.yaml`, which generates the Go, Dart and TypeScript forms, so a change now
+touches `Docs/02` and that specification — both shared surfaces this branch may not edit. It is a
+request to the repository owner with a recommendation attached, which is what §9 asks of a domain
+branch that meets one of these.
+
+#### The unmapped 500 on the award path is settled, and the answer is that it is intended
+
+§9's second open item: `acceptBid`'s compare-and-set matching nothing produces an error that is none of
+this domain's sentinels, so `httpx.WriteError` falls through to an opaque `500 internal_error` the
+published contract does not describe. Two ways out were offered — a sentinel with a mapped code, or a
+comment saying the 500 is intended and why — and **the comment is the answer**, written into
+`Service.AwardBid`.
+
+The argument: a code exists so a client can **branch** on it (`Docs/10` §4.4), and there is nothing for
+a client to do differently here. Every state this branch could describe is one two guards already
+answer legibly — an offer that stopped being live is `bidding_bid_closed`, one already accepted is the
+retry branch, a job that moved on is `conflict`. Reaching the line means the row was read as
+`Submitted` under a lock the transaction still holds and then did not match on the same conditions,
+which is not a state the platform has. SHIP-95 established that the liveness rule is kept **twice**;
+this is the second guard reporting that the first was wrong about the world, which is a defect rather
+than a condition. A mapped code would buy a client branch on something that should never occur, which
+is the shape that makes a real defect look handled — and SHIP-15i already made the cause loggable
+against the request id, which is what a defect actually needs.
+
+#### Shared surfaces
+
+§3's check count, and nothing else. **No migration, no route, no `$ref`, no `routes_golden.txt`
+line**: the endpoint SHIP-88 built is the endpoint SHIP-96 governs, and what changed is who may reach
+it.
 
 ### SHIP-98 — the first provider surface, and the endpoint that does not refuse a customer
 

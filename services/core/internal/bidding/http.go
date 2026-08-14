@@ -819,7 +819,13 @@ func (h *Handler) Award() http.Handler {
 // Read-only, so no `Idempotency-Key`: the middleware lets safe methods through untouched, and a key
 // on a request that changes nothing would be a key stored for no reason.
 //
-// # Two callers, and the one this file has to be most careful about
+// # Two callers here, three in the domain, and the one this file has to be most careful about
+//
+// SHIP-96 enumerates Docs/02 §4's three readers in `visibility.go` — the bidding provider, the
+// customer, and an administrator. **Two of the three can reach this handler**, because the route is
+// `RequireUser` and no administrator session exists until SHIP-147; the third is reachable from the
+// domain and is exercised by test. That is recorded rather than papered over, and the one line a
+// later administrator endpoint changes is the [Viewer] built below.
 //
 // The customer sees the provider's prices, which Docs/01 §4.3 explicitly wants — "allow a customer to
 // compare price, timing, provider profile". The provider sees the customer's *counters*, which is new
@@ -846,7 +852,13 @@ func (h *Handler) History() http.Handler {
 			return err
 		}
 
-		offers, truncated, err := h.svc.Chain(r.Context(), pool, callerID, jobID, bidID)
+		// Administrator is false and cannot be anything else on this route: it declares
+		// RequireUser, and `authctx.Subject` cannot carry an administrator at all — Docs/06 §5.2
+		// and SHIP-147 make admin sign-in a separate system that a user token cannot reach.
+		// **The line SHIP-152's administrator endpoint changes is this one**, and nothing in the
+		// domain moves with it (SHIP-96).
+		offers, _, truncated, err := h.svc.Chain(
+			r.Context(), pool, Viewer{ID: callerID}, jobID, bidID)
 		if err != nil {
 			return apiError(err)
 		}

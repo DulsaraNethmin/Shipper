@@ -1197,6 +1197,77 @@ status="$(bid_get "$bid_rival_token" "$history_path" histrival)"
 ok "a competing provider cannot read it at all — a whole negotiation in one response is exactly what Docs/01 §4.3 keeps private"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-96  Docs/02 §4's three readers, and the only answer everybody else gets"
+
+# SHIP-96's *Done when*: "customer, bidding provider, and admin each see only what Docs/02 §4
+# permits." That section's last line is the whole rule — "bid history remains visible to the
+# customer, bidding provider, and administrators" — and SHIP-88 built the read and served the first
+# two, naming this ticket for the third and for the rules in full.
+#
+# # What is demonstrated here, and the one third that is demonstrated by tests
+#
+# internal/bidding/visibility_test.go holds all three audiences and every refusal, against a real
+# database. **The administrator's third cannot be demonstrated over the wire, and that is a fact
+# about the platform rather than a gap in this section**: `authctx.Subject` cannot carry an
+# administrator — Docs/06 §5.2 and SHIP-147 make admin sign-in a separate system that a user token
+# cannot reach — so there is no credential a client can hold that would make `Viewer.Administrator`
+# true. SHIP-147 supplies the session and SHIP-152 the endpoint.
+#
+# So what this asserts is the half that is served: the two audiences that can reach the route see the
+# same negotiation, everybody else gets the 404 a bid that does not exist gets, and the served route
+# **cannot build an administrator at all** — which is asserted as the refusal an outsider still gets
+# whatever credential they hold.
+#
+# The competing provider is the case that matters. They hold a real credential, they bid on the same
+# job, and the negotiation they are asking for is the one thing Docs/01 §4.3 most needs kept from
+# them.
+
+# The two permitted readers see the same rows. Read as the ordered list of identifiers rather than as
+# a count, because two audiences seeing different *versions* of one record is the failure this rule
+# exists against, and a count would miss it.
+for reader in "customer:$bid_customer_token" "provider:$bid_provider_token"; do
+  status="$(bid_get "${reader#*:}" "$history_path" "vis-${reader%%:*}")"
+  [[ "$status" == "200" ]] \
+    || { cat "$WORKDIR/bid-vis-${reader%%:*}.json"; fail "the ${reader%%:*} reading the chain returned $status"; }
+done
+customer_chain="$(python3 -c '
+import json, sys
+print(" ".join(row["id"] for row in json.load(open(sys.argv[1]))["data"]))
+' "$WORKDIR/bid-vis-customer.json")"
+provider_chain="$(python3 -c '
+import json, sys
+print(" ".join(row["id"] for row in json.load(open(sys.argv[1]))["data"]))
+' "$WORKDIR/bid-vis-provider.json")"
+[[ -n "$customer_chain" ]] || fail "the customer's read is empty, so this section proves nothing"
+[[ "$customer_chain" == "$provider_chain" ]] \
+  || fail "the two parties read different chains: [$customer_chain] against [$provider_chain]"
+ok "the customer and the bidding provider read the same negotiation, row for row — Docs/02 §4 gives them one record, not two views of it"
+
+# Everybody else, and each of the three is a different kind of caller: a provider bidding on the same
+# job, a customer who owns no part of it, and a request with no credential at all.
+status="$(bid_get "$bid_rival_token" "$history_path" vis-rival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-vis-rival.json"; fail "a competing provider read the chain: $status"; }
+[[ "$(json "$WORKDIR/bid-vis-rival.json" '["error"]["code"]')" == "not_found" ]] \
+  || fail "the competitor's refusal answered $(json "$WORKDIR/bid-vis-rival.json" '["error"]["code"]'), want not_found"
+
+status="$(curl -s -o "$WORKDIR/bid-vis-absent.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_rival_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$counter_job/bids/$(uuidgen | tr 'A-Z' 'a-z')/history")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-vis-absent.json"; fail "a bid that does not exist returned $status"; }
+diff <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["error"]; print(d["code"], d["message"])' "$WORKDIR/bid-vis-rival.json") \
+     <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["error"]; print(d["code"], d["message"])' "$WORKDIR/bid-vis-absent.json") >/dev/null \
+  || fail "a negotiation somebody may not read answers differently from one that does not exist"
+ok "a competing provider gets the answer a bid that does not exist gets, code and message alike — a refusal that differed would confirm the negotiation"
+
+status="$(bid_get "$bid_customer_token" "/v1/jobs/$counter_job/bids/$(uuidgen | tr 'A-Z' 'a-z')/history" vis-cust-absent)"
+[[ "$status" == "404" ]] || fail "an identifier that names nothing returned $status to the job's own customer"
+status="$(curl -s -o "$WORKDIR/bid-vis-anon.json" -w '%{http_code}' "http://localhost:$VERIFY_PORT$history_path")"
+[[ "$status" == "401" ]] || fail "an unauthenticated read returned $status, want 401"
+ok "and a caller with no credential is refused before any of it — the platform decides who is reading, never the device"
+
+unset customer_chain provider_chain reader
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-88  the record outlives the job, and a chain cannot fork"
 
 move_job "$counter_job" - Cancelled
