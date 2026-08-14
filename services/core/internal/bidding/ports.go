@@ -223,6 +223,139 @@ func (a JobAward) String() string {
 	}
 }
 
+// JobPresentation is what Docs/02 §2 said about a presentation move, in terms this domain can act
+// on (SHIP-90).
+//
+// An outcome rather than a bool, for [JobAward]'s reason and one of its own. The award's port both
+// asks and acts, and so does this one — but here the interesting distinction is not "may this
+// happen": it is **which of three things happened**, and only one of the three is a refusal a
+// caller should act on. A bool would have collapsed "the job is already Negotiating", which is the
+// ordinary case on every bid after the first, into the same answer as "this job cannot take a bid
+// at all", which has to become a 404.
+type JobPresentation int
+
+const (
+	// JobPresentationUnrecognised is the zero value and is never a valid answer.
+	//
+	// First on purpose, exactly as [JobAwardUnrecognised] is: a stub, a half-written adapter or a
+	// switch with a missing case returns this, and the caller refuses it rather than reading
+	// silence as "the job moved".
+	JobPresentationUnrecognised JobPresentation = iota
+
+	// JobPresentationMoved means the transition ran and is recorded.
+	JobPresentationMoved
+
+	// JobPresentationAlreadyThere means the job is already in the status asked for.
+	//
+	// **The ordinary answer, not an edge case**, and the reason this is an enumeration. Every bid
+	// after the first on one job meets it, and so does every withdrawal on a job that was never
+	// moved. Nothing is wrong and nothing is written.
+	JobPresentationAlreadyThere
+
+	// JobPresentationClosed means Docs/02 §2 has no such move from where the job stands, or there
+	// is no such job.
+	//
+	// **One value for both**, which is the collapse every port in this file makes: telling them
+	// apart would take a second query whose only product is the knowledge that somebody else's job
+	// exists.
+	JobPresentationClosed
+
+	// JobPresentationHeld means another transaction holds the job row, so no presentation change
+	// was attempted. Only [Presentation.LeaveNegotiation] answers it.
+	//
+	// See that method for why it does not wait.
+	JobPresentationHeld
+)
+
+func (p JobPresentation) String() string {
+	switch p {
+	case JobPresentationMoved:
+		return "moved"
+	case JobPresentationAlreadyThere:
+		return "already there"
+	case JobPresentationClosed:
+		return "closed"
+	case JobPresentationHeld:
+		return "held elsewhere"
+	default:
+		return "unrecognised"
+	}
+}
+
+// Presentation is Docs/02 §1's Negotiating status, which is this domain's to move (SHIP-90).
+//
+// Docs/02 §2 has two rows nothing could reach until now: `Open → Negotiating` on "first bid or
+// counter-offer submitted", and `Negotiating → Open` on "all active bids expire, are withdrawn, or
+// are rejected". Both conditions are facts about `bids`, so this domain is the only one that can
+// know when they hold — and neither is a status this domain may write, because a job's status
+// passes one guarded function in `jobs` (Docs/02 §2, CLAUDE.md). So it asks, in the transaction
+// that made the condition true.
+//
+// **Deliberately not "move this job to any status I name"**, which is [Awarding]'s rule and the
+// same rule: a port shaped that way would be Docs/02 §2's table acquiring a second opinion through
+// the back door. The two methods name the two rows.
+//
+// # Only a placement enters, and that is not an omission
+//
+// Docs/02 §2 says "first bid **or counter-offer** submitted", and [Service.CounterOffer] does not
+// call [Presentation.EnterNegotiation]. It cannot need to: a counter answers a *live* offer, a
+// live offer is one [Service.PlaceBid] wrote, and that placement is what moved the job. **A
+// counter can never be the first thing to happen in a negotiation**, which is what "first" is
+// doing in that sentence.
+//
+// # The two methods take the job row differently, and that is the whole of the lock ordering
+//
+// Docs/11 §3's SHIP-88 entry records the ordering this domain keeps: `jobs` → `bids`, in one
+// direction, with nothing coming back. [Presentation.EnterNegotiation] is called before any bid
+// row is touched, so it takes an ordinary blocking lock and the ordering holds.
+// [Presentation.LeaveNegotiation] cannot: it is called once the offer has closed, which is after
+// the bid is locked — and in the expiry sweep the bid was locked by the *claim*, before this
+// domain was reached at all. A blocking lock there would close the cycle, and the first deadlock
+// would be between a sweep and an award.
+type Presentation interface {
+	// EnterNegotiation runs Docs/02 §2's `Open → Negotiating` through the one guarded function,
+	// inside the caller's transaction, as the platform.
+	//
+	// **The platform, and not the provider who bid.** Docs/02 §1 calls Negotiating "a useful
+	// presentation status" in as many words, and this move is the platform's reading of a
+	// condition rather than an act anybody performed: a provider placing an offer asked for their
+	// offer to exist, not for the job to move, and `job_status_history` records who acted.
+	//
+	// It takes an ordinary blocking `FOR UPDATE`, because it runs before this domain has touched
+	// a `bids` row. **That is a strengthening rather than a cost**: the eligibility answer a
+	// placement is authorised by is read without a lock, so a job awarded in the window between
+	// the two used to acquire a fresh offer. Holding the row and reading Docs/02 §2 under it
+	// closes that window — [JobPresentationClosed] is a job no bid may be placed on, and
+	// [Service.PlaceBid] refuses it with the 404 an ineligible provider gets.
+	EnterNegotiation(ctx context.Context, r db.Runner, jobID uuid.UUID) (JobPresentation, error)
+
+	// LeaveNegotiation runs Docs/02 §2's `Negotiating → Open` through the one guarded function,
+	// inside the caller's transaction, as the platform.
+	//
+	// Called only once the caller has established that no live offer remains on the job.
+	//
+	// # It does not wait for the job row, and answers [JobPresentationHeld] rather than blocking
+	//
+	// The implementation takes the row `FOR UPDATE SKIP LOCKED` before running the transition, so
+	// a job somebody else is holding is skipped rather than queued behind. Two reasons, and the
+	// first is structural:
+	//
+	//   - **The caller already holds `bids` rows.** A blocking lock here would be `bids` → `jobs`,
+	//     against the `jobs` → `bids` an award takes, and the cycle would deadlock a sweep against
+	//     an award. A lock attempt that cannot wait cannot deadlock.
+	//   - **Whatever holds the row is making a real change, and it supersedes a presentational
+	//     one.** The transactions that hold a `jobs` row are an award, a cancellation, an expiry,
+	//     a publication and an extension. In the first three the job is leaving Negotiating for
+	//     somewhere this move has no opinion about; in the others the next bid or withdrawal moves
+	//     it correctly. Docs/02 §1's own sentence is the licence: this is presentation, and a
+	//     presentation change must never block a real one.
+	//
+	// The cost is stated rather than hidden: under contention a job can sit at Negotiating with no
+	// live offer until the next thing happens to it. It remains awardable-by-nobody and biddable
+	// by everybody, which is what Negotiating means anyway.
+	LeaveNegotiation(ctx context.Context, r db.Runner, jobID uuid.UUID) (JobPresentation, error)
+}
+
 // Awarding is the job lifecycle, as far as the award reaches into it (SHIP-92).
 //
 // Deliberately not "move this job to any status I name". A port shaped that way would be Docs/02

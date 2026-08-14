@@ -79,9 +79,95 @@ var (
 // the one property the outbox exists for — so events_test.go reads the table.
 func newTestService() *Service {
 	c := clock.NewFixed(testInstant)
-	return NewService(
-		events.NewOutbox(), fleet.NewService(c), newTestNegotiation(c), newTestAwarding(c), c)
+	return NewService(events.NewOutbox(), fleet.NewService(c),
+		newTestNegotiation(c), newTestAwarding(c), newTestPresentation(c), c)
 }
+
+// newTestPresentation is [Presentation] over the real `jobs` service, as both composition roots
+// wire it (SHIP-90).
+//
+// A third copy of the same adapter — cmd/api/routes_bidding.go and cmd/worker/tasks_bidding.go hold
+// the other two — for the reason [newTestNegotiation] is a second copy of `negotiatedJobs`: neither
+// composition root is importable from here, and the whole point of the port is that this package
+// names neither type.
+//
+// **The copy matters as much as the award's does.** It writes, it takes the two locks the ticket's
+// whole concurrency story is about, and it runs the guarded transition. A stub answering "moved"
+// would make every test below pass against a service that never moved a job — and `make verify`
+// could not catch that either, since it drives the same binary from outside.
+func newTestPresentation(c clock.Clock) jobPresentation {
+	return jobPresentation{jobs: jobs.NewService(events.NewOutbox(), c, nil)}
+}
+
+type jobPresentation struct{ jobs *jobs.Service }
+
+const (
+	testNegotiationOpenedReason = "An offer was made on the job (Docs/02 §2)."
+	testNegotiationEndedReason  = "The last live offer on the job was withdrawn or expired (Docs/02 §2)."
+)
+
+func (p jobPresentation) EnterNegotiation(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (JobPresentation, error) {
+	return p.move(p.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusNegotiating,
+		Actor:  jobs.System(),
+		Reason: testNegotiationOpenedReason,
+	}))
+}
+
+// LeaveNegotiation takes the job row FOR UPDATE SKIP LOCKED, exactly as both composition roots do.
+//
+// The `SKIP LOCKED` is the half a stub would have quietly dropped, and it is the half the race
+// tests are about: a sweep holding claimed `bids` rows must not queue behind an award holding the
+// `jobs` row.
+func (p jobPresentation) LeaveNegotiation(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (JobPresentation, error) {
+	const q = `SELECT status FROM jobs WHERE id = $1 FOR UPDATE SKIP LOCKED`
+
+	var status jobs.Status
+	switch err := r.QueryRow(ctx, q, jobID).Scan(&status); {
+	case errors.Is(err, db.ErrNoRows):
+		return JobPresentationHeld, nil
+	case err != nil:
+		return JobPresentationUnrecognised, err
+	}
+
+	if !jobs.Permitted(status, jobs.StatusOpen) {
+		if status == jobs.StatusOpen {
+			return JobPresentationAlreadyThere, nil
+		}
+		return JobPresentationClosed, nil
+	}
+
+	return p.move(p.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusOpen,
+		Actor:  jobs.System(),
+		Reason: testNegotiationEndedReason,
+	}))
+}
+
+func (jobPresentation) move(_ jobs.Job, err error) (JobPresentation, error) {
+	switch {
+	case err == nil:
+		return JobPresentationMoved, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return JobPresentationAlreadyThere, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted), errors.Is(err, jobs.ErrJobNotFound):
+		return JobPresentationClosed, nil
+	default:
+		return JobPresentationUnrecognised, err
+	}
+}
+
+var _ Presentation = jobPresentation{}
 
 // newTestNegotiation is [Negotiation] over the real `jobs` service, as cmd/api wires it.
 //
@@ -464,11 +550,25 @@ func (m market) jobStatus(t *testing.T, job uuid.UUID) (string, int) {
 	return status, changes
 }
 
-// chain reads one negotiation's history, on the pool rather than in a transaction — which is what
-// [Service.Chain] is built for and what the handler passes it.
+// chain reads one negotiation's history as an ordinary account, on the pool rather than in a
+// transaction — which is what [Service.Chain] is built for and what the handler passes it.
+//
+// The audience is dropped here and asserted by the tests that are about it (visibility_test.go), so
+// that the twenty callers who only want the rows are not rewritten every time SHIP-96 adds a reader.
 func (m market) chain(t *testing.T, caller, job, bid uuid.UUID) ([]Bid, bool, error) {
 	t.Helper()
-	return m.svc.Chain(t.Context(), m.pool, caller, job, bid)
+
+	offers, _, truncated, err := m.svc.Chain(t.Context(), m.pool, Viewer{ID: caller}, job, bid)
+	return offers, truncated, err
+}
+
+// chainAs reads one negotiation's history as a named viewer, and reports which of Docs/02 §4's
+// readers the platform decided they are (SHIP-96).
+func (m market) chainAs(t *testing.T, v Viewer, job, bid uuid.UUID) ([]Bid, Audience, error) {
+	t.Helper()
+
+	offers, audience, _, err := m.svc.Chain(t.Context(), m.pool, v, job, bid)
+	return offers, audience, err
 }
 
 // counterOf is a counter-offer changing the price alone, which is the ordinary shape.
@@ -672,6 +772,27 @@ func transitionBy(t *testing.T, pool *pgxpool.Pool, actorType string, job, actor
 	}); err != nil {
 		t.Fatalf("moving %s from %s to %s: %v", job, from, to, err)
 	}
+}
+
+// moveJob moves the fixture job to `to` from wherever it is now (SHIP-90).
+//
+// **A fixture that named its own `from` was correct until this ticket and is a hazard after it.**
+// 000402's trigger compares the history row's `from_status` with the row it is updating, so a test
+// that wrote "Open" after a bid had moved the job to Negotiating failed inside the fixture rather
+// than in the assertion — which is a long way from the cause. Reading the current status here means
+// a test says where the job is going and never where it has been.
+//
+// [transition] is still used directly where a test is arranging a job **before** any offer exists,
+// because there the `from` is the point.
+func (m market) moveJob(t *testing.T, to string) {
+	t.Helper()
+
+	var from string
+	if err := m.pool.QueryRow(t.Context(),
+		`SELECT status FROM jobs WHERE id = $1`, m.job).Scan(&from); err != nil {
+		t.Fatalf("reading the status of %s: %v", m.job, err)
+	}
+	transition(t, m.pool, m.job, m.customer, from, to)
 }
 
 // exec runs one statement and fails the test rather than returning an error, because every caller

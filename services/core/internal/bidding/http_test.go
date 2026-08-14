@@ -68,6 +68,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("POST /v1/jobs/{id}/bids/{bid_id}/counter", handler.Counter())
 	mux.Handle("GET /v1/jobs/{id}/bids/{bid_id}/history", handler.History())
 	mux.Handle("POST /v1/jobs/{id}/award", handler.Award())
+	mux.Handle("GET /v1/fleet/bids", handler.Mine())
 	return mux
 }
 
@@ -172,6 +173,15 @@ func (w wire) history(t *testing.T, caller uuid.UUID, job, bid uuid.UUID) *httpt
 	t.Helper()
 	return send(t, w.router, http.MethodGet, caller, "",
 		"/v1/jobs/"+job.String()+"/bids/"+bid.String()+"/history", "")
+}
+
+// mine sends one GET against the caller's own bid list (SHIP-101a).
+//
+// No idempotency key and no job in the path: the resource is the caller's own bids across every job,
+// which is what puts it under `/v1/fleet` rather than under any one job.
+func (w wire) mine(t *testing.T, caller uuid.UUID, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	return send(t, w.router, http.MethodGet, caller, "", "/v1/fleet/bids"+query, "")
 }
 
 // award sends one POST against a job's award verb (SHIP-92).

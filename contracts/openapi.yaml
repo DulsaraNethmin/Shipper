@@ -210,6 +210,8 @@ paths:
     $ref: './paths/identity.yaml#/VerifyPhone'
   /v1/driver/jobs/{id}:
     $ref: './paths/delivery.yaml#/DriverJob'
+  /v1/fleet/bids:
+    $ref: './paths/bidding.yaml#/FleetBids'
   /v1/fleet/profile:
     $ref: './paths/fleet.yaml#/Profile'
   /v1/fleet/vehicles:

@@ -346,6 +346,52 @@ func (postgresStore) withdrawBid(ctx context.Context, r db.Runner, id uuid.UUID)
 	return bid, nil
 }
 
+// expireBid moves an offer past its own collection time to Expired (SHIP-89).
+//
+// # It is a compare-and-set, and the deadline is inside the `WHERE` rather than in the caller
+//
+// `status = 'Submitted' AND pickup_at IS NOT NULL AND pickup_at <= $3` is the claim's predicate
+// written a second time, which is deliberate and is the one redundancy in this file that has a
+// mutation behind it. `cmd/worker` chooses *which* rows to sweep; this refuses to expire a row
+// that is not due whichever query found it. Delete the deadline from
+// [ExpiryClaim] and this statement matches nothing, so the pass reports a row it could not expire
+// rather than quietly killing every live offer on the marketplace.
+//
+// `superseded_by IS NULL` is redundant against `ck_bids_superseded_is_not_live` — a displaced row
+// cannot be 'Submitted' — and is written for [postgresStore.acceptBid]'s reason: a displaced offer
+// should *match nothing* rather than raise a constraint violation that aborts the pass's
+// transaction and releases every other claimed row with it.
+//
+// The status is a parameter rather than a literal so the value comes from [StatusExpired] — Docs/02
+// §4's own string, held to `ck_bids_status` by TestEveryBidStatusConstraintMatchesTheGoConstants —
+// rather than from a second spelling of it in SQL. `updated_at` is left to `bids_set_updated_at`
+// (000500), which is what makes "this pass moved it" observable.
+func (postgresStore) expireBid(
+	ctx context.Context,
+	r db.Runner,
+	id uuid.UUID,
+	now time.Time,
+) (Bid, bool, error) {
+	const q = `
+		UPDATE bids
+		SET status = $2
+		WHERE id = $1
+		  AND status = $4
+		  AND superseded_by IS NULL
+		  AND pickup_at IS NOT NULL
+		  AND pickup_at <= $3
+		RETURNING ` + bidColumns
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id, string(StatusExpired), now, string(StatusSubmitted)))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Bid{}, false, nil
+	case err != nil:
+		return Bid{}, false, fmt.Errorf("bidding: expiring bid %s: %w", id, err)
+	}
+	return bid, true, nil
+}
+
 // supersedeHead moves the offer being answered out of the live predicate (SHIP-87).
 //
 // # It is a compare-and-set, and the WHERE clause is the whole of that
@@ -515,6 +561,29 @@ func (postgresStore) rejectCompeting(ctx context.Context, r db.Runner, jobID uui
 	return closed, nil
 }
 
+// liveOffers is how many offers on a job are still open for either party to act on (SHIP-90).
+//
+// **The predicate is [Status.live]'s, written in SQL**, and the two have to agree: Docs/02 §2 has
+// `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", so a count that
+// treated some closed status as live would leave a job at Negotiating with nothing in it, and one
+// that treated a live status as closed would reopen a job somebody is still negotiating on.
+// `status = 'Submitted'` is the whole of it for the reason [postgresStore.rejectCompeting] gives:
+// `ck_bids_superseded_is_not_live` makes the live offer and the head of its chain the same row, so
+// this predicate misses no live offer. TestTheLivePredicateIsOneRule holds the pair together.
+//
+// A count rather than an existence check, because the caller acts on "none" and the number is what
+// a failure message can report. No lock: the caller has already written the row that changed the
+// answer, inside this transaction, so what this reads is that transaction's own view.
+func (postgresStore) liveOffers(ctx context.Context, r db.Runner, jobID uuid.UUID) (int, error) {
+	const q = `SELECT count(*) FROM bids WHERE job_id = $1 AND status = $2`
+
+	var live int
+	if err := r.QueryRow(ctx, q, jobID, string(StatusSubmitted)).Scan(&live); err != nil {
+		return 0, fmt.Errorf("bidding: counting the live offers on %s: %w", jobID, err)
+	}
+	return live, nil
+}
+
 // linkSuccessor records which offer displaced this one, completing the chain (SHIP-88).
 //
 // The third statement of a counter and the one that makes the history readable. `superseded_by IS
@@ -595,4 +664,77 @@ func (postgresStore) chain(
 		return nil, fmt.Errorf("bidding: reading the chain on %s: %w", jobID, err)
 	}
 	return offers, nil
+}
+
+// bidsFor is one page of a provider's own negotiations, newest first (SHIP-101a).
+//
+// # The scope is one column and there is no parameter that widens it
+//
+// `provider_id = $1`, taken from the authenticated subject. Another provider's offer is not refused
+// by this query — it is never selected, which is the strongest available form of Docs/01 §4.3's
+// second privacy rule and the same construction `fleet`'s vehicle list uses. **The `WHERE` clause is
+// the whole of the rule here**, unlike the addressed reads above where ownership is judged in Go:
+// there is no identifier a caller supplied to tell "somebody else's" from "nobody's" about, so there
+// is nothing for a comparison in Go to be more precise about.
+//
+// `idx_bids_provider` is `(provider_id, created_at DESC)` from 000500, which is this predicate and
+// this order exactly.
+//
+// # The keyset, and why the tuple comparison rather than two clauses
+//
+// `(created_at, id) < ($3, $4)` is a row-value comparison, which PostgreSQL can answer straight off
+// the index. Written as `created_at < $3 OR (created_at = $3 AND id < $4)` it is the same rows and a
+// worse plan, and it is the form somebody eventually gets wrong by dropping the parenthesis.
+//
+// Descending on both, because the list is newest first: a cursor names the last row of the previous
+// page and the next page is everything **before** it.
+//
+// # The status filter is optional and is applied in SQL rather than after the page is cut
+//
+// A filter applied in Go would page over the unfiltered set and hand back short pages — the failure
+// that makes `has_more` a lie. `$2` is the empty string when no status was asked for, and the clause
+// is written so that PostgreSQL sees a constant-false disjunct rather than a second query.
+func (postgresStore) bidsFor(
+	ctx context.Context,
+	r db.Runner,
+	providerID uuid.UUID,
+	status Status,
+	after BidCursor,
+	limit int,
+) ([]Bid, error) {
+	const q = `
+		SELECT ` + bidColumns + `
+		FROM bids
+		WHERE provider_id = $1
+		  AND ($2 = '' OR status = $2)
+		  AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4))
+		ORDER BY created_at DESC, id DESC
+		LIMIT $5`
+
+	var (
+		at *time.Time
+		id *uuid.UUID
+	)
+	if !after.IsZero() {
+		at, id = &after.CreatedAt, &after.ID
+	}
+
+	rows, err := r.Query(ctx, q, providerID, string(status), at, id, limit)
+	if err != nil {
+		return nil, fmt.Errorf("bidding: reading %s's bids: %w", providerID, err)
+	}
+	defer rows.Close()
+
+	bids := make([]Bid, 0, limit)
+	for rows.Next() {
+		bid, err := scanBid(rows)
+		if err != nil {
+			return nil, fmt.Errorf("bidding: reading one of %s's bids: %w", providerID, err)
+		}
+		bids = append(bids, bid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bidding: reading %s's bids: %w", providerID, err)
+	}
+	return bids, nil
 }

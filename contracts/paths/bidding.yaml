@@ -678,6 +678,95 @@ BidHistory:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+FleetBids:
+  get:
+    operationId: myBids
+    summary: List your own bids across every job
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Every offer in every negotiation you are in, newest first (SHIP-101a).
+
+      This is the read behind a provider's "my bids" screen. It is **not** a filter on one job's
+      offers: it crosses jobs, which is why it sits under `/v1/fleet` beside your vehicles and your
+      service area rather than under `/v1/jobs`.
+
+      ## What is in it
+
+      Every row of every negotiation you are a party to — **including the customer's counter-offers**,
+      which carry your provider id and are told apart by `offered_by`. That is deliberate: a counter
+      from the customer is the one row waiting for an answer from you, and a list that showed only
+      your own offers would hide it.
+
+      Each row is the same `Bid` shape every other bidding endpoint answers with. Nothing about the
+      job travels in it beyond `job_id`, so **the customer's budget is not here in any form** (Docs/01
+      §4.3) — read `GET /v1/jobs/open/{id}` for the job.
+
+      ## Grouping by status
+
+      Ask for one group with `?status=`, or read `status` off each row and group them yourself. Both
+      work; the endpoint has no opinion about which. A response of named buckets was not offered
+      because the collection envelope pages a flat list, and buckets would have to be paged
+      separately or not at all.
+
+      ## Whose bids
+
+      Yours. The provider comes from your token and there is no parameter that widens it, so another
+      provider's offer is not refused here — it is never selected. A caller who is not a provider gets
+      an empty page rather than a refusal, because the answer is empty by construction.
+
+      Read-only, so no `Idempotency-Key`.
+    parameters:
+      - name: status
+        in: query
+        required: false
+        description: |
+          Narrow to one of Docs/02 §4's eight bid statuses, in the same lower snake case the `status`
+          field uses. Omit it for every status.
+        schema:
+          type: string
+          enum: [draft, submitted, countered, accepted, rejected, withdrawn, expired, superseded]
+        example: submitted
+      - $ref: '#/Limit'
+      - $ref: '#/CursorParameter'
+    responses:
+      '200':
+        description: |
+          One page of your bids, newest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/BidList'
+      '400':
+        description: |
+          An unknown `status`, a `limit` that is not a positive whole number, or a `cursor` this
+          endpoint did not issue (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 AwardJob:
   post:
     operationId: awardJob
@@ -1075,6 +1164,34 @@ BidChain:
         True only when the negotiation is longer than the response carries.
       example: false
 
+BidList:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    One page of your own bids, newest first — the collection envelope every collection in this API
+    uses (SHIP-101a).
+
+    Unlike `BidChain` this one really does page: `next_cursor` is present while there is another page
+    and omitted on the last. Hand it back as `?cursor=` unchanged.
+  properties:
+    data:
+      type: array
+      description: |
+        Every offer in every negotiation you are in, newest first, including the customer's
+        counter-offers — `offered_by` says which is which.
+      items:
+        $ref: '#/Bid'
+    next_cursor:
+      type: string
+      description: |
+        Opaque. Pass it back as `?cursor=` for the next page. Omitted on the last page.
+      example: MR9yZWNvcmQ
+    has_more:
+      type: boolean
+      description: Whether `next_cursor` names another page.
+      example: true
+
 Bid:
   type: object
   additionalProperties: false
@@ -1113,10 +1230,12 @@ Bid:
         answered, only read. `accepted` and `rejected` are the two halves of one award: the offer the
         customer chose, and every offer that was still live on that job when they chose it.
 
-        `expired` waits on the ticket that gives an offer its own terms. `draft` is not written by any
-        endpoint — an offer you send is live when you send it — and `countered` is in the list because
-        Docs/02 §4 names it; nothing writes it, because `superseded` is the one status this platform
-        gives a displaced offer.
+        `expired` is an offer that ran out on its own terms (SHIP-89), and **its terms are the
+        collection time it committed to**: once `pickup_at` has passed, a scheduled sweep closes the
+        offer, because an offer to collect in the past is one nobody can accept. Revise it before then
+        if you still want the work. `draft` is not written by any endpoint — an offer you send is live
+        when you send it — and `countered` is in the list because Docs/02 §4 names it; nothing writes
+        it, because `superseded` is the one status this platform gives a displaced offer.
       example: submitted
     offered_by:
       type: string
@@ -1193,6 +1312,33 @@ BidID:
     type: string
     format: uuid
   example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+
+Limit:
+  name: limit
+  in: query
+  required: false
+  description: |
+    How many bids to return. Absent is 20; anything above 100 is narrowed to 100 rather than refused,
+    so raising the maximum later cannot break a client. A value that is not a whole number of at least
+    1 is refused, because that is a client defect rather than a request.
+  schema:
+    type: integer
+    minimum: 1
+    maximum: 100
+    default: 20
+  example: 20
+
+CursorParameter:
+  name: cursor
+  in: query
+  required: false
+  description: |
+    A position in the list, from the `next_cursor` of a previous page. **Opaque** — pass back exactly
+    what was received. Its contents are this endpoint's business and its encoding may change; a cursor
+    from an encoding no longer served is refused rather than misread.
+  schema:
+    type: string
+  example: MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0yZjlhNGQ1MWI3ZTA
 
 IdempotencyKey:
   name: Idempotency-Key
