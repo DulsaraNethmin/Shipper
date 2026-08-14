@@ -129,7 +129,32 @@ func TestTheRegisteredTaskSetIsWhatItSaysItIs(t *testing.T) {
 	}
 
 	// Sorted, because tasks() sorts. Add a name here in the same change that registers it.
-	want := []string{"bid-expiry", "job-expiry", "job-expiry-warning", "outbox-publisher"}
+	//
+	// # SHIP-119 added the fifth, and this is the paragraph it was made to read
+	//
+	// job-auto-complete sweeps Delivered jobs seventy-two hours after they were delivered
+	// (Docs/02 §6.1). Two things were checked before the line was added rather than after.
+	//
+	// **§9's reopening trigger does not fire.** SHIP-15r settled the --only=<task> question as a
+	// convention — fence what you assert on, own what you assert about — and named exactly one
+	// case that would reopen it: "a task that sweeps rows due by wall-clock alone", which fencing
+	// cannot cover. This is not that task. It claims what is *due*, on a deadline derived from the
+	// row's own job_status_history entry, so a section that leaves no job Delivered and older than
+	// seventy-two hours leaves it nothing to do. That is the property job-expiry and bid-expiry
+	// have and the one outbox-publisher conspicuously does not.
+	//
+	// **What it does to the existing sections is nothing, and that was measured rather than
+	// assumed.** No section leaves a job in Delivered with a backdated transition: 70-delivery.sh
+	// records milestones against jobs it created in the same run, and a job delivered seconds ago
+	// is not due for three days. The one section that makes a job due is 51-jobs-autocomplete.sh,
+	// which creates it, demonstrates it, and owns it.
+	want := []string{
+		"bid-expiry",
+		"job-auto-complete",
+		"job-expiry",
+		"job-expiry-warning",
+		"outbox-publisher",
+	}
 
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Errorf(`cmd/worker registers %v; this test expects %v.

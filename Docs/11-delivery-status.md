@@ -477,6 +477,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-116** | M4 | The reasoned exception — a milestone may be evidenced by a photograph **or** by one of `Docs/01` §4.4's three reasons there is none, and never both and never neither. It is one row in `proofs` rather than a table beside it, because that is the only shape in which "never both" is a `CHECK` at all. Nothing is uploaded and the object store is not contacted; the reader is handed the reason and **no signed URL**, because there is no object to sign one for — *see below* |
 | **SHIP-117** | M4 | The delivery-exception moderation queue — `GET /v1/admin/moderation/exceptions`, and it is a **query over the evidence rather than a table of flags**, which is what `000604` said it would be when it built `idx_proofs_exception`. `internal/delivery` is **untouched**: a flag would have needed a cross-domain write for a fact already in the row, and a second source of truth that can drift. Takes **no position on X-6** — *see below* |
 | **SHIP-118** | M4 | **The invariant stops being intended and starts being enforced.** `Delivered` becomes recordable — the `Jobs` port gains its fifth move, whose absence had been half of the old refusal — and a recording carrying neither a photograph nor a reasoned exception is refused with nothing written and the job unmoved. Enforced twice: in the domain, where a client is told which of the two to send, and by a **deferred constraint trigger** (`000605`) that refuses the row at `COMMIT` whoever wrote it — *see below* |
+| **SHIP-119** | M4 | The seventy-two hour auto-complete, and it is a **`jobs` sweep with `internal/delivery` untouched**: "a Delivered job with no dispute" is exactly "a job still in `Delivered`", because `Disputed` is a status of its own and a dispute has already moved the job out. **X-6 answered the question that held it for eight waves**, and answering it removed work rather than adding any — the claim asks about status and time and never about evidence. The deadline is derived from `job_status_history` rather than from a new `delivered_at`, so the ticket needs no column that does not already exist. `cmd/worker`'s **fifth** registered task — *see below* |
 | **SHIP-120** | M4 | Driver portal token landing — the first product code in the fourth deployable. The link is `/j/<job-id>#<token>`: the token in the **fragment**, which no server ever receives, moved to `sessionStorage` and stripped from the address bar; **the job identifier carried independently of it**, because a client deriving it from the token would make SHIP-108's one-job check compare the token with itself. Five fields, because five is what the endpoint serves — and **the delivery detail its *Done when* names is not among them**, see §4 — *see below* |
 | **SHIP-120a** | M4 | `POST /v1/driver/jobs/{id}/milestones`, auth class `RequireDriverToken` — **the first write in the service served on a credential that names no account**, and the route three wave-7 lanes specified and none built. It settles the idempotency scope §9 had held open since SHIP-15m: a driver's key is scoped by the job, because `uq_milestones_idempotency (job_id, idempotency_key)` already scopes it there and `000602` named this case while doing it. The `Jobs` port's four moves take a `Recorder` instead of a provider identifier, so a driver's transition is attributed to their `driver_assignments` row rather than to their provider — *see below* |
 | **SHIP-124** | M4 | Flutter durable operation queue — Drift over SQLite, **FIFO within an ordering key and nothing between keys**, and an operation this build cannot read is **quarantined rather than skipped**. Six ways an operation could vanish, enumerated and tested. No endpoint: **demonstrated by its own tests** — *see below* |
@@ -9397,6 +9398,99 @@ landing under them buys nothing. §9 carries it.
 **SHIP-90's narrowing of SHIP-68 and SHIP-69 was recorded, not fixed.** `Docs/02` §2 has one expiry row
 and it says `Open → Cancelled`; widening the claim means widening the document first. It is
 `Docs/09`'s SHIP-70a and §9 has the account.
+
+### SHIP-119 — the sweep is `jobs`, because a dispute has already moved the job out
+
+`cmd/worker`'s fifth registered task. A job recorded as `Delivered` becomes `Completed`
+seventy-two hours later unless a dispute has been raised (`Docs/02` §6.1), attributed to the
+platform, with a reason support and the customer's timeline can read.
+
+#### X-6 is what made it buildable, and it changed nothing about the code
+
+The ticket has been *dependency*-startable since SHIP-118 landed in wave 7. What held it was
+`Docs/09`'s "decisions still required" list, which no tool reads: whether a job delivered through
+the proof-exception path may auto-complete at all. **It was decided on 14 August 2026 — it may, on
+this ordinary rule** — and the consequence for the implementation is that there is nothing to
+exclude. The claim asks about status and time and never about evidence, which is both what the
+decision permits and what makes it impossible to get subtly wrong: there is no proof lookup to
+forget and no join to leave off.
+
+#### `internal/delivery` is not in the diff, and that is a reading rather than a convenience
+
+`Docs/11` §6 listed this ticket under `delivery`. It needed nothing from that package, and the
+argument is three lines of `Docs/02`:
+
+- §2 has `Delivered → Completed`, "customer confirms, or 72 hours pass with no dispute".
+- `Disputed` is a status in its own right (§1), with `Awarded through Delivered → Disputed` and its
+  own two ways out.
+- §3: "a dispute freezes automatic completion until an administrator resolves it."
+
+So **"a Delivered job with no dispute" is exactly "a job still in `Delivered`"** — a dispute has
+already moved the job somewhere else, and the status column is the whole answer. What is left is a
+status, a deadline and a transition, all of which are `jobs`. That is what let this be built in a
+wave where another track owned `internal/delivery`, and it is the same shape SHIP-117 found from
+the other side.
+
+#### The deadline is derived, and there is no `delivered_at`
+
+The obvious column — filled by a trigger as the job becomes `Delivered`, exactly as `000406` fills
+`expires_at` as it becomes `Open` — was refused. `000401` already records when the job entered
+`Delivered`, as `server_recorded_at` on the transition; `Docs/02` §2 has one way into that status
+and no way back to it; so the fact has exactly one statement already and a column would be a second
+that a backfill or a repair script could put out of step. `Docs/09`'s row says the ticket "needs no
+column that does not already exist", and it does not. `000408` adds an index and nothing else.
+
+The claim reads it with a lateral `max()` rather than a join. A join on `to_status = 'Delivered'`
+returns one row per matching history row, so a job that had somehow entered `Delivered` twice would
+be claimed twice and the second transition would fail on a job already `Completed` — failing the
+pass and rolling back the first. An aggregate returns one row per job whatever the history holds.
+`FOR UPDATE OF j` locks the job and not the append-only evidence beside it.
+
+#### Which clock owns which timestamp, decided rather than inherited
+
+This is the case `Docs/11` §9 names as the two-clock defect class, and a seventy-two hour window is
+exactly where it bites.
+
+| Value | Clock | Why |
+|---|---|---|
+| `job_status_history.server_recorded_at` | the **database** | `000401` defaults it from `now()` and forbids a caller to supply it: a caller who could set it could backdate a transition |
+| the instant the sweep judges against | the **Go** `internal/clock` | `Docs/10` §6.3 puts every scheduled task behind an injected clock; a query asking the database for the time is a sweep no test can move without waiting three days |
+
+A test that pinned a `clock.Fixed` to a literal date would compare the two, pass on the day it was
+written and fail permanently once `now()` had moved past the literal. So **every clock in
+`tasks_jobs_autocomplete_test.go` is built by reading the row's own `server_recorded_at` back and
+adding to it**, and there is no calendar date in the file for time to overtake. The verify section
+does the same thing from the other end: it writes the `Delivered` history row with its
+`server_recorded_at` already three days old, which is the only way to reach the state at all —
+`job_status_history` is append-only by trigger, so it cannot be aged afterwards the way
+`50-jobs.sh` ages a deadline with an `UPDATE`.
+
+#### The fifth task, and the deadline that had already passed
+
+`Docs/11` §9 set itself a trigger — settle the `--only=<task>` selector "before the fourth task
+registers" — and SHIP-89 registered the fourth in wave 8 with nobody noticing. SHIP-15t turned the
+count into `TestTheRegisteredTaskSetIsWhatItSaysItIs`, and this registration failed there until the
+name was added, which is the guard working.
+
+**Two things were checked before adding the line rather than after.** SHIP-15r's reopening trigger
+is "a task that sweeps rows due by wall-clock alone", and this is not that task: it claims what is
+*due*, on a deadline derived from the row's own history entry, so a section that leaves no job
+`Delivered` and older than seventy-two hours leaves it nothing to do. And **no existing section
+leaves such a job** — `70-delivery.sh` records milestones against jobs it created in the same run,
+and a job delivered seconds ago is not due for three days. The one section that makes a job due is
+`51-jobs-autocomplete.sh`, which creates it and owns it.
+
+#### Mutations
+
+| Mutation | Outcome |
+|---|---|
+| Drop `SKIP LOCKED` from `AutoCompleteClaim` | **Caught** — `cmd/worker.ClaimIDs` refuses the query by name, in four tests |
+| Keep the words `FOR UPDATE OF j SKIP LOCKED` in a SQL comment and remove the clause | **Caught** — `TestTwoWorkersCompleteEachDeliveryExactlyOnce` fails with "is already Completed" |
+
+The second is the one that matters. `ClaimIDs` is a text check and is satisfied by the words
+appearing anywhere, so a green run under the first mutation would have proved only that the string
+was present. `Docs/11` §9 records that `internal/bidding`'s equivalent lock has **neither** check;
+this one has both.
 
 ## 4. Partly done — do not treat these as finished
 
