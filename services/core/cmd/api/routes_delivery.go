@@ -421,6 +421,12 @@ func driverTokenIssuer(d Deps) *delivery.DriverTokenIssuer {
 // that already exists and never touches an address, and jobs.NewService is explicit that a nil
 // Geocoder is a supported state rather than a broken one. Handing this path a maps vendor would be
 // an outbound dependency nothing on it has a reason for.
+//
+// No jobs.WithBidders either, and that is the same call rather than a second one (SHIP-65a). This
+// service moves a job's status for `delivery`, `bidding` and `admin`; none of them reads a status
+// history, and jobs.Service.HistoryFor is the only operation the lookup serves. An absent one is
+// refused loudly there — jobs.ErrNoBidderLookup — rather than answered as "nobody has bid", so
+// leaving it off here cannot narrow anything in silence.
 func newJobService(d Deps) *jobs.Service {
 	return jobs.NewService(events.NewOutbox(), d.Clock, nil)
 }

@@ -28,10 +28,11 @@ const EventStatusChanged = "job.status_changed"
 // whoever owns the invariant being protected (Docs/10 §3.2) — and for the award that is
 // `bidding`, which moves a job inside a transaction of its own without importing this package.
 type Service struct {
-	events EventSink
-	clock  clock.Clock
-	geo    Geocoder
-	store  postgresStore
+	events  EventSink
+	clock   clock.Clock
+	geo     Geocoder
+	bidders Bidders
+	store   postgresStore
 }
 
 // NewService builds the domain service.
@@ -53,7 +54,7 @@ type Service struct {
 // GEOCODING_* configuration exists — because the alternative is worse. Falling back to the
 // deterministic stub outside development would write plausible-looking coordinates that are
 // fiction, and a fictional coordinate on a real job is harder to notice than none at all.
-func NewService(sink EventSink, c clock.Clock, geo Geocoder) *Service {
+func NewService(sink EventSink, c clock.Clock, geo Geocoder, opts ...Option) *Service {
 	if sink == nil {
 		panic("jobs: NewService needs an EventSink; a transition that emits no event is " +
 			"a state change nothing downstream will ever hear about (Docs/10 §6.1)")
@@ -61,7 +62,42 @@ func NewService(sink EventSink, c clock.Clock, geo Geocoder) *Service {
 	if c == nil {
 		panic("jobs: NewService needs a clock (Docs/10 §6.3)")
 	}
-	return &Service{events: sink, clock: c, geo: geo}
+
+	svc := &Service{events: sink, clock: c, geo: geo}
+	for _, opt := range opts {
+		opt(svc)
+	}
+	return svc
+}
+
+// Option supplies a collaborator only some callers of this domain need.
+//
+// Variadic rather than a fourth parameter, and the reason is a shared-surface one as much as a
+// design one. [Bidders] is wanted by exactly one operation — [Service.HistoryFor], SHIP-65a — and
+// this constructor has seven call sites across cmd/api and cmd/worker, six of which move a job's
+// status and none of which reads a history. A fourth positional parameter would have put a nil at
+// every one of them, in files belonging to three different tracks, which is both the shape that
+// eventually gets passed in the wrong order and a change that cannot be made from one branch.
+// `notifications.Option` is the same pattern for the same reason and carries the same warning.
+//
+// **An option is only acceptable where the default is the safe answer**, and here that took
+// arranging: see [WithBidders].
+type Option func(*Service)
+
+// WithBidders supplies the lookup that decides whether a provider may read a job's history
+// (SHIP-65a).
+//
+// # Without it the operation refuses loudly rather than quietly
+//
+// The tempting default is to answer "no bid" when there is no lookup, and it is the wrong one. It
+// would refuse every provider on every job while being **indistinguishable from a job nobody bid
+// on** — a narrowing that fails safe and fails silently, found by a support ticket rather than by a
+// test. So [Service.HistoryFor] treats an absent lookup as the wiring defect it is and returns
+// [ErrNoBidderLookup], which becomes a 500 naming itself. A process that never serves a history
+// pays nothing for that; one that does, fails on its first request rather than on its hundredth
+// provider.
+func WithBidders(b Bidders) Option {
+	return func(s *Service) { s.bidders = b }
 }
 
 // Transition is the guarded function. Every job status change in the platform passes through it.

@@ -61,6 +61,7 @@ POST   /v1/jobs/{id}/disputes                   user         v1
 POST   /v1/jobs/{id}/driver                     user         v1
 POST   /v1/jobs/{id}/driver/link                user         v1
 POST   /v1/jobs/{id}/extend                     user         v1
+GET    /v1/jobs/{id}/history                    user         v1
 POST   /v1/jobs/{id}/milestones                 user         v1
 POST   /v1/jobs/{id}/proof-uploads              user         v1
 POST   /v1/notifications/device-tokens          user         v1

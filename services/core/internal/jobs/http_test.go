@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
@@ -35,11 +36,15 @@ import (
 // A handler added here and not to cmd/api/routes_jobs.go is an endpoint that exists only in the
 // tests, so the two lists are worth reading against each other — routes_golden.txt is what makes
 // the other direction visible.
-func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
+//
+// opts go straight to [NewService]. Every caller but SHIP-65a's history tests passes none, which
+// is how this domain is wired everywhere except cmd/api's own jobs handler.
+func newTestRouter(t *testing.T, pool *pgxpool.Pool, opts ...Option) http.Handler {
 	t.Helper()
 
-	handler, err := NewHandler(newDraftService(t, &fakeGeocoder{}), pool,
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler, err := NewHandler(
+		NewService(&recordingSink{}, clock.NewFixed(testInstant), &fakeGeocoder{}, opts...),
+		pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -51,6 +56,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("PATCH /v1/jobs/{id}", handler.Update())
 	mux.Handle("POST /v1/jobs/{id}/cancel", handler.Cancel())
 	mux.Handle("POST /v1/jobs/{id}/extend", handler.Extend())
+	mux.Handle("GET /v1/jobs/{id}/history", handler.History())
 	return mux
 }
 

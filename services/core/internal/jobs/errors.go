@@ -115,6 +115,16 @@ var (
 	// reload and show what is actually available — and only the sentence differs.
 	ErrExpiryBoundByPickup = errors.New("jobs: the pickup date is what ends this job, not the listing period")
 
+	// ErrNoBidderLookup means the service was built with no [Bidders] and was asked who may
+	// read a job's history (SHIP-65a).
+	//
+	// A wiring defect rather than a condition a caller can act on, and it is an error rather
+	// than a silent "no" for the reason [WithBidders] gives: refusing every provider while
+	// looking like a job nobody bid on is the failure that is never noticed. It maps to an
+	// opaque 500 through [apiError]'s default branch, which is the correct treatment of a
+	// mistake in the composition root.
+	ErrNoBidderLookup = errors.New("jobs: this service was built with no bidder lookup")
+
 	// ErrJobNotCancellable means Docs/02 §2 has no `→ Cancelled` row for the status the job
 	// is in.
 	//

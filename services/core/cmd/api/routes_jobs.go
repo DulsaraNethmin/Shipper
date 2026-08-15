@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 
+	"github.com/google/uuid"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/geocoding"
@@ -68,6 +73,38 @@ func init() {
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Cancel() },
 		},
 		Route{
+			// **The first four-segment `GET /v1/jobs/{id}/<literal>` in the service**
+			// (SHIP-65a), and the endpoint SHIP-83a existed to make registrable.
+			//
+			// While `GET /v1/jobs/open/{id}` existed, this pattern and that one both
+			// matched `/v1/jobs/open/history` with neither more specific, and Go's
+			// ServeMux panics at registration rather than answering a 404 somebody
+			// debugs — `make run` died at startup. Registering the intersection did not
+			// help. Four tickets took workarounds for it (SHIP-115, SHIP-115a,
+			// SHIP-101a, SHIP-102a) and `Docs/09`'s row for this one declared the
+			// blocker instead. SHIP-83a moved the feed to `GET /v1/fleet/jobs/{id}` and
+			// proved the slot free by registering a probe; this is the first ticket to
+			// spend what that bought.
+			//
+			// **`GET /v1/jobs/open` now answers 400 rather than 404**, because "open"
+			// lands in the identifier slot of the route above and fails UUID parsing.
+			// That is the proof the slot is an identifier again rather than a defect.
+			//
+			// # RequireUser is not the access control here, and this is the first route
+			// in this file where that distinction is live
+			//
+			// Every other route in this file is owner-only. This one serves two parties
+			// — the customer who owns the job, and a provider holding a bid on it — and
+			// which of the two a caller is comes from rows rather than from the role
+			// claim on their token. Being neither answers exactly what a job that does
+			// not exist answers, byte for byte.
+			Method:  http.MethodGet,
+			Pattern: "/jobs/{id}/history",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return jobsHandler(d).History() },
+		},
+		Route{
 			// Also a verb under the resource, but for a different reason from cancel's.
 			// The deadline is an ordinary column, so a PATCH would work — and would be
 			// wrong, because the new deadline is the platform's to compute (Docs/02 §6.3).
@@ -93,7 +130,8 @@ func init() {
 // startup, which is a transient condition the service is built to survive, and the handlers
 // answer 503 for as long as it lasts.
 func jobsHandler(d Deps) *jobs.Handler {
-	svc := jobs.NewService(events.NewOutbox(), d.Clock, newGeocoder(d))
+	svc := jobs.NewService(events.NewOutbox(), d.Clock, newGeocoder(d),
+		jobs.WithBidders(jobBidders{}))
 
 	handler, err := jobs.NewHandler(svc, d.Pool, d.Logger)
 	if err != nil {
@@ -152,10 +190,61 @@ func newGeocoder(d Deps) jobs.Geocoder {
 	return provider
 }
 
-// Compile-time proof that the two implementations of the port satisfy it, which is the only place
+// jobBidders implements jobs.Bidders by asking whether this provider has ever offered on this job
+// (SHIP-65a).
+//
+// # Why this query is here and not in a domain
+//
+// It belongs to `bidding`, and `jobs` may not import it. The composition root is where a dependency
+// between two domains is visible to anybody reading how the service is wired, rather than buried in
+// `jobs/postgres.go` where a `SELECT … FROM bids` would read as a table `jobs` owns. `acceptedBids`
+// in routes_delivery.go is the same arrangement for the same reason and carries the fuller argument;
+// this is the second instance of it and the first outside `delivery`.
+//
+// **When `bidding` grows a reader for this, the type is deleted and a method on its store passed
+// instead.** Nothing in `jobs` changes, which is the point of the port.
+//
+// # Any bid, at any status, and the absence of a status filter is the decision
+//
+// `EXISTS` over `(job_id, provider_id)` with no predicate on `bids.status`. jobs.Bidders argues why
+// at length: a losing or withdrawn bidder has a legitimate interest in what became of the job they
+// priced, and filtering would put `bidding`'s eight-value enumeration into a statement neither
+// domain owns — a second copy of another domain's vocabulary, in a file that cannot see it change
+// (Docs/10 §3.4).
+//
+// idx_bids_job leads on job_id, so this is an index scan over the bids on one job with a filter,
+// and the planner stops at the first match.
+type jobBidders struct{}
+
+// HasBidOn reports whether providerID has any bid on jobID.
+//
+// No lock and no transaction: one read, and it is a question about the past. A bid placed in the
+// instant after this returns would make the answer "yes" a moment later, which is a provider
+// gaining access to a history they are about to be entitled to rather than a race worth serialising.
+//
+// A job that does not exist answers false, exactly as a job nobody bid on does. The caller has
+// already established that the job exists — jobs.Service.HistoryFor reads the row before it asks
+// this — so the two cases cannot be confused here.
+func (jobBidders) HasBidOn(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+) (bool, error) {
+	const q = `SELECT EXISTS (SELECT 1 FROM bids WHERE job_id = $1 AND provider_id = $2)`
+
+	var held bool
+	if err := r.QueryRow(ctx, q, jobID, providerID).Scan(&held); err != nil {
+		return false, fmt.Errorf("cmd/api: reading whether %s has bid on %s: %w",
+			providerID, jobID, err)
+	}
+	return held, nil
+}
+
+// Compile-time proof that the implementations of these ports satisfy them, which is the only place
 // in the build where that can be established — the domain does not name the adapter and the
 // adapter does not name the domain, so nothing else links them.
 var (
 	_ jobs.Geocoder = (*geocoding.Stub)(nil)
 	_ jobs.Geocoder = (*geocoding.Provider)(nil)
+	_ jobs.Bidders  = jobBidders{}
 )

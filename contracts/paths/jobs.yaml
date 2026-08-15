@@ -521,6 +521,85 @@ ExtendJob:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+JobHistory:
+  get:
+    operationId: getJobHistory
+    summary: Read a job's status history
+    tags: [Jobs]
+    description: |
+      Every recorded change of a job's status, **oldest first** (SHIP-65a).
+
+      This is the only place the platform says *how* a job reached the status it is in. The job
+      resource carries one `status` with a `created_at` and an `updated_at`; this carries the whole
+      sequence, with what kind of actor caused each move, why, and both clocks.
+
+      ## Who may read it
+
+      **The customer who owns the job, and any provider holding a bid on it.** Being either is
+      decided from the job and its bids rather than from the role on your token — a provider who
+      has bid on this job is a party to it, and a provider who has not is a stranger to it.
+
+      **Any bid, at any status.** A provider whose offer was rejected, superseded or withdrawn
+      still reads the history: they priced this job, and what became of it is the answer to the
+      only question they have about it.
+
+      **Anybody else gets exactly what a job that does not exist gets** — `404 not_found`, the same
+      status, the same code, the same message. Do not read a `404` as "the job exists and is not
+      yours"; the two are indistinguishable on purpose, because telling them apart would confirm
+      the existence of somebody else's job to anybody holding an identifier.
+
+      ## It does not page
+
+      The collection envelope is returned for consistency (`Docs/10` §4.5), and `has_more` is always
+      `false` with no `next_cursor`. `Docs/02` §2's transition graph is acyclic and twelve statuses
+      wide, and a job cannot move to the status it already stands in, so the collection is bounded
+      by the lifecycle at under a dozen rows. There is no `cursor` parameter and sending one would
+      do nothing.
+
+      ## What is deliberately absent
+
+      **No amount of any kind**, and in particular nothing derived from the customer's budget
+      (`Docs/01` §4.3). **No actor identifier** — the actor is served as its *kind*, one of
+      `customer`, `provider`, `driver`, `admin` or `system`. That is what a timeline renders, and an
+      identifier here would name a member of staff to a commercial party, hand a provider the
+      customer's account id, or return a driver-assignment id that reads like a user id and is not
+      one.
+
+      `reason` is free text written by whoever made the move, and is usually absent. It is required
+      only of an administrator, for whom `Docs/01` §3 makes it the condition of changing a
+      commercial record at all.
+    parameters:
+      - $ref: '#/JobID'
+    responses:
+      '200':
+        description: |
+          The job's recorded transitions, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/StatusChangePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- parameters --------------------------------------------------------------------------------
 
 JobID:
@@ -875,6 +954,95 @@ JobPage:
         Whether asking again with `next_cursor` would return anything. Always present, and
         carried rather than inferred from the cursor's absence — which is also what the first
         request looks like.
+      example: false
+
+StatusChange:
+  type: object
+  required: [id, job_id, from_status, to_status, actor_type, recorded_at, accepted_at]
+  additionalProperties: false
+  description: |
+    One recorded change of a job's status (SHIP-65a) — one row of the append-only history the
+    platform writes in the same transaction as the move itself.
+
+    **There is no actor identifier and there will not be one.** See `getJobHistory` for the four
+    separate reasons, one per kind of actor.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: This history entry's own identifier. Stable, and safe to use as a list key.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    from_status:
+      allOf:
+        - $ref: '#/JobStatus'
+      description: The status the job was in before this move.
+    to_status:
+      allOf:
+        - $ref: '#/JobStatus'
+      description: The status it moved to.
+    actor_type:
+      type: string
+      description: |
+        What kind of actor caused the move, and **not who they were**.
+
+        `system` is the platform acting on its own — a job expiring, an auto-completion — and has
+        no account behind it. `driver` is somebody holding a job-scoped link, who has no account
+        either.
+      enum: [customer, provider, driver, admin, system]
+      example: customer
+    reason:
+      type: string
+      description: |
+        Free text from whoever made the move, in their own words. Absent when none was given,
+        which is the ordinary case: it is optional for everyone except an administrator.
+
+        Render it as the words of the actor named by `actor_type` rather than as the platform's
+        own explanation, because that is what it is.
+      example: Goods no longer need moving
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        The **actor's** clock: when they say they acted. This is what to show a person. A milestone
+        recorded out of signal carries the moment it happened, not the moment it arrived.
+      example: '2026-08-11T03:30:00.000Z'
+    accepted_at:
+      type: string
+      format: date-time
+      description: |
+        The **platform's** clock: when the change was accepted here. Later than `recorded_at` by
+        however long a device was out of signal. What support reasons about, and not what to
+        display beside a step.
+      example: '2026-08-11T05:12:44.118Z'
+
+StatusChangePage:
+  type: object
+  required: [data, has_more]
+  additionalProperties: false
+  description: |
+    One job's status history, in the envelope Docs/10 §4.5 gives every list in this API.
+
+    **This collection does not page.** `has_more` is always `false` and `next_cursor` is never
+    present — the envelope is here so a client can tell a collection from a single resource without
+    knowing the endpoint, not because there is a second page to fetch.
+  properties:
+    data:
+      type: array
+      description: |
+        The recorded transitions, **oldest first** — the order a timeline is read in. Never `null`.
+      items:
+        $ref: '#/StatusChange'
+    next_cursor:
+      type: string
+      description: |
+        Never sent by this operation. Described only because the envelope is shared.
+    has_more:
+      type: boolean
+      description: Always `false` here. See the schema description.
       example: false
 
 JobStatus:
