@@ -638,6 +638,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
 | **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
+| **SHIP-147a** | M6 | The platform's password cost, under its own name. `Config.Identity.Argon2` and `IDENTITY_ARGON2_*` became `Config.Passwords.Argon2` and `PASSWORDS_ARGON2_*` — one setting, read by identity's hasher, by admin's, and by identity's phone one-time codes. **Declined in three consecutive prep passes and it cost nothing to take**: five files. "No second knob" is a **guard rather than a claim** — a reflective walk of the `Config` tree and a source scan of `cmd/api` — and the release note naming the rename is in `deploy/.env.example` beside the variables, because no release-notes artefact exists to put it in — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13097,6 +13098,84 @@ records what was *done*, when nothing was. `withdrawn` exists in the CHECK and h
 named as a later ticket's, so that a pending review is not something only an approval can clear.
 
 #### Nothing was needed from `internal/config`
+
+### SHIP-147a — the rename three prep passes declined, and the two guards that replace the claim
+
+`Config.Identity.Argon2` and `IDENTITY_ARGON2_MEMORY_KIB`, `_ITERATIONS`, `_PARALLELISM` are now
+`Config.Passwords.Argon2` and `PASSWORDS_ARGON2_*`. The section name and the environment prefix
+agree, as every other pair in `internal/config` does — `Storage`/`STORAGE_`, `Pagination`/
+`PAGINATION_` — and both now name `internal/passwords`, which is the package that does the hashing.
+
+**The name was accurate until SHIP-147 and then was not.** argon2id lived in `internal/identity`
+and the cost was that domain's; SHIP-15r moved the hashing to `internal/passwords` so a second
+domain would not be the reason for a second implementation, and SHIP-147 hashed an administrator's
+password with the same profile. That was the right call — `Docs/10` §3.4's argument is that two
+copies of a security parameter agree by comment until somebody raises one — and it left the
+platform's cost spelled as one domain's.
+
+#### What "no second cost knob exists anywhere" is held to
+
+The *Done when* asks for a negative, and a negative is the one thing a search proves only on the
+day somebody runs it. Two guards replace it:
+
+- **`config.TestThereIsOneArgon2CostSetting`** walks the `Config` struct tree reflectively and
+  fails unless there is exactly one field of type `Argon2`, at exactly `Config.Passwords.Argon2`;
+  then it scans `config.go` for every loader key containing `ARGON2` and holds the set to the
+  three `PASSWORDS_*` names. A domain adding its own cost section fails the first half; a second
+  prefix fails the second.
+- **`cmd/api`'s `TestEveryPasswordHasherIsBuiltFromTheOnePlatformCost`** reads this package's own
+  non-test source, finds every `passwords.Argon2Profile{` literal, and fails any that is not built
+  from `Config.Passwords.Argon2`. It is the only file that can: the composition root is where a
+  domain and its configuration meet, and a profile is three integers, so a second one is a
+  composite literal away. It also fails when it finds **fewer than two** profiles, because a
+  source-scanning guard's own failure mode is to stop matching and pass by finding nothing.
+
+**The one thing neither guard covers is stated rather than left implicit.**
+`passwords.ProductionArgon2Profile` writes the same three numbers a second time, as the value
+`Docs/10` §5 fixes, and nothing reads it at runtime. Its doc comment claimed it *was* the default
+in `internal/config`, which was not true — the default is compiled separately — so a reader
+checking one place would have believed they had checked both. The comment is corrected, and
+`config`'s own default test now compares the two and fails when they differ. **Held together by a
+test rather than unified in the code**: importing `internal/passwords` from `internal/config` is
+infrastructure on infrastructure and permitted, but it puts argon2 in `cmd/migrate`'s link graph
+for three integers, and a test import gives the same guarantee for nothing.
+
+#### The release note, and where it had to go
+
+The *Done when* asks for a release note, and **this repository has no release-notes artefact** —
+no `CHANGELOG`, no `Docs/` release file, and `Docs/**` other than this file is not a lane's to
+create. So it is written where a deployment engineer with none of this context will actually be
+looking: **at the top of the `deploy/.env.example` section that holds the three variables**, as a
+block headed `RELEASE NOTE — RENAME REQUIRED`, naming each old variable and its replacement.
+
+Its substance, because the failure it prevents is quiet rather than loud: **the old names are not
+read and are not accepted, and nothing errors.** A deployment that leaves `IDENTITY_ARGON2_*` set
+gets the defaults — m=64 MiB, t=3, p=4, the production profile — so the service starts and every
+password still verifies. What is silently lost is a *raise*: a deployment that had deliberately
+moved the cost up falls back without a word. The note therefore points at the startup log line,
+which prints `argon2=m=…,t=…,p=…` from the values actually loaded, as the thing to read after the
+deploy.
+
+**Today there is no deployment to be wrong about**, which is precisely why the ticket was worth
+taking now. `Docs/09`'s row says the same: after the first secret store holds `IDENTITY_ARGON2_*`
+this stops being a rename and becomes a migration somebody has to sequence.
+
+#### One cost, three things hashed
+
+Worth recording because the new name is narrower than the truth in a different direction from the
+old one. The profile is written into a user's password, an administrator's password **and
+`internal/identity`'s phone one-time codes** — `otp.go` hashes a six-digit code with the same
+hasher, deliberately, and argues why. `PASSWORDS_ARGON2_*` reads as covering the first two. It
+covers all three, and the field comment now says so; a code is a credential the platform stores
+the same way, so there is nothing to separate, only something to write down.
+
+#### What it deliberately did not do
+
+**No compatibility period, and no reading of both names.** `Docs/09` names deciding that as part of
+the ticket rather than a mechanical substitution, and the decision is: one name. Accepting both
+would mean a deployment can hold two values for one setting with no rule about which wins, and the
+condition that makes a compatibility period worth its cost — an existing deployment — does not
+exist. The release note is what carries the change instead.
 
 ## 4. Partly done — do not treat these as finished
 

@@ -56,6 +56,7 @@ type Config struct {
 	Redis       Redis
 	Kafka       Kafka
 	Idempotency Idempotency
+	Passwords   Passwords
 	Identity    Identity
 	Delivery    Delivery
 	Email       Email
@@ -259,19 +260,44 @@ type Email struct {
 	Sender string
 }
 
-// Identity configures credentials and sessions (SHIP-29, SHIP-37).
+// Passwords configures how the platform stores a password (SHIP-29, SHIP-15r, SHIP-147a).
 //
-// Both halves are configuration rather than compiled-in constants because both are expected to
-// change without a release: the argon2id cost is raised as hardware improves, and a signing key
-// is rotated on a schedule or in a hurry. Docs/10 §5 is the specification.
-type Identity struct {
-	// Argon2 is the cost new password hashes are written at.
+// # Why this is its own section rather than a field of [Identity]
+//
+// It was `Identity.Argon2`, read from `IDENTITY_ARGON2_*`, and both names were accurate until
+// SHIP-147: argon2id lived in internal/identity and the cost was that domain's. SHIP-15r moved
+// the hashing to internal/passwords so that a second domain needing to hash a password would not
+// be the reason for a second implementation, and SHIP-147 then hashed an administrator's password
+// with the same profile — correctly, because two cost knobs are Docs/10 §3.4's failure one level
+// up: two security parameters that agree by comment until somebody raises one.
+//
+// So there is one platform password cost, and after SHIP-147 it was spelled as one domain's.
+// SHIP-147a renames it to what it is. **There is exactly one argon2id cost setting in this
+// service**, and a second one appearing here is the defect this section exists to make obvious.
+//
+// It is configuration rather than a compiled-in constant because it is expected to change
+// without a release: the cost is raised as hardware improves. Docs/10 §5 is the specification.
+type Passwords struct {
+	// Argon2 is the cost new password hashes are written at, wherever the platform writes one —
+	// a user's password, an administrator's password, and internal/identity's phone one-time
+	// codes, which are stored the same way.
 	//
 	// Verification does not read it. The parameters travel with each hash in its PHC string,
 	// so raising these values leaves every stored password verifiable and upgrades each one at
 	// its owner's next sign-in, with no migration (Docs/10 §5).
 	Argon2 Argon2
+}
 
+// Identity configures credentials and sessions (SHIP-37).
+//
+// These are configuration rather than compiled-in constants because they are expected to change
+// without a release: a signing key is rotated on a schedule or in a hurry. Docs/10 §5 is the
+// specification.
+//
+// **The argon2id cost is deliberately not here.** It moved to [Passwords] at SHIP-147a, because
+// internal/admin hashes with the same profile and may not import internal/identity — see that
+// section's note.
+type Identity struct {
 	// AccessTokenTTL is how long an issued access token stays valid. Docs/10 §5 fixes it at
 	// fifteen minutes: long enough that a phone on a poor connection is not refreshing
 	// constantly, short enough that revoking a device session takes effect quickly — an
@@ -722,15 +748,17 @@ func Load() (*Config, error) {
 			TTL:         l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
 			InFlightTTL: l.duration("IDEMPOTENCY_IN_FLIGHT_TTL", 60*time.Second),
 		},
-		Identity: Identity{
-			// m=64 MiB, t=3, p=4 — Docs/10 §5. The bounds are the range the identity
-			// package will run; a value outside them is refused here rather than at the
-			// first sign-in.
+		Passwords: Passwords{
+			// m=64 MiB, t=3, p=4 — Docs/10 §5. The bounds are the range
+			// internal/passwords will run; a value outside them is refused here rather
+			// than at the first sign-in.
 			Argon2: Argon2{
-				MemoryKiB:   uint32(l.boundedInt("IDENTITY_ARGON2_MEMORY_KIB", 64*1024, 1024, 1<<20)),
-				Iterations:  uint32(l.boundedInt("IDENTITY_ARGON2_ITERATIONS", 3, 1, 64)),
-				Parallelism: uint8(l.boundedInt("IDENTITY_ARGON2_PARALLELISM", 4, 1, 255)),
+				MemoryKiB:   uint32(l.boundedInt("PASSWORDS_ARGON2_MEMORY_KIB", 64*1024, 1024, 1<<20)),
+				Iterations:  uint32(l.boundedInt("PASSWORDS_ARGON2_ITERATIONS", 3, 1, 64)),
+				Parallelism: uint8(l.boundedInt("PASSWORDS_ARGON2_PARALLELISM", 4, 1, 255)),
 			},
+		},
+		Identity: Identity{
 			AccessTokenTTL:       l.duration("IDENTITY_ACCESS_TOKEN_TTL", 15*time.Minute),
 			AccessTokenKeys:      l.signingKeys("IDENTITY_ACCESS_TOKEN_KEYS", developmentSigningKeys()),
 			AccessTokenActiveKID: l.str("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", developmentActiveKID),
@@ -827,7 +855,7 @@ func (c Config) LogValue() slog.Value {
 		// The cost is worth having in the startup line: a deployment that has silently
 		// fallen back to a cheap profile is otherwise invisible.
 		slog.String("argon2", fmt.Sprintf("m=%d,t=%d,p=%d",
-			c.Identity.Argon2.MemoryKiB, c.Identity.Argon2.Iterations, c.Identity.Argon2.Parallelism)),
+			c.Passwords.Argon2.MemoryKiB, c.Passwords.Argon2.Iterations, c.Passwords.Argon2.Parallelism)),
 		slog.Duration("access_token_ttl", c.Identity.AccessTokenTTL),
 		// The identifier and the count, never the key material. Which key is active and how
 		// many are loaded is exactly what a rotation needs to confirm from a log line, and
@@ -1117,10 +1145,10 @@ func (l *loader) validate(cfg *Config) {
 
 	// argon2 divides its memory between the lanes and rounds down, so a profile with more
 	// lanes than kibibytes to give them is not a slow hash but an undefined one.
-	if cfg.Identity.Argon2.MemoryKiB < 8*uint32(cfg.Identity.Argon2.Parallelism) {
-		l.errf("IDENTITY_ARGON2_MEMORY_KIB (%d) leaves less than 8 KiB for each of "+
-			"IDENTITY_ARGON2_PARALLELISM (%d) lanes",
-			cfg.Identity.Argon2.MemoryKiB, cfg.Identity.Argon2.Parallelism)
+	if cfg.Passwords.Argon2.MemoryKiB < 8*uint32(cfg.Passwords.Argon2.Parallelism) {
+		l.errf("PASSWORDS_ARGON2_MEMORY_KIB (%d) leaves less than 8 KiB for each of "+
+			"PASSWORDS_ARGON2_PARALLELISM (%d) lanes",
+			cfg.Passwords.Argon2.MemoryKiB, cfg.Passwords.Argon2.Parallelism)
 	}
 
 	// A signature nobody can produce is not a token anybody can use, and this is the only

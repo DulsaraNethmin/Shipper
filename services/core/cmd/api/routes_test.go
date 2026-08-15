@@ -27,16 +27,23 @@ const testKID = "test"
 
 func testIdentityConfig() config.Identity {
 	return config.Identity{
-		// The cheapest profile internal/identity will run. It has to be a real one: the
-		// identity handler is built during attach, from every test in this package that
-		// constructs a router, and a zero profile stops the process at startup rather than
-		// producing a hasher nothing can verify against. 64 MiB per hash across parallel
-		// packages would thrash a laptop (Docs/10 §5), and no test here hashes anything.
-		Argon2: config.Argon2{MemoryKiB: 1024, Iterations: 1, Parallelism: 1},
-
 		AccessTokenTTL:       15 * time.Minute,
 		AccessTokenKeys:      map[string][]byte{testKID: testSigningKey},
 		AccessTokenActiveKID: testKID,
+	}
+}
+
+// testPasswordsConfig is the one platform password cost, which SHIP-147a moved out of
+// [testIdentityConfig] along with the setting it mirrors.
+//
+// The cheapest profile internal/passwords will run. It has to be a real one: both the identity
+// handler and the admin handler are built during attach, from every test in this package that
+// constructs a router, and a zero profile stops the process at startup rather than producing a
+// hasher nothing can verify against. 64 MiB per hash across parallel packages would thrash a
+// laptop (Docs/10 §5), and no test here hashes anything.
+func testPasswordsConfig() config.Passwords {
+	return config.Passwords{
+		Argon2: config.Argon2{MemoryKiB: 1024, Iterations: 1, Parallelism: 1},
 	}
 }
 
@@ -94,10 +101,11 @@ func testStorageConfig() config.Storage {
 func testDeps() Deps {
 	return Deps{
 		Config: &config.Config{
-			Identity: testIdentityConfig(),
-			Delivery: testDeliveryConfig(),
-			Storage:  testStorageConfig(),
-			App:      testAppConfig(),
+			Passwords: testPasswordsConfig(),
+			Identity:  testIdentityConfig(),
+			Delivery:  testDeliveryConfig(),
+			Storage:   testStorageConfig(),
+			App:       testAppConfig(),
 		},
 		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		Clock:     clock.System{},

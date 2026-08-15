@@ -143,9 +143,9 @@ func init() {
 // Deps); the handlers answer 503 for as long as it lasts.
 func identityHandler(d Deps) *identity.Handler {
 	hasher, err := passwords.NewHasher(passwords.Argon2Profile{
-		MemoryKiB:   d.Config.Identity.Argon2.MemoryKiB,
-		Iterations:  d.Config.Identity.Argon2.Iterations,
-		Parallelism: d.Config.Identity.Argon2.Parallelism,
+		MemoryKiB:   d.Config.Passwords.Argon2.MemoryKiB,
+		Iterations:  d.Config.Passwords.Argon2.Iterations,
+		Parallelism: d.Config.Passwords.Argon2.Parallelism,
 	})
 	if err != nil {
 		panic("cmd/api: identity password hasher: " + err.Error())
