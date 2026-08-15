@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**221 tickets, 686 points.**
+**223 tickets, 692 points.**
 
 ## How to read this
 
@@ -40,12 +40,12 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 38 | 106 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 27 | 81 |
-| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 31 | 107 |
+| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 33 | 113 |
 | **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 32 | 110 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 21 | 67 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 20 | 58 |
-| | | **221** | **686** |
+| | | **223** | **692** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -203,16 +203,18 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M3 — Bidding and award
 
 **Goal:** Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one.  
-**Size:** 31 tickets, 107 points
+**Size:** 33 tickets, 113 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
 | SHIP-78 | vehicles table and fleet CRUD endpoints | 5 | A provider can add, edit, and deactivate vehicles | SHIP-44, SHIP-7 |
 | SHIP-79 | Provider profile and service area | 3 | Provider declares service area and specialties; stored and queryable | SHIP-78 |
+| SHIP-79a | A provider profile a customer may be shown | 3 | A customer reading an offer sees a provider summary that says something about the provider — beyond whether they are verified and when they joined — and none of it is the service area or specialties SHIP-102a forbids; the fields are a closed set, and the same set is what an admin read and the open feed disclose | SHIP-79 |
 | SHIP-80 | bids table and status enum | 3 | Schema covers all eight bid statuses from Docs 02 §4 | SHIP-56 |
 | SHIP-81 | Job eligibility filter query | 5 | Filters by service area, vehicle capability, verification state, and job status | SHIP-79, SHIP-80 |
 | SHIP-82 | Open jobs feed endpoint for providers | 3 | GET /v1/jobs/open returns only eligible jobs, paginated | SHIP-81 |
 | SHIP-83 | Provider job detail with budget stripped | 3 | Provider view omits budget entirely; verified by test | SHIP-82, SHIP-67 |
+| SHIP-83a | Move the open feed off the `{id}` slot | 3 | `GET /v1/jobs/{id}/<literal>` can be registered at four segments — demonstrated by registering one — and the provider feed answers on a path that no longer puts a literal where an identifier goes; routes_golden.txt, the contract fragment and the Dart client all move together and the old path is gone rather than aliased | SHIP-83 |
 | SHIP-84 | Place bid endpoint | 3 | A verified, eligible provider can bid once per job with price and timing | SHIP-83 |
 | SHIP-85 | Update bid endpoint | 2 | A provider can revise their own active bid | SHIP-84 |
 | SHIP-86 | Withdraw bid endpoint | 2 | A provider can withdraw before acceptance; status becomes Withdrawn | SHIP-84 |
@@ -234,7 +236,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-100 | Flutter provider job detail and bid placement | 3 | Provider can review a job and submit a bid | SHIP-99, SHIP-84 |
 | SHIP-101 | Flutter provider bid list | 3 | Provider sees their own bids grouped by status | SHIP-100 |
 | SHIP-101a | A provider reads their own bids — `GET /v1/fleet/bids`, auth class `RequireUser` | 3 | A provider lists every bid they have placed, grouped by status, paginated, and sees no other provider's; the response carries no customer budget in any form | SHIP-88, SHIP-66 |
-| SHIP-102a | A customer reads the offers on their own job — `GET /v1/jobs/{id}/bids`, auth class `RequireUser` | 3 | The owning customer lists every live offer on one of their jobs in the Docs 10 §4.5 collection envelope with cursor pagination, each element carrying the offer's price and timing, a closed customer-facing provider summary and the vehicle it is offered with; a provider gets what a stranger gets; the response carries no budget in any form, and no provider's service area, specialties or other jobs | SHIP-84, SHIP-88, SHIP-66 |
+| SHIP-102a | A customer reads the offers on their own job — `GET /v1/jobs/{id}/bids/received`, auth class `RequireUser` | 3 | The owning customer lists every live offer on one of their jobs in the Docs 10 §4.5 collection envelope with cursor pagination, each element carrying the offer's price and timing, a closed customer-facing provider summary and the vehicle it is offered with; a provider gets what a stranger gets; the response carries no budget in any form, and no provider's service area, specialties or other jobs | SHIP-84, SHIP-88, SHIP-66 |
 | SHIP-102 | Flutter customer bid comparison | 5 | Customer compares price, timing, provider profile, and vehicle side by side | SHIP-77, SHIP-96 |
 | SHIP-103 | Flutter negotiation and messaging UI | 5 | Both parties exchange messages and counter-offers against a job | SHIP-102, SHIP-97 |
 | SHIP-104 | Flutter award confirmation flow | 3 | Customer awards a bid with explicit confirmation and sees the result | SHIP-102, SHIP-92 |
@@ -245,7 +247,9 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 
 **Its *Done when* names the disclosure rules in both directions, deliberately.** The customer's budget must not reach the response, which is the invariant every bidding read carries. The mirror is the one that is easy to miss: a **provider** summary rendered to a customer must not disclose what `contracts/paths/fleet.yaml` calls commercial information — the regions a provider covers and the work they specialise in — because that is a competitor's map of the market. So the row says the summary is a **closed** set of fields rather than "the provider's profile", which is the same argument SHIP-83 makes for the job view and the one wave 6 proved the hard way.
 
-**SHIP-102a's row names `GET /v1/jobs/{id}/bids`, and that path cannot be registered — the row is left as written and must be corrected by whoever builds it.** Measured in a standalone program rather than inferred: against the existing `GET /v1/jobs/open/{id}`, `net/http.ServeMux` panics because both match `/v1/jobs/open/bids` and neither is more specific. Renaming the literal to `/offers` panics identically; `POST /v1/jobs/{id}/bids` is unaffected only because the conflicting route is a `GET`; five segments are safe, which is why the manifest already serves `GET /v1/jobs/{id}/bids/{bid_id}/history`. **Two ways out, and they are not equivalent**: insert a segment under the job, as `internal/delivery` did with `/delivery/proof`, or move the open feed off the `{id}` slot, which is the structural fix and a breaking contract change that gets cheaper the earlier it is made. The lane building SHIP-102a owns that choice; this row is not corrected here because a path chosen away from the lane would be a guess. **Check the built route against `routes_golden.txt` and correct this row in the same change.**
+**SHIP-102a's row named `GET /v1/jobs/{id}/bids` until wave 10, and that path cannot be registered.** Measured in a standalone program rather than inferred: against the existing `GET /v1/jobs/open/{id}`, `net/http.ServeMux` panics because both match `/v1/jobs/open/bids` and neither is more specific. Renaming the literal to `/offers` panics identically. **Registering the intersection `GET /v1/jobs/open/bids` as a third route does not help either, in either registration order** — that is the escape hatch anybody reaches for and Go has no such rule. `POST /v1/jobs/{id}/bids` is unaffected only because the conflicting route is a `GET`, and five segments are safe, which is why the manifest already serves `GET /v1/jobs/{id}/bids/{bid_id}/history`. **The row now names `GET /v1/jobs/{id}/bids/received`, which is what the lane built and what `routes_golden.txt` carries.**
+
+**The deciding factor was ownership rather than resource modelling, and that is the part to carry.** Two ways out were available: insert a segment under the job, as `internal/delivery` did with `/delivery/proof`, or move the open feed off the `{id}` slot, which frees the whole `/v1/jobs/{id}/<literal>` space for good. **The move is the better design and was not taken**, because it needs `contracts/paths/fleet.yaml`, `internal/fleet/http_test.go` and the fleet verify section — three files the lane did not own — and a four-line change spread across another lane's files is how a route gets dropped in a merge. **A path shape can therefore be decided by who holds which files in a given wave**, which is worth knowing before reading the manifest as though every path in it were a modelling decision. The move is now **SHIP-83a**.
 
 **The route is `GET /v1/fleet/bids` rather than anything under `/v1/jobs/`, and that is a constraint rather than a preference.** `GET /v1/jobs/open/{id}` puts a literal in the `{id}` position, so it and any `GET /v1/jobs/{id}/<literal>` both match `/v1/jobs/open/<literal>` with neither more specific — Go's `ServeMux` panics at registration and the process does not start. A provider's own bids are a fleet-side collection anyway, beside `/v1/fleet/vehicles`.
 
@@ -254,6 +258,14 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 **What the response is, and what it is not.** It is `openJobResponse` — SHIP-83's budget-stripped shape, held to a closed key set by three separate guards — with the *authorisation* predicate changed and nothing else: eligibility is replaced by "you hold a bid on this job, or you hold the award". `GET /v1/jobs/{id}` is the customer's job and carries their budget, and one shape with a redaction step somebody has to remember is the arrangement the privacy rule is hardest to keep with. It is **not** the delivery shelf: `GET /v1/jobs/{id}/delivery/detail` (SHIP-115a) serves the driver assignment and nothing about the job itself, which is why building it did not close this. `/v1/fleet/jobs/{id}` avoids the `ServeMux` panic the paragraph above describes, and sits beside `/v1/fleet/bids` where a provider's own things already live.
 
 **SHIP-95a exists because the guard it tests is the strongest untested invariant on the board, and that was verified rather than suspected.** `LeaveNegotiation`'s `FOR UPDATE SKIP LOCKED` in `cmd/api/routes_bidding.go` is what keeps the `bids` → `jobs` lock order out of the sweep, against the award's `jobs` → `bids`; making it blocking reintroduces exactly the cycle SHIP-88's ordering exists to prevent, and `make check` exits 0 with the mutation applied. It is a **survivor by inspection**: a deadlock needs a sweep and an award racing, and a single-transaction test cannot produce that failure — one that appeared to would be testing something else. **The harness already exists.** SHIP-95 observes contention by holding a transaction open and polling `pg_blocking_pids` until PostgreSQL confirms the other backend is waiting, and wave 9 built the same shape for the delivery sweep in `TestTwoWorkersCompleteEachDeliveryExactlyOnce`. Three points is one race test per claim, extending that harness rather than writing a third.
+
+**SHIP-83a is the structural fix four tickets have now paid a workaround for, and it gets cheaper the earlier it is made.** `GET /v1/jobs/open/{id}` (SHIP-83) puts a literal in the `{id}` position, so it and any four-segment `GET /v1/jobs/{id}/<literal>` both match `/v1/jobs/open/<literal>` with neither more specific, and Go's `ServeMux` panics at registration — the process does not start. **The workarounds are visible in the manifest**: SHIP-115 took `/delivery/proof`, SHIP-115a took `/delivery/detail` and `/delivery/milestones`, SHIP-101a went to `/v1/fleet/bids` rather than under the job at all, and SHIP-102a took `/bids/received`. Each is defensible on its own and the set is a shape nobody chose.
+
+**Why it is a row rather than a note, and why it is three points.** It was recorded as a recommendation in `Docs/11` when SHIP-115 first met it, and three tickets have hit the same wall since — a recommendation with no owner is how a finding goes quiet, which this backlog has two worked examples of in SHIP-56a and SHIP-136. The cost today is one path in `contracts/paths/fleet.yaml`, one route file, `internal/fleet/http_test.go`, one Dart client method and one verify section. **It is a breaking contract change**, so it is cheapest before there is a deployment and before more clients bind to the path. The *Done when* asks for a four-segment `GET` under the job to be **registered**, not merely for the feed to move, because the whole point is the space it frees.
+
+**SHIP-79a exists because a customer has nothing to be told about a provider, and no row anywhere creates it.** SHIP-102's *Done when* has the customer comparing "price, timing, provider profile, and vehicle", and the profile clause is servable today only in reduced form. Measured: `internal/profiles` holds `doc.go` and nothing else, and the only provider profile in the service is `fleet.Profile`, **whose two fields are the service area and the specialties — precisely what SHIP-102a's *Done when* forbids disclosing to a customer**, because they are a competitor's map of the market. There is no trading name, no rating and no completed-job count anywhere in the schema.
+
+**It is placed at SHIP-79 rather than beside the screen, because the gap is data and not presentation.** A provider's public-facing identity is declared where they declare their service area; a screen can only render what exists. The row deliberately does **not** enumerate the fields — a rating implies a review mechanism nobody has specified and a completed-job count is a figure the platform can derive — and asks instead for a closed set, which is the discipline SHIP-83, SHIP-102a and the budget-privacy invariant all already impose. **Whoever reconciles the wave that lands SHIP-102 should add it to `Docs/11` §4 with this row as its named owner**, which is the shape SHIP-118 and SHIP-123 closed in and the shape SHIP-77 has never been able to reach.
 
 ## M4 — Delivery execution
 
