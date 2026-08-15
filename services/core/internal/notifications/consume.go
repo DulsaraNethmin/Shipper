@@ -150,6 +150,14 @@ func (s *Service) Consume(ctx context.Context, r db.Runner, env events.Envelope)
 	rows := make([]Notification, 0, len(recipients)*len(rule.Channels))
 	for _, recipient := range recipients {
 		for _, channel := range rule.Channels {
+			// Rendered per channel, because an email and a locked screen are not the same
+			// surface — templates.go carries the argument. Rendered here rather than per
+			// address, because two handsets belonging to one person get one message.
+			subject, text, err := Render(channel, rule, jobID)
+			if err != nil {
+				return 0, err
+			}
+
 			address, reachable := recipient.AddressOn(channel)
 			if !reachable {
 				// Today this can only be push, which [Rules] does not produce. It
@@ -174,8 +182,8 @@ func (s *Service) Consume(ctx context.Context, r db.Runner, env events.Envelope)
 				Category:  rule.Category,
 				Essential: rule.Category.Essential(),
 				Address:   address,
-				Subject:   rule.Headline,
-				Body:      body(rule, jobID),
+				Subject:   subject,
+				Body:      text,
 			})
 		}
 	}
@@ -183,21 +191,12 @@ func (s *Service) Consume(ctx context.Context, r db.Runner, env events.Envelope)
 	return s.store.insert(ctx, r, rows)
 }
 
-// body is the whole of the rendering, and its inputs are the whole of the argument.
-//
-// A headline the routing table declares as a literal, and a job identifier. Nothing else is
-// available to it: it is not handed the payload, it never reads the job, and it has no template
-// slot anybody could fill. So SHIP-141's rule — no address, no goods description, no full customer
-// name in a notification body — holds because there is nowhere for any of those to come from,
-// rather than because a redaction pass removes them.
-//
-// SHIP-138 owns the templates and the copy, and will replace this. Whatever replaces it inherits
-// the constraint: the day a renderer takes the job as a parameter is the day the rule becomes
-// something a reviewer has to check by eye.
-func body(rule Rule, jobID uuid.UUID) string {
-	return rule.Headline + "\n\nJob " + jobID.String() +
-		"\n\nOpen the Shipper app for the details. Please do not reply to this message."
-}
+// The rendering used to live here, as a single concatenation. **SHIP-138 moved it to
+// templates.go** and made it per channel, and it inherited this function's whole argument rather
+// than replacing it: the inputs are a headline the routing table declares as a literal and a job
+// identifier, and nothing else is available. So SHIP-141's rule — no address, no goods description,
+// no full customer name in a notification body — still holds because there is nowhere for any of
+// those to come from, rather than because a redaction pass removes them.
 
 // resolve turns a rule's audiences into people with addresses.
 //
@@ -296,6 +295,7 @@ func (s *Service) resolve(
 	if len(wanted) == 0 {
 		return nil, nil
 	}
+
 	return s.store.contacts(ctx, r, wanted, roles)
 }
 

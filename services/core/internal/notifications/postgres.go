@@ -139,8 +139,10 @@ func (postgresStore) contacts(
 }
 
 // claimUndelivered runs [DispatchClaim] and reads what it locked.
-func (postgresStore) claimUndelivered(ctx context.Context, r db.Runner, batch int) ([]Notification, error) {
-	rows, err := r.Query(ctx, DispatchClaim, batch)
+func (postgresStore) claimUndelivered(
+	ctx context.Context, r db.Runner, batch int, at time.Time,
+) ([]Notification, error) {
+	rows, err := r.Query(ctx, DispatchClaim, batch, at)
 	if err != nil {
 		return nil, fmt.Errorf("notifications: claiming undelivered notifications: %w", err)
 	}
@@ -180,13 +182,19 @@ func (postgresStore) markSent(ctx context.Context, r db.Runner, id uuid.UUID, at
 // not be lost, and a row that retires itself is a notification nobody receives and nobody is told
 // about. What bounds the retries is a person reading `attempts`, which is why SHIP-176's alerting
 // has a column to count.
-func (postgresStore) markFailed(ctx context.Context, r db.Runner, id uuid.UUID, reason string) error {
+//
+// **next_attempt_at is written here and nowhere else** (SHIP-138, 000703). Without it a permanently
+// failing row is claimed on every pass forever and, at twenty of them, nothing written afterwards
+// is ever sent. See [BackoffFor].
+func (postgresStore) markFailed(
+	ctx context.Context, r db.Runner, id uuid.UUID, reason string, retryAt time.Time,
+) error {
 	const q = `
 		UPDATE notifications
-		   SET status = 'failed', attempts = attempts + 1, last_error = $2
+		   SET status = 'failed', attempts = attempts + 1, last_error = $2, next_attempt_at = $3
 		 WHERE id = $1`
 
-	if _, err := r.Exec(ctx, q, id, reason); err != nil {
+	if _, err := r.Exec(ctx, q, id, reason, retryAt); err != nil {
 		return fmt.Errorf("notifications: marking %s failed: %w", id, err)
 	}
 	return nil

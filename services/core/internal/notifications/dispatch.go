@@ -3,6 +3,7 @@ package notifications
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 )
@@ -59,6 +60,18 @@ const DispatchBatch = 20
 // idx_notifications_undelivered (000702, replacing 000700's) is partial on exactly this predicate,
 // so a platform that has sent a million notifications reads the handful it has not.
 //
+// # The instant is a parameter, and that is what stops twenty bad rows stopping the queue
+//
+// SHIP-138 added `next_attempt_at` (000703). Without it, twenty rows that will never succeed are
+// claimed on every pass in perpetuity and nothing written after them is ever sent — the queue is
+// stopped rather than slow, and every counter reports a healthy platform dispatching twenty
+// messages a pass. See [BackoffFor].
+//
+// $2 is the injected clock rather than `now()`, for Docs/10 §6.3's reason: a test that has to wait
+// out a real backoff is a test nobody runs. **NULL means nothing has deferred this row** — see
+// 000703 on why the column is not `NOT NULL DEFAULT now()`, which is the shape that looks tidier
+// and silently stops a fixed-clock service from dispatching anything at all.
+//
 // **Two terminal statuses rather than one, since SHIP-139.** `undeliverable` is what a rejected
 // device token leaves behind (000702): the address is gone, no retry can help, and a row that
 // stayed claimable would be retried against a handset that no longer exists on every pass forever
@@ -68,6 +81,7 @@ const DispatchClaim = `
 	       address, subject, body, status, attempts
 	FROM notifications
 	WHERE status NOT IN ('sent', 'undeliverable')
+	  AND (next_attempt_at IS NULL OR next_attempt_at <= $2)
 	ORDER BY created_at, id
 	FOR UPDATE SKIP LOCKED
 	LIMIT $1`
@@ -91,7 +105,7 @@ const DispatchClaim = `
 // the first is not something a later row will survive either, and the second is a wiring fault that
 // should be fixed and restarted rather than written into every row as a failure.
 func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
-	due, err := s.store.claimUndelivered(ctx, r, DispatchBatch)
+	due, err := s.store.claimUndelivered(ctx, r, DispatchBatch, s.clock.Now().UTC())
 	if err != nil {
 		return 0, err
 	}
@@ -105,7 +119,8 @@ func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
 		rejected, sendErr := sender(ctx, r, n)
 		switch {
 		case sendErr != nil:
-			if err := s.store.markFailed(ctx, r, n.ID, sendErr.Error()); err != nil {
+			retryAt := s.clock.Now().UTC().Add(BackoffFor(n.Attempts + 1))
+			if err := s.store.markFailed(ctx, r, n.ID, sendErr.Error(), retryAt); err != nil {
 				return 0, err
 			}
 
@@ -137,17 +152,11 @@ func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
 //     eventually ignored, including on the day it means something;
 //   - marking it `sent` is a lie a support query cannot see through.
 //
-// So the row becomes `undeliverable` (000702) — terminal and truthful.
-//
-// **Half of the response is missing until SHIP-140**, and it is named here rather than left to be
-// noticed: the platform should also stop addressing the handset, and it cannot, because there is no
-// device token registry to deregister anything from. Until then a dead token keeps being resolved
-// as an address and every event writes one more row that this branch immediately retires. That is
-// bounded and visible — one terminal row per event rather than an unbounded retry — which is why it
-// is worth landing the adapter ahead of the registry rather than after it.
+// So the row becomes `undeliverable` (000702) — terminal and truthful. Deregistering the handset
+// as well is SHIP-140's half, which has no table to do it in yet.
 //
 // A failure here **does** fail the pass, unlike a failed send. A send that bounces is one row's
-// business; a database error while recording that an address is gone is not something the next
+// business; a database error while recording that a device is gone is not something the next
 // nineteen rows will survive either.
 func (s *Service) reject(ctx context.Context, r db.Runner, n Notification) error {
 	return s.store.markUndeliverable(ctx, r, n.ID)
@@ -194,4 +203,33 @@ func (s *Service) senderFor(c Channel) (send, error) {
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrNoSender, c)
 	}
+}
+
+// BackoffFor is how long a notification waits before its next attempt (SHIP-138).
+//
+// Exponential from a minute, flattening at an hour, and it **never gives up**: Docs/01 §4.5 says a
+// notification failure must not lose the event, so a row that retired itself would be a message
+// nobody receives and nobody is told about. What bounds the retries is a person reading `attempts`,
+// which is 000700's own answer and the column SHIP-176 alerts on.
+//
+// No jitter. Jitter spreads a thundering herd across a shared far end, and there is no herd here:
+// one dispatcher claims twenty rows at a time under SKIP LOCKED, and two instances already
+// interleave rather than collide.
+func BackoffFor(attempts int) time.Duration {
+	const (
+		base = time.Minute
+		max  = time.Hour
+	)
+
+	if attempts < 1 {
+		return base
+	}
+	wait := base
+	for range attempts - 1 {
+		wait *= 2
+		if wait >= max {
+			return max
+		}
+	}
+	return wait
 }

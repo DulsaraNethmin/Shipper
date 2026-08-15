@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -158,10 +159,21 @@ func TestAFailedSendLeavesTheRowClaimable(t *testing.T) {
 		t.Errorf("the recorded reason is %q and does not say what went wrong", reason)
 	}
 
-	// The channel comes back and the message goes out, with no intervention and nothing
-	// scheduled: the claim's predicate is what retries it.
+	// **A failed row waits before it is claimed again** (SHIP-138, 000703). It did not, until
+	// this ticket: twenty permanently failing rows were claimed on every pass in perpetuity and
+	// nothing written after them was ever sent. So the immediate retry is now asserted to *not*
+	// happen, which is a change to this test rather than a bug in it.
 	mail.fail = nil
-	claimed, err := dispatchOnce(t, pool, service)
+	if claimed, err := dispatchOnce(t, pool, service); err != nil || claimed != 0 {
+		t.Fatalf("a pass one instant after the failure claimed %d rows (%v); a row that failed "+
+			"a moment ago is a row every pass will keep failing", claimed, err)
+	}
+
+	// Once the backoff has elapsed the message goes out, with no intervention and nothing
+	// scheduled: the claim's predicate is still what retries it.
+	later := NewService(&stubParties{}, clock.NewFixed(testInstant.Add(BackoffFor(1)+time.Second)),
+		Senders{Email: mail})
+	claimed, err := dispatchOnce(t, pool, later)
 	if err != nil {
 		t.Fatalf("the retry pass: %v", err)
 	}
@@ -172,6 +184,70 @@ func TestAFailedSendLeavesTheRowClaimable(t *testing.T) {
 		t.Errorf("after the retry the row is %s on attempt %d, want sent on 2", status, attempts)
 	}
 }
+
+// TestABackoffGrowsAndThenStops. Docs/01 §4.5 says a notification failure must not lose the event,
+// so nothing here gives up — the schedule flattens rather than terminating, and what bounds the
+// retries is a person reading `attempts`.
+func TestABackoffGrowsAndThenStops(t *testing.T) {
+	t.Parallel()
+
+	first := BackoffFor(1)
+	if first != time.Minute {
+		t.Errorf("the first retry waits %s, want a minute", first)
+	}
+	if second := BackoffFor(2); second != 2*first {
+		t.Errorf("the second waits %s, want %s", second, 2*first)
+	}
+	if long := BackoffFor(50); long != time.Hour {
+		t.Errorf("after fifty attempts the wait is %s, want an hour — a schedule that kept "+
+			"doubling would stop retrying without ever saying it had", long)
+	}
+	if BackoffFor(0) != time.Minute {
+		t.Error("a row with no attempts recorded waits an unexpected time")
+	}
+}
+
+// TestOneStuckRowDoesNotStopTheQueue is the defect SHIP-138's *Done when* — "sends reliably" — is
+// actually about.
+//
+// The dispatcher claims DispatchBatch rows ordered by age. Before the backoff, a full batch of
+// permanently failing rows was claimed on every pass forever and **nothing written after them was
+// ever sent**: the queue was stopped rather than slow, and every counter reported a healthy
+// platform dispatching twenty messages a pass.
+func TestOneStuckRowDoesNotStopTheQueue(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	recipient := newUser(t, pool, "stuck@example.com", "+61400007213", "customer")
+	mail := &selectiveSender{failFor: "stuck@example.com"}
+	service := NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{Email: mail})
+
+	// A batch's worth of rows that will never succeed, all older than the one that must go out.
+	for range DispatchBatch {
+		pending(t, pool, recipient, ChannelEmail, "stuck@example.com")
+	}
+	good := pending(t, pool, recipient, ChannelEmail, "fine@example.com")
+
+	// The first pass claims the full batch of bad rows and defers every one of them.
+	if claimed, err := dispatchOnce(t, pool, service); err != nil || claimed != DispatchBatch {
+		t.Fatalf("the first pass claimed %d (%v), want the full batch", claimed, err)
+	}
+	if status, _, _ := stateOf(t, pool, good); status != "pending" {
+		t.Fatalf("the good row is %s already; the fixture is not testing what it says", status)
+	}
+
+	// The second pass, an instant later, reaches the message behind them.
+	if claimed, err := dispatchOnce(t, pool, service); err != nil || claimed != 1 {
+		t.Fatalf("the second pass claimed %d (%v), want the one message behind the stuck "+
+			"batch", claimed, err)
+	}
+	if status, _, _ := stateOf(t, pool, good); status != "sent" {
+		t.Errorf("the message behind the stuck batch is %s; twenty bad addresses have stopped "+
+			"the queue", status)
+	}
+}
+
+// selectiveSender, which the batch test below already declares, is what makes the stuck rows
+// stuck and lets the one behind them through.
 
 // TestOneFailureDoesNotRollBackTheRestOfTheBatch is why Dispatch records a failure rather than
 // returning it.
