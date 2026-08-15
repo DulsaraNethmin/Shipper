@@ -829,3 +829,162 @@ func (postgresStore) offersOn(
 	}
 	return bids, nil
 }
+
+// --- the job_messages table (SHIP-97) -------------------------------------------------------------
+
+// messageColumns is every column of a [Message], in the order [scanMessage] reads them.
+//
+// Named rather than `SELECT *`, for [bidColumns]' reason: a column added to `job_messages` by a
+// later ticket must not arrive in this package's shapes with somebody else's schema change.
+//
+// `idempotency_key` is coalesced because "" is what this domain means by "not given" and
+// `ck_job_messages_idempotency_key` permits no empty string — the same pair `message` takes on
+// `bids`. `body` is NOT NULL and needs no coalesce, which is the one difference and is worth
+// noticing: a bid's message is optional and a message's body is the whole of it.
+const messageColumns = `
+	id, job_id, provider_id, sent_by, body, COALESCE(idempotency_key, ''), created_at`
+
+// scanMessage reads one row of [messageColumns].
+func scanMessage(row pgx.Row) (Message, error) {
+	var (
+		m  Message
+		by string
+	)
+	if err := row.Scan(&m.ID, &m.JobID, &m.ProviderID, &by, &m.Body, &m.Key, &m.CreatedAt); err != nil {
+		return Message{}, err
+	}
+	m.SentBy = Party(by)
+	return m, nil
+}
+
+// insertMessage writes one message, absorbing a retry under the same key (SHIP-97).
+//
+// `created` is false when the key had already written in this conversation from this side, which
+// [Service.SendMessage] then answers by reading the row.
+//
+// **DO NOTHING rather than DO UPDATE**, for [postgresStore.insertBid]'s reason and more sharply: a
+// retry must return what was recorded rather than overwrite it. Somebody who retried after editing
+// what they meant to say has made a *new* message, and silently replacing the delivered one would
+// change what the other party had already read.
+//
+// **The arbiter is `uq_job_messages_idempotency`, inferred by its columns and its predicate**,
+// because a partial unique index has no constraint name to name. The `WHERE` clause is not a filter
+// on rows; it is how PostgreSQL is told which index this statement expects. Unlike `bids`, this
+// table has only one unique index, so there is no second conflict to keep apart — every unique
+// violation here is a retry and none of them is a second message.
+func (postgresStore) insertMessage(ctx context.Context, r db.Runner, m Message) (Message, bool, error) {
+	const q = `
+		INSERT INTO job_messages (id, job_id, provider_id, sent_by, body, idempotency_key)
+		VALUES ($1, $2, $3, $4, $5, nullif($6, ''))
+		ON CONFLICT (job_id, provider_id, sent_by, idempotency_key)
+			WHERE idempotency_key IS NOT NULL DO NOTHING
+		RETURNING ` + messageColumns
+
+	written, err := scanMessage(r.QueryRow(ctx, q,
+		m.ID, m.JobID, m.ProviderID, string(m.SentBy), m.Body, m.Key))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Message{}, false, nil
+	case err != nil:
+		return Message{}, false,
+			fmt.Errorf("bidding: writing %s's message on %s: %w", m.SentBy, m.JobID, err)
+	}
+	return written, true, nil
+}
+
+// messageSentUnder is what a key already wrote in this conversation from this side, if anything.
+//
+// **Scoped by the pair *and* by the sending party**, which matches `uq_job_messages_idempotency`
+// exactly — so the index serves the read as well as the constraint — and is the privacy rule
+// [postgresStore.bidPlacedUnder] states: a lookup missing a column of the key hands one caller
+// another caller's row to anybody who reuses a value. Here both writers sit inside one
+// `(job_id, provider_id)` pair, so `sent_by` is the column that keeps a customer's key from reaching
+// the provider's message and the other way round.
+//
+// The pair itself never comes from a request. [Service.SendMessage] takes it from the offer the
+// caller was able to reach, so there is no way to ask on somebody else's behalf.
+func (postgresStore) messageSentUnder(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+	by Party,
+	key string,
+) (Message, bool, error) {
+	const q = `
+		SELECT ` + messageColumns + `
+		FROM job_messages
+		WHERE job_id = $1 AND provider_id = $2 AND sent_by = $3 AND idempotency_key = $4`
+
+	m, err := scanMessage(r.QueryRow(ctx, q, jobID, providerID, string(by), key))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Message{}, false, nil
+	case err != nil:
+		return Message{}, false,
+			fmt.Errorf("bidding: reading what %s wrote on %s: %w", key, jobID, err)
+	}
+	return m, true, nil
+}
+
+// messages is one conversation, oldest first, from `after` onwards (SHIP-97).
+//
+// # The pair is the whole of the scope, and it is not a filter a caller can widen
+//
+// `job_id` and `provider_id` together are the conversation. Both arrive from
+// [Service.reachableBid]'s answer or from the bid [Service.Messages] read, never from a query
+// parameter — so a competing provider cannot reach another negotiation's messages by asking for one,
+// and there is no parameter that would let them try. That is the same construction
+// `fleet.Service.Vehicles` uses and states.
+//
+// # Keyset pagination, ascending, and the tuple comparison is what makes it exact
+//
+// `(created_at, id) > ($3, $4)` is a **row-value** comparison rather than an OR of two predicates,
+// which is what lets `idx_job_messages_conversation` serve it as a single range scan and what makes
+// the boundary exact when two messages share an instant. Ascending because a conversation is read
+// forward — the opposite of [postgresStore.bidsFor], and the same as [postgresStore.chain].
+//
+// **The zero cursor is the first page, and it is expressed as a value rather than as a second
+// statement.** `time.Time{}` is year 1 and [uuid.Nil] is all zeros, so every row in the table sorts
+// after the pair — one query with one plan serves the first page and every page after it. A branch
+// that built a different statement for the first page would be two queries to keep in step, and the
+// one that runs least often is the one that would drift.
+func (postgresStore) messages(
+	ctx context.Context,
+	r db.Runner,
+	jobID, providerID uuid.UUID,
+	after MessageCursor,
+	limit int,
+) ([]Message, error) {
+	const q = `
+		SELECT ` + messageColumns + `
+		FROM job_messages
+		WHERE job_id = $1
+		  AND provider_id = $2
+		  AND (created_at, id) > ($3, $4)
+		ORDER BY created_at, id
+		LIMIT $5`
+
+	at, id := time.Time{}, uuid.Nil
+	if !after.IsZero() {
+		at, id = after.CreatedAt, after.ID
+	}
+
+	rows, err := r.Query(ctx, q, jobID, providerID, at, id, limit)
+	if err != nil {
+		return nil, fmt.Errorf("bidding: reading the conversation on %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	found := make([]Message, 0, limit)
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("bidding: reading the conversation on %s: %w", jobID, err)
+		}
+		found = append(found, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bidding: reading the conversation on %s: %w", jobID, err)
+	}
+	return found, nil
+}

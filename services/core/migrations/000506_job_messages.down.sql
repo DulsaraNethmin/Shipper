@@ -1,0 +1,14 @@
+-- Reverses 000506.
+--
+-- `IF EXISTS`, which is this repository's convention for a down migration and is not decoration
+-- here. Numbers are drawn from reserved per-domain blocks rather than in time order
+-- (migrations/blocks.go), so a new bidding migration is *below* the version a working database
+-- already records — and SHIP-15g's guard prints `make migrate-down n=all && make migrate-up` as the
+-- fix. That `down` walks the file list downward from the current version, so **this file runs before
+-- its own `up` ever has.** The statement below therefore has to be safe against a schema where it
+-- was never applied. 000302, 000407, 000502, 000503, 000504 and 000505 all take the same precaution.
+--
+-- Dropping the table takes its indexes, its constraints and its comments with it, so there is
+-- nothing further to restore: this migration created the table, and the schema without it is the
+-- schema before it, entire.
+DROP TABLE IF EXISTS job_messages;

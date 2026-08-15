@@ -1499,3 +1499,239 @@ func (h *Handler) Received() http.Handler {
 		return nil
 	})
 }
+
+// --- job-scoped messaging (SHIP-97) ---------------------------------------------------------------
+
+// messageRequest is the body of POST /v1/jobs/{id}/bids/{bid_id}/messages.
+//
+// **One field, and that is the whole request.** There is no `job_id`, no `provider_id`, no `sent_by`
+// and no `created_at`: the conversation comes from the path, the party is whichever side the platform
+// works out the caller is on, and the instant is the platform's. A `sent_by` in a body would be an
+// authorisation decision made from client input, which Docs/07 §3 puts on the platform — and it is
+// the one field somebody would reach for, because a client rendering "you" against "them" has the
+// value in hand and could send it back.
+//
+// httpx.DecodeJSON refuses unknown fields, so a client sending any of them is told it does not exist
+// rather than having it silently ignored.
+type messageRequest struct {
+	Body string `json:"body"`
+}
+
+// messageResponse is one message on the wire (SHIP-97).
+//
+// # A closed key set, and this is the response where that matters most in the domain
+//
+// Every other shape here carries numbers and instants. This one carries **free text**, and wave 10
+// and wave 11 both established that a disclosure with no field, no value and no digit defeats every
+// structural guard there is. So the set is closed *and* the platform contributes no prose to it:
+// every string a client receives is a key name, an identifier, an instant, a party name, or the body
+// a party typed. `TestNothingTheCustomerTypedIsAddedToByThePlatform` holds that word by word over the
+// rendered bytes rather than over the struct.
+//
+// **The idempotency key is not here.** It is on the row (000506) and it is the *sender's* client's
+// token — rendering it would hand one party a value the other party's device generated, which is
+// nothing they need and is exactly the sort of field that ends up in a log. [bidResponse] leaves
+// `Bid.Key` off for the same reason.
+//
+// There is no `job_id` either, unlike [bidResponse]. A message is only ever reached through its own
+// job's path, and the collection is the conversation rather than a mixed list — so the identifier
+// would be the same value on every element of every page.
+type messageResponse struct {
+	ID string `json:"id"`
+
+	// SentBy is which party wrote it — `provider` or `customer` — and it is the field the screen is
+	// built out of.
+	//
+	// [bidResponse.OfferedBy]'s argument applies unchanged and more strongly: a client cannot infer
+	// it. A conversation does not alternate, both parties may write twice in a row, and a reader may
+	// join it halfway. Rendering "you" against "them" is the whole of what a message list does.
+	SentBy string `json:"sent_by"`
+
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
+}
+
+func messageFrom(m Message) messageResponse {
+	return messageResponse{
+		ID:        m.ID.String(),
+		SentBy:    m.SentBy.Wire(),
+		Body:      m.Body,
+		CreatedAt: timestamp(m.CreatedAt),
+	}
+}
+
+// SendMessage handles POST /v1/jobs/{id}/bids/{bid_id}/messages (SHIP-97).
+//
+// Protected: the sender is whoever the token says is calling, and the side they are on is worked out
+// from the database — `bids.provider_id` for the provider, `jobs.customer_id` for the customer. That
+// is `RequireUser` doing what routes_bidding.go says it is for: a role claim in a token is evidence
+// about the token rather than the fact.
+//
+// **201 when the message was sent, 200 when this key had already sent it.** The same shape either
+// way, which is the arrangement `POST /v1/jobs/{id}/bids` and `POST /v1/jobs/{id}/milestones` already
+// use — a client that does not care parses one type, and one recovering from a dropped connection
+// generally does not.
+//
+// State-changing, so it carries an `Idempotency-Key` like every other mutating route (SHIP-15), and
+// the key is read here as well as by the middleware. See [Service.SendMessage]: the middleware
+// replays a response while its entry lives and the column replays the row forever, and a duplicated
+// message is one the other party has already read.
+//
+// A caller who is neither party answers 404, byte-identically to a bid that does not exist.
+func (h *Handler) SendMessage() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		caller, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, bidID, err := pathIDs(r)
+		if err != nil {
+			return err
+		}
+
+		var req messageRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		note := Note{Body: req.Body, Key: r.Header.Get(httpx.HeaderIdempotencyKey)}
+
+		message, created, err := h.svc.SendMessage(r.Context(), pool, caller, jobID, bidID, note)
+		if err != nil {
+			return apiError(err)
+		}
+
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		httpx.WriteJSON(w, status, messageFrom(message))
+		return nil
+	})
+}
+
+// Messages handles GET /v1/jobs/{id}/bids/{bid_id}/messages (SHIP-97).
+//
+// The collection envelope of Docs/10 §4.5 with cursor pagination, **oldest first** — a conversation
+// is read forward, which is the opposite of `GET /v1/fleet/bids` and the same as the history.
+//
+// Read-only, so the idempotency middleware lets it through untouched and it carries no key.
+//
+// # The administrative reader is one field, and the field cannot be set from here
+//
+// `Viewer{ID: caller}` with `Administrator` left false, exactly as [Handler.History] builds it and
+// for exactly the same reason: this route declares `RequireUser`, and `authctx.Subject` cannot carry
+// an administrator at all — Docs/06 §5.2 and SHIP-147 make admin sign-in a separate system that a
+// user token cannot reach. **The line an administrative endpoint changes is this one**, and nothing
+// in the domain moves with it. SHIP-97's "and admins" clause is therefore met in `internal/bidding`
+// and unreachable from the wire; Docs/11 §3 records it as a declared reduced clause rather than a
+// clause quietly met.
+func (h *Handler) Messages() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		caller, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, bidID, err := pathIDs(r)
+		if err != nil {
+			return err
+		}
+
+		query, err := messageQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		page, _, err := h.svc.Messages(r.Context(), pool, Viewer{ID: caller}, jobID, bidID, query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		messages := make([]messageResponse, 0, len(page.Messages))
+		for _, message := range page.Messages {
+			messages = append(messages, messageFrom(message))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK,
+			pagination.NewPage(messages, encodeMessageCursor(page.Next)))
+		return nil
+	})
+}
+
+// messageQueryFrom reads `?limit=` and `?cursor=`, which is every parameter this list has.
+//
+// No `?status=` and no `?sent_by=`, unlike [bidQueryFrom]: see [MessageQuery]. Every failure is
+// `bad_request` rather than `validation_failed`, which is httpx's own division and the reading
+// [bidQueryFrom] states — a query parameter is part of how the request was addressed rather than data
+// a person typed into a form.
+//
+// An unknown parameter is passed over rather than refused, for [bidQueryFrom]'s reason. What matters
+// is the other direction: neither parameter here can widen the scope, and the conversation is not one
+// of them.
+func messageQueryFrom(r *http.Request) (MessageQuery, error) {
+	values := r.URL.Query()
+
+	var query MessageQuery
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return MessageQuery{}, err
+	}
+	query.Limit = limit
+
+	if query.After, err = decodeMessageCursor(values.Get("cursor")); err != nil {
+		return MessageQuery{}, err
+	}
+	return query, nil
+}
+
+// encodeMessageCursor renders a position for a client to hand back, in the encoding
+// `internal/pagination` owns.
+//
+// The same two fields [encodeBidCursor] writes and deliberately not the same function: the two
+// cursors are positions in differently ordered lists, and one encoder shared between them would be
+// an invitation to hand a bid cursor to a conversation. They decode to different types, so the
+// compiler refuses that.
+func encodeMessageCursor(c MessageCursor) string {
+	if c.IsZero() {
+		return ""
+	}
+	return pagination.Cursor{
+		c.CreatedAt.UTC().Format(time.RFC3339Nano),
+		c.ID.String(),
+	}.Encode()
+}
+
+// decodeMessageCursor reads one back.
+//
+// Nanoseconds rather than the millisecond precision responses render, for [decodeBidCursor]'s reason
+// and with more riding on it here: two parties answering each other inside one millisecond is the
+// ordinary case, so a rounded boundary would repeat or drop a message rather than an offer.
+func decodeMessageCursor(raw string) (MessageCursor, error) {
+	fields, err := pagination.Decode(raw, bidCursorFields)
+	if err != nil || fields == nil {
+		return MessageCursor{}, err
+	}
+
+	at, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		return MessageCursor{}, invalidBidCursor(err)
+	}
+	id, err := uuid.Parse(fields[1])
+	if err != nil {
+		return MessageCursor{}, invalidBidCursor(err)
+	}
+	return MessageCursor{CreatedAt: at, ID: id}, nil
+}

@@ -1674,3 +1674,326 @@ Capacity:
     height_cm:
       type: integer
       example: 160
+
+JobMessages:
+  get:
+    operationId: jobMessages
+    summary: Read the conversation with one provider about one job
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Every message exchanged between one customer and one provider about one job, oldest first
+      (SHIP-97).
+
+      Counter-offers say what the terms are. This is where the questions go — "is there a lift?",
+      "can you be there before nine?" — which a price and two dates cannot carry.
+
+      ## A conversation is with one provider, not with the job
+
+      An open job can hold offers from several providers at once, and **they are not in one room**.
+      Each pair — you and one provider, or you and the customer — has its own conversation, and no
+      provider can see another's. Address it through **any** offer in the negotiation; the one you are
+      holding will do, however old, and a negotiation that has run through several counters is still
+      one conversation.
+
+      ## Who may read it
+
+      The two parties: the provider bidding, and the customer who owns the job. Anybody else answers
+      `404`, byte-identically to a bid that does not exist.
+
+      Administrators are the third reader Docs/02 §4 names for a negotiation. **That reader has no
+      endpoint yet** — administrative sessions are a separate credential system, and this route takes
+      a user token — so it is not reachable here today.
+
+      ## It keeps working after the job is awarded
+
+      There is no status rule at all. The moment two parties most need to arrange something is after
+      the award, when the offer that got them there is accepted and the rest are closed.
+
+      ## Paging
+
+      The collection envelope with cursor paging, **oldest first** — a conversation is read forward.
+      `next_cursor` is present while there is another page and omitted on the last; hand it back as
+      `?cursor=` unchanged.
+
+      Read-only, so no `Idempotency-Key`.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/BidID'
+      - $ref: '#/MessageLimit'
+      - $ref: '#/CursorParameter'
+    responses:
+      '200':
+        description: |
+          One page of the conversation, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/MessageList'
+      '400':
+        description: |
+          A malformed identifier in the path, a `limit` that is not a whole number of at least 1, or a
+          cursor this endpoint did not issue (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such bid — or one you are not a party to, or not on the job in the path. These are one
+          answer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+  post:
+    operationId: sendJobMessage
+    summary: Send a message to the other party
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Write one message into the conversation about this job (SHIP-97).
+
+      **One endpoint for both parties.** The platform works out which side you are on — the provider
+      the negotiation is with, or the customer who owns the job — so there is no field for saying who
+      you are and sending one would be refused as an unknown field.
+
+      `201` when the message was sent. `200` when this `Idempotency-Key` had already sent it, with the
+      same message back. A client that does not care which happened parses one shape.
+
+      ## Who may write
+
+      The same two parties who may read. Anybody else answers `404`.
+
+      There is no status rule: a message can be sent while the offer is live, after it has been
+      countered, and after the job has been awarded.
+
+      ## What the platform adds
+
+      Nothing. The body is stored as you wrote it, trimmed of surrounding whitespace and otherwise
+      unaltered, and every other field in the response is an identifier, an instant, or which party
+      wrote it.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/BidID'
+      - $ref: '#/MessageIdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/MessageSend'
+    responses:
+      '201':
+        description: |
+          The message was sent.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Message'
+      '200':
+        description: |
+          This key had already sent this message. The same message, and nothing further recorded.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Message'
+      '400':
+        description: |
+          A malformed identifier in the path, a body that is not valid JSON, or an unknown field
+          (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such bid — or one you are not a party to, or not on the job in the path. These are one
+          answer.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          An empty message, or one over 2000 characters (`validation_failed`, with `body` named).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+MessageSend:
+  type: object
+  additionalProperties: false
+  required: [body]
+  description: |
+    A message to the other party. One field, deliberately.
+  properties:
+    body:
+      type: string
+      minLength: 1
+      maxLength: 2000
+      description: |
+        What you want to say. Stored as written, trimmed of surrounding whitespace; a message of
+        whitespace alone is empty and is refused.
+
+        The limit is the same one a bid's `message` carries — the same kind of text, written by the
+        same two people, in the same negotiation.
+      example: Is there a lift, or is it stairs to the second floor?
+
+Message:
+  type: object
+  additionalProperties: false
+  required: [id, sent_by, body, created_at]
+  description: |
+    One message in a conversation about a job.
+
+    **The key set here is closed**, and it matters more on this shape than on any other in this API:
+    it is the only response in the bidding domain that carries free text, and a disclosure written as
+    a sentence carries no field name and no value for a structural check to find. So the platform
+    contributes no prose to it at all — every string you receive is a key name, an identifier, an
+    instant, which party wrote the message, or the words a party typed.
+
+    There is no `job_id` and no `provider_id`: a message is only ever reached through its own
+    conversation's address, so both would be the same value on every element of every page. The
+    sender's `Idempotency-Key` is not here either — it is their client's token and is nothing the
+    other party needs.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    sent_by:
+      type: string
+      enum: [provider, customer]
+      description: |
+        Which party wrote it. **This cannot be inferred** — a conversation does not alternate, either
+        party may write twice in a row, and a reader may join it halfway — and rendering "you" against
+        "them" is the whole of what a message list does.
+      example: provider
+    body:
+      type: string
+      description: What they wrote, as they wrote it.
+      example: There is a lift, but it is out until Thursday.
+    created_at:
+      type: string
+      format: date-time
+      description: When the platform recorded it, in UTC with milliseconds.
+      example: '2026-08-15T03:30:00.000Z'
+
+MessageList:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    One page of a conversation, **oldest first** — the collection envelope every collection in this
+    API uses.
+
+    Oldest first is the opposite of `BidList` and deliberate: a work queue is read newest first, and a
+    conversation is read forward or it is not a conversation.
+  properties:
+    data:
+      type: array
+      description: |
+        The messages, oldest first, from both parties. `sent_by` says which is which.
+      items:
+        $ref: '#/Message'
+    next_cursor:
+      type: string
+      description: |
+        Opaque. Pass it back as `?cursor=` for the next page. Omitted on the last page.
+      example: MR9yZWNvcmQ
+    has_more:
+      type: boolean
+      description: Whether `next_cursor` names another page.
+      example: true
+
+MessageLimit:
+  name: limit
+  in: query
+  required: false
+  description: |
+    How many messages to return. Absent is 20; anything above 100 is narrowed to 100 rather than
+    refused, so raising the maximum later cannot break a client. A value that is not a whole number of
+    at least 1 is refused, because that is a client defect rather than a request.
+  schema:
+    type: integer
+    minimum: 1
+    maximum: 100
+    default: 20
+  example: 20
+
+MessageIdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per message, reused for every retry of that message. Every
+    state-changing request carries one and is refused without it (SHIP-15).
+
+    Here the key is more than a retry mechanism: it is stored against the message, so a retry that
+    arrives after any cache has forgotten it is answered with the message it sent rather than sending
+    a second one. **A duplicated message is worse than most duplicated writes** — the other party has
+    already read it and cannot tell which sending was the mistake.
+
+    The key is scoped to you, to this conversation, and to your side of it, so no key of yours can
+    reach the other party's message and theirs cannot reach yours.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8e

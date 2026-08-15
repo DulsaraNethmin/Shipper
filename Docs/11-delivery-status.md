@@ -640,6 +640,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
 | **SHIP-87a** | M3 | `ck_bids_offer_has_timing` restored (`000505`) — the constraint `000501` wrote, applied and removed because it would have bound SHIP-87's design. That design is made and it **inherits**, so every row the platform writes past `Draft` already states both instants. It is a `CHECK` rather than a validator because the validator is in front of one door and a worker, a repair script or a psql prompt is not behind it. **The cost `Docs/09` priced in was real and wider than the six tests it named** — ten fixture sites across five packages and two verify sections wrote a closed bid with no timing, because until now nothing refused one — *see below* |
 | **SHIP-95a** | M3 | The race nothing was running: **an expiry sweep and an award contending for one `jobs` row.** `LeaveNegotiation`'s `FOR UPDATE SKIP LOCKED` was the strongest untested invariant on the board — `make check` exited 0 with it removed. It now exits 1 in two ways: the race, driven by hand and confirmed with `pg_blocking_pids` as SHIP-95 does, and a source guard over **all three copies** of the statement. With the clause gone PostgreSQL reports a real deadlock, SQLSTATE **40P01**, in about a second. **No endpoint: demonstrated by its own tests** — *see below* |
+| **SHIP-97** | M3 | Job-scoped messaging — `POST` and `GET /v1/jobs/{id}/bids/{bid_id}/messages`, `000506_job_messages`. **A conversation is the `(job, provider)` pair rather than the job**, which is `bids.provider_id`'s meaning since `000502` and is what keeps competing providers out of one room — a shared thread discloses through prose, which no closed key set can catch. It attaches to the *negotiation* and not to an offer, so it survives a counter, and **there is no status gate at all**: the moment two parties most need to arrange something is after the award. The disclosure guard is **word-level over rendered output**, inverted — every word must be accounted for. **The 'and admins' clause is declared reduced**: met in the domain, unreachable from the wire — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13260,6 +13261,123 @@ The subject is a lock ordering between two transactions, one of which is a worke
 drives HTTP and cannot arrange the interleaving; a bash approximation of it would be the vacuous race
 this file's own harness exists to refuse. This is the case Docs/11 §3's opening paragraph describes —
 work that reaches no HTTP endpoint is demonstrated by its own tests and says so in the row.
+
+#### Nothing was needed from `internal/config`
+
+### SHIP-97 — the conversation is a pair, not a job, and the admin clause is declared rather than met
+
+*Done when*: "messages attach to a job and are visible only to its two parties and admins." One
+sentence, three clauses, and the second one settles the whole data model.
+
+#### "Its two parties" — a job before an award has one customer and several providers
+
+An Open job carries offers from a dozen providers at once. A table keyed on the job alone would put
+every one of them in one room with the customer and with each other, and **Docs/01 §4.3's second line
+— "treat provider bid price as private from competing providers" — would then be broken by prose
+rather than by a field.** A provider writing *"I can beat whoever quoted you six hundred"* discloses
+a competitor's price with no column involved, and no closed key set, no value search and no AST walk
+can catch that. The only guard is not to build the room.
+
+So a conversation is `(job_id, provider_id)`, which is exactly what a negotiation is. **`000506`
+copies `000502`'s pair verbatim** — `provider_id` names the conversation and `sent_by` names the
+writer — so `bids` and `job_messages` answer "who is this between" and "who wrote this" the same way.
+There is no `sender_id` and no `customer_id`: the first is derivable from the other two and the
+second is `jobs`' column, which this domain may not read.
+
+#### It attaches to the negotiation, not to an offer, which is why there is no `bid_id`
+
+`POST /v1/jobs/{id}/bids/{bid_id}/messages` names an offer and the row records none. A counter
+replaces the live offer with a new row (SHIP-88) and a withdrawn offer can be replaced by a fresh
+one, so one pair of parties can hold several chains on one job. A conversation attached to an offer
+would restart every time somebody countered — the question on the superseded row and the answer on
+its successor — and neither party could read the exchange.
+`TestTheConversationSurvivesTheOfferItWasStartedOn` reaches the same conversation through the
+original offer and through the counter that displaced it.
+
+#### There is no status gate anywhere, and that is a decision rather than an omission
+
+Nothing in `messages.go` reads a bid's status. **The moment two parties most need to arrange
+something is after the award**, when the offer that got them there is `Accepted` and every other one
+is `Rejected`; a rule that closed the conversation when the negotiation closed would shut it exactly
+then. Docs/02 §4 keeps the chain readable after a negotiation ends for the same reason, and
+`Negotiation.CustomerOf` is already documented as answering "whatever the job's status" so that a
+party keeps their access afterwards. `TestMessagingOutlivesTheOffer` runs every closed status rather
+than the awarded one, because the rule is *no* status rule and a test naming one would pass against
+an implementation that permitted that one.
+
+#### The "and admins" clause is **declared reduced**, and here is exactly what a future reader adds
+
+`Service.Messages` takes SHIP-96's `Viewer` and resolves the reader through SHIP-96's own
+`audienceFor`, so an administrator is one branch that already exists — `AudienceAdministrator`, no
+second rule, no field list. `TestAnAdministratorReadsAnyConversation` proves it at the service, and
+proves it *is* the flag doing the work by refusing the identical account with the flag off first.
+
+**It is unreachable from the wire and cannot be made reachable by this branch.** `authctx.Subject`
+carries two roles and neither is an administrator — Docs/06 §5.2 and SHIP-147 make admin sign-in a
+separate credential system a user token cannot reach — so `cmd/api` builds every `Viewer` with
+`Administrator: false` and there is nothing in this platform that could make it true. This is the
+same shape SHIP-96 recorded for the bid history and this is the second endpoint behind it.
+
+**What a future administrative reader has to add, in full:**
+
+1. an admin-authenticated route — `GET /v1/admin/jobs/{id}/bids/{bid_id}/messages` or a conversation
+   list under SHIP-152's job detail — declared in `cmd/api/routes_admin.go` with `RequireAdmin`;
+2. a handler that builds `bidding.Viewer{ID: <administrator>, Administrator: true}` and calls
+   `Service.Messages`. **That is the entire change.** No migration, no store method, no widening of
+   `messages.go`, and no second audience rule;
+3. an `audit_log` entry if the read is to be recorded, which is SHIP-150's helper and this domain's
+   business not at all.
+
+Nothing about what a row *shows* differs between the three readers — visibility.go's own point — so
+the administrative half is a mapping in `cmd/api` and never a field.
+
+#### The disclosure guard is word-level and inverted, because this is the domain's first free text
+
+Every other response here is numbers and instants, so a closed key set is a complete answer: there is
+no budget field because there is no job in the shape. **This one carries a sentence.** Wave 10
+isolated *"The customer has set a maximum."* — no field, no value, no digit — and a thirteen-test
+suite passed with it live, defeating a closed key set, a word search, a value search, an AST walk and
+a SQL column guard in turn.
+
+So `TestNothingTheCustomerTypedIsAddedToByThePlatform` **inverts the assertion**: it renders the
+response, decomposes it into words, and requires every word to have come from the closed key set, the
+party enumeration, an identifier, an instant, or the bodies the test itself typed. Anything left over
+is something the platform introduced. **The check does not need to recognise a disclosure; it only
+needs to notice a word nobody put there.** `scripts/verify/61-bidding.sh` runs the same shape over the
+wire, against a job whose budget is asserted present first so the check is not vacuous.
+
+One thing this deliberately does *not* claim: **a party's own words are their own to choose.** A
+customer who types their budget into a message has disclosed it themselves. The invariant is about
+what the platform exposes, and the platform exposes nothing.
+
+#### The retry is the column rather than the cache, and a duplicated message is worse than most
+
+`uq_job_messages_idempotency` is scoped `(job_id, provider_id, sent_by, idempotency_key)` — `000502`'s
+correction to `000501` applied from the start rather than discovered later, because two writers sit
+inside one pair. `make verify` demonstrates both halves: a retry answered by the middleware
+(`Idempotency-Replayed: true`), then the cached entry deleted and the *same* retry answered from the
+row with the header absent.
+
+It matters more here than for a bid. **The other party has already read the message and cannot tell
+which sending was the mistake**, which is also why the insert is `DO NOTHING` rather than `DO UPDATE`:
+a retry carrying different words is a *new* message, and silently replacing the delivered one would
+rewrite what somebody had already seen.
+
+#### What was declined, on the record
+
+**No domain event.** SHIP-97's *Done when* asks for none, `Docs/01` §4.5's notification list does not
+name messaging, and SHIP-138's templates would need copy nobody has specified. Emitting an
+unschematised type would fail `cmd/api`'s own event-catalogue test, and emitting a schematised one
+nothing consumes is the coverage-shaped hole SHIP-136 refused for `bid.expired`. **The trigger is a
+notification ticket for messaging, which does not exist.**
+
+**No read receipts, no unread count, no attachments.** None is in any document; each needs a
+per-reader row rather than a column, and an attachment is an object-storage design (Docs/06 §4.1).
+`000506`'s header names all three with their triggers.
+
+**No administrator as a writer.** `ck_job_messages_sent_by` admits two values.
+`TestAnAdministratorMayReadAndNotWrite` holds it: Docs/02 §4 makes an administrator a *reader* of a
+negotiation, and a message from one would have to be attributed to a party who did not write it.
 
 #### Nothing was needed from `internal/config`
 

@@ -2816,3 +2816,243 @@ SQL
 ok "a bid past Draft cannot be written without both of its instants, refused by ck_bids_offer_has_timing rather than by a validator, and a Draft may still state neither"
 
 unset bid_untimed_id
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-97  a job-scoped conversation between the customer and one provider"
+
+# **What only the harness can show.** The domain's tests drive the service against a real database
+# and prove what it stores and who it refuses. What they cannot reach is the half this ticket is
+# about at the edge: that both parties reach one conversation through one address with two different
+# credentials, that the platform works out which side each is on from the database rather than from
+# a claim in a token, and that a competing provider holding a live offer on the same job gets the
+# same bytes a missing bid gets.
+#
+# A conversation of its own on a job of its own, rather than the fixture job every check above has
+# been countering and awarding on. This section asserts on the whole conversation, so a message left
+# behind by a section that runs before it would be counted.
+
+status="$(bid_post "$bid_customer_token" "verify-msg-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":432199}' msg-job)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-msg-job.json"; fail "creating the messaging job returned $status"; }
+msg_job_id="$(json "$WORKDIR/bid-msg-job.json" '["id"]')"
+move_job "$msg_job_id" Draft Open
+
+status="$(bid_post "$bid_provider_token" "verify-msg-bid-$$" "/v1/jobs/$msg_job_id/bids" "$bid_body" msg-bid)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-msg-bid.json"; fail "placing the offer the conversation hangs off returned $status"; }
+msg_bid_id="$(json "$WORKDIR/bid-msg-bid.json" '["id"]')"
+
+# The rival bids on the same job, so the refusal below is a *competitor with a live offer* rather
+# than a stranger — which is the reader Docs/01 §4.3's second line is about.
+status="$(bid_post "$bid_rival_token" "verify-msg-rival-bid-$$" "/v1/jobs/$msg_job_id/bids" "$bid_body" msg-rival-bid)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-msg-rival-bid.json"; fail "the rival's offer returned $status"; }
+msg_rival_bid_id="$(json "$WORKDIR/bid-msg-rival-bid.json" '["id"]')"
+
+msg_path="/v1/jobs/$msg_job_id/bids/$msg_bid_id/messages"
+
+# --- it cannot be reached without a credential, or without a key ------------------------
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-msg-anon.json" -w '%{http_code}' \
+  -H "Idempotency-Key: verify-msg-anon-$$" -H 'Content-Type: application/json' \
+  -d '{"body":"Anybody there?"}' "http://localhost:$VERIFY_PORT$msg_path")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-msg-anon.json"; fail "an unauthenticated message returned $status, want 401"; }
+
+status="$(curl -s -X POST -o "$WORKDIR/bid-msg-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_customer_token" -H 'Content-Type: application/json' \
+  -d '{"body":"Anybody there?"}' "http://localhost:$VERIFY_PORT$msg_path")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-msg-nokey.json"; fail "a message with no Idempotency-Key returned $status, want 400"; }
+ok "messaging needs a credential and an Idempotency-Key, like every other state-changing route"
+
+# --- both parties, one address ----------------------------------------------------------
+
+status="$(bid_post "$bid_customer_token" "verify-msg-1-$$" "$msg_path" \
+  '{"body":"Is there parking at the pickup end?"}' msg-1)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-msg-1.json"; fail "the customer's message returned $status, want 201"; }
+[[ "$(json "$WORKDIR/bid-msg-1.json" '["sent_by"]')" == "customer" ]] \
+  || { cat "$WORKDIR/bid-msg-1.json"; fail "the platform attributed the customer's message to somebody else"; }
+
+status="$(bid_post "$bid_provider_token" "verify-msg-2-$$" "$msg_path" \
+  '{"body":"There is a loading zone out the front."}' msg-2)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-msg-2.json"; fail "the provider's reply returned $status, want 201"; }
+[[ "$(json "$WORKDIR/bid-msg-2.json" '["sent_by"]')" == "provider" ]] \
+  || { cat "$WORKDIR/bid-msg-2.json"; fail "the platform attributed the provider's reply to somebody else"; }
+ok "one address serves both parties, and the platform decides which side each is on from the database rather than from the token"
+
+# **Every token in this file claims `role: customer`**, including the provider's — see the header. So
+# the attribution above is decided by `bids.provider_id` and `jobs.customer_id`, which is the whole
+# of what CLAUDE.md means by no authorisation decision on the device.
+
+# --- both read one conversation, oldest first --------------------------------------------
+
+msg_get() {
+  curl -s -o "$WORKDIR/bid-msg-read-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" "http://localhost:$VERIFY_PORT$2"
+}
+
+for reader in "$bid_customer_token:customer" "$bid_provider_token:provider"; do
+  status="$(msg_get "${reader%%:*}" "$msg_path" "${reader##*:}")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/bid-msg-read-${reader##*:}.json"; fail "the ${reader##*:} reading the conversation returned $status"; }
+
+  python3 - "$WORKDIR/bid-msg-read-${reader##*:}.json" "${reader##*:}" <<'CONVERSATION' || fail "the conversation is not what both parties wrote"
+import json, sys
+
+page = json.load(open(sys.argv[1]))
+rows = page["data"]
+
+want = [
+    ("customer", "Is there parking at the pickup end?"),
+    ("provider", "There is a loading zone out the front."),
+]
+got = [(r["sent_by"], r["body"]) for r in rows]
+if got != want:
+    sys.exit("the %s reads %r, want %r — both messages, oldest first" % (sys.argv[2], got, want))
+CONVERSATION
+done
+ok "both parties read one conversation, oldest first, with each message attributed to whoever wrote it"
+
+# --- and nobody else, including a provider bidding on the same job -----------------------
+
+# The rival reaching the first provider's conversation through *its* address, which is what a
+# competitor would actually try.
+status="$(msg_get "$bid_rival_token" "$msg_path" rival)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-msg-read-rival.json"; fail "a competing provider read the conversation: $status"; }
+
+# The same 404 a bid that does not exist gets, byte for byte. A refusal that differed would confirm
+# that a negotiation exists on a job the competitor is bidding against.
+absent_bid="$("$PSQL" "$DATABASE_URL" -tAc "select gen_random_uuid();" | tr -d ' ')"
+status="$(msg_get "$bid_rival_token" "/v1/jobs/$msg_job_id/bids/$absent_bid/messages" absent)"
+[[ "$status" == "404" ]] || fail "a conversation on a bid that does not exist returned $status, want 404"
+python3 - "$WORKDIR/bid-msg-read-rival.json" "$WORKDIR/bid-msg-read-absent.json" <<'IDENTICAL' || fail "the two refusals differ"
+import json, sys
+
+def shape(path):
+    body = json.load(open(path))["error"]
+    body.pop("request_id", None)
+    return body
+
+if shape(sys.argv[1]) != shape(sys.argv[2]):
+    sys.exit("a competitor is told something different from what a missing bid says: %r vs %r"
+             % (shape(sys.argv[1]), shape(sys.argv[2])))
+IDENTICAL
+
+status="$(bid_post "$bid_rival_token" "verify-msg-rival-write-$$" "$msg_path" \
+  '{"body":"What did they quote?"}' msg-rival-write)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-msg-rival-write.json"; fail "a competing provider wrote into the conversation: $status"; }
+ok "a provider holding a live offer on the same job gets exactly what a bid that does not exist gets, in both directions"
+
+# And their own conversation is a different one, which is what makes the refusal a scope rather than
+# a blanket.
+status="$(bid_post "$bid_rival_token" "verify-msg-rival-own-$$" \
+  "/v1/jobs/$msg_job_id/bids/$msg_rival_bid_id/messages" '{"body":"I can do Friday."}' msg-rival-own)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-msg-rival-own.json"; fail "the rival could not write in their own conversation: $status"; }
+
+status="$(msg_get "$bid_provider_token" "/v1/jobs/$msg_job_id/bids/$msg_rival_bid_id/messages" cross)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-msg-read-cross.json"; fail "the first provider read the rival's conversation: $status"; }
+ok "each provider has a conversation of their own with the customer, and neither can reach the other's"
+
+# --- the customer's budget reaches no provider, and the platform adds no words -----------
+
+# The fixture, verified rather than assumed: a disclosure check whose job has no budget passes
+# forever.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select budget from jobs where id = '$msg_job_id';")" == "4321.99" ]] \
+  || fail "the messaging job has no budget, so the checks below assert nothing"
+
+python3 - "$WORKDIR/bid-msg-read-provider.json" <<'WORDS' || fail "the conversation carries words nobody typed"
+import json, re, sys
+
+# **Word-level over rendered output, which is the only guard that works on a response carrying free
+# text.** Wave 10 isolated the disclosure "The customer has set a maximum." — no field, no value and
+# no digit — and a closed key set, a word search, a value search and an AST walk all missed it.
+#
+# So the assertion is inverted: every word in the rendered page has to have come from somewhere
+# legitimate, and anything left over is something the platform introduced. It does not need to
+# recognise a disclosure; it only needs to notice a word nobody put there.
+raw = open(sys.argv[1]).read()
+page = json.loads(raw)
+
+def words(text):
+    return [w for w in re.split(r"[^0-9a-z]+", text.lower()) if w]
+
+allowed = set()
+for token in ("data", "next_cursor", "has_more", "id", "sent_by", "body", "created_at",
+              "provider", "customer"):
+    allowed.update(words(token))
+
+for row in page["data"]:
+    allowed.update(words(row["body"]))       # what a party actually typed
+    allowed.update(words(row["id"]))         # the identifier, by its own rendered form
+    allowed.update(words(row["created_at"]))  # the instant, likewise
+
+if not page["data"]:
+    sys.exit("the page is empty, so this check proves nothing")
+
+left = sorted(set(words(raw)) - allowed)
+if left:
+    sys.exit("the conversation carries %r, which neither party typed and no field accounts for.\n%s"
+             % (left, raw))
+
+# And the budget by every spelling, kept beside the exhaustive check because it names what is being
+# protected.
+identifier = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+searchable = identifier.sub("<id>", raw).lower()
+for spelling in ("budget", "maximum", "4321.99", "432199", "4,321.99"):
+    if spelling in searchable:
+        sys.exit("the conversation carries %r: %s" % (spelling, raw))
+WORDS
+ok "every word a party reads is one of them typed it, a key of the closed set, an identifier or an instant — the platform adds no prose"
+
+# --- the retry, which is the column rather than the cache --------------------------------
+
+status="$(bid_post "$bid_customer_token" "verify-msg-1-$$" "$msg_path" \
+  '{"body":"Is there parking at the pickup end?"}' msg-retry)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-msg-retry.json"; fail "a retry under the original key returned $status, want 200"; }
+replayed_from_redis msg-retry || fail "the retry was not answered by the middleware, so this is not the cached case"
+
+# And once the cache has forgotten it, the row answers — which is the guarantee Redis cannot give.
+forget_the_cached_response "$bid_customer_id" "verify-msg-1-$$"
+status="$(bid_post "$bid_customer_token" "verify-msg-1-$$" "$msg_path" \
+  '{"body":"Is there parking at the pickup end?"}' msg-retry-cold)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-msg-retry-cold.json"; fail "a retry after the cache expired returned $status, want 200"; }
+replayed_from_redis msg-retry-cold && fail "the cold retry was answered from Redis, so the column was not what answered"
+[[ "$(json "$WORKDIR/bid-msg-retry-cold.json" '["id"]')" == "$(json "$WORKDIR/bid-msg-1.json" '["id"]')" ]] \
+  || fail "the cold retry answered with a different message"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_messages where job_id = '$msg_job_id' and provider_id = '$bid_provider_id';")" == "2" ]] \
+  || fail "two retries of one message left more than the two messages the parties sent"
+ok "a retry is answered from the row once the cached response has gone, and no second message is delivered"
+
+# --- what may be written ------------------------------------------------------------------
+
+status="$(bid_post "$bid_customer_token" "verify-msg-empty-$$" "$msg_path" '{"body":"   "}' msg-empty)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-msg-empty.json"; fail "a message of whitespace returned $status, want 422"; }
+[[ "$(json "$WORKDIR/bid-msg-empty.json" '["error"]["details"][0]["field"]')" == "body" ]] \
+  || { cat "$WORKDIR/bid-msg-empty.json"; fail "the refusal does not name the body field"; }
+
+status="$(bid_post "$bid_customer_token" "verify-msg-sender-$$" "$msg_path" \
+  '{"body":"Whose message is this?","sent_by":"provider"}' msg-sender)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-msg-sender.json"; fail "a body naming its own sender returned $status, want 400"; }
+ok "an empty message is refused with the field named, and a client cannot say which party it is writing as"
+
+# --- and it outlives the offer --------------------------------------------------------------
+
+status="$(bid_post "$bid_customer_token" "verify-msg-award-$$" "/v1/jobs/$msg_job_id/award" \
+  "{\"bid_id\":\"$msg_bid_id\"}" msg-award)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-msg-award.json"; fail "awarding the messaging job returned $status"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from bids where id = '$msg_rival_bid_id';")" == "Rejected" ]] \
+  || fail "the award did not close the rival's offer, so the check below is not about a closed one"
+
+status="$(bid_post "$bid_customer_token" "verify-msg-after-award-$$" "$msg_path" \
+  '{"body":"What time will the driver arrive?"}' msg-after-award)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-msg-after-award.json"; fail "a message after the award returned $status, want 201"; }
+
+# The losing provider keeps their conversation too, which is the same rule seen from the other end:
+# Docs/02 §4 keeps a negotiation's record readable once it is over.
+status="$(msg_get "$bid_rival_token" "/v1/jobs/$msg_job_id/bids/$msg_rival_bid_id/messages" losing)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-msg-read-losing.json"; fail "the losing provider lost their conversation: $status"; }
+ok "messaging follows the relationship rather than the offer — it keeps working after the award, for the winner and the loser alike"
+
+unset msg_job_id msg_bid_id msg_rival_bid_id msg_path absent_bid
+unset -f msg_get
