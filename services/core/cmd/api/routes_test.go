@@ -97,6 +97,7 @@ func testDeps() Deps {
 			Identity: testIdentityConfig(),
 			Delivery: testDeliveryConfig(),
 			Storage:  testStorageConfig(),
+			App:      testAppConfig(),
 		},
 		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		Clock:     clock.System{},

@@ -24,6 +24,27 @@ import (
 //
 // Overwriting one field on a copy has the property the literal did not: a section added tomorrow
 // arrives here already correct, because it arrives through whatever built the configuration.
+// testAppConfig is the App section testDeps carries, and it exists because the fourth section this
+// package needed collected on the literal exactly as withApp's note predicted.
+//
+// `TestResponsesMatchTheContract` found it: with a zero-valued App, `GET /v1/app/policy` answered
+// `{"unsynced_nudge_after_seconds":0,"proof_compression_budget_bytes":0}`, and the contract's
+// `minimum: 1` on both refused it. **That is the guard working rather than a nuisance** — a zero
+// threshold would prompt a provider about every update the instant they recorded it, and
+// `internal/config`'s `validate` refuses both values at startup, so the only way to produce one is a
+// fixture that builds configuration from a literal instead of from the loader.
+//
+// The values are the documented defaults, so a test that has no opinion about this section gets the
+// answer a fresh deployment gives.
+func testAppConfig() config.App {
+	return config.App{
+		MinimumIOSBuild:             1,
+		MinimumAndroidBuild:         1,
+		UnsyncedNudgeAfter:          4 * time.Hour,
+		ProofCompressionBudgetBytes: 1 << 20,
+	}
+}
+
 func withApp(deps Deps, app config.App) Deps {
 	cfg := *deps.Config
 	cfg.App = app
