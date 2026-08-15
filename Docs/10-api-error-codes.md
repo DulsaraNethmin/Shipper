@@ -56,7 +56,11 @@ them where the call is made, beside the thing the user was trying to do.
 | `admin_job_not_disputable` | A dispute can only be raised on a job that has been awarded and has not yet been completed or cancelled. Reload the job to see its current status. |
 | `admin_job_not_unpublishable` | A job can only be unpublished before it is awarded. Once a provider has committed, ending it is a dispute an administrator resolves — reload the job to see its current status. |
 | `admin_permission_denied` | This administrator account does not have permission to do that. Ask whoever administers the platform if you need it. |
+| `admin_same_administrator` | A suspension must be approved by a different administrator from the one who requested it. Docs/04 §9 requires two people. |
 | `admin_session_expired` | The administrator session has ended, through inactivity or by reaching its maximum length. Sign in again. |
+| `admin_suspension_needs_review` | A permanent suspension needs a second administrator's approval. Request one instead, and another administrator can approve it. |
+| `admin_suspension_review_outstanding` | This account already has a suspension waiting for a second administrator. Approve the existing request rather than making another. |
+| `admin_suspension_review_settled` | That suspension review has already been settled. Reload the queue — another administrator may have approved it. |
 | `admin_user_standing_unchanged` | This account already has that standing. Reload it — another administrator may have changed it already, and the audit trail will say who. |
 | `bidding_already_bid` | You already have a live offer on this job. Revise or withdraw it rather than placing a second. |
 | `bidding_bid_accepted` | That offer has been accepted. An accepted bid can be neither revised nor withdrawn. |

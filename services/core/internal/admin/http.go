@@ -57,17 +57,18 @@ import (
 // for intake that is this layer: the party check, the dispute row and the status change are one
 // decision against one version of the job.
 type Handler struct {
-	svc        *Service
-	creds      *Credentials
-	moderation *Moderation
-	cancels    *Cancellations
-	users      *Users
-	jobs       *JobConsole
-	trail      *AuditTrail
-	enforce    *Enforcement
-	notes      *Notes
-	pool       *pgxpool.Pool
-	log        *slog.Logger
+	svc         *Service
+	creds       *Credentials
+	moderation  *Moderation
+	cancels     *Cancellations
+	users       *Users
+	jobs        *JobConsole
+	trail       *AuditTrail
+	enforce     *Enforcement
+	notes       *Notes
+	suspensions *Suspensions
+	pool        *pgxpool.Pool
+	log         *slog.Logger
 }
 
 // HandlerServices is what a handler is built from, beyond the pool and the logger.
@@ -108,6 +109,9 @@ type HandlerServices struct {
 
 	// Notes is the internal support history (SHIP-162).
 	Notes *Notes
+
+	// Suspensions is Docs/04 §9's two-person review (SHIP-166).
+	Suspensions *Suspensions
 }
 
 // NewHandler wires the handlers to the services.
@@ -169,21 +173,29 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// the second-worst thing that happens that day.
 		return nil, errors.New("admin: a handler needs the notes service")
 	}
+	if s.Suspensions == nil {
+		// SHIP-166. The same argument once more, and here it guards a *control*: a nil
+		// discovered at the first request is a two-person review that panics the first time
+		// somebody tries to exercise it, which is a moment when the console failing looks
+		// exactly like the control refusing.
+		return nil, errors.New("admin: a handler needs the suspension review service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
 	return &Handler{
-		svc:        s.Disputes,
-		creds:      s.Credentials,
-		moderation: s.Moderation,
-		cancels:    s.Cancellations,
-		users:      s.Users,
-		jobs:       s.Jobs,
-		trail:      s.Trail,
-		enforce:    s.Enforcement,
-		notes:      s.Notes,
-		pool:       pool,
-		log:        log,
+		svc:         s.Disputes,
+		creds:       s.Credentials,
+		moderation:  s.Moderation,
+		cancels:     s.Cancellations,
+		users:       s.Users,
+		jobs:        s.Jobs,
+		trail:       s.Trail,
+		enforce:     s.Enforcement,
+		notes:       s.Notes,
+		suspensions: s.Suspensions,
+		pool:        pool,
+		log:         log,
 	}, nil
 }
 
@@ -583,6 +595,35 @@ func apiError(err error) error {
 		return fieldProblem("ground", fmt.Errorf(
 			"that is not a delivery-exception ground; use one of %s",
 			strings.Join(groundNames(), ", ")))
+
+	// --- Docs/04 §9's two-person review (SHIP-166) -------------------------------------------
+
+	case errors.Is(err, ErrSuspensionNeedsReview):
+		return httpx.NewError(http.StatusConflict, CodeSuspensionNeedsReview,
+			"A permanent suspension needs a second administrator's approval. "+
+				"Request one instead.").WithCause(err)
+
+	case errors.Is(err, ErrSameAdministrator):
+		// 409 rather than 403. The caller holds the permission and the request is
+		// well-formed; what is refused is the *state* — this review is theirs — which is a
+		// conflict rather than a matter of authorisation. A 403 would read as "you may not
+		// approve suspensions", which is not what happened.
+		return httpx.NewError(http.StatusConflict, CodeSameAdministrator,
+			"A suspension must be approved by a different administrator from the one who "+
+				"requested it.").WithCause(err)
+
+	case errors.Is(err, ErrSuspensionReviewNotFound):
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such suspension review.").WithCause(err)
+
+	case errors.Is(err, ErrSuspensionReviewSettled):
+		return httpx.NewError(http.StatusConflict, CodeSuspensionReviewSettled,
+			"That suspension review has already been settled.").WithCause(err)
+
+	case errors.Is(err, ErrSuspensionReviewOutstanding):
+		return httpx.NewError(http.StatusConflict, CodeSuspensionReviewOutstanding,
+			"This account already has a suspension waiting for a second administrator.").
+			WithCause(err)
 
 	case errors.Is(err, ErrStandingUnchanged):
 		return httpx.NewError(http.StatusConflict, CodeUserStandingUnchanged,
@@ -2273,12 +2314,14 @@ type standingResponse struct {
 // Docs/01 §4.6's fourth capability — "restrict or suspend accounts with a recorded reason" — behind
 // [PermissionUsersRestrict], which `moderator` and `owner` hold and `support` does not.
 //
-// # One endpoint for all three standings, including putting an account back
+// # One endpoint for two of the three standings — `suspended` left it at SHIP-166
 //
-// `restricted`, `suspended` and `active` are one vocabulary (`ck_users_status`), the permission to
-// move between them is one permission, and the reason is required in every direction. A separate
-// reinstate endpoint would be a second place for the reason to become optional, and the direction is
-// already in the response and in the entry.
+// `restricted` and `active` are one vocabulary and one permission, and the reason is required in
+// both directions; a separate reinstate endpoint would be a second place for the reason to become
+// optional. **`suspended` is refused here** with `admin_suspension_needs_review`, pointing at
+// `POST /v1/admin/users/{id}/suspension` — Docs/04 §9 requires two administrators for a permanent
+// suspension, and an endpoint that did half of that quietly would be the control's worst failure
+// mode. See enforcement.go.
 //
 // # What enforcement this adds: none, deliberately
 //
@@ -2327,6 +2370,189 @@ func (h *Handler) SetStanding() http.Handler {
 		})
 		return nil
 	})
+}
+
+// --- SHIP-166: two-person review for permanent suspension ----------------------------------------
+
+// suspensionRequestBody is the body of POST /v1/admin/users/{id}/suspension.
+//
+//	{"reason": "Three unresolved safety reports in a fortnight; see note 0198f2c1."}
+//
+// A reason and nothing else. No account identifier — it is in the path — and **no administrator**:
+// who is asking comes from the verified session, because a two-person control whose participants a
+// client could name has one participant.
+type suspensionRequestBody struct {
+	Reason string `json:"reason"`
+}
+
+// suspensionReviewResponse is one review as the console sees it.
+//
+// **Both administrators are on it once a review is approved**, which is the whole record a
+// two-person control produces. `approved_by` is empty while it is pending, rather than absent, so a
+// console that renders without checking does not crash on the ordinary case.
+type suspensionReviewResponse struct {
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+
+	// Status is `pending`, `approved` or `withdrawn`. There is deliberately no `rejected` — see
+	// [ReviewWithdrawn].
+	Status string `json:"status"`
+
+	// RequestedBy is the administrator who made the case.
+	RequestedBy string `json:"requested_by"`
+
+	// Reason is that case, recorded once at the request. The approval has no reason of its own:
+	// two free-text accounts of one decision is two things to reconcile afterwards.
+	Reason string `json:"reason"`
+
+	// ApprovedBy and ApprovedAt are the second administrator. Empty while pending.
+	ApprovedBy string `json:"approved_by"`
+	ApprovedAt string `json:"approved_at"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+func suspensionReviewFrom(r SuspensionReview) suspensionReviewResponse {
+	approvedBy := ""
+	if r.ApprovedBy != uuid.Nil {
+		approvedBy = r.ApprovedBy.String()
+	}
+
+	return suspensionReviewResponse{
+		ID:          r.ID.String(),
+		UserID:      r.UserID.String(),
+		Status:      r.Status.String(),
+		RequestedBy: r.RequestedBy.String(),
+		Reason:      r.Reason,
+		ApprovedBy:  approvedBy,
+		ApprovedAt:  timestamp(r.ApprovedAt),
+		CreatedAt:   timestamp(r.CreatedAt),
+	}
+}
+
+// RequestSuspension handles POST /v1/admin/users/{id}/suspension (SHIP-166).
+//
+// The first half of Docs/04 §9's control: one administrator proposes, with a reason, and **nothing
+// happens to the account**. [PermissionUsersRestrict], which `moderator` and `owner` hold.
+//
+// `202 Accepted` rather than `201`. A review is created, but what the caller asked for — the
+// suspension — has not happened and may not; 202 is the status for "the platform has accepted this
+// and the outcome is elsewhere", and a 201 would read to a console as though the account were gone.
+func (h *Handler) RequestSuspension() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := h.permitted(r, PermissionUsersRestrict)
+		if err != nil {
+			return err
+		}
+
+		userID, err := userIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req suspensionRequestBody
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		review, err := h.suspensions.Request(r.Context(), SuspensionRequest{
+			UserID:  userID,
+			ActorID: grant.Administrator.ID,
+			Reason:  req.Reason,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusAccepted, suspensionReviewFrom(review))
+		return nil
+	})
+}
+
+// ApproveSuspension handles POST /v1/admin/suspensions/{id}/approval (SHIP-166).
+//
+// The second half, and the one the control turns on: a **different** administrator agrees, and the
+// suspension is applied in the same transaction. [PermissionUsersRestrict], the same permission the
+// request needs — the control is that there are two people, not that the second holds something the
+// first does not, and a separate approval permission would make the second signature a role rather
+// than a review.
+//
+// `admin_same_administrator` is what the requester gets back if they approve their own request. The
+// service refuses it and so does `ck_suspension_reviews_two_people`; this is the message.
+func (h *Handler) ApproveSuspension() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := h.permitted(r, PermissionUsersRestrict)
+		if err != nil {
+			return err
+		}
+
+		reviewID, err := reviewIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		review, err := h.suspensions.Approve(r.Context(), SuspensionApproval{
+			ReviewID: reviewID,
+			ActorID:  grant.Administrator.ID,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, suspensionReviewFrom(review))
+		return nil
+	})
+}
+
+// PendingSuspensions handles GET /v1/admin/suspensions (SHIP-166).
+//
+// **Without this the control does not work.** A second administrator has to be able to find a
+// request they did not make, and a review nobody can see is a review nobody approves — which turns a
+// two-person rule into an account that stays active because the queue was invisible.
+//
+// [PermissionUsersRead], which every role holds including `support`: seeing that a suspension has
+// been proposed is looking, and acting on it is the permission on the other endpoint.
+func (h *Handler) PendingSuspensions() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionUsersRead); err != nil {
+			return err
+		}
+
+		limit, err := pagination.Limit(r.URL.Query().Get("limit"))
+		if err != nil {
+			return err
+		}
+
+		reviews, err := h.suspensions.Pending(r.Context(), limit)
+		if err != nil {
+			return apiError(err)
+		}
+
+		out := make([]suspensionReviewResponse, 0, len(reviews))
+		for _, review := range reviews {
+			out = append(out, suspensionReviewFrom(review))
+		}
+
+		// No cursor. The pending set is bounded by how many accounts are under review at once,
+		// which is a handful rather than a page — see postgres_suspension.go. The envelope is
+		// the standard one either way, so widening it later changes no client.
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, ""))
+		return nil
+	})
+}
+
+// reviewIDFrom reads and parses the {id} path parameter on the suspension routes.
+//
+// A third function beside [jobIDFrom] and [userIDFrom] rather than a shared one, for the reason
+// userIDFrom records: the message names the thing, and "the account id in the path" on a review
+// route sends somebody looking in the wrong place.
+func reviewIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That suspension review id is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
 }
 
 // userIDFrom reads and parses the {id} path parameter on the account routes.

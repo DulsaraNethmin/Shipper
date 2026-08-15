@@ -344,6 +344,14 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin cancellations: " + err.Error())
 	}
 
+	// SHIP-166. Docs/04 §9's two-person review. It needs the auditor and nothing else: the table
+	// is this domain's own, in its own migration block, so there is no port and no statement in
+	// this file — which postgres_users.go's rule predicts.
+	suspensions, err := admin.NewSuspensions(auditor, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin suspensions: " + err.Error())
+	}
+
 	// SHIP-151. It takes the pool alone: the search reads `users`, which is a shared table this
 	// domain may read directly, and there is no port to supply. See internal/admin/postgres_users.go
 	// for why that is not the arrangement jobPartiesLookup and exceptionQueueLookup use.
@@ -404,6 +412,7 @@ func adminHandler(d Deps) *admin.Handler {
 		Trail:         trail,
 		Enforcement:   enforcement,
 		Notes:         notes,
+		Suspensions:   suspensions,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())

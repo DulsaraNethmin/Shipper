@@ -364,6 +364,47 @@ var (
 	// ErrNoteTooLong means a note is longer than the column holds.
 	ErrNoteTooLong = errors.New("admin: that note is longer than this field holds")
 
+	// ErrSuspensionNeedsReview means somebody tried to suspend an account through the standing
+	// endpoint, which one administrator may no longer do alone (SHIP-166).
+	//
+	// A typed error rather than a validation failure on the field: `suspended` is a standing the
+	// platform has and the caller has not mistyped anything. What they need is the other route.
+	ErrSuspensionNeedsReview = errors.New(
+		"admin: a permanent suspension needs a second administrator's approval")
+
+	// ErrSameAdministrator means one administrator tried to complete a two-person review alone
+	// (SHIP-166).
+	//
+	// **This is the whole of Docs/04 §9's control**, and it is refused in two places: here, one
+	// statement before the write, and by `ck_suspension_reviews_two_people` in the database. The
+	// constraint is what makes it a control — application logic refusing to write is a convention,
+	// and a convention does not apply to a repair script or a psql prompt.
+	ErrSameAdministrator = errors.New(
+		"admin: the administrator who requested a suspension cannot be the one who approves it")
+
+	// ErrSuspensionReviewNotFound means no review with that identifier exists.
+	//
+	// Disclosed plainly, like [ErrUserNotFound] and for the same reason: the caller is an
+	// authenticated administrator holding `users.restrict`, and there is nothing here being kept
+	// from them.
+	ErrSuspensionReviewNotFound = errors.New("admin: no such suspension review")
+
+	// ErrSuspensionReviewSettled means the review has already been approved or withdrawn.
+	//
+	// The ordinary outcome of two moderators reading the same queue, and the console's right
+	// response is to reload — most often because the other one got there first, which is the
+	// control working rather than failing.
+	ErrSuspensionReviewSettled = errors.New("admin: that suspension review has already been settled")
+
+	// ErrSuspensionReviewOutstanding means the account already has a review waiting.
+	//
+	// Refused by `uq_suspension_reviews_one_pending` rather than by a check-then-insert, which
+	// two moderators on one account lose in practice. Two pending reviews would also let one
+	// administrator approve the other's request while their own waited — the letter of a
+	// two-person rule with one person driving both halves.
+	ErrSuspensionReviewOutstanding = errors.New(
+		"admin: this account already has a suspension review waiting for a second administrator")
+
 	// ErrStandingUnchanged means the account already holds the standing it was being moved to.
 	//
 	// Refused rather than recorded. An entry saying "changed from suspended to suspended" is
@@ -404,4 +445,44 @@ var (
 	CodeUserStandingUnchanged = httpx.RegisterCode("admin_user_standing_unchanged",
 		"This account already has that standing. Reload it — another administrator may have "+
 			"changed it already, and the audit trail will say who.")
+
+	// --- Docs/04 §9's two-person review (SHIP-166) -----------------------------------------------
+
+	// CodeSuspensionNeedsReview is returned when somebody suspends through the standing endpoint.
+	//
+	// 409 rather than 422: `suspended` is a standing the platform has and nothing was mistyped.
+	// What changed is *who may do it alone*, and a console branching on this code sends the same
+	// reason to the review endpoint rather than asking the moderator to retype it.
+	CodeSuspensionNeedsReview = httpx.RegisterCode("admin_suspension_needs_review",
+		"A permanent suspension needs a second administrator's approval. Request one instead, "+
+			"and another administrator can approve it.")
+
+	// CodeSameAdministrator is the whole of the control, as a client sees it (SHIP-166).
+	//
+	// A distinct code because the console's response is specific and is not "try again": the
+	// person reading it must fetch somebody else. It is deliberately **not** a 403 — the caller
+	// holds `users.restrict`, and a permission error would read as "you may not approve
+	// suspensions", which is the wrong thing to learn.
+	CodeSameAdministrator = httpx.RegisterCode("admin_same_administrator",
+		"A suspension must be approved by a different administrator from the one who requested "+
+			"it. Docs/04 §9 requires two people.")
+
+	// CodeSuspensionReviewSettled is returned when the review has already been approved or
+	// withdrawn.
+	//
+	// The ordinary outcome of two moderators reading one queue, and the console's right response
+	// is to reload — most often because the other one got there first, which is the control
+	// working rather than failing.
+	CodeSuspensionReviewSettled = httpx.RegisterCode("admin_suspension_review_settled",
+		"That suspension review has already been settled. Reload the queue — another "+
+			"administrator may have approved it.")
+
+	// CodeSuspensionReviewOutstanding is returned when the account already has one waiting.
+	//
+	// Distinct from the code above because the action differs: this one says *find the existing
+	// review and approve it*, and a second request would be a second thing for somebody to
+	// approve. `uq_suspension_reviews_one_pending` is what makes it a refusal rather than a race.
+	CodeSuspensionReviewOutstanding = httpx.RegisterCode("admin_suspension_review_outstanding",
+		"This account already has a suspension waiting for a second administrator. Approve the "+
+			"existing request rather than making another.")
 )

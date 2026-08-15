@@ -278,12 +278,17 @@ func (e *Enforcement) Unpublish(ctx context.Context, cmd UnpublishCommand) error
 // table whose value is that everything in it happened, and the console's right response is to reload
 // — most often because another administrator got there first.
 //
-// # Two-person review is SHIP-166 and is not here
+// # Suspension left this endpoint at SHIP-166, and the refusal is the control being visible
 //
 // Docs/04 §9 asks for "two-person review for permanent account suspension where practical", and
-// SHIP-166 is that ticket. Nothing below anticipates it: there is no pending state and no approval
-// column, because a half-built approval is worse than none — an administrator who sees a
-// "pending approval" that nothing enforces believes there is a control.
+// SHIP-166 built it. **`suspended` is refused here**, with [ErrSuspensionNeedsReview] pointing at
+// `POST /v1/admin/users/{id}/suspension` — because a standing endpoint that quietly did half of a
+// two-person review, or that suspended and then asked for a signature, would be the "half-built
+// approval" this comment previously warned against. One person can still restrict and reinstate.
+//
+// The refusal is a **typed error rather than a validation failure on the field**: `suspended` is a
+// standing the platform has, the caller has not made a mistake about the vocabulary, and the console
+// needs to know where to go rather than that the value is wrong.
 func (e *Enforcement) SetStanding(ctx context.Context, cmd StandingCommand) (StandingChange, error) {
 	if cmd.UserID == uuid.Nil {
 		return StandingChange{}, ErrUserNotFound
@@ -293,6 +298,12 @@ func (e *Enforcement) SetStanding(ctx context.Context, cmd StandingCommand) (Sta
 	}
 	if !cmd.Standing.Valid() {
 		return StandingChange{}, fmt.Errorf("%w: %q", ErrStandingUnrecognised, cmd.Standing)
+	}
+	if cmd.Standing == StandingSuspended {
+		// Docs/04 §9. Checked before the reason and before the pool, so that a console asking
+		// for the wrong thing is told so without a round trip to the database and without a
+		// second validation failure to render alongside the redirection.
+		return StandingChange{}, ErrSuspensionNeedsReview
 	}
 	if err := checkReason(cmd.Reason); err != nil {
 		return StandingChange{}, err

@@ -113,6 +113,11 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the notes service: %v", err)
 	}
 
+	suspensions, err := NewSuspensions(auditor, pool)
+	if err != nil {
+		t.Fatalf("building the suspension review: %v", err)
+	}
+
 	return HandlerServices{
 		Disputes:      testDisputeService(t),
 		Credentials:   creds,
@@ -123,6 +128,7 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		Trail:         trail,
 		Enforcement:   enforce,
 		Notes:         notes,
+		Suspensions:   suspensions,
 	}
 }
 
