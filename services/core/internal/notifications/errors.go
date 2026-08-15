@@ -35,6 +35,23 @@ var (
 	// row is written, and what reaches a consumer is only the transient class.
 	ErrNoRule = errors.New("notifications: no routing rule for this event type")
 
+	// ErrRedacted is returned when rendered copy breaks SHIP-141's rules.
+	//
+	// Docs/01 §4.4: no address, no goods description and no full customer name in a
+	// notification. redaction.go carries the four rules and what each is for.
+	//
+	// It stops the message rather than scrubbing it, and the two are not close. A scrub would
+	// send something — a sentence with a hole in it, to somebody who cannot tell what was
+	// removed — and would leave the copy that produced it in rules.go for the next event to
+	// use. Refusing makes the defect visible in one place and sends nothing meanwhile.
+	//
+	// Reaching this at runtime should be impossible: every input to [Render] is a compile-time
+	// literal, and TestNoRuleCanRenderCopyThatBreaksTheRedactionRules holds the whole routing
+	// table on every channel. It is an error rather than a panic because [Consume] runs inside
+	// a transaction holding a Kafka partition's progress — a panic there stops a consumer where
+	// an error stops one message.
+	ErrRedacted = errors.New("notifications: this copy cannot be sent to a handset")
+
 	// ErrNoSender is returned when a row names a channel this process cannot send on.
 	//
 	// The row stays claimable rather than being marked failed, because the fault is in the

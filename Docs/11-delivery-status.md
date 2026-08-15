@@ -586,6 +586,8 @@ The file's own header says which invocation demonstrates which claim.
 
 | **SHIP-134a** | M5 | The harness stops being the hazard it was asserting against. `80-notifications.sh` deleted `shipper.delivery` **twice** to stage a drifted topic, on a broker every worktree shares — so `cmd/topics` now reads the **replication factor** back as well as the partition count, and the refusal is demonstrated by asking for three replicas the single-broker stack cannot hold: **the request drifts, not the cluster.** The partition branch moved to a unit test that needs no broker. The *Done when*'s "run two `make verify` concurrently" **asks for exactly what wave 10's mutex exists to prevent**, so the reading taken is a concurrent **publisher** rather than a concurrent harness, and the provenance count is asserted rather than printed — *see below* |
 
+| **SHIP-141** | M5 | Push content redaction — **two guards, because wave 10 proved one of them insufficient.** The structural half was already there and covers what would have to arrive through the event; what this adds is a **word-level** guard over *rendered* copy, because `Rule.Headline` is free prose in a Go literal and wave 10 isolated a sentence carrying no field and no value that a thirteen-test suite passed with live. Four rules: **no digit** once the job identifier is removed, no capitalised word mid-sentence outside a **two-word** allowlist, no street type from a closed Australian list, no `@` or link. `Render` refuses with `ErrRedacted` and writes nothing. **What it cannot catch is named rather than glossed**: a lower-case goods description trips nothing, and that half is structural only — *see below* |
+
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
 ### What SHIP-15a built
@@ -11994,6 +11996,96 @@ carries it as a decision nobody has taken rather than as work left half done.
 **Nothing was needed from `internal/config`.** The replication factor is already
 `KAFKA_REPLICATION_FACTOR` with a `-replication` flag over it (SHIP-15m), which is what the
 demonstration uses; adding a variable here would have been a second way to say the same thing.
+
+### SHIP-141 — two guards, because the structural one has a hole wave 10 walked through
+
+Two points, and the interesting part is why the ticket was not already finished. SHIP-138's summary
+row says "so SHIP-141 stays structural", and that was true of everything the *event* could carry and
+false of the thing a person types.
+
+#### The structural guard covers the payload and stops at the routing table
+
+`facts` — everything this domain reads out of an event — has six fields, all identifiers or routing
+values. `content`, everything a template may be handed, has two, neither from the payload. A
+renderer cannot leak what it was never given, and `text/template` makes that enforceable rather than
+aspirational: a template naming a field the struct does not have fails to execute.
+
+**`Rule.Headline` is outside all of it.** It is a Go string literal in `rules.go`, edited by whoever
+writes the next ticket's copy, and nothing checked what it said. Wave 10's lane D established what
+that costs on the neighbouring invariant: it isolated the sentence *"The customer has set a
+maximum."* — no field name, no value, prose alone — and the thirteen-test budget-privacy suite passed
+with it live. **A test that asserts on a field name does not catch a leak written as prose**, and
+the same hole is the same size here: "Collect from 12 Collins Street" needs no schema change to
+reach a lock screen.
+
+#### The word-level guard, and why each of the four rules is the shape it is
+
+It runs over **rendered** text with the job identifier removed, so it sees what a handset shows
+rather than a template source — a template assembling a forbidden phrase from permitted parts would
+pass a check on its source.
+
+1. **No digit.** A street number, a unit, a postcode, a weight, a quantity and an amount are all
+   digits. It is the most effective rule here precisely because it is not a vocabulary — it does not
+   have to know what a postcode looks like. Removing the job identifier first is what lets the rule
+   be "no digits at all" rather than "no digits except these", which is the version somebody widens.
+2. **No capitalised word mid-sentence**, outside a two-word allowlist (`Shipper`, `Job`). This is
+   the rule that catches a person, and it catches one with no field name and no digits in sight. It
+   also catches a suburb, a street name and a business, which is most of an address once the number
+   has gone.
+3. **No street type**, case-insensitively, from a closed list. Australia Post publishes the set, so
+   unlike a goods vocabulary it is genuinely closed. It is the rule that catches an address written
+   in lower case, which rules 1 and 2 both miss.
+4. **No `@` and no link.** A push carrying a link is a phishing surface as well as a disclosure.
+
+`Render` returns `ErrRedacted` and **writes nothing**. It is the only writer of a notification's
+text — `Consume` renders and inserts in the same loop — so nothing reaches the table that has not
+been through it. Both the subject and the body are checked, not only the body: on a push the subject
+is the bold line the handset shows, which is the more visible half on the surface this ticket is
+about.
+
+#### What it cannot catch, stated rather than left to be found
+
+**A goods description in lower case with no digits.** "two pallets of copper piping" trips none of
+the four rules, and no textual rule distinguishes it from ordinary prose. A goods blocklist would be
+endlessly incomplete and, worse, would invite the belief that it was not. That half of the
+*Done when* is met **structurally and only structurally**, and the same is true of a name written in
+lower case. `TestTheFactsThisDomainReadsCarryNothingToLeak` is the guard those two halves have: it
+refuses a field on `facts` whose name contains any of eighteen words, so the disclosure has to be
+argued for before it can be carried.
+
+The two guards are weak in exactly the places the other is strong, which is the reason for having
+two rather than a better one.
+
+#### False positives fail the build, and that is the direction chosen
+
+"drive", "court", "lane" and "terrace" are street types and ordinary English, so copy using one is
+refused and has to be reworded. `way`, `close`, `rise`, `view`, `grove` and `quay` were left **out**
+of the list for that reason — an address using one still carries a street number and a capitalised
+street name. The sentence-start rule likewise resolves ambiguity towards permitting: a guard that
+fires on ordinary copy gets widened until it fires on nothing, which is the failure mode of every
+heuristic left in a build.
+
+#### The mutation, and what it establishes
+
+`pushBody` was mutated from `Job {{.JobID}}` to a literal carrying `12 Collins Street`, which is the
+ticket's whole content put back. **Four tests failed and the verdict is in §7's wave notes**; the
+important part is which ones and why, because the shape wave 10 warned about did occur: the tests
+that failed are the ones that read *rendered output*, and every test that asserts on a field name or
+a struct shape passed with the address live. `TestTheClosedInputIsStillClosed` passed. So did
+`TestNoNotificationFieldCanCarryABudget`. The structural suite is untouched by a leak of this shape,
+which is the whole argument for the second guard, demonstrated rather than asserted.
+
+#### What was declined
+
+**A re-check at dispatch time.** `Dispatch` reads subject and body from the table rather than from
+`Render`, so a row written by an older build could in principle carry copy this guard would refuse.
+It was not added: `Render` is the only writer, and a redaction failure at dispatch would need either
+a fifth `last_error` shape on the terminal `undeliverable` status — which SHIP-176's alerting would
+have to learn to distinguish from a dead device token — or a `failed` row retried forever. Neither is
+worth it for a case that cannot arise while `Consume` is the only path into the table. If a second
+writer ever appears, this is the paragraph to revisit.
+
+**Nothing was needed from `internal/config`.** A redaction rule with a switch is not a rule.
 
 
 ## 4. Partly done — do not treat these as finished
