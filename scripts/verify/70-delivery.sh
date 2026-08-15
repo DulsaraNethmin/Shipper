@@ -834,6 +834,87 @@ unset conflict_job conflict_milestone_id conflict_row conflict_last still_on_del
 unset -f delivery_admin_move
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-128  an update unsynced for a day raises an operations alert when it lands"
+
+# Docs/02 §3.1's ladder has three rungs and this is the last: "24 hours — operations alert. The job
+# is treated as at risk and enters the delivery-exception queue (04 §5)." SHIP-126 built the first
+# rung and SHIP-127 the second, both on the handset, both measuring `enqueued_at` — a column the
+# platform has never seen.
+#
+# # What the platform measures instead, and 000601 named it before this ticket existed
+#
+# `server_recorded_at - actor_recorded_at`. The two clocks SHIP-110 kept apart *are* how long the
+# update was unsynced, and 000601 says so: `server_recorded_at` is "what makes an unsynced-milestone
+# threshold (Docs/02 §6.5) measurable". No column is added and no flag is written — the rows are the
+# queue, which is the reading `admin.ExceptionQueue` takes of its own.
+#
+# # This section demonstrates the alert; the queue is Go's to demonstrate
+#
+# `delivery.UnsyncedMilestones` has no HTTP surface until SHIP-157 builds the screen, so it is
+# covered against a real database in internal/delivery. What only a running process can show is the
+# alert itself, and `$WORKDIR/server.log` is where this harness already reads the service's structured
+# output.
+#
+# **Both instants come from the platform's own clock**, computed here and sent as `recorded_at`, so
+# there is no calendar literal for the real date to overtake — the trap wave 9 closed on the 72-hour
+# ticket, and a threshold section is the shape most likely to fall into it.
+unsynced_job="$(delivery_awarded_job unsynced)"
+delivery_move "$unsynced_job" Awarded 'En route to pickup'
+
+# Twenty-five hours behind: a driver who recorded the pickup yesterday morning in a place with no
+# coverage, and whose phone has only now found some.
+unsynced_at="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-unsynced.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-unsynced" \
+  -H 'Content-Type: application/json' \
+  -d "{\"milestone\":\"picked_up\",\"recorded_at\":\"$unsynced_at\"}" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$unsynced_job/milestones")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-unsynced.json"; fail "a day-old update returned $status, want 201 — a stale update is still a recording"; }
+unsynced_milestone_id="$(json "$WORKDIR/ms-unsynced.json" '["id"]')"
+ok "an update recorded a day ago is accepted when it finally lands — being late is not being wrong"
+
+# The gap, from the row rather than from what the endpoint said about itself. `>= interval '24 hours'`
+# is the queue's own predicate, so this asserts the row would be selected by it.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select server_recorded_at - actor_recorded_at >= interval '24 hours'
+     from milestones where id = '$unsynced_milestone_id';")" == "t" ]] \
+  || fail "the stored gap is $("$PSQL" "$DATABASE_URL" -tAc "select server_recorded_at - actor_recorded_at from milestones where id = '$unsynced_milestone_id';"), want at least 24 hours"
+ok "the two clocks are a day apart on the stored row — the gap is measured, not asserted by the client"
+
+# The alert. At WARN, naming the job and the gap, so a log search can find it and order by it.
+unsynced_line="$(grep -F "\"milestone_id\":\"$unsynced_milestone_id\"" "$WORKDIR/server.log" \
+  | grep -F 'more than a day after it was recorded' | tail -1)"
+[[ -n "$unsynced_line" ]] \
+  || { grep -F "$unsynced_milestone_id" "$WORKDIR/server.log" | tail -5; fail "no operations alert was logged for an update a day out of sync"; }
+[[ "$unsynced_line" == *'"level":"WARN"'* ]] \
+  || fail "the unsynced alert is not at WARN: $unsynced_line"
+[[ "$unsynced_line" == *"\"job_id\":\"$unsynced_job\""* && "$unsynced_line" == *'"unsynced_for"'* ]] \
+  || fail "the alert does not name the job and the gap: $unsynced_line"
+ok "it raises an operations alert at WARN, naming the job and how far behind the record ran"
+
+# And the rung is a threshold rather than "any gap at all". An update inside the four-hour rung is
+# the handset's business (SHIP-127) and must not page anybody.
+nudge_job="$(delivery_awarded_job unsynced-nudge)"
+delivery_move "$nudge_job" Awarded 'En route to pickup'
+nudge_at="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-nudge.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-nudge" \
+  -H 'Content-Type: application/json' \
+  -d "{\"milestone\":\"picked_up\",\"recorded_at\":\"$nudge_at\"}" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$nudge_job/milestones")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-nudge.json"; fail "a three-hour-old update returned $status, want 201"; }
+nudge_milestone_id="$(json "$WORKDIR/ms-nudge.json" '["id"]')"
+
+grep -F "\"milestone_id\":\"$nudge_milestone_id\"" "$WORKDIR/server.log" \
+  | grep -qF 'more than a day after it was recorded' \
+  && fail "an update three hours behind raised the twenty-four-hour alert; the rung is a threshold"
+ok "and an update inside the four-hour rung raises nothing here — that one is the handset's (SHIP-127)"
+
+unset unsynced_job unsynced_at unsynced_milestone_id unsynced_line nudge_job nudge_at nudge_milestone_id
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-108  a driver token grants exactly one job and cannot be exchanged for a user session"
 
 # # What only this section can show

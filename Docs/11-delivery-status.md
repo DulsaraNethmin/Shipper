@@ -490,6 +490,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
 | **SHIP-127** | M4 | Flutter four-hour unsynced nudge — `Docs/02` §3.1's second rung, and **a prompt rather than a fourth line in SHIP-126's bar**: a card over a scrim, above the router, dismissed by an explicit tap and by nothing else. It measures `enqueued_at` of the oldest **pending or in-flight** operation and excludes quarantined work, because the whole content of the prompt is *go and find signal*. **No timer at all** — a published snapshot and the clock at build time, because every trigger that brings a person back to the app already publishes one. Finding: **the queue's clock and the nudge's clock have to be the same one**, which no fixture had needed until now. The four hours is a value rather than a constant and **should not stay on the device** — *see below* |
+| **SHIP-128** | M4 | Operations alert at 24 hours unsynced — `Docs/02` §3.1's third rung, and **the platform's own measure of "unsynced", which is `server_recorded_at - actor_recorded_at`**: the pair SHIP-110 kept apart, which `000601` had already named as what makes this threshold measurable. **No column, no flag and no second table** — the rows are the queue, the reading `admin.ExceptionQueue` takes of its own. The alert is a WARN line when a long-unsynced update *lands*; `delivery.UnsyncedMilestones` is the queue SHIP-157 renders. **What it deliberately cannot see is named rather than narrowed away**: an update still on a handset has not arrived, and a job that has stopped moving is SHIP-177's different fact — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
 | **SHIP-130** | M4 | Flutter camera capture with on-device compression — **`camera` and not `image_picker`**, because the one-line answer hands the capture to the manufacturer's camera application and several of those keep a copy in `DCIM/Camera`, which no Dart can prevent or observe. The negative is proved from the two places that can enforce one: **no Android media permission and no iOS photo-library string**, both asserted. Compression is **pure Dart** so a host test measures it on real JPEGs, EXIF included. It also builds the **three-request upload exchange** SHIP-125 left as an `UnimplementedError` — and corrects that comment, which named a multipart send the platform does not have. `delivered` becomes recordable from the app for the first time — *see below* |
 | **SHIP-131** | M4 | Flutter camera permission fallback — `Docs/01` §4.4's three reasons, chosen and queued as `POST /v1/jobs/{id}/milestones` with `proof.exception_reason`. **The copy was already right and the button under it did nothing**, which SHIP-130 said in as many words when it declined to offer one. Queued as `OperationKind.milestone` and not `proof` — there is no file — which is also what puts a recorded exception in the driver's own pending log. The confirmation is **its own stage**, because "Photograph saved" about an exception is a driver who believes they photographed a delivery they did not. Deliberate scope: the reason is reachable with a **working** camera, since only one of the three is about the camera at all — *see below* |
@@ -10932,6 +10933,99 @@ because it asserted only that *an* error came back. Both now drive a premature `
 delivery, which reaches the branch; the genuinely unreachable-but-skipped case is held by the
 derivation test against `Docs/02` §2 directly, and the verify section says so rather than pretending
 to cover it.
+
+
+### SHIP-128 — the platform's measure of "unsynced" was already in the schema, waiting
+
+`Docs/02` §3.1's ladder has three rungs. SHIP-126 built the first and SHIP-127 the second, both on
+the handset and both measuring `enqueued_at` — a column that never leaves the device. This is the
+third: *"24 hours — operations alert. The job is treated as at risk and enters the delivery-exception
+queue (`04` §5)."*
+
+**The platform cannot read `enqueued_at`, and it does not need to.** `milestones` records the actor's
+clock and the platform's separately (SHIP-110), and the difference between them *is* how long the
+update was unsynced. `000601` said so before this ticket existed — `server_recorded_at` is "what
+makes an unsynced-milestone threshold (Docs/02 §6.5) measurable" — so the fact was in the schema
+waiting for somebody to subtract two columns.
+
+#### No column, no flag, no second table
+
+The queue is a query. `delivery.UnsyncedMilestones` selects rows where
+`server_recorded_at - actor_recorded_at >= $1` and nothing marks a row as belonging to it.
+
+That is `admin.ExceptionQueue`'s argument (SHIP-117), applied in the same domain to the same shape of
+problem: a flag is a second source of truth that a repair script or a rolled-back transaction can put
+out of step with the rows, and it "would have to be written where the exception is recorded, which is
+`internal/delivery`'s transaction, through a port it would have to declare". Here it is even weaker
+than that — **the fact is two existing columns subtracted**, so a flag would be a cached arithmetic
+result with all the same failure modes and none of the excuse.
+
+The gap is computed **once** in the statement and both the predicate and the returned figure read the
+same expression. Selecting on one figure and reporting another is how a queue comes to hold a row
+that does not satisfy its own rule, and the test asserts the returned gap against the threshold
+rather than against the fixture that produced it.
+
+#### The alert fires when the update lands, and what that cannot see is named rather than narrowed away
+
+An update still sitting on a handset has not arrived, so the platform cannot know it exists. This
+rung therefore fires when a long-unsynced update **lands** — a WARN line naming the job and the gap,
+in `writeMilestone`, beside SHIP-116's exception line and for the same reason: it is operations'
+business rather than a client's, and `Docs/04` §5's queue is where somebody acts on it. It is raised
+on whatever the milestone did — recorded, absorbed or overruled — because how far behind the record
+ran is a fact about the *update* rather than about the move it caused, and it is suppressed on a
+replay alone, because paging operations again because a phone retried would make the alert mean less
+each time it fired.
+
+**A delivery whose driver never reconnects is invisible here, and that gap belongs to a different
+ticket.** A job that has *stopped moving* is a different fact with a different measurement — the last
+thing that happened to it, rather than the gap inside one update — and it is "delayed delivery" in
+`Docs/04` §5, which SHIP-177's alerting owns. Folding the two together would produce a queue that
+could not tell "the record is stale" from "the delivery is stuck", which are different problems with
+different responses. Recorded here so the next reader does not file the absence as a defect.
+
+#### The threshold is a constant, and the four-hour one deliberately is not
+
+`UnsyncedAlertThreshold` is a Go constant on exactly `jobs.ExpiryWarning`'s reasoning: this is a
+lifecycle rule from a document, not an operational limit of the kind `Docs/06` §5.3 requires to be
+changeable without a deploy.
+
+**SHIP-127's four hours is the opposite case**, and the contrast is worth holding: it fires on a
+handset that `Docs/07` says has no over-the-air update path for Dart code, so it is precisely the
+number CLAUDE.md puts server-side and hands to the client to cache. That is SHIP-167a's endpoint, not
+this constant, and the two sit either side of the same line.
+
+#### The mutation, and the test of mine it proved was asserting nothing
+
+The queue's `ORDER BY` was changed from `server_recorded_at` to `actor_recorded_at` — the exact
+substitution the code comment warns about, since ordering a support queue by a handset's clock lets a
+device reorder it. **`TestTheQueueIsOldestArrivalFirst` passed.**
+
+The fixture was wrong, not the mutation. Both rows were inserted longest-gap-first, and a larger gap
+means an *earlier* actor clock — so the two columns sorted the rows identically and the test could
+not tell them apart. It now inserts the row that **arrives first carrying the later actor clock**, so
+the two orderings genuinely disagree; the mutation then fails it on both assertions, and the restored
+query passes.
+
+**This is the third instance in this file of a guard that looked behavioural and was not**, after
+wave 9's `FOR UPDATE OF j SKIP LOCKED` demotion and this branch's own SHIP-70a finding. The pattern
+is the same each time: the test exercised the code, and the *fixture* could not distinguish the
+correct answer from the wrong one. Running the mutation is what separates those, and it is why the
+Definition of Done asks for one.
+
+`postgres.go` was snapshotted to `/tmp` before the mutation and restored from that copy, never with
+`git checkout`; `shasum -a 256` matched afterwards and `git diff` still carried the ticket's 77 added
+lines.
+
+#### What is not built, and who owns it
+
+`delivery.UnsyncedMilestones` has **no HTTP surface**. `Docs/11` §6 says this ticket "owns the fact
+rather than the screen", and the screen is SHIP-157's — which also means the queue has no cursor,
+deliberately: `admin.QueueQuery`'s cursor is `(created_at, id)` because somebody had a page to
+render, and a cursor shape chosen without a consumer is a guess the first real caller has to live
+with. A bounded read is the honest surface and widening it is additive.
+
+`internal/admin` was not touched. It is another lane's this wave, and nothing here needed it: the
+query is over `milestones`, which this domain owns.
 
 
 ## 4. Partly done — do not treat these as finished

@@ -647,6 +647,30 @@ func writeMilestone(
 			slog.String("exception_reason", recording.Exception.String()))
 	}
 
+	// **The twenty-four-hour rung of Docs/02 §3.1's ladder (SHIP-128).** At warning, beside the
+	// proof-exception line above and for the same reason: this is operations' business rather
+	// than a client's, and Docs/04 §5's delivery-exception queue is where somebody acts on it.
+	//
+	// Fired on whatever the milestone did — recorded, absorbed or overruled — because how long
+	// the record ran behind the delivery is a fact about the update rather than about the move it
+	// caused, and an absorbed or overruled milestone is if anything *more* likely to be badly out
+	// of date. Suppressed on a replay alone: paging operations again because a phone retried
+	// would make the alert mean less each time it fired.
+	//
+	// The gap is stated in the line rather than left to be computed from the two instants beside
+	// it, so a log search can order by it. `delivery.UnsyncedMilestones` is the queue over the
+	// same rows; this is the alert, and Docs/11 §3 records why the platform cannot see an update
+	// that has not arrived at all.
+	if outcome != OutcomeAlreadyRecorded && record.Unsynced() {
+		httpx.LoggerFrom(r.Context()).Warn("a milestone reached the platform more than a day after it was recorded",
+			slog.String("job_id", jobID.String()),
+			slog.String("milestone", record.Milestone.Wire()),
+			slog.String("milestone_id", record.ID.String()),
+			slog.Duration("unsynced_for", record.UnsyncedFor()),
+			slog.Time("recorded_at", record.ActorRecordedAt),
+			slog.Time("accepted_at", record.ServerRecordedAt))
+	}
+
 	switch outcome {
 	case OutcomeRecorded:
 		httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
