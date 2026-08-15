@@ -146,6 +146,55 @@ abstract interface class BiddingRepository {
     BidStatus? status,
     String? cursor,
   });
+
+  /// `POST /v1/jobs/{id}/award` (SHIP-104) — accept one provider's offer and end the bidding.
+  ///
+  /// ## A verb on the job, and the offer travels in the body
+  ///
+  /// The job is what moves — to `awarded`, through the one guarded transition — so the path names
+  /// the job and `{"bid_id": …}` names the offer. `withdraw` and `counter` act on an offer and
+  /// leave the job where it is; this ends the bidding on it.
+  ///
+  /// ## It is not this client's decision, and the refusals say so
+  ///
+  /// Five things have to be true and the platform checks all five: the job is the caller's, the bid
+  /// is on **this** job, the job can still be awarded, the offer is live, and the offer is a
+  /// provider's rather than the customer's own counter. A job that is not yours and one that does
+  /// not exist are the **same** `404`, made before the body is read — so this endpoint cannot be
+  /// used to find out whether a bid identifier names anything.
+  ///
+  /// [ReceivedOffer.isAwardable] is presentation only. It stops the screen drawing a button the
+  /// platform would refuse; it decides nothing.
+  ///
+  /// ## Every other offer closes with it, and none of them are in the response
+  ///
+  /// In the same transaction, every offer still `submitted` becomes `rejected` (SHIP-93) —
+  /// `Docs/02` §3's "awarding a job atomically marks one bid accepted and all others closed". The
+  /// response is the offer that was accepted and nothing else; the job's other bids are read where
+  /// they were always read, which is why the screen re-reads them with `?status=accepted`
+  /// afterwards rather than reasoning about what the award did to the list it is holding.
+  ///
+  /// ## Retrying is safe, and it does not depend on the key
+  ///
+  /// The same key soon replays the stored response. **A fresh key naming the same offer is answered
+  /// `200` with that offer** and records nothing further — an award is an update of a row that
+  /// already exists, so applying it twice reaches the state applying it once reaches. That is the
+  /// row to design against: a phone that lost its connection, was restarted and minted a new key
+  /// must not be told its award failed when it succeeded.
+  ///
+  /// A fresh key naming a **different** offer on a job already awarded is `409 conflict`. One job,
+  /// one accepted bid — enforced by a partial unique index rather than by application logic.
+  ///
+  /// ## Not offline, ever
+  ///
+  /// `Docs/07` §4 puts awarding beside bidding and negotiation as deliberately not queued. The
+  /// compiler agrees: `OperationKind`'s constructor is private and its two members are both
+  /// `delivery.*`.
+  Future<Bid> awardTo({
+    required String jobId,
+    required String bidId,
+    required String idempotencyKey,
+  });
 }
 
 /// The real one, over [ApiClient].
@@ -214,6 +263,23 @@ final class ApiBiddingRepository implements BiddingRepository {
         },
       ),
       ReceivedOffer.fromJson,
+    );
+  }
+
+  @override
+  Future<Bid> awardTo({
+    required String jobId,
+    required String bidId,
+    required String idempotencyKey,
+  }) async {
+    return Bid.fromJson(
+      await _client.postJson(
+        '/v1/jobs/$jobId/award',
+        idempotencyKey: idempotencyKey,
+        // The one field the schema has. Unknown fields are refused, and there is deliberately
+        // nothing here about the status of the bid or of the job — both are the platform's.
+        body: <String, Object?>{'bid_id': bidId},
+      ),
     );
   }
 }

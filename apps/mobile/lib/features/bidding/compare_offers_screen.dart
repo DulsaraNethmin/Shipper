@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/errors/api_failure.dart';
+import 'package:shipper/features/bidding/award_controller.dart';
+import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
 import 'package:shipper/features/bidding/compare_offers_controller.dart';
 import 'package:shipper/features/bidding/received_offer.dart';
@@ -49,8 +51,30 @@ import 'package:shipper/shared/formatting/money.dart';
 /// ## Nothing here decides what may be done
 ///
 /// `Docs/07` §3: the app may hide or disable; the platform decides. [ReceivedOffer.isAwardable]
-/// chooses whether to draw an action, and the award itself is SHIP-104 — this screen deliberately
-/// ships without one rather than with a button that goes nowhere.
+/// chooses whether to draw an action, and the platform checks all five of its conditions on every
+/// award — a job that is not yours, an offer that has just been withdrawn, and a job somebody
+/// cancelled a second ago are all refused server-side with this screen none the wiser.
+///
+/// ## Awarding, and why it is a dialog rather than a button (SHIP-104)
+///
+/// The award is **irreversible and it is not only about the offer that was tapped.** `Docs/02` §3
+/// has it atomically mark one bid accepted and **every other offer on the job rejected** (SHIP-93),
+/// and a rejected offer can no longer be revised, withdrawn or countered. There is no un-award, and
+/// no endpoint that would be one.
+///
+/// So the *Done when*'s "explicit confirmation" is taken at its strength: a modal naming the price
+/// and the provider being committed to, saying in a sentence what happens to the other offers, and
+/// dismissable without doing anything. A row of cards that scrolls horizontally under a thumb is
+/// exactly where a mis-tap happens, and the cost of one here is somebody's delivery ended at the
+/// wrong price.
+///
+/// ## And then it shows the result, which is a read rather than an assumption
+///
+/// After the platform accepts, the screen re-reads the job's offers with `?status=accepted` — the
+/// way the contract names — and draws the accepted offer under a banner. It does **not** rewrite
+/// the list it is holding to what it believes the award did: `Docs/02` §2 makes status the
+/// platform's, and a client computing the consequences of a transition keeps a second copy of the
+/// state machine that is correct until the day it is not.
 class CompareOffersScreen extends ConsumerWidget {
   const CompareOffersScreen({required this.jobId, super.key});
 
@@ -76,7 +100,7 @@ class CompareOffersScreen extends ConsumerWidget {
           final s when s.isEmpty => const _NoOffersYet(),
           _ => RefreshIndicator(
               onRefresh: controller.refresh,
-              child: _Comparison(state: state, controller: controller),
+              child: _Comparison(jobId: jobId, state: state, controller: controller),
             ),
         },
       ),
@@ -85,20 +109,36 @@ class CompareOffersScreen extends ConsumerWidget {
 }
 
 /// The comparison itself: a control that orders the offers, then the cards.
-class _Comparison extends StatelessWidget {
-  const _Comparison({required this.state, required this.controller});
+class _Comparison extends ConsumerWidget {
+  const _Comparison({required this.jobId, required this.state, required this.controller});
 
+  final String jobId;
   final CompareOffersState state;
   final CompareOffersController controller;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final offers = state.sorted;
+    final award = ref.watch(awardProvider(jobId));
 
     return ListView(
       key: const Key('compare-offers-list'),
       padding: const EdgeInsets.symmetric(vertical: 16),
       children: [
+        if (award.awarded) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: _Awarded(award.accepted!),
+          ),
+        ],
+        if (award.failure != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: _AwardFailed(
+              state: award,
+              onDismiss: ref.read(awardProvider(jobId).notifier).dismissFailure,
+            ),
+          ),
         if (state.failure != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
@@ -107,13 +147,23 @@ class _Comparison extends StatelessWidget {
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Text(
-            offers.length == 1 ? '1 offer' : '${offers.length} offers',
+            // After an award the list answers a different question — the offer that was accepted,
+            // read back from the platform — so counting it as "1 offer" would be an odd thing to
+            // say about a delivery that has just been awarded.
+            state.showingAccepted
+                ? 'The offer you accepted'
+                : offers.length == 1
+                    ? '1 offer'
+                    : '${offers.length} offers',
             key: const Key('compare-offers-count'),
             style: Theme.of(context).textTheme.titleMedium,
           ),
         ),
         const SizedBox(height: 12),
-        _Order(order: state.order, onChanged: controller.orderBy),
+        // Ordering a list of one is a control with nothing to do. It goes rather than being
+        // disabled: a disabled radio group under an awarded delivery reads as something that has
+        // stopped working.
+        if (!state.showingAccepted) _Order(order: state.order, onChanged: controller.orderBy),
         if (!state.sortedIsComplete) ...[
           const SizedBox(height: 8),
           Padding(
@@ -133,13 +183,16 @@ class _Comparison extends StatelessWidget {
         // The row itself. A fixed height, because cards of different heights side by side stop the
         // rows lining up — which is the whole of what makes this a comparison.
         SizedBox(
-          height: 360,
+          // Raised from 360 when SHIP-104 added the action, so that the button is on the card
+          // rather than below the fold of the card's own scroll view. A primary action a customer
+          // has to scroll a card to find is one most of them will not find.
+          height: 420,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 16),
             itemCount: offers.length,
             separatorBuilder: (context, index) => const SizedBox(width: 12),
-            itemBuilder: (context, index) => _OfferCard(offers[index]),
+            itemBuilder: (context, index) => _OfferCard(offers[index], jobId: jobId),
           ),
         ),
 
@@ -210,15 +263,21 @@ class _Order extends StatelessWidget {
 /// shared card taking either shape, or one taking a "this is the customer's view" flag, is the
 /// arrangement the budget invariant is hardest to keep: the flag is one careless call site away
 /// from being wrong and nothing would fail.
-class _OfferCard extends StatelessWidget {
-  const _OfferCard(this.offer);
+class _OfferCard extends ConsumerWidget {
+  const _OfferCard(this.offer, {required this.jobId});
 
   final ReceivedOffer offer;
 
+  /// The job, so the card can reach the award for it. Passed down rather than read off the offer's
+  /// `jobId`: the route is where the identifier this screen is about comes from, and an offer whose
+  /// `job_id` disagreed with the route is a response worth failing on rather than following.
+  final String jobId;
+
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final amount = offer.amountCents;
+    final award = ref.watch(awardProvider(jobId));
 
     return SizedBox(
       width: 280,
@@ -277,8 +336,232 @@ class _OfferCard extends StatelessWidget {
 
               // 4. The vehicle and its declared capability.
               _Vehicle(offer),
+
+              // 5. The action, when there is one to offer (SHIP-104).
+              //
+              // Below the four things being compared rather than above them, because it is what a
+              // customer does *after* reading the card. `isAwardable` is presentation — the
+              // platform decides — and the button is simply absent on the customer's own counter
+              // and on an offer that has ended, which the rows above already say in words.
+              if (offer.isAwardable && !award.awarded) ...[
+                const SizedBox(height: 16),
+                _AwardButton(offer: offer, jobId: jobId, awarding: award.awarding),
+              ],
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The button, and the confirmation it opens (SHIP-104).
+class _AwardButton extends ConsumerWidget {
+  const _AwardButton({required this.offer, required this.jobId, required this.awarding});
+
+  final ReceivedOffer offer;
+  final String jobId;
+
+  /// Whether **any** award on this job is in flight.
+  ///
+  /// Every card is disabled while one is, not merely the card that was tapped. Two awards on one
+  /// job are two different offers and the second would be refused `409 conflict` — but the customer
+  /// would have watched two spinners and been told one of them failed, which is not what happened.
+  final bool awarding;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return SizedBox(
+      width: double.infinity,
+      child: FilledButton(
+        key: Key('award-offer-${offer.id}'),
+        onPressed: awarding ? null : () => _confirm(context, ref),
+        child: awarding
+            ? const SizedBox(
+                height: 18,
+                width: 18,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Text('Award this offer'),
+      ),
+    );
+  }
+
+  Future<void> _confirm(BuildContext context, WidgetRef ref) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => _AwardConfirmation(offer),
+    );
+    if (confirmed != true) return;
+
+    final awarded = await ref.read(awardProvider(jobId).notifier).award(offer.id);
+    if (!awarded) return;
+
+    // The result the *Done when* asks for, read back from the platform rather than assumed. See
+    // `CompareOffersController.showAwarded`.
+    await ref.read(compareOffersProvider(jobId).notifier).showAwarded();
+  }
+}
+
+/// The explicit confirmation.
+///
+/// **It names the two things being committed to** — the price and who is being engaged — because a
+/// dialog reading "Are you sure?" over a horizontally scrolling row of near-identical cards
+/// confirms that the customer tapped something, not that they tapped the right thing.
+///
+/// It says what happens to the other offers, which is the part nobody would guess: the award closes
+/// every one of them in the same transaction (`Docs/02` §3, SHIP-93), and none of them can be
+/// revived. And it says there is no way back, because there is not — `contracts/paths/bidding.yaml`
+/// has one job and one accepted bid, held by a database constraint.
+class _AwardConfirmation extends StatelessWidget {
+  const _AwardConfirmation(this.offer);
+
+  final ReceivedOffer offer;
+
+  @override
+  Widget build(BuildContext context) {
+    final amount = offer.amountCents;
+    final verified = offer.provider?.verified ?? false;
+
+    return AlertDialog(
+      key: const Key('award-confirm'),
+      title: const Text('Award this delivery?'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            amount == null
+                ? 'This offer names no price.'
+                : 'You will be committing to ${audFromCents(amount)}.',
+            key: const Key('award-confirm-amount'),
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            // The same two facts the card shows, and no more: there is no trading name and no
+            // rating on this platform, and inventing a warmer sentence here would imply one.
+            verified
+                ? 'The provider has cleared verification.'
+                : 'This provider has not yet cleared verification.',
+            key: const Key('award-confirm-provider'),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'Awarding closes every other offer on this delivery, and it cannot be undone.',
+            key: Key('award-confirm-consequence'),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          key: const Key('award-confirm-cancel'),
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const Key('award-confirm-accept'),
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Award'),
+        ),
+      ],
+    );
+  }
+}
+
+/// What the customer sees once the platform has accepted (SHIP-104).
+///
+/// It draws from [Bid] — the award response — rather than from the list, so it is on screen the
+/// instant the platform answers and does not wait for the re-read behind it. The list follows and
+/// shows the same offer with its provider and vehicle.
+class _Awarded extends StatelessWidget {
+  const _Awarded(this.accepted);
+
+  final Bid accepted;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final amount = accepted.amountCents;
+
+    return Card(
+      key: const Key('award-result'),
+      color: theme.colorScheme.secondaryContainer,
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(Icons.handshake_outlined, color: theme.colorScheme.onSecondaryContainer),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Delivery awarded', style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 4),
+                  Text(
+                    amount == null
+                        ? 'The offer you accepted named no price.'
+                        : 'You accepted ${audFromCents(amount)}. Every other offer is now closed.',
+                    key: const Key('award-result-amount'),
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The platform refused the award.
+///
+/// Every one of the four codes is a thing the customer can do something about, and the sentence
+/// comes from [AwardState.refusal] rather than from the platform's `message`: `Docs/07` §6 branches
+/// on `code`, and a message is copy that gets reworded.
+class _AwardFailed extends StatelessWidget {
+  const _AwardFailed({required this.state, required this.onDismiss});
+
+  final AwardState state;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Card(
+      key: const Key('award-failed'),
+      color: theme.colorScheme.errorContainer,
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              state.refusal ??
+                  // Anything the codes do not name — no connection, a `500`, a `503`. Nothing is
+                  // known about whether the award happened, so the honest advice is to look rather
+                  // than to promise it did not.
+                  'The delivery was not awarded. Check your connection and try again — if the '
+                      'offer disappears when you reload, it went through.',
+              key: const Key('award-failed-message'),
+              style: theme.textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                key: const Key('award-failed-dismiss'),
+                onPressed: onDismiss,
+                child: const Text('Close'),
+              ),
+            ),
+          ],
         ),
       ),
     );

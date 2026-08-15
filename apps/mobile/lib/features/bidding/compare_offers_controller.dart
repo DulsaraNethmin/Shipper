@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:freezed_annotation/freezed_annotation.dart';
 
 import 'package:shipper/core/errors/api_failure.dart';
+import 'package:shipper/features/bidding/bid_status.dart';
 import 'package:shipper/features/bidding/bidding_repository.dart';
 import 'package:shipper/features/bidding/received_offer.dart';
 
@@ -71,6 +72,19 @@ abstract class CompareOffersState with _$CompareOffersState {
     /// How the customer wants them ordered.
     @Default(OfferOrder.cheapest) OfferOrder order,
 
+    /// Which offers are being read, or `null` for the platform's own default (SHIP-104).
+    ///
+    /// `null` while the customer is comparing, which the endpoint reads as `submitted` — the offers
+    /// standing right now. It becomes [BidStatus.accepted] after an award, because that is the only
+    /// question worth asking then: the award rejected every other live offer in the same
+    /// transaction, so the default list would come back **empty** and the screen would draw
+    /// "nobody has offered yet" over a delivery that has just been awarded.
+    ///
+    /// The contract names this as the way back in — "`?status=accepted` is how the awarded offer is
+    /// read back afterwards" — so this is reading the platform's record rather than reasoning
+    /// locally about what the award did to the list this device is holding.
+    BidStatus? status,
+
     /// What the last read failed with, or `null`.
     ApiFailure? failure,
   }) = _CompareOffersState;
@@ -112,6 +126,9 @@ abstract class CompareOffersState with _$CompareOffersState {
   /// **An ordinary state rather than a fault**, and the one a customer meets first: a job published
   /// a minute ago has no offers on it and nothing is wrong.
   bool get isEmpty => loaded && offers.isEmpty;
+
+  /// Whether this screen is showing the awarded offer rather than the comparison (SHIP-104).
+  bool get showingAccepted => status == BidStatus.accepted;
 
   /// Nothing has arrived and nothing has failed — the only state a spinner belongs in.
   bool get isFirstLoad => loading && offers.isEmpty && failure == null;
@@ -174,12 +191,12 @@ class CompareOffersController extends Notifier<CompareOffersState> {
   ///
   /// Returned rather than awaited internally so `RefreshIndicator` can hold its spinner until the
   /// read finishes.
-  Future<void> refresh() => _load(replacing: true);
+  Future<void> refresh() => _load(replacing: true, status: state.status);
 
   /// Asks again after a failure, with the spinner back.
   Future<void> retry() {
     state = state.copyWith(loading: true, failure: null);
-    return _load(replacing: true);
+    return _load(replacing: true, status: state.status);
   }
 
   /// Reorders what is on screen.
@@ -194,19 +211,54 @@ class CompareOffersController extends Notifier<CompareOffersState> {
     state = state.copyWith(order: order);
   }
 
+  /// Reads the awarded offer back, after this customer has awarded the job (SHIP-104).
+  ///
+  /// **A read rather than a local edit**, and that is the decision worth naming. The award rejected
+  /// every other live offer server-side, so this device could in principle rewrite the list it is
+  /// holding — one accepted, the rest rejected — and show that without a round trip. It does not:
+  /// `Docs/02` §2 makes status the platform's, and a client that computed the consequences of a
+  /// transition would be maintaining a second copy of the state machine that is right until the day
+  /// it is not. Asking is one request and cannot be wrong.
+  ///
+  /// The offers already on screen are dropped rather than kept, because they answered a different
+  /// question: they were the live offers, and none of them is live now.
+  Future<void> showAwarded() {
+    state = state.copyWith(
+      status: BidStatus.accepted,
+      loading: true,
+      loaded: false,
+      offers: const <ReceivedOffer>[],
+      nextCursor: null,
+      hasMore: false,
+      failure: null,
+    );
+    return _load(replacing: true, status: BidStatus.accepted);
+  }
+
   /// Reads the next page and appends it.
   Future<void> loadMore() {
     final cursor = state.nextCursor;
     if (cursor == null || state.loadingMore) return Future<void>.value();
 
     state = state.copyWith(loadingMore: true, failure: null);
-    return _load(cursor: cursor, replacing: false);
+    return _load(cursor: cursor, replacing: false, status: state.status);
   }
 
-  Future<void> _load({String? cursor, required bool replacing}) async {
+  /// Reads one page.
+  ///
+  /// [status] is a **parameter rather than a read of `state.status`**, and that is not tidiness:
+  /// `build` calls this before `state` exists, and every line of a `_load` that ran before the
+  /// first suspension would be reading an uninitialised provider — the exact `Bad state` the note
+  /// on [jobId] is about. It is passed by every caller that has a state to read it from.
+  Future<void> _load({
+    String? cursor,
+    required bool replacing,
+    BidStatus? status,
+  }) async {
     try {
       final page = await ref.read(biddingRepositoryProvider).offersOn(
             jobId: jobId,
+            status: status,
             cursor: cursor,
           );
       if (!ref.mounted) return;

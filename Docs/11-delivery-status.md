@@ -583,6 +583,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
+| **SHIP-104** | M3 | The customer awards an offer — a modal naming the **price and the provider being committed to** and what awarding costs, because a mis-tap on a horizontally scrolling row of near-identical cards ends the bidding on a delivery at the wrong price and there is no un-award. The result is **read back with `?status=accepted`** rather than computed from what the award is known to do: `Docs/02` §2 makes status the platform's, and a client that derived it keeps a second copy of the state machine. No server change, no new route — *see below* |
 | **SHIP-167a** | M7 | `GET /v1/app/policy` — the unsynced-nudge threshold and the proof compression budget, served beside the build floor and read from configuration on every request. The client half is where the ticket lives: **offline and never-told are two different situations and only the second gets the compiled default**, which is one `if` in `resolveAppPolicy` and the whole of what makes the endpoint reach the devices it exists for. A **budget above `STORAGE_MAX_UPLOAD_BYTES` is refused at startup** — a cross-section rule neither variable is wrong under on its own — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -11889,6 +11890,81 @@ now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is
 and a database check that are believed to agree are two checks until something compares them.
 
 **Nothing was needed from `internal/config` by any of the five tickets.**
+
+### SHIP-104 — the one irreversible thing a customer does
+
+`POST /v1/jobs/{id}/award` has existed since SHIP-92 and no client had ever called it.
+`compare_offers_screen.dart` said so in as many words — "the award itself is SHIP-104; this screen
+deliberately ships without one rather than with a button that goes nowhere" — so this is a client
+ticket end to end: **no migration, no route, no contract change, and `routes_golden.txt` unchanged.**
+
+#### Why the confirmation is a modal and not a second tap
+
+`Docs/02` §3 has the award atomically mark one bid accepted and **every other offer on the job
+rejected** (SHIP-93), and a rejected offer can no longer be revised, withdrawn or countered. There
+is no un-award and no endpoint that would be one. The offers are a horizontally scrolling row of
+near-identical 280-wide cards under a thumb — the exact place a mis-tap happens — and the cost of
+one is somebody's delivery ended at the wrong price.
+
+So the dialog names the **two things being committed to**, the price and the provider, and states
+the consequence in a sentence: awarding closes every other offer and cannot be undone. A dialog
+reading "Are you sure?" confirms that the customer tapped something, not that they tapped the right
+thing.
+
+**The half of that most easily left untested is the refusing direction**, and it is the half a
+defect would live in: a confirmation only exercised through its accept button would pass with a
+dialog that awarded when it opened. `award_test.dart` asserts that tapping the button sends nothing
+and that cancelling leaves the offer still awardable.
+
+#### "Sees the result" is a read, not a derivation
+
+After the platform accepts, the screen re-reads the job's offers with `?status=accepted` — which
+`contracts/paths/bidding.yaml` names as how the awarded offer is read back — and shows it under a
+banner drawn from the award response itself, so something is on screen the instant the platform
+answers.
+
+**It deliberately does not rewrite the list it is holding.** The device knows what the award did in
+principle: one accepted, every live one rejected. Deriving that locally is a second copy of a state
+machine `Docs/02` §2 puts on the platform, correct until the day it is not, and the test asserts on
+the **parameter** rather than on the rows so a screen that derived it would fail.
+
+There is a consequence worth naming: the default read is `submitted`, so after an award the
+unfiltered list is **empty** — a screen that simply refreshed would draw "nobody has offered yet"
+over a delivery that had just been awarded.
+
+#### The retry guarantee does not rest on the idempotency key, and the client is written that way
+
+`ActionKey` holds a key across a retry whose outcome is unknown, as everywhere else. But the
+contract is explicit that a client must not design as though the key were the mechanism: an award
+is an update of a row that already exists, so a **fresh** key naming the **same** offer is answered
+`200` with that offer and records nothing further. A phone restarted between attempts is safe. What
+is refused is a fresh key naming a *different* offer on a job already awarded — `409 conflict`, one
+job and one accepted bid, held by a partial unique index.
+
+The failure copy follows from that. A lost connection says *try again — if the offer disappears when
+you reload, it went through*, because nothing on the device establishes whether the award happened
+and a message claiming it did not would be wrong half the time.
+
+#### Four refusal codes, three destinations, and none of them read from `message`
+
+`conflict`, `bidding_bid_closed`, `bidding_wrong_party` and `idempotency_key_reused`, each mapped to
+a sentence in `AwardState.refusal`. `Docs/07` §6 branches on `code` and never on `message`, and the
+repository test proves it by answering with a `message` that says so.
+
+**`bidding_wrong_party` is reachable even though the screen never offers a button on the customer's
+own counter**, which is the `Docs/07` §3 point in miniature: `ReceivedOffer.isAwardable` decides what
+to draw and decides nothing else, and an offer that changed hands between the draw and the tap is
+refused by the platform with this screen none the wiser.
+
+#### One layout change, recorded because it is the kind that gets reverted
+
+The card row went from 360 to 420 logical pixels high. The cards are a fixed height so their rows
+line up — that is what makes it a comparison — and the action sits below the four compared fields,
+which put it below the fold of the card's own scroll view. A primary action a customer has to scroll
+a card to find is one most of them will not find. The first run of `award_test.dart` failed on
+exactly that.
+
+**Nothing was needed from `internal/config`.**
 
 ### SHIP-167a — the endpoint two shipped features asked for by name
 

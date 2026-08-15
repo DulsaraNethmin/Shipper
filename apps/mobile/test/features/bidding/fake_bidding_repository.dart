@@ -166,13 +166,24 @@ class FakeBiddingRepository implements BiddingRepository {
   /// Held open until completed, so a test can assert what the screen shows mid-read.
   Completer<void>? offersGate;
 
+  /// Answers for one status only, when a test is about the read that follows an award (SHIP-104).
+  ///
+  /// The counterpart of [groups], and it exists for the same reason: `?status=accepted` is a
+  /// **different request**, not a predicate over the rows already read, and a fake that filtered
+  /// [offerPages] itself would let a screen which reasoned locally about what the award did to its
+  /// list pass a test about reading the platform's record.
+  Map<BidStatus, List<ApiPage<ReceivedOffer>>> offerGroups =
+      <BidStatus, List<ApiPage<ReceivedOffer>>>{};
+
   @override
   Future<ApiPage<ReceivedOffer>> offersOn({
     required String jobId,
     BidStatus? status,
     String? cursor,
   }) async {
-    final index = offerReads.length;
+    // Counted per status rather than over every read, so the page a test scripted for the awarded
+    // offer is not consumed by however many times the comparison was refreshed first.
+    final index = offerReads.where((call) => call.status == status).length;
     offerReads.add((jobId: jobId, status: status, cursor: cursor));
 
     final held = offersGate;
@@ -181,8 +192,47 @@ class FakeBiddingRepository implements BiddingRepository {
     final thrown = offersFailure;
     if (thrown != null) throw thrown;
 
-    if (offerPages.isEmpty) return const ApiPage<ReceivedOffer>(data: <ReceivedOffer>[]);
-    return offerPages[index < offerPages.length ? index : offerPages.length - 1];
+    final script = status == null ? offerPages : (offerGroups[status] ?? offerPages);
+    if (script.isEmpty) return const ApiPage<ReceivedOffer>(data: <ReceivedOffer>[]);
+    return script[index < script.length ? index : script.length - 1];
+  }
+
+  // --- SHIP-104: awarding the job to one offer -------------------------------------------------
+
+  /// Every award attempt, in order, with the key it carried.
+  ///
+  /// The key is the half worth recording: `Docs/07` §4 mints one per action and reuses it across a
+  /// retry of that same action, and only a recorded sequence can tell a client that holds it from
+  /// one that mints a fresh key each time — both of which look identical on screen.
+  final awards = <AwardCall>[];
+
+  /// What a successful award answers with. The platform answers with the accepted offer.
+  Bid awarded = aBid(status: BidStatus.accepted);
+
+  /// Thrown by [awardTo] instead of answering, on every call until it is cleared.
+  Object? awardFailure;
+
+  /// Held open until completed, so a test can assert what the screen shows mid-award.
+  Completer<void>? awardGate;
+
+  /// Every idempotency key an award carried, in order.
+  List<String> get awardKeys => awards.map((c) => c.idempotencyKey).toList(growable: false);
+
+  @override
+  Future<Bid> awardTo({
+    required String jobId,
+    required String bidId,
+    required String idempotencyKey,
+  }) async {
+    awards.add((jobId: jobId, bidId: bidId, idempotencyKey: idempotencyKey));
+
+    final held = awardGate;
+    if (held != null) await held.future;
+
+    final thrown = awardFailure;
+    if (thrown != null) throw thrown;
+
+    return awarded;
   }
 }
 
@@ -258,3 +308,6 @@ VehicleSummary aVehicle({
 
 /// One recorded read of the offers on a job (SHIP-102).
 typedef OffersCall = ({String jobId, BidStatus? status, String? cursor});
+
+/// One recorded award (SHIP-104).
+typedef AwardCall = ({String jobId, String bidId, String idempotencyKey});
