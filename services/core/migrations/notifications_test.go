@@ -158,6 +158,68 @@ func TestANotificationNeedsARealRecipient(t *testing.T) {
 	}
 }
 
+// TestOnlyAMutableCategoryCanBeMuted is SHIP-142's *Done when*, held by the schema.
+//
+// "Essential events cannot be muted" is a guarantee, and a guarantee held only in Go is one an
+// INSERT from psql walks past. ck_notification_preferences_category admits exactly the categories
+// Docs/01 §4.5 leaves off its list of essential events, so the row cannot exist.
+//
+// The pairing runs in both directions, which is what Docs/10 §3.4 asks. A category Go calls mutable
+// and the CHECK refuses is a preference nothing can save; a category the CHECK admits and Go calls
+// essential is a mute the consumer would **honour**, on an event that must always be sent — and
+// that direction is the one this table exists to make impossible.
+func TestOnlyAMutableCategoryCanBeMuted(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	inDatabase := constraintLiterals(t, pool, "ck_notification_preferences_category")
+
+	for _, category := range notifications.Categories {
+		mutable := !category.Essential()
+		switch {
+		case mutable && !inDatabase[category.String()]:
+			t.Errorf("Category(%q).Essential() is false and "+
+				"ck_notification_preferences_category refuses it, so it can never be muted",
+				category)
+		case !mutable && inDatabase[category.String()]:
+			t.Errorf("ck_notification_preferences_category accepts %q and "+
+				"Category.Essential() calls it essential, so a mute could be written for "+
+				"an event Docs/01 §4.5 says must always be sent", category)
+		}
+		delete(inDatabase, category.String())
+	}
+	for leftover := range inDatabase {
+		t.Errorf("ck_notification_preferences_category accepts %q, which is not a category at all",
+			leftover)
+	}
+}
+
+// TestAnEssentialCategoryCannotBeMutedByAnyWriter is the same claim from the other end.
+//
+// The test above reads the constraint's text; this one writes the row. Wave 10's lesson is that a
+// pairing guard is a text guard — it reads a constant and proves nothing about the statement that
+// uses it — so the value of this one is that it goes through PostgreSQL.
+func TestAnEssentialCategoryCannotBeMutedByAnyWriter(t *testing.T) {
+	pool := pgtest.DB(t)
+	user := notifiedUser(t, pool, "mute-me@example.com", "0418000704")
+
+	mute := func(category string) error {
+		_, err := pool.Exec(t.Context(),
+			`INSERT INTO notification_preferences (user_id, category, muted_at)
+			 VALUES ($1, $2, now())`, user, category)
+		return err
+	}
+
+	if err := mute("job_expiry"); err != nil {
+		t.Fatalf("muting the one mutable category was refused: %v", err)
+	}
+	for _, essential := range []string{"bidding", "award", "delivery"} {
+		if err := mute(essential); err == nil {
+			t.Errorf("%q was muted, and Docs/01 §4.5 says every account is told about it",
+				essential)
+		}
+	}
+}
+
 // TestNotificationsMigrationIsInTheNotificationsBlock is the block allocation, which is what stops
 // two branches drawing the same migration number.
 func TestNotificationsMigrationIsInTheNotificationsBlock(t *testing.T) {

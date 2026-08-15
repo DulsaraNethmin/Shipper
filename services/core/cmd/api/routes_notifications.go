@@ -57,6 +57,28 @@ func init() {
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return notificationsHandler(d).Deregister() },
 		},
+
+		// SHIP-142. One path, two methods, and no identifier — for the same reason the pair
+		// above has none: the account is the caller's, taken from the credential.
+		//
+		// **`PUT` is the first one in this service**, and it belongs here rather than being a
+		// deviation. The body is the complete muted set, so the client is placing a resource
+		// at a location it already knows, which is what PUT is for — and it makes the request
+		// idempotent by construction rather than only by its key.
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/notifications/preferences",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return notificationsHandler(d).Preferences() },
+		},
+		Route{
+			Method:  http.MethodPut,
+			Pattern: "/notifications/preferences",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return notificationsHandler(d).UpdatePreferences() },
+		},
 	)
 }
 

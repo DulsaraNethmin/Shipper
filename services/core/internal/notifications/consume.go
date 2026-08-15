@@ -171,6 +171,25 @@ func (s *Service) Consume(ctx context.Context, r db.Runner, env events.Envelope)
 	if err != nil {
 		return 0, err
 	}
+
+	// SHIP-142's filter, and the condition in front of it is the guarantee rather than an
+	// optimisation.
+	//
+	// `Essential()` is false for exactly one category today, so twelve of the thirteen events in
+	// the catalogue never reach this at all — which means there is **no branch in which a muted
+	// row for an award could be read and honoured**, whatever is in the table. That is the same
+	// guarantee ck_notification_preferences_category gives from the other end: the database
+	// cannot hold the row, and the consumer would not look for it.
+	//
+	// It also saves a query inside a transaction holding a Kafka partition's progress, which is
+	// the reason `ruleNeedsPush` guards the device lookup the same way.
+	if !rule.Category.Essential() {
+		recipients, err = s.filterMuted(ctx, r, rule.Category, recipients)
+		if err != nil {
+			return 0, err
+		}
+	}
+
 	if len(recipients) == 0 {
 		return 0, nil
 	}

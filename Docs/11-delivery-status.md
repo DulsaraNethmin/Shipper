@@ -588,6 +588,8 @@ The file's own header says which invocation demonstrates which claim.
 
 | **SHIP-141** | M5 | Push content redaction — **two guards, because wave 10 proved one of them insufficient.** The structural half was already there and covers what would have to arrive through the event; what this adds is a **word-level** guard over *rendered* copy, because `Rule.Headline` is free prose in a Go literal and wave 10 isolated a sentence carrying no field and no value that a thirteen-test suite passed with live. Four rules: **no digit** once the job identifier is removed, no capitalised word mid-sentence outside a **two-word** allowlist, no street type from a closed Australian list, no `@` or link. `Render` refuses with `ErrRedacted` and writes nothing. **What it cannot catch is named rather than glossed**: a lower-case goods description trips nothing, and that half is structural only — *see below* |
 
+| **SHIP-142** | M5 | `GET` and `PUT /v1/notifications/preferences` — and **"essential events cannot be muted" is a CHECK constraint, not a handler branch**: `ck_notification_preferences_category` (`000704`) admits only the categories `Docs/01` §4.5 leaves off its list, so the row cannot exist however it is written. **Presence is the mute** — no `muted boolean`, no backfill, and an account that existed yesterday receives exactly what it did. The consumer looks up preferences **only when the category is mutable**, so there is no branch in which a muted award could be honoured. The first `PUT` in this service, because the body is the complete set and `[]` means unmute everything — *see below* |
+
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
 ### What SHIP-15a built
@@ -12086,6 +12088,99 @@ worth it for a case that cannot arise while `Consume` is the only path into the 
 writer ever appears, this is the paragraph to revisit.
 
 **Nothing was needed from `internal/config`.** A redaction rule with a switch is not a rule.
+
+### SHIP-142 — a mute is a row, and the thing that cannot be muted is a constraint
+
+Three points and two endpoints, and the design decisions are all about where the second clause of the
+*Done when* lives.
+
+#### The invariant is in the schema, and the handler is the courtesy
+
+"Essential events cannot be muted" is a guarantee, and a guarantee held only in Go is one an
+`INSERT` from psql walks past. `ck_notification_preferences_category` admits **only** the categories
+`Docs/01` §4.5 leaves off its list of essential events — today `job_expiry` alone — so the row cannot
+exist however it is written.
+
+The service refuses one too, and the handler refuses it with the **index** of the offending element,
+because a client is owed a field error naming `muted.1` rather than a 500 carrying a constraint
+name. That is the same division `000701` draws for a device token: the handler is the courtesy and
+the constraint is the control. `make verify` demonstrates both — the endpoint's 422 with
+`notifications_category_essential`, and then an `INSERT` from psql that never touches the service and
+is refused anyway.
+
+It also means **making a second category mutable is a migration**, deliberately. §4.5's list is a
+product decision, and the shape that lets somebody widen it by editing a Go constant is the shape
+where it gets widened without anybody noticing. `migrations/notifications_test.go` pairs the CHECK
+against `Category.Essential()` in both directions, per `Docs/10` §3.4.
+
+#### Presence is the mute, and that is what makes the migration free
+
+There is no `muted boolean`. A row means "switched off", and absence means the default — because
+there is no third state: "explicitly on" and "never touched" are the same fact about what the
+platform should send.
+
+So there is **no backfill**. Every account that existed before `000704` has no rows and receives
+exactly what it received yesterday. The alternative — one row per account per category with
+`DEFAULT false` — needs four rows written for every user in the database and then a second mechanism
+to keep new accounts in step, whose only job is to reproduce a default.
+
+`muted_at` is kept because support is asked when somebody turned this off, and the write is
+`ON CONFLICT … DO UPDATE` rather than delete-and-reinsert so that saving an unchanged screen — which
+a client does on every visit — does not reset that date to "when they last opened settings".
+
+#### The consumer only looks when the category is mutable, and that is the guarantee from the other end
+
+`Consume` calls the filter when `rule.Category.Essential()` is false and **not otherwise**. Twelve of
+the thirteen events in the catalogue never reach it, which means there is no branch in which a muted
+row for an award could be read and honoured — whatever is in the table, and whoever put it there.
+`TestAMuteDoesNotSilenceAnEssentialEvent` is that stated as a test: it mutes what can be muted, then
+consumes an award, and requires the customer to be told.
+
+A muted recipient is dropped on **every** channel rather than only on push. The unit of the
+preference is the notification: somebody who switched off expiry reminders has not asked to receive
+them by email instead, and a mute that silenced the push and sent the email would read as the
+platform ignoring them.
+
+#### `PUT` is the first in this service, and `[]` had to mean something
+
+The body is the complete muted set rather than a change to it, so the client is placing a resource at
+a location it already knows — which is what `PUT` is for, and which makes the request idempotent by
+construction rather than only by its key. Two switches flipped in one session then have no ordering
+between them.
+
+That makes `[]` meaningful: it is "unmute everything", and it has to be accepted. An implementation
+reading an empty list as "change nothing" fails **silently**, because the screen it answers with is
+the one the client just sent. It falls out of the general statement rather than being a branch —
+`DELETE … WHERE category <> ALL('{}')` removes every row — and both `make verify` and
+`TestAMutableCategoryCanBeMutedAndUnmuted` assert it.
+
+#### `essential` is served, not assumed
+
+The response carries all four categories with `essential` on each, and the client holds no category
+list. `Docs/06` §5.3 keeps anything that changes under operational pressure on the platform, and
+Flutter has no over-the-air path for Dart code — so a build with today's answer compiled into it
+would be wrong the day a second category became mutable and could not be corrected. The app disables
+the switch; the platform refuses the request (`Docs/07` §3).
+
+#### The honest size of it
+
+**This ticket buys exactly one switch.** `Category.Essential()` has said since SHIP-137 that
+`job_expiry` is the only mutable category, and `Docs/01` §4.5's essential list covers everything
+else. That is the right size rather than a shortfall: the alternative reading — that a preference
+screen should be able to switch off the message telling somebody their job has been awarded — is one
+§4.5 forecloses. What this ticket buys beyond the switch is the **mechanism**, which is where the
+work was: a table whose constraint cannot be argued with, a consumer that cannot look at it for an
+essential event, and an endpoint that tells the client which categories exist.
+
+#### What Lane D is owed and did not get
+
+**There is no client for this.** `apps/mobile/lib/features/notifications/**` belongs to another lane
+this wave and was not touched. The two endpoints, their contract fragment and their error code are
+everything a preference screen needs; the screen itself is unbuilt and has no ticket in `Docs/09`
+that names it. §9 should carry it.
+
+**Nothing was needed from `internal/config`.** The category list is derived from the Go enumeration
+and served over HTTP, which is what "server-side" means here.
 
 
 ## 4. Partly done — do not treat these as finished
