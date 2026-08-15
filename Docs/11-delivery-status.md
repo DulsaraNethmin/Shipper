@@ -12135,6 +12135,90 @@ status, but it is a trap sitting in a shared fixture.
 
 #### Nothing was needed from `internal/config`
 
+
+### SHIP-166 — the control, and the mutation that showed which layer is holding it up
+
+Docs/04 §9's second required internal control: "two-person review for permanent account suspension
+where practical". The hedge is for a platform with one administrator; this one has three roles, two
+of which hold `users.restrict`, and SHIP-147 built the sign-in that tells two people apart. So it is
+practical, and what was missing was somewhere to record a request and a rule that the approver is not
+the requester.
+
+`000803_suspension_reviews`, three routes, and **`suspended` leaves
+`POST /v1/admin/users/{id}/standing`**. One administrator may still restrict and reinstate.
+Reinstatement is deliberately *not* paired: a control that made undoing a mistake as slow as making
+one would leave somebody locked out while two people found each other, and an account wrongly
+*restored* is not the failure §9 is about.
+
+#### The suspension is applied by the approval, not by the request
+
+The account keeps its standing until the second administrator agrees. **A request that suspended
+immediately and collected a signature afterwards would be a control that does nothing** — the person
+is already locked out by the time anybody reviews it, and the second signature is paperwork. So the
+account's standing is asserted after the *request* as well as after the approval, in the Go suite and
+again in `make verify`.
+
+The approval writes the review, the standing and the audit entry in one transaction. A review marked
+approved beside an account still active reads, to the next person, as a suspension that was agreed
+and then quietly reversed.
+
+#### The mutation: removing the Go check **survived**, and that is the finding
+
+The dispatch's mutation was to let the second approver be the same administrator as the first. It was
+applied in three stages, and the verdict is worth reading in order because only the third is a
+failure of the control.
+
+| Mutation | Verdict |
+|---|---|
+| The `if review.RequestedBy == cmd.ActorID` check in `Suspensions.Approve`, removed | **Survived.** `make test` exited 0 — no test failed |
+| That, **plus** `AND requested_by <> $2` removed from the UPDATE | Caught. `TestOneAdministratorCannotCompleteATwoPersonReview` failed with **500 rather than 409** |
+| That, **plus** `ck_suspension_reviews_two_people` dropped from `000803` | Caught by three: the same test with **200 and the account suspended**, `TestTheDatabaseRefusesAReviewApprovedByItsRequester`, and `migrations.TestTheApproverMayNotBeTheRequester` |
+
+**The survivor is the useful result.** The Go `if` is not what enforces Docs/04 §9 — the UPDATE's own
+`requested_by <> $2` predicate is, because it makes the statement affect no rows and the caller maps
+that to the same `ErrSameAdministrator`. The `if` exists to make the refusal readable at the point a
+person looks for it, and removing it changes nothing a client can observe.
+
+That is exactly the wave-10 lesson in the other direction: **the guard lives in SQL, and the tests
+exercise the SQL**, so a mutation of the Go layer is invisible to them and *should* be. Had the tests
+been written against the `if` — asserting on the error value from a fake store — the first row would
+have been a failure and the control would have been proved in the one layer that is not enforcing it.
+
+Row two is the shape most worth noticing: with both application layers gone the constraint still
+refuses, but the answer degrades from a **409 a console can act on** to a **500**. The account stays
+active, so the control holds; what is lost is the message. That is the honest description of what the
+two application-level checks buy — not enforcement, but a refusal somebody can read.
+
+Restored from `/tmp/snap-a-ship166` and confirmed with `git diff` (empty) **and**
+`shasum -a 256 -c SHASUMS` (three files, all OK).
+
+#### What the route manifest caught that no domain test could
+
+The three handlers were written, wired into `HandlerServices`, covered by nine tests in
+`internal/admin` — and **not registered**. `TestEveryRouteIsInTheContract` found it: a handler that
+compiles and is absent from the route table serves a 404 to the console while every test in the
+domain passes. It is the failure `routes_golden.txt` exists for, arriving from the opposite direction
+to the one it usually does.
+
+`TestEveryMutatingAdminRouteIsAudited` then refused both new mutating routes until each named the
+audit action it writes. Both tripwires fired on this ticket, which is the first time both have fired
+on one.
+
+#### Two administrators in the trail, and no `rejected` status
+
+The request writes `user.suspension_requested` and the approval writes `user.suspension_approved`,
+with `requested_by` in its metadata. **A two-person control whose trail names one participant has not
+recorded what happened**, and the request is the moment the case was made — so an entry for something
+that has not happened yet is correct here, unusually.
+
+There is deliberately no `rejected`. A second administrator who disagrees says so to the first, and
+the request is withdrawn by whoever made it; recording a rejection would make this a workflow with
+two outcomes to route, and would put a disagreement between colleagues into the one table that
+records what was *done*, when nothing was. `withdrawn` exists in the CHECK and has no endpoint —
+named as a later ticket's, so that a pending review is not something only an approval can clear.
+
+#### Nothing was needed from `internal/config`
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

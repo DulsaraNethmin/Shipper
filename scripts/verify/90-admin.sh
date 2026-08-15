@@ -1375,6 +1375,17 @@ status="$(post_json "verify-susp-signin-$$" /v1/auth/login \
   || { cat "$WORKDIR/susp-signin.json"; fail "a suspended account signed in, so the review changed a column nothing reads"; }
 ok "and the account cannot sign in — the review reaches the enforcement identity already had"
 
+# Refresh too, which is where a suspension actually takes effect: an access token lives fifteen
+# minutes and carries no standing, so an account refused only at sign-in keeps working until the
+# token it already holds expires. This half moved here from the SHIP-161 section, because the
+# two-person route is now the only way to reach a suspension at all.
+status="$(post_json "verify-susp-login-$$" /v1/auth/login \
+  "{\"email\":\"$susp_email\",\"password\":\"correct-horse-battery-staple\",\"device_label\":\"Verify Suspension\"}" \
+  "$WORKDIR/susp-login-refused.json")"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/susp-login-refused.json"; fail "a suspended account signed in and got $status, want 403"; }
+ok "and the refusal is a 403 rather than a bad-credentials answer — the account exists and may not be used"
+
 # --- the audit trail names both administrators ----------------------------------------------------
 
 approved_entries="$("$PSQL" "$DATABASE_URL" -qtAc \
@@ -2338,8 +2349,15 @@ stand_user_id="$(json "$WORKDIR/standing-user.json" '["id"]')"
 
 # --- the permission ---------------------------------------------------------------------------------
 
+# `restricted` rather than `suspended` throughout this section, and the change is SHIP-166's.
+#
+# Docs/04 §9 took permanent suspension off this endpoint: one administrator may no longer do it
+# alone. So what this section demonstrates is the **limited** half of the *Done when*'s "limited or
+# disabled" — and the disabled half, including that a suspended account can neither sign in nor
+# refresh, is demonstrated in the SHIP-166 section above, through the two-person route that is now
+# the only way to reach it.
 stand_reason="Two unresolved no-shows in a fortnight; see the delivery exception queue."
-stand_body="{\"standing\":\"suspended\",\"reason\":\"$stand_reason\"}"
+stand_body="{\"standing\":\"restricted\",\"reason\":\"$stand_reason\"}"
 
 status="$(standing "$unpub_support_token" "verify-adm161-sup-$$" "$stand_user_id" "$stand_body" sup)"
 [[ "$status" == "403" ]] \
@@ -2358,54 +2376,50 @@ status="$(standing "$unpub_token" "verify-adm161-bad-$$" "$stand_user_id" \
   || { cat "$WORKDIR/stand-bad.json"; fail "the refusal does not name the field"; }
 
 status="$(standing "$unpub_token" "verify-adm161-noreason-$$" "$stand_user_id" \
-  '{"standing":"suspended","reason":"bad"}' noreason)"
+  '{"standing":"restricted","reason":"bad"}' noreason)"
 [[ "$status" == "422" ]] \
   || { cat "$WORKDIR/stand-noreason.json"; fail "a reason that records nothing returned $status, want 422"; }
 ok "a standing outside ck_users_status's three and a reason too short to record anything are both refused and name their field"
 
-# --- the account can use the platform, and then cannot ------------------------------------------------
+# --- the account is limited rather than disabled ------------------------------------------------------
 #
-# **This is the pair no Go test in internal/admin can make.** The domain writes a column; whether a
-# suspended account can still sign in is internal/identity's code, and the two only meet in the
-# running service.
+# **This is the pair no Go test in internal/admin can make.** The domain writes a column; what that
+# column *does* is internal/identity's code, and the two only meet in the running service.
+#
+# The distinction is the whole of Docs/04 §4's vocabulary and it is easy to lose: a **restricted**
+# account may still sign in and read — `User.CanSignIn` refuses `suspended` alone — and may not
+# trade. An implementation that refused a restricted account at sign-in would pass a check that only
+# looked for "access is limited", and would lock somebody out of the messages telling them why.
 
 status="$(post_json "verify-adm161-login1-$$" /v1/auth/login \
   "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-before.json")"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-before.json"; fail "the account could not sign in before being suspended ($status)"; }
-stand_refresh="$(json "$WORKDIR/stand-login-before.json" '["refresh_token"]')"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-before.json"; fail "the account could not sign in before being restricted ($status)"; }
 ok "the account signs in while it is active, which is the precondition the next check needs"
 
-status="$(standing "$unpub_token" "verify-adm161-suspend-$$" "$stand_user_id" "$stand_body" susp)"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-susp.json"; fail "suspending returned $status, want 200"; }
+status="$(standing "$unpub_token" "verify-adm161-restrict-$$" "$stand_user_id" "$stand_body" susp)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-susp.json"; fail "restricting returned $status, want 200"; }
 [[ "$(json "$WORKDIR/stand-susp.json" '["from"]')" == "active" ]] \
   || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account held before"; }
-[[ "$(json "$WORKDIR/stand-susp.json" '["to"]')" == "suspended" ]] \
+[[ "$(json "$WORKDIR/stand-susp.json" '["to"]')" == "restricted" ]] \
   || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account holds now"; }
-[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from users where id = '$stand_user_id';")" == "suspended" ]] \
-  || fail "the account is not suspended"
-ok "an account is suspended, and the response carries both ends — a console rendering only the new standing cannot tell a tightening from a loosening"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from users where id = '$stand_user_id';")" == "restricted" ]] \
+  || fail "the account is not restricted"
+ok "an account is restricted, and the response carries both ends — a console rendering only the new standing cannot tell a tightening from a loosening"
 
 [[ "$("$PSQL" "$DATABASE_URL" -qtAc \
   "select count(*) from audit_log
     where target_id = '$stand_user_id' and target_type = 'user'
       and action = 'user.standing_changed' and actor_id = '$unpub_id'
       and reason = '$stand_reason'
-      and metadata->>'from' = 'active' and metadata->>'to' = 'suspended';")" == "1" ]] \
+      and metadata->>'from' = 'active' and metadata->>'to' = 'restricted';")" == "1" ]] \
   || fail "the change wrote no audit entry carrying the reason and both ends"
 ok "and the audit entry names the account, the administrator, the reason and both ends of the change"
 
-# The enforcement. Sign-in is refused, and so is refresh — which is where a suspension actually takes
-# effect, because an access token lives fifteen minutes and carries no standing.
 status="$(post_json "verify-adm161-login2-$$" /v1/auth/login \
   "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-after.json")"
-[[ "$status" == "403" ]] \
-  || { cat "$WORKDIR/stand-login-after.json"; fail "a suspended account signed in and got $status, want 403"; }
-
-status="$(post_json "verify-adm161-refresh-$$" /v1/auth/refresh \
-  "{\"refresh_token\":\"$stand_refresh\"}" "$WORKDIR/stand-refresh.json")"
-[[ "$status" != "200" ]] \
-  || { cat "$WORKDIR/stand-refresh.json"; fail "a suspended account refreshed its session, so the suspension does not take effect until the token expires"; }
-ok "the suspended account can no longer sign in, and the session it already had cannot be refreshed — 'account access is disabled', on the wire"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/stand-login-after.json"; fail "a restricted account could not sign in and got $status, want 200 — restricted limits what an account may do, and an account locked out cannot read why"; }
+ok "the restricted account still signs in — 'access is limited', not disabled, which is the distinction Docs/04 §4 draws and the SHIP-166 section shows the other side of"
 
 # --- a no-op, and putting the account back ------------------------------------------------------------
 
@@ -2417,12 +2431,12 @@ status="$(standing "$unpub_token" "verify-adm161-noop-$$" "$stand_user_id" "$sta
 [[ "$("$PSQL" "$DATABASE_URL" -qtAc \
   "select count(*) from audit_log where target_id = '$stand_user_id';")" == "1" ]] \
   || fail "a no-op wrote a second entry, in a table whose value is that everything in it happened"
-ok "setting the standing an account already holds is refused rather than recorded — an entry saying suspended to suspended is noise in the one table that must be all signal"
+ok "setting the standing an account already holds is refused rather than recorded — an entry saying restricted to restricted is noise in the one table that must be all signal"
 
 status="$(standing "$unpub_token" "verify-adm161-reinstate-$$" "$stand_user_id" \
   '{"standing":"active","reason":"No-shows explained and evidenced; access restored after review."}' back)"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/stand-back.json"; fail "reinstating returned $status, want 200"; }
-[[ "$(json "$WORKDIR/stand-back.json" '["from"]')" == "suspended" ]] \
+[[ "$(json "$WORKDIR/stand-back.json" '["from"]')" == "restricted" ]] \
   || { cat "$WORKDIR/stand-back.json"; fail "the reinstatement does not say what the account held"; }
 
 status="$(post_json "verify-adm161-login3-$$" /v1/auth/login \
