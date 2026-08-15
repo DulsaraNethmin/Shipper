@@ -13089,7 +13089,7 @@ and not-found is comma-ok rather than a sentinel error, because `errors.Is(err, 
 
 **Re-checked against the tree in this pass, and it is now a fact in the code rather than a prediction about it.** `internal/bidding/model.go` declares `StatusCountered`, lists it in the closed status set that `ck_bids_status` is held against in both directions, and carries a comment saying it is **deliberately never written**. Nothing in the domain assigns it. So the constant, the `CHECK` and `Docs/02` §4 all agree that the value exists, and the only thing that does not is the platform. **SHIP-96 still owns it**, and the cheaper of the two options has not become less cheap by waiting.
 
-**`ck_bids_offer_has_timing` is answerable now and is still not written, and the "answerable" half was confirmed rather than assumed.** `000501` removed it because it would have bound SHIP-87's design. **SHIP-87 has landed**, that design is made, and every offer this platform writes past `Draft` names both instants — so the constraint would hold against the data the service produces today. It is not added because 000501's *other* finding still holds: it failed six of SHIP-80's own migration tests, which insert `Submitted` and `Accepted` bids with no timing in order to exercise `ck_bids_status`, and making them pass means editing another ticket's test file. **A small ticket: one migration plus an edit to `migrations/bids_test.go`'s fixtures.** Worth taking, because a stated-timing rule enforced only by a validator is one a worker or an admin path could bypass.
+**~~`ck_bids_offer_has_timing` is answerable now and is still not written.~~ Written as `Docs/09`'s SHIP-87a at the wave-10 reconciliation — two points in M3, and the reasoning below is what the row's *Done when* is built from.** The "answerable" half was confirmed rather than assumed. `000501` removed it because it would have bound SHIP-87's design. **SHIP-87 has landed**, that design is made, and every offer this platform writes past `Draft` names both instants — so the constraint would hold against the data the service produces today. It is not added because 000501's *other* finding still holds: it failed six of SHIP-80's own migration tests, which insert `Submitted` and `Accepted` bids with no timing in order to exercise `ck_bids_status`, and making them pass means editing another ticket's test file. **A small ticket: one migration plus an edit to `migrations/bids_test.go`'s fixtures.** Worth taking, because a stated-timing rule enforced only by a validator is one a worker or an admin path could bypass.
 
 **`flutter_secure_storage` is held at 10.x because version 11 needs `compileSdk = 37`.** The client compiles against 36 today, and Android Gradle Plugin 9.0.1 names 36 as its own maximum recommended — so taking 11 means moving the SDK and probably the Gradle plugin together. There is no urgency: 10.3.1 uses the same Keystore-wrapped ciphers and the same API 23 requirement. **Decide it with SHIP-24 and SHIP-26**, which are the tickets that touch the Android build configuration anyway.
 
@@ -13285,7 +13285,7 @@ taken by SHIP-15m** and are struck below — which is the mechanism §1 describe
 paragraphs accumulate here during a wave and become the next wave's pre-step. An eighth, found while
 building that pre-step, is at the end.
 
-**No endpoint serves a job's status history to a customer, and no ticket in the backlog adds one.**
+**~~No endpoint serves a job's status history to a customer, and no ticket in the backlog adds one.~~ Written as `Docs/09`'s SHIP-65a at the wave-10 reconciliation** — three points in M2, and the oldest entry in this section to get an owner: it has been open since wave 5 and is the reason SHIP-77 has sat in §4 longer than any other ticket. **It is not startable yet**, because a four-segment `GET` under `/v1/jobs/{id}/` cannot be registered while `GET /v1/jobs/open/{id}` exists, so the row declares an edge to SHIP-83a — this file's first forward edge to open work. The finding below is unchanged and is what the row is built from.
 `job_status_history` has recorded the actor, the reason and both clocks since SHIP-57a,
 append-only, and `jobs.Service.History` reads it in Go — but nothing exposes it over HTTP.
 `GET /v1/jobs/{id}` answers the `Job` schema, which is `additionalProperties: false` and carries one
@@ -13310,7 +13310,7 @@ provider's vehicle. What it is is an inconsistency with a real cost: the endpoin
 the platform decides" is supposed to make safe. A customer who reached the fleet screen would have
 seen an empty fleet, an Add button, a form to fill in, and a `403` at the very end of all of it.
 SHIP-98 gated the surface on the device instead, which is the right call for that ticket and is a
-workaround for a platform gap rather than a fix for it. **SHIP-78's gap; it wants a ticket.**
+workaround for a platform gap rather than a fix for it. **~~SHIP-78's gap; it wants a ticket.~~ It has one: `Docs/09`'s SHIP-78a, two points in M3, written at the wave-10 reconciliation.** It had been restated at every reconciliation since wave 5 without ever being written down as work, which is the failure mode this section is supposed to prevent rather than demonstrate.
 
 **~~Kafka has no per-worktree isolation, unlike the database and the ports.~~ Written down where it
 will be read, at SHIP-15m — see §3.** The rule is now a row in `CLAUDE.md`'s worktree table and the
@@ -13472,11 +13472,15 @@ trigger for generating them is the second surface that needs the milestone vocab
 client's SHIP-129 screen has its own strings today, so a third copy is what should pay for the
 generator rather than the second.
 
-**A driver cannot see which milestones they have already recorded, and no ticket owns the route that
+**~~A driver cannot see which milestones they have already recorded, and no ticket owns the route that
+would fix it.~~ Written as `Docs/09`'s SHIP-121a at the wave-10 reconciliation** — two points in M4, five
+segments so it registers today with no dependency on SHIP-83a. The finding below is unchanged.
+
+**A driver cannot see which milestones they have already recorded, and no ticket owned the route that
 would fix it (SHIP-121).** The portal's buttons start at rest on every page view and a reload forgets
 what the last one did. Persisting it needs the platform to serve a driver their own milestone list,
 and `GET /v1/jobs/{id}/delivery/milestones` is `RequireUser`; `GET /v1/driver/jobs/{id}/milestones`
-under `RequireDriverToken` is the shape, and `Docs/09` names no such row.
+under `RequireDriverToken` is the shape, and `Docs/09` named no such row until SHIP-121a.
 
 It costs a driver nothing they cannot recover from — tapping a milestone twice is safe, and `Docs/02`
 §5 makes a repeat an ordinary recording — so this is a usability gap rather than a correctness one,
@@ -13929,6 +13933,12 @@ calendar rather than the behaviour. **`81190d9` fixed it — SHIP-127 itself**, 
 until it was wired "the nudge fired in tests that had never heard of it, and would have gone on
 firing differently as the calendar moved past the fixture's date".
 
+*Re-checked at the wave-10 reconciliation, and the correction survived.* Both fixes are still
+ancestors of `605ad3a`, the entry still reads *closed* on both instances, and nothing in wave 10
+reopened either. This paragraph is confirmed rather than rewritten, which is the whole point of
+re-reading an entry that was once wrong: a correction that quietly reverts is worse than the defect,
+because the second reader trusts it.
+
 *What was actually stale, and why it matters more than the two fixes.* This entry read **"Neither
 instance is fixed here — both are live code in `internal/admin` and `apps/mobile`"**, and both
 commits are ancestors of the branch it was written on. Its lane-letter attributions were wrong as
@@ -14062,6 +14072,78 @@ SHIP-120a — appear in **no `Depends on` cell anywhere**, measured. **A client 
 precondition is a route on the served surface, and `routes_golden.txt` is the only artefact that
 answers it.** The cheap habit, until somebody makes it mechanical: before scheduling a client ticket,
 grep `routes_golden.txt` for each noun in its *Done when*.
+
+**The habit was applied in wave 10 and it worked**, which is the first evidence for it rather than the
+argument. The lane building SHIP-102 re-checked every clause of its *Done when* against
+`routes_golden.txt` before writing a line, found three of four served and one not, and said so on the
+screen and in §3 — where the wave-9 dispatch brief for the same ticket had not checked at all. **It
+cost the lane an hour and it is why §4's SHIP-102 row could be written at the wave that landed it
+instead of a wave later.**
+
+---
+
+**The four below were found at the wave-10 reconciliation, and none of them was owned by a ticket
+when it was written down.** Three now are; the fourth is a decision rather than work.
+
+**A report or flag mechanism exists nowhere, and SHIP-156 needs one nobody has specified.**
+Measured on `605ad3a`: no migration creates a report, flag or moderation table — the only matches for
+"report" across the whole migration set are fifteen prose sentences in comments — and there is no
+conversation either, because SHIP-97 is unbuilt. SHIP-156's *Done when* is "reports surface with the
+job and conversation in context", so **both halves of it are missing and only one of them has a row.**
+§6 strikes the ticket rather than declaring the SHIP-97 edge alone, because a half-declared dependency
+makes a ticket look blocked on scheduling when it is blocked on a product decision. **What is
+undecided is not small**: who may report what, against which policy, with what outcome, and whether a
+report is a lightweight signal or the intake of a moderation case `Docs/04` §5 already half-describes.
+**Owner: whoever writes the next prep, with `Docs/04` §5 as the authority.** It is one row and it
+unblocks a three-point M6 ticket; leaving it means SHIP-156 stays struck indefinitely, which is the
+shape §6 says does not close by itself.
+
+**`scripts/verify-foundation.sh`'s `kafka_fence` note is false, and the file is shared so this pass
+did not touch it.** The comment above `kafka_fence shipper.bid shipper.delivery` reads: *"`shipper.job`
+is not fenced: 80-notifications.sh deletes and recreates it, so `--from-beginning` there is already a
+statement about this run."* **Wave 10's Lane B stopped that section deleting `shipper.job`** — the
+file now says in its own header *"And this section no longer deletes `shipper.job`. It takes an offset
+fence instead"*, and its first check reads *"this section leaves it alone"*. So the justification for
+leaving `shipper.job` unfenced no longer exists, and a run reading that topic `--from-beginning` would
+now see every other worktree's history rather than a topic that was just emptied. **This is a
+documentation defect rather than a live failure** — the section that would have depended on it fences
+for itself — but it is the exact class this file exists to catch: a comment that was true, whose
+premise a different ticket removed, and which now argues for the opposite of what it says.
+**Owner: the shared-surface holder.** One paragraph, and it should be taken in the same change as
+anything else that touches the harness.
+
+**Three cross-references in §3 were made stale by this pass's §7 renumber, and were deliberately not
+fixed.** Wave 10 is the new §7 and the nine waves behind it each moved one letter, so §3's references
+to §7a, §7d and §7e now name the wrong wave — they should read §7b, §7e and §7f. **The prep pass that
+fixed them would have bought the wave's merge collision**, which is what happened to each of the last
+two preps for exactly one token each. §3 belongs to the code lanes during a wave. **Route the three
+corrections through whoever merges**, after the lanes have landed and before the next reconciliation
+reads them.
+
+**Whether a comment inside an *applied* migration may be corrected is an open convention question,
+and this pass records it rather than answering it.** `000302_vehicle_capability_index.up.sql`
+line 58 says *"idx_jobs_open_expiry is partial on 'Open' alone and ordered"*. SHIP-70a's `000409`
+dropped and recreated that index to cover `Negotiating` as well, so the sentence is now false about
+the schema the file itself helps produce. **Wave 10's Lane C left it alone and was right to**, on the
+reasoning that an applied migration is the record of what ran.
+
+*The two positions, stated so the decision can be made once.* **Against correcting:** the file is
+history. `CLAUDE.md` and `Docs/09` both treat an applied migration as unrewritable, and a reader who
+finds a comment that does not match the SQL beside it learns something true about when it was written.
+Editing the prose while the SQL stays fixed also makes the file's provenance ambiguous — the
+`000005_users_role_is_immutable` precedent exists precisely because `000002` could not be rewritten.
+**For correcting:** the migration set is read as documentation far more often than it is replayed, a
+comment is not part of any checksum a migration tool verifies, and a false statement about a live
+index is the kind of thing somebody reasons from. `000409` itself sets a partial precedent — it kept
+the index *names* deliberately "because they are named" elsewhere, which is a continuity decision the
+same argument would extend to comments.
+
+**A third option nobody has considered and probably should**: leave applied migrations untouched and
+require the *superseding* migration to say what it invalidated. `000409` already half does this. That
+makes the correction additive, keeps every applied file a true record of its own moment, and puts the
+statement where somebody reading forward will meet it. **Owner: the repository owner**, with the same
+standing as X-6 — a decision somebody can make in an afternoon, and one that gets more expensive as
+the migration set grows past ninety files.
 
 ## 10. The done list, in a form a script can read
 
