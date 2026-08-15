@@ -115,3 +115,42 @@ type SMSSender interface {
 type Pusher interface {
 	Push(ctx context.Context, deviceToken, title, body string, jobID uuid.UUID) (rejected bool, err error)
 }
+
+// Sessions reports which device sessions are still usable.
+//
+// # This is what makes SHIP-140's "clears on sign-out" a platform guarantee rather than a client one
+//
+// A device token binds to a `device_sessions` row (000701). Signing out **revokes** that row rather
+// than deleting it (000104), so a foreign key cascade would never fire and would be a guarantee in
+// name only — and the alternative, having identity write to `device_tokens` when a session ends, is
+// a cross-domain write into a table another domain owns.
+//
+// So a token is never addressed unless its session is live, and this port is how that is asked.
+// Revoking a session ends push delivery to that handset in the same transaction that revoked it,
+// with nothing to keep in step and no change to internal/identity — a domain this one may not
+// import in either direction.
+//
+// # Why a port rather than a join
+//
+// postgres.go reads `users` directly because migrations/blocks.go calls the shared block "tables
+// every domain reads" and five domains do. `device_sessions` is in identity's block and is not one
+// of them. A join written in this package would read as though identity's sessions were a table
+// notifications owns, which is the objection this file already records against a `jobs`-to-`bids`
+// join — see [Parties]. The composition root is where a dependency between two domains is visible
+// to somebody reading how the service is wired, and this is the fourth instance of that arrangement
+// (SHIP-113, SHIP-117, SHIP-137).
+//
+// # What a nil implementation means
+//
+// No push address resolves at all. A process wired without this cannot tell a live device from a
+// signed-out one, and addressing every registered handset would push to phones whose owner has
+// signed out — so it addresses none. See [WithSessions].
+type Sessions interface {
+	// LiveSessions returns the subset of ids whose sessions are usable: not revoked, and with a
+	// refresh token that has not lapsed.
+	//
+	// A map rather than a slice, because the caller holds a token per session and needs to test
+	// membership rather than iterate. A session that does not exist is simply absent, which is
+	// the same answer as revoked and is the answer this domain wants: do not address it.
+	LiveSessions(ctx context.Context, r db.Runner, ids []uuid.UUID) (map[uuid.UUID]bool, error)
+}

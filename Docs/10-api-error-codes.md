@@ -82,3 +82,4 @@ them where the call is made, beside the thing the user was trying to do.
 | `jobs_not_a_draft` | The job has been published and can no longer be edited as a draft. Reload it to see its current status. |
 | `jobs_not_cancellable` | The job can no longer be cancelled. Once a provider has been awarded the work, ending the job is a support matter rather than a state change. Reload it to see its current status. |
 | `jobs_not_extendable` | The job's expiry cannot be extended. Either it is not being offered to providers any more, or its pickup date is what is ending it — and no amount of extra listing time keeps a job alive past the date its goods were to be collected. |
+| `notifications_no_device_session` | That credential does not name a device session, so there is nothing to register a push token against. Sign in again. |

@@ -1,0 +1,221 @@
+# Notifications — the handsets a push notification is addressed to.
+#
+# The counterpart of cmd/api/routes_notifications.go. Docs/10 §8.1 keeps the two in step: a domain
+# adds one route file and one fragment, and edits neither this file's siblings nor the middle of a
+# shared document. The one shared line per path is its `$ref` in contracts/openapi.yaml.
+#
+# This is the seventh domain's first appearance in the contract. SHIP-137 built the consumer and the
+# dispatcher, both of which run in cmd/notifier and answer no request at all; these two operations
+# exist because a push notification needs an address and only the handset knows it (SHIP-140).
+#
+# # Both operations are the caller's own device, and neither takes an identifier
+#
+# A device token binds to the device session the access token was issued against. There is no `{id}`
+# on either path and no field in either body naming whose device this is — a client naming a session
+# would be an authorisation decision made from client input, which Docs/07 §3 puts on the platform.
+#
+# That is also why this fragment is short. There is no "somebody else's token" case, so no `404`
+# that has to be indistinguishable from a `403`, and no ownership rule to describe.
+#
+# # The token is accepted and never returned
+#
+# `DeviceToken` carries no `token` field. The client sent it and already has it, and a value that
+# identifies somebody's handset should appear in as few places as possible — including response
+# bodies, which are logged by more middleware than anybody remembers. Response schemas are
+# `additionalProperties: false` throughout, so this is a statement about what the service returns
+# rather than a summary of it.
+
+DeviceTokens:
+  post:
+    operationId: registerDeviceToken
+    summary: Register this device for push notifications
+    tags: [Notifications]
+    description: |
+      Records the Firebase registration token this handset is addressable at (SHIP-140).
+
+      **Registering again is the ordinary case, not the exception.** Firebase hands the app a token
+      at every launch and only sometimes the same one, so SHIP-143 calls this each time. Whatever
+      this device had registered is superseded, and a token that was live against another device
+      session — a handset restored from someone else's backup — is superseded too, so that a
+      notification meant for the previous owner cannot reach the new one.
+
+      It answers `201` every time, including for a token already registered: the resource created is
+      the registration, and a client that retries after a dropped connection has created one either
+      way.
+
+      ## Signing out clears this without calling anything
+
+      The token is bound to the device session, and nothing is addressed whose session has been
+      revoked — so `POST /v1/auth/logout` and `DELETE /v1/auth/sessions/{id}` both end push delivery
+      to this handset from the instant they commit. Calling `DELETE …/device-tokens/current` as well
+      is a courtesy that makes the record legible; it is not what makes the guarantee hold.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/RegisterDeviceToken'
+    responses:
+      '201':
+        description: The device is registered and will receive push notifications.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DeviceToken'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable credential, or one that names no device session.
+
+          **Branch on `error.code`.** `notifications_no_device_session` is not a credential problem
+          the client can refresh its way out of: there is nothing to register a token against, and
+          signing in again is the only way forward. Refreshing and replaying — which is the ordinary
+          answer to a `401` — would loop against a session that will still not be there.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '405':
+        $ref: '../openapi.yaml#/components/responses/MethodNotAllowed'
+      '422':
+        description: |
+          The token was missing or too long, or the platform is not one this app runs on. Field
+          errors name `token` and `platform`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The platform cannot complete this right now. Retry shortly.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+CurrentDeviceToken:
+  delete:
+    operationId: deregisterDeviceToken
+    summary: Stop sending push notifications to this device
+    tags: [Notifications]
+    description: |
+      Deregisters whatever this device session has registered (SHIP-140).
+
+      `current` rather than a token in the path: the client always knows which device it is without
+      knowing which token is live, and putting a value that identifies somebody's handset into the
+      path would put it into every access log and every proxy on the way, for no gain.
+
+      **It answers `204` whether or not anything was registered.** Deregistering twice is not an
+      error — a client retrying after a dropped connection must not be told it did something wrong —
+      and "there was nothing registered" is not a fact a client can act on differently.
+
+      This is a courtesy rather than the control. See the note on registration: signing out ends
+      push delivery whether or not this is called.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '204':
+        description: This device will not receive push notifications. No body.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '405':
+        $ref: '../openapi.yaml#/components/responses/MethodNotAllowed'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The platform cannot complete this right now. Retry shortly.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- schemas ---------------------------------------------------------------------------------
+
+RegisterDeviceToken:
+  type: object
+  additionalProperties: false
+  required: [token, platform]
+  properties:
+    token:
+      type: string
+      minLength: 1
+      maxLength: 4096
+      description: |
+        The Firebase Cloud Messaging registration token this handset was issued.
+
+        It addresses a device and authenticates nobody, which is why the platform stores it in the
+        clear — it has to be able to send to it. The length bound is a sanity limit rather than a
+        specification: Firebase's tokens are around 160 characters today and the format has changed
+        twice.
+      example: fMEr9Xk2Q3aBcDeF:APA91bHq…
+    platform:
+      type: string
+      enum: [ios, android]
+      description: |
+        Which store this build came from.
+
+        Not how a message is routed — Firebase fronts APNs, so one adapter reaches both. It is what
+        lets support answer which handsets an account is signed in on.
+
+DeviceToken:
+  type: object
+  additionalProperties: false
+  required: [id, platform, registered_at]
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: The registration.
+    platform:
+      type: string
+      enum: [ios, android]
+    registered_at:
+      type: string
+      description: When the platform recorded this registration.
+  description: |
+    A registration, without the token.
+
+    The absent field is deliberate and is described at the head of this fragment: the client sent
+    the token and already has it, and a value identifying somebody's handset belongs in as few
+    places as possible.
+
+# --- parameters ------------------------------------------------------------------------------
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a phone that retries
+    after a dropped connection must not end up registering twice.
+  schema:
+    type: string

@@ -38,13 +38,17 @@ const (
 	// that a ticket which decides otherwise adds a line to [Rules] and nothing else.
 	ChannelSMS Channel = "sms"
 
-	// ChannelPush is Docs/01 §4.5's primary channel and cannot be sent today.
+	// ChannelPush is Docs/01 §4.5's primary channel, and since SHIP-139 and SHIP-140 it is one
+	// this platform can actually send on.
 	//
-	// SHIP-139 is the Firebase adapter and SHIP-140 is the device token registry, and neither
-	// exists — so there is no address a push notification could be written with, which is why
-	// [Rules] produces none rather than producing rows nothing can complete. [Pusher] is the
-	// port SHIP-139 fills; declaring it here is the whole of what this ticket can honestly do
-	// about push.
+	// It is the one channel whose address is not a property of the account. An email address and
+	// a phone number are columns on `users`; a push address is a device token bound to a signed-in
+	// device (000701), so one person is nought, one or several addresses depending on how many
+	// handsets they are signed in on — and none at all once they sign out.
+	//
+	// That is why [Recipient.AddressesOn] returns a list and why a recipient with nothing
+	// registered is skipped rather than failing: a customer who has never opened the app is
+	// reachable by email and by nothing else, which is a fact about them and not an error.
 	ChannelPush Channel = "push"
 )
 
@@ -136,20 +140,39 @@ type Recipient struct {
 	Email   string
 	Phone   string
 	Deleted bool
+
+	// PushTokens is every handset this person is addressable on, and it is the one field here
+	// that is a list.
+	//
+	// A person has one email address and one number, and any number of signed-in devices. Each
+	// is its own notification row: the phone and the tablet are two messages about one event,
+	// and uq_notifications_event_recipient_device (000701) is what keeps them one apiece.
+	//
+	// Only the live ones. A token whose device session has been revoked is not here, which is
+	// what "clears on sign-out" means in practice — see [Sessions].
+	PushTokens []string
 }
 
-// AddressOn is where this recipient is reached on a channel, and whether they can be.
+// AddressesOn is every address this recipient is reached at on a channel.
 //
-// Push has no address and never will have one here: SHIP-140's device tokens are rows in a table
-// this ticket does not create, and inventing an address for them would be worse than having none.
-func (r Recipient) AddressOn(c Channel) (string, bool) {
-	switch c {
-	case ChannelEmail:
-		return r.Email, r.Email != ""
-	case ChannelSMS:
-		return r.Phone, r.Phone != ""
+// Zero, one or many, and the many is push. SHIP-137's version of this returned one address and a
+// boolean, which was exactly right while every channel had one address per person; a device token
+// registry (SHIP-140) makes push the exception, and a signature returning one address would have
+// forced the second handset to be dropped somewhere no caller could see it happen.
+//
+// An empty result is not a failure. It is a customer with no phone number, or one who has never
+// opened the app on a handset — both ordinary, and both meaning "not reachable that way" rather
+// than "something went wrong".
+func (r Recipient) AddressesOn(c Channel) []string {
+	switch {
+	case c == ChannelEmail && r.Email != "":
+		return []string{r.Email}
+	case c == ChannelSMS && r.Phone != "":
+		return []string{r.Phone}
+	case c == ChannelPush:
+		return r.PushTokens
 	default:
-		return "", false
+		return nil
 	}
 }
 

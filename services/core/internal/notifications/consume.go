@@ -38,10 +38,34 @@ type Senders struct {
 // and for a consumer pass that is this package, since "every row for one event, or none" is what
 // makes a redelivery meet a complete set.
 type Service struct {
-	parties Parties
-	clock   clock.Clock
-	senders Senders
-	store   postgresStore
+	parties  Parties
+	sessions Sessions
+	clock    clock.Clock
+	senders  Senders
+	store    postgresStore
+}
+
+// Option adjusts what a service can do beyond consuming and sending.
+//
+// Variadic rather than a fourth parameter to [NewService], and the reason is the one [Senders] was
+// made a struct for: a positional nil is the wiring mistake nobody sees in review. [Sessions] is
+// legitimately absent from any process that does not dispatch — cmd/api registers device tokens and
+// sends nothing — and a fourth parameter would have put a nil at fifteen call sites with no
+// interest in push, which is exactly the shape that eventually gets passed in the wrong order.
+//
+// An option is only acceptable here because the default is the safe answer in every case. See
+// [WithSessions].
+type Option func(*Service)
+
+// WithSessions supplies the device-session liveness lookup (SHIP-140).
+//
+// Without it **no push notification is addressed at all**, deliberately. A process that cannot tell
+// a live device session from a signed-out one cannot tell which handsets it may address, and
+// addressing all of them would push to phones whose owner has signed out — the one failure this
+// port exists to prevent. Quietly sending to everybody would be the dangerous default; quietly
+// sending to nobody is visible in a single query over `notifications`.
+func WithSessions(sessions Sessions) Option {
+	return func(s *Service) { s.sessions = sessions }
 }
 
 // NewService builds the domain service.
@@ -55,7 +79,7 @@ type Service struct {
 // sender still consumes correctly — the rows are written and stay pending — and dispatch.go reports
 // [ErrNoSender] per row rather than at start-up, because the row is the thing that must not be
 // lost. cmd/notifier does supply one; a test that only exercises consumption does not have to.
-func NewService(p Parties, c clock.Clock, s Senders) *Service {
+func NewService(p Parties, c clock.Clock, s Senders, opts ...Option) *Service {
 	if p == nil {
 		panic("notifications: NewService needs a Parties lookup; two thirds of the catalogue " +
 			"names only a job, and a consumer that cannot resolve a job's parties resolves " +
@@ -64,7 +88,11 @@ func NewService(p Parties, c clock.Clock, s Senders) *Service {
 	if c == nil {
 		panic("notifications: NewService needs a clock (Docs/10 §6.3)")
 	}
-	return &Service{parties: p, clock: c, senders: s}
+	svc := &Service{parties: p, clock: c, senders: s}
+	for _, opt := range opts {
+		opt(svc)
+	}
+	return svc
 }
 
 // facts is what this domain reads out of an event payload.
@@ -158,33 +186,30 @@ func (s *Service) Consume(ctx context.Context, r db.Runner, env events.Envelope)
 				return 0, err
 			}
 
-			address, reachable := recipient.AddressOn(channel)
-			if !reachable {
-				// Today this can only be push, which [Rules] does not produce. It
-				// stays a skip rather than an error so that SHIP-140 adding device
-				// tokens does not have to change this loop: a recipient with no
-				// token registered is simply not reachable that way.
-				continue
-			}
+			// Nought, one or several. Push is the channel that can be several — one row
+			// per signed-in handset — and the channel that is routinely nought, because a
+			// customer who has never opened the app is reachable by email and by nothing
+			// else. Both are ordinary and neither is an error.
+			for _, address := range recipient.AddressesOn(channel) {
+				id, err := uuid.NewV7()
+				if err != nil {
+					return 0, fmt.Errorf("notifications: generating an id: %w", err)
+				}
 
-			id, err := uuid.NewV7()
-			if err != nil {
-				return 0, fmt.Errorf("notifications: generating an id: %w", err)
+				rows = append(rows, Notification{
+					ID:        id,
+					EventID:   env.ID,
+					EventType: env.Type,
+					JobID:     jobID,
+					Recipient: recipient.UserID,
+					Channel:   channel,
+					Category:  rule.Category,
+					Essential: rule.Category.Essential(),
+					Address:   address,
+					Subject:   subject,
+					Body:      text,
+				})
 			}
-
-			rows = append(rows, Notification{
-				ID:        id,
-				EventID:   env.ID,
-				EventType: env.Type,
-				JobID:     jobID,
-				Recipient: recipient.UserID,
-				Channel:   channel,
-				Category:  rule.Category,
-				Essential: rule.Category.Essential(),
-				Address:   address,
-				Subject:   subject,
-				Body:      text,
-			})
 		}
 	}
 
@@ -296,7 +321,83 @@ func (s *Service) resolve(
 		return nil, nil
 	}
 
-	return s.store.contacts(ctx, r, wanted, roles)
+	recipients, err := s.store.contacts(ctx, r, wanted, roles)
+	if err != nil {
+		return nil, err
+	}
+	if !ruleNeedsPush(rule) {
+		// A rule that does not push needs no device tokens, and the two extra queries below
+		// are two round trips inside a transaction holding a Kafka partition's progress.
+		return recipients, nil
+	}
+	return s.withDevices(ctx, r, recipients)
+}
+
+// ruleNeedsPush reports whether a rule sends on [ChannelPush].
+func ruleNeedsPush(rule Rule) bool {
+	for _, channel := range rule.Channels {
+		if channel == ChannelPush {
+			return true
+		}
+	}
+	return false
+}
+
+// withDevices fills in each recipient's live push addresses (SHIP-140).
+//
+// # Two queries rather than one join, and the second one is a port
+//
+// The first reads this domain's own `device_tokens`. The second asks [Sessions] which of those
+// devices are still signed in, and it is a port because `device_sessions` is identity's table —
+// ports.go carries the argument, and it is the same one that makes `Parties` a port rather than a
+// join onto `jobs` and `bids`.
+//
+// **The filter is what makes a token clear on sign-out.** 000104 revokes a session rather than
+// deleting it, so nothing cascades and nothing writes here; what happens instead is that the
+// revoked session stops appearing in this answer, from the instant the revocation commits.
+//
+// A service with no [Sessions] resolves no push address at all, which is [WithSessions]'s doing and
+// is the safe direction: it under-notifies visibly rather than pushing to a handset whose owner has
+// signed out.
+func (s *Service) withDevices(
+	ctx context.Context, r db.Runner, recipients []Recipient,
+) ([]Recipient, error) {
+	if s.sessions == nil || len(recipients) == 0 {
+		return recipients, nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(recipients))
+	for _, recipient := range recipients {
+		ids = append(ids, recipient.UserID)
+	}
+
+	devices, err := s.store.liveDevicesOf(ctx, r, ids)
+	if err != nil {
+		return nil, err
+	}
+	if len(devices) == 0 {
+		return recipients, nil
+	}
+
+	sessionIDs := make([]uuid.UUID, 0, len(devices))
+	for _, registered := range devices {
+		for _, device := range registered {
+			sessionIDs = append(sessionIDs, device.SessionID)
+		}
+	}
+	live, err := s.sessions.LiveSessions(ctx, r, sessionIDs)
+	if err != nil {
+		return nil, fmt.Errorf("notifications: resolving which device sessions are live: %w", err)
+	}
+
+	for i, recipient := range recipients {
+		for _, device := range devices[recipient.UserID] {
+			if live[device.SessionID] {
+				recipients[i].PushTokens = append(recipients[i].PushTokens, device.Token)
+			}
+		}
+	}
+	return recipients, nil
 }
 
 // needs reports whether a rule names an audience.

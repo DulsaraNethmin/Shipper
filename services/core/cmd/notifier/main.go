@@ -123,7 +123,11 @@ func run() error {
 		// exactly what push.Noop must not do, and does not: it records, it never rejects,
 		// and nothing marks a row sent that a real adapter would not have sent.
 		Push: newPushSender(cfg),
-	})
+	},
+		// SHIP-140. Without this the consumer resolves no push address at all, because it
+		// cannot tell a live device session from a signed-out one — see the port.
+		notifications.WithSessions(deviceSessionLookup{}),
+	)
 
 	consumer, err := newConsumer(cfg, log, pool, service)
 	if err != nil {

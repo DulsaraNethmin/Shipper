@@ -268,6 +268,10 @@ paths:
     $ref: './paths/delivery.yaml#/Milestones'
   /v1/jobs/{id}/proof-uploads:
     $ref: './paths/delivery.yaml#/ProofUploads'
+  /v1/notifications/device-tokens:
+    $ref: './paths/notifications.yaml#/DeviceTokens'
+  /v1/notifications/device-tokens/current:
+    $ref: './paths/notifications.yaml#/CurrentDeviceToken'
 
 components:
   schemas:

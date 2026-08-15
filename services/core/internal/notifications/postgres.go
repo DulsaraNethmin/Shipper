@@ -21,9 +21,8 @@ type postgresStore struct{}
 //
 // # ON CONFLICT DO NOTHING is the idempotence, and the count is how it is observed
 //
-// A redelivered event resolves exactly the same recipients and produces exactly the same
-// (event_id, recipient_id, channel) triples, so uq_notifications_event_recipient_channel refuses
-// every insert and this returns zero. Nothing had to remember that the event had been seen:
+// A redelivered event resolves exactly the same recipients and the same device tokens, so every
+// insert is refused and this returns zero. Nothing had to remember that the event had been seen:
 // the rows are the memory, and they are the same rows a second consumer instance would be racing to
 // write.
 //
@@ -31,6 +30,19 @@ type postgresStore struct{}
 // is not. Two consumers reading the same message both find nothing, both insert, and one of them
 // gets a unique violation anyway; handling that is this statement, written out longhand and one
 // round trip later.
+//
+// # The conflict target is untargeted since SHIP-140, and that is a widening rather than a loosening
+//
+// It named `(event_id, recipient_id, channel)` while that was the only index it could collide with.
+// 000701 splits the rule in two, because a recipient signed in on two handsets has two push
+// addresses and one of each other kind: uq_notifications_event_recipient_channel stays, partial on
+// `channel <> 'push'`, and uq_notifications_event_recipient_device holds push to one row per
+// device. A statement can name one target, so it names neither and lets either fire.
+//
+// What that also swallows is a primary-key collision on `id`, and it is worth saying so rather than
+// leaving a reader to notice: every id here is a fresh UUIDv7 generated moments earlier, so a
+// collision is not a case this is hiding. Everything else — the foreign key on recipient_id, every
+// CHECK — still raises.
 //
 // One statement rather than a loop, so that a batch of rows for one event is one round trip inside
 // a transaction that is holding a Kafka partition's progress.
@@ -46,7 +58,7 @@ func (postgresStore) insert(ctx context.Context, r db.Runner, rows []Notificatio
 		SELECT * FROM unnest(
 		    $1::uuid[], $2::uuid[], $3::text[], $4::uuid[], $5::uuid[], $6::text[],
 		    $7::text[], $8::boolean[], $9::text[], $10::text[], $11::text[])
-		ON CONFLICT (event_id, recipient_id, channel) DO NOTHING`
+		ON CONFLICT DO NOTHING`
 
 	n := len(rows)
 	ids := make([]uuid.UUID, n)

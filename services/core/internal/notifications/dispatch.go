@@ -152,13 +152,20 @@ func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
 //     eventually ignored, including on the day it means something;
 //   - marking it `sent` is a lie a support query cannot see through.
 //
-// So the row becomes `undeliverable` (000702) — terminal and truthful. Deregistering the handset
-// as well is SHIP-140's half, which has no table to do it in yet.
+// So the row becomes `undeliverable` (000702) — terminal and truthful — and the device is
+// deregistered so that nothing addresses it again. Both happen in the dispatch pass's transaction,
+// which means the two facts commit together: there is no window in which the platform has recorded
+// that a token is dead and still holds it as live.
 //
 // A failure here **does** fail the pass, unlike a failed send. A send that bounces is one row's
 // business; a database error while recording that a device is gone is not something the next
 // nineteen rows will survive either.
 func (s *Service) reject(ctx context.Context, r db.Runner, n Notification) error {
+	if n.Channel == ChannelPush {
+		if err := s.DeregisterToken(ctx, r, n.Address); err != nil {
+			return err
+		}
+	}
 	return s.store.markUndeliverable(ctx, r, n.ID)
 }
 

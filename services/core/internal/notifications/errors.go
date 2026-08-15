@@ -1,6 +1,10 @@
 package notifications
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+)
 
 // The conditions this domain distinguishes.
 //
@@ -39,3 +43,36 @@ var (
 	// quietly retire a message nobody has received.
 	ErrNoSender = errors.New("notifications: no sender is configured for this channel")
 )
+
+// The device registry's conditions (SHIP-140), and the codes its two endpoints answer with.
+//
+// Both endpoints belong to the caller's own device session, so there is no "somebody else's token"
+// case and no 404 that has to be indistinguishable from a 403 — which is why this list is two
+// sentinels and one code rather than the six a resource with owners would need.
+var (
+	// ErrUnknownPlatform is returned for a platform ck_device_tokens_platform would refuse.
+	//
+	// Checked in Go as well as in the database because the client is told which field was wrong,
+	// and a constraint violation arriving at the handler is a 500 with a constraint name in it.
+	ErrUnknownPlatform = errors.New("notifications: that is not a platform this app runs on")
+
+	// ErrNoDeviceToken is returned when a registration names no token.
+	//
+	// Distinct from the adapter's error of the same name and deliberately not shared: this
+	// package may not import internal/platform/push, and the two mean the same thing at two
+	// different points on the path.
+	ErrNoDeviceToken = errors.New("notifications: a device registration needs a token")
+)
+
+// CodeNoDeviceSession is returned when a caller registers a device token on a token that names no
+// device session.
+//
+// It cannot happen with a token this platform issues — SHIP-38 puts a session on every one — so it
+// is a 401 rather than a 422: the credential is not one this endpoint can act on, and the client's
+// correct response is to sign in again rather than to fix a field.
+//
+// A distinct code because the alternative is a bare 401, which the Flutter client's interceptor
+// answers by refreshing and replaying — a loop, against a session that will still not be there.
+var CodeNoDeviceSession = httpx.RegisterCode("notifications_no_device_session",
+	"That credential does not name a device session, so there is nothing to register a push "+
+		"token against. Sign in again.")
