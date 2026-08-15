@@ -73,6 +73,8 @@ type Service struct {
 	negotiation  Negotiation
 	awarding     Awarding
 	presentation Presentation
+	vehicles     Vehicles
+	directory    Directory
 	store        postgresStore
 	clock        clock.Clock
 }
@@ -100,6 +102,8 @@ func NewService(
 	negotiation Negotiation,
 	awarding Awarding,
 	presentation Presentation,
+	vehicles Vehicles,
+	directory Directory,
 	c clock.Clock,
 ) *Service {
 	if sink == nil {
@@ -113,6 +117,8 @@ func NewService(
 		negotiation:  negotiation,
 		awarding:     awarding,
 		presentation: presentation,
+		vehicles:     vehicles,
+		directory:    directory,
 		clock:        c,
 	}
 }
@@ -196,6 +202,13 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 		return Bid{}, false, ErrJobNotOffered
 	}
 
+	// 2a. The vehicle, if one was named — the caller's own and in service (SHIP-102a). In the same
+	//     transaction and for the same reason step 2 is: a vehicle deactivated between two
+	//     statements would otherwise be committed to on an offer nobody checked.
+	if err := s.vehicleUsable(ctx, r, providerID, offer.VehicleID); err != nil {
+		return Bid{}, false, err
+	}
+
 	// 3. The job, held and moved to Negotiating if this is the first offer on it (SHIP-90).
 	if err := s.enterNegotiation(ctx, r, jobID); err != nil {
 		return Bid{}, false, err
@@ -217,6 +230,7 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 		PickupAt:    offer.PickupAt,
 		DeliverBy:   offer.DeliverBy,
 		Message:     offer.Message,
+		VehicleID:   offer.VehicleID,
 		Key:         offer.Key,
 	})
 	switch {
@@ -321,6 +335,16 @@ func (s *Service) ReviseBid(
 	}
 	if !permitted {
 		return Bid{}, ErrJobNotOffered
+	}
+
+	// The vehicle, and **only when the revision moves it** (SHIP-102a). A provider re-pricing an
+	// offer made with a truck they have since taken out of service is not naming that truck again,
+	// and refusing them would be the platform enforcing a rule against a row it already holds —
+	// the same asymmetry [Vehicles.Usable] states between writing the column and reading it.
+	if offer.VehicleID != bid.VehicleID {
+		if err := s.vehicleUsable(ctx, r, providerID, offer.VehicleID); err != nil {
+			return Bid{}, err
+		}
 	}
 
 	revised, err := s.store.reviseOffer(ctx, r, bid.ID, offer)
@@ -635,7 +659,19 @@ func (s *Service) CounterOffer(
 		PickupAt:    offer.PickupAt,
 		DeliverBy:   offer.DeliverBy,
 		Message:     offer.Message,
-		Key:         c.Key,
+
+		// Inherited from the offer this counter displaces, through [Revision.applyTo], and never
+		// named by the caller: [Counter] has no vehicle field (SHIP-102a). The vehicle is the
+		// provider's commitment, so a customer countering on price carries it forward rather than
+		// dropping it, and a provider changing which truck does so by revising their own offer.
+		//
+		// **It is deliberately not re-checked against `fleet` here.** It was checked when it was
+		// written, and a vehicle deactivated since is one an offer already stands on — 000504's
+		// `ON DELETE RESTRICT` and [Vehicles.Usable]'s doc comment are the same sentence. Asking
+		// again would let a customer's counter fail because of something the *provider* did.
+		VehicleID: offer.VehicleID,
+
+		Key: c.Key,
 	})
 	if err != nil {
 		return Bid{}, false, err
@@ -1219,6 +1255,48 @@ func changeable(b Bid) error {
 // making an offer the customer is free to decline, and Docs/01 §4.3's answer to bids that miss is
 // better job detail rather than a platform that refuses them. Migration 000501 records the same
 // split from the schema's side.
+// vehicleUsable refuses an offer that names a vehicle the caller may not offer (SHIP-102a).
+//
+// # It answers 422 naming the field rather than a 404 or a 403
+//
+// `vehicle_id` is a value in the request body, and Docs/10 §4.6's division puts a body field whose
+// value the platform will not accept in the validation contract — the client marks the field and
+// the provider picks another truck from a list they already have. A 404 would be answering a
+// question about the *job*, which is not what is wrong, and a 403 would be an authorisation answer
+// to what is really a bad reference.
+//
+// **[validate.CodeNotAllowed] rather than [validate.CodeInvalid]**, because the value is a
+// well-formed identifier that this caller may not use. The three refusals it covers — no such
+// vehicle, another provider's, and out of service — are one message for [Vehicles.Usable]'s reason:
+// telling them apart would let a provider enumerate a competitor's fleet one identifier at a time.
+//
+// A zero vehicle is no vehicle and asks nothing. That is the ordinary case for every client written
+// before 000504 and it must not reach the port, which would otherwise be asked whether a provider
+// may use [uuid.Nil].
+func (s *Service) vehicleUsable(ctx context.Context, r db.Runner, providerID, vehicleID uuid.UUID) error {
+	if vehicleID == uuid.Nil {
+		return nil
+	}
+	if s.vehicles == nil {
+		// Wiring rather than a refusal, and reported as one. A service built without the port cannot
+		// answer the question, and treating silence as permission would store a commitment to a
+		// vehicle nobody checked — the failure JobAwardUnrecognised is ordered first to prevent.
+		return fmt.Errorf("bidding: no vehicle port is wired, so %s cannot be checked", vehicleID)
+	}
+
+	usable, err := s.vehicles.Usable(ctx, r, providerID, vehicleID)
+	if err != nil {
+		return fmt.Errorf("bidding: deciding whether %s may offer %s: %w", providerID, vehicleID, err)
+	}
+	if !usable {
+		var e validate.Errors
+		e.Add("vehicle_id", validate.CodeNotAllowed,
+			"Choose a vehicle from your own fleet that is in service.")
+		return e.Err()
+	}
+	return nil
+}
+
 func (o Offer) validate(now time.Time) error {
 	var e validate.Errors
 

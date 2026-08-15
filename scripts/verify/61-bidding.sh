@@ -2433,3 +2433,248 @@ ok "and no bid event carries the customer's budget, on jobs that have one"
 
 unset bid_event bid_event_fence
 unset -f bid_events_of
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-102a  GET /v1/jobs/{id}/bids/received — a customer reads the offers on their own job"
+
+# SHIP-102a's *Done when*: "the owning customer lists every live offer on one of their jobs in the
+# Docs 10 §4.5 collection envelope with cursor pagination, each element carrying the offer's price
+# and timing, a closed customer-facing provider summary and the vehicle it is offered with; a
+# provider gets what a stranger gets; the response carries no budget in any form, and no provider's
+# service area, specialties or other jobs."
+#
+# The read SHIP-102's comparison screen had nothing to work from without. Docs/11 §6 struck that
+# ticket for two waves as "every dependency met and unbuildable in fact" — all four things it names
+# were unserved, because the only bidding reads on the surface were a provider's own bids and one
+# negotiation's history, and the history needs a bid identifier the customer would have to hold.
+#
+# # The path is five segments and Docs/09 says four
+#
+# `GET /v1/jobs/{id}/bids` cannot be registered: `GET /v1/jobs/open/{id}` puts a literal where the
+# job identifier goes, so both patterns match `/v1/jobs/open/bids` with neither more specific and the
+# mux refuses the pair at start-up. **The service starting at all is therefore part of what this
+# section demonstrates** — every check below runs against a binary that would not have booted if the
+# collision had been resolved wrongly.
+#
+# # What only this can show
+#
+# internal/bidding/offers_test.go holds the ownership rule, the closed key set, the word guard and
+# the keyset. What only this can show is the route being served at all, at five segments, past the
+# real auth class, beside `GET /v1/jobs/open/{id}` in one running router — and against offers this
+# file placed through real endpoints on a job that really carries a budget.
+
+# A job of its own, so that the assertions below are about offers this section placed rather than
+# about whatever state the sections above left the shared job in. It carries the same budget, which
+# is what makes the privacy checks real.
+status="$(bid_post "$bid_customer_token" "verify-offers-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":432199}' offers-job)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-offers-job.json"; fail "creating the offers job returned $status"; }
+offers_job_id="$(json "$WORKDIR/bid-offers-job.json" '["id"]')"
+move_job "$offers_job_id" Draft Open
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from jobs where id = '$offers_job_id' and budget is not null;")" == "1" ]] \
+  || fail "the offers job carries no budget, so every privacy check in this section would be vacuous"
+
+# The provider's own vehicle, named on the offer — the column 000504 added and the clause of the
+# *Done when* that could not be served before it. Read out of the fleet endpoint rather than the
+# database, so that what the offer names is what a client would have had to hand.
+status="$(curl -s -o "$WORKDIR/bid-offers-fleet.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" "http://localhost:$VERIFY_PORT/v1/fleet/vehicles")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-offers-fleet.json"; fail "reading the provider's fleet returned $status"; }
+offers_vehicle_id="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["data"][0]["id"])
+' "$WORKDIR/bid-offers-fleet.json")"
+[[ "$offers_vehicle_id" =~ ^[0-9a-f-]{36}$ ]] || fail "could not read a vehicle out of the provider fleet"
+
+offers_body="{\"amount_cents\":45000,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\",\"vehicle_id\":\"$offers_vehicle_id\"}"
+status="$(bid_post "$bid_provider_token" "verify-offers-a-$$" "/v1/jobs/$offers_job_id/bids" "$offers_body" offers-a)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-offers-a.json"; fail "the first offer returned $status"; }
+offers_bid_a="$(json "$WORKDIR/bid-offers-a.json" '["id"]')"
+
+# The rival offers without naming a vehicle, which is the other half of the pair: `vehicle` is
+# omitted rather than sent empty, and a client can tell the two apart without a second flag.
+status="$(bid_post "$bid_rival_token" "verify-offers-b-$$" "/v1/jobs/$offers_job_id/bids" \
+  "{\"amount_cents\":39900,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\"}" offers-b)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-offers-b.json"; fail "the second offer returned $status"; }
+offers_bid_b="$(json "$WORKDIR/bid-offers-b.json" '["id"]')"
+
+# A vehicle that is not the caller's is refused as a *field* rather than as a 404 about the job —
+# 422 naming vehicle_id, which is what sends a client back to their own fleet list.
+status="$(bid_post "$bid_rival_token" "verify-offers-steal-$$" "/v1/jobs/$bid_job_id/bids" \
+  "{\"amount_cents\":41000,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\",\"vehicle_id\":\"$offers_vehicle_id\"}" offers-steal)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-offers-steal.json"; fail "offering another provider's vehicle returned $status, want 422"; }
+[[ "$(json "$WORKDIR/bid-offers-steal.json" '["error"]["details"][0]["field"]')" == "vehicle_id" ]] \
+  || fail "the refusal does not name vehicle_id: $(cat "$WORKDIR/bid-offers-steal.json")"
+ok "an offer names a vehicle from the caller's own fleet, and another provider's is refused on the field"
+
+offers_get() {
+  curl -s -o "$WORKDIR/bid-offers-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/jobs/$offers_job_id/bids/received$2"
+}
+
+status="$(curl -s -o "$WORKDIR/bid-offers-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$offers_job_id/bids/received")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/bid-offers-anon.json"; fail "an unauthenticated read returned $status, want 401"; }
+ok "it cannot be reached without a credential"
+
+status="$(offers_get "$bid_customer_token" "" list)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-offers-list.json"; fail "the owning customer got $status"; }
+
+python3 - "$WORKDIR/bid-offers-list.json" "$offers_bid_a" "$offers_bid_b" "$offers_vehicle_id" <<'PY' \
+  || fail "the offers list is not what SHIP-102a's Done when describes"
+import json, sys
+
+page = json.load(open(sys.argv[1]))
+wanted_a, wanted_b, vehicle = sys.argv[2], sys.argv[3], sys.argv[4]
+
+if sorted(page) not in (["data", "has_more"], ["data", "has_more", "next_cursor"]):
+    sys.exit("the envelope carries %s" % sorted(page))
+
+rows = {row["id"]: row for row in page["data"]}
+if set(rows) != {wanted_a, wanted_b}:
+    sys.exit("the customer sees %s, want both offers on their job" % sorted(rows))
+
+for row in rows.values():
+    # Price and timing — the first two things Docs/01 4.3 asks a customer to compare.
+    for field in ("amount_cents", "pickup_at", "deliver_by", "status", "offered_by"):
+        if not row.get(field):
+            sys.exit("an offer carries no %s" % field)
+    # The provider summary, on every element and closed.
+    summary = row.get("provider")
+    if sorted(summary or {}) != ["id", "member_since", "verified"]:
+        sys.exit("the provider summary carries %s" % sorted(summary or {}))
+    if summary["verified"] is not True:
+        sys.exit("a verified fixture provider is reported unverified")
+
+# The vehicle, on the offer that named one and absent from the one that did not.
+if rows[wanted_a].get("vehicle", {}).get("id") != vehicle:
+    sys.exit("the offer that named a vehicle carries %r" % rows[wanted_a].get("vehicle"))
+if sorted(rows[wanted_a]["vehicle"]["capacity"]) != ["height_cm", "length_cm", "max_weight_kg", "width_cm"]:
+    sys.exit("the declared capability carries %s" % sorted(rows[wanted_a]["vehicle"]["capacity"]))
+if "registration" in rows[wanted_a]["vehicle"]:
+    sys.exit("the vehicle carries its registration, which a losing bidder never published to this customer")
+if "vehicle" in rows[wanted_b]:
+    sys.exit("an offer that named no vehicle carries one")
+PY
+ok "the owning customer compares price, timing, a closed provider summary and the vehicle, side by side"
+
+# **The clause that needs its own check, in both directions and byte for byte.** A refusal that
+# differed by a word between "not yours" and "no such job" would still confirm the job exists.
+absent_job="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+status="$(offers_get "$bid_provider_token" "" refused-provider)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/bid-offers-refused-provider.json"; fail "the bidding provider got $status, want 404"; }
+status="$(offers_get "$bid_rival_token" "" refused-rival)"
+[[ "$status" == "404" ]] || fail "the rival provider got $status, want 404"
+status="$(curl -s -o "$WORKDIR/bid-offers-refused-absent.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_customer_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$absent_job/bids/received")"
+[[ "$status" == "404" ]] || fail "a job that does not exist got $status, want 404"
+
+python3 - "$WORKDIR/bid-offers-refused-provider.json" "$WORKDIR/bid-offers-refused-rival.json" \
+  "$WORKDIR/bid-offers-refused-absent.json" <<'PY' || fail "the three refusals are not the same answer"
+import json, re, sys
+
+uuid = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+bodies = []
+for path in sys.argv[1:]:
+    body = json.load(open(path))
+    if "amount_cents" in json.dumps(body):
+        sys.exit("a refusal carried an offer: %s" % body)
+    bodies.append(uuid.sub("<id>", json.dumps(body, sort_keys=True)))
+
+if len(set(bodies)) != 1:
+    sys.exit("the refusals differ: %s" % bodies)
+PY
+ok "a provider bidding on the job, a rival, and a job that does not exist are told the same thing, byte for byte"
+
+# The three subjects the *Done when* forbids, over the whole document. **The word check is the one
+# wave 9's finding is about**: a response saying "the customer has set a maximum" carries no field
+# and no amount, and passes a closed key set and a source scan alike.
+python3 - "$WORKDIR/bid-offers-list.json" <<'PY' || fail "the offers response carries something it may not"
+import json, re, sys
+
+raw = open(sys.argv[1]).read()
+document = json.loads(raw)
+
+allowed = {
+    "data", "next_cursor", "has_more",
+    "id", "job_id", "status", "offered_by", "amount_cents", "pickup_at", "deliver_by",
+    "message", "superseded_by", "created_at", "updated_at",
+    "provider", "verified", "member_since",
+    "vehicle", "type", "make", "model", "capacity",
+    "max_weight_kg", "length_cm", "width_cm", "height_cm",
+}
+
+def walk(node):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            if key not in allowed:
+                sys.exit("the customer's response carries %r" % key)
+            walk(child)
+    elif isinstance(node, list):
+        for child in node:
+            walk(child)
+
+walk(document)
+
+searchable = re.sub(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "<id>", raw)
+for rendering in ("4321.99", "432199", "4321,99", "4,321.99"):
+    if rendering in searchable:
+        sys.exit("the customer's budget appears as %r" % rendering)
+
+lowered = raw.lower()
+for word in ("budget", "maximum", "ceiling", "price cap", "service area", "specialt", "victoria"):
+    if word in lowered:
+        sys.exit("the response contains the word %r — a sentence saying a budget exists is the "
+                 "flag Docs/01 4.3 forbids, and a provider's declared area is excluded by name" % word)
+PY
+ok "no budget in any form — no field, no value, and no sentence saying one exists — and no declaration of the provider's"
+
+# Live by default, the rest by name. The comparison screen shows what can be awarded.
+status="$(bid_post "$bid_rival_token" "verify-offers-wd-$$" \
+  "/v1/jobs/$offers_job_id/bids/$offers_bid_b/withdraw" '{}' offers-withdraw)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-offers-withdraw.json"; fail "withdrawing returned $status"; }
+
+status="$(offers_get "$bid_customer_token" "" live)"
+[[ "$status" == "200" ]] || fail "the live list returned $status"
+python3 - "$WORKDIR/bid-offers-live.json" "$offers_bid_a" <<'PY' || fail "a withdrawn offer is on the comparison screen"
+import json, sys
+rows = json.load(open(sys.argv[1]))["data"]
+if [row["id"] for row in rows] != [sys.argv[2]]:
+    sys.exit("the live list holds %s" % [row["id"] for row in rows])
+PY
+status="$(offers_get "$bid_customer_token" "?status=withdrawn" withdrawn)"
+[[ "$status" == "200" ]] || fail "?status=withdrawn returned $status"
+python3 - "$WORKDIR/bid-offers-withdrawn.json" "$offers_bid_b" <<'PY' || fail "?status= did not reach the withdrawn offer"
+import json, sys
+rows = json.load(open(sys.argv[1]))["data"]
+if [row["id"] for row in rows] != [sys.argv[2]]:
+    sys.exit("the withdrawn group holds %s" % [row["id"] for row in rows])
+PY
+ok "the default is the offers that can be awarded, and ?status= reaches the rest"
+
+# Cursor pagination, and the two refusals a query parameter makes.
+status="$(offers_get "$bid_customer_token" "?status=submitted&limit=1" page1)"
+[[ "$status" == "200" ]] || fail "the first page returned $status"
+python3 - "$WORKDIR/bid-offers-page1.json" <<'PY' || fail "a single-row page is not the envelope"
+import json, sys
+page = json.load(open(sys.argv[1]))
+if len(page["data"]) != 1:
+    sys.exit("limit=1 returned %d rows" % len(page["data"]))
+if page["has_more"] or page.get("next_cursor"):
+    sys.exit("one live offer reported another page: %s" % page)
+PY
+status="$(offers_get "$bid_customer_token" "?cursor=not-a-cursor" badcursor)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/bid-offers-badcursor.json"; fail "a mangled cursor returned $status, want 400"; }
+status="$(offers_get "$bid_customer_token" "?status=haggling" badstatus)"
+[[ "$status" == "400" ]] || fail "an unknown status returned $status, want 400"
+ok "cursor pagination in the Docs/10 §4.5 envelope, and a cursor this endpoint did not issue is refused rather than read as the first page"
+
+unset offers_job_id offers_vehicle_id offers_body offers_bid_a offers_bid_b absent_job
+unset -f offers_get

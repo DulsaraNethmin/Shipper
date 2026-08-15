@@ -80,7 +80,8 @@ var (
 func newTestService() *Service {
 	c := clock.NewFixed(testInstant)
 	return NewService(events.NewOutbox(), fleet.NewService(c),
-		newTestNegotiation(c), newTestAwarding(c), newTestPresentation(c), c)
+		newTestNegotiation(c), newTestAwarding(c), newTestPresentation(c),
+		newTestVehicles(c), newTestDirectory(), c)
 }
 
 // newTestPresentation is [Presentation] over the real `jobs` service, as both composition roots
@@ -803,4 +804,97 @@ func exec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 	if _, err := pool.Exec(t.Context(), sql, args...); err != nil {
 		t.Fatalf("%s: %v", strings.Join(strings.Fields(sql), " "), err)
 	}
+}
+
+// newTestVehicles is [Vehicles] over the real `fleet` service, as cmd/api wires it (SHIP-102a).
+//
+// A second copy of `offerableVehicles`, for the reason [newTestNegotiation] is a second copy of
+// `negotiatedJobs`: the composition root is not importable from here, and the whole point of the
+// port is that this package names neither type.
+//
+// **The copy matters.** A stub answering "usable" would make every placement test pass against a
+// service that never asked `fleet` anything, and the rule this port carries is precisely the one
+// migration 000501 declined to guess at — that the vehicle is the caller's own and in service.
+func newTestVehicles(c clock.Clock) testVehicles { return testVehicles{fleet: fleet.NewService(c)} }
+
+type testVehicles struct {
+	fleet *fleet.Service
+}
+
+func (v testVehicles) Usable(
+	ctx context.Context,
+	r db.Runner,
+	providerID, vehicleID uuid.UUID,
+) (bool, error) {
+	vehicle, err := v.fleet.Vehicle(ctx, r, providerID, vehicleID)
+	switch {
+	case errors.Is(err, fleet.ErrVehicleNotFound), errors.Is(err, fleet.ErrNotVehicleOwner):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return vehicle.Active(), nil
+}
+
+// newTestDirectory is [Directory] over the real `users` and `vehicles` tables, as cmd/api wires it
+// (SHIP-102a).
+//
+// The third and last of these copies, and the one whose fidelity the budget invariant rests on. A
+// stub returning a hand-written [ProviderSummary] would prove nothing about
+// TestTheOfferResponseCarriesNothingItMayNot, because the question that test asks is what a *real*
+// read of a real provider produces — and the two statements this mirrors are the only ones in the
+// service that touch another domain's tables on a customer's behalf.
+func newTestDirectory() testDirectory { return testDirectory{} }
+
+type testDirectory struct{}
+
+func (testDirectory) Describe(
+	ctx context.Context,
+	r db.Runner,
+	offers map[uuid.UUID]Offeror,
+) (map[uuid.UUID]OfferorDetail, error) {
+	described := make(map[uuid.UUID]OfferorDetail, len(offers))
+
+	for bidID, offeror := range offers {
+		const providerQ = `
+			SELECT id,
+			       (status = 'active'
+			            AND email_verified_at IS NOT NULL
+			            AND phone_verified_at IS NOT NULL) AS verified,
+			       created_at
+			FROM users
+			WHERE id = $1`
+
+		var detail OfferorDetail
+		switch err := r.QueryRow(ctx, providerQ, offeror.ProviderID).Scan(
+			&detail.Provider.ID, &detail.Provider.Verified, &detail.Provider.MemberSince,
+		); {
+		case errors.Is(err, db.ErrNoRows):
+		case err != nil:
+			return nil, fmt.Errorf("describing provider %s: %w", offeror.ProviderID, err)
+		}
+
+		if offeror.VehicleID != uuid.Nil {
+			const vehicleQ = `
+				SELECT id, vehicle_type, COALESCE(make, ''), COALESCE(model, ''),
+				       COALESCE(max_weight_kg, 0), COALESCE(load_length_cm, 0),
+				       COALESCE(load_width_cm, 0), COALESCE(load_height_cm, 0)
+				FROM vehicles
+				WHERE id = $1`
+
+			var vehicle VehicleSummary
+			switch err := r.QueryRow(ctx, vehicleQ, offeror.VehicleID).Scan(
+				&vehicle.ID, &vehicle.Type, &vehicle.Make, &vehicle.Model,
+				&vehicle.MaxWeightKg, &vehicle.LengthCm, &vehicle.WidthCm, &vehicle.HeightCm,
+			); {
+			case errors.Is(err, db.ErrNoRows):
+			case err != nil:
+				return nil, fmt.Errorf("describing vehicle %s: %w", offeror.VehicleID, err)
+			default:
+				detail.Vehicle, detail.HasVehicle = vehicle, true
+			}
+		}
+		described[bidID] = detail
+	}
+	return described, nil
 }

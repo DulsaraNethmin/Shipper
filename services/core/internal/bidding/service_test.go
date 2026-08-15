@@ -700,6 +700,8 @@ func TestAnEligibilityFailureIsNotARefusal(t *testing.T) {
 		newTestNegotiation(m.svc.clock),
 		newTestAwarding(m.svc.clock),
 		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -2212,6 +2214,8 @@ func TestANegotiationFailureIsNotARefusal(t *testing.T) {
 		brokenNegotiation{err: errors.New("the job service could not run")},
 		newTestAwarding(m.svc.clock),
 		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -3305,6 +3309,8 @@ func TestAnAwardingFailureIsNotARefusal(t *testing.T) {
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lockErr: errors.New("the job service could not run")},
 		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -3341,6 +3347,8 @@ func TestAnUnrecognisedAwardAnswerIsRefused(t *testing.T) {
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardUnrecognised},
 		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -3377,6 +3385,8 @@ func TestAFailedTransitionRollsTheAcceptBackWithIt(t *testing.T) {
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},
 		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -3691,6 +3701,8 @@ func TestAFailedTransitionRollsTheSweepBackToo(t *testing.T) {
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},
 		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 

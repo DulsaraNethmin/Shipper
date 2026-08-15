@@ -172,6 +172,24 @@ type Bid struct {
 	// item after price and timing; empty when none was given.
 	Message string
 
+	// VehicleID is the vehicle the offer is made with, or [uuid.Nil] when the provider named none
+	// (SHIP-102a).
+	//
+	// **The seam 000500 and 000501 both deferred, arriving with the ticket they named as its
+	// trigger.** Docs/01 §4.3 wants it for the customer's comparison — "price, timing, provider
+	// profile, vehicle, and declared capability" — and 000504 argues one column against a join
+	// table.
+	//
+	// [uuid.Nil] rather than a pointer, for [Bid.SupersededBy]'s reason: "no vehicle stated" is a
+	// total answer rather than a missing one, and a nil pointer would add a third state no read of
+	// this table can produce.
+	//
+	// **This is an identifier and nothing else, which is what keeps `fleet` out of this package.**
+	// The make, model, type and capacity a customer compares are read by the *edge*, through
+	// [Directory], and never stored here — a copy of a vehicle inside `bidding` would be a second
+	// place for it to disagree with the fleet the provider actually runs.
+	VehicleID uuid.UUID
+
 	// Key is the idempotency key the offer was placed under.
 	//
 	// Held on the model because it is the row's own identity for a retry, not merely how one request
@@ -199,6 +217,20 @@ type Offer struct {
 	PickupAt    time.Time
 	DeliverBy   time.Time
 	Message     string
+
+	// VehicleID is the vehicle the offer is made with, and [uuid.Nil] means none was named
+	// (SHIP-102a).
+	//
+	// **Optional, and that is a compatibility decision rather than a weak rule.** SHIP-84's request
+	// schema has been served since wave 5 and every client written against it omits this field;
+	// Docs/10 §4.2's rule is that a field added to a request is optional or it is a new endpoint.
+	// A provider who names none makes an offer whose vehicle the customer's screen shows as
+	// unstated, which is the truth about it.
+	//
+	// **Nothing in [Offer.validate] looks at it**, because everything worth checking about it is a
+	// fact in another domain's table — that it is the caller's own, and in service. [Vehicles] is
+	// the port that asks, and [Service.PlaceBid] asks inside the transaction that writes the row.
+	VehicleID uuid.UUID
 
 	// Key is the caller's idempotency key, which becomes the row's. Required: see
 	// [ErrNoIdempotencyKey].
@@ -245,6 +277,18 @@ type Revision struct {
 	// same treatment a placement gives a blank message: `nullif` puts NULL in the column, so ""
 	// and "not given" cannot part company.
 	Message *string
+
+	// VehicleID is the vehicle the offer is made with (SHIP-102a). Present and [uuid.Nil] clears
+	// it, which is the treatment [Revision.Message] gets and for the same reason: a provider who
+	// named a truck and then decided not to commit to one has to be able to say so, and without an
+	// explicit empty value "no longer stated" would be inexpressible.
+	//
+	// **A revision is the only way the vehicle on a negotiation ever changes.** A counter-offer
+	// inherits it — [Counter] has no such field, so [Counter.terms] leaves this nil and
+	// [Revision.applyTo] carries the superseded row's forward. That is deliberate: the vehicle is
+	// the *provider's* commitment, and a customer countering on price must not silently drop the
+	// truck out of the negotiation the customer is comparing.
+	VehicleID *uuid.UUID
 }
 
 // IsEmpty reports whether the caller named no field at all.
@@ -253,7 +297,8 @@ type Revision struct {
 // naming no field: it is almost always a client defect, and answering `200` with the unchanged bid
 // would hide it behind a success.
 func (r Revision) IsEmpty() bool {
-	return r.AmountCents == nil && r.PickupAt == nil && r.DeliverBy == nil && r.Message == nil
+	return r.AmountCents == nil && r.PickupAt == nil && r.DeliverBy == nil &&
+		r.Message == nil && r.VehicleID == nil
 }
 
 // applyTo is the offer that would stand if this revision were accepted.
@@ -280,8 +325,12 @@ func (r Revision) applyTo(b Bid) Offer {
 		PickupAt:    b.PickupAt,
 		DeliverBy:   b.DeliverBy,
 		Message:     b.Message,
+		VehicleID:   b.VehicleID,
 	}
 
+	if r.VehicleID != nil {
+		o.VehicleID = *r.VehicleID
+	}
 	if r.AmountCents != nil {
 		o.AmountCents = *r.AmountCents
 	}

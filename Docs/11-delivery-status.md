@@ -464,6 +464,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-99** | M3 | Flutter provider job feed — the provider half of the shell stops being a placeholder. **`GET /v1/jobs/open` accepts no filter at all**, so the *Done when*'s filters are a client-side narrowing the contract delegates to this ticket by name, drawn from a second response type with no field a budget could go in — *see below* |
 | **SHIP-100** | M3 | Flutter provider job detail and bid placement — one job over `GET /v1/jobs/open/{id}` and an offer over `POST /v1/jobs/{id}/bids`. **The bid is sent directly and never queued**, which `Docs/07` §4 requires and SHIP-124's private `OperationKind` constructor already made impossible to get wrong; what makes a retry safe is one `ActionKey` per action against SHIP-84's stored key column. It also **closes §9's client-side budget guard** by holding every provider-facing model to a closed key set — *see below* |
 | **SHIP-101** | M3 | Flutter provider bid list — `/bids` over `GET /v1/fleet/bids`, grouped by status in `Docs/02` §4's own order, and **the ticket that closes §6's third category** after three waves in it. The endpoint offers two ways to group and both are used: picking a group **re-reads** rather than filtering, because a cursor issued for one question does not answer another. Finding: **no endpoint serves a provider the job behind a closed bid**, which is SHIP-129's gap seen from the other end. The budget mutation produced a **surviving third form** — a "budget supplied" flag with no field at all, which no existing guard could see — and the screen-level guard that now catches it — *see below* |
+| **SHIP-102a** | M3 | `GET /v1/jobs/{id}/bids/received` — the owning customer's view of every live offer on their job, in the collection envelope with cursor pagination, each element carrying the price, the timing, a closed provider summary and the vehicle. **It is served at five segments and `Docs/09` names four**, because `GET /v1/jobs/{id}/bids` cannot be registered beside `GET /v1/jobs/open/{id}` — measured five ways, including that registering the overlap does not resolve it. It found the clause it could not serve: **nothing bound a bid to a vehicle at all**, a seam `000500` and `000501` both deferred under the ticket `???`, so this ticket took it. "A provider gets what a stranger gets" is a *clause*, tested byte for byte in three directions. The budget mutation confirmed wave 9's fourth form is closed here: a **sentence** with no key and no value was caught only by the word guard — *see below* |
 | **SHIP-105** | M4 | `driver_assignments` — the driver has no account, so no foreign key to `users`; one live assignment per job by partial unique index. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-106** | M4 | `POST /v1/jobs/{id}/driver` — the awarded provider nominates a driver or drives it themselves, and the job moves in the same transaction. The first endpoint in `delivery`, and the first to reach two other domains through ports rather than imports — *see below* |
 | **SHIP-107** | M4 | The driver's job-scoped token — its own keyset, `aud=shipper-driver`, seven days, minted **inside the assignment transaction** and obtainable nowhere else. **The claim set has no `sub`**, so the exchange `Docs/10` §5 forbids has no material to work from rather than merely being refused — *see below* |
@@ -10698,6 +10699,150 @@ selected rather than refused" answer does not transfer.
 rather than measuring, in a brief whose own baselines were measured — which is this repository's
 recurring failure mode arriving in a document meant to prevent it. The check that caught it is
 `grep` against the golden file, and it took under a minute.
+
+
+### SHIP-102a — the read SHIP-102 had nothing to work from without, and the two things it found
+
+`GET /v1/jobs/{id}/bids/received`, `RequireUser`. §6 had struck SHIP-102 for two waves as "every
+dependency met and unbuildable in fact", and the entry above this one predicted the shape of the
+ticket that would close it almost exactly. Two things it did not predict are the whole cost of this
+ticket, and both are recorded here because the next reader of `internal/bidding` will meet them.
+
+#### The path is five segments, `Docs/09` says four, and that is a request rather than a slip
+
+**`GET /v1/jobs/{id}/bids` cannot be registered.** `GET /v1/jobs/open/{id}` (SHIP-83) puts a literal
+where the job identifier goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>` both match
+`/v1/jobs/open/bids` with neither more specific, and Go's `ServeMux` **panics at registration** — the
+process does not start. Measured on this branch against Go's own mux rather than reasoned about:
+
+| Patterns | Result |
+|---|---|
+| `GET /jobs/open/{id}` + `GET /jobs/{id}/bids` | **panic** |
+| `GET /jobs/open/{id}` + `GET /jobs/{id}/offers` | **panic** — renaming the literal does not help |
+| `GET /jobs/open/{id}` + `GET /jobs/{id}/bids` + `GET /jobs/open/bids` | **panic** — *registering the overlap does not resolve it* |
+| `GET /jobs/open/{id}` + `POST /jobs/{id}/bids` | ok — which is why the `POST` exists and no `GET` did |
+| `GET /jobs/open/{id}` + `GET /jobs/{id}/bids/received` | ok — five segments do not overlap four |
+
+**The third row is the one worth keeping.** It is the escape hatch anybody meeting this will reach
+for, and Go has no such rule: an intersecting pattern is a third conflict rather than a tie-break.
+
+There were two honest options. **Insert a segment**, which is SHIP-115's precedent —
+`/jobs/{id}/delivery/detail`, `/delivery/milestones` and `/delivery/proof` are all shaped by this
+same collision, and that file's note ends by recording it "for whoever owns `/jobs/open/{id}`". Or
+**move `/jobs/open/{id}`**, which is the structural fix: it frees the whole `GET /v1/jobs/{id}/<literal>`
+space, which is otherwise closed to every future ticket, and this lane was unusually well placed to
+take it because it also owns `apps/mobile` and could have moved the client in the same branch.
+
+**It took the first, and the deciding reason is ownership rather than modelling.** Moving the route
+is a breaking change to a served endpoint that SHIP-101 and SHIP-133 already consume, and carrying it
+through means editing `contracts/paths/fleet.yaml`, `internal/fleet/http_test.go` and the fleet
+verify section — three files this branch does not own, in a wave with five concurrent trees. A
+four-line change spread across another lane's files is how a route gets dropped in a merge, which is
+the one failure `routes_golden.txt` exists to catch and not one to invite. `routes_fleet.go`'s own
+argument at its line 45 also still stands on the merits: the resource is a job, and `/v1/jobs/open`
+is the collection offered to the calling provider.
+
+**So `Docs/09`'s SHIP-102a row names a path the service does not serve, and correcting it is a
+request to the owner rather than a commit here** — `Docs/09` belongs to another lane this wave. The
+served path is `GET /v1/jobs/{id}/bids/received`; `received` says which side of the negotiation is
+asking, which is the whole difference between this endpoint and `GET /v1/fleet/bids`.
+
+**The structural fix is still worth taking and is now costed.** Whoever moves `/v1/jobs/open/{id}`
+frees the four-segment `GET` space for every future ticket and could then collapse
+`/jobs/{id}/delivery/detail` and this endpoint back to their intended shapes. It is a §9
+recommendation rather than a ticket, because it is a breaking change to two served routes and wants
+one owner and one branch.
+
+#### Nothing bound a bid to a vehicle, and that is why this ticket carries a migration
+
+SHIP-102a's *Done when* says each element carries "the vehicle it is offered with". **There was no
+such column.** `bids` had no `vehicle_id`, and both earlier migrations say so deliberately: `000500`
+handed "the vehicle or vehicles a bid is offered on" to SHIP-84, and `000501` **declined it under the
+ticket `???`** with its reason stated in full — it is not in that ticket's *Done when*, `Docs/01` §4.3
+wants it for the *customer's* comparison, and validating it "needs a second `fleet` fact … and
+therefore a second port, which is more design than a three-point ticket should be taking on somebody
+else's behalf".
+
+**This ticket is the somebody.** `000504_bid_vehicle` adds one nullable `vehicle_id` with
+`ON DELETE RESTRICT`, and the port is `bidding.Vehicles`, satisfied in `cmd/api` over
+`fleet.Service.Vehicle`. Three decisions are argued in the migration and repeated here because they
+will be re-litigated:
+
+- **One column, not a join table.** `000500` read `Docs/01` §4.2's "select one or more vehicles"
+  literally and said a literal reading is a join table. Taken as a column anyway: §4.3 — the sentence
+  this exists to serve — is singular; a set of vehicles per offer defeats comparability, which is
+  `000501`'s own first argument for two instants over two windows; and one column is the reversible
+  direction, since widening to a join table later is additive and narrowing a populated one is not.
+- **Nullable, and it stays nullable.** Every offer already placed has no vehicle and there is none to
+  backfill with. Forwards, `POST /v1/jobs/{id}/bids` *accepts* `vehicle_id` and does not require it,
+  because `Docs/10` §4.2 makes a field added to a served request optional or a new endpoint.
+- **A revision is the only way it moves.** `Counter` has no vehicle field, so a counter inherits it
+  through `Revision.applyTo` — the vehicle is the *provider's* commitment, and a customer countering
+  on price must not silently drop the truck out of the comparison they are making.
+
+**The vehicle is re-checked only when it changes.** A provider re-pricing an offer made with a truck
+they have since deactivated is not refused: the offer already stands on it, which is the same
+sentence `ON DELETE RESTRICT` makes from the schema's side. The check belongs where the column is
+written and nowhere else.
+
+**A trap the test suite found rather than the design.** Deactivating a provider's *only* vehicle makes
+them ineligible for the job entirely, so the offer is refused with the job's 404 before the vehicle is
+ever looked at — a fixture that did not give the provider a second van would have passed while
+proving nothing. And `fleet` keeps `ErrVehicleNotFound` and `ErrNotVehicleOwner` apart in Go
+deliberately; an adapter matching only the first answered **500** for a competitor's vehicle, which is
+a refusal turned into an outage by an omission no compiler can see.
+
+#### The provider summary is thin, and the thinness is a finding
+
+The *Done when* asks for "a closed customer-facing provider summary" while forbidding "no provider's
+service area, specialties or other jobs". **Those two fields are the entirety of `fleet.Profile`**, so
+what a customer may know about a provider is whatever `users` can answer: whether the account has
+cleared the platform's automated verification, and when it was created. There is **no trading name, no
+rating and no completed-job count in this database at all** — `internal/profiles` is `doc.go` and
+nothing else, ten waves in. SHIP-153…SHIP-159 are what change that, and the summary is a closed struct
+in `bidding/ports.go` so that adding a field is an edit somebody records.
+
+The verification predicate is `fleet/eligibility.go`'s, **copied deliberately rather than abstracted**:
+a port into `fleet` for a fact `fleet` derives from `identity`'s table would be a seam neither domain
+asked for. It is a second copy of one predicate and it is named here so that `profiles` collapses both.
+
+#### "A provider gets what a stranger gets" is a clause, and it needed its own test in three directions
+
+Unlike `GET /v1/fleet/bids`, this endpoint takes a job identifier **from the client**, so it cannot
+answer an empty page: that would disclose the job exists. The ownership check runs before a single
+`bids` row is read, and there is **no branch anywhere that asks whether the caller is a provider** —
+which is what makes "not the customer", "no such job" and "somebody else's job" one answer by
+construction rather than by three code paths agreeing.
+
+The test compares the three refusals **byte for byte** with identifiers stripped, not by status code.
+A 404 whose message differed by a word would still confirm the job exists, and this is the one
+endpoint in the domain that would otherwise hand a competing provider every rival's price on a job in
+a single request.
+
+#### The mutation: wave 9's fourth form is closed here, and only the word guard sees it
+
+Two mutations were applied to `offerResponse` and both were caught, but **not by the same guard**, and
+that is the finding:
+
+- **`above_budget bool`** — the band form, no amount and not the word "budget" in the value. Caught by
+  the closed key set.
+- **A sentence appended to an existing `message`: "The customer has set a maximum."** — **no new key,
+  no value, nothing a closed key set can see.** It was caught **only** by the assertion on words.
+
+That is the form wave 9 found surviving a source-parsing scan and a closed key set on the *provider's*
+side, and it survives on this side too unless something reads the rendered text. `TestTheOfferResponseCarriesNothingItMayNot` asserts on keys, on the value in four renderings, **and on eleven words** —
+budget, maximum, ceiling, price cap, and the provider's declared area and specialties, which the
+*Done when* excludes by name. `scripts/verify/61-bidding.sh` makes the same three assertions from
+outside Go.
+
+Restored from a copy taken before the mutation, confirmed by `git diff` **and** by `shasum` — the
+checksum being the half that matters, because a destructive `git checkout` leaves `git diff` reporting
+nothing, which reads as success and is precisely the signature of that failure.
+
+#### One thing it asked of `internal/config`: nothing
+
+The page bounds come from `internal/pagination`, which SHIP-15g already made configuration. No field
+was added to a shared struct and no line to `main.go`.
 
 
 ## 4. Partly done — do not treat these as finished

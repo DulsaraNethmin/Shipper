@@ -2,6 +2,7 @@ package bidding
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -411,4 +412,181 @@ type Awarding interface {
 	// before the bid was touched — and it is still reported as an outcome rather than assumed away,
 	// because the alternative is [Service.AwardBid] treating "the job did not move" as success.
 	MoveToAwarded(ctx context.Context, r db.Runner, jobID, customerID uuid.UUID) (JobAward, error)
+}
+
+// Vehicles is the one fact this domain needs about a vehicle before it will store an offer made
+// with one (SHIP-102a).
+//
+// # This is the port migration 000501 named and declined to write
+//
+// That file deferred `bids.vehicle_id` under the ticket `???` and gave the reason in as many words:
+// "Validating it needs a second `fleet` fact — that the vehicle is the caller's and in service — and
+// therefore a second port, which is more design than a three-point ticket should be taking on
+// somebody else's behalf." This is that port, taken by the ticket the column exists for.
+//
+// # A bool, for [Eligibility]'s reason and a privacy one of its own
+//
+// A caller deciding whether to *permit* something wants a boolean rather than a row. Returning a
+// `fleet.Vehicle` would put a copy of another domain's shape inside this package, and this domain
+// has no use for one: nothing it writes reads a field of the vehicle, and the make and model a
+// customer compares are read at the edge through [Directory] rather than stored here.
+//
+// It also collapses the two refusals a placement is allowed to make, exactly as
+// [Eligibility.EligibleFor] collapses "no such job" and "not for you": a vehicle that does not
+// exist, one belonging to another provider, and one out of service are one answer. Telling them
+// apart would let a provider enumerate a competitor's fleet one identifier at a time, which is the
+// disclosure `contracts/paths/fleet.yaml` already refuses on `GET /v1/fleet/vehicles/{id}`.
+type Vehicles interface {
+	// Usable reports whether this provider may offer this vehicle, right now.
+	//
+	// It takes the caller's [db.Runner] so the answer is read inside the transaction that writes the
+	// offer, for [Eligibility.EligibleFor]'s reason: a vehicle can be deactivated between two
+	// statements, and an offer authorised by a check made in a different transaction is an offer
+	// nobody checked.
+	//
+	// **In service as well as owned.** Docs/01 §4.2 makes deactivation the act that stops a vehicle
+	// carrying new work, and an offer is new work. A vehicle deactivated *after* the offer was made
+	// keeps standing on it — 000504's `ON DELETE RESTRICT` is the same sentence from the schema's
+	// side — which is why this is asked when the column is written and never when it is read.
+	//
+	// A non-nil error is a failure of the mechanism rather than a refusal.
+	Usable(ctx context.Context, r db.Runner, providerID, vehicleID uuid.UUID) (bool, error)
+}
+
+// ProviderSummary is what a customer comparing offers may know about the provider who made one
+// (SHIP-102a).
+//
+// # A closed set declared here, which is what makes Docs/01 §4.3 structural rather than remembered
+//
+// The invariant SHIP-102a's *Done when* states from the other end — "no provider's service area,
+// specialties or other jobs" — is held by this struct having no field for any of them. The adapter
+// in `cmd/api` reads whatever it likes and can only hand back this, so a field cannot travel by
+// being forgotten about; adding one is an edit here, in a type whose doc comment says why each
+// field is allowed.
+//
+// **It is deliberately thin, and the thinness is a finding rather than an omission.** `internal/
+// profiles` — which Docs/06 §3 gives "profile detail" and the five verification states of Docs/04
+// §4 — is `doc.go` and nothing else at wave 10, and the only provider profile that exists is
+// `fleet.Profile`, whose two fields are precisely the two this response may not carry. So there is
+// no trading name, no rating and no completed-job count to show, and this carries the two facts the
+// database can actually answer. Docs/11 §3 records what SHIP-153…SHIP-159 will add.
+type ProviderSummary struct {
+	// ID is the provider the negotiation is with.
+	//
+	// The customer already holds it — every offer in the page names one — and it is carried anyway
+	// because it is what a client hands back to any later provider-facing endpoint.
+	ID uuid.UUID
+
+	// Verified is whether this account has cleared the platform's automated verification: email and
+	// phone confirmed, on an account in good standing.
+	//
+	// **The same predicate `fleet`'s eligibility filter reads**, rather than a second definition —
+	// 000002's own comment says provider verification will live in `profiles` and this is the
+	// automated row of it that exists today. A customer choosing between offers is choosing between
+	// strangers, and Docs/01 §1 makes "verified transport providers" the product's promise; a
+	// comparison screen that could not show it would be hiding the one thing the promise is about.
+	Verified bool
+
+	// MemberSince is when the provider's account was created.
+	//
+	// Not a rating and not a job count — neither exists, and "other jobs" is a thing this response
+	// may not carry at all. How long somebody has been on the platform is a fact about the account
+	// rather than about their work, and it is the only durability signal available.
+	MemberSince time.Time
+}
+
+// VehicleSummary is what a customer comparing offers may know about the vehicle one is made with
+// (SHIP-102a).
+//
+// Docs/01 §4.3's "vehicle, and declared capability", which is why the capacity is here in full: it
+// is the half of the sentence a customer with a two-seater sofa is actually reading.
+//
+// **The registration is deliberately absent.** A plate identifies a vehicle in the physical world
+// and nothing on a comparison screen needs one — the customer is choosing between offers, not
+// meeting a driver, and the awarded provider's vehicle reaches them again through `delivery` once
+// there is something to meet. `contracts/paths/fleet.yaml` already treats a competitor's fleet as
+// commercial information; a losing bidder's plate is the same fact with a customer in the middle.
+type VehicleSummary struct {
+	ID uuid.UUID
+
+	// Type is `fleet`'s vehicle type, carried as the string that domain publishes rather than as a
+	// second enumeration. This package has no opinion about the list and must not acquire one:
+	// `contracts/statuses.yaml` generates the eight bid statuses because they are this domain's,
+	// and vehicle types are not.
+	Type string
+
+	Make  string
+	Model string
+
+	// MaxWeightKg and the three dimensions are Docs/01 §4.3's "declared capability".
+	//
+	// Carried as they are declared, including the zeroes. A provider who stated no maximum weight
+	// has a vehicle whose capacity is unstated rather than nil, which is `fleet.Capacity`'s own
+	// reading of the same columns, and a client renders the difference.
+	MaxWeightKg float64
+	LengthCm    int
+	WidthCm     int
+	HeightCm    int
+}
+
+// Offeror names one negotiation's provider and, when the offer states one, the vehicle it is made
+// with (SHIP-102a).
+type Offeror struct {
+	ProviderID uuid.UUID
+
+	// VehicleID is [uuid.Nil] when the offer named no vehicle, and [Directory.Describe] answers with
+	// a zero [OfferorDetail.Vehicle] for it.
+	VehicleID uuid.UUID
+}
+
+// OfferorDetail is one offer's provider and vehicle, described for the customer comparing it.
+type OfferorDetail struct {
+	Provider ProviderSummary
+
+	// Vehicle is the vehicle the offer is made with, and HasVehicle says whether there is one.
+	//
+	// A flag rather than a nil pointer, for the reason [Bid.SupersededBy] is [uuid.Nil] rather than
+	// a pointer: an offer either states a vehicle or does not, and a pointer would add a third state
+	// — "not looked up" — that a client would have to tell apart from "none stated" and could not.
+	Vehicle    VehicleSummary
+	HasVehicle bool
+}
+
+// Directory is how the customer's comparison reaches the two things about an offer that are not in
+// `bids` (SHIP-102a).
+//
+// # Why it is a port and not a join
+//
+// `provider_profiles`, `vehicles` and `users` are other domains' tables. Reading them from
+// `bidding/postgres.go` would be the import's effect without the import's visibility — a second
+// place that knows what `vehicles.deactivated_at` means, in a file whose header says it is the
+// `bids` table in SQL. The composition root is where a dependency between two domains is allowed to
+// be visible, which is the argument [Awarding] makes about locking a `jobs` row and
+// `cmd/api/routes_delivery.go`'s `acceptedBids` makes pointing the other way.
+//
+// # One call for the whole page, which is the difference between this and a lookup
+//
+// The alternative shape — describe one provider, describe one vehicle — reads two rows per offer,
+// so a page of a hundred offers costs two hundred round trips to render one screen. This takes the
+// page and answers the page. It is also what lets the adapter answer with one statement per table
+// however many offers there are.
+//
+// # It reads and never decides
+//
+// Nothing here is an authorisation answer. Whether this caller may see this page is settled before
+// [Directory.Describe] is reached — [Service.Offers] asks [Negotiation.CustomerOf] first — so an
+// implementation of this port cannot widen what a caller sees, only describe what they were already
+// permitted to read.
+type Directory interface {
+	// Describe returns a detail for each offer, keyed by the bid identifier it was asked under.
+	//
+	// **Keyed by bid rather than by provider**, because a page reached with `?status=` can carry
+	// several rows of one negotiation — a superseded offer and the counter that displaced it — and
+	// they may name different vehicles. A map keyed on the provider would silently answer one row
+	// with another's vehicle.
+	//
+	// An offer whose provider or vehicle has no row is absent from the result rather than an error,
+	// and [Service.Offers] renders it with what it has. A page of offers is not the place to fail
+	// because one of them names something unreadable.
+	Describe(ctx context.Context, r db.Runner, offers map[uuid.UUID]Offeror) (map[uuid.UUID]OfferorDetail, error)
 }

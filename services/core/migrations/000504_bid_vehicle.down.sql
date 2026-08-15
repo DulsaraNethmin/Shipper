@@ -1,0 +1,15 @@
+-- Reverses 000504.
+--
+-- `IF EXISTS` throughout, which is this repository's convention for a down migration and is not
+-- decoration here. Numbers are drawn from reserved per-domain blocks rather than in time order
+-- (migrations/blocks.go), so a new bidding migration is *below* the version a working database
+-- already records — and SHIP-15g's guard prints `make migrate-down n=all && make migrate-up` as the
+-- fix. That `down` walks the file list downward from the current version, so **this file runs
+-- before its own `up` ever has.** Every statement below therefore has to be safe against a schema
+-- where none of them was ever applied. 000302, 000407, 000502, 000503 and 000602 all take the same
+-- precaution.
+--
+-- Dropping the column drops its comment and its foreign key with it, so there is nothing to restore
+-- the way 000503 has to restore 000501's sentence: this migration added the column, so the schema
+-- without it is the schema before it, entire.
+ALTER TABLE bids DROP COLUMN IF EXISTS vehicle_id;

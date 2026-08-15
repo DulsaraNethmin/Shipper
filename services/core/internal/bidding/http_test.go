@@ -69,6 +69,14 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("GET /v1/jobs/{id}/bids/{bid_id}/history", handler.History())
 	mux.Handle("POST /v1/jobs/{id}/award", handler.Award())
 	mux.Handle("GET /v1/fleet/bids", handler.Mine())
+
+	// **Five segments, and the shape is the finding rather than a preference (SHIP-102a).** The
+	// intended `GET /v1/jobs/{id}/bids` cannot be registered beside `GET /v1/jobs/open/{id}`: both
+	// match `/v1/jobs/open/bids` with neither more specific, and Go's ServeMux panics rather than
+	// choosing. This mux carries no `/jobs/open` route, so it would accept either — the pattern here
+	// is the one cmd/api actually serves, which is the whole reason this file mounts a real mux
+	// rather than calling handlers directly.
+	mux.Handle("GET /v1/jobs/{id}/bids/received", handler.Received())
 	return mux
 }
 
