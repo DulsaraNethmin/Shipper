@@ -569,7 +569,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
-| **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7b loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
+| **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -6317,7 +6317,7 @@ had no way of being reached.
 Five are unambiguous. **Two are recorded here rather than resolved silently**, which is what
 `CLAUDE.md` asks of a documented ambiguity.
 
-**Category — §7b names the field and enumerates no values.** The six in `ck_disputes_category` are
+**Category — §7a names the field and enumerates no values.** The six in `ck_disputes_category` are
 derived from `Docs/02` §5's exception table, the only list in the documents of what actually goes
 wrong on a delivery, plus `Other`. Two of §5's seven rows are excluded as operational events rather
 than complaints (a lost portal link, unsynced milestones), and one string is shortened: §5 writes
@@ -6326,7 +6326,7 @@ derived lower-snake-case wire mapping, which is a constraint on three generated 
 rather than a preference. **`Other` is deliberate** — a closed list with no escape hatch turns every
 unanticipated complaint into a mis-filed one, and the filing is what an administrator triages from.
 
-**Evidence — §7b names it and there is nowhere for it to live.** Verification evidence uploads to
+**Evidence — §7a names it and there is nowhere for it to live.** Verification evidence uploads to
 private object storage through short-lived pre-signed URLs (`Docs/04` §3.1) and delivery proof does
 the same from SHIP-114; neither exists, so no complainant can produce an object reference and no
 endpoint would hand them one. Capturing nothing would drop a field the *Done when* names; capturing
@@ -6335,7 +6335,7 @@ complainant's own words** — "photographed the crates at the depot" — as `tex
 and does not resolve. When uploads land, an attachment is a row in a table of its own pointing at
 this one, and nothing about the column changes.
 
-**`occurred_at` is required rather than defaulted, and that is the third decision.** §7b names "time
+**`occurred_at` is required rather than defaulted, and that is the third decision.** §7a names "time
 of event" as an intake field distinct from the report, and the platform records the filing time
 itself in `created_at`. A default would write the report's time into the incident's column on every
 request that omitted it, and support could not afterwards tell that value from one somebody meant —
