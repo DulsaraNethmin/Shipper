@@ -364,9 +364,11 @@ The import lint is what makes this safe on the Go side: two domains physically c
 
 These belong to whoever is doing shared-platform work in a given cycle, and are not edited from a domain branch:
 
-`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `scripts/verify-foundation.sh` · `CLAUDE.md` and `Docs/**`
+`cmd/api/routes.go` · `cmd/api/manifest.go` · `cmd/api/main.go` · `internal/boundaries/boundaries.go` · `internal/httpx/**` · `go.mod` and `go.sum` · the root `Makefile` · `migrations` in the shared block · `contracts/openapi.yaml` · `scripts/verify-foundation.sh` · `deploy/docker-compose.yml` · `deploy/.env.example` · `CLAUDE.md` and `Docs/**`
 
 **`scripts/verify-foundation.sh` is on that list and `scripts/verify/<your-domain>.sh` is not**, which is the whole point of splitting it (§7.3). The same asymmetry as `mk/*.mk` and `cmd/api/routes_<domain>.go`: the shared file is the mechanism, and a track's contribution is a file of its own.
+
+**The two `deploy/` entries were missing from this list until the wave-10 reconciliation, and both had been edited by a lane in every wave that added a service or a setting.** `deploy/docker-compose.yml` is the local stack every worktree shares — `COMPOSE_PROJECT_NAME` is pinned precisely so that they do — so a service added from a domain branch changes what four other trees are running. `deploy/.env.example` is worse than shared, because it is **machine-checked against `internal/config`**: a test reads the loader calls out of `config.go` and fails when a variable is read but not documented, or documented but not read, so the file and the configuration section are one change and `internal/config` is already on this list. Neither omission had caused a lost edit, which is why it went six waves unnoticed; the list is the record of what a domain branch may not take unilaterally, and both belonged on it.
 
 **`Deps` is pre-seeded so that no domain has a reason to edit it.** It carries the configuration, the logger, the clock, the PostgreSQL pool and the Redis client, and a domain builds everything else — a keyset, a hasher, a token issuer, a repository — inside its own `Handler` closure, from those. All of them are pure functions of a pool, a client and configuration, so the field a domain wants almost always is not one.
 
