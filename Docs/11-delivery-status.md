@@ -15660,6 +15660,22 @@ envelope `GET /v1/fleet/bids` already uses. **Recorded now rather than when a cl
 because that is the entire argument this section makes about itself and SHIP-101 and SHIP-102 are the
 worked examples of the alternative.
 
+**`scripts/delivery-status.sh` cannot see that §3's summary table is one table, and a blank line in a
+merge resolution is invisible to every guard there is.** Demonstrated by mutation at this pass rather
+than argued — §11 has the run and its two verdicts. The check counts lines beginning with `|` and asks
+whether every done ticket appears in a first cell, so **a table split in half passes and a row deleted
+fails**, which is exactly the line between what it can and cannot see. **§3's summary tables are two
+and only two on `5a3b8d7`**, both contiguous, so this is a latent hazard rather than a live defect.
+
+**What would catch it is small and belongs to a prep ticket, and the reason it is not taken here is
+worth stating.** The check already walks §3's lines in order; counting header separators (`|---|`)
+inside the section and failing when the count exceeds the expected number of summary tables would do
+it. **That number is currently two and is a thing somebody would have to maintain**, which is the
+shape this file spends a lot of words regretting — a hand-maintained scalar in an instrument. The
+better form is probably to require every `|` line in §3's summary region to be contiguous with its
+header, which needs no number at all. **Owner: whoever writes the next prep**, and it is cheaper than
+the wave 11 spent finding the last instance by eye.
+
 ## 10. The done list, in a form a script can read
 
 **The list is `Docs/11-done.txt`**, one ticket per line. It is still authoritative and it is
@@ -15722,4 +15738,8 @@ Update it in the same change that finishes a ticket. A tracker maintained afterw
 
 `make status` compares three things: the backlog, the list in §10, and the tickets named by commit subjects. It fails when §10 claims something git has never seen, and warns when git has seen something §10 does not mention. It reads subjects only, so a commit finishing two tickets while naming one under-reports — which is why §10 is authoritative and the git side is a check on it rather than the source.
 
-**It also checks that the done list is in *build* order, and `sort -c` is wrong for that job in both directions — measured at the wave-10 reconciliation rather than assumed.** The guard was mutated on this tree by inserting `SHIP-12` between `SHIP-119` and `SHIP-120`, which is the shape a `merge=union` resolution produces. **`LC_ALL=C sort -c` accepts that window**, because `SHIP-119` < `SHIP-12` < `SHIP-120` byte for byte, so the defect is invisible to it; the build-order guard rejected it with exit 1 and named the line — *"line 197: SHIP-12 follows SHIP-119"*. **And `LC_ALL=C sort -c` rejects the *correct* file**, at line 2, because Track X sorts first in build order while `X` sorts after `S` in bytes. An instrument that passes the defect and fails the healthy file is not a weaker check than the guard; it answers a different question. The comparison has to be on the parsed triple — track, number, letter suffix — which is what `scripts/delivery-status.sh` writes out longhand, and why it is written out longhand.
+**It cannot see table structure, and that was demonstrated at the wave-11 reconciliation rather than reasoned about.** The §3 completeness check counts lines beginning with `|` and asks whether every done ticket appears in a first cell. **It has no idea how many tables there are.** Mutated on this tree: a **blank line inserted into §3's "Elsewhere" summary table**, immediately above the SHIP-134 row, splits one 142-row table into two — and `make status` **exits 0 with both ticks green**. Mutated a second time on top of it, **deleting SHIP-166's summary row** made the same run exit 1 naming `SHIP-166`. So the guard is real for what it checks and blind to the shape of what it reads, and the two mutations together say exactly where the line is. Both were reverted from a copy taken before either was applied, confirmed with `git diff` **and** a checksum against that copy.
+
+**This matters because the failure has happened.** A merge can split a summary table by leaving a blank line in a resolution, the tables still render as two adjacent tables in most viewers, every guard stays green, and it is found only by somebody reading. **§3's summary tables on `5a3b8d7` are two and only two** — `M0 — Foundation` at 28 rows and `Elsewhere` at 142, each contiguous, checked before this was written — so nothing is wrong today. §9 has what would catch it if it happened.
+
+**It also checks that the done list is in *build* order, and `sort -c` is wrong for that job in both directions — measured at the wave-10 reconciliation and re-measured here.** The guard was mutated on this tree by inserting `SHIP-12` between `SHIP-119` and `SHIP-120`, which is the shape a `merge=union` resolution produces. **`LC_ALL=C sort -c` accepts that window**, because `SHIP-119` < `SHIP-12` < `SHIP-120` byte for byte, so the defect is invisible to it; the build-order guard rejected it with exit 1 and named the line — *"line 202: SHIP-12 follows SHIP-119"* when re-run at the wave-11 reconciliation, *"line 197"* when first run at wave 10, the difference being the rows added since. **And `LC_ALL=C sort -c` rejects the *correct* file**, at line 2 — re-confirmed here, and the reason is not the one this paragraph gave for a wave. It is **the comment header**, which sorts after nothing; Track X sorting first in build order while `X` sorts after `S` in bytes is a *second*, independent reason the whole-file check is meaningless, and it bites on the ticket rows rather than at line 2. An instrument that passes the defect and fails the healthy file is not a weaker check than the guard; it answers a different question. The comparison has to be on the parsed triple — track, number, letter suffix — which is what `scripts/delivery-status.sh` writes out longhand, and why it is written out longhand.
