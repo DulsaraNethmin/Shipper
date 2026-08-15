@@ -78,6 +78,11 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the moderation service: %v", err)
 	}
 
+	cancellations, err := NewCancellations(testCancellationQueue{}, pool)
+	if err != nil {
+		t.Fatalf("building the cancellation queue: %v", err)
+	}
+
 	jobConsole, err := NewJobConsole(&testJobDirectory{}, testJobStatuses, pool)
 	if err != nil {
 		t.Fatalf("building the job search: %v", err)
@@ -109,14 +114,15 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 	}
 
 	return HandlerServices{
-		Disputes:    testDisputeService(t),
-		Credentials: creds,
-		Moderation:  moderation,
-		Users:       users,
-		Jobs:        jobConsole,
-		Trail:       trail,
-		Enforcement: enforce,
-		Notes:       notes,
+		Disputes:      testDisputeService(t),
+		Credentials:   creds,
+		Moderation:    moderation,
+		Cancellations: cancellations,
+		Users:         users,
+		Jobs:          jobConsole,
+		Trail:         trail,
+		Enforcement:   enforce,
+		Notes:         notes,
 	}
 }
 

@@ -120,6 +120,34 @@ COMMIT;
 SQL
 }
 
+# dispute_move_because <job> <from> <to> <actor-kind> <reason> — a guarded transition that records
+# a reason and names which kind of actor made it (SHIP-158).
+#
+# **It takes the row it wrote through RETURNING rather than re-querying on (job_id, to_status)**,
+# which dispute_move above does and which is ambiguous the moment a job reaches one status twice —
+# Draft to Open, then Awarded back to Open, which is exactly the shape this ticket is about. The
+# guard would be handed whichever row the planner returned first.
+dispute_move_because() {
+  local actor_id="$dispute_customer_id"
+  [[ "$4" == "provider" ]] && actor_id="$dispute_provider_id"
+
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -v job="$1" -v from_status="$2" -v to_status="$3" -v actor_type="$4" -v reason="$5" \
+    -v actor="$actor_id" >/dev/null <<'SQL'
+BEGIN;
+WITH written AS (
+    INSERT INTO job_status_history
+        (id, job_id, from_status, to_status, actor_type, actor_id, reason, actor_recorded_at)
+    VALUES (gen_random_uuid(), :'job', :'from_status', :'to_status', :'actor_type', :'actor',
+            :'reason', now())
+    RETURNING id
+)
+SELECT set_config('shipper.job_status_transition', (SELECT id::text FROM written), true);
+UPDATE jobs SET status = :'to_status' WHERE id = :'job';
+COMMIT;
+SQL
+}
+
 # dispute_award <job-id> <provider-id> — the accepted bid SHIP-92 will write.
 dispute_award() {
   "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -v job="$1" -v provider="$2" >/dev/null <<'SQL'
@@ -1045,6 +1073,150 @@ status="$(admin_get "/v1/admin/moderation/exceptions?cursor=$old_cursor" "$queue
 [[ "$status" == "400" ]] \
   || { cat "$WORKDIR/admin-queue-old-cursor.json"; fail "a two-field cursor returned $status, want 400"; }
 ok "and a cursor from before the queue was widened is refused rather than paging wrongly"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-158 — the post-award cancellation queue.
+#
+# # What only this section can show
+#
+# The statement is a four-CTE read living in **cmd/api**, over `job_status_history`, `bids` and
+# `jobs` — three tables belonging to two domains `internal/admin` may not import. The Go suite in
+# that package drives the handler against a copy held to the original by a text guard, which
+# establishes that the two agree and nothing about the one the binary runs.
+#
+# # The finding this ticket turned on, demonstrated rather than asserted
+#
+# **Docs/02 §2 has no `Awarded → Cancelled` transition.** So a queue keyed on a job reaching
+# `Cancelled` would list the pre-award cancellations and none of the post-award ones — the exact
+# inverse of the ticket. The negatives below are what say this queue is not that one: a job cancelled
+# from `Open` and a draft the customer abandoned are both refused, and both are what the wrong
+# implementation returns.
+#
+# # Every assertion is fenced on this run's own rows
+#
+# `job_status_history` is shared with every other section, every previous run and every other
+# worktree, so a count would be a statement about the machine. Each job is found by the id this
+# section created.
+
+ticket "SHIP-158  cancellations after award are listed with the provider's history"
+
+admin_clear_limits
+
+# cancel_find <job-id> — the outcome the job is on the queue with, or "" when it is not there.
+cancel_find() {
+  local wanted="$1" cursor="" path found=""
+
+  for _ in $(seq 1 60); do
+    path="/v1/admin/moderation/cancellations?limit=100"
+    [[ -n "$cursor" ]] && path="$path&cursor=$cursor"
+
+    status="$(admin_get "$path" "$queue_token" cancel-find)"
+    [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-cancel-find.json"; fail "reading the cancellation queue returned $status"; }
+
+    python3 - "$WORKDIR/admin-cancel-find.json" "$wanted" >"$WORKDIR/cancel-find.txt" <<'SCAN'
+import json, sys
+page = json.load(open(sys.argv[1]))
+items = page.get("data") or []
+match = next((i for i in items if i["job_id"] == sys.argv[2]), None)
+print(match["outcome"] if match else "")
+print(json.dumps(match) if match else "")
+print(page.get("next_cursor") or "")
+SCAN
+
+    found="$(sed -n '1p' "$WORKDIR/cancel-find.txt")"
+    if [[ -n "$found" ]]; then
+      sed -n '2p' "$WORKDIR/cancel-find.txt" >"$WORKDIR/cancel-entry.json"
+      printf '%s' "$found"
+      return
+    fi
+
+    cursor="$(sed -n '3p' "$WORKDIR/cancel-find.txt")"
+    [[ -n "$cursor" ]] || break
+  done
+  printf ''
+}
+
+# --- the two shapes Docs/02 permits -------------------------------------------------------------
+#
+# Both are driven through dispute_move, which is the guarded transition function — 000402 refuses a
+# status written any other way, so a fixture that wrote one would be testing a queue over rows the
+# platform cannot produce. Neither shape has an endpoint yet: provider cancellation has no ticket and
+# dispute resolution is SHIP-164, which is exactly why the queue is a query over rows the guard
+# already permits rather than a table something has to remember to write to.
+
+walked_job="$(dispute_awarded_job walked)"
+dispute_move_because "$walked_job" Awarded Open provider \
+  'The provider could not source a vehicle with a tailgate lifter.'
+
+ended_job="$(dispute_awarded_job ended)"
+dispute_move "$ended_job" Awarded Disputed
+dispute_move_because "$ended_job" Disputed Cancelled admin \
+  'Resolved as a failed delivery; the goods never left the depot.'
+
+[[ "$(cancel_find "$walked_job")" == "returned_to_market" ]] \
+  || fail "a provider cancellation after award is not in the queue on returned_to_market"
+[[ "$(json "$WORKDIR/cancel-entry.json" '["from_status"]')" == "Awarded" ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "the entry does not say which status the job left"; }
+[[ "$(json "$WORKDIR/cancel-entry.json" '["provider_id"]')" == "$dispute_provider_id" ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "the entry names the wrong provider"; }
+[[ -n "$(json "$WORKDIR/cancel-entry.json" '["reason"]')" ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "the recorded reason is not carried"; }
+ok "a provider cancellation after award is in the queue — Docs/02 §6.2's signal, which cannot be reconstructed later"
+
+[[ "$(cancel_find "$ended_job")" == "ended" ]] \
+  || fail "a job cancelled through a dispute after award is not in the queue on ended"
+[[ "$(json "$WORKDIR/cancel-entry.json" '["from_status"]')" == "Disputed" ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "the ended entry does not report the status it left"; }
+ok "and so is one ended through a dispute — Docs/02 §2's only route to Cancelled after award"
+
+# --- the negatives, which are what the wrong implementation returns ------------------------------
+
+open_cancelled="$(dispute_draft opencancel)"
+dispute_move "$open_cancelled" Draft Open
+dispute_move "$open_cancelled" Open Cancelled
+
+abandoned_draft="$(dispute_draft abandoned)"
+dispute_move "$abandoned_draft" Draft Cancelled
+
+[[ -z "$(cancel_find "$open_cancelled")" ]] \
+  || fail "a job cancelled from Open is in the post-award queue, so it is a list of every cancelled job"
+[[ -z "$(cancel_find "$abandoned_draft")" ]] \
+  || fail "an abandoned draft is in the post-award queue"
+ok "and a job cancelled from Open and an abandoned draft are not — there is no Awarded to Cancelled transition, so those are what a naive query returns"
+
+# --- the provider's history, which is the clause a queue of job ids would not meet ----------------
+#
+# Two cancellations against one completion for this run's provider. The figures are read off the
+# entry rather than counted here: what is being shown is that the endpoint computes them, and a
+# count taken from the database would be this section agreeing with itself.
+
+completed_job="$(dispute_delivered_job completedone)"
+dispute_move "$completed_job" Delivered Completed
+
+cancel_find "$walked_job" >/dev/null
+cancellations="$(json "$WORKDIR/cancel-entry.json" '["provider_cancellations"]')"
+completions="$(json "$WORKDIR/cancel-entry.json" '["provider_completions"]')"
+
+[[ "$cancellations" -ge 2 ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "provider_cancellations is $cancellations, and this run made two"; }
+[[ "$completions" -ge 1 ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "provider_completions is $completions, and this run completed one"; }
+ok "the entry carries the provider's history — the count and its denominator, because three cancellations against four hundred deliveries is not three against five"
+
+status="$(admin_get /v1/admin/moderation/cancellations "" cancel-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-cancel-nocred.json"; fail "the cancellation queue is readable without a credential ($status)"; }
+ok "and the queue is behind the administrator credential like every other administrative route"
+
+# Nothing commercial. A queue entry says who walked away and how often; a price is the job console's
+# disclosure decision and a customer's budget is nobody's.
+cancel_find "$walked_job" >/dev/null
+for forbidden in budget amount price bid_amount; do
+  [[ "$(cat "$WORKDIR/cancel-entry.json")" != *"\"$forbidden\""* ]] \
+    || { cat "$WORKDIR/cancel-entry.json"; fail "the cancellation entry carries a $forbidden field"; }
+done
+ok "the entry carries no budget and no bid amount — a shape that never carried one cannot leak one"
 
 admin_clear_limits
 

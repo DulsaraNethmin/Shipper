@@ -107,6 +107,20 @@ func init() {
 
 		Route{
 			Method:  http.MethodGet,
+			Pattern: "/admin/moderation/cancellations",
+			Group:   GroupV1,
+
+			// Docs/04 §5's fifth queue (SHIP-158), beside its fourth rather than inside it:
+			// the document numbers its queues, and this one asks who withdrew from a
+			// commitment rather than which delivery is going wrong.
+			//
+			// RequireAdmin, and `moderation.read` inside the handler, like every other queue.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).CancellationQueue() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
 			Pattern: "/admin/users",
 			Group:   GroupV1,
 
@@ -322,6 +336,14 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin moderation: " + err.Error())
 	}
 
+	// SHIP-158. Docs/04 §5's fifth queue, over `job_status_history`, `jobs` and `bids` — three
+	// tables belonging to two domains `internal/admin` may not import, which is why the statement
+	// is a port implemented here rather than a method on that domain's store.
+	cancellations, err := admin.NewCancellations(cancellationQueueLookup{}, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin cancellations: " + err.Error())
+	}
+
 	// SHIP-151. It takes the pool alone: the search reads `users`, which is a shared table this
 	// domain may read directly, and there is no port to supply. See internal/admin/postgres_users.go
 	// for why that is not the arrangement jobPartiesLookup and exceptionQueueLookup use.
@@ -373,14 +395,15 @@ func adminHandler(d Deps) *admin.Handler {
 	}
 
 	handler, err := admin.NewHandler(admin.HandlerServices{
-		Disputes:    svc,
-		Credentials: creds,
-		Moderation:  moderation,
-		Users:       users,
-		Jobs:        jobConsole,
-		Trail:       trail,
-		Enforcement: enforcement,
-		Notes:       notes,
+		Disputes:      svc,
+		Credentials:   creds,
+		Moderation:    moderation,
+		Cancellations: cancellations,
+		Users:         users,
+		Jobs:          jobConsole,
+		Trail:         trail,
+		Enforcement:   enforcement,
+		Notes:         notes,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
@@ -594,10 +617,11 @@ func (jobPartiesLookup) PartyOn(
 // in the build where that can be established — admin names neither type and neither type names
 // admin, so nothing else links them.
 var (
-	_ admin.Jobs           = disputeLifecycle{}
-	_ admin.JobParties     = jobPartiesLookup{}
-	_ admin.ExceptionQueue = exceptionQueueLookup{}
-	_ admin.JobDirectory   = jobDirectory{}
+	_ admin.Jobs              = disputeLifecycle{}
+	_ admin.JobParties        = jobPartiesLookup{}
+	_ admin.ExceptionQueue    = exceptionQueueLookup{}
+	_ admin.CancellationQueue = cancellationQueueLookup{}
+	_ admin.JobDirectory      = jobDirectory{}
 )
 
 // exceptionQueueLookup implements admin.ExceptionQueue over `delivery`s and `jobs`' rows
@@ -792,6 +816,159 @@ func (exceptionQueueLookup) ExceptionsAwaitingReview(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("cmd/api: reading the delivery-exception queue: %w", err)
+	}
+	return out, nil
+}
+
+// --- SHIP-158: the post-award cancellation queue --------------------------------------------------
+
+// cancellationQueueLookup implements admin.CancellationQueue over `jobs`, `job_status_history` and
+// `bids`.
+//
+// Here rather than in a domain for the reason exceptionQueueLookup and jobDirectory are: the
+// statement spans two other domains' tables, `admin` may import neither, and the composition root is
+// where a dependency between domains is visible to somebody reading how the service is wired.
+type cancellationQueueLookup struct{}
+
+// providerCommitmentStatuses is where a job stands once a provider has undertaken to carry it.
+//
+// Docs/02 §2 permits `Awarded / Driver assigned → Open` and nothing later: after `Picked up` the
+// goods are in somebody's vehicle and §6.2 makes ending it a support case rather than a transition.
+// So the set is exactly the two statuses from which a provider may still walk away.
+//
+// Single-line, like the exception queue's sets, so internal/admin's copy of this statement can be
+// held to it by a guard that resolves the constant by name.
+const providerCommitmentStatuses = `('Awarded', 'Driver assigned')`
+
+// CancelledAfterAward reads one page of the queue, most recent first.
+//
+// # "After award" is a fact about the history, and Docs/02 §2 is why
+//
+// **There is no `Awarded → Cancelled` transition.** The guard refuses it, and the document is
+// deliberate about that: `Open / Negotiating → Cancelled` is the ordinary route out of the
+// marketplace, and after award a job either goes back on the market or ends through a dispute. A
+// queue that read `to_status = 'Cancelled'` and stopped there would therefore return the *pre*-award
+// cancellations and none of the post-award ones — which is the exact inverse of this ticket.
+//
+// So the queue reads two shapes, and an entry says which:
+//
+//   - **`returned_to_market`** — `Awarded / Driver assigned → Open`. Docs/02 §6.2 calls this a
+//     provider cancellation after award, closes every bid on the job and says the cancellation "is
+//     **recorded against the provider**… the reliability signal that Phase 2 reputation will be
+//     built from, and it cannot be reconstructed later if it is not captured now". This queue is
+//     where it is read.
+//   - **`ended`** — a transition into `Cancelled` on a job that had earlier reached `Awarded`, which
+//     under Docs/02 §2 can only arrive through `Disputed → Cancelled`: an administrator resolving a
+//     dispute as a cancelled or failed delivery.
+//
+// The earlier-award test is `(server_recorded_at, id)` rather than the timestamp alone, because one
+// transaction can write two history rows at the same instant and `now()` is transaction start time.
+//
+// # Neither shape has an endpoint yet, and the queue is still correct
+//
+// Nothing in the platform currently drives either transition: provider cancellation has no ticket,
+// and dispute resolution is SHIP-164. **The queue is a query over rows the guard already permits**,
+// so it fills the moment either arrives and needs no change when it does — which is the same
+// position `admin.ExceptionQueue` takes and the reason neither has a flag column. What it must not
+// do in the meantime is quietly list pre-award cancellations so that the screen looks populated.
+//
+// # The provider comes from the accepted bid, and there is a named gap
+//
+// `uq_bids_one_accepted_per_job` makes that join single-valued. **On the `returned_to_market` shape
+// the accepted bid is closed by the same operation** (Docs/02 §6.2: "all prior bids are closed, not
+// restored"), so once that path is built the join will find nothing and the entry will report no
+// provider. Closing that needs `bids` to record which offer *was* accepted after it stops being
+// accepted — a column in `internal/bidding`'s migration block, which is not this ticket's to take.
+// It is written up in Docs/11 §4 rather than papered over with a guess.
+//
+// # The two provider counts are aggregates over the whole table, deliberately
+//
+// `history` and `completions` are computed once per query rather than per row. That is more work
+// than a correlated subquery on a small page and far less on a large one, and it keeps the counts
+// consistent with each other. **The trigger for revisiting it is named**: the first time this
+// endpoint is read on a schedule rather than on a person's request, or the first `bids` table where
+// a full aggregate is not free — at which point the shape to add is a partial index on
+// `bids (provider_id) WHERE status = 'Accepted'`.
+func (cancellationQueueLookup) CancelledAfterAward(
+	ctx context.Context,
+	r db.Runner,
+	q admin.QueueQuery,
+) ([]admin.CancellationEntry, error) {
+	const query = `
+		WITH cancellations AS (
+		    SELECT h.job_id, h.id AS transition_id, h.server_recorded_at AS cancelled_at,
+		           h.from_status, h.actor_type, coalesce(h.reason, '') AS reason,
+		           CASE WHEN h.to_status = 'Open'
+		                THEN '` + string(admin.OutcomeReturnedToMarket) + `'
+		                ELSE '` + string(admin.OutcomeEnded) + `' END AS outcome
+		    FROM job_status_history h
+		    WHERE (h.to_status = 'Open' AND h.from_status IN ` + providerCommitmentStatuses + `)
+		       OR (h.to_status = 'Cancelled'
+		           AND EXISTS (SELECT 1
+		                         FROM job_status_history a
+		                        WHERE a.job_id = h.job_id
+		                          AND a.to_status = 'Awarded'
+		                          AND (a.server_recorded_at, a.id) < (h.server_recorded_at, h.id)))
+		),
+		carrier AS (
+		    SELECT c.transition_id, b.provider_id
+		    FROM cancellations c
+		    LEFT JOIN bids b ON b.job_id = c.job_id AND b.status = 'Accepted'
+		),
+		walked AS (
+		    SELECT provider_id, count(*) AS cancellations
+		    FROM carrier
+		    WHERE provider_id IS NOT NULL
+		    GROUP BY provider_id
+		),
+		completions AS (
+		    SELECT b.provider_id, count(*) AS completions
+		    FROM bids b
+		    JOIN jobs j ON j.id = b.job_id
+		    WHERE b.status = 'Accepted' AND j.status = 'Completed'
+		    GROUP BY b.provider_id
+		)
+		SELECT c.job_id, c.transition_id,
+		       coalesce(r.provider_id, '00000000-0000-0000-0000-000000000000'::uuid),
+		       c.outcome, c.from_status, c.actor_type, c.reason, c.cancelled_at,
+		       coalesce(w.cancellations, 0), coalesce(m.completions, 0)
+		FROM cancellations c
+		JOIN carrier r      ON r.transition_id = c.transition_id
+		LEFT JOIN walked w      ON w.provider_id = r.provider_id
+		LEFT JOIN completions m ON m.provider_id = r.provider_id
+		WHERE ($1::timestamptz IS NULL OR (c.cancelled_at, c.transition_id) < ($1, $2))
+		ORDER BY c.cancelled_at DESC, c.transition_id DESC
+		LIMIT $3`
+
+	// A nil rather than a zero time for the first page: `< (NULL, …)` is NULL rather than true,
+	// so the predicate has to be skipped rather than satisfied. The comparison is `<` because
+	// the order is descending — the next page is what happened *before* this one's last row.
+	var (
+		after   any
+		afterID any
+	)
+	if !q.After.Zero() {
+		after, afterID = q.After.RecordedAt, q.After.EntryID
+	}
+
+	rows, err := r.Query(ctx, query, after, afterID, q.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the post-award cancellation queue: %w", err)
+	}
+	defer rows.Close()
+
+	var out []admin.CancellationEntry
+	for rows.Next() {
+		var e admin.CancellationEntry
+		if err := rows.Scan(&e.JobID, &e.TransitionID, &e.ProviderID, &e.Outcome,
+			&e.FromStatus, &e.ActorType, &e.Reason, &e.CancelledAt,
+			&e.ProviderCancellations, &e.ProviderCompletions); err != nil {
+			return nil, fmt.Errorf("cmd/api: reading a cancellation entry: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the post-award cancellation queue: %w", err)
 	}
 	return out, nil
 }

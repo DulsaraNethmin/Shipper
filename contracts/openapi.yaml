@@ -188,6 +188,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminJobUnpublish'
   /v1/admin/me:
     $ref: './paths/admin.yaml#/AdminMe'
+  /v1/admin/moderation/cancellations:
+    $ref: './paths/admin.yaml#/AdminCancellationQueue'
   /v1/admin/moderation/exceptions:
     $ref: './paths/admin.yaml#/AdminExceptionQueue'
   /v1/admin/notes:

@@ -585,6 +585,7 @@ The file's own header says which invocation demonstrates which claim.
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 | **SHIP-30a** | M1 | `users.name` (`000006`, shared block), required by `POST /v1/auth/register`, collected by the app's registration screen, and matched by `GET /v1/admin/users` — so **SHIP-151's fourth term answers on the wire** after a wave partly met. The column is **nullable and that is the decision**: accounts predating it have no name and a name cannot be backfilled, so `NOT NULL` is named as a later tightening rather than faked with a default. **A required field on registration broke 37 `make verify` call sites across nine sections**, which no unit test could have shown — *see below* |
 | **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
+| **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -12054,11 +12055,91 @@ restored from a `/tmp` copy and confirmed with `shasum -a 256 -c`.
 
 #### Nothing was needed from `internal/config`
 
+
+### SHIP-158 — the queue whose *Done when* names a transition that does not exist
+
+"Cancellations after award are listed with the provider's history." The obvious implementation is a
+read of `job_status_history` where `to_status = 'Cancelled'` and `from_status` is at or past
+`Awarded`, and it was written that way first. **Every test failed with the same message:
+`cannot move from Awarded to Cancelled: that transition is not permitted`.**
+
+`Docs/02` §2 is deliberate about it. The routes into `Cancelled` are `Draft → Cancelled`, `Open /
+Negotiating → Cancelled` — the customer changing their mind, or SHIP-68's expiry sweep — and
+`Disputed → Cancelled`. There is no direct route from a committed job, because §6.2 settles what
+happens instead: **a provider cancellation between `Awarded` and `Picked up` returns the job to
+`Open`**, closes every bid on it, and "the cancellation is **recorded against the provider**… the
+reliability signal that Phase 2 reputation will be built from, and it cannot be reconstructed later
+if it is not captured now."
+
+**So the naive query is not merely incomplete, it is inverted**: it returns exactly the
+cancellations that are *not* post-award, and returns them looking plausible. A screen built on it
+would have shown a busy queue of ordinary customer cancellations and none of the provider
+withdrawals the ticket exists to surface.
+
+#### What the queue reads instead, and the two outcomes
+
+A fact about the job's **history** rather than about one transition, with `outcome` saying which
+shape an entry is:
+
+- **`returned_to_market`** — `Awarded / Driver assigned → Open`, §6.2's provider cancellation.
+- **`ended`** — a transition into `Cancelled` on a job that had earlier reached `Awarded`, which
+  under §2 can only arrive through `Disputed → Cancelled`.
+
+The earlier-award test is `(server_recorded_at, id) <` rather than a timestamp comparison, because
+one transaction can write two history rows at the same instant — `now()` is transaction start time,
+which `000401` records as the property that makes the history join up with `jobs.updated_at`.
+
+**A job may appear more than once**, which is why the cursor is keyed on the transition rather than
+the job: one returned to the market can be awarded and walked away from again, and both belong here.
+
+#### Neither shape has an endpoint yet, and that is not a reason to wait
+
+Nothing in the platform drives either transition today: provider cancellation has no ticket at all,
+and dispute resolution is SHIP-164. **The queue is a query over rows the guard already permits**, so
+it fills the moment either arrives and needs no change when it does — the same position
+`admin.ExceptionQueue` takes, and the reason neither has a flag column. What it must not do in the
+meantime is list pre-award cancellations so the screen looks populated, which is what the two
+negatives in both the Go suite and `make verify` are for.
+
+#### "With the provider's history" is a count and its denominator
+
+The clause a queue of job identifiers would not meet. One cancellation is an event; whether it is a
+pattern is the question, and answering it by opening each provider's account in turn is the work the
+screen exists to remove.
+
+So an entry carries **two** counts: post-award cancellations, and jobs carried to `Completed`.
+**Three cancellations against four hundred deliveries is a different provider from three against
+five**, and a single figure cannot say so. `TestTheEntryCarriesTheProvidersHistory` uses two
+providers precisely because a platform-wide count looks correct on the first one.
+
+#### A named gap rather than a guess: the provider on a returned-to-market entry
+
+`provider_id` comes from the accepted bid, which `uq_bids_one_accepted_per_job` makes single-valued.
+**Docs/02 §6.2 closes every bid when a provider cancels after award**, so once that path is built the
+join will find nothing on precisely the outcome that most needs a provider named, and the entry will
+report none.
+
+Closing it needs `bids` to record which offer *was* accepted after it stops being accepted — a column
+in `internal/bidding`'s migration block, which this branch does not own. It is in §4 rather than
+worked around here, and the counts have the same limit for the same reason.
+
+#### The verify harness had a latent ambiguity this ticket's fixture found
+
+`dispute_move` writes a history row and then re-selects it by `(job_id, to_status)` to hand the
+guard its identifier. **That predicate is ambiguous the moment a job reaches one status twice** —
+`Draft → Open` and then `Awarded → Open`, which is this ticket's own shape — and the guard would be
+handed whichever row the planner returned first. `dispute_move_because` takes the row through
+`RETURNING` instead. The original is left alone because no existing section moves a job to a repeated
+status, but it is a trap sitting in a shared fixture.
+
+#### Nothing was needed from `internal/config`
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
 |---|---|---|
 | ~~**SHIP-149**~~ | ~~`audit_log` table, append-only triggers, tests~~ | **Closed.** SHIP-150 built the write helper — see §3. On `7d7caf0` the only `INSERT INTO audit_log` in the repository was four statements in `migrations/schema_test.go`, and no Go code wrote an entry; `internal/admin/audit.go` and `postgres_audit.go` now do, and `migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing that could not be written while there was no Go vocabulary to pair |
+| **SHIP-158** | `GET /v1/admin/moderation/cancellations`, both outcomes, with the provider's cancellation and completion counts | **The provider on a `returned_to_market` entry, once that path is built.** `Docs/02` §6.2 closes every bid when a provider cancels after award, so no `Accepted` bid survives and the join that names the provider finds nothing — on precisely the outcome that most needs one. `bids` has no column recording which offer *was* accepted; adding one is a migration in `internal/bidding`'s block. Not yet reachable — neither transition has an endpoint — so nothing is wrong today and it will be the day one arrives |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | ~~**SHIP-118**~~ | ~~`Delivered` recordable and refused without evidence~~ | **Closed by SHIP-123 — see §3.** `000607` adds `recipient_name` and `delivery_note`, required on `Delivered` and refused on every other milestone, in the domain and in `ck_milestones_delivery_details`. `Docs/01` §4.4's field set is closed end to end |
 | ~~**SHIP-151**~~ | ~~`GET /v1/admin/users` — search by **email**, **phone** and **status**~~ | **Closed by SHIP-30a — see §3.** `000006` adds `users.name`, registration requires it, and the search matches it, so all four of the *Done when*'s terms answer on the wire. An account created before the migration has no name and is found by its address; a name cannot be backfilled, which is why the closing ticket sits in M1 |

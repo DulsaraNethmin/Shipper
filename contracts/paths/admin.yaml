@@ -1215,6 +1215,241 @@ ExceptionQueueEntry:
         through the exception path may auto-complete.
       example: Delivered
 
+AdminCancellationQueue:
+  get:
+    operationId: adminCancellationQueue
+    summary: Jobs a provider had committed to and then left
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §5's **fifth** moderation queue — "cancellations after award" (SHIP-158). A different
+      endpoint from the fourth for the reason the fourth is one endpoint with four grounds: the
+      document numbers its queues, and this one asks a different question. Nobody here is late and
+      nothing is unrecorded; somebody withdrew from a commitment, and the question that raises is
+      about the **provider**.
+
+      ## "After award" is a fact about the job's history, not about a `Cancelled` job
+
+      **Docs/02 §2 has no `Awarded → Cancelled` transition.** A queue keyed on a job reaching
+      `Cancelled` would therefore list the *pre*-award cancellations — a customer changing their
+      mind, or a job expiring unclaimed — and none of the post-award ones. So this reads the history,
+      and `outcome` says which of the two shapes an entry is:
+
+      | `outcome` | What happened |
+      |---|---|
+      | `returned_to_market` | `Awarded / Driver assigned → Open`. Docs/02 §6.2: the provider cancelled after award, every prior bid was closed, and "the cancellation is **recorded against the provider**… the reliability signal that Phase 2 reputation will be built from" |
+      | `ended` | the job reached `Cancelled` after having been awarded — under Docs/02 §2 only through `Disputed → Cancelled`, an administrator resolving a dispute as a cancelled or failed delivery |
+
+      **A job may appear more than once.** One returned to the market can be awarded again and walked
+      away from again, and both belong here — that is the history this screen exists to show. `job_id`
+      is therefore not unique; `transition_id` is.
+
+      ## The provider's history
+
+      Each entry carries two counts about the provider who was carrying the job: how many post-award
+      cancellations they have in total, and how many jobs they have carried to `Completed`. **The
+      pair is deliberate** — three cancellations against four hundred deliveries is a different
+      provider from three against five, and one number cannot tell them apart. Neither figure is a
+      judgement; Docs/04 §6's process is where somebody decides.
+
+      `provider_id` is empty when no accepted bid remains on the job. That is a real state rather
+      than an error: Docs/02 §6.2 closes every bid when a provider cancels after award, so on the
+      `returned_to_market` outcome the accepted bid does not survive the operation that creates the
+      entry. Recording which offer *was* accepted after it stops being accepted is a schema change in
+      another domain and is tracked separately.
+
+      ## What an entry never carries
+
+      **No budget and no bid amount.** A customer's budget is never exposed in any form (Docs/01
+      §4.3), and the accepted bid's price is a commercial fact belonging to the job console with its
+      own disclosure decisions. `actor_type` is the *kind* of actor and never the account: Docs/02 §1
+      says support needs the kind, and naming somebody puts an accusation in a list people scan.
+
+      ## Ordering and paging
+
+      **Newest first**, and deliberately unlike the delivery-exception queue. Docs/04 §8 sets
+      acknowledgement targets against deliveries going wrong, so the oldest entry there is closest to
+      breaching one; a cancellation is already over, nothing degrades while it waits, and what
+      somebody scanning this screen wants is what has happened since they last looked.
+
+      Cursor paged on `(cancelled_at, transition_id)`.
+
+      ## Permission
+
+      Needs `moderation.read`, which every administrator role holds.
+    parameters:
+      - name: limit
+        in: query
+        required: false
+        description: How many entries to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page — a client that sent one has a bug, and
+          answering "nothing here" would let it page for ever through a queue it never saw.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of the queue, most recent first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/CancellationQueuePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `moderation.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+CancellationQueuePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/CancellationQueueEntry'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wOC0xNFQwMjoxNTozMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like and a client should not have to know the difference.
+      example: false
+
+CancellationQueueEntry:
+  type: object
+  additionalProperties: false
+  required:
+    - job_id
+    - transition_id
+    - outcome
+    - provider_id
+    - from_status
+    - actor_type
+    - reason
+    - cancelled_at
+    - provider_cancellations
+    - provider_completions
+  description: |
+    One job a provider had committed to and then left. See the operation description for what
+    "after award" means and why it is a fact about the history.
+  properties:
+    job_id:
+      type: string
+      format: uuid
+      description: |
+        The job. **Not unique on this queue** — one returned to the market can be awarded and walked
+        away from again, and both entries belong here.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    transition_id:
+      type: string
+      format: uuid
+      description: |
+        The recorded transition this entry came from, and what makes the cursor total. Not a handle
+        to resolve against any endpoint; `job_id` is the identifier to follow.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    outcome:
+      type: string
+      enum: [returned_to_market, ended]
+      description: |
+        Which of Docs/02's two post-award endings happened. Clients branch on this.
+      example: returned_to_market
+    provider_id:
+      type: string
+      description: |
+        The provider who was carrying the job, from the accepted bid. **Empty when no accepted bid
+        remains** — see the operation description.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e7
+    from_status:
+      type: string
+      description: |
+        Where the job was when it left the commitment — `Awarded`, `Driver assigned`, or `Disputed`
+        on the `ended` outcome. Carried rather than implied: a job abandoned before a driver was
+        nominated is a different conversation from one abandoned after.
+      example: Awarded
+    actor_type:
+      type: string
+      enum: [customer, provider, driver, admin, system]
+      description: |
+        Who moved it — the **kind** of actor, never the account. Docs/02 §1 says support needs the
+        kind; naming somebody puts an accusation in a list people scan.
+      example: provider
+    reason:
+      type: string
+      description: |
+        What was recorded on the transition. Always present, and empty is ordinary — a reason is
+        required only of an administrator's move.
+      example: The provider could not source a vehicle with a tailgate lifter.
+    cancelled_at:
+      type: string
+      format: date-time
+      description: The platform's clock, in UTC. Never the actor's — the ordering depends on it.
+      example: '2026-08-14T02:15:30.000Z'
+    provider_cancellations:
+      type: integer
+      description: |
+        How many post-award cancellations this provider carries in total, this one included.
+      example: 2
+    provider_completions:
+      type: integer
+      description: |
+        How many jobs this provider has carried to `Completed`. **The denominator**, and why the
+        count above is not enough on its own.
+      example: 137
+
 AdminUsers:
   get:
     operationId: adminSearchUsers

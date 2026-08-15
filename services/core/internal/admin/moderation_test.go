@@ -779,7 +779,7 @@ func TestTheTestDoubleRunsTheStatementCmdApiRuns(t *testing.T) {
 		t.Fatalf("reading cmd/api/routes_admin.go: %v", err)
 	}
 
-	production := extractExceptionQuery(t, string(source))
+	production := extractStatement(t, string(source), "WITH entries AS (", "LIMIT $6")
 	if !strings.Contains(production, "UNION ALL") {
 		t.Fatalf("the statement read out of cmd/api is not the union this guards:\n%s", production)
 	}
@@ -791,19 +791,16 @@ func TestTheTestDoubleRunsTheStatementCmdApiRuns(t *testing.T) {
 	}
 }
 
-// extractExceptionQuery pulls the union statement out of cmd/api's source with its Go constants
-// resolved.
+// extractStatement pulls one SQL statement out of cmd/api's source with its Go constants resolved.
 //
 // Deliberately textual rather than a parse: the thing being compared is the SQL a database receives,
 // which is what string concatenation produces, and go/ast would give the pieces rather than the
 // result.
-func extractExceptionQuery(t *testing.T, source string) string {
+//
+// `open` and `close` bracket the statement. Shared with the cancellation queue's guard, which is the
+// second caller and the reason this took two parameters rather than knowing one statement.
+func extractStatement(t *testing.T, source, open, close string) string {
 	t.Helper()
-
-	const (
-		open  = "WITH entries AS ("
-		close = "LIMIT $6"
-	)
 
 	from := strings.Index(source, open)
 	to := strings.Index(source, close)
@@ -823,21 +820,22 @@ func extractExceptionQuery(t *testing.T, source string) string {
 	})
 }
 
-// constantValue reads a single-line backtick constant out of Go source by name.
+// constantValue reads a constant that cmd/api's SQL concatenates in, by name.
 //
-// It handles the two shapes this statement uses: a package constant declared in the same file
-// (`overduePickupStatuses`), and a qualified constant from another package
-// (`admin.GroundFailedProof`), whose value is the string the type is declared with.
+// Two shapes appear: a package constant declared in the same file (`overduePickupStatuses`), read
+// out of the source; and a qualified constant this package exports (`admin.GroundFailedProof`),
+// whose value is resolved from the declaration rather than from the text — so a renamed *value*
+// changes what the guard compares against, which is the whole point of resolving rather than
+// restating.
 func constantValue(t *testing.T, source, name string) string {
 	t.Helper()
 
+	if value, ok := exportedConstant(name); ok {
+		return value
+	}
 	if strings.HasPrefix(name, "admin.") {
-		for _, ground := range ExceptionGrounds {
-			if "admin.Ground"+groundConstantName(ground) == name {
-				return ground.String()
-			}
-		}
-		t.Fatalf("cmd/api's statement names %s, which is not an ExceptionGround constant", name)
+		t.Fatalf("cmd/api's statement names %s, which this guard cannot resolve; add it to "+
+			"exportedConstant so a change to its value still fails here", name)
 	}
 
 	pattern := regexp.MustCompile(regexp.QuoteMeta(name) + "\\s*=\\s*`([^`]*)`")
@@ -849,13 +847,31 @@ func constantValue(t *testing.T, source, name string) string {
 	return found[1]
 }
 
-// groundConstantName is the Go identifier suffix for a ground, derived from its wire value.
+// exportedConstant maps a `admin.X` reference in cmd/api's SQL to its value here.
 //
-// `overdue_pickup` is `GroundOverduePickup`. Derived rather than tabulated, so a fifth ground needs
-// no edit here.
-func groundConstantName(g ExceptionGround) string {
+// Derived from the declared sets rather than tabulated by hand, so a fifth ground or a third
+// outcome needs no edit: the identifier is reconstructed from the wire value, which is the same
+// direction the constants themselves are written in.
+func exportedConstant(name string) (string, bool) {
+	for _, g := range ExceptionGrounds {
+		if "admin.Ground"+camelFromWire(g.String()) == name {
+			return g.String(), true
+		}
+	}
+	for _, o := range CancellationOutcomes {
+		if "admin.Outcome"+camelFromWire(o.String()) == name {
+			return o.String(), true
+		}
+	}
+	return "", false
+}
+
+// camelFromWire is the Go identifier suffix for a wire value: `overdue_pickup` is `OverduePickup`.
+//
+// Derived rather than tabulated, so a value added to either closed set needs no edit here.
+func camelFromWire(value string) string {
 	var out strings.Builder
-	for _, word := range strings.Split(g.String(), "_") {
+	for _, word := range strings.Split(value, "_") {
 		if word == "" {
 			continue
 		}

@@ -60,6 +60,7 @@ type Handler struct {
 	svc        *Service
 	creds      *Credentials
 	moderation *Moderation
+	cancels    *Cancellations
 	users      *Users
 	jobs       *JobConsole
 	trail      *AuditTrail
@@ -88,6 +89,9 @@ type HandlerServices struct {
 
 	// Moderation is the queues of Docs/04 §5 (SHIP-117).
 	Moderation *Moderation
+
+	// Cancellations is Docs/04 §5's fifth queue (SHIP-158).
+	Cancellations *Cancellations
 
 	// Users is the account search (SHIP-151).
 	Users *Users
@@ -129,6 +133,12 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// round for a collaborator that is decided once, in the composition root.
 		return nil, errors.New("admin: a handler needs the moderation queue service")
 	}
+	if s.Cancellations == nil {
+		// SHIP-158. The same argument the moderation queue above records, and it lands the
+		// same way: a nil here is a queue that panics the first time somebody opens it, which
+		// on this screen is the first time somebody is asking why a provider walked away.
+		return nil, errors.New("admin: a handler needs the post-award cancellation queue")
+	}
 	if s.Users == nil {
 		// SHIP-151. A nil here would make the search endpoint panic at the first request
 		// rather than at startup, which is the wrong way round for a collaborator decided once
@@ -166,6 +176,7 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		svc:        s.Disputes,
 		creds:      s.Credentials,
 		moderation: s.Moderation,
+		cancels:    s.Cancellations,
 		users:      s.Users,
 		jobs:       s.Jobs,
 		trail:      s.Trail,
@@ -1107,6 +1118,175 @@ func (h *Handler) ExceptionQueue() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
 		return nil
 	})
+}
+
+// --- SHIP-158: the post-award cancellation queue -------------------------------------------------
+
+// cancellationEntryResponse is one job a provider had committed to and that was then cancelled.
+//
+// **No budget and no bid amount**, which is structural: [CancellationEntry] has nowhere to put
+// either, so no change to this mapping can acquire one. Held to its key set by
+// TestTheCancellationShapeCarriesNothingCommercial.
+type cancellationEntryResponse struct {
+	// JobID is the job. **Not unique on this queue** — a job returned to the market can be
+	// awarded and walked away from again, and both appear.
+	JobID string `json:"job_id"`
+
+	// TransitionID is the history row this entry came from, and what makes the cursor total. It
+	// is not a handle to resolve; `job_id` is the identifier to follow.
+	TransitionID string `json:"transition_id"`
+
+	// Outcome is `returned_to_market` or `ended` — which of Docs/02's two post-award endings
+	// happened. Clients branch on this.
+	Outcome string `json:"outcome"`
+
+	// ProviderID is the provider who was carrying it, from the accepted bid. Empty only if no
+	// accepted bid exists, which a post-award job cannot be in — reported rather than assumed.
+	ProviderID string `json:"provider_id"`
+
+	// FromStatus is where the job was when it left the commitment — `Awarded`, `Driver assigned`
+	// or `Disputed`. Different conversations, which is why it is on the shape.
+	FromStatus string `json:"from_status"`
+
+	// ActorType is who moved it — `customer`, `provider`, `admin` or `system`. **The kind, not
+	// the account.** Docs/02 §1 says support needs the kind; naming somebody puts an accusation
+	// in a list people scan.
+	ActorType string `json:"actor_type"`
+
+	// Reason is what was recorded on the transition. Always present, and empty is ordinary:
+	// `job_status_history.reason` is required only of an administrator's move.
+	Reason string `json:"reason"`
+
+	// CancelledAt is the platform's clock, never the actor's.
+	CancelledAt string `json:"cancelled_at"`
+
+	// ProviderCancellations and ProviderCompletions are the *Done when*'s "with the provider's
+	// history", and they are a pair on purpose: three cancellations against four hundred
+	// deliveries is a different provider from three against five, and one number cannot say so.
+	ProviderCancellations int `json:"provider_cancellations"`
+	ProviderCompletions   int `json:"provider_completions"`
+}
+
+func cancellationEntryFrom(e CancellationEntry) cancellationEntryResponse {
+	providerID := ""
+	if e.ProviderID != uuid.Nil {
+		providerID = e.ProviderID.String()
+	}
+
+	return cancellationEntryResponse{
+		JobID:                 e.JobID.String(),
+		TransitionID:          e.TransitionID.String(),
+		Outcome:               e.Outcome.String(),
+		ProviderID:            providerID,
+		FromStatus:            e.FromStatus,
+		ActorType:             e.ActorType,
+		Reason:                e.Reason,
+		CancelledAt:           timestamp(e.CancelledAt),
+		ProviderCancellations: e.ProviderCancellations,
+		ProviderCompletions:   e.ProviderCompletions,
+	}
+}
+
+// CancellationQueue handles GET /v1/admin/moderation/cancellations (SHIP-158).
+//
+// Docs/04 §5's fifth queue, and a different endpoint from the fourth for the reason the fourth is one
+// endpoint with four grounds: the document numbers its queues, and this is a different screen asking
+// a different question. Nobody here is late; somebody withdrew from a commitment.
+//
+// [PermissionModerationRead], like every other queue: looking is what the least-privileged role
+// exists to be able to do, and acting on what is found is a different permission elsewhere.
+//
+// **Newest first**, unlike the exception queue and deliberately so — see [CancellationQueue].
+func (h *Handler) CancellationQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
+			return err
+		}
+
+		query, err := cancellationQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so "is there another page" is answered by the rows rather
+		// than by a second COUNT — the same arrangement every other paged read here uses.
+		query.Limit++
+
+		entries, err := h.cancels.AfterAward(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+			next = pagination.Cursor{
+				timestamp(last.CancelledAt),
+				last.TransitionID.String(),
+			}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]cancellationEntryResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, cancellationEntryFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// cancellationQueryFrom reads the page parameters.
+//
+// **Two cursor fields rather than three**, unlike the exception queue: an entry is a `job_status_history`
+// row, and that row's identifier is unique — so `(cancelled_at, transition_id)` is total without a
+// third component. The exception queue needs one because two of its grounds are keyed by the job,
+// which is a property of that union rather than of paging in general.
+func cancellationQueryFrom(r *http.Request) (QueueQuery, error) {
+	values := r.URL.Query()
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return QueueQuery{}, err
+	}
+
+	after, err := decodeCancellationCursor(values.Get("cursor"))
+	if err != nil {
+		return QueueQuery{}, err
+	}
+	return QueueQuery{Limit: limit, After: after}, nil
+}
+
+// decodeCancellationCursor reads the two fields this queue's ordering is total on.
+//
+// It reuses [QueueCursor] and leaves [QueueCursor.Ground] empty, which is honest rather than
+// convenient: the type is "where a moderation queue stopped", the exception queue needs a third
+// component to be total and this one does not, and a second near-identical struct would be two
+// things to keep in step for one absent field.
+func decodeCancellationCursor(raw string) (QueueCursor, error) {
+	if raw == "" {
+		return QueueCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return QueueCursor{}, err
+	}
+
+	cancelledAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	transitionID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return QueueCursor{RecordedAt: cancelledAt, EntryID: transitionID}, nil
 }
 
 // --- SHIP-151: the administrator's account search -----------------------------------------------

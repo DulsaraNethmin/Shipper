@@ -420,6 +420,142 @@ type ExceptionEntry struct {
 	JobStatus string
 }
 
+// --- SHIP-158: the post-award cancellation queue --------------------------------------------------
+
+// CancellationQueue is the jobs a provider had committed to and that were then cancelled.
+//
+// # Why this is a port
+//
+// It reads `job_status_history` and `jobs`, which are `internal/jobs`', and `bids`, which is
+// `internal/bidding`'s — and `admin` may import neither. cmd/api holds the implementation, exactly as
+// it does for [JobParties], [ExceptionQueue] and [JobDirectory].
+//
+// # What "after award" means, and why it is not a `Cancelled` job
+//
+// **Docs/02 §2 has no `Awarded → Cancelled` transition**, and the guard refuses one. A queue that
+// read `to_status = 'Cancelled'` would therefore list the *pre*-award cancellations — a customer
+// changing their mind, or SHIP-68's expiry sweep — and none of the post-award ones, which is the
+// exact inverse of this ticket. It is a fact about the job's **history** rather than about one
+// transition, and it takes two shapes ([CancellationOutcome] says which).
+//
+// This is a contradiction between a backlog row and a document, resolved by reading the document:
+// Docs/02 §6.2 is explicit that a provider cancellation after award returns the job to `Open` and
+// that "the cancellation is recorded against the provider… the reliability signal that Phase 2
+// reputation will be built from, and it cannot be reconstructed later if it is not captured now".
+// This queue is where it is read.
+//
+// # The vocabulary stays on the other side of the port
+//
+// [CancellationEntry.FromStatus] and [CancellationEntry.ActorType] are plain strings for the reason
+// [ExceptionEntry] gives: both are other domains' closed lists, one of them generated from
+// `contracts/statuses.yaml` (SHIP-56a), and a copy here would shadow a generated one.
+type CancellationQueue interface {
+	// CancelledAfterAward returns one page of cancellations, most recent first.
+	//
+	// **Newest first, unlike the exception queue, and the difference is not an inconsistency.**
+	// Docs/04 §8 sets acknowledgement targets against the delivery exceptions, so the oldest
+	// entry there is the one closest to breaching one and belongs at the top. A cancellation is
+	// already over: nothing degrades while it waits, and what somebody scanning this screen
+	// wants is what happened since they last looked. The account search takes the same position
+	// for the same reason.
+	CancelledAfterAward(ctx context.Context, r db.Runner, q QueueQuery) ([]CancellationEntry, error)
+}
+
+// CancellationOutcome is what became of a job whose provider commitment ended (SHIP-158).
+//
+// This domain's own vocabulary, like [ExceptionGround] and unlike the statuses beside it: it names
+// which of Docs/02's two post-award endings happened, which is a moderation distinction rather than
+// a lifecycle one — `jobs` has no such concept, only the transitions this is derived from.
+type CancellationOutcome string
+
+const (
+	// OutcomeReturnedToMarket is Docs/02 §6.2: the provider cancelled after award and the job
+	// went back on the market. Every prior bid was closed, and the cancellation "is recorded
+	// against the provider".
+	OutcomeReturnedToMarket CancellationOutcome = "returned_to_market"
+
+	// OutcomeEnded is a job that reached `Cancelled` after having been awarded — under Docs/02
+	// §2 that can only arrive through `Disputed → Cancelled`, an administrator resolving a
+	// dispute as a cancelled or failed delivery.
+	OutcomeEnded CancellationOutcome = "ended"
+)
+
+// CancellationOutcomes is the closed set.
+var CancellationOutcomes = []CancellationOutcome{OutcomeReturnedToMarket, OutcomeEnded}
+
+func (o CancellationOutcome) String() string { return string(o) }
+
+// CancellationEntry is one job that a provider had committed to and that then left that commitment.
+//
+// **No budget and no bid amount.** A customer's budget is never exposed in any form (Docs/01 §4.3),
+// and the accepted bid's amount is not on this shape either — the question a moderation queue asks
+// is who walked away and how often, and a price is a commercial fact belonging to SHIP-152's job
+// console with its own disclosure decisions. A shape that never carried one cannot leak one.
+type CancellationEntry struct {
+	// JobID is the job. **Not unique on this queue**: a job returned to the market can be
+	// awarded again and cancelled again, so one job may appear more than once — which is not an
+	// artefact but the history a moderator is here to read.
+	JobID uuid.UUID
+
+	// TransitionID is the `job_status_history` row this entry came from, and what makes the
+	// cursor total. It is not a handle a client resolves; [CancellationEntry.JobID] is the
+	// identifier to follow.
+	TransitionID uuid.UUID
+
+	// Outcome is what became of the job — one of [CancellationOutcomes].
+	Outcome CancellationOutcome
+
+	// ProviderID is the provider who was carrying it, from the accepted bid.
+	//
+	// `uq_bids_one_accepted_per_job` makes that single-valued. **It is the zero value where no
+	// accepted bid remains**, which is a real state rather than a defect: Docs/02 §6.2 closes
+	// every bid when a provider cancels after award, so on the `returned_to_market` outcome the
+	// accepted bid will not survive the operation that creates the entry. Closing that needs
+	// `bids` to record which offer *was* accepted after it stops being accepted — a column in
+	// another domain's migration block, named in Docs/11 §4 rather than guessed at here.
+	ProviderID uuid.UUID
+
+	// FromStatus is where the job was when it left the commitment — `Awarded`, `Driver assigned`
+	// or, on the `ended` outcome, `Disputed`.
+	//
+	// Carried rather than implied: a job abandoned before a driver was nominated is a different
+	// conversation from one abandoned after, and a dispute resolved as a failed delivery is a
+	// third.
+	FromStatus string
+
+	// ActorType is who moved it — `customer`, `provider`, `admin` or `system` — and **not who
+	// they are.** Docs/02 §1 says support needs the kind; naming the account is a different
+	// disclosure on a different screen, and an entry that named one would put an accusation in a
+	// list somebody scans.
+	ActorType string
+
+	// Reason is what was recorded on the transition, where anything was.
+	//
+	// Empty is ordinary rather than a gap: `job_status_history.reason` is nullable because most
+	// transitions are self-explanatory, and it is required only of an administrator's
+	// (`ck_job_status_history_admin_reason`).
+	Reason string
+
+	// CancelledAt is the platform's clock, never the actor's — the ordering depends on it, and a
+	// device with a wrong clock could otherwise reorder a queue.
+	CancelledAt time.Time
+
+	// ProviderCancellations is how many post-award cancellations this provider carries in total,
+	// this one included.
+	//
+	// The *Done when*'s "with the provider's history", and the reason it is a count rather than a
+	// list: a list would be one query per row on the screen, and the question a moderator asks
+	// first is whether this is a pattern. Following it up is SHIP-152's job console.
+	ProviderCancellations int
+
+	// ProviderCompletions is how many jobs this provider has carried to `Completed`.
+	//
+	// **The denominator, and it is why the field above is not enough on its own.** Three
+	// cancellations against four hundred deliveries is a different provider from three against
+	// five, and a queue that showed only the first number would make them look identical.
+	ProviderCompletions int
+}
+
 // --- SHIP-152: the administrator's view of jobs and their bids ------------------------------------
 
 // JobDirectory is every job, its offers and its recorded transitions.
