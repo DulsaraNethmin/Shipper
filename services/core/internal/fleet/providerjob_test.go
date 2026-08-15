@@ -66,7 +66,12 @@ func newNegotiation(t *testing.T) negotiation {
 // **SQL rather than `internal/bidding`, because domains do not import each other.** This package
 // cannot call the bidding service, and a fake would prove nothing about the predicate — [readable]
 // is SQL and what it reads is a real row. The columns are the ones 000500 makes NOT NULL plus the
-// amount its `ck_bids_offer_has_an_amount` requires of anything past 'Draft'.
+// amount its `ck_bids_offer_has_an_amount` requires of anything past 'Draft' — and, since SHIP-87a,
+// the two instants `ck_bids_offer_has_timing` requires of the same rows.
+//
+// Both of those are stated **only past 'Draft'**, which is what keeps this helper able to write a
+// draft at all: the two constraints are twins with the same predicate, and a fixture that filled
+// them in unconditionally would stop exercising the one status that is allowed to be incomplete.
 func (n negotiation) bid(t *testing.T, job, provider uuid.UUID, status string) uuid.UUID {
 	t.Helper()
 
@@ -80,8 +85,11 @@ func (n negotiation) bid(t *testing.T, job, provider uuid.UUID, status string) u
 		amount = 45000
 	}
 
-	exec(t, n.pool,
-		`INSERT INTO bids (id, job_id, provider_id, status, amount) VALUES ($1, $2, $3, $4, $5)`,
+	exec(t, n.pool, `
+		INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+		VALUES ($1, $2, $3, $4, $5,
+		        CASE WHEN $4 = 'Draft' THEN NULL ELSE now() + interval '2 days' END,
+		        CASE WHEN $4 = 'Draft' THEN NULL ELSE now() + interval '3 days' END)`,
 		id, job, provider, status, amount)
 	return id
 }

@@ -638,6 +638,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
 | **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
+| **SHIP-87a** | M3 | `ck_bids_offer_has_timing` restored (`000505`) — the constraint `000501` wrote, applied and removed because it would have bound SHIP-87's design. That design is made and it **inherits**, so every row the platform writes past `Draft` already states both instants. It is a `CHECK` rather than a validator because the validator is in front of one door and a worker, a repair script or a psql prompt is not behind it. **The cost `Docs/09` priced in was real and wider than the six tests it named** — ten fixture sites across five packages and two verify sections wrote a closed bid with no timing, because until now nothing refused one — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13095,6 +13096,86 @@ the request is withdrawn by whoever made it; recording a rejection would make th
 two outcomes to route, and would put a disagreement between colleagues into the one table that
 records what was *done*, when nothing was. `withdrawn` exists in the CHECK and has no endpoint —
 named as a later ticket's, so that a pending review is not something only an approval can clear.
+
+#### Nothing was needed from `internal/config`
+
+### SHIP-87a — the constraint `000501` wrote and took back out, and what four waves of deferral cost
+
+`000501` is unusually explicit about what it did: the obvious twin of `ck_bids_offer_has_an_amount`
+"was written, applied, and then removed", because "it binds a design SHIP-87 has not made yet". That
+was the right call at the time and it has been spent for three waves. SHIP-87 landed, SHIP-88 built
+the supersede chain on top of it, and the specific question `000501` was protecting — whether a
+customer countering on price alone restates the timing or inherits it — **was answered `inherit`**.
+So every row this platform writes past `Draft` carries both instants already, and `000505` adds the
+constraint against data that satisfies it rather than against data it has to be reconciled with.
+
+#### The argument for a `CHECK` is that a validator is in front of exactly one door
+
+`Offer.validate` refuses an offer naming neither instant, at placement and at revision. That is the
+whole of the enforcement that existed, and it covers `POST /v1/jobs/{id}/bids` and nothing else. A
+worker, a repair script, an administrative path, a future endpoint or a psql prompt writes SQL, and
+SQL does not call a validator.
+
+**The consequence was already documented in the code rather than hypothetical.**
+`internal/bidding/expiry.go`'s claim carries `pickup_at IS NOT NULL` with a comment naming this
+missing constraint as its reason: "a claim that relied on a validator holding would sweep a row it
+could not judge the moment some other writer skipped it." That predicate stays. It is now the second
+of two guards rather than the only one, which is the same relation `postgresStore.expireBid`'s
+compare-and-set has to the claim that selected the row, and both files now say so.
+
+`TestAnOfferWithNoCollectionTimeIsNotSwept` is where that reads oddly at first glance: the row it
+needs is now a row the schema refuses, so it **drops the constraint in its own cloned database**
+before writing the fixture. `pgtest` clones a database per test, so nothing outside the function
+sees it — and it is the only honest way to go on asserting the claim's half of a property that is
+now held twice.
+
+#### Both instants rather than either, because the ordering constraint cannot see a NULL
+
+`ck_bids_timing_is_ordered` (`000501`) compares `deliver_by > pickup_at` and is written to pass when
+either is NULL, since it can only compare two values it has. So a row naming a collection time and
+no delivery satisfies every other constraint on the table and is still an offer nobody can be held
+to. "Neither", "pickup only" and "delivery only" are therefore three cases in
+`TestAnOfferPastDraftNamesItsTiming` and in `scripts/verify/61-bidding.sh`, not one.
+
+The `Draft` exemption is asserted rather than assumed, for `000404`'s reason about job drafts:
+refusing an incomplete row is refusing to save what somebody has typed so far. A constraint that had
+quietly lost its `status = 'Draft' OR` would pass every case above and break the one screen a
+provider spends the longest on.
+
+#### What it actually cost, measured rather than predicted — and this is the part to read before merging
+
+`Docs/09`'s row prices in "editing another ticket's fixtures", and `000501` sized that at "six of
+SHIP-80's own migration tests". **The measurement on this tree is wider.** With the constraint
+applied and nothing else changed, `make test` failed in **five packages** — `internal/admin`,
+`internal/bidding`, `internal/delivery`, `internal/fleet` and `cmd/notifier` — plus `migrations`,
+and two `scripts/verify` sections would have followed.
+
+The blast is loud and the repair is small: **ten fixture sites**, every one of them a single
+`INSERT INTO bids` arranging a world rather than testing one. `internal/delivery` alone carries
+about a hundred and fifty failures behind **one** helper. The sites are
+
+| File | Sites | What it was arranging |
+|---|---|---|
+| `migrations/bids_test.go` | 6 | `ck_bids_status`, `uq_bids_one_accepted_per_job`, the two foreign keys |
+| `migrations/bid_counter_offers_test.go` | 2 | the supersede chain and the per-party idempotency key |
+| `internal/delivery/assignment_test.go` | 1 | `acceptBid` — the awarded job every delivery test starts from |
+| `internal/admin/service_test.go` | 2 | `acceptBid`, and a losing bid for the stranger checks |
+| `internal/fleet/providerjob_test.go` | 1 | SHIP-96a's every-status loop, which includes `Draft` |
+| `cmd/notifier/parties_test.go` | 2 | the accepted and losing bids party resolution reads |
+| `scripts/verify/70-delivery.sh` | 1 | `delivery_award` |
+| `scripts/verify/90-admin.sh` | 1 | `dispute_award` |
+
+**Every one of those edits makes a fixture write the row the platform would actually have written**,
+which is why they are corrections rather than accommodations. `internal/fleet`'s is the only one
+with a condition in it, and the condition is the point: that helper is the one caller that writes a
+`Draft`, and the two constraints are twins with one predicate, so filling the timing in
+unconditionally would have stopped it exercising the one status allowed to be incomplete.
+
+**Eight of those ten sites are outside this branch's stated ownership**, and that is recorded here
+rather than glossed: five domain packages and two verify sections belong to other lanes. The edits
+are additive fixture lines in `_test.go` files and two shell fixtures, and no production code in
+another domain changes — but a merge conflict here is a real possibility and this is the row that
+says where to look.
 
 #### Nothing was needed from `internal/config`
 

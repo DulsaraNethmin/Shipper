@@ -2758,3 +2758,61 @@ ok "the customer is told who is offering, in a closed set, and none of it is the
 
 unset offers_job_id offers_vehicle_id offers_body offers_bid_a offers_bid_b absent_job
 unset -f offers_get
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-87a  an offer past Draft names both of its instants, and the database is what says so"
+
+# **This check exists because the rule it tests is one no request can reach.**
+#
+# `Offer.validate` refuses an offer naming neither instant, and every check above this one goes
+# through an endpoint — so the whole of `POST /v1/jobs/{id}/bids` is already covered and would go on
+# passing with `ck_bids_offer_has_timing` dropped. What 000501 deferred and 000505 restored is the
+# guard for every *other* writer: a worker, a repair script, an administrative path, a psql prompt.
+# Those write SQL, so this writes SQL, against the same running database the service is using.
+#
+# It is the one shape `make verify` can demonstrate that `migrations/bids_test.go` cannot: that
+# constraint is on the schema the **service** is running against, not only on a test template.
+
+bid_untimed_id="$("$PSQL" "$DATABASE_URL" -tAc "select gen_random_uuid();" | tr -d ' ')"
+
+# Neither instant, at Submitted — the row a validator-only rule would have let through.
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null 2>"$WORKDIR/bid-untimed.err" <<SQL
+insert into bids (id, job_id, provider_id, status, amount)
+values ('$bid_untimed_id', '$bid_job_id', '$bid_provider_id', 'Submitted', 450.00);
+SQL
+then
+  "$PSQL" "$DATABASE_URL" -q -c "delete from bids where id = '$bid_untimed_id';"
+  fail "an offer stating neither of its instants was written straight into bids — ck_bids_offer_has_timing is not on the database the service is running against"
+fi
+grep -q 'ck_bids_offer_has_timing' "$WORKDIR/bid-untimed.err" \
+  || { cat "$WORKDIR/bid-untimed.err"; fail "the untimed offer was refused by something other than ck_bids_offer_has_timing"; }
+
+# Half the timing is refused too. ck_bids_timing_is_ordered (000501) compares two values and passes
+# when either is NULL, so nothing else on this table stands between a one-sided offer and the award.
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null 2>"$WORKDIR/bid-halftimed.err" <<SQL
+insert into bids (id, job_id, provider_id, status, amount, pickup_at)
+values ('$bid_untimed_id', '$bid_job_id', '$bid_provider_id', 'Submitted', 450.00, now() + interval '2 days');
+SQL
+then
+  "$PSQL" "$DATABASE_URL" -q -c "delete from bids where id = '$bid_untimed_id';"
+  fail "an offer stating only its collection time was written straight into bids"
+fi
+grep -q 'ck_bids_offer_has_timing' "$WORKDIR/bid-halftimed.err" \
+  || { cat "$WORKDIR/bid-halftimed.err"; fail "the half-timed offer was refused by something other than ck_bids_offer_has_timing"; }
+
+# And a Draft may still state neither, which is the exemption ck_bids_offer_has_an_amount already
+# carries. A constraint that had quietly lost `status = 'Draft' OR` would pass both cases above and
+# break the screen a provider spends the longest on.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null <<SQL || fail "a draft offer with no timing was refused; the Draft exemption is gone"
+insert into bids (id, job_id, provider_id) values ('$bid_untimed_id', '$bid_job_id', '$bid_provider_id');
+delete from bids where id = '$bid_untimed_id';
+SQL
+
+# Every offer these checks placed through the endpoint already satisfies it, which is what makes the
+# constraint safe to add against live data rather than merely correct in principle.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from bids where status <> 'Draft' and (pickup_at is null or deliver_by is null);")" == "0" ]] \
+  || fail "the database already holds an offer past Draft with incomplete timing"
+ok "a bid past Draft cannot be written without both of its instants, refused by ck_bids_offer_has_timing rather than by a validator, and a Draft may still state neither"
+
+unset bid_untimed_id

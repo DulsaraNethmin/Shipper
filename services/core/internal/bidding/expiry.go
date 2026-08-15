@@ -70,10 +70,12 @@ const ExpiryBatch = 100
 // same row, so this predicate misses no live offer. Everything else it excludes is already over —
 // accepted, rejected, withdrawn, superseded, and offers this sweep expired on an earlier pass.
 //
-// `pickup_at IS NOT NULL` because the column is nullable and no constraint says otherwise:
-// `ck_bids_offer_has_timing` was removed by 000501 and is still not written (Docs/11 §9). Nothing
-// this platform writes past 'Draft' leaves it NULL, and a claim that relied on a validator holding
-// would sweep a row it could not judge the moment some other writer skipped it.
+// `pickup_at IS NOT NULL` because the column is nullable, and it stays after SHIP-87a rather than
+// being deleted by it. `ck_bids_offer_has_timing` — deferred by 000501, restored by 000505 — now
+// refuses a row past 'Draft' naming neither instant, so this predicate can no longer exclude
+// anything: it is the second of two guards rather than the only one, which is exactly the relation
+// [postgresStore.expireBid]'s compare-and-set has to the claim that selected the row. It costs one
+// line and is what the sweep would need again the moment anything ever drops the constraint.
 //
 // `ORDER BY pickup_at` drains the longest-overdue first, and `idx_bids_live_expiry` (000503) is a
 // partial index on exactly this predicate in exactly this order.

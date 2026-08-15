@@ -311,7 +311,11 @@ func acceptBid(t *testing.T, pool *pgxpool.Pool, jobID, providerID uuid.UUID) {
 	t.Helper()
 
 	if _, err := pool.Exec(t.Context(),
-		`INSERT INTO bids (id, job_id, provider_id, status, amount) VALUES ($1, $2, $3, 'Accepted', 450.00)`,
+		// The timing is SHIP-87a's `ck_bids_offer_has_timing`: a bid past 'Draft' states both of its
+		// instants, so this fixture writes the row the platform would have written rather than one
+		// the schema now refuses.
+		`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+		 VALUES ($1, $2, $3, 'Accepted', 450.00, now() + interval '2 days', now() + interval '3 days')`,
 		uuid.Must(uuid.NewV7()), jobID, providerID); err != nil {
 		t.Fatalf("accepting a bid: %v", err)
 	}

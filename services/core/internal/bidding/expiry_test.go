@@ -165,10 +165,23 @@ func TestTheExpirySweepLeavesEveryClosedOfferAsItWas(t *testing.T) {
 // TestAnOfferWithNoCollectionTimeIsNotSwept holds the claim's `pickup_at IS NOT NULL`.
 //
 // No endpoint can produce such a row — [Offer.validate] refuses an offer naming neither instant —
-// and the column is nullable and no constraint says otherwise (000501 removed
-// `ck_bids_offer_has_timing`, and Docs/11 §9 still carries it). A claim that relied on the
-// validator holding would sweep a row whose terms it cannot read the first time some other writer
-// skipped one.
+// and, since SHIP-87a, **no writer of any kind can either**: `ck_bids_offer_has_timing` refuses a
+// row past 'Draft' that names neither instant, which is the constraint 000501 deferred and Docs/11
+// §9 carried for four waves.
+//
+// # So the guard now lives one layer down, and this test says so by taking that layer away
+//
+// The row it needs is a row the schema refuses, so the constraint is dropped in this test's own
+// cloned database (Docs/10 §7.1 gives every test one) before the fixture is written. That is not a
+// back door around a guard — it is the only honest way to keep asserting the *claim's* half of a
+// property now held twice.
+//
+// **Both halves are worth keeping and they fail differently.** Without the constraint, a writer that
+// skipped the validator produces an untimed offer and the claim is what stops the sweep judging a
+// row whose terms it cannot read. Without the claim's predicate, no such row exists to be swept
+// today — but the predicate costs one line and is what the sweep would need again the moment
+// anything ever drops the constraint. postgresStore.expireBid's compare-and-set stands in the same
+// relation to the claim that selected the row, and expiry.go states it.
 func TestAnOfferWithNoCollectionTimeIsNotSwept(t *testing.T) {
 	m := newMarket(t)
 
@@ -176,6 +189,10 @@ func TestAnOfferWithNoCollectionTimeIsNotSwept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("placing the offer: %v", err)
 	}
+
+	// SHIP-87a, undone for this database alone so that the claim's own predicate can still be
+	// exercised. pgtest clones a database per test, so nothing outside this function sees it.
+	exec(t, m.pool, `ALTER TABLE bids DROP CONSTRAINT ck_bids_offer_has_timing`)
 	exec(t, m.pool, `UPDATE bids SET pickup_at = NULL, deliver_by = NULL WHERE id = $1`, bid.ID)
 
 	claimed, err := m.sweepAt(t, pastCollection)

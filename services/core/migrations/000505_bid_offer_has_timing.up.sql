@@ -1,0 +1,63 @@
+-- SHIP-87a: an offer past Draft names both of its instants, and the rule is a CHECK rather than a
+-- validator.
+--
+-- 000501 wrote this constraint, applied it, removed it, and left the reason in place of it: "it
+-- binds a design SHIP-87 has not made yet". That was correct then and is spent now. SHIP-87 landed,
+-- SHIP-88 built the chain on top of it, and the design it was protecting has been made — so the
+-- only question left is whether the rule holds against the data this platform actually writes.
+--
+-- # It does, and the design SHIP-87 made is the reason
+--
+-- 000501's worry was a specific one: "whether a customer countering on *price alone* restates the
+-- timing or inherits it from the offer it supersedes is that ticket's decision. A constraint here
+-- would settle it, in the direction that costs SHIP-87 a migration to undo."
+--
+-- SHIP-87 decided **inherit**. A counter naming only a price copies the timing forward from the
+-- offer it answers, so the new row states both instants even though the caller stated neither —
+-- internal/bidding's Counter.applyTo is where that happens, and `counterOf` in the domain's own
+-- fixtures exercises the price-only case precisely because it is the one 000501 named. Every row
+-- this platform writes past 'Draft' therefore carries both, and the constraint costs the design
+-- nothing it did not already choose.
+--
+-- # Why a CHECK when a validator already refuses it
+--
+-- Because the validator is only in front of one door. `Offer.validate` refuses an offer naming
+-- neither instant at placement and at revision, and that is the whole of the enforcement today —
+-- so a worker, a repair script, an admin path or a future endpoint that wrote a row directly would
+-- produce an offer with no terms and nothing would say so. The consequence is not hypothetical and
+-- is already documented: internal/bidding/expiry.go's claim carries `pickup_at IS NOT NULL` with a
+-- comment naming this missing constraint as the reason, because "a claim that relied on a validator
+-- holding would sweep a row it could not judge the moment some other writer skipped it".
+--
+-- That predicate stays. It is now belt and braces rather than the only belt, which is the same
+-- relationship postgresStore.expireBid's compare-and-set has to the claim that selected the row.
+--
+-- # The shape mirrors ck_bids_offer_has_an_amount exactly, which is the point
+--
+-- 000500 wrote `status = 'Draft' OR amount IS NOT NULL` and gave the reason: a Draft may be
+-- incomplete because refusing an incomplete row is refusing to save what somebody has typed so far;
+-- anything past it is an offer the other party is expected to act on. Timing is the other half of
+-- Docs/03's "price, timing, and conditions", and Docs/01 §4.3 has the customer comparing "price,
+-- timing, provider profile" — so an offer with no timing is as unactionable as one with no price,
+-- and most sharply at 'Accepted', where the award would commit both parties to an unstated date.
+--
+-- Both instants rather than either, because ck_bids_timing_is_ordered (000501) is written to pass
+-- when either is NULL — it can only compare two values it has. A row stating a pickup and no
+-- delivery would satisfy both constraints and still be an offer nobody can be held to.
+--
+-- # What this cost, stated rather than discovered
+--
+-- 000501 recorded that the constraint "failed six of SHIP-80's own migration tests, which insert
+-- Submitted and Accepted bids to exercise ck_bids_status and uq_bids_one_accepted_per_job and have
+-- no interest in timing". That is still true, and it is now wider than six: fixtures in
+-- internal/admin, internal/delivery, internal/fleet, cmd/notifier, migrations/bid_counter_offers_test.go
+-- and two scripts/verify sections all insert a closed bid with no timing, because until today
+-- nothing refused one. Docs/09's SHIP-87a row prices that in — "taking it means editing another
+-- ticket's fixtures" — and every one of those edits makes a fixture write the row the platform
+-- would actually have written.
+ALTER TABLE bids ADD CONSTRAINT ck_bids_offer_has_timing CHECK (
+    status = 'Draft' OR (pickup_at IS NOT NULL AND deliver_by IS NOT NULL)
+);
+
+COMMENT ON CONSTRAINT ck_bids_offer_has_timing ON bids IS
+    'An offer past Draft states both of its instants. 000501 deferred this constraint until SHIP-87 had made the counter-offer design; SHIP-87a restores it (Docs/03, Docs/01 §4.3).';
