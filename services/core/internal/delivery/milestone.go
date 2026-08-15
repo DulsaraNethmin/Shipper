@@ -427,6 +427,27 @@ const (
 	// OutcomeAlreadyRecorded means this idempotency key had already recorded this milestone and
 	// nothing was written. The record returned is the one the first attempt wrote.
 	OutcomeAlreadyRecorded
+
+	// OutcomeOverruled means the row was written and the job was deliberately not moved, because
+	// the job had left the delivery altogether — cancelled, disputed or completed while this
+	// milestone was still on a phone with no signal (SHIP-113, Docs/02 §3.1).
+	//
+	// # It is not [OutcomeAbsorbed], and the difference is what happened to the delivery
+	//
+	// Absorption is a milestone the job has already been past: the work it describes was done, and
+	// the platform recorded that it happened in sequence. This is a milestone the job will now
+	// never be at, because something ended or froze the delivery while the driver was out of
+	// contact. Both retain the row and move nothing, and both are true records — but only one of
+	// them is a driver whose work is about to come as a surprise to them, and Docs/02 §3.1 asks
+	// for exactly that to be surfaced rather than swallowed.
+	//
+	// **Retaining the row is the whole ticket.** Before SHIP-113 the transaction rolled back and
+	// took the milestone with it, and any photograph attached to it. `milestones` is append-only
+	// for this case specifically: 000601's own comment says the append-only trigger is "what 'the
+	// attempt is retained' means in Docs/02 §3.1 — a milestone that lost to an administrative
+	// action is still a true record of what somebody recorded, and tidying it away would destroy
+	// the evidence SHIP-113 has to show the driver".
+	OutcomeOverruled
 )
 
 func (o Outcome) String() string {
@@ -437,6 +458,8 @@ func (o Outcome) String() string {
 		return "absorbed"
 	case OutcomeAlreadyRecorded:
 		return "already recorded"
+	case OutcomeOverruled:
+		return "overruled"
 	default:
 		return "unrecognised"
 	}

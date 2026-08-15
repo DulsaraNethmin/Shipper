@@ -379,7 +379,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **712 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **714 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -501,6 +501,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-68** | M2 | Job expiry — the deadline is a trigger's, the sweep is the worker's, and `make verify` runs the real binary — *see below* |
 | **SHIP-69** | M2 | The expiry warning forty-eight hours ahead — a second task over the same column, and the job is warned once per *deadline* rather than once per job — *see below* |
 | **SHIP-70** | M2 | `POST /v1/jobs/{id}/extend` — an empty body, because the platform computes the deadline. **Not a status transition**, and the pickup date still bounds it — *see below* |
+| **SHIP-70a** | M2 | Both expiry sweeps see a job with live offers. **The document changed first**: `Docs/02` §2's expiry row now reads `Open / Negotiating → Cancelled`, and the two claims, the write behind the warning, `000409`'s two partial indexes and the extend endpoint all follow it. The product question the backlog left open — what expiry does to the offers on the job — is answered **nothing**, and the reason is that SHIP-89 already answers it. `SHIP-70` had to be widened too, or the warning would have pointed at an action that refused — *see below* |
 | **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-77** | M2 | Flutter customer job detail — the timeline is derived from the current status, because the transition history the database records is served by no endpoint; and sign-out finally tells the platform — *see below* |
@@ -536,6 +537,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
+| **SHIP-113** | M4 | Administrative conflict resolution — a queued milestone whose job was cancelled, disputed or completed while the phone was offline is **retained rather than rolled back**, with its evidence, and the administrator's decision stands untouched. `Docs/02` §3.1's fourth bullet had described this since the first draft and the platform did the opposite; SHIP-112 left the case in the refusal branch on purpose and named this ticket. **The wire answer is deliberately indistinguishable from an absorption** and the client reconciles on the job resource, because the milestone row is written *before* the move is attempted and there is nowhere consistent to record which outcome it was — *see below* |
 | **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
 | **SHIP-115** | M4 | `proofs` and `GET /v1/jobs/{id}/delivery/proof` — an uploaded object becomes evidence for **one recorded milestone**, and the customer and the awarded provider read it back through short-lived signed URLs issued *after* an authorisation check. Because the platform is not in the upload path it **asks the store whether the object arrived** rather than believing the client, and records what the store reports — which is also what finally puts SHIP-114's upload limits under a guard inside the domain — *see below* |
 | **SHIP-115a** | M4 | The delivery read shelf — `GET /v1/jobs/{id}/delivery/detail` and `GET /v1/jobs/{id}/delivery/milestones`, both `RequireUser`, both **five segments because four would panic the router at registration**. The milestone list is the only place a recording that moved nothing can be seen, which is why it is served rather than derived from the job's status; it pages on a keyset carrying the actor's clock *and* the identifier, because an offline batch shares one timestamp. `driver_mobile` reaches the provider who typed it and not the customer, and the domain drops it rather than the handler — *see below* |
@@ -552,6 +554,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-125** | M4 | Flutter sync worker — **six triggers, because "reconnection" is not a reliable event on a handset**; an exponential backoff stored per operation and ceilinged at five minutes, because nothing can shorten a stored wait; and one idempotency key per operation, minted at enqueue and unchanged on every attempt. Sign-out finally clears the queue. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-126** | M4 | Flutter pending-updates indicator — a bar **above the router and below the content**, so it survives every navigation, because "persistent" in `Docs/02` §3.1 means it does not go away when the screen does. It counts `unsynced` — pending **and in flight** — and shows quarantined work as a second line rather than a fourth number, which closes the hole SHIP-125's exclusion would have left. It lives inside `ShipperApp`, so the worker is **supplied by `main.dart`** rather than reached for, and a test holds that wire — *see below* |
 | **SHIP-127** | M4 | Flutter four-hour unsynced nudge — `Docs/02` §3.1's second rung, and **a prompt rather than a fourth line in SHIP-126's bar**: a card over a scrim, above the router, dismissed by an explicit tap and by nothing else. It measures `enqueued_at` of the oldest **pending or in-flight** operation and excludes quarantined work, because the whole content of the prompt is *go and find signal*. **No timer at all** — a published snapshot and the clock at build time, because every trigger that brings a person back to the app already publishes one. Finding: **the queue's clock and the nudge's clock have to be the same one**, which no fixture had needed until now. The four hours is a value rather than a constant and **should not stay on the device** — *see below* |
+| **SHIP-128** | M4 | Operations alert at 24 hours unsynced — `Docs/02` §3.1's third rung, and **the platform's own measure of "unsynced", which is `server_recorded_at - actor_recorded_at`**: the pair SHIP-110 kept apart, which `000601` had already named as what makes this threshold measurable. **No column, no flag and no second table** — the rows are the queue, the reading `admin.ExceptionQueue` takes of its own. The alert is a WARN line when a long-unsynced update *lands*; `delivery.UnsyncedMilestones` is the queue SHIP-157 renders. **What it deliberately cannot see is named rather than narrowed away**: an update still on a handset has not arrived, and a job that has stopped moving is SHIP-177's different fact — *see below* |
 | **SHIP-129** | M4 | Flutter milestone update UI — `/jobs/{id}/delivery`, three large buttons, and a log with **pending marked in a word, an icon and a sentence rather than a colour**. **The only reconciliation signal a client has is the operation leaving the queue** — `send` returns `void` and the row is deleted — so a stale snapshot could say the platform had work it did not, and the guard against that is the one mutation that survived the suite. Finding: **no endpoint serves an awarded job to the provider delivering it**. Driven against a live API on a simulator — *see below* |
 | **SHIP-130** | M4 | Flutter camera capture with on-device compression — **`camera` and not `image_picker`**, because the one-line answer hands the capture to the manufacturer's camera application and several of those keep a copy in `DCIM/Camera`, which no Dart can prevent or observe. The negative is proved from the two places that can enforce one: **no Android media permission and no iOS photo-library string**, both asserted. Compression is **pure Dart** so a host test measures it on real JPEGs, EXIF included. It also builds the **three-request upload exchange** SHIP-125 left as an `UnimplementedError` — and corrects that comment, which named a multipart send the platform does not have. `delivered` becomes recordable from the app for the first time — *see below* |
 | **SHIP-131** | M4 | Flutter camera permission fallback — `Docs/01` §4.4's three reasons, chosen and queued as `POST /v1/jobs/{id}/milestones` with `proof.exception_reason`. **The copy was already right and the button under it did nothing**, which SHIP-130 said in as many words when it declined to offer one. Queued as `OperationKind.milestone` and not `proof` — there is no file — which is also what puts a recorded exception in the driver's own pending log. The confirmation is **its own stage**, because "Photograph saved" about an exception is a driver who believes they photographed a delivery they did not. Deliberate scope: the reason is reachable with a **working** camera, since only one of the three is about the camera at all — *see below* |
@@ -10765,6 +10768,331 @@ selected rather than refused" answer does not transfer.
 rather than measuring, in a brief whose own baselines were measured — which is this repository's
 recurring failure mode arriving in a document meant to prevent it. The check that caught it is
 `grep` against the golden file, and it took under a minute.
+
+### SHIP-70a — the document was widened first, and the widening reached one endpoint nobody listed
+
+`Docs/02` §2 had one expiry row and it read `Open → Cancelled`. It now reads
+`Open / Negotiating → Cancelled`, with the clause the sweep needed and could not decide for itself:
+
+> | Open / Negotiating | Cancelled | Job expires unclaimed — see §6.3. The deadline is the job's own
+> and does not wait for its last offer to lapse |
+
+**That is the whole of what changed in `Docs/02`, and the ordering was the ticket.** SHIP-90 narrowed
+SHIP-68 and SHIP-69 without either being reopened — before it, `WHERE status = 'Open'` was the whole
+of "a live job", and after it a job with one unanswered offer sits at `Negotiating` where neither
+sweep could see it. Widening the queries and leaving §2 alone would have been resolving a
+contradiction silently in code, which `CLAUDE.md` forbids; so the row moved first and five things
+followed it rather than the other way round.
+
+#### The set is written once, and the three copies that must agree are held to each other
+
+`jobs.LiveStatuses` is a SQL fragment — `('Open', 'Negotiating')` — concatenated into
+`ExpiryClaim`, `ExpiryWarningClaim` and `postgresStore.markExpiryWarned`. `jobs.offered` is its Go
+form, asked by the extend endpoint. `TestLiveStatusesAgreeInGoAndSQL` **parses the fragment** and
+puts all twelve of `Docs/02` §1's statuses to both, so the two cannot drift.
+
+Both directions of a drift are silent, which is why the pairing exists rather than a comment. A
+status live in SQL and not in Go warns a customer about a job the endpoint then refuses to extend; a
+status live in Go and not in SQL extends a job no sweep is watching. `Docs/10` §3.4 already pairs a
+Go constant list against a `CHECK` in both directions, and this is the same instrument aimed at a
+predicate.
+
+#### SHIP-70 had to move with it, and no ticket said so
+
+`Service.Extend` read `job.Status != StatusOpen`. `Docs/02` §6.3 is one mechanism in two sentences —
+"the customer is warned 48 hours before expiry **and can extend in one action**" — so the moment the
+warning claim can reach a `Negotiating` job, an extend endpoint still filtering on `Open` answers
+`409 jobs_not_extendable` to the one customer the warning was for, on the one kind of job somebody
+has actually bid on. It is now `offered(job.Status)`, and `contracts/paths/jobs.yaml` says so.
+
+This is worth recording as a shape rather than as a fix: **the ticket's *Done when* named the two
+claims, and the third consumer of the same predicate was in another ticket's file.** Nothing in
+`Docs/09` would have found it; the thing that found it was reading §6.3's sentence to the end.
+
+#### What expiring a Negotiating job does to the offers on it — nothing, and that is the answer
+
+`Docs/09`'s note says "whoever takes it decides what `Negotiating → Cancelled` means for the offers
+on the job, which is a product question the sweep cannot answer for itself." It is answered
+**nothing**, on three grounds that were checked rather than assumed:
+
+- `Docs/02` §2 **already** permits `Negotiating → Cancelled` — SHIP-64's cancellation uses it — so
+  the sweep takes an existing edge and the job ends exactly as an unbid one does. No new row, and no
+  change to `internal/jobs/model.go`'s table.
+- Every live offer runs out at its own collection time under SHIP-89, which is `Docs/09`'s own
+  argument for why this was a ticket rather than an incident, read in the other direction.
+- **No offer on a cancelled job can be accepted meanwhile.** The award moves the job to `Awarded`,
+  which `permitted` allows from `Open` and `Negotiating` and from nowhere else, so a `Cancelled` job
+  refuses every award in the same guard that refuses every other impossible move. That is checked in
+  `internal/jobs/model.go` rather than believed from the endpoint.
+
+Closing the offers here would have meant this sweep writing `bids` — a second domain's table, from a
+query `jobs` owns, for a fact SHIP-89 already produces on its own schedule. `Docs/06` §4.1 exists to
+prevent exactly that, and it would buy nothing a provider can observe.
+
+#### `000409` widens two partial indexes, and that is the part a query change alone would have missed
+
+`000406` and `000407` each built a partial index on exactly the predicate its sweep claimed with, and
+each said so. A widened claim over a narrow partial index is **correct and unplanned**: a sequential
+scan over every job the platform has ever had, every few minutes, with nothing failing to announce
+it. So `000409` drops and recreates both — a partial predicate is not alterable — keeping the names,
+because `idx_jobs_open_expiry` and `idx_jobs_open_unwarned` are cited in two migrations, one Go file
+and the migration tests, and a rename would be a change with four writers and no reader.
+
+**No deadline logic changed.** `000406`'s trigger fires on `NEW.status = 'Open' AND OLD.status IS
+DISTINCT FROM 'Open'`, and a job reaches `Negotiating` *from* `Open`, so it is already carrying the
+deadline publication gave it. `000406`'s own comment had anticipated the cycle — the trigger fills a
+NULL and never overwrites, which "stops the clock restarting every time a job cycles Negotiating →
+Open as bids expire" — and the verify section asserts the deadline survived the move rather than
+assuming it.
+
+#### The mutation, and which kind of guard each test turned out to be
+
+`ExpiryClaim` was put back to `WHERE status = 'Open'` — the pre-SHIP-70a text — and `make test` run
+whole. **One test failed: `TestTheExpiryClaimTakesANegotiatingJobOnItsOwnDeadline`**, which claims
+against a real database and compares what the claim took.
+
+`TestLiveStatusesAgreeInGoAndSQL` **did not fail**, and that is the finding worth keeping. It reads
+`LiveStatuses`, and the mutation was in `ExpiryClaim`'s own literal — so the pairing guard is a
+*text* guard over the constant and says nothing about the query that concatenates it. Wave 9's
+`FOR UPDATE OF j SKIP LOCKED` demotion is the same shape from the other side. **A pairing test and a
+behavioural test are different instruments and this ticket has both**, deliberately.
+
+The file was snapshotted to `/tmp` before the mutation and restored from that copy, never with
+`git checkout`; `shasum -a 256` matched the snapshot afterwards and `git diff` still carried the
+ticket's 57 added lines, which is the pair of checks that distinguishes "restored" from "reverted to
+the last commit".
+
+#### It puts two `cmd/worker` tasks on the same row for the first time, and that was checked
+
+`job-expiry` and `bid-expiry` run in one binary and, until this ticket, could never contend: the
+expiry sweep claimed only `Open` jobs, and `bid-expiry`'s `LeaveNegotiation` only ever touches a
+`Negotiating` one. Widening the claim makes the same row reachable from both. **This was read rather
+than assumed, and it is safe by construction in three directions:**
+
+- **Contended.** `ExpiryClaim` holds the job row `FOR UPDATE SKIP LOCKED`; `LeaveNegotiation` takes
+  it the same way and answers `JobPresentationHeld` when it gets nothing. `leaveNegotiationIfEmpty`
+  treats that as success, so the bid sweep backs off rather than blocking or failing.
+- **Already cancelled.** `jobs.Permitted(Cancelled, Open)` is false, so `LeaveNegotiation` answers
+  `JobPresentationClosed` — whose comment already named this case before SHIP-70a existed: "the job
+  has gone somewhere this move has no opinion about — awarded, cancelled, expired".
+- **The other order.** If `bid-expiry` returns the job to `Open` first, the expiry claim still covers
+  it, because `Open` is in `LiveStatuses` too. **There is no interleaving in which the job falls out
+  of both**, which is exactly what widening to the pair — rather than switching the claim from `Open`
+  to `Negotiating` — buys.
+
+Worth stating because a correction arrived mid-wave: **`LeaveNegotiation` has two implementations,
+not one** — `cmd/api/routes_bidding.go:480` and `cmd/worker/tasks_bidding.go:188` — and every account
+of it so far, including the brief that reached this lane, cited only the first. The worker's copy is
+the one this ticket newly contends with, and it is the one checked above.
+
+#### One stale sentence in another domain's migration, left alone deliberately
+
+`000302_vehicle_capability_index.up.sql` says "idx_jobs_open_expiry is partial on 'Open' alone", and
+after `000409` that is no longer true. It is a comment in an **applied** migration in the fleet
+block, and editing one is worse than the staleness: the file is the record of what ran. Whoever next
+touches `000302` can correct the aside; nothing reads it.
+
+
+### SHIP-113 — the code catches up to a bullet the document had carried from the first draft
+
+`Docs/02` §3.1's fourth bullet has always said what happens to a queued update that contradicts an
+administrative action: "the cancellation stands, **the attempt is retained in history**, and the app
+must show the driver what happened rather than silently discarding their work." The platform did the
+opposite. A milestone recorded against a job that had been cancelled, disputed or completed answered
+`409 delivery_milestone_not_permitted` and **rolled the transaction back**, which discarded a
+driver's record of work they had genuinely done — and, because evidence is written before the move is
+attempted, their photograph or reasoned exception with it.
+
+**This is `Docs/02` running one ticket ahead of the code, and §9 recorded it so nobody filed it as a
+bug.** It is the exact mirror of SHIP-70a on the same branch, which is why the two were one lane: one
+made the document catch up, the other made the code catch up, and reversing them would have been a
+silent correctness change to the status model.
+
+#### The change is one case in one switch, and SHIP-112 had already put the seam there
+
+`delivery.JobLostTheDelivery` joins `JobAlreadyPast` and `JobNotAssignable` on the port, and
+`OutcomeOverruled` joins `OutcomeAbsorbed`. `Service.record`'s switch retains the row instead of
+returning the sentinel. That is the whole of the domain change, and it is small because SHIP-111 left
+the milestone insert independent of whether the job moved and SHIP-112 proved that seam works.
+
+`Service.AssignDriver`'s switch gained the case too, and that one is not cosmetic: the adapter now
+answers a value it did not before, and without a case there it would have fallen to `default` and
+turned a clean refusal into a 500. It answers `ErrJobNotAssignable`, unchanged on the wire — an
+assignment is an instruction about who drives *now*, not a historical claim, so it is the
+`JobAlreadyPast` argument rather than this ticket's.
+
+#### The predicate is three named statuses, and naming them is what protects SHIP-112
+
+`jobLifecycle.refusal` in `cmd/api` asks three questions in a fixed order: has the job recorded a
+transition **into** the target (absorb); is it standing in a status Docs/02 §2 gives no way back into
+a delivery from (retain); otherwise, it is premature (refuse).
+
+**The obvious implementation is a reachability search — "can the job still reach the target?" — and
+it is wrong.** Docs/02 §2 makes `Driver assigned` skippable, so a job at `In transit` can never reach
+it either; a reachability test would call a premature milestone an administrative conflict and keep
+it. So `outOfTheDeliveryStatuses` names `Cancelled`, `Completed` and `Disputed` instead — the
+statuses where something *ended or froze the delivery*, which is the only thing §3.1's bullet is
+about.
+
+The hand-written list is then held to the table it came from.
+`TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays` searches `jobs.Permitted` over all twelve
+statuses for one from which no milestone status is reachable — **counting the job's own status as
+reachable from itself**, which is the clause that correctly keeps `Delivered` out of the set — and
+derives exactly those three. A status added to Docs/02 §2, or an edge added out of `Disputed`, fails
+there rather than silently changing which milestones the platform keeps.
+
+**The order of the first two questions is load-bearing.** A job that reached `Delivered` and was then
+disputed satisfies both for a queued `Picked up`: it has been past the pickup *and* it now stands
+somewhere with no way back. It is the first — the work was done and recorded in sequence — and
+answering it as an administrative conflict would tell the driver their pickup lost to something when
+it had not. `TestAbsorptionIsAnsweredBeforeAnOverruling` is that case, and it can only be asserted on
+the outcome, because both answers retain the row and nothing in the table distinguishes them.
+
+#### The wire answer is the same 201 an absorption gets, and that is a decision rather than an omission
+
+§3.1 also asks that "the app must show the driver what happened", which reads like a field on the
+response. It is answered on the **job resource** instead, which is the same paragraph's own
+instruction — "the app displays optimistic local state, clearly marked as pending, and reconciles to
+whatever the platform returns" — and SHIP-132 is the client ticket that does it. The job reads
+`cancelled`, with the administrator's reason on its status history, and `make verify` asserts that
+reason is still what the job records after the retained milestone lands.
+
+**A field on the milestone response could not have been answered consistently anyway, and this is the
+mechanical reason rather than a preference.** `milestones` is append-only — no `UPDATE` — and the row
+is inserted *before* the move is attempted, so there is nowhere to record which of the outcomes it
+was. A retry that outlived its Redis entry lands on `Service.alreadyRecorded`, which reads the row
+back and deliberately does not re-evaluate the move; it would have to recompute what the first
+attempt decided. SHIP-112 argued the same point when it declined to add an outcome field, and this
+ticket is the one that tests the argument rather than inheriting it.
+
+**A second table recording the conflict was considered and refused.** It would have made the outcome
+storable and the reason literal, but it is a second source of truth for a fact the rows already carry
+— the milestone, its `server_recorded_at`, and the job's own status history are together the whole
+account — and that is the argument `admin.ExceptionQueue` (SHIP-117) makes at length about a flag
+column, in the same domain, for the same reason.
+
+#### What "with its reason" turned out to mean
+
+The *Done when* reads "loses and is retained **with its reason**", and the natural first reading is
+that the platform stores why the attempt lost. It does not, and does not need to: `000601`'s own
+comment had already settled it, saying the append-only trigger is "what 'the attempt is retained'
+means in `Docs/02` §3.1 — a milestone that lost to an administrative action is still a true record of
+what somebody recorded". What is retained is the attempt *and everything recorded with it* — the
+actor's clock uncorrected, `Docs/01` §4.4's recipient and note, and the photograph or reasoned
+exception. Why it lost is on the job's status history, where `ck_job_status_history_admin_reason`
+already makes an administrator's reason mandatory.
+
+#### The mutation, and one check that turned out to be asserting nothing
+
+`Service.record`'s `JobLostTheDelivery` case was put back to the pre-ticket refusal and `make test`
+run whole. **Four tests failed** — `TestADeliveredMilestoneOnACancelledJobIsRetained`,
+`TestAMilestoneOnADisputedJobIsRetained`, `TestAnOverruledMilestoneIsStillRecordedOncePerKey` and
+`TestARetainedMilestoneEmitsWithJobMovedFalse` — all of them against a real database. `service.go`
+was snapshotted to `/tmp` first and restored from that copy, never with `git checkout`; `shasum -a
+256` matched afterwards and `git diff` still carried the ticket's 49 added lines.
+
+**Separately, `make verify` caught a check of mine that proved nothing**, which is worth recording
+because it is the shape this file keeps warning about. Both the Go test and the verify section
+originally drove the "skipped status" case with `driver_assigned` on an `In transit` job — and
+`Recording.problems` refuses that milestone outright with a **422**, long before the switch under
+test is reached, because a driver is put on a job through its own endpoint. The Go test passed
+because it asserted only that *an* error came back. Both now drive a premature `in_transit` on a live
+delivery, which reaches the branch; the genuinely unreachable-but-skipped case is held by the
+derivation test against `Docs/02` §2 directly, and the verify section says so rather than pretending
+to cover it.
+
+
+### SHIP-128 — the platform's measure of "unsynced" was already in the schema, waiting
+
+`Docs/02` §3.1's ladder has three rungs. SHIP-126 built the first and SHIP-127 the second, both on
+the handset and both measuring `enqueued_at` — a column that never leaves the device. This is the
+third: *"24 hours — operations alert. The job is treated as at risk and enters the delivery-exception
+queue (`04` §5)."*
+
+**The platform cannot read `enqueued_at`, and it does not need to.** `milestones` records the actor's
+clock and the platform's separately (SHIP-110), and the difference between them *is* how long the
+update was unsynced. `000601` said so before this ticket existed — `server_recorded_at` is "what
+makes an unsynced-milestone threshold (Docs/02 §6.5) measurable" — so the fact was in the schema
+waiting for somebody to subtract two columns.
+
+#### No column, no flag, no second table
+
+The queue is a query. `delivery.UnsyncedMilestones` selects rows where
+`server_recorded_at - actor_recorded_at >= $1` and nothing marks a row as belonging to it.
+
+That is `admin.ExceptionQueue`'s argument (SHIP-117), applied in the same domain to the same shape of
+problem: a flag is a second source of truth that a repair script or a rolled-back transaction can put
+out of step with the rows, and it "would have to be written where the exception is recorded, which is
+`internal/delivery`'s transaction, through a port it would have to declare". Here it is even weaker
+than that — **the fact is two existing columns subtracted**, so a flag would be a cached arithmetic
+result with all the same failure modes and none of the excuse.
+
+The gap is computed **once** in the statement and both the predicate and the returned figure read the
+same expression. Selecting on one figure and reporting another is how a queue comes to hold a row
+that does not satisfy its own rule, and the test asserts the returned gap against the threshold
+rather than against the fixture that produced it.
+
+#### The alert fires when the update lands, and what that cannot see is named rather than narrowed away
+
+An update still sitting on a handset has not arrived, so the platform cannot know it exists. This
+rung therefore fires when a long-unsynced update **lands** — a WARN line naming the job and the gap,
+in `writeMilestone`, beside SHIP-116's exception line and for the same reason: it is operations'
+business rather than a client's, and `Docs/04` §5's queue is where somebody acts on it. It is raised
+on whatever the milestone did — recorded, absorbed or overruled — because how far behind the record
+ran is a fact about the *update* rather than about the move it caused, and it is suppressed on a
+replay alone, because paging operations again because a phone retried would make the alert mean less
+each time it fired.
+
+**A delivery whose driver never reconnects is invisible here, and that gap belongs to a different
+ticket.** A job that has *stopped moving* is a different fact with a different measurement — the last
+thing that happened to it, rather than the gap inside one update — and it is "delayed delivery" in
+`Docs/04` §5, which SHIP-177's alerting owns. Folding the two together would produce a queue that
+could not tell "the record is stale" from "the delivery is stuck", which are different problems with
+different responses. Recorded here so the next reader does not file the absence as a defect.
+
+#### The threshold is a constant, and the four-hour one deliberately is not
+
+`UnsyncedAlertThreshold` is a Go constant on exactly `jobs.ExpiryWarning`'s reasoning: this is a
+lifecycle rule from a document, not an operational limit of the kind `Docs/06` §5.3 requires to be
+changeable without a deploy.
+
+**SHIP-127's four hours is the opposite case**, and the contrast is worth holding: it fires on a
+handset that `Docs/07` says has no over-the-air update path for Dart code, so it is precisely the
+number CLAUDE.md puts server-side and hands to the client to cache. That is SHIP-167a's endpoint, not
+this constant, and the two sit either side of the same line.
+
+#### The mutation, and the test of mine it proved was asserting nothing
+
+The queue's `ORDER BY` was changed from `server_recorded_at` to `actor_recorded_at` — the exact
+substitution the code comment warns about, since ordering a support queue by a handset's clock lets a
+device reorder it. **`TestTheQueueIsOldestArrivalFirst` passed.**
+
+The fixture was wrong, not the mutation. Both rows were inserted longest-gap-first, and a larger gap
+means an *earlier* actor clock — so the two columns sorted the rows identically and the test could
+not tell them apart. It now inserts the row that **arrives first carrying the later actor clock**, so
+the two orderings genuinely disagree; the mutation then fails it on both assertions, and the restored
+query passes.
+
+**This is the third instance in this file of a guard that looked behavioural and was not**, after
+wave 9's `FOR UPDATE OF j SKIP LOCKED` demotion and this branch's own SHIP-70a finding. The pattern
+is the same each time: the test exercised the code, and the *fixture* could not distinguish the
+correct answer from the wrong one. Running the mutation is what separates those, and it is why the
+Definition of Done asks for one.
+
+`postgres.go` was snapshotted to `/tmp` before the mutation and restored from that copy, never with
+`git checkout`; `shasum -a 256` matched afterwards and `git diff` still carried the ticket's 77 added
+lines.
+
+#### What is not built, and who owns it
+
+`delivery.UnsyncedMilestones` has **no HTTP surface**. `Docs/11` §6 says this ticket "owns the fact
+rather than the screen", and the screen is SHIP-157's — which also means the queue has no cursor,
+deliberately: `admin.QueueQuery`'s cursor is `(created_at, id)` because somebody had a page to
+render, and a cursor shape chosen without a consumer is a guess the first real caller has to live
+with. A bounded read is the honest surface and widening it is additive.
+
+`internal/admin` was not touched. It is another lane's this wave, and nothing here needed it: the
+query is over `milestones`, which this domain owns.
 
 
 

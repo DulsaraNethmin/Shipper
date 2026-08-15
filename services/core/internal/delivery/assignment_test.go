@@ -138,7 +138,23 @@ func (j testJobs) refusal(ctx context.Context, r db.Runner, m jobs.Move) (JobMov
 			return JobAlreadyPast, nil
 		}
 	}
+
+	// SHIP-113, and the order matters: a job that reached 'Delivered' and was then disputed
+	// satisfies both tests, and it is the first of them. The production copy says the same.
+	if len(history) > 0 && testOutOfTheDelivery(history[len(history)-1].To) {
+		return JobLostTheDelivery, nil
+	}
 	return JobNotAssignable, nil
+}
+
+// testOutOfTheDelivery is cmd/api's outOfTheDelivery — the statuses Docs/02 §2 gives a job no way
+// back into a delivery from (SHIP-113).
+//
+// The third copy of the same three statuses, and the one that would drift silently, so
+// TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays derives the set from jobs.Permitted and
+// holds this function to it.
+func testOutOfTheDelivery(s jobs.Status) bool {
+	return s == jobs.StatusCancelled || s == jobs.StatusCompleted || s == jobs.StatusDisputed
 }
 
 // testAwards is delivery.Awards over the accepted bid, as cmd/api reads it.

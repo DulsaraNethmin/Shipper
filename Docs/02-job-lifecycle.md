@@ -39,7 +39,7 @@
 | Picked up | In transit | Transport begins; can be automatic presentation change |
 | In transit | Delivered | Proof-of-delivery data recorded, or a reasoned exception recorded |
 | Delivered | Completed | Customer confirms, or 72 hours pass with no dispute — see §6.1 |
-| Open | Cancelled | Job expires unclaimed — see §6.3 |
+| Open / Negotiating | Cancelled | Job expires unclaimed — see §6.3. The deadline is the job's own and does not wait for its last offer to lapse |
 | Awarded through Delivered | Disputed | Eligible user/admin opens a supported dispute |
 | Disputed | Completed | Admin resolves dispute with delivery accepted |
 | Disputed | Cancelled | Admin resolves as cancelled/failed delivery |

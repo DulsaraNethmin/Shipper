@@ -465,16 +465,21 @@ func (postgresStore) jobsFor(ctx context.Context, r db.Runner, customerID uuid.U
 // **The status write is untouched.** This statement does not name `status`, so 000402's guard
 // returns early and no job_status_history row is needed — a warning is not a transition, and
 // nothing here should make it look like one.
+//
+// The status *test* names [LiveStatuses] rather than repeating a literal, since SHIP-70a. This
+// predicate and [ExpiryWarningClaim]'s are one rule written twice on purpose — the claim chooses
+// the row and this refuses to write one it would not have chosen — and two copies that could drift
+// apart would produce a claim whose write silently matches nothing.
 func (postgresStore) markExpiryWarned(ctx context.Context, r db.Runner, id uuid.UUID, at time.Time) (Job, error) {
 	const q = `
 		UPDATE jobs SET expiry_warned_at = $2
-		WHERE id = $1 AND status = 'Open' AND expiry_warned_at IS NULL
+		WHERE id = $1 AND status IN ` + LiveStatuses + ` AND expiry_warned_at IS NULL
 		RETURNING ` + jobColumns
 
 	j, err := scanJob(r.QueryRow(ctx, q, id, at.UTC()))
 	switch {
 	case errors.Is(err, db.ErrNoRows):
-		return Job{}, fmt.Errorf("jobs: %s is not an Open job awaiting a warning: %w",
+		return Job{}, fmt.Errorf("jobs: %s is not a live job awaiting a warning: %w",
 			id, ErrExpiryWarningNotDue)
 	case err != nil:
 		return Job{}, fmt.Errorf("jobs: warn %s of expiry: %w", id, err)

@@ -683,6 +683,238 @@ status="$(curl -s -X POST -o "$WORKDIR/ms-early.json" -w '%{http_code}' \
 ok "a milestone the delivery has not reached yet is still refused and still rolls back whole — retrying it succeeds, which is what makes the refusal cost a retry rather than a record"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-113  a queued update contradicting an administrative action loses and is retained"
+
+# Docs/02 §3.1's fourth bullet, run against the running binary:
+#
+#   A queued update that contradicts an administrative action loses. If a driver records
+#   "Delivered" offline while an administrator cancels the job, the cancellation stands, the
+#   attempt is retained in history, and the app must show the driver what happened rather than
+#   silently discarding their work.
+#
+# # Why this belongs here and not only in Go, which is the SHIP-112 argument again
+#
+# The three-way split of one refusal is `jobLifecycle.refusal` in cmd/api/routes_delivery.go, and
+# internal/delivery's tests drive a *copy* of it because cmd/api has no database in a Go test. The
+# production adapter — including `outOfTheDelivery`, which is what decides retention — is exercised
+# here or nowhere.
+#
+# # The fixture goes through Disputed because Docs/02 §2 offers no other way out
+#
+# There is no `Awarded → Cancelled` row, and none from any delivery status: once the goods are in
+# somebody's vehicle the route out is a dispute and an administrator resolving it (§6.2). So an
+# administrator ending a live delivery is two guarded moves, both made as `admin` with the reason
+# ck_job_status_history_admin_reason requires — which is what makes the action distinguishable in the
+# record afterwards, and is what the app reconciles against.
+
+# delivery_admin_move <job-id> <from> <to> <reason> — a guarded transition made by an administrator.
+#
+# Deliberately not delivery_move with a different argument: an administrator owes a reason, the
+# constraint enforces it, and a fixture that routed round that would demonstrate this ticket against
+# a move no administrator could actually make.
+delivery_admin_move() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -v job="$1" -v from_status="$2" -v to_status="$3" -v why="$4" \
+    >/dev/null <<'SQL'
+BEGIN;
+INSERT INTO job_status_history
+    (id, job_id, from_status, to_status, actor_type, actor_id, reason, actor_recorded_at)
+VALUES (gen_random_uuid(), :'job', :'from_status', :'to_status', 'admin',
+        gen_random_uuid(), :'why', now());
+SELECT set_config('shipper.job_status_transition',
+                  (SELECT id::text FROM job_status_history
+                    WHERE job_id = :'job' AND to_status = :'to_status'), true);
+UPDATE jobs SET status = :'to_status' WHERE id = :'job';
+COMMIT;
+SQL
+}
+
+# A live delivery: the driver is in transit and about to lose signal.
+conflict_job="$(delivery_awarded_job conflict)"
+delivery_move "$conflict_job" Awarded 'En route to pickup'
+delivery_move "$conflict_job" 'En route to pickup' 'Picked up'
+delivery_move "$conflict_job" 'Picked up' 'In transit'
+
+# While they are out of contact, an administrator disputes the job and resolves it as cancelled.
+delivery_admin_move "$conflict_job" 'In transit' Disputed "Customer reported the goods never arrived."
+delivery_admin_move "$conflict_job" Disputed Cancelled "Resolved as a failed delivery."
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$conflict_job';")" == "Cancelled" ]] \
+  || fail "the fixture did not reach Cancelled; the rest of this section would prove nothing"
+
+# The phone reconnects and syncs the delivery it recorded three hours ago. Before SHIP-113 this
+# answered 409 and rolled back, taking the driver's row and their recorded exception with it.
+status="$(curl -s -X POST -o "$WORKDIR/ms-conflict.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-conflict" \
+  -H 'Content-Type: application/json' \
+  -d '{"milestone":"delivered","recorded_at":"2026-08-12T06:40:11Z","recipient_name":"R. Chen","delivery_note":"Left with reception","proof":{"exception_reason":"recipient_objected"}}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$conflict_job/milestones")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-conflict.json"; fail "the queued delivery returned $status, want 201 — Docs/02 §3.1 requires the attempt retained, not discarded"; }
+conflict_milestone_id="$(json "$WORKDIR/ms-conflict.json" '["id"]')"
+[[ "$conflict_milestone_id" =~ ^[0-9a-f-]{36}$ ]] || fail "the retained attempt came back with no id"
+ok "a milestone recorded offline into a job an administrator cancelled is accepted rather than refused"
+
+# **The attempt is retained in history** — the row, read from the table, carrying the driver's own
+# clock and Docs/01 §4.4's delivery details. This is the half a rollback took silently.
+conflict_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select milestone || ' @ ' || to_char(actor_recorded_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+        || ' for ' || recipient_name || ' / ' || delivery_note
+     from milestones where id = '$conflict_milestone_id';")"
+[[ "$conflict_row" == "Delivered @ 2026-08-12 06:40:11 for R. Chen / Left with reception" ]] \
+  || fail "the retained attempt is stored as '$conflict_row'"
+ok "the row is there afterwards with the actor's clock uncorrected — 'the attempt is retained in history', literally"
+
+# And the evidence with it. A reasoned exception is the driver's account of why there is no
+# photograph, written before the move is attempted, so a rollback discarded that too.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from proofs where milestone_id = '$conflict_milestone_id';")" == "1" ]] \
+  || fail "the retained attempt lost the reason recorded with it"
+ok "and the evidence recorded with it survives — the driver's work is kept, not merely the fact they tried"
+
+# **The cancellation stands.** Nothing re-opens the job, moves it, or annotates it.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$conflict_job';")" == "Cancelled" ]] \
+  || fail "the retained milestone moved the job; the administrative action must win"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$conflict_job' and to_status = 'Delivered';")" == "0" ]] \
+  || fail "the retained milestone wrote a job_status_history row for a move that did not happen"
+ok "the cancellation stands and no transition was recorded — the update lost, and losing is what it did"
+
+# The last recorded transition is still the administrator's, with their reason on it. That reason is
+# what a client reconciling against the job resource shows the driver (SHIP-132), and it is why the
+# milestone response carries no field of its own.
+conflict_last="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select to_status || ' by ' || actor_type || ': ' || reason from job_status_history
+    where job_id = '$conflict_job' order by server_recorded_at desc, id desc limit 1;")"
+[[ "$conflict_last" == "Cancelled by admin: Resolved as a failed delivery." ]] \
+  || fail "the job's latest transition is '$conflict_last', want the administrator's cancellation"
+ok "and the administrator's own reason is what the job still records, for the app to reconcile against"
+
+# The retry, because retention must not have opened a second way past uq_milestones_idempotency.
+redis-cli -u "$REDIS_URL" del "idem:v1:user:$delivery_provider_id:$milestone_key-conflict" >/dev/null
+status="$(curl -s -X POST -o "$WORKDIR/ms-conflict-again.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-conflict" \
+  -H 'Content-Type: application/json' \
+  -d '{"milestone":"delivered","recorded_at":"2026-08-12T06:40:11Z","recipient_name":"R. Chen","delivery_note":"Left with reception","proof":{"exception_reason":"recipient_objected"}}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$conflict_job/milestones")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/ms-conflict-again.json"; fail "the retry returned $status, want 200"; }
+[[ "$(json "$WORKDIR/ms-conflict-again.json" '["id"]')" == "$conflict_milestone_id" ]] \
+  || fail "the retry answered with a different milestone"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$conflict_job';")" == "1" ]] \
+  || fail "the retry of a retained milestone wrote a second row"
+ok "retried with its cached response deleted it is answered from the row it already wrote — once per key, retained or not"
+
+# --- and the case that must NOT have become a retention -----------------------------------------
+#
+# A job **still on its delivery** refuses a premature milestone exactly as it did before this ticket,
+# and rolls it back whole. That is the boundary SHIP-113 had to not cross: retention is for a job
+# that has *left* the delivery, and widening it to every unreachable move would keep updates a retry
+# would have recorded properly a few minutes later.
+#
+# The other half of the boundary — that a status the delivery legitimately *skipped* is not treated
+# as an administrative conflict — cannot be driven from here at all. 'Driver assigned' is the only
+# skippable status, and `Recording.problems` refuses it at validation with a 422 long before any of
+# this is reached, because a driver is put on a job through its own endpoint. cmd/api's
+# TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays is where that half is held, against
+# Docs/02 §2 directly.
+still_on_delivery_job="$(delivery_awarded_job still-on-delivery)"
+delivery_move "$still_on_delivery_job" Awarded 'En route to pickup'
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-still.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-still" \
+  -H 'Content-Type: application/json' -d '{"milestone":"in_transit"}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$still_on_delivery_job/milestones")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-still.json"; fail "a premature milestone on a live delivery returned $status, want 409"; }
+[[ "$(json "$WORKDIR/ms-still.json" '["error"]["code"]')" == "delivery_milestone_not_permitted" ]] \
+  || { cat "$WORKDIR/ms-still.json"; fail "expected code=delivery_milestone_not_permitted"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$still_on_delivery_job';")" == "0" ]] \
+  || fail "a job still on its delivery retained a refused milestone; SHIP-112's refusal has been widened by accident"
+ok "a job still on its delivery still refuses and still rolls back — only a job that has left one retains"
+
+unset conflict_job conflict_milestone_id conflict_row conflict_last still_on_delivery_job
+unset -f delivery_admin_move
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-128  an update unsynced for a day raises an operations alert when it lands"
+
+# Docs/02 §3.1's ladder has three rungs and this is the last: "24 hours — operations alert. The job
+# is treated as at risk and enters the delivery-exception queue (04 §5)." SHIP-126 built the first
+# rung and SHIP-127 the second, both on the handset, both measuring `enqueued_at` — a column the
+# platform has never seen.
+#
+# # What the platform measures instead, and 000601 named it before this ticket existed
+#
+# `server_recorded_at - actor_recorded_at`. The two clocks SHIP-110 kept apart *are* how long the
+# update was unsynced, and 000601 says so: `server_recorded_at` is "what makes an unsynced-milestone
+# threshold (Docs/02 §6.5) measurable". No column is added and no flag is written — the rows are the
+# queue, which is the reading `admin.ExceptionQueue` takes of its own.
+#
+# # This section demonstrates the alert; the queue is Go's to demonstrate
+#
+# `delivery.UnsyncedMilestones` has no HTTP surface until SHIP-157 builds the screen, so it is
+# covered against a real database in internal/delivery. What only a running process can show is the
+# alert itself, and `$WORKDIR/server.log` is where this harness already reads the service's structured
+# output.
+#
+# **Both instants come from the platform's own clock**, computed here and sent as `recorded_at`, so
+# there is no calendar literal for the real date to overtake — the trap wave 9 closed on the 72-hour
+# ticket, and a threshold section is the shape most likely to fall into it.
+unsynced_job="$(delivery_awarded_job unsynced)"
+delivery_move "$unsynced_job" Awarded 'En route to pickup'
+
+# Twenty-five hours behind: a driver who recorded the pickup yesterday morning in a place with no
+# coverage, and whose phone has only now found some.
+unsynced_at="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-unsynced.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-unsynced" \
+  -H 'Content-Type: application/json' \
+  -d "{\"milestone\":\"picked_up\",\"recorded_at\":\"$unsynced_at\"}" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$unsynced_job/milestones")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-unsynced.json"; fail "a day-old update returned $status, want 201 — a stale update is still a recording"; }
+unsynced_milestone_id="$(json "$WORKDIR/ms-unsynced.json" '["id"]')"
+ok "an update recorded a day ago is accepted when it finally lands — being late is not being wrong"
+
+# The gap, from the row rather than from what the endpoint said about itself. `>= interval '24 hours'`
+# is the queue's own predicate, so this asserts the row would be selected by it.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select server_recorded_at - actor_recorded_at >= interval '24 hours'
+     from milestones where id = '$unsynced_milestone_id';")" == "t" ]] \
+  || fail "the stored gap is $("$PSQL" "$DATABASE_URL" -tAc "select server_recorded_at - actor_recorded_at from milestones where id = '$unsynced_milestone_id';"), want at least 24 hours"
+ok "the two clocks are a day apart on the stored row — the gap is measured, not asserted by the client"
+
+# The alert. At WARN, naming the job and the gap, so a log search can find it and order by it.
+unsynced_line="$(grep -F "\"milestone_id\":\"$unsynced_milestone_id\"" "$WORKDIR/server.log" \
+  | grep -F 'more than a day after it was recorded' | tail -1)"
+[[ -n "$unsynced_line" ]] \
+  || { grep -F "$unsynced_milestone_id" "$WORKDIR/server.log" | tail -5; fail "no operations alert was logged for an update a day out of sync"; }
+[[ "$unsynced_line" == *'"level":"WARN"'* ]] \
+  || fail "the unsynced alert is not at WARN: $unsynced_line"
+[[ "$unsynced_line" == *"\"job_id\":\"$unsynced_job\""* && "$unsynced_line" == *'"unsynced_for"'* ]] \
+  || fail "the alert does not name the job and the gap: $unsynced_line"
+ok "it raises an operations alert at WARN, naming the job and how far behind the record ran"
+
+# And the rung is a threshold rather than "any gap at all". An update inside the four-hour rung is
+# the handset's business (SHIP-127) and must not page anybody.
+nudge_job="$(delivery_awarded_job unsynced-nudge)"
+delivery_move "$nudge_job" Awarded 'En route to pickup'
+nudge_at="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-nudge.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-nudge" \
+  -H 'Content-Type: application/json' \
+  -d "{\"milestone\":\"picked_up\",\"recorded_at\":\"$nudge_at\"}" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$nudge_job/milestones")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-nudge.json"; fail "a three-hour-old update returned $status, want 201"; }
+nudge_milestone_id="$(json "$WORKDIR/ms-nudge.json" '["id"]')"
+
+grep -F "\"milestone_id\":\"$nudge_milestone_id\"" "$WORKDIR/server.log" \
+  | grep -qF 'more than a day after it was recorded' \
+  && fail "an update three hours behind raised the twenty-four-hour alert; the rung is a threshold"
+ok "and an update inside the four-hour rung raises nothing here — that one is the handset's (SHIP-127)"
+
+unset unsynced_job unsynced_at unsynced_milestone_id unsynced_line nudge_job nudge_at nudge_milestone_id
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-108  a driver token grants exactly one job and cannot be exchanged for a user session"
 
 # # What only this section can show

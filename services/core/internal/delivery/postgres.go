@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 )
@@ -573,4 +574,80 @@ func (postgresStore) linkIssued(
 		return Assignment{}, fmt.Errorf("delivery: recording the link on %s: %w", assignmentID, err)
 	}
 	return a, nil
+}
+
+// unsyncedMilestones reads the delivery exception queue on the unsynced ground (SHIP-128).
+//
+// # The gap is computed once, in SQL, and both the predicate and the result read it
+//
+// `server_recorded_at - actor_recorded_at` appears twice in the statement and is one expression:
+// selecting on one figure and returning another is how a queue comes to hold a row that does not
+// satisfy its own rule. `$1` is [UnsyncedAlertThreshold], passed rather than written, so
+// Docs/02 §3.1's twenty-four hours lives in one place in Go and a test can move it without waiting.
+//
+// # `>=` rather than `>`, and the interval comparison is the reason it is safe
+//
+// A row exactly on the threshold is over it: Docs/02 §3.1 says "24 hours — operations alert", and a
+// strict inequality would leave the boundary case in nobody's rung. PostgreSQL compares intervals
+// exactly, so this is a real boundary rather than a floating-point one.
+//
+// # It joins `jobs` for the status and nothing else
+//
+// A queue is triage, and a stale record on a completed job is a different morning's work from one on
+// a job still in transit. The join is to `jobs` rather than to `job_status_history` because the
+// current status is the only fact needed and the row already has it — reconstructing it from history
+// would be a second answer to a question the column answers.
+//
+// No index is added for this. The predicate is over a computed difference, so a partial index would
+// have to be an expression index on exactly this expression, and the queue is read by a moderator
+// rather than by a sweep on a ticker — a sequential scan over `milestones` costs nothing at pilot
+// scale and buys nothing to prepay. **The trigger for adding one is named rather than left to
+// judgement: the first caller that reads this on a schedule rather than on a person's request.**
+func (postgresStore) unsyncedMilestones(
+	ctx context.Context,
+	r db.Runner,
+	threshold time.Duration,
+	limit int,
+) ([]UnsyncedEntry, error) {
+	const q = `
+		SELECT m.id, m.job_id, m.milestone, m.actor_type,
+		       m.server_recorded_at - m.actor_recorded_at,
+		       m.actor_recorded_at, m.server_recorded_at, j.status
+		FROM milestones m
+		JOIN jobs j ON j.id = m.job_id
+		WHERE m.server_recorded_at - m.actor_recorded_at >= $1
+		ORDER BY m.server_recorded_at, m.id
+		LIMIT $2`
+
+	rows, err := r.Query(ctx, q, threshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("delivery: reading the unsynced-milestone queue: %w", err)
+	}
+	defer rows.Close()
+
+	var out []UnsyncedEntry
+	for rows.Next() {
+		var (
+			entry UnsyncedEntry
+			gap   pgtype.Interval
+		)
+		if err := rows.Scan(&entry.MilestoneID, &entry.JobID, &entry.Milestone, &entry.Actor,
+			&gap, &entry.ActorRecordedAt, &entry.ServerRecordedAt, &entry.JobStatus); err != nil {
+			return nil, fmt.Errorf("delivery: scanning the unsynced-milestone queue: %w", err)
+		}
+
+		// An interval is months, days and microseconds, and only the last two can appear
+		// here: the difference between two timestamptz values never carries a month, because
+		// PostgreSQL has no month to attribute it to. Days are kept separate from
+		// microseconds all the same, since a delivery unsynced for a week is exactly the row
+		// this queue exists to surface and dropping the field would report it as zero.
+		entry.UnsyncedFor = time.Duration(gap.Days)*24*time.Hour +
+			time.Duration(gap.Microseconds)*time.Microsecond
+
+		out = append(out, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("delivery: reading the unsynced-milestone queue: %w", err)
+	}
+	return out, nil
 }

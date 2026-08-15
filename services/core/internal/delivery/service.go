@@ -340,6 +340,22 @@ func (s *Service) AssignDriver(
 		return s.refused(fmt.Errorf("delivery: %s has already moved past taking a driver: %w",
 			jobID, ErrJobNotAssignable))
 
+	case JobLostTheDelivery:
+		// The job was cancelled, disputed or completed, so there is no delivery left to put a
+		// driver on. **Refused, and it is the [JobAlreadyPast] argument above rather than
+		// SHIP-113's retention**: a milestone is a claim about work that was already done and
+		// keeping it costs nothing, while an assignment is an instruction about who drives the
+		// job *now*. Retaining one against a cancelled job would name a live driver on a
+		// delivery nobody is carrying.
+		//
+		// Written out rather than folded into [JobNotAssignable] for the reason that case
+		// gives: an outcome no case names becomes a 500, which is right for an outcome nobody
+		// has thought about and wrong for this one. Before SHIP-113 the adapter answered
+		// [JobNotAssignable] here, so this case is what keeps the refusal identical on the wire
+		// while the adapter's answer got finer.
+		return s.refused(fmt.Errorf("delivery: %s is no longer on a delivery a driver can take: %w",
+			jobID, ErrJobNotAssignable))
+
 	case JobNotFound:
 		// Reachable only if the job was deleted between the award lookup and here, which
 		// nothing in this platform does — fk_driver_assignments_job would have refused the
@@ -520,9 +536,20 @@ func (s *Service) refused(err error) (Assignment, DriverToken, bool, error) {
 // unchanged as soon as the delivery reaches that point. Absorbing a premature milestone would
 // answer a client "recorded" for a move that then silently never happened.
 //
-// A job cancelled or disputed before it reached the milestone falls in the second group today, and
-// **that is SHIP-113's** — "a queued update that contradicts an administrative action loses… the
-// attempt is retained in history". Retaining it is that ticket's change to this same switch.
+// # And a third: the job that lost the delivery while the phone was offline (SHIP-113)
+//
+// A job cancelled, disputed or completed before the milestone reached it is neither late nor
+// premature. It has not been past the status and it will never arrive at it, because Docs/02 §2
+// gives those three statuses no route back into a delivery. That is §3.1's fourth bullet — "a
+// queued update that contradicts an administrative action loses… **the attempt is retained in
+// history**" — and it answers [JobLostTheDelivery], which this function retains exactly as it
+// retains an absorbed milestone: the row stands, the evidence stands, and the job is left where
+// the administrator put it.
+//
+// Until SHIP-113 this fell into the premature branch and was rolled back, which is the one place
+// this platform destroyed a driver's record of work that had genuinely been done. The distinction
+// is the reachability question SHIP-112 refused to answer here and named this ticket for, so that
+// half of it would not get finished by accident in the wrong place.
 //
 // r must be a transaction. The milestone and the transition are one act recorded in two tables, and
 // a milestone that committed without its transition would leave a delivery whose timeline and whose
@@ -777,10 +804,28 @@ func (s *Service) record(
 		// exactly that: the row was already independent of whether the job moved.
 		return s.recorded(ctx, r, stored, evidence, false, OutcomeAbsorbed)
 
+	case JobLostTheDelivery:
+		// **SHIP-113.** The job was cancelled, disputed or completed while this milestone was
+		// still on a phone with no signal, so Docs/02 §2 offers it no route to the status the
+		// milestone names and never will again. Docs/02 §3.1's fourth bullet says what happens
+		// to the attempt: "the cancellation stands, **the attempt is retained in history**, and
+		// the app must show the driver what happened rather than silently discarding their
+		// work."
+		//
+		// So this returns rather than erroring, exactly as absorption does and for the same
+		// mechanical reason — the row was inserted before the move was attempted, and is
+		// independent of whether the job moved. The administrative action stands untouched:
+		// nothing here re-opens the job, moves it, or annotates it.
+		//
+		// Until this ticket the case fell into the branch below and the transaction rolled
+		// back, discarding a driver's record of work they had actually done — and the
+		// photograph written above it.
+		return s.recorded(ctx, r, stored, evidence, false, OutcomeOverruled)
+
 	case JobNotAssignable:
 		// The delivery has not reached the point this milestone describes. Refused, and the
 		// transaction rolls the milestone back with it — see the header for why this one is
-		// not absorbed and the case above is.
+		// not absorbed and the two cases above are.
 		return notRecorded(fmt.Errorf("delivery: %s cannot record %s from where it stands: %w",
 			jobID, recording.Milestone, ErrMilestoneNotPermitted))
 

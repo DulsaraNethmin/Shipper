@@ -54,7 +54,49 @@ const ExpiryReason = "The job expired without being awarded (Docs/02 §6.3)."
 // pass either commits or releases what it took.
 const ExpiryBatch = 100
 
-// ExpiryClaim selects the Open jobs whose deadline has passed, and locks them.
+// LiveStatuses are the statuses a job can be offered in, and therefore the statuses it can expire
+// from (SHIP-70a).
+//
+// Docs/02 §2's expiry row names both. Until SHIP-90 there was only one — a job with bids on it was
+// still `Open` — and SHIP-68 and SHIP-69 were written then, with `WHERE status = 'Open'` meaning
+// "a live job" rather than meaning the literal status. SHIP-90 made that reading wrong without
+// reopening either ticket: a job with one unanswered offer sits at `Negotiating`, and neither sweep
+// could see it, so Docs/02 §6.3's deadline stopped being enforced on precisely the jobs somebody
+// had bid on.
+//
+// It is written as a SQL fragment rather than as a Go slice because both consumers are SQL literals
+// that must be identical: the claim and the write that follows it (postgresStore.markExpiryWarned)
+// carry the same predicate, and a set that widened in one and not the other would claim rows the
+// write then refused. 000409's two partial indexes carry it a third time, where a mismatch costs a
+// plan rather than a row.
+//
+// # What expiring a Negotiating job does to the offers on it, which is the product question
+//
+// Nothing, deliberately. Docs/02 §2 permits `Negotiating → Cancelled` already and this sweep uses
+// that row rather than a new one, so the job ends exactly as an unbid one does. Every live offer
+// runs out at its own collection time under SHIP-89, and none of them can be accepted meanwhile:
+// the award moves the job to `Awarded`, which Docs/02 §2 permits from `Open` and `Negotiating` and
+// from nowhere else, so a `Cancelled` job refuses every award in the same guard that refuses every
+// other impossible move.
+//
+// Closing the offers here would mean this sweep writing `bids` — a second domain's table, from a
+// query `jobs` owns, for a fact SHIP-89 already produces on its own schedule. That is the write
+// Docs/06 §4.1 exists to prevent, and it would buy nothing a provider can observe.
+const LiveStatuses = `('Open', 'Negotiating')`
+
+// offered reports whether a job in this status is still being offered to providers, and is
+// therefore subject to Docs/02 §6.3's deadline (SHIP-70a).
+//
+// The Go form of [LiveStatuses], and deliberately not a second list: TestLiveStatusesAgreeInGoAndSQL
+// parses the SQL fragment and holds this function to it in both directions, which is Docs/10 §3.4's
+// pairing applied to a predicate rather than to a constraint. A set that widened in SQL and not
+// here would warn a customer about a job the endpoint then refused to extend, and a set that
+// widened here and not in SQL would extend a job no sweep is watching.
+func offered(s Status) bool {
+	return s == StatusOpen || s == StatusNegotiating
+}
+
+// ExpiryClaim selects the live jobs whose deadline has passed, and locks them.
 //
 // $1 is the instant to judge against and $2 is the batch size. The instant is a parameter rather
 // than now() so that the caller's clock decides — Docs/10 §6.3 puts every scheduled task behind an
@@ -64,12 +106,12 @@ const ExpiryBatch = 100
 // ORDER BY expires_at drains the longest-overdue first, which matters after an outage: the jobs
 // that have been misleading providers longest stop doing so first.
 //
-// idx_jobs_open_expiry (000406) is a partial index on exactly this predicate, so the sweep reads
-// the live marketplace rather than every job the platform has ever had.
+// idx_jobs_open_expiry (000406, widened by 000409) is a partial index on exactly this predicate, so
+// the sweep reads the live marketplace rather than every job the platform has ever had.
 const ExpiryClaim = `
 	SELECT id
 	FROM jobs
-	WHERE status = 'Open'
+	WHERE status IN ` + LiveStatuses + `
 	  AND expires_at IS NOT NULL
 	  AND expires_at <= $1
 	ORDER BY expires_at
@@ -78,8 +120,10 @@ const ExpiryClaim = `
 
 // Expire ends one claimed job, as the platform (SHIP-68).
 //
-// Docs/02 §2's table has Open → Cancelled and describes it as "job expires unclaimed", which is
-// exactly this. Nothing here decides that the move is legal: [Service.Transition] asks
+// Docs/02 §2's table has `Open / Negotiating → Cancelled` and describes it as "job expires
+// unclaimed", which is exactly this — and since SHIP-70a both halves of that row are reachable
+// here, because [ExpiryClaim] takes a job with live offers as readily as one with none. Nothing
+// here decides that the move is legal: [Service.Transition] asks
 // [Permitted], writes the history row 000402 requires, and emits the domain event inside the
 // caller's transaction. An expiry is therefore indistinguishable, in the record, from any other
 // transition — except that its actor is the platform and its reason says why.
@@ -137,7 +181,7 @@ const ExpiryWarning = 48 * time.Hour
 // the job is expiring, which is a condition a consumer can read off `expires_at`.
 const EventExpiryWarned = "job.expiry_warned"
 
-// ExpiryWarningClaim selects the Open jobs whose deadline is inside the warning window and which
+// ExpiryWarningClaim selects the live jobs whose deadline is inside the warning window and which
 // have not been told about the deadline they have now, and locks them.
 //
 // $1 is the instant to judge against, $2 is the horizon — [ExpiryWarning] ahead of it — and $3 is
@@ -160,11 +204,15 @@ const EventExpiryWarned = "job.expiry_warned"
 // ORDER BY expires_at warns the most urgent first, which matters after an outage for the same
 // reason [ExpiryClaim]'s ordering does — the jobs closest to dying are told first.
 //
-// idx_jobs_open_unwarned (000407) is a partial index on exactly this predicate.
+// idx_jobs_open_unwarned (000407, widened by 000409) is a partial index on exactly this predicate.
+//
+// [LiveStatuses] is the same set [ExpiryClaim] uses, and the two must not drift: a job warned in a
+// status the expiry sweep cannot see would be told it was about to expire and then never expire,
+// which is the failure SHIP-70a exists to end rather than to invert.
 const ExpiryWarningClaim = `
 	SELECT id
 	FROM jobs
-	WHERE status = 'Open'
+	WHERE status IN ` + LiveStatuses + `
 	  AND expiry_warned_at IS NULL
 	  AND expires_at IS NOT NULL
 	  AND expires_at > $1

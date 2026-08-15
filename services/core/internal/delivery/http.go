@@ -341,8 +341,18 @@ type proofRequest struct {
 //
 // The job's status is not echoed, for the reason [assignmentResponse] gives — it is the jobs
 // endpoints' vocabulary — and here there is a second reason: a milestone may deliberately move
-// nothing at all. Since SHIP-112 there are two ways for that to happen and this shape distinguishes
-// neither of them; [Outcome] is where the decision not to is argued.
+// nothing at all. Since SHIP-113 there are **three** ways for that to happen — the repeat of
+// Docs/02 §5, SHIP-112's absorbed late milestone, and SHIP-113's overruled one — and this shape
+// distinguishes none of them; [Outcome] is where the decision not to is argued.
+//
+// **SHIP-113 is the one that tests that decision, because Docs/02 §3.1 asks for the driver to be
+// shown what happened.** It is answered on the job resource rather than here, which is the same
+// paragraph's own instruction: "the app displays optimistic local state, clearly marked as pending,
+// and reconciles to whatever the platform returns". A field here could not be answered consistently
+// anyway — `milestones` is append-only and the row is written *before* the move is attempted, so
+// there is nowhere to record which of the three happened, and a retry landing on
+// [Service.alreadyRecorded] would have to recompute what the first attempt decided. SHIP-132 is the
+// client ticket that reconciles and shows it.
 type milestoneResponse struct {
 	ID    string `json:"id"`
 	JobID string `json:"job_id"`
@@ -637,6 +647,30 @@ func writeMilestone(
 			slog.String("exception_reason", recording.Exception.String()))
 	}
 
+	// **The twenty-four-hour rung of Docs/02 §3.1's ladder (SHIP-128).** At warning, beside the
+	// proof-exception line above and for the same reason: this is operations' business rather
+	// than a client's, and Docs/04 §5's delivery-exception queue is where somebody acts on it.
+	//
+	// Fired on whatever the milestone did — recorded, absorbed or overruled — because how long
+	// the record ran behind the delivery is a fact about the update rather than about the move it
+	// caused, and an absorbed or overruled milestone is if anything *more* likely to be badly out
+	// of date. Suppressed on a replay alone: paging operations again because a phone retried
+	// would make the alert mean less each time it fired.
+	//
+	// The gap is stated in the line rather than left to be computed from the two instants beside
+	// it, so a log search can order by it. `delivery.UnsyncedMilestones` is the queue over the
+	// same rows; this is the alert, and Docs/11 §3 records why the platform cannot see an update
+	// that has not arrived at all.
+	if outcome != OutcomeAlreadyRecorded && record.Unsynced() {
+		httpx.LoggerFrom(r.Context()).Warn("a milestone reached the platform more than a day after it was recorded",
+			slog.String("job_id", jobID.String()),
+			slog.String("milestone", record.Milestone.Wire()),
+			slog.String("milestone_id", record.ID.String()),
+			slog.Duration("unsynced_for", record.UnsyncedFor()),
+			slog.Time("recorded_at", record.ActorRecordedAt),
+			slog.Time("accepted_at", record.ServerRecordedAt))
+	}
+
 	switch outcome {
 	case OutcomeRecorded:
 		httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
@@ -649,6 +683,27 @@ func writeMilestone(
 		// milestone is invisible to operations, and Docs/02 §3.1's escalation is
 		// entirely about how long updates have been out of sync.
 		httpx.LoggerFrom(r.Context()).Info("a late milestone was absorbed as history and the job was not moved",
+			slog.String("job_id", jobID.String()),
+			slog.String("milestone", record.Milestone.Wire()),
+			slog.String("milestone_id", record.ID.String()),
+			slog.Time("recorded_at", record.ActorRecordedAt),
+			slog.Time("accepted_at", record.ServerRecordedAt))
+
+		httpx.WriteJSON(w, http.StatusCreated, milestoneFrom(record))
+		return nil
+
+	case OutcomeOverruled:
+		// **SHIP-113, and this line is the trace the retention leaves.** At warning rather
+		// than info, like the proof exception above and for the same reason: this is an
+		// operational fact rather than a reconciliation one. A driver has recorded work on a
+		// job that was ended or frozen while they were out of signal, and Docs/04 §5's queues
+		// are where somebody looks at that.
+		//
+		// The status the job stands in is deliberately not on this line. `delivery` may not
+		// name a jobs.Status (Docs/06 §4.1) and this would be the only place in the package
+		// that did — while `job_status_history` already records which action overruled the
+		// attempt, with the administrator's reason attached, which Docs/01 §3 requires.
+		httpx.LoggerFrom(r.Context()).Warn("a queued milestone lost to an action taken while it was unsynced, and was retained",
 			slog.String("job_id", jobID.String()),
 			slog.String("milestone", record.Milestone.Wire()),
 			slog.String("milestone_id", record.ID.String()),

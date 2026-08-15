@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 )
 
 // SHIP-120a's wiring, through the real router.
@@ -189,5 +191,89 @@ func TestEveryDriverTokenRouteNamesItsJobInThePath(t *testing.T) {
 	}
 	if found == 0 {
 		t.Fatal("no route declares RequireDriverToken; this test is asserting nothing")
+	}
+}
+
+// TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays derives SHIP-113's set from Docs/02 §2
+// rather than trusting the three names written beside [refusal].
+//
+// [outOfTheDeliveryStatuses] is a hand-written list, deliberately — see its comment for why naming
+// them is what keeps SHIP-112's premature refusals untouched. This is the other half of that
+// bargain: the list is *checked* against the transition table, so a status added to Docs/02 §2, or
+// an edge added out of Disputed, fails here instead of silently changing which milestones the
+// platform retains.
+//
+// # The derivation, and the one subtlety in it
+//
+// A job has left the delivery when **no milestone status is reachable from where it stands**,
+// searching Docs/02 §2's graph and counting the job's own status as reachable from itself. That
+// last clause is what keeps 'Delivered' out of the set: a job standing at 'Delivered' is still on
+// its delivery, and a queued milestone against it is late or premature rather than overruled.
+//
+// The search asks [jobs.Permitted] rather than reading a table of its own, so there is no second
+// copy of Docs/02 §2 anywhere in this test.
+func TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays(t *testing.T) {
+	// The five milestone statuses, named as the four move methods above name them — a delivery
+	// is *on* one of these or on its way to one.
+	onADelivery := map[jobs.Status]bool{
+		jobs.StatusDriverAssigned:  true,
+		jobs.StatusEnRouteToPickup: true,
+		jobs.StatusPickedUp:        true,
+		jobs.StatusInTransit:       true,
+		jobs.StatusDelivered:       true,
+	}
+
+	// Breadth-first over Docs/02 §2, including the starting status itself.
+	reaches := func(start jobs.Status) bool {
+		seen := map[jobs.Status]bool{start: true}
+		queue := []jobs.Status{start}
+		for len(queue) > 0 {
+			at := queue[0]
+			queue = queue[1:]
+			if onADelivery[at] {
+				return true
+			}
+			for _, next := range jobs.Statuses {
+				if !seen[next] && jobs.Permitted(at, next) {
+					seen[next] = true
+					queue = append(queue, next)
+				}
+			}
+		}
+		return false
+	}
+
+	var derived []jobs.Status
+	for _, status := range jobs.Statuses {
+		if !reaches(status) {
+			derived = append(derived, status)
+		}
+	}
+
+	slices.Sort(derived)
+	named := slices.Clone(outOfTheDeliveryStatuses)
+	slices.Sort(named)
+
+	if !slices.Equal(derived, named) {
+		t.Errorf("Docs/02 §2 says a job has left the delivery in %v; outOfTheDeliveryStatuses "+
+			"names %v.\nOne of the two changed without the other, and the difference decides "+
+			"whether a queued milestone is retained (SHIP-113) or refused (SHIP-112).",
+			derived, named)
+	}
+
+	// Named as well as derived, because the point of the ticket is which statuses these are and
+	// a derivation that silently produced the empty set would satisfy an equality test alone.
+	for _, status := range []jobs.Status{jobs.StatusCancelled, jobs.StatusCompleted, jobs.StatusDisputed} {
+		if !outOfTheDelivery(status) {
+			t.Errorf("a job at %s is still on its delivery; Docs/02 §2 offers it no way back", status)
+		}
+	}
+	for _, status := range []jobs.Status{
+		jobs.StatusOpen, jobs.StatusAwarded, jobs.StatusPickedUp, jobs.StatusInTransit, jobs.StatusDelivered,
+	} {
+		if outOfTheDelivery(status) {
+			t.Errorf("a job at %s was treated as having lost its delivery; a milestone against it "+
+				"is late or premature, which is SHIP-112's question and not SHIP-113's", status)
+		}
 	}
 }

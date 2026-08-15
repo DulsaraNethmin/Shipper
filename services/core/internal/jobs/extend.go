@@ -93,12 +93,25 @@ const EventExpiryExtended = "job.expiry_extended"
 //
 //  1. a job that does not exist is [ErrJobNotFound];
 //  2. a job belonging to somebody else is [ErrNotJobOwner];
-//  3. a job that is not Open is [ErrJobNotExtendable], and one bounded by its pickup date is
-//     [ErrExpiryBoundByPickup].
+//  3. a job that is not being offered is [ErrJobNotExtendable], and one bounded by its pickup date
+//     is [ErrExpiryBoundByPickup].
 //
 // Ownership before status, exactly as [Service.Cancel] has it and for the same reason: the first
 // two are one 404 on the wire, so a stranger who could tell "not extendable" from "no such job"
 // would learn that the job exists and roughly what state it is in.
+//
+// # "Being offered" is [LiveStatuses] and not `Open` alone, since SHIP-70a
+//
+// This read `job.Status != StatusOpen` while `Open` was the whole of a live job, and SHIP-70a is
+// what makes that wrong rather than merely narrow. Docs/02 §6.3's two halves are one mechanism —
+// "the customer is warned 48 hours before expiry **and can extend in one action**" — so the moment
+// [ExpiryWarningClaim] can warn a `Negotiating` job, refusing to extend that same job makes the
+// warning point at an action that answers 422. A customer told their job is about to die, on a
+// job somebody has actually bid on, is the last customer who should be unable to keep it alive.
+//
+// It is not a widening of what an extension *does*: 000406's trigger fills a deadline only when it
+// is NULL, so the job already carries the one it was given at publication, and [setDeadline] names
+// no status at all.
 //
 // r must be a transaction. The read, the ownership check, the write and the event are one decision
 // against one version of the row.
@@ -119,7 +132,7 @@ func (s *Service) Extend(ctx context.Context, r db.Runner, customerID, jobID uui
 	if job.CustomerID != customerID {
 		return Job{}, fmt.Errorf("jobs: %s does not belong to %s: %w", jobID, customerID, ErrNotJobOwner)
 	}
-	if job.Status != StatusOpen {
+	if !offered(job.Status) {
 		return Job{}, fmt.Errorf("jobs: %s is %s: %w", jobID, job.Status, ErrJobNotExtendable)
 	}
 
