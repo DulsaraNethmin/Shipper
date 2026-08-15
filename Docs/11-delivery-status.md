@@ -15502,13 +15502,35 @@ premise a different ticket removed, and which now argues for the opposite of wha
 **Owner: the shared-surface holder.** One paragraph, and it should be taken in the same change as
 anything else that touches the harness.
 
-**Three cross-references in §3 were made stale by this pass's §7 renumber, and were deliberately not
-fixed.** Wave 10 is the new §7 and the nine waves behind it each moved one letter, so §3's references
-to §7b, §7e and §7f now name the wrong wave — they should read §7c, §7f and §7g. **The prep pass that
-fixed them would have bought the wave's merge collision**, which is what happened to each of the last
-two preps for exactly one token each. §3 belongs to the code lanes during a wave. **Route the three
-corrections through whoever merges**, after the lanes have landed and before the next reconciliation
-reads them.
+**Still open at the wave-11 reconciliation, and now reported by three independent readers.** Two
+wave-11 lanes hit the same comment and **neither edited it, which was correct** —
+`scripts/verify-foundation.sh` is on `Docs/10` §9.2's shared list and a lane may not open it. The
+comment is unchanged on `5a3b8d7`. **A finding that three readers arrive at independently and nobody
+may fix is the exact shape a prep ticket exists for**, and this one is a single paragraph: delete the
+justification, or fence `shipper.job` with the other two. It is recorded a second time rather than
+restated, because the first record said "owner: the shared-surface holder" and there has not been
+one since.
+
+**Four cross-references in §3 are stale by one letter after this pass's §7 renumber, and were
+deliberately not fixed.** Wave 11 is the new §7 and the ten waves behind it each moved one letter.
+§3's four internal references are at lines carrying `§7e`, `§7d`, `§7a` and a bare `§7`; they were
+already stale by one before this pass and are stale by two now. **The prep pass that fixed them would
+have bought the wave's merge collision** — §3 belongs to the code lanes during a wave. **Route the
+corrections through whoever merges.**
+
+**And the churn itself now wants a decision rather than a note, because it recurs every wave and
+compounds.** The letters are **positional**: §7 is always the most recent wave, so every reference
+written in prose points one wave too early after the next reconciliation, for ever. Three options,
+stated so somebody can settle it once. **(a) Leave it** — the cost is one round of edits per wave and
+four permanently-wrong references in §3, and the mitigation is the note at the head of §7 telling a
+reader to trust the wave number in the heading over the letter. **(b) Number by wave** — `§7.11`,
+`§7.10` and so on, so a section's number never changes again; costs one renumber now, after which
+every reference is stable and §3's four become dangling rather than silently wrong, which is the
+better failure. **(c) Stop cross-referencing by section and cite the wave** — "wave 8's notes"
+instead of "§7c" — which needs no renumber at all and is the only option a reconciliation pass could
+have taken on its own. **This pass took (a)**, deliberately, because departing from a ten-wave
+convention is a decision and a reconciliation may not take one silently. **Owner: the repository
+owner.** (b) plus (c) together is probably the answer.
 
 **Whether a comment inside an *applied* migration may be corrected is an open convention question,
 and this pass records it rather than answering it.** `000302_vehicle_capability_index.up.sql`
@@ -15534,6 +15556,109 @@ makes the correction additive, keeps every applied file a true record of its own
 statement where somebody reading forward will meet it. **Owner: the repository owner**, with the same
 standing as X-6 — a decision somebody can make in an afternoon, and one that gets more expensive as
 the migration set grows past ninety files.
+
+---
+
+**The seven below were found in wave 11 and none of them was owned by a ticket when it was written
+down.** One is a document decision, two are harness defects on a shared surface, two want an ordinary
+lettered ticket, one is a PostgreSQL fact worth not rediscovering, and one is a moderation surface
+nobody has looked at. **None of them describes work a wave-12 lane is holding**, which was checked
+against the dispatch ticket by ticket rather than assumed.
+
+**`Docs/02` §2 has no `Awarded → Cancelled` transition, and the consequence is an *inversion* rather
+than a gap.** SHIP-158's row asks for post-award cancellations listed with the provider's history. The
+obvious query — jobs that reached `Cancelled` — returns the **pre**-award cancellations and none of the
+post-award ones, which is the exact inverse of what the row wants, because `Docs/02` §2 describes no
+transition out of `Awarded` to `Cancelled` at all. The lane read `job_status_history` on two named
+outcomes instead and was right to; what it could not do from a lane branch is settle the document.
+
+**Reported rather than resolved, and the ordering is the point.** Two answers and neither is a code
+change first. Either `Docs/02` §2 gains the row — at which point somebody has to say what happens to
+the offers on the job and whether the two outcomes SHIP-158 reads (`returned_to_market` and `ended`)
+are the whole of it — or §2 is right that a job never leaves `Awarded` for `Cancelled` directly, and
+SHIP-158's row is describing something the status model deliberately does not have. **`CLAUDE.md`
+forbids resolving that in code**, which is why SHIP-70a's *Done when* named its document first and why
+this is a §9 entry rather than a fix. **Owner: whoever writes the row that first needs a post-award
+cancellation to be reachable** — §4's SHIP-158 entry records that neither transition has an endpoint
+today, so nothing is broken while it waits.
+
+**`make verify` has no shared "register a user" helper, and one required field cost 37 call sites
+across nine sections.** SHIP-30a made `name` required by `POST /v1/auth/register`. The harness shares
+`ticket`, `ok`, `fail`, `json`, `post_json`, the token minting and the service lifecycle; it does not
+share an account fixture, so **every section carries its own registration JSON literal** and every one
+of them had to change. No unit test could have shown it — a domain test constructs its own request —
+and `make check` was green throughout.
+
+**It is a cost that recurs, which is what makes it an entry rather than an anecdote.** The next
+required registration field costs the same 37 edits, spread across nine files that belong to nine
+different owners, in a wave where several of them are held by lanes. **What it wants is a
+`register_user` helper in the harness beside `mint_token`**, taking the fields a section actually
+cares about and defaulting the rest — which is a `scripts/verify-foundation.sh` change and therefore a
+prep ticket's. Recorded with the number because "several call sites" would not have made the case.
+
+**`scripts/verify/81-notifier.sh` reassigns `jobs.customer_id` of `$notif_job` and the variable keeps
+its name.** Line 456: `UPDATE jobs SET customer_id = '$push_customer_id' WHERE id = '$notif_job';`.
+From that statement onwards `$notif_job` is a job belonging to `$push_customer_id`, while every name
+in scope still says `notif_`, and the section is 500 lines long. **A shared mutable fixture whose
+ownership changes mid-file is the shape a later check reads wrongly without failing** — it reads a
+job, gets a row, and asserts about the wrong party. Nothing is wrong today; the reassignment is
+deliberate and the checks after it are written for the new owner. **What it wants is a second variable
+rather than a comment**, which is a two-line change in a domain's own verify section and therefore
+belongs to whoever next opens it, not to a prep pass.
+
+**`dispute_move` in `scripts/verify/90-admin.sh` re-selects its history row by `(job_id, to_status)`,
+which is ambiguous the moment a job reaches one status twice.** The helper writes a
+`job_status_history` row, then hands the guard an id it finds with
+`SELECT id FROM job_status_history WHERE job_id = … AND to_status = …` — and a job that goes `Draft →
+Open`, is awarded, and returns to `Open` has two rows matching. The guard is then handed whichever the
+planner returned first. **The defect is known and half-fixed**: SHIP-158's `dispute_move_because`
+takes its row through `RETURNING` and its header says in as many words that the older helper "is
+ambiguous the moment a job reaches one status twice". **The older helper was left alone**, correctly —
+it is used by fixtures that never revisit a status. **It wants the same `RETURNING`**, which is a
+one-line change, and it should be taken before a fixture returns a job to `Open`, not after.
+
+**`INSERT … ON CONFLICT DO UPDATE` cannot express "leave the unnamed column alone" against a `CHECK`,
+and this is worth not rediscovering.** SHIP-79a wanted a `PATCH` that names one field and preserves
+the other. The obvious shape is an upsert with a `COALESCE` per column — and it does not work:
+**PostgreSQL forms and validates the proposed row before it arbitrates the conflict**, so the
+placeholder standing in for "not named" must itself satisfy `ck_provider_profiles_display_name`, and
+the only value that would is a made-up name. It was found by a test that amended one field on an
+existing row and got a 500 out of a constraint doing exactly its job
+(`internal/fleet/postgres.go:541` records it beside the two statements that replaced the upsert).
+**Nothing to fix** — the two-statement form is correct and the read that chooses between them is free
+under a lock already held. It is here because the upsert-with-`COALESCE` idiom is the first thing
+anybody reaches for and the failure it produces looks like a bug in the caller.
+
+**`display_name` is a live moderation surface and nothing moderates it.** SHIP-79a lets a provider
+declare what they trade as through `PATCH /v1/fleet/profile`, and a customer comparing offers is shown
+it. It is free text, chosen by one party, displayed to another — the same shape as a job description,
+which `Docs/04` §5 puts in a moderation queue, and as a dispute narrative, which SHIP-163 routes into
+one. **There is no queue, no report path and no administrative read of a provider profile at all** —
+`routes_golden.txt` on `5a3b8d7` has no such route, which is separately why §4 records SHIP-79a's
+final clause as unmet. So a provider can trade as anything until a human happens to look at an offer.
+
+**It is reported rather than made a ticket, and the reason is that it is the same undecided thing as
+SHIP-156.** What is reportable, by whom, with what outcome and against what policy is `Docs/04` §5's
+territory and is not a row a reconciliation pass may invent — and a `display_name` queue with no
+report mechanism behind it is half an answer. **Whoever writes the report-mechanism row should size it
+for three surfaces rather than one**: a job, a message once SHIP-97 lands, and a provider's declared
+name. It is one more argument for that row and not a separate finding.
+
+**No endpoint lists the jobs a provider has been awarded.** SHIP-96a widened
+`GET /v1/fleet/jobs/{id}` from eligibility to relationship, so a provider can read **a** job they hold
+a bid on by identifier — which closed the gap three wave-7 lanes had reported. **What it did not add
+is a collection.** The fleet surface on `5a3b8d7` is eleven routes: the feed, the job read, the
+provider's own bids, the profile pair and six vehicle routes. So a provider can list every bid they
+have made and cannot list the jobs they are currently delivering, and a client wanting "my work"
+would have to fetch `GET /v1/fleet/bids`, filter for accepted, and read each job by identifier.
+
+**It wants a lettered M3 ticket and is the sixth instance of the shape §6 describes** — a read over
+tables that already hold everything, wanted by a screen that has not been written yet, owned by no
+row in the backlog. It is smaller than SHIP-96a was: the predicate is `bids.status = 'Accepted'`
+scoped to the caller, over the same budget-stripped shape the feed already serves, in the collection
+envelope `GET /v1/fleet/bids` already uses. **Recorded now rather than when a client lane hits it**,
+because that is the entire argument this section makes about itself and SHIP-101 and SHIP-102 are the
+worked examples of the alternative.
 
 ## 10. The done list, in a form a script can read
 
