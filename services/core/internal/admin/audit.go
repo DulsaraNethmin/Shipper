@@ -178,6 +178,55 @@ const (
 	// entry — nothing acts, so there is nothing to attribute — and that asymmetry is honest: this
 	// records a person leaving, not a timer firing.
 	AuditActionAdministratorSignedOut AuditAction = "administrator.signed_out"
+
+	// AuditActionJobUnpublished is a policy-breaching job taken off the marketplace (SHIP-160).
+	//
+	// **The first entry in this catalogue whose target is not an administrator**, which is why
+	// [AuditTargetJob] exists. The reason is required rather than optional: Docs/01 §4.6 says
+	// "remove or unpublish policy-breaching jobs" and SHIP-160's *Done when* says "with a
+	// recorded reason", and a removal nobody has to justify is the one an administrator can make
+	// carelessly.
+	//
+	// The same reason is written twice, into two tables, and that is deliberate rather than
+	// redundant. `job_status_history` records why the *job* moved, which is what a customer's
+	// support conversation reads; `audit_log` records what the *administrator* did, which is what
+	// Docs/04 §9's controls read. The two are joined by nothing but the job identifier, and a
+	// reader of either should not have to find the other.
+	AuditActionJobUnpublished AuditAction = "job.unpublished"
+
+	// AuditActionUserStandingChanged is an account restricted, suspended or reinstated
+	// (SHIP-161).
+	//
+	// **One action for all three directions, not three.** cmd/api's
+	// TestTheAuditedMutationsAreDistinctActions requires one action per route and there is one
+	// route; more usefully, "what happened to this account's standing" is one question, and a
+	// reader filtering by action should get the whole history of it rather than having to know
+	// which of three verbs to ask for. Which way it moved is in the metadata, as `from` and `to`.
+	//
+	// Reinstating is on the same route and writes the same action for the same reason. Docs/04 §4
+	// treats the standings as one vocabulary; a separate `user.reinstated` would make the trail
+	// answer "was this account ever restricted" differently from "what has this account's
+	// standing been", and only the second is answerable from one filter.
+	AuditActionUserStandingChanged AuditAction = "user.standing_changed"
+
+	// AuditActionNoteAdded is a support note attached to a user or a job (SHIP-162).
+	//
+	// **The entry names the subject, not the note.** `target_type` and `target_id` are the thing
+	// the note is *about*, so a search for "everything that happened to this account" (SHIP-165)
+	// returns the notes taken about it alongside its standing changes. An entry naming the note
+	// would answer "a note was added" to a query nobody runs, and would leave the account's own
+	// history with a gap where support's attention was. The note's identifier is in the metadata,
+	// so an entry can still be traced to the row it caused.
+	//
+	// **The body is deliberately not in the entry.** `audit_log` is append-only and `admin_notes`
+	// is not (`000802` records why the two differ), so copying the body across would create an
+	// uncorrectable copy of a correctable record — and would put free-form prose about a person
+	// into the one table this platform promises never to rewrite.
+	//
+	// There is no `note.read` action and there will not be. Docs/01 §5.1 asks for audit logs of
+	// **privileged actions**; reading a queue or a history is not one, and an entry per read
+	// would bury the actions in the reads.
+	AuditActionNoteAdded AuditAction = "note.added"
 )
 
 // AuditActions is the whole catalogue, in the order the constants declare it.
@@ -191,6 +240,9 @@ var AuditActions = []AuditAction{
 	AuditActionAdministratorCreated,
 	AuditActionAdministratorSignedIn,
 	AuditActionAdministratorSignedOut,
+	AuditActionJobUnpublished,
+	AuditActionUserStandingChanged,
+	AuditActionNoteAdded,
 }
 
 // Valid reports whether a is in the catalogue.
@@ -208,6 +260,21 @@ func (a AuditAction) String() string { return string(a) }
 const (
 	// AuditTargetAdministrator is an `admin_users` row.
 	AuditTargetAdministrator = "administrator"
+
+	// AuditTargetJob is a `jobs` row (SHIP-160).
+	//
+	// Named for the thing rather than for the table, which is the point of the column having no
+	// CHECK constraint: `audit_log` outlives its subjects (Docs/05 §3.1), so a target kind has to
+	// be able to name something the schema no longer has a table for.
+	AuditTargetJob = "job"
+
+	// AuditTargetUser is a `users` row — a customer or a provider (SHIP-161).
+	//
+	// Deliberately distinct from [AuditTargetAdministrator]. They are different account systems
+	// that cannot be exchanged for each other (SHIP-147), and an entry that called both "account"
+	// would make "everything done to this administrator" a search that also returned customers
+	// whose identifiers happened to be asked about.
+	AuditTargetUser = "user"
 )
 
 // AuditActor is who acted.

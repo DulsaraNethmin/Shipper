@@ -41,6 +41,22 @@ var auditedAdminMutations = map[string]admin.AuditAction{
 
 	// SHIP-147, SHIP-148. The most privileged action the console has.
 	"POST /v1/admin/administrators": admin.AuditActionAdministratorCreated,
+
+	// SHIP-160. The first audited mutation whose target is not an administrator — the entry
+	// names the job, and the same reason is written into `job_status_history` as well, because
+	// the two tables answer different questions to different readers.
+	"POST /v1/admin/jobs/{id}/unpublish": admin.AuditActionJobUnpublished,
+
+	// SHIP-161. One action for all three standings including reinstatement, which is what this
+	// table's one-action-per-route rule and TestTheAuditedMutationsAreDistinctActions require —
+	// and independently the right shape, because "what has happened to this account's standing"
+	// is one question a reader should be able to ask with one filter.
+	"POST /v1/admin/users/{id}/standing": admin.AuditActionUserStandingChanged,
+
+	// SHIP-162. The entry names the **subject** of the note rather than the note, so that a
+	// search for everything that happened to an account returns the notes taken about it. The
+	// note's identifier is in the metadata; the body deliberately is not.
+	"POST /v1/admin/notes": admin.AuditActionNoteAdded,
 }
 
 // administrativeMutation reports whether this route is a state change an administrator makes.

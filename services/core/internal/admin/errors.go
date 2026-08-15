@@ -280,3 +280,120 @@ var (
 		"This administrator account does not have permission to do that. Ask whoever administers "+
 			"the platform if you need it.")
 )
+
+// The sentinels the administrative outcomes of Docs/04 §6 raise (SHIP-160, SHIP-161).
+//
+// A third block, because they are a third subject: the first is a dispute a customer raised, the
+// second is who may be here at all, and these are an administrator acting on somebody else's job or
+// account. `errors.Is` does not care and a reader does.
+var (
+	// ErrReasonRequired means a privileged action arrived with nothing recorded about why.
+	//
+	// Both *Done when* lines say "with a recorded reason", `ck_job_status_history_admin_reason`
+	// requires one of any administrator's transition, and this is the field a later reader has no
+	// way to reconstruct. Checked before a transaction opens, so the failure names the field
+	// rather than a constraint.
+	ErrReasonRequired = errors.New("admin: this action must record why it was taken")
+
+	// ErrReasonTooShort means a reason was supplied and says nothing.
+	//
+	// **A floor rather than a formality.** A single character satisfies a required field without
+	// recording anything, which is the shape a required field acquires the moment somebody is in
+	// a hurry — and unlike an empty reason it looks, in the trail, exactly like a reason.
+	ErrReasonTooShort = errors.New("admin: that reason is too short to be a record of anything")
+
+	// ErrReasonTooLong means a reason is longer than the trail should carry.
+	//
+	// The ceiling stops `audit_log` becoming a document store. An administrator with more to say
+	// writes an internal note (SHIP-162) and the reason references it.
+	ErrReasonTooLong = errors.New("admin: that reason is longer than this field holds")
+
+	// ErrJobNotUnpublishable means Docs/02 §2 has no route from the job's status to 'Cancelled'.
+	//
+	// The ordinary case is a job that has been **awarded**. A provider has committed and may have
+	// travelled, and Docs/02 §6.2 makes ending it after that a support case rather than a status
+	// change — so the administrator's path is a dispute they then resolve (SHIP-164), which
+	// records both sides. The other case is a job that has already completed or been cancelled
+	// and has left the lifecycle.
+	//
+	// Narrower than "that transition is not permitted", in the same spirit as
+	// [ErrJobNotDisputable]: somebody pressing "unpublish" asked for an outcome rather than for a
+	// named move.
+	ErrJobNotUnpublishable = errors.New("admin: this job cannot be unpublished in its current status")
+
+	// ErrJobAlreadyUnpublished means the job was already off the marketplace.
+	//
+	// Distinct from the refusal above because the console's response differs: reload and show
+	// who removed it, rather than offer a different action. It is the ordinary outcome of two
+	// moderators reading the same queue.
+	ErrJobAlreadyUnpublished = errors.New("admin: this job has already been unpublished")
+
+	// ErrUserNotFound means no account with that identifier exists.
+	//
+	// **Disclosed plainly, unlike [ErrJobNotFound].** The caller is an authenticated
+	// administrator holding `users.restrict`, every account is theirs to act on, and there is
+	// nothing here being kept from them — the 404 on dispute intake is a customer being told
+	// nothing about somebody else's job, which is a different question with a different asker.
+	ErrUserNotFound = errors.New("admin: no such account")
+
+	// ErrStandingUnrecognised means a standing outside `ck_users_status`s three.
+	ErrStandingUnrecognised = errors.New("admin: that is not an account standing")
+
+	// ErrNoteSubjectUnrecognised means a note named a kind of thing outside
+	// `ck_admin_notes_subject_type`s two.
+	ErrNoteSubjectUnrecognised = errors.New("admin: a note can only be about a user or a job")
+
+	// ErrNoteSubjectMissing means a note named no subject at all.
+	ErrNoteSubjectMissing = errors.New("admin: a note must say what it is about")
+
+	// ErrNoteEmpty means a note records nothing.
+	//
+	// Measured after trimming, so four thousand spaces is not a note. `ck_admin_notes_body`
+	// refuses it too; this refuses it a statement earlier, with a message a person can act on
+	// rather than a constraint name.
+	ErrNoteEmpty = errors.New("admin: a note with nothing in it records nothing")
+
+	// ErrNoteTooLong means a note is longer than the column holds.
+	ErrNoteTooLong = errors.New("admin: that note is longer than this field holds")
+
+	// ErrStandingUnchanged means the account already holds the standing it was being moved to.
+	//
+	// Refused rather than recorded. An entry saying "changed from suspended to suspended" is
+	// noise in the one table whose value is that everything in it happened, and the console's
+	// right response is to reload — most often because another administrator got there first.
+	ErrStandingUnchanged = errors.New("admin: that account already holds that standing")
+)
+
+// The error codes the administrative outcomes answer with (SHIP-160, SHIP-161).
+//
+// Three, and each earns its place by leading somewhere different in the console: raise a dispute
+// instead, reload and see who got there first, reload and see the current standing. Everything else
+// these actions can refuse is already served by a code that exists — a missing reason is
+// `validation_failed` with the field named, and an account that does not exist is `not_found`.
+var (
+	// CodeJobNotUnpublishable is returned when Docs/02 §2 permits no move to 'Cancelled'.
+	//
+	// 409 rather than 403: the administrator is permitted and the request contradicts the state
+	// the job is in. The console reloads and offers what is actually available, which for an
+	// awarded job is raising a dispute.
+	CodeJobNotUnpublishable = httpx.RegisterCode("admin_job_not_unpublishable",
+		"A job can only be unpublished before it is awarded. Once a provider has committed, "+
+			"ending it is a dispute an administrator resolves — reload the job to see its "+
+			"current status.")
+
+	// CodeJobAlreadyUnpublished is returned when the job is already off the marketplace.
+	//
+	// A distinct code because the client's response is different: show who removed it and why,
+	// rather than offer the action again. On a queue two moderators are reading, this is the
+	// answer the second one gets.
+	CodeJobAlreadyUnpublished = httpx.RegisterCode("admin_job_already_unpublished",
+		"This job has already been unpublished. Reload it to see who removed it and why.")
+
+	// CodeUserStandingUnchanged is returned when the account already holds that standing.
+	//
+	// 409 for the same reason, and a distinct code because an administrator seeing it has
+	// learned something specific: somebody else has already acted, and the trail will say who.
+	CodeUserStandingUnchanged = httpx.RegisterCode("admin_user_standing_unchanged",
+		"This account already has that standing. Reload it — another administrator may have "+
+			"changed it already, and the audit trail will say who.")
+)

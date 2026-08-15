@@ -1366,3 +1366,1560 @@ UserAccount:
       format: date-time
       description: When the account was registered, in UTC.
       example: '2026-05-01T09:00:00.000Z'
+
+AdminJobs:
+  get:
+    operationId: adminSearchJobs
+    summary: Search jobs
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/01 §4.6's first administrative capability, second term — "search users, jobs, bids, and
+      disputes" (SHIP-152). Searching accounts is `GET /v1/admin/users` (SHIP-151).
+
+      ## What can be searched
+
+      `q` matches the **goods description**, anywhere within it. That is what a support engineer
+      holds when they are searching — a sentence off a ticket, "the piano", "two pallets of tiles".
+      Somebody holding a job identifier opens the job instead, which is `GET /v1/admin/jobs/{id}`.
+
+      `status` narrows to one of Docs/02 §1's job statuses and `customer` to one account's jobs.
+
+      ## The status vocabulary here is the stored form, not the wire form
+
+      `Driver assigned`, not `driver_assigned`. A departure from the lower snake case Docs/10 §4.7
+      puts on every other enumeration, taken deliberately and consistently with `job_status` on the
+      exception queue: the console is an operator surface, and somebody reading a screen beside a
+      `psql` window should see one vocabulary rather than two.
+
+      It applies to the `status` **filter** as well as to the field, which is the property that
+      matters most — a console displaying one vocabulary and filtering on another would make every
+      filter a guess.
+
+      ## What a job carries here, and what it never will
+
+      **No budget.** Docs/01 §4.3's invariant names providers, so an administrator is not the
+      audience it protects the customer's maximum from — leaving it out is a decision rather than a
+      rule, and the reasoning is that nothing in this capability asks for it and a shape that never
+      carried one cannot leak one. The named revisit is SHIP-164, where an administrator resolving a
+      dispute about price may genuinely need it.
+
+      **No addresses and no contact details**, per Docs/01 §5.1's "minimise exposure of phone
+      numbers, addresses, and delivery details". What identifies a job on a console screen is its
+      description, its customer, its status and its dates.
+
+      `bid_count` counts **every** bid in every status. What a scan of this list answers is whether
+      anybody engaged with the job at all, and three withdrawn offers is a very different fact from
+      no offers.
+
+      ## Ordering and paging
+
+      Newest first, like the account search and unlike the moderation queue — a search has no
+      acknowledgement target, and the jobs somebody is looking for are overwhelmingly recent. Cursor
+      paged on `(created_at, id)`; jobs published in the same instant would make a single-column
+      cursor either skip one or repeat it.
+
+      ## Permission
+
+      Needs `jobs.read`, which every administrator role holds: looking is what the least-privileged
+      role exists to be able to do. Unpublishing a job is `jobs.unpublish` on a different endpoint
+      (SHIP-160).
+    parameters:
+      - name: q
+        in: query
+        required: false
+        description: |
+          Matches the goods description, anywhere within it. Absent or empty matches every job,
+          which with the two filters below is how "every open job for this customer" is expressed.
+
+          **It is a string, not a pattern.** `%` and `_` are matched literally rather than as
+          wildcards, so a search box cannot be turned into a full read of the table.
+
+          A draft that never reached the details step has no description and matches no term.
+        schema:
+          type: string
+          maxLength: 200
+        example: piano
+      - name: status
+        in: query
+        required: false
+        description: |
+          Narrows to one job status, in Docs/02 §1's **stored** form. Absent matches every status. A
+          value that is not one of the twelve is refused rather than ignored — an ignored filter
+          answers with every job, which reads exactly like "the whole marketplace is delivered" to
+          somebody who mistyped one.
+        schema:
+          type: string
+          enum:
+            - Draft
+            - Open
+            - Negotiating
+            - Awarded
+            - Driver assigned
+            - En route to pickup
+            - Picked up
+            - In transit
+            - Delivered
+            - Completed
+            - Cancelled
+            - Disputed
+        example: Open
+      - name: customer
+        in: query
+        required: false
+        description: Narrows to one customer's jobs. Absent matches every customer.
+        schema:
+          type: string
+          format: uuid
+        example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+      - name: limit
+        in: query
+        required: false
+        description: How many jobs to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of jobs, newest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/JobSearchPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `jobs.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          A query parameter carried a value the platform does not have (`validation_failed`), with
+          one `error.details` entry per field — `status` for a status that is not one of the twelve,
+          `customer` for an identifier that is not a UUID, `q` for a term longer than any
+          description it could match.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminJob:
+  get:
+    operationId: adminOpenJob
+    summary: Open one job with its full bid and status history
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      The second half of SHIP-152 — "open **any** job with its full bid and status history" — and
+      *any* is the word doing the work. Every job is an administrator's to open; there is no
+      ownership scope on this endpoint and no `404` standing in for a refusal, which is the opposite
+      of every other job endpoint in this API and is exactly what Docs/01 §4.6 asks for.
+
+      A `404` here means the job genuinely does not exist.
+
+      ## One response rather than three endpoints
+
+      The job, every bid on it and every recorded transition, read in **one snapshot**. A console
+      making three calls to draw one screen is three chances to show a job beside somebody else's
+      bids, or an `Awarded` header above a bid list in which nothing is accepted. A support screen
+      that contradicts itself is worse than a stale one, because somebody acts on it.
+
+      ## Bid amounts are here and the customer's budget is not
+
+      Docs/02 §4: "bid history remains visible to the customer, bidding provider, and
+      administrators". This is that third reader, and unlike the two views a provider and a customer
+      get, it is not scoped to one provider's chain — an administrator looking at a disputed award
+      needs the offers it was chosen over.
+
+      The customer's maximum budget is a different fact with a different audience and is on no shape
+      in this API outside the customer's own.
+
+      ## Both clocks on every transition, never one
+
+      Docs/02 §3.1 keeps the actor's claim (`actor_recorded_at`) apart from the platform's
+      acceptance (`server_recorded_at`) because a driver records a milestone with no signal and the
+      device syncs later. The history is ordered by the **platform's** clock: a timeline ordered by
+      the device's could be reordered by a handset with the wrong time.
+
+      ## Permission
+
+      Needs `jobs.read`, which every administrator role holds.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The job to open.
+        schema:
+          type: string
+          format: uuid
+    responses:
+      '200':
+        description: The job, its bids and its recorded transitions.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminJobDetail'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `jobs.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          There is no such job (`not_found`). Unlike the same answer on the dispute endpoint, this
+          is not a disclosure decision — an administrator holding `jobs.read` may open any job, so
+          there is nothing here being kept from them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+JobSearchPage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/AdminJobSummary'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wOC0wMVQwOTowMDowMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like.
+      example: false
+
+AdminJobDetail:
+  type: object
+  additionalProperties: false
+  required: [job, bids, history]
+  description: |
+    One job as an administrator sees it, with everything recorded against it. `bids` and `history`
+    are always arrays, never `null` — an absent list and an empty one are the same fact here, and
+    `null` crashes a console that iterates without checking on the one job that had neither.
+  properties:
+    job:
+      $ref: '#/AdminJobSummary'
+    bids:
+      type: array
+      description: Every offer on the job, in every status, oldest first.
+      items:
+        $ref: '#/AdminBid'
+    history:
+      type: array
+      description: Every recorded transition, oldest first on the platform's clock.
+      items:
+        $ref: '#/AdminStatusEvent'
+
+AdminJobSummary:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - customer_id
+    - status
+    - goods_description
+    - bid_count
+    - expires_at
+    - created_at
+    - updated_at
+  description: |
+    One job as an administrator sees it. **No budget, no addresses and no contact details** — see
+    the endpoint description.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    customer_id:
+      type: string
+      format: uuid
+      description: The account that owns the job.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    status:
+      type: string
+      description: |
+        Docs/02 §1's **stored** form — `En route to pickup`, not `en_route_to_pickup`. See the
+        endpoint description for why this one enumeration departs from Docs/10 §4.7.
+      enum:
+        - Draft
+        - Open
+        - Negotiating
+        - Awarded
+        - Driver assigned
+        - En route to pickup
+        - Picked up
+        - In transit
+        - Delivered
+        - Completed
+        - Cancelled
+        - Disputed
+      example: Open
+    goods_description:
+      type: string
+      description: |
+        What the customer said they are sending. Empty on a draft that never reached the details
+        step.
+      example: An upright piano and two stools
+    bid_count:
+      type: integer
+      description: |
+        How many bids the job carries, in **every** status. Three withdrawn offers and no offers
+        are very different facts about whether anybody engaged with a job.
+      example: 3
+    expires_at:
+      type: string
+      description: |
+        When an unclaimed job lapses, in UTC. Empty where none is set. Always present, so a console
+        that renders without checking does not crash on the ordinary case.
+      example: '2026-08-20T09:00:00.000Z'
+    created_at:
+      type: string
+      format: date-time
+      description: When the job was created, in UTC.
+      example: '2026-08-01T09:00:00.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      description: When the job row last changed, in UTC.
+      example: '2026-08-02T14:30:00.000Z'
+
+AdminBid:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - provider_id
+    - status
+    - offered_by
+    - amount_cents
+    - pickup_at
+    - deliver_by
+    - message
+    - superseded_by
+    - created_at
+    - updated_at
+  description: |
+    One offer on the job. Docs/02 §4 makes bid history visible to the customer, the bidding provider
+    and administrators; this is the third of those readers, and the only one that sees every
+    provider's offers on one job.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e6
+    provider_id:
+      type: string
+      format: uuid
+      description: The provider whose offer this is.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e7
+    status:
+      type: string
+      description: Docs/02 §4's stored form.
+      enum: [Draft, Submitted, Countered, Accepted, Rejected, Withdrawn, Expired, Superseded]
+      example: Accepted
+    offered_by:
+      type: string
+      description: |
+        Which side made this offer. A customer's counter-offer is a bid row like any other, and a
+        reader who could not tell the two apart would read a negotiation as one party bidding
+        against themselves.
+      enum: [provider, customer]
+      example: provider
+    amount_cents:
+      type: integer
+      format: int64
+      description: |
+        The offer, in cents. `0` where the row carries no amount, which a draft bid may not have —
+        `ck_bids_amount` refuses a non-positive amount, so `0` and "absent" cannot be confused.
+      example: 45000
+    pickup_at:
+      type: string
+      description: The pickup time offered, in UTC. Empty where the row carries none.
+      example: '2026-08-05T07:00:00.000Z'
+    deliver_by:
+      type: string
+      description: The delivery time offered, in UTC. Empty where the row carries none.
+      example: '2026-08-06T17:00:00.000Z'
+    message:
+      type: string
+      description: The offering party's note, where they left one. Empty otherwise.
+      example: Happy to bring a second person for the stairs.
+    superseded_by:
+      type: string
+      description: |
+        The offer that displaced this one, so a reader can follow a negotiation in the order it
+        happened rather than by comparing timestamps. Empty on an offer nothing displaced.
+      example: ''
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-01T11:00:00.000Z'
+    updated_at:
+      type: string
+      format: date-time
+      example: '2026-08-01T11:30:00.000Z'
+
+AdminStatusEvent:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - from
+    - to
+    - actor_type
+    - actor_id
+    - reason
+    - actor_recorded_at
+    - server_recorded_at
+  description: |
+    One recorded transition. **Both clocks, never one** — see the endpoint description.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e8
+    from:
+      type: string
+      description: The status the job left, in Docs/02 §1's stored form.
+      example: Open
+    to:
+      type: string
+      description: The status the job reached, in Docs/02 §1's stored form.
+      example: Awarded
+    actor_type:
+      type: string
+      description: |
+        Who moved it. Finer than the audit log's three actor kinds, because the difference between
+        a provider and the driver they nominated is exactly the distinction support needs when a
+        delivery goes wrong.
+      enum: [customer, provider, driver, admin, system]
+      example: customer
+    actor_id:
+      type: string
+      description: |
+        The account that acted, or the driver assignment for a driver. Empty for `system`, which is
+        the platform acting with no account behind it.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    reason:
+      type: string
+      description: |
+        Why, where one was given. Required of an administrator by the schema and optional for
+        everybody else.
+      example: ''
+    actor_recorded_at:
+      type: string
+      format: date-time
+      description: |
+        When the actor says they acted, in UTC. On a device with no signal this can be well before
+        the platform heard about it.
+      example: '2026-08-02T14:29:00.000Z'
+    server_recorded_at:
+      type: string
+      format: date-time
+      description: When the platform accepted it, in UTC. The trail is ordered by this.
+      example: '2026-08-02T14:30:00.000Z'
+
+AdminAudit:
+  get:
+    operationId: adminSearchAuditLog
+    summary: Search the immutable audit trail
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/01 §4.6's last administrative capability — "view an immutable history of important
+      actions" (SHIP-165) — and the read side of SHIP-150, which writes the entries.
+
+      ## The trail is append-only, and this API offers no other verb on it
+
+      There is no `POST`, no `PATCH` and no `DELETE` on this path, and there will not be. Docs/04 §9
+      requires that ordinary administrators cannot delete audit history; the permission catalogue
+      has no permission that would authorise it, and the database refuses `UPDATE` and `DELETE` on
+      `audit_log` by trigger — from **any** connection, including a `psql` prompt, so the guarantee
+      does not depend on this service.
+
+      Entries are written by the actions that cause them, in the same transaction, never by a
+      request to this endpoint. An action whose entry cannot be written does not happen.
+
+      ## What can be searched
+
+      `actor` is what one administrator did, and it is the first question anybody asks of a trail.
+      `target` is everything that happened to one thing — an administrator, a user, a job — and it
+      reads across kinds deliberately, because an identifier is already unique and a caller should
+      not have to know which kind it is. `from` and `to` bound it by date.
+
+      `action` is a fourth and is not in the ticket's wording. It is here because the table was built
+      around it: the column holds a **stable identifier rather than a sentence**, precisely so the
+      log is searchable by action, and a column created for a search with no way to search it would
+      be the odd omission.
+
+      Every filter is refused rather than ignored when it carries a value the platform does not
+      have. An ignored filter answers with the whole trail, and "everything" and "the seventeen
+      entries for this action" are indistinguishable to somebody who mistyped one — who then
+      concludes the action never happened.
+
+      ## `from` is inclusive and `to` is exclusive
+
+      The only pair that makes consecutive days tile without overlapping: somebody asking for the
+      3rd and then the 4th must not be shown an entry twice, and an inclusive upper bound at
+      midnight shows every entry written in that instant on both days.
+
+      Both accept a **day** (`2026-08-14`) or a **full instant** (`2026-08-14T09:30:00Z`). A support
+      engineer types the first and a console sends the second; accepting only the second would make
+      the endpoint unusable by hand, which is most of what it is for. A bare day is read as UTC
+      midnight, because the column holds the platform's clock and reading it in the server's local
+      zone would move the boundary whenever the deployment moved.
+
+      ## Ordering and paging
+
+      Newest first — somebody opening a trail is almost always asking what happened recently. Cursor
+      paged on `(created_at, id)`, and here the second field is not a nicety: every entry written in
+      one transaction shares the same instant **by design**, so a single-column cursor would skip an
+      entry or repeat one on exactly the rows most worth reading together. The identifier is
+      time-ordered, so entries appended in one transaction come back in the order they were
+      appended.
+
+      ## Permission
+
+      Needs `audit.read`, which every administrator role holds including the least privileged. A
+      trail only the people it records can read is not a control.
+    parameters:
+      - name: actor
+        in: query
+        required: false
+        description: |
+          Narrows to what one account did. Absent matches every actor. Entries written by the
+          platform itself have no actor and are matched by no value here.
+        schema:
+          type: string
+          format: uuid
+        example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+      - name: target
+        in: query
+        required: false
+        description: |
+          Narrows to everything done to one thing, whatever kind of thing it is. Absent matches
+          every target.
+        schema:
+          type: string
+          format: uuid
+        example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+      - name: action
+        in: query
+        required: false
+        description: |
+          Narrows to one kind of entry. Absent matches every action. A value the platform does not
+          record is refused rather than ignored.
+
+          The list grows one value per ticket that adds a privileged action, so a client should not
+          hard-code it — the refusal names the current set.
+        schema:
+          type: string
+        example: administrator.created
+      - name: from
+        in: query
+        required: false
+        description: |
+          The earliest instant to include, **inclusive**. A day or a full instant; a day is read as
+          UTC midnight. Absent is unbounded.
+        schema:
+          type: string
+        example: '2026-08-14'
+      - name: to
+        in: query
+        required: false
+        description: |
+          The instant to stop before, **exclusive**. A day or a full instant. Absent is unbounded.
+          A range that ends before it starts is refused rather than answered with an empty page.
+        schema:
+          type: string
+        example: '2026-08-15'
+      - name: limit
+        in: query
+        required: false
+        description: How many entries to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of the trail, newest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AuditPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `audit.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          A query parameter carried a value the platform does not have (`validation_failed`), with
+          one `error.details` entry per field — `action` for an action nothing records, `actor` or
+          `target` for something that is not an identifier, `from` or `to` for something that is not
+          a date, and `to` for a range that ends before it starts.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AuditPage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/AuditEntry'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wOC0xNFQwOTowMDowMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like.
+      example: false
+
+AuditEntry:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - actor_type
+    - actor_id
+    - action
+    - target_type
+    - target_id
+    - reason
+    - metadata
+    - created_at
+  description: |
+    One thing that happened, exactly as it was recorded. **Nothing is withheld and nothing is
+    redacted** — a viewer showing a filtered version of the record would be a second record, and the
+    one somebody checks would be the wrong one. What keeps that safe is that nothing commercial is
+    ever written into an entry in the first place.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: |
+        Time-ordered, so entries appended in one transaction sort in the order they were appended
+        even though they share an instant.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    actor_type:
+      type: string
+      description: |
+        What kind of thing acted. `system` is the platform acting with nobody behind it — the expiry
+        sweep, the auto-complete timer.
+      enum: [admin, user, system]
+      example: admin
+    actor_id:
+      type: string
+      description: |
+        The account that acted. Empty for `system`, which has none — and the schema requires exactly
+        that, so an empty value here is a fact rather than a missing one.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    action:
+      type: string
+      description: |
+        What was done, as a stable identifier rather than a sentence. Free text would make the log
+        unsearchable by action, which is how support uses it.
+      example: administrator.created
+    target_type:
+      type: string
+      description: |
+        What kind of thing it was done to. Not a closed set: the trail outlives its subjects, so it
+        has to be able to name a kind of thing that no longer exists.
+      example: administrator
+    target_id:
+      type: string
+      format: uuid
+      description: |
+        What it was done to. Deliberately not a foreign key in the schema — an entry outlives its
+        subject — so nothing guarantees the row still exists, or ever did.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e6
+    reason:
+      type: string
+      description: |
+        Why, where the action recorded one. Empty where it has none: creating an administrator has
+        no reason beyond the act, and the actions that need one are refused without it.
+      example: ''
+    metadata:
+      type: object
+      additionalProperties: true
+      description: |
+        The extra facts the action recorded — the role granted, the standing set, the status a job
+        moved to. Always an object, never `null`; `{}` where the action recorded nothing beyond
+        itself.
+      example:
+        role: moderator
+    created_at:
+      type: string
+      format: date-time
+      description: |
+        When the action committed, on the platform's clock, in UTC. Supplied by the service rather
+        than by the column default, so an entry sorts correctly against the session, dispute and
+        status-history rows it describes.
+      example: '2026-08-14T09:00:00.000Z'
+
+AdminJobUnpublish:
+  post:
+    operationId: adminUnpublishJob
+    summary: Unpublish a policy-breaching job
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The job to remove from the marketplace.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    description: |
+      Docs/01 §4.6's third administrative capability — "remove or unpublish policy-breaching jobs"
+      (SHIP-160) — with the reason it requires.
+
+      ## Nothing is deleted, and that is why this is not a `DELETE`
+
+      The job moves to `cancelled` through the one guarded transition every status change in this
+      platform passes. Its status history records who moved it, when, and why; the row stays exactly
+      where it was, because Docs/05 §3.1 keeps records. There is no `unpublished` status and no
+      hidden flag — a second way for a job to be off the marketplace would be a second thing every
+      feed, every eligibility query and every expiry sweep had to know about, and one of them would
+      eventually not.
+
+      ## Only before the job is awarded
+
+      Docs/02 §2 permits `cancelled` from `draft`, `open` and `negotiating` — the statuses in which
+      nobody is yet committed. **An awarded job cannot be unpublished**: a provider has committed and
+      may have travelled, and Docs/02 §6.2 makes ending it after that a support case. The path is a
+      dispute an administrator then resolves, which records both sides. That answers
+      `admin_job_not_unpublishable`.
+
+      A job somebody has already removed answers `admin_job_already_unpublished` instead — a
+      different code, because the console's response is to reload and show who removed it rather
+      than to offer the action again. On a queue two moderators are reading, this is the answer the
+      second one gets.
+
+      ## The reason is required, and it is recorded twice
+
+      Not a formality: an empty string and a single character both satisfy a required field without
+      recording anything, and this is the field a later reader has no way to reconstruct. Between 10
+      and 500 characters after trimming; outside that it is a `422` naming `reason`.
+
+      It is written into the job's **status history**, which is what a customer's support
+      conversation reads, and into the **audit log**, which is what Docs/04 §9's controls read. The
+      two answer different questions to different readers, and neither should have to find the other.
+
+      ## The customer is notified, and no separate event arranges it
+
+      The transition emits `job.status_changed` in the same transaction, and the notification rules
+      already route a move to `cancelled` to the job's customer and the awarded provider. A second
+      event announcing the same state change would mean two messages about one thing, which is worse
+      than the second being redundant — a recipient who learns this platform emails twice starts
+      ignoring the first one.
+
+      The reason is **not** in that message. It is an administrator's internal note about a policy
+      breach; what a customer is told is a copy decision belonging to whoever writes that template.
+
+      ## Permission
+
+      Needs `jobs.unpublish`, which `moderator` and `owner` hold and **`support` does not** — a
+      support administrator may open any job and may not remove one. That split is Docs/04 §9's
+      least-privilege control expressed as two permissions on two endpoints.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/UnpublishJobRequest'
+    responses:
+      '200':
+        description: The job has been removed from the marketplace.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/UnpublishJobResult'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `jobs.unpublish`
+          (`admin_permission_denied`). A `support` administrator gets this.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: There is no such job (`not_found`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The job is past the point of being unpublishable
+          (`admin_job_not_unpublishable`), or somebody has already removed it
+          (`admin_job_already_unpublished`). Two codes rather than one, because the console's
+          response differs: offer a dispute, or reload and show who removed it.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The reason records nothing, or is longer than the field holds (`validation_failed`, with a
+          `reason` entry in `error.details`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+UnpublishJobRequest:
+  type: object
+  additionalProperties: false
+  required: [reason]
+  description: |
+    One field. There is no job identifier — it is in the path — and no actor: the administrator is
+    whoever the credential says is calling, and a body that named its own actor would be an audit
+    trail the client writes. Unknown fields are refused rather than ignored.
+  properties:
+    reason:
+      type: string
+      minLength: 10
+      maxLength: 500
+      description: |
+        Why the job is being removed, measured after trimming. Recorded in the job's status history
+        and in the audit log.
+      example: Listing offers to transport a live animal, which Docs/05 prohibits.
+
+UnpublishJobResult:
+  type: object
+  additionalProperties: false
+  required: [job_id, status, reason]
+  properties:
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    status:
+      type: string
+      description: |
+        Where the job is now. Always `Cancelled` — Docs/02 §1's stored form, consistently with every
+        other administrative shape.
+      example: Cancelled
+    reason:
+      type: string
+      description: |
+        What was recorded, read back so a console renders what the platform *stored* rather than
+        what somebody typed. The two differ by trimming.
+      example: Listing offers to transport a live animal, which Docs/05 prohibits.
+
+AdminUserStanding:
+  post:
+    operationId: adminSetUserStanding
+    summary: Restrict, suspend or reinstate an account
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The account whose standing is changing.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    description: |
+      Docs/01 §4.6's fourth administrative capability — "restrict or suspend accounts with a recorded
+      reason" (SHIP-161).
+
+      ## One endpoint for all three standings, reinstatement included
+
+      `active`, `restricted` and `suspended` are one vocabulary, the permission to move between them
+      is one permission, and the reason is required in **every** direction. A separate reinstate
+      endpoint would be a second place for the reason to become optional — and a trail that records a
+      restriction but not its reversal is the one that makes a person look permanently suspect.
+
+      Setting the standing an account already holds is refused (`admin_user_standing_unchanged`)
+      rather than recorded. An entry saying "changed from suspended to suspended" is noise in the one
+      table whose value is that everything in it happened, and the right response is to reload —
+      most often because another administrator got there first, which the audit trail will show.
+
+      ## What each standing does, and where that is enforced
+
+      - **`restricted`** limits the account without ending its access. A restricted provider may sign
+        in and read and **may not bid**; a restricted account can still read the message explaining
+        why it is restricted, which is the point of the standing existing at all.
+      - **`suspended`** disables access. Sign-in is refused, and so is **session refresh** — which is
+        where a suspension actually takes effect, because an access token lives fifteen minutes and
+        deliberately carries no standing so that standing is read fresh.
+      - **`active`** is an ordinary account.
+
+      None of that enforcement is added by this endpoint; it has been in the identity domain since
+      the account model was built. What this adds is the administrative act that sets the column,
+      with the reason and the entry.
+
+      Account standing is **not** provider verification, which is a separate eligibility decision
+      with five states of its own (Docs/04 §4) and its own queue.
+
+      ## Two-person review is not implemented
+
+      Docs/04 §9 asks for "two-person review for permanent account suspension where practical".
+      That is a separate ticket and there is deliberately no half of it here — no pending state and
+      no approval field, because an administrator who sees a "pending approval" that nothing enforces
+      believes there is a control.
+
+      ## Permission
+
+      Needs `users.restrict`, which `moderator` and `owner` hold and **`support` does not**. A
+      support administrator may search accounts and may not change one.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/SetStandingRequest'
+    responses:
+      '200':
+        description: The standing has changed.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/StandingChangeResult'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.restrict`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          There is no such account (`not_found`). Said plainly — the caller is an administrator
+          holding a permission over accounts, so unlike the `404` on dispute intake there is nothing
+          being kept from them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The account already holds that standing (`admin_user_standing_unchanged`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The standing is not one of the three, or the reason records nothing
+          (`validation_failed`, with one `error.details` entry per field).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+SetStandingRequest:
+  type: object
+  additionalProperties: false
+  required: [standing, reason]
+  description: |
+    No account identifier — it is in the path. **No `from`**: what the account currently holds is
+    read under a row lock rather than taken from a console that may have loaded the page five
+    minutes ago.
+  properties:
+    standing:
+      type: string
+      enum: [active, restricted, suspended]
+      description: What the account becomes.
+      example: suspended
+    reason:
+      type: string
+      minLength: 10
+      maxLength: 500
+      description: |
+        Why, measured after trimming. Required in every direction, reinstatement included. Recorded
+        in the audit log, which is append-only.
+      example: Two unresolved no-shows in a fortnight; see the delivery exception queue.
+
+StandingChangeResult:
+  type: object
+  additionalProperties: false
+  required: [user_id, from, to, reason]
+  description: |
+    **Both ends, never just the new one.** A console rendering `restricted` cannot tell a reader
+    whether that was a tightening or a loosening, and the same request performs all three
+    directions.
+  properties:
+    user_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    from:
+      type: string
+      enum: [active, restricted, suspended]
+      description: What the account held, read under the row lock at the moment of the change.
+      example: active
+    to:
+      type: string
+      enum: [active, restricted, suspended]
+      description: What it holds now.
+      example: suspended
+    reason:
+      type: string
+      description: What was recorded, read back after trimming.
+      example: Two unresolved no-shows in a fortnight; see the delivery exception queue.
+
+AdminNotes:
+  post:
+    operationId: adminAddNote
+    summary: Attach an internal support note to a user or a job
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    description: |
+      Docs/01 §4.6's fifth administrative capability — "add internal support notes" (SHIP-162).
+
+      ## Notes are never user-visible, and that is structural rather than promised
+
+      They live in a table of their own that **no user-facing endpoint reads and none joins**; both
+      operations here require an administrator session, which is a separate credential system a user
+      token cannot reach at all; and the note shape appears in these two responses and in no other
+      response in this API. There is no field on a job, an account or a dispute that carries one, so
+      a note cannot reach a customer by somebody widening a shape.
+
+      The dispute table records the same decision from the other side: every column of a dispute is
+      read straight back to the complainant, which is why notes were never a column on it.
+
+      ## What a note attaches to
+
+      A `user` or a `job` — **not an administrator**. A note about a colleague is a different thing
+      with different handling; the record of what an administrator did is the audit trail, which
+      nothing can rewrite.
+
+      **The subject is not checked against its table.** A note may name a job or an account that no
+      longer exists, and that is deliberate: a note outlives its subject (Docs/05 §3.1), and support
+      writing up why an account was closed *after* it was closed is the case this table most exists
+      for. An existence check would refuse exactly that note, and would buy a guarantee that stops
+      holding a second later anyway.
+
+      ## Notes are appended, not edited
+
+      There is no `PATCH` and no `DELETE`. A support note is a contemporaneous record of what
+      somebody knew at the time, and one that can be revised afterwards is worth less than one that
+      cannot — in exactly the situation it exists for.
+
+      That is a weaker guarantee than the audit trail's, which the database enforces by trigger, and
+      the difference is deliberate: the audit trail holds administrators to account, while an
+      operator correcting a note that names the wrong job is a legitimate act. The API offers no verb
+      for it; the schema does not forbid one.
+
+      ## Permission
+
+      Needs `notes.write`, which `moderator` and `owner` hold and `support` does not. **Reading them
+      needs less** — see the `GET` — and that asymmetry is the right way round: a support
+      administrator reads the history and a moderator adds to it.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/AddNoteRequest'
+    responses:
+      '201':
+        description: The note has been recorded.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminNote'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `notes.write`
+          (`admin_permission_denied`). A `support` administrator gets this, and may still read.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The subject is not a user or a job, the subject identifier is missing or malformed, or the
+          note records nothing (`validation_failed`, one `error.details` entry per field).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+  get:
+    operationId: adminReadNotes
+    summary: Read the internal notes on one user or job
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Every note on one subject, newest first.
+
+      ## The permission is the subject's, not a note permission
+
+      A note on a `user` needs `users.read`; a note on a `job` needs `jobs.read`. Both are held by
+      **every** administrator role including `support` — which is the role that most needs to read a
+      support history and which deliberately cannot add to it.
+
+      There is deliberately no `notes.read` permission. Notes never leave the console, so a
+      permission gating this read would be one that every role holds and that never refuses
+      anybody; what needs distinguishing is who may *add* one.
+
+      ## Not paged
+
+      The notes on one account or one job are tens at most and a console shows them all. The
+      response carries `data` and nothing else — no cursor and no `has_more`, because publishing
+      either would tell a client there is a paging mechanism when there is not.
+    parameters:
+      - name: subject_type
+        in: query
+        required: true
+        description: What kind of thing the notes are about.
+        schema:
+          type: string
+          enum: [user, job]
+        example: user
+      - name: subject_id
+        in: query
+        required: true
+        description: |
+          Which one. A subject with no notes answers `200` with an empty list rather than `404` —
+          the subject is not looked up, so "no notes" and "no such subject" are the same answer
+          here, and the caller establishes the second by opening the subject.
+        schema:
+          type: string
+          format: uuid
+        example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    responses:
+      '200':
+        description: The notes on that subject, newest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminNoteList'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold the subject's read permission
+          (`admin_permission_denied`). No role is in that position today — every role holds both —
+          so this is the contract describing the check rather than a case a console will meet.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The subject is not a user or a job, or its identifier is missing or malformed
+          (`validation_failed`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AddNoteRequest:
+  type: object
+  additionalProperties: false
+  required: [subject_type, subject_id, body]
+  description: |
+    There is no author — the administrator is whoever the credential says is calling, and a body
+    that named its own author would be a support history a client writes.
+  properties:
+    subject_type:
+      type: string
+      enum: [user, job]
+      description: What the note is about.
+      example: user
+    subject_id:
+      type: string
+      format: uuid
+      description: Which one. Not checked against its table — see the operation description.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    body:
+      type: string
+      minLength: 1
+      maxLength: 4000
+      description: |
+        The note, measured after trimming. Generous compared with an action's `reason`, and
+        deliberately: a reason is a sentence justifying an action and a note is prose about a
+        situation.
+      example: Rang about the damaged crates; sending photographs this afternoon.
+
+AdminNote:
+  type: object
+  additionalProperties: false
+  required: [id, subject_type, subject_id, author_id, body, created_at]
+  description: |
+    One internal support note. **This shape is returned by these two operations and by nothing else
+    in this API** — that is how "never user-visible" is kept true.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e9
+    subject_type:
+      type: string
+      enum: [user, job]
+      example: user
+    subject_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    author_id:
+      type: string
+      format: uuid
+      description: |
+        The administrator who wrote it, as an identifier. A name would be a second read of the
+        administrator table, and a console listing notes already knows its own administrators.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7ea
+    body:
+      type: string
+      description: The note, as it was stored — trimmed.
+      example: Rang about the damaged crates; sending photographs this afternoon.
+    created_at:
+      type: string
+      format: date-time
+      description: |
+        When it was written, in UTC, on the platform's clock — the same clock the audit entry
+        describing it takes, so the two sort together.
+      example: '2026-08-15T09:12:00.000Z'
+
+AdminNoteList:
+  type: object
+  additionalProperties: false
+  required: [data]
+  description: |
+    **Not the standard collection envelope**, deliberately: there is no `next_cursor` and no
+    `has_more`, because this read does not page and publishing either would describe a mechanism
+    that does not exist. `data` is kept so the shape can grow into the envelope if it ever does.
+  properties:
+    data:
+      type: array
+      description: The notes, newest first. Always an array, never `null`.
+      items:
+        $ref: '#/AdminNote'

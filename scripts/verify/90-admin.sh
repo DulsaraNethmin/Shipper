@@ -1114,3 +1114,883 @@ status="$(admin_get "/v1/admin/users?q=$search_email" "" search-nocred)"
 ok "and the search is behind the administrator credential, like every other administrative route"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-152 — searching jobs, and opening one with its full bid and status history.
+#
+# # What only this section can show
+#
+# The statements behind `admin.JobDirectory` live in **cmd/api**, because they span `jobs`,
+# `bids` and `job_status_history` — three tables belonging to two domains `internal/admin` may not
+# import. The Go suite in that package drives the handler against a directory that records what it
+# was asked for, which establishes the query translation and nothing about the SQL. **The SQL is
+# demonstrated here or nowhere**, exactly as SHIP-113's party lookup and SHIP-117's exception queue
+# are.
+#
+# # Every assertion is fenced on this run's own job
+#
+# `jobs` is shared with every other section, every previous run and every other worktree, so a count
+# would be a statement about the machine. The job is found by the id this section created and the
+# negative cases are asserted against a second job it also created.
+
+ticket "SHIP-152  an administrator searches jobs and opens one with its bids and status history"
+
+admin_clear_limits
+
+# A delivered job with an accepted bid, which gives the detail view something in both lists: seven
+# recorded transitions and one bid. dispute_delivered_job is the SHIP-163 fixture above and is
+# reused rather than copied — it is already "a job moved through the guard the way 000402 demands".
+console_job="$(dispute_delivered_job console)"
+console_other="$(dispute_draft consoleother)"
+
+# The goods description is what `q` matches, and no endpoint sets one on these fixtures — SHIP-63
+# publishes and SHIP-71 collects the details, and the fixture writes the row directly. So it is set
+# here, with a term unique to this run.
+console_term="conso1e-$$-piano"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set goods_description = '$console_term and two stools' where id = '$console_job';" >/dev/null \
+  || fail "the searchable goods description could not be set"
+
+# A support administrator, because `jobs.read` is held by every role: looking is what the
+# least-privileged one exists to be able to do, and Docs/01 §4.6 lists searching first.
+console_email="verify-admin-console-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$console_email', 'Verify Console', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the console reader could not be created"
+
+status="$(admin_signin "verify-adm-console-in-$$" "$console_email" "$admin_password" console-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-console-in.json"; fail "the console reader could not sign in ($status)"; }
+console_token="$(json "$WORKDIR/admin-console-in.json" '["token"]')"
+
+# console_finds <query-string> <job-id> <name> — 1 when the job is on the page, 0 when it is not.
+console_finds() {
+  local found
+  status="$(admin_get "/v1/admin/jobs?$1" "$console_token" "$3")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-$3.json"; fail "searching jobs returned $status, want 200"; }
+  found="$(python3 - "$WORKDIR/admin-$3.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for j in (page.get("data") or []) if j["id"] == sys.argv[2]))
+PY
+)"
+  printf '%s' "$found"
+}
+
+[[ "$(console_finds "q=$console_term" "$console_job" console-term)" == "1" ]] \
+  || fail "a job could not be found by part of its goods description"
+ok "a job is found by part of its goods description"
+
+[[ "$(console_finds "q=$console_term&status=Delivered" "$console_job" console-status)" == "1" ]] \
+  || fail "a Delivered job is not found when filtering for Delivered jobs"
+[[ "$(console_finds "q=$console_term&status=Open" "$console_job" console-status-neg)" == "0" ]] \
+  || fail "a Delivered job came back from a search filtered to Open ones"
+ok "the status filter takes Docs/02 §1's stored form and finds the jobs in that status and only those"
+
+[[ "$(console_finds "customer=$dispute_customer_id&status=Delivered" "$console_job" console-customer)" == "1" ]] \
+  || fail "a job could not be found by its customer"
+[[ "$(console_finds "customer=$dispute_provider_id" "$console_job" console-customer-neg)" == "0" ]] \
+  || fail "a job came back from a search filtered to an account that does not own it"
+ok "and the customer filter narrows to one account's jobs"
+
+# An unrecognised status is refused rather than ignored, for the reason the account search refuses
+# an unrecognised standing: ignoring it answers with every job, which reads exactly like "the whole
+# marketplace is delivered" to somebody who mistyped one. 422, because it is a field-level
+# validation failure in validate.Errors' shape and not a malformed request.
+status="$(admin_get "/v1/admin/jobs?status=Delivred" "$console_token" console-bad-status)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-console-bad-status.json"; fail "a mistyped job status returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-console-bad-status.json")" == *'"status"'* ]] \
+  || { cat "$WORKDIR/admin-console-bad-status.json"; fail "the refusal does not name the field"; }
+[[ "$(cat "$WORKDIR/admin-console-bad-status.json")" == *'En route to pickup'* ]] \
+  || { cat "$WORKDIR/admin-console-bad-status.json"; fail "the refusal does not say what the statuses are"; }
+ok "a status the platform does not have is refused, names the field and lists the twelve — rather than answering with every job"
+
+status="$(admin_get "/v1/admin/jobs?customer=not-a-uuid" "$console_token" console-bad-customer)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-console-bad-customer.json"; fail "a malformed customer filter returned $status, want 422"; }
+ok "and so is a customer filter that is not an identifier"
+
+# --- a search term is a string, not a pattern ---------------------------------------------------
+#
+# The one defect here with a security shape, and the same one the account search carries. `%` is
+# LIKE's "anything", so an unescaped term of `%` returns every job in the marketplace to the
+# least-privileged role from one character in a search box.
+
+[[ "$(console_finds "q=%25" "$console_job" console-wildcard)" == "0" ]] \
+  || fail "a bare % matched every job, so the search term is being used as a LIKE pattern"
+ok "a bare wildcard matches nothing — a search term is a string somebody typed, not a pattern"
+
+# --- opening the job, which is the half the Done when is really about ----------------------------
+
+status="$(admin_get "/v1/admin/jobs/$console_job" "$console_token" console-open)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-console-open.json"; fail "opening a job returned $status, want 200"; }
+
+[[ "$(json "$WORKDIR/admin-console-open.json" '["job"]["id"]')" == "$console_job" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the detail view answered with the wrong job"; }
+[[ "$(json "$WORKDIR/admin-console-open.json" '["job"]["status"]')" == "Delivered" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the job's status is not the stored form the console filters on"; }
+ok "any job opens — there is no ownership scope on this endpoint, which is what Docs/01 §4.6 asks for"
+
+python3 - "$WORKDIR/admin-console-open.json" "$dispute_provider_id" >"$WORKDIR/console-detail.txt" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+bids, history = d["bids"], d["history"]
+accepted = [b for b in bids if b["status"] == "Accepted" and b["provider_id"] == sys.argv[2]]
+print(len(bids))
+print(len(history))
+print(accepted[0]["amount_cents"] if accepted else "")
+print(",".join(sorted(bids[0].keys())) if bids else "")
+print(",".join(sorted(history[0].keys())) if history else "")
+print(",".join(sorted(d["job"].keys())))
+print(history[0]["from"] + ">" + history[0]["to"] if history else "")
+print(history[-1]["to"] if history else "")
+PY
+console_bids="$(sed -n '1p' "$WORKDIR/console-detail.txt")"
+console_history="$(sed -n '2p' "$WORKDIR/console-detail.txt")"
+console_amount="$(sed -n '3p' "$WORKDIR/console-detail.txt")"
+
+[[ "$console_bids" == "1" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the detail view carries $console_bids bids, want the one that was accepted"; }
+[[ "$console_amount" == "45000" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the accepted bid's amount is $console_amount cents, want 45000 — numeric(12,2) converted in SQL"; }
+ok "the full bid history is on the job, with the amount in cents — Docs/02 §4's third reader, which had no route until there was an administrator"
+
+# Six transitions, because dispute_delivered_job makes six *moves*: Draft → Open → Awarded → En
+# route to pickup → Picked up → In transit → Delivered. Seven statuses, six rows — a job_status_history
+# row records a move rather than a state, and the Draft the job started in was never moved *into*.
+# Asserted as a count *and* by both ends, so a statement returning one row per join rather than one
+# per transition fails here.
+[[ "$console_history" == "6" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the detail view carries $console_history transitions, want 6"; }
+[[ "$(sed -n '7p' "$WORKDIR/console-detail.txt")" == "Draft>Open" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the history does not start where the job did"; }
+[[ "$(sed -n '8p' "$WORKDIR/console-detail.txt")" == "Delivered" ]] \
+  || { cat "$WORKDIR/admin-console-open.json"; fail "the history is not ordered oldest first on the platform's clock"; }
+ok "and the full status history, oldest first on the platform's clock rather than the device's (Docs/02 §3.1)"
+
+# --- the closed key sets, which are where a budget would arrive ----------------------------------
+#
+# Docs/01 §4.3's invariant names providers, so an administrator is not the audience it protects the
+# customer's maximum from — leaving it out is a decision (see internal/admin/jobsearch.go) and the
+# way it is kept is a closed key set rather than a search for the word "budget". SHIP-83 established
+# the axis: a field called `max_price` passes a spelling check and leaks the same fact.
+
+console_job_keys="$(sed -n '6p' "$WORKDIR/console-detail.txt")"
+[[ "$console_job_keys" == "bid_count,created_at,customer_id,expires_at,goods_description,id,status,updated_at" ]] \
+  || fail "the administrator's view of a job carries [$console_job_keys], which is not the closed set this shape is held to"
+
+console_bid_keys="$(sed -n '4p' "$WORKDIR/console-detail.txt")"
+[[ "$console_bid_keys" == "amount_cents,created_at,deliver_by,id,message,offered_by,pickup_at,provider_id,status,superseded_by,updated_at" ]] \
+  || fail "the administrator's view of a bid carries [$console_bid_keys], which is not the closed set this shape is held to"
+
+console_event_keys="$(sed -n '5p' "$WORKDIR/console-detail.txt")"
+[[ "$console_event_keys" == "actor_id,actor_recorded_at,actor_type,from,id,reason,server_recorded_at,to" ]] \
+  || fail "the administrator's view of a transition carries [$console_event_keys], which is not the closed set this shape is held to"
+ok "the job, the bid and the transition each carry a closed set of keys — no budget, no address and no contact detail on any of the three"
+
+# --- what a missing job answers, and what an unauthenticated caller does --------------------------
+
+status="$(admin_get "/v1/admin/jobs/$(uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')" "$console_token" console-missing)"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/admin-console-missing.json"; fail "opening a job that does not exist returned $status, want 404"; }
+ok "a job that does not exist is a 404 — and unlike the same answer on dispute intake, nothing is being kept from the caller"
+
+status="$(admin_get "/v1/admin/jobs?q=$console_term" "" console-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-console-nocred.json"; fail "the job search is readable without a credential ($status)"; }
+[[ "$(cat "$WORKDIR/admin-console-nocred.json")" != *"$console_term"* ]] \
+  || fail "a refused search returned jobs anyway"
+
+status="$(admin_get "/v1/admin/jobs/$console_job" "" console-open-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-console-open-nocred.json"; fail "a job is openable without a credential ($status)"; }
+ok "both routes are behind the administrator credential, like every other administrative route"
+
+# The other fixture exists so the search is a filter rather than a passthrough: a job with no
+# description never matches a term, which is the right answer because it has none to match.
+[[ "$(console_finds "q=$console_term" "$console_other" console-other)" == "0" ]] \
+  || fail "a job with no goods description matched a search term"
+ok "a draft with no goods description matches no term — NULL ILIKE is NULL, not a match on everything"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-165 — the immutable history, searchable by actor, target and date.
+#
+# # What only this section can show
+#
+# The Go suite drives the reader against a real database and is the stronger of the two — it writes
+# entries through the real [Auditor] and reads them back through the real statement. **What it cannot
+# show is that the wiring in cmd/api hands the handler a trail at all**: `adminHandler` builds one
+# from `d.Pool` and passes it in the services struct, and a change that passed a nil, or that built
+# the reader against a different pool, compiles and passes every Go test in the domain.
+#
+# It also shows the half that matters most operationally: the entries this **running service** wrote
+# for its own administrative actions are the ones the endpoint returns. A reader over a table nothing
+# populates would pass every filter test ever written.
+#
+# # Everything is fenced on this run's own administrator
+#
+# `audit_log` holds every previous run's entries and every other worktree's, so a count over the
+# table would be a statement about the machine. Every assertion below is on entries whose actor is an
+# account this section created.
+
+ticket "SHIP-165  the audit trail is searchable by actor, target and date"
+
+admin_clear_limits
+
+# An owner, because this section needs to *cause* audit entries as well as read them — and creating
+# an administrator is the one action that needs `admins.manage`. Reading needs only `audit.read`,
+# which the support administrator below is used to prove.
+trail_email="verify-admin-trail-$$@example.com"
+trail_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$trail_email', 'Verify Trail', '$admin_fixture_hash', 'owner')
+   returning id;")"
+[[ -n "$trail_id" ]] || fail "the trail fixture administrator could not be created"
+
+status="$(admin_signin "verify-adm-trail-in-$$" "$trail_email" "$admin_password" trail-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-trail-in.json"; fail "the trail fixture could not sign in ($status)"; }
+trail_token="$(json "$WORKDIR/admin-trail-in.json" '["token"]')"
+
+# One administrator created, which is the entry with a target and metadata worth reading back.
+trail_made_email="verify-admin-trail-made-$$@example.com"
+status="$(curl -s -X POST -o "$WORKDIR/admin-trail-made.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $trail_token" -H "Idempotency-Key: verify-adm-trail-made-$$" \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$trail_made_email\",\"name\":\"Trail Made\",\"password\":\"$admin_password\",\"role\":\"moderator\"}" \
+  "http://localhost:$VERIFY_PORT/v1/admin/administrators")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/admin-trail-made.json"; fail "creating an administrator returned $status, want 201"; }
+trail_made_id="$(json "$WORKDIR/admin-trail-made.json" '["id"]')"
+
+# A support administrator does the reading, because `audit.read` is held by every role: a trail only
+# the people it records can read is not a control.
+trail_reader_email="verify-admin-trail-reader-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$trail_reader_email', 'Verify Reader', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the trail reader could not be created"
+
+status="$(admin_signin "verify-adm-trail-read-$$" "$trail_reader_email" "$admin_password" trail-read)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-trail-read.json"; fail "the trail reader could not sign in ($status)"; }
+trail_reader_token="$(json "$WORKDIR/admin-trail-read.json" '["token"]')"
+
+# trail_actions <query-string> <name> — the actions on the page, comma separated, deduplicated.
+trail_actions() {
+  status="$(admin_get "/v1/admin/audit?$1" "$trail_reader_token" "$2")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-$2.json"; fail "reading the audit trail returned $status, want 200"; }
+  python3 - "$WORKDIR/admin-$2.json" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(",".join(sorted({e["action"] for e in (page.get("data") or [])})))
+PY
+}
+
+# --- by actor, which is the first question anybody asks of a trail --------------------------------
+
+trail_seen="$(trail_actions "actor=$trail_id&limit=50" trail-actor)"
+[[ "$trail_seen" == "administrator.created,administrator.signed_in" ]] \
+  || { cat "$WORKDIR/admin-trail-actor.json"; fail "a search by actor returned [$trail_seen], want this run's sign-in and creation and nothing else"; }
+ok "the trail is searchable by actor, and returns exactly what that administrator did — including the entries this running service wrote for its own actions"
+
+# The negative direction, which is the half a filter that does nothing would still pass. The reader
+# has signed in and so has an entry of its own; it must not appear under another actor.
+python3 - "$WORKDIR/admin-trail-actor.json" "$trail_id" >"$WORKDIR/trail-foreign.txt" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for e in (page.get("data") or []) if e["actor_id"] != sys.argv[2]))
+PY
+[[ "$(cat "$WORKDIR/trail-foreign.txt")" == "0" ]] \
+  || { cat "$WORKDIR/admin-trail-actor.json"; fail "a search by actor returned another administrator's entries, so the filter does nothing"; }
+ok "and only that administrator's — the other accounts this run signed in are not on the page"
+
+# --- by target ------------------------------------------------------------------------------------
+
+trail_seen="$(trail_actions "target=$trail_made_id&limit=50" trail-target)"
+[[ "$trail_seen" == "administrator.created" ]] \
+  || { cat "$WORKDIR/admin-trail-target.json"; fail "a search by target returned [$trail_seen], want the creation of that account alone"; }
+ok "and by target, which answers 'everything that ever happened to this' without the caller knowing what kind of thing it is"
+
+# --- by action, and by date -----------------------------------------------------------------------
+
+trail_seen="$(trail_actions "actor=$trail_id&action=administrator.created&limit=50" trail-action)"
+[[ "$trail_seen" == "administrator.created" ]] \
+  || { cat "$WORKDIR/admin-trail-action.json"; fail "a search by action returned [$trail_seen]"; }
+ok "and by action — the column 000003 made a stable identifier rather than a sentence, so that this search exists"
+
+# Today, as a bare day. A support engineer types a date and a console sends an instant, and both are
+# accepted; `from` is inclusive and `to` is exclusive so consecutive days tile without overlapping.
+trail_today="$("$PSQL" "$DATABASE_URL" -qtAc "select to_char(now() at time zone 'utc', 'YYYY-MM-DD');")"
+trail_tomorrow="$("$PSQL" "$DATABASE_URL" -qtAc "select to_char((now() at time zone 'utc') + interval '1 day', 'YYYY-MM-DD');")"
+
+trail_seen="$(trail_actions "actor=$trail_id&from=$trail_today&to=$trail_tomorrow&limit=50" trail-today)"
+[[ "$trail_seen" == "administrator.created,administrator.signed_in" ]] \
+  || { cat "$WORKDIR/admin-trail-today.json"; fail "a search bounded to today returned [$trail_seen]"; }
+
+trail_seen="$(trail_actions "actor=$trail_id&from=$trail_tomorrow&limit=50" trail-tomorrow)"
+[[ -z "$trail_seen" ]] \
+  || { cat "$WORKDIR/admin-trail-tomorrow.json"; fail "a search starting tomorrow returned [$trail_seen], so the lower bound does nothing"; }
+ok "and by date, as a bare day — the bounds are half-open, so nothing written today falls inside a window that starts tomorrow"
+
+# --- what an entry carries, and that it is exactly what was written --------------------------------
+
+status="$(admin_get "/v1/admin/audit?target=$trail_made_id" "$trail_reader_token" trail-entry)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-trail-entry.json"; fail "reading the audit trail returned $status"; }
+
+python3 - "$WORKDIR/admin-trail-entry.json" "$trail_id" "$trail_made_id" >"$WORKDIR/trail-entry.txt" <<'PY'
+import json, sys
+e = (json.load(open(sys.argv[1])).get("data") or [None])[0]
+if e is None:
+    print("MISSING"); raise SystemExit
+print(",".join(sorted(e.keys())))
+print(e["actor_type"])
+print("actor-ok" if e["actor_id"] == sys.argv[2] else "actor-" + str(e["actor_id"]))
+print("target-ok" if e["target_id"] == sys.argv[3] else "target-" + str(e["target_id"]))
+print(e["target_type"])
+# The role granted, which is the field an entry about a created administrator most needs — a
+# record that an account was made without saying what it may do is half a fact. Asserted by key
+# rather than as the whole object, because the writer also records the address and a whole-object
+# comparison would make this section fail the next time somebody adds a field to the metadata.
+print(str(e["metadata"].get("role")))
+print("object" if isinstance(e["metadata"], dict) else "not-an-object")
+PY
+trail_keys="$(sed -n '1p' "$WORKDIR/trail-entry.txt")"
+[[ "$trail_keys" == "action,actor_id,actor_type,created_at,id,metadata,reason,target_id,target_type" ]] \
+  || { cat "$WORKDIR/admin-trail-entry.json"; fail "an audit entry carries [$trail_keys], which is not every column of the row"; }
+[[ "$(sed -n '2p' "$WORKDIR/trail-entry.txt")" == "admin" ]] || fail "the entry does not say an administrator acted"
+[[ "$(sed -n '3p' "$WORKDIR/trail-entry.txt")" == "actor-ok" ]] || fail "the entry does not name the administrator who acted"
+[[ "$(sed -n '4p' "$WORKDIR/trail-entry.txt")" == "target-ok" ]] || fail "the entry does not name the account that was created"
+[[ "$(sed -n '5p' "$WORKDIR/trail-entry.txt")" == "administrator" ]] || fail "the entry does not say what kind of thing it names"
+[[ "$(sed -n '6p' "$WORKDIR/trail-entry.txt")" == "moderator" ]] \
+  || { cat "$WORKDIR/admin-trail-entry.json"; fail "the metadata does not carry the role that was granted: $(sed -n '6p' "$WORKDIR/trail-entry.txt")"; }
+[[ "$(sed -n '7p' "$WORKDIR/trail-entry.txt")" == "object" ]] \
+  || { cat "$WORKDIR/admin-trail-entry.json"; fail "the metadata is not a JSON object; null is what a console renders by crashing"; }
+ok "an entry carries every column of the row, including the metadata as the object that was written — a viewer that redacted would be a second record"
+
+# --- the filters are refused rather than ignored ---------------------------------------------------
+#
+# The direction that matters most for this endpoint. An ignored filter answers with the whole trail,
+# and a support engineer who mistyped an action would read "no entries" as "it never happened".
+
+status="$(admin_get "/v1/admin/audit?action=administrator.deleted" "$trail_reader_token" trail-bad-action)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-trail-bad-action.json"; fail "an action nothing records returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-trail-bad-action.json")" == *'"action"'* ]] \
+  || { cat "$WORKDIR/admin-trail-bad-action.json"; fail "the refusal does not name the field"; }
+
+status="$(admin_get "/v1/admin/audit?from=last%20Tuesday" "$trail_reader_token" trail-bad-date)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-trail-bad-date.json"; fail "a date that is not a date returned $status, want 422"; }
+
+status="$(admin_get "/v1/admin/audit?from=$trail_tomorrow&to=$trail_today" "$trail_reader_token" trail-bad-range)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-trail-bad-range.json"; fail "an inverted range returned $status, want 422"; }
+ok "an action nothing records, a date that is not a date and a range that ends before it starts are each refused and name their field"
+
+# --- the invariant this ticket is most able to break -----------------------------------------------
+#
+# CLAUDE.md: audit entries are append-only and ordinary administrators cannot delete them. SHIP-165
+# is the ticket that gives the trail a reader, and the obvious next thing somebody adds is a way to
+# correct one. There is no such route, and the four verbs are refused on the path that exists.
+
+for verb in POST PUT PATCH DELETE; do
+  status="$(curl -s -X "$verb" -o "$WORKDIR/admin-trail-$verb.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $trail_reader_token" -H "Idempotency-Key: verify-adm-trail-$verb-$$" \
+    -H 'Content-Type: application/json' -d '{}' \
+    "http://localhost:$VERIFY_PORT/v1/admin/audit")"
+  [[ "$status" == "404" || "$status" == "405" ]] \
+    || { cat "$WORKDIR/admin-trail-$verb.json"; fail "$verb on the audit trail returned $status; the trail is append-only and no route may change it"; }
+done
+ok "no verb but GET is served on the trail — entries are written by the actions that cause them, in the transaction that performs them, and never by a request"
+
+status="$(admin_get "/v1/admin/audit" "" trail-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-trail-nocred.json"; fail "the audit trail is readable without a credential ($status)"; }
+[[ "$(cat "$WORKDIR/admin-trail-nocred.json")" != *"$trail_id"* ]] \
+  || fail "a refused request returned entries anyway"
+ok "and the trail is behind the administrator credential — without one it would be a public list of who runs the platform and what they touch"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-160 — unpublishing a policy-breaching job, and SHIP-161 — restricting or suspending an
+# account.
+#
+# # What only this section can show
+#
+# Two things, and the second is the one the Go suite structurally cannot reach.
+#
+# The composition root's half: `adminHandler` builds the enforcement service from the same
+# `disputeLifecycle` adapter the dispute workflow uses, and `disputeLifecycle.Unpublish` is the
+# translation between `jobs`' sentinels and `admin.JobMove`. `internal/admin`'s tests use their own
+# copy of that adapter, so a change that wired a different lifecycle, or that mistranslated
+# `ErrTransitionNotPermitted`, compiles and passes every Go test in the domain.
+#
+# **And SHIP-161's enforcement, which lives in `internal/identity`.** The *Done when* is "account
+# access is limited or disabled", and no test in `internal/admin` can show that: the domain writes a
+# column, and whether a suspended account can still sign in is a question for a different domain's
+# code, through the real HTTP surface, against the real running service. That is demonstrated here
+# or nowhere.
+#
+# # Everything is fenced on rows this run created
+#
+# `jobs`, `users` and `audit_log` are shared with every previous run and every other worktree, so
+# every assertion below is on identifiers this section made.
+
+# **Every key below is prefixed `verify-adm160-` or `verify-adm161-`, and that is not cosmetic.**
+# `dispute_draft <name>` sends `verify-adm-<name>-$$` and `admin_signin <key>` sends the key it is
+# handed, so a section reusing one string across two different bodies is answered
+# `idempotency_key_reused` by the middleware — a 409 where the check expects a 403, which reads as a
+# broken endpoint rather than as two requests sharing a key. This section paid for that once.
+
+ticket "SHIP-160  an administrator unpublishes a policy-breaching job, with a recorded reason"
+
+admin_clear_limits
+
+# A moderator, because `jobs.unpublish` is held by `moderator` and `owner` and not by `support` —
+# the split that makes Docs/04 §9's least-privilege control real rather than nominal.
+unpub_email="verify-admin-unpub-$$@example.com"
+unpub_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$unpub_email', 'Verify Moderator', '$admin_fixture_hash', 'moderator')
+   returning id;")"
+[[ -n "$unpub_id" ]] || fail "the unpublishing moderator could not be created"
+
+status="$(admin_signin "verify-adm160-signin-$$" "$unpub_email" "$admin_password" unpub-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-unpub-in.json"; fail "the moderator could not sign in ($status)"; }
+unpub_token="$(json "$WORKDIR/admin-unpub-in.json" '["token"]')"
+
+# A support administrator too, for the permission check below.
+unpub_support_email="verify-admin-unpub-sup-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$unpub_support_email', 'Verify Support', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the support administrator could not be created"
+status="$(admin_signin "verify-adm160-supsignin-$$" "$unpub_support_email" "$admin_password" unpub-sup)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-unpub-sup.json"; fail "the support administrator could not sign in ($status)"; }
+unpub_support_token="$(json "$WORKDIR/admin-unpub-sup.json" '["token"]')"
+
+# unpublish <token> <key> <job-id> <body> <name> — one attempt, answering with its status.
+unpublish() {
+  curl -s -X POST -o "$WORKDIR/unpub-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT/v1/admin/jobs/$3/unpublish"
+}
+
+unpub_reason="Listing offers to transport a live animal, which Docs 05 prohibits."
+unpub_body="{\"reason\":\"$unpub_reason\"}"
+
+# An Open job: published, nobody committed. dispute_draft creates it and one guarded move publishes.
+unpub_job="$(dispute_draft ship160job)"
+dispute_move "$unpub_job" Draft Open
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$unpub_job';")" == "Open" ]] \
+  || fail "the fixture job is not Open, so nothing below is testing what it claims"
+
+# --- the permission, before anything succeeds -----------------------------------------------------
+
+status="$(unpublish "$unpub_support_token" "verify-adm160-suptry-$$" "$unpub_job" "$unpub_body" sup)"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/unpub-sup.json"; fail "a support administrator unpublished a job and got $status, want 403"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$unpub_job';")" == "Open" ]] \
+  || fail "a refused removal moved the job anyway"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from audit_log where target_id = '$unpub_job';")" == "0" ]] \
+  || fail "a refused removal wrote an audit entry, in a table nothing can correct"
+ok "a support administrator may open any job and may not remove one — two permissions on two endpoints, which is what makes least privilege real"
+
+# --- a reason that records nothing is refused -----------------------------------------------------
+
+status="$(unpublish "$unpub_token" "verify-adm160-noreason-$$" "$unpub_job" '{"reason":""}' noreason)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/unpub-noreason.json"; fail "an empty reason returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/unpub-noreason.json")" == *'"reason"'* ]] \
+  || { cat "$WORKDIR/unpub-noreason.json"; fail "the refusal does not name the field"; }
+
+status="$(unpublish "$unpub_token" "verify-adm160-short-$$" "$unpub_job" '{"reason":"spam"}' short)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/unpub-short.json"; fail "a four-character reason returned $status, want 422"; }
+ok "an empty reason and one too short to record anything are both refused and name the field — a required field satisfied by one character is not a recorded reason"
+
+# --- the removal itself ----------------------------------------------------------------------------
+
+status="$(unpublish "$unpub_token" "verify-adm160-remove-$$" "$unpub_job" "$unpub_body" ok)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/unpub-ok.json"; fail "unpublishing returned $status, want 200"; }
+[[ "$(json "$WORKDIR/unpub-ok.json" '["status"]')" == "Cancelled" ]] \
+  || { cat "$WORKDIR/unpub-ok.json"; fail "the response does not say the job was cancelled"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$unpub_job';")" == "Cancelled" ]] \
+  || fail "the job is not Cancelled"
+ok "a published job is removed by moving it to Cancelled through the one guarded transition — there is no unpublished status and no hidden flag"
+
+# The transition went through the guard, attributed to an administrator, with the reason. A bare
+# UPDATE would have been refused by 000402, so reaching Cancelled at all is half the claim; that it
+# is recorded against an *admin* rather than the customer is the other half.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from job_status_history
+    where job_id = '$unpub_job' and to_status = 'Cancelled'
+      and actor_type = 'admin' and actor_id = '$unpub_id'
+      and reason = '$unpub_reason';")" == "1" ]] \
+  || fail "the transition is not recorded against the administrator with the reason they gave"
+ok "and the job's status history names the administrator and says why — which is what a customer's support conversation reads"
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$unpub_job' and target_type = 'job'
+      and action = 'job.unpublished' and actor_type = 'admin'
+      and actor_id = '$unpub_id' and reason = '$unpub_reason';")" == "1" ]] \
+  || fail "the removal wrote no audit entry naming the job, the administrator and the reason"
+ok "and the audit log records the same reason against the administrator — two tables, two readers, and neither has to find the other"
+
+# --- the customer is notified, and no new event arranges it ------------------------------------------
+#
+# The last clause of the *Done when*. The guarded transition emits `job.status_changed` in the same
+# transaction and `notifications.StatusRules` routes a move to Cancelled to the job's customer and
+# the awarded provider. **No `admin.job_unpublished` event was added**, which is the finding rather
+# than a shortcut: a second announcement of one state change is the failure those rules exist to
+# prevent. Fenced on this job's aggregate id rather than on a count or a timestamp, because the
+# outbox is shared with every other worktree.
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from outbox
+    where aggregate_id = '$unpub_job' and event_type = 'job.status_changed'
+      and payload->>'to' = 'Cancelled' and payload->>'actor_type' = 'admin';")" == "1" ]] \
+  || fail "the removal emitted no job.status_changed to Cancelled, so nothing tells the customer"
+ok "the removal emits job.status_changed to Cancelled — which notifications already routes to the customer, so the customer is notified without a second event about one state change"
+
+# --- a second attempt, and a job past the point ------------------------------------------------------
+
+status="$(unpublish "$unpub_token" "verify-adm160-again-$$" "$unpub_job" "$unpub_body" again)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/unpub-again.json"; fail "unpublishing an already-removed job returned $status, want 409"; }
+[[ "$(cat "$WORKDIR/unpub-again.json")" == *'admin_job_already_unpublished'* ]] \
+  || { cat "$WORKDIR/unpub-again.json"; fail "the refusal does not say the job was already removed"; }
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from audit_log where target_id = '$unpub_job';")" == "1" ]] \
+  || fail "a second attempt wrote a second entry, so the trail says the job was taken down twice"
+ok "a job somebody has already removed answers with its own code and writes nothing — the ordinary outcome of two moderators reading one queue"
+
+# An awarded job. Docs/02 §2 offers no route from Awarded to Cancelled: a provider has committed,
+# and Docs/02 §6.2 makes ending it a support case rather than a status change.
+unpub_awarded="$(dispute_draft ship160awarded)"
+dispute_move "$unpub_awarded" Draft Open
+dispute_move "$unpub_awarded" Open Awarded
+dispute_award "$unpub_awarded" "$dispute_provider_id"
+
+status="$(unpublish "$unpub_token" "verify-adm160-awarded-$$" "$unpub_awarded" "$unpub_body" awarded)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/unpub-awarded.json"; fail "unpublishing an awarded job returned $status, want 409"; }
+[[ "$(cat "$WORKDIR/unpub-awarded.json")" == *'admin_job_not_unpublishable'* ]] \
+  || { cat "$WORKDIR/unpub-awarded.json"; fail "the refusal does not carry the code a console branches on"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$unpub_awarded';")" == "Awarded" ]] \
+  || fail "a refused removal moved an awarded job"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from audit_log where target_id = '$unpub_awarded';")" == "0" ]] \
+  || fail "a refused removal wrote an audit entry"
+ok "an awarded job cannot be unpublished — Docs/02 §2 has no such row, and the administrator's path is a dispute they then resolve"
+
+status="$(curl -s -X POST -o "$WORKDIR/unpub-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $unpub_token" -H 'Content-Type: application/json' -d "$unpub_body" \
+  "http://localhost:$VERIFY_PORT/v1/admin/jobs/$unpub_job/unpublish")"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/unpub-nokey.json"; fail "unpublishing without an Idempotency-Key returned $status, want 400"; }
+ok "and it is refused without an Idempotency-Key — a retry after a dropped connection must not write a second entry into a table nothing can tidy"
+
+admin_clear_limits
+
+# ==========================================================================================
+ticket "SHIP-161  an administrator restricts or suspends an account, and the account loses access"
+
+admin_clear_limits
+
+# **This is the one section in this file that signs a *user* in**, and SHIP-47 limits failed
+# sign-ins per account and per network address — every request in `make verify` arrives from
+# 127.0.0.1, so one address bucket is shared with 40-identity.sh, with every other section and with
+# every previous run. The deliberate 403 below counts against it. Cleared here for the reason
+# 40-identity.sh clears it at the point sign-ins begin: a run that ended part-way through would
+# otherwise leave the bucket full and the *next* run would fail with a 429 that looks like a broken
+# endpoint.
+#
+# `admin_clear_limits` above clears `rl:v1:admin-signin:*`, which is a separate keyspace — an
+# administrator's failures and a user's against one address are separate allowances (see
+# credentials.go). This clears the user one.
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
+# standing <token> <key> <user-id> <body> <name> — one attempt, answering with its status.
+standing() {
+  curl -s -X POST -o "$WORKDIR/stand-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT/v1/admin/users/$3/standing"
+}
+
+# A real registered account, because the second half of this ticket is what happens when it tries to
+# use the platform — and that needs a password the sign-in endpoint will accept.
+stand_email="verify-standing-$$@example.com"
+stand_password="correct-horse-battery-staple"
+status="$(post_json "verify-adm161-register-$$" /v1/auth/register \
+  "{\"email\":\"$stand_email\",\"phone\":\"04195$$\",\"password\":\"$stand_password\",\"role\":\"provider\"}" \
+  "$WORKDIR/standing-user.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/standing-user.json"; fail "could not register the account: $status"; }
+stand_user_id="$(json "$WORKDIR/standing-user.json" '["id"]')"
+
+# --- the permission ---------------------------------------------------------------------------------
+
+stand_reason="Two unresolved no-shows in a fortnight; see the delivery exception queue."
+stand_body="{\"standing\":\"suspended\",\"reason\":\"$stand_reason\"}"
+
+status="$(standing "$unpub_support_token" "verify-adm161-sup-$$" "$stand_user_id" "$stand_body" sup)"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/stand-sup.json"; fail "a support administrator suspended an account and got $status, want 403"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from users where id = '$stand_user_id';")" == "active" ]] \
+  || fail "a refused change altered the account anyway"
+ok "a support administrator may search accounts and may not restrict one — the other half of the same least-privilege split"
+
+# --- a standing the platform does not have, and a reason that records nothing -------------------------
+
+status="$(standing "$unpub_token" "verify-adm161-bad-$$" "$stand_user_id" \
+  '{"standing":"banned","reason":"Repeated policy breaches on delivery."}' bad)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/stand-bad.json"; fail "a standing the platform does not have returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/stand-bad.json")" == *'"standing"'* ]] \
+  || { cat "$WORKDIR/stand-bad.json"; fail "the refusal does not name the field"; }
+
+status="$(standing "$unpub_token" "verify-adm161-noreason-$$" "$stand_user_id" \
+  '{"standing":"suspended","reason":"bad"}' noreason)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/stand-noreason.json"; fail "a reason that records nothing returned $status, want 422"; }
+ok "a standing outside ck_users_status's three and a reason too short to record anything are both refused and name their field"
+
+# --- the account can use the platform, and then cannot ------------------------------------------------
+#
+# **This is the pair no Go test in internal/admin can make.** The domain writes a column; whether a
+# suspended account can still sign in is internal/identity's code, and the two only meet in the
+# running service.
+
+status="$(post_json "verify-adm161-login1-$$" /v1/auth/login \
+  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-before.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-before.json"; fail "the account could not sign in before being suspended ($status)"; }
+stand_refresh="$(json "$WORKDIR/stand-login-before.json" '["refresh_token"]')"
+ok "the account signs in while it is active, which is the precondition the next check needs"
+
+status="$(standing "$unpub_token" "verify-adm161-suspend-$$" "$stand_user_id" "$stand_body" susp)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-susp.json"; fail "suspending returned $status, want 200"; }
+[[ "$(json "$WORKDIR/stand-susp.json" '["from"]')" == "active" ]] \
+  || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account held before"; }
+[[ "$(json "$WORKDIR/stand-susp.json" '["to"]')" == "suspended" ]] \
+  || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account holds now"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from users where id = '$stand_user_id';")" == "suspended" ]] \
+  || fail "the account is not suspended"
+ok "an account is suspended, and the response carries both ends — a console rendering only the new standing cannot tell a tightening from a loosening"
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$stand_user_id' and target_type = 'user'
+      and action = 'user.standing_changed' and actor_id = '$unpub_id'
+      and reason = '$stand_reason'
+      and metadata->>'from' = 'active' and metadata->>'to' = 'suspended';")" == "1" ]] \
+  || fail "the change wrote no audit entry carrying the reason and both ends"
+ok "and the audit entry names the account, the administrator, the reason and both ends of the change"
+
+# The enforcement. Sign-in is refused, and so is refresh — which is where a suspension actually takes
+# effect, because an access token lives fifteen minutes and carries no standing.
+status="$(post_json "verify-adm161-login2-$$" /v1/auth/login \
+  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-after.json")"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/stand-login-after.json"; fail "a suspended account signed in and got $status, want 403"; }
+
+status="$(post_json "verify-adm161-refresh-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$stand_refresh\"}" "$WORKDIR/stand-refresh.json")"
+[[ "$status" != "200" ]] \
+  || { cat "$WORKDIR/stand-refresh.json"; fail "a suspended account refreshed its session, so the suspension does not take effect until the token expires"; }
+ok "the suspended account can no longer sign in, and the session it already had cannot be refreshed — 'account access is disabled', on the wire"
+
+# --- a no-op, and putting the account back ------------------------------------------------------------
+
+status="$(standing "$unpub_token" "verify-adm161-noop-$$" "$stand_user_id" "$stand_body" noop)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/stand-noop.json"; fail "setting the standing it already holds returned $status, want 409"; }
+[[ "$(cat "$WORKDIR/stand-noop.json")" == *'admin_user_standing_unchanged'* ]] \
+  || { cat "$WORKDIR/stand-noop.json"; fail "the refusal does not carry the code a console branches on"; }
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log where target_id = '$stand_user_id';")" == "1" ]] \
+  || fail "a no-op wrote a second entry, in a table whose value is that everything in it happened"
+ok "setting the standing an account already holds is refused rather than recorded — an entry saying suspended to suspended is noise in the one table that must be all signal"
+
+status="$(standing "$unpub_token" "verify-adm161-reinstate-$$" "$stand_user_id" \
+  '{"standing":"active","reason":"No-shows explained and evidenced; access restored after review."}' back)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-back.json"; fail "reinstating returned $status, want 200"; }
+[[ "$(json "$WORKDIR/stand-back.json" '["from"]')" == "suspended" ]] \
+  || { cat "$WORKDIR/stand-back.json"; fail "the reinstatement does not say what the account held"; }
+
+status="$(post_json "verify-adm161-login3-$$" /v1/auth/login \
+  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-back.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-back.json"; fail "a reinstated account cannot sign in ($status)"; }
+ok "and reinstatement is the same endpoint, the same permission and the same audit action — a trail recording a restriction but not its reversal makes a person look permanently suspect"
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$stand_user_id' and action = 'user.standing_changed';")" == "2" ]] \
+  || fail "the reinstatement is not on the trail beside the suspension"
+
+# `restricted` is the limited half, and it is not `suspended`: a restricted account may still sign
+# in and read, which is the point — somebody who cannot sign in cannot read why they are restricted.
+status="$(standing "$unpub_token" "verify-adm161-restrict-$$" "$stand_user_id" \
+  '{"standing":"restricted","reason":"Insurance certificate expired; bidding paused until renewed."}' restr)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-restr.json"; fail "restricting returned $status, want 200"; }
+
+status="$(post_json "verify-adm161-login4-$$" /v1/auth/login \
+  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-restr.json")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/stand-login-restr.json"; fail "a restricted account cannot sign in ($status); restricted is limited access, not disabled access"; }
+ok "a restricted account still signs in and a suspended one does not — 'limited or disabled' is two standings, and an account that cannot sign in cannot read why it is restricted"
+
+status="$(standing "$unpub_token" "verify-adm161-missing-$$" \
+  "$(uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')" "$stand_body" missing)"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/stand-missing.json"; fail "an account that does not exist returned $status, want 404"; }
+ok "an account that does not exist is a plain 404 — the caller is an administrator, and unlike dispute intake nothing is being kept from them"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-162 — internal support notes.
+#
+# # What only this section can show, and it is the whole second half of the ticket
+#
+# The *Done when* is two claims. "Notes attach to a user or a job" is established by the Go suite in
+# `internal/admin`, which drives both handlers against a real database.
+#
+# **"And are never user-visible" cannot be established there at all.** Every test in that package
+# drives an *administrative* handler, so a note not appearing in an administrative response proves
+# nothing — the interesting claim is about a **customer's** endpoint, in a different domain, reached
+# with a different credential. So this section writes a note on a job and then reads that job back
+# **as its customer**, over HTTP, and fails if the note's text appears anywhere in the response.
+#
+# That check survives somebody widening the customer's job shape later, which is the failure mode
+# the claim actually has: nobody sets out to publish a support note, they add a field.
+#
+# # Everything is fenced on rows this run created
+#
+# The note body carries this run's process id, so the absence check below is an assertion about a
+# string that exists nowhere else in the database.
+
+ticket "SHIP-162  support notes attach to a user or a job and are never user-visible"
+
+admin_clear_limits
+
+# note_add <token> <key> <body-json> <name> — one attempt, answering with its status.
+note_add() {
+  curl -s -X POST -o "$WORKDIR/note-$4.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$3" \
+    "http://localhost:$VERIFY_PORT/v1/admin/notes"
+}
+
+# note_read <token> <subject-type> <subject-id> <name> — one read, answering with its status.
+note_read() {
+  curl -s -o "$WORKDIR/note-$4.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/admin/notes?subject_type=$2&subject_id=$3"
+}
+
+# The moderator and the support administrator this file already created for SHIP-160 — `notes.write`
+# is a moderator's and reading is gated on the *subject's* read permission, which every role holds.
+note_secret="conf1dential-$$-do-not-show-the-customer"
+note_job="$(dispute_draft ship162job)"
+note_body="{\"subject_type\":\"job\",\"subject_id\":\"$note_job\",\"body\":\"$note_secret — escalated to the insurer, do not discuss with the customer.\"}"
+
+status="$(note_add "$unpub_token" "verify-adm162-add-$$" "$note_body" add)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-add.json"; fail "adding a note returned $status, want 201"; }
+[[ "$(json "$WORKDIR/note-add.json" '["subject_type"]')" == "job" ]] \
+  || { cat "$WORKDIR/note-add.json"; fail "the note is not attached to a job"; }
+[[ "$(json "$WORKDIR/note-add.json" '["subject_id"]')" == "$note_job" ]] \
+  || { cat "$WORKDIR/note-add.json"; fail "the note is attached to the wrong job"; }
+[[ "$(json "$WORKDIR/note-add.json" '["author_id"]')" == "$unpub_id" ]] \
+  || { cat "$WORKDIR/note-add.json"; fail "the note does not name the administrator who wrote it"; }
+ok "a support note attaches to a job and names the administrator who wrote it"
+
+# A note on a user, through the same endpoint. Both kinds, because a polymorphic subject with one
+# kind exercised is a column that happens to hold one value.
+note_user_body="{\"subject_type\":\"user\",\"subject_id\":\"$stand_user_id\",\"body\":\"$note_secret — two no-shows; watch the next booking.\"}"
+status="$(note_add "$unpub_token" "verify-adm162-adduser-$$" "$note_user_body" adduser)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-adduser.json"; fail "adding a note on a user returned $status, want 201"; }
+ok "and to a user, through the same endpoint — one place the never-user-visible rule has to hold rather than two"
+
+# --- the audit entry names the subject, not the note ------------------------------------------------
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$note_job' and target_type = 'job'
+      and action = 'note.added' and actor_id = '$unpub_id'
+      and metadata ? 'note_id';")" == "1" ]] \
+  || fail "adding a note wrote no audit entry naming the job it was about"
+
+# And the body is deliberately NOT in the entry: audit_log is append-only and admin_notes is not, so
+# a copy there would be an uncorrectable copy of a correctable record.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log where target_id = '$note_job' and metadata::text like '%$note_secret%';")" == "0" ]] \
+  || fail "the note's body was copied into the audit trail, which nothing can rewrite"
+ok "the entry names the subject rather than the note, carries the note's id and does not carry its body — so 'everything that happened to this job' includes the notes without copying them into a table nothing can correct"
+
+# --- reading them back, and the permission split ------------------------------------------------------
+
+status="$(note_read "$unpub_support_token" job "$note_job" readsup)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-readsup.json"; fail "a support administrator could not read notes ($status)"; }
+[[ "$(cat "$WORKDIR/note-readsup.json")" == *"$note_secret"* ]] \
+  || { cat "$WORKDIR/note-readsup.json"; fail "the note is not in what support reads back"; }
+
+status="$(note_add "$unpub_support_token" "verify-adm162-supwrite-$$" "$note_body" supwrite)"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/note-supwrite.json"; fail "a support administrator added a note and got $status, want 403"; }
+ok "a support administrator reads the history and cannot add to it — reading is gated on the subject's own permission, which every role holds, and writing on notes.write, which support does not"
+
+# A subject with no notes is an empty list rather than a 404: the subject is deliberately not looked
+# up, so "no notes" and "no such subject" are the same answer here.
+status="$(note_read "$unpub_token" user "$(uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')" readempty)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-readempty.json"; fail "reading notes on a subject with none returned $status, want 200"; }
+[[ "$(cat "$WORKDIR/note-readempty.json")" == *'"data":[]'* ]] \
+  || { cat "$WORKDIR/note-readempty.json"; fail "an empty history is not an empty array; null crashes a console that iterates"; }
+ok "a subject with no notes answers with an empty array rather than a 404 — the subject is not looked up, because a note outlives it"
+
+# --- the claim the Go suite structurally cannot make --------------------------------------------------
+#
+# Read the job back **as its customer**, with the mobile credential, and fail if the note is anywhere
+# in the response. This is an assertion about internal/jobs' endpoint rather than about this one,
+# which is why it survives somebody widening that shape later.
+
+status="$(curl -s -o "$WORKDIR/note-customer-job.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $dispute_customer_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$note_job")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/note-customer-job.json"; fail "the customer could not read their own job ($status), so the check below would pass vacuously"; }
+[[ "$(cat "$WORKDIR/note-customer-job.json")" != *"$note_secret"* ]] \
+  || { cat "$WORKDIR/note-customer-job.json"; fail "a support note appeared in the customer's own view of their job"; }
+ok "the job's customer reads their own job and the note is not in it — the claim no test in internal/admin can make, because it is about another domain's endpoint"
+
+# The same job through the customer's list, which is a different shape built by a different query.
+status="$(curl -s -o "$WORKDIR/note-customer-list.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $dispute_customer_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs?limit=50")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-customer-list.json"; fail "the customer could not list their jobs ($status)"; }
+[[ "$(cat "$WORKDIR/note-customer-list.json")" != *"$note_secret"* ]] \
+  || { cat "$WORKDIR/note-customer-list.json"; fail "a support note appeared in the customer's job list"; }
+ok "and it is not in their job list either — two shapes, two queries, and the note is in neither"
+
+# --- a note that records nothing, and one about something the platform does not have -------------------
+
+status="$(note_add "$unpub_token" "verify-adm162-empty-$$" \
+  "{\"subject_type\":\"job\",\"subject_id\":\"$note_job\",\"body\":\"   \"}" empty)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/note-empty.json"; fail "an empty note returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/note-empty.json")" == *'"body"'* ]] \
+  || { cat "$WORKDIR/note-empty.json"; fail "the refusal does not name the field"; }
+
+status="$(note_add "$unpub_token" "verify-adm162-badsubj-$$" \
+  "{\"subject_type\":\"administrator\",\"subject_id\":\"$unpub_id\",\"body\":\"About a colleague.\"}" badsubj)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/note-badsubj.json"; fail "a note about an administrator returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/note-badsubj.json")" == *'"subject_type"'* ]] \
+  || { cat "$WORKDIR/note-badsubj.json"; fail "the refusal does not name the field"; }
+ok "a note with nothing in it and one about a kind of thing this table does not hold are both refused and name their field"
+
+status="$(note_read "" job "$note_job" nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/note-nocred.json"; fail "notes are readable without a credential ($status)"; }
+[[ "$(cat "$WORKDIR/note-nocred.json")" != *"$note_secret"* ]] \
+  || fail "a refused read returned the note anyway"
+ok "and the history is behind the administrator credential — without one it would be a public file on every customer the platform has had a problem with"
+
+admin_clear_limits

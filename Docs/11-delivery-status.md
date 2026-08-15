@@ -379,7 +379,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **714 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **747 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -577,6 +577,11 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-167** | M7 | `GET /v1/app/minimum-version`, configuration-driven |
 | **SHIP-168** | M7 | Flutter launch-time version gate — the app asks the floor at launch and **replaces itself** below it, in **two shapes**: with a store link, and without one, which is the shape the pilot actually ships. An **unreachable API does not block**, because the gate is a courtesy and `/v1` refusing the build is the control. The running build's number is the **native** one, read rather than duplicated into a define — *see below* |
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
+| **SHIP-152** | M6 | `GET /v1/admin/jobs` and `GET /v1/admin/jobs/{id}` — search by description, status and customer; open **any** job with every bid and every recorded transition, read in **one snapshot** so a console cannot render an `Awarded` header above a bid list with nothing accepted. The statements are in `cmd/api` because they span two other domains' tables, which is the line `postgres_users.go` drew. **Bid amounts are here and the budget is not** — Docs/02 §4 names the administrator as bid history's third reader, and leaving the budget out is a *decision* with SHIP-164 named as its revisit — *see below* |
+| **SHIP-165** | M6 | `GET /v1/admin/audit` — the trail SHIP-150 writes, searchable by actor, target, date and **action**. The reader is a **second type** rather than a method on `Auditor`, so one can only append and the other can only read; there is no `UPDATE` or `DELETE` anywhere in the package and no verb but `GET` on the path. The date bounds are **half-open** so consecutive days tile, and the cursor is two-column because every entry in one transaction shares an instant **by design** — *see below* |
+| **SHIP-160** | M6 | `POST /v1/admin/jobs/{id}/unpublish` — the job moves to `Cancelled` through the one guarded transition, with the reason written into **both** `job_status_history` and `audit_log`. **No new domain event and no `internal/notifications` edit**: the transition already emits `job.status_changed`, which `StatusRules` routes to the customer, so "and the customer notified" is a consequence of the move rather than a second announcement of it. An **awarded** job is refused — Docs/02 §2 has no such row — *see below* |
+| **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
+| **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -11537,6 +11542,352 @@ an "other jobs" count.
 
 The page size is server configuration and no number is compiled in. No field was added to any shared
 struct.
+### SHIP-152 — the third reader Docs/02 §4 named and could not serve
+
+`GET /v1/admin/jobs` and `GET /v1/admin/jobs/{id}`, both `RequireAdmin`, both gated on `jobs.read` —
+which every role holds, because looking is what the least-privileged role exists to be able to do.
+The search matches the goods description, narrows by status and by customer, cursor paged on
+`(created_at, id)`, newest first. The detail view carries the job, **every** bid in every status, and
+**every** recorded transition.
+
+#### Docs/02 §4's third reader finally has a route
+
+"Bid history remains visible to the customer, bidding provider, and administrators." SHIP-96
+enumerated all three and could serve two: `authctx.Subject` cannot carry an administrator, so the
+third audience was reachable from the domain and exercised by test alone. It has a route now, and it
+is the only one of the three that is **not scoped to one provider's chain** — an administrator
+looking at a disputed award needs the offers it was chosen over.
+
+#### The budget is left out, and that is a decision rather than a rule
+
+Docs/01 §4.3's invariant names **providers**: "the customer's maximum budget is private; providers
+never see it". An administrator is not a provider, so nothing in the documents forbids showing one
+here. It is left out anyway, on two grounds. Nothing in the *Done when* asks for it — the ticket is
+the bid history and the status history. And a shape that never carried a budget cannot leak one: the
+ways an administrative shape reaches the wrong audience are all ways a *present* field travels.
+
+**The revisit is named rather than left to judgement: SHIP-164**, where an administrator resolving a
+dispute about price may genuinely need the number. At that point it is a field on that ticket's own
+shape, decided by that ticket.
+
+It is made structural rather than remembered. `jobs.budget` is in neither column list, there is
+nowhere on `admin.JobRecord` to put it, and the shape is held to a **closed key set** in Go and again
+in `make verify` — SHIP-83's axis, because a field named `max_price` passes a search for the word
+"budget" and leaks the same fact.
+
+#### One transaction for a read, which is not the usual answer
+
+`JobConsole.Open` wraps the three statements. Without it a console can render an `Awarded` header
+above a bid list in which nothing is accepted, or a status history whose last row the header does not
+reflect. **A support screen that contradicts itself is worse than a stale one, because somebody acts
+on it.** Read-only and no locks: a job that moves during the three statements is simply the next page
+load.
+
+#### The status vocabulary is the stored form, on the field *and* on the filter
+
+`Driver assigned`, not `driver_assigned` — a departure from Docs/10 §4.7, taken consistently with
+`job_status` on the exception queue, which was already the stored form. The console is an operator
+surface and somebody reading a screen beside a `psql` window should see one vocabulary. The wire
+mapping lives in `jobs`, which `admin` may not import, so translating would mean a hand-written copy
+of a list generated from `contracts/statuses.yaml` — the trade `ExceptionEntry.JobStatus` already
+refused.
+
+**What makes the filter safe without that copy is that the closed list is supplied rather than
+declared.** `cmd/api` has `jobs.Statuses` in scope and passes it to `NewJobConsole`; the domain
+validates against what it was given. That is the composition root doing what it already does for
+`actorFor` — the one place two vocabularies are both visible.
+
+#### `HandlerServices` replaced a widening parameter list, and it was overdue by one ticket
+
+`admin.NewHandler` took four collaborators positionally and M6 has five tickets left that each add
+one. Six same-typed pointers in a row is a call that still compiles after two are swapped, and the
+failure would be a console serving one screen from another screen's service — which no test in the
+package would notice, because each supplies the collaborator it is about.
+
+#### Where this is demonstrated, and the half that is *only* demonstrated in verify
+
+The statements behind `admin.JobDirectory` are in `cmd/api`, and no test in that package has a
+database. So the Go suite drives the handler against a directory that **records what it was asked
+for** — which establishes the query translation, the validation, the paging and the shapes — and
+`scripts/verify/90-admin.sh` exercises the SQL against the built binary. Exactly the split SHIP-113
+and SHIP-117 took, and the verify section is not optional in it: **the SQL is checked there or
+nowhere.**
+
+`make verify` found one defect: the section asserted **seven** transitions on a job moved through six
+statuses. Seven statuses, six rows — `job_status_history` records a *move*, and the `Draft` the job
+started in was never moved into.
+
+### SHIP-165 — the trail gets a reader, and the reader cannot write
+
+`GET /v1/admin/audit`, `RequireAdmin`, gated on `audit.read` — the permission SHIP-148 declared and
+nothing served for two waves. §4 could have recorded it as a gap and did not, because the permission
+existed and the endpoint was a scheduled ticket rather than a missing half.
+
+Searchable by `actor`, `target`, `from`/`to` — the *Done when*'s three — and by `action`, which is a
+fourth. `000003` built the column as "a stable identifier rather than a sentence … free text would
+make the log unsearchable by action, which is how support will use it", and a column created for a
+search with no way to search it would have been the odd omission.
+
+#### The reader is a second type, and that is what keeps the invariant structural
+
+`Auditor` has one verb and it appends. `AuditTrail` has one verb and it reads. Neither can update or
+delete, no permission authorises it, no route offers a verb but `GET`, and `000003`'s triggers refuse
+both from any connection. **Four places, and only the last is a database guarantee** — which is why
+the Go halves are shaped so that writing the wrong thing needs a new type rather than a new method.
+
+`postgres_audit.go`'s header claimed of itself that "there is exactly one statement here … no SELECT,
+no UPDATE, no DELETE", and named this ticket as the one that would want a read. Putting the SELECT
+there would have satisfied the ticket by falsifying the header. It went in
+`postgres_audit_search.go` instead.
+
+#### The date bounds are half-open, and the cursor is two-column for a reason peculiar to this table
+
+`from` inclusive, `to` exclusive: the only pair on which consecutive days tile. A reader asking for
+the 3rd and then the 4th must not be shown an entry twice, and an inclusive upper bound at midnight
+shows every entry written in that instant on both days.
+
+Both accept a **day** or a **full instant**. A support engineer types `2026-08-14` and a console
+sends `2026-08-14T09:30:00Z`; accepting only the second makes the endpoint unusable by hand, which is
+most of what an audit viewer is for. A bare day is UTC midnight, because the column holds the
+platform's clock and reading it in the server's local zone would move the boundary whenever the
+deployment moved.
+
+**`created_at` is emphatically not unique here, and unlike every other cursor in this service that is
+by design rather than by coincidence.** `Auditor.Record` gives every entry written in one transaction
+the same injected instant, so a single-column cursor would skip an entry or repeat one on exactly the
+rows most worth reading together. The identifier breaks the tie and is a v7, so entries appended in
+one transaction come back in the order they were appended.
+
+#### Nothing is redacted, and the reason is upstream of this endpoint
+
+Every column of the row, metadata included, passed through as **raw JSON** rather than decoded and
+re-encoded — a round trip reorders keys and turns every number into a float, which in the one table
+whose value is being trusted is a gratuitous difference between the record and the report of it.
+
+A viewer that showed a filtered version would be a second record, and the one somebody checks would
+be the wrong one. What makes publishing the whole row safe is that **nothing commercial is ever
+written into an entry**: a ticket tempted to put a budget in one has made the mistake a layer earlier
+than this file.
+
+#### Every filter is refused rather than ignored, and here that matters more than elsewhere
+
+An ignored filter answers with the whole trail. "Everything" and "the seventeen entries for this
+action" are indistinguishable to somebody who mistyped one — **who then concludes the action never
+happened**, which is the one wrong answer an audit search must not give. A mistyped action, a
+malformed identifier, a date that is not a date and a range that ends before it starts are each a 422
+naming their field, and every problem is reported at once (Docs/10 §4.6).
+
+#### No index was added, and that is measured rather than assumed
+
+`000003` created `idx_audit_log_actor`, `idx_audit_log_target` and `idx_audit_log_created` — exactly
+the three axes the *Done when* names. The fourth filter, action, has none and is applied over a set
+the other three have already narrowed. A migration adding one belongs to whoever has a row count to
+point at.
+
+### SHIP-160 — a removal is a status, and the notification is a consequence rather than an event
+
+`POST /v1/admin/jobs/{id}/unpublish`, `RequireAdmin`, gated on `jobs.unpublish` — which `moderator`
+and `owner` hold and **`support` does not**. Reading a job is `jobs.read` and every role has it;
+taking one off the marketplace is a different permission on a different endpoint, which is Docs/04
+§9's least-privilege control expressed as something a test can fail.
+
+#### Nothing is deleted, which is why the verb is not DELETE
+
+The job moves to `Cancelled` through the one guarded function. Docs/02 §2 has exactly one row for it
+— `Open / Negotiating → Cancelled`, "customer cancels before award; **admin may intervene**" — so an
+unpublished job *is* a cancelled job, moved by an administrator, with a reason on the transition.
+
+**There is no `unpublished` status and no hidden flag**, and that was the decision worth taking
+slowly: a second way for a job to be off the marketplace would be a second thing every feed, every
+eligibility query and every expiry sweep had to know about, and one of them would eventually not.
+
+It follows that an **awarded job cannot be unpublished**, and that is the document's decision rather
+than a limitation. A provider has committed and may have travelled; Docs/02 §6.2 makes ending it
+after that a support case. The administrator's path is a dispute they then resolve (SHIP-164), which
+records both sides. The port names no source status and checks none — it asks for the move and
+translates the refusal, so the transition table stays the only copy.
+
+#### "And the customer notified" needed no notification code at all
+
+This is the finding rather than a shortcut. The guarded transition emits `job.status_changed` inside
+the same transaction, and `notifications.StatusRules["Cancelled"]` already routes it to the job's
+customer **and** the awarded provider, by email, under "A job has been cancelled."
+
+An `admin.job_unpublished` event was considered and rejected. It would have been a **second
+announcement of one state change** — precisely the failure those rules are written to prevent, where
+a recipient who learns the platform emails twice starts ignoring the first one — and it would have
+needed a routing rule in a package this branch does not own, plus a line in `events_golden.txt` and
+in another lane's verify file. Nothing outside `internal/admin` and `cmd/api` was touched.
+
+What the customer is *not* told is the reason. Docs/04 §6 step 5 asks for "a clear, non-sensitive
+reason where appropriate", and the reason here is an administrator's note about a policy breach;
+rendering it into an email is a copy decision belonging to whoever writes that template.
+
+#### The reason is required, bounded, and written into two tables
+
+Ten to five hundred characters after trimming. The floor is what makes "with a recorded reason" mean
+something — an empty string and a single character both satisfy a required field without recording
+anything, and in the trail the second looks exactly like a reason. The ceiling stops `audit_log`
+becoming a document store.
+
+It goes into `job_status_history`, which a customer's support conversation reads, and into
+`audit_log`, which Docs/04 §9's controls read. Two tables, two readers, and neither has to find the
+other.
+
+### SHIP-161 — the enforcement already existed; what was missing was the act
+
+`POST /v1/admin/users/{id}/standing`, gated on `users.restrict` — again `moderator` and `owner`, not
+`support`.
+
+#### No migration, and no new enforcement either
+
+`users.status` has existed since `000002` with `ck_users_status CHECK (status IN
+('active','restricted','suspended'))`. And `internal/identity` already refuses a suspended account at
+sign-in **and at refresh** — which is where a suspension actually takes effect, because an access
+token lives fifteen minutes and Docs/10 §5 deliberately keeps standing out of it so that standing is
+read fresh. `User.CanBid` refuses a *restricted* provider, which is the "limited" half.
+
+**So this ticket adds no enforcement and deliberately does not.** A second check inside `admin` would
+be a second authority for one question, in a domain that cannot see the sessions it would need to
+invalidate. What was missing was the administrative act that sets the column, with the reason and the
+entry Docs/01 §4.6 asks for.
+
+That also means the *Done when* — "account access is limited or disabled" — is **only** demonstrable
+in `make verify`. No Go test in `internal/admin` can show it: the domain writes a column, and whether
+a suspended account can still sign in is another domain's code through the real HTTP surface. The
+section registers an account, signs in, suspends it, and shows sign-in refused and the refresh token
+it already held refused too.
+
+#### The recorded reason is in `audit_log`, not in a column on `users`
+
+A `restriction_reason` column was considered and rejected. It would be a **mutable copy of an
+immutable fact**, and the mutable one is the one somebody later corrects — while the append-only
+entry it was copied from says something else. SHIP-165 makes the trail searchable by target, so
+"why is this account suspended" is one query.
+
+#### One endpoint for all three standings, and both ends recorded
+
+Reinstatement is the same route, the same permission and the same audit action with the direction in
+its metadata. A separate reinstate endpoint would be a second place for the reason to become
+optional — and a trail that records a restriction but not its reversal is the one that makes a person
+look permanently suspect.
+
+The standing is read **under a row lock** before it is written, and the entry carries `from` and `to`.
+Without the lock two administrators acting at once both read `active` and both record a move from it,
+one of which never happened. `users` keeps no version of its own, so an entry saying only
+"restricted" could never afterwards be joined to what the account held before.
+
+A no-op is **refused**, not recorded: an entry saying "changed from suspended to suspended" is noise
+in the one table whose value is that everything in it happened.
+
+#### Two-person review is SHIP-166 and there is deliberately no half of it here
+
+Docs/04 §9 asks for "two-person review for permanent account suspension where practical". Nothing
+below anticipates it — no pending state, no approval column — because a half-built approval is worse
+than none: an administrator who sees a "pending approval" that nothing enforces believes there is a
+control.
+
+#### The mutation, run, and what it found about the instrument
+
+**Make one of the new privileged actions ignore the error from `Auditor.Record`, and confirm a test
+fails.** It was run twice, and the first attempt is the more useful half.
+
+| Mutation | Outcome |
+|---|---|
+| `Enforcement.Unpublish` swallows `Auditor.Record`'s error, against a test that makes the **INSERT fail with a trigger** | **Not caught.** Every test still passed |
+| The same mutation, against a test whose audit write fails **before any SQL is issued** (a nil auditor, constructed past the constructor's refusal) | **Caught** — `TestAPrivilegedActionIsRefusedWhenItsAuditEntryCannotBeWritten/a_job_is_not_unpublished`: the job reached `Cancelled` with nothing recording who removed it |
+
+**The trigger is the obvious instrument and it does not discriminate**, which is worth writing down
+because it is the instrument anybody would reach for. PostgreSQL aborts the whole transaction as soon
+as a statement in it raises, so every later statement fails and the COMMIT reports the abort — the
+error reaches the caller *whether or not the code checks it*. A test built on it establishes the
+rollback and says nothing about the `if err != nil`.
+
+Both tests are kept, apart, and each says which claim it supports:
+`TestATriggerRefusalRollsTheWholeActionBack` for the rollback, and the nil-auditor test for the
+check. **This is the same shape as wave 9's `FOR UPDATE … SKIP LOCKED` finding** — a guard can be
+textually present, or behaviourally real, and knowing which kind a test proves is the whole
+difference. Wave 9's version was a comment that read as a clause; this one is a test that reads as a
+check.
+
+`TestEveryAdminMutationWritesAnAuditEntry` also passed under the mutation, for the same reason: it
+drives a database where the insert succeeds.
+
+Restored by `cp` from a copy taken before the mutation, confirmed by `shasum`
+(`5aa5487a3d8816361bdd337f2fdd4545b48f4a6f`) and by there being no `MUTATION` marker left in the
+file. **Not** by `git checkout`, which on an untracked file would have deleted it outright.
+
+### SHIP-162 — the claim that could only be demonstrated from outside the domain
+
+`POST /v1/admin/notes` behind `notes.write`, and `GET /v1/admin/notes` behind the **subject's** read
+permission. One collection taking the subject kind rather than two sub-resources under
+`/admin/users/{id}/notes` and `/admin/jobs/{id}/notes`, because one endpoint is one place the
+never-user-visible rule has to hold.
+
+#### "Never user-visible" is four structural things and one behavioural check
+
+The rows are in a table of their own that no user-facing endpoint reads or joins; both routes declare
+`RequireAdmin`, which is a separate credential system rather than a permission somebody could forget;
+and the note shape is returned by these two operations and appears in no other response in the API.
+
+**None of that can be established by a test in `internal/admin`**, and noticing that is most of what
+this ticket was. Every test in that package drives an administrative handler, so a note not appearing
+in an administrative response proves nothing — the interesting claim is about a **customer's**
+endpoint, in a different domain, reached with a different credential.
+
+So `scripts/verify/90-admin.sh` writes a note whose body carries the run's process id, then reads the
+job back **as its customer** over HTTP — both `GET /v1/jobs/{id}` and `GET /v1/jobs` — and fails if
+that string appears anywhere. That check is an assertion about `internal/jobs`' shapes rather than
+about this domain's, which is why it survives the failure mode the claim actually has: nobody sets
+out to publish a support note, they add a field.
+
+#### The subject is not a foreign key, and that is the case the table most exists for
+
+`subject_type` plus `subject_id`, with no FK. A note **outlives its subject** (Docs/05 §3.1), and
+support writing up why an account was closed *after* it was closed is exactly the note an existence
+check would refuse. `ON DELETE RESTRICT` would make the note block the deletion and `CASCADE` would
+delete the record of why — `audit_log.target_id` took this position first, for the same reason.
+
+The **author** is a foreign key, and the two columns differing is the decision: the author is always
+an administrator of this platform and must always be nameable, because a note whose author cannot be
+identified is a note nobody can weigh.
+
+#### There is no `notes.read`, and the read is gated on the subject instead
+
+permissions.go already recorded the decision this is built on: "notes are never user-visible, so
+there is no corresponding read permission for anyone outside the console". So a note on a user needs
+`users.read` and one on a job needs `jobs.read` — both held by **every** role including `support`,
+which is the role that most needs to read a support history and which deliberately cannot add to it.
+
+That means the permission is chosen from a value in the request, which is worth naming. It is safe
+because every role holds both, so the choice cannot widen anybody's access, and because an
+unrecognised subject is refused before the choice is made. `ReadPermissionFor` is a switch with no
+default rather than a map with a fallback, so a subject kind added later that *is* restricted becomes
+a decision somebody has to take.
+
+#### The audit entry names the subject, and deliberately does not carry the body
+
+`target_id` is the thing the note is *about*, so SHIP-165's "everything that happened to this
+account" returns the notes taken about it alongside its standing changes. An entry naming the note
+would answer a question nobody asks and leave the account's own history with a gap where support's
+attention was. The note's identifier is in the metadata; **the body is not**, because `audit_log` is
+append-only and `admin_notes` is not — copying it across would create an uncorrectable copy of a
+correctable record, and would put free-form prose about a person into the one table the platform
+promises never to rewrite.
+
+#### A one-argument `btrim` strips spaces only, which a test found and the constraint now says
+
+`ck_admin_notes_body` was written as `btrim(body) <> ''`. **PostgreSQL's one-argument `btrim` removes
+spaces — not tabs, not newlines** — so a body of a single newline satisfied the constraint while
+`strings.TrimSpace` in the service refused the same value. The two disagreed about what an empty note
+is, and the disagreement would only ever have surfaced through a connection that did not go through
+the service, which is precisely the connection a CHECK constraint exists for.
+
+Found by `TestANoteMustRecordSomething`, which tried a newline among its cases; the character set is
+now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is about**: a Go check
+and a database check that are believed to agree are two checks until something compares them.
+
+**Nothing was needed from `internal/config` by any of the five tickets.**
 
 
 ## 4. Partly done — do not treat these as finished
