@@ -1847,3 +1847,150 @@ status="$(standing "$unpub_token" "verify-adm161-missing-$$" \
 ok "an account that does not exist is a plain 404 — the caller is an administrator, and unlike dispute intake nothing is being kept from them"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-162 — internal support notes.
+#
+# # What only this section can show, and it is the whole second half of the ticket
+#
+# The *Done when* is two claims. "Notes attach to a user or a job" is established by the Go suite in
+# `internal/admin`, which drives both handlers against a real database.
+#
+# **"And are never user-visible" cannot be established there at all.** Every test in that package
+# drives an *administrative* handler, so a note not appearing in an administrative response proves
+# nothing — the interesting claim is about a **customer's** endpoint, in a different domain, reached
+# with a different credential. So this section writes a note on a job and then reads that job back
+# **as its customer**, over HTTP, and fails if the note's text appears anywhere in the response.
+#
+# That check survives somebody widening the customer's job shape later, which is the failure mode
+# the claim actually has: nobody sets out to publish a support note, they add a field.
+#
+# # Everything is fenced on rows this run created
+#
+# The note body carries this run's process id, so the absence check below is an assertion about a
+# string that exists nowhere else in the database.
+
+ticket "SHIP-162  support notes attach to a user or a job and are never user-visible"
+
+admin_clear_limits
+
+# note_add <token> <key> <body-json> <name> — one attempt, answering with its status.
+note_add() {
+  curl -s -X POST -o "$WORKDIR/note-$4.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$3" \
+    "http://localhost:$VERIFY_PORT/v1/admin/notes"
+}
+
+# note_read <token> <subject-type> <subject-id> <name> — one read, answering with its status.
+note_read() {
+  curl -s -o "$WORKDIR/note-$4.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/admin/notes?subject_type=$2&subject_id=$3"
+}
+
+# The moderator and the support administrator this file already created for SHIP-160 — `notes.write`
+# is a moderator's and reading is gated on the *subject's* read permission, which every role holds.
+note_secret="conf1dential-$$-do-not-show-the-customer"
+note_job="$(dispute_draft ship162job)"
+note_body="{\"subject_type\":\"job\",\"subject_id\":\"$note_job\",\"body\":\"$note_secret — escalated to the insurer, do not discuss with the customer.\"}"
+
+status="$(note_add "$unpub_token" "verify-adm162-add-$$" "$note_body" add)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-add.json"; fail "adding a note returned $status, want 201"; }
+[[ "$(json "$WORKDIR/note-add.json" '["subject_type"]')" == "job" ]] \
+  || { cat "$WORKDIR/note-add.json"; fail "the note is not attached to a job"; }
+[[ "$(json "$WORKDIR/note-add.json" '["subject_id"]')" == "$note_job" ]] \
+  || { cat "$WORKDIR/note-add.json"; fail "the note is attached to the wrong job"; }
+[[ "$(json "$WORKDIR/note-add.json" '["author_id"]')" == "$unpub_id" ]] \
+  || { cat "$WORKDIR/note-add.json"; fail "the note does not name the administrator who wrote it"; }
+ok "a support note attaches to a job and names the administrator who wrote it"
+
+# A note on a user, through the same endpoint. Both kinds, because a polymorphic subject with one
+# kind exercised is a column that happens to hold one value.
+note_user_body="{\"subject_type\":\"user\",\"subject_id\":\"$stand_user_id\",\"body\":\"$note_secret — two no-shows; watch the next booking.\"}"
+status="$(note_add "$unpub_token" "verify-adm162-adduser-$$" "$note_user_body" adduser)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-adduser.json"; fail "adding a note on a user returned $status, want 201"; }
+ok "and to a user, through the same endpoint — one place the never-user-visible rule has to hold rather than two"
+
+# --- the audit entry names the subject, not the note ------------------------------------------------
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$note_job' and target_type = 'job'
+      and action = 'note.added' and actor_id = '$unpub_id'
+      and metadata ? 'note_id';")" == "1" ]] \
+  || fail "adding a note wrote no audit entry naming the job it was about"
+
+# And the body is deliberately NOT in the entry: audit_log is append-only and admin_notes is not, so
+# a copy there would be an uncorrectable copy of a correctable record.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log where target_id = '$note_job' and metadata::text like '%$note_secret%';")" == "0" ]] \
+  || fail "the note's body was copied into the audit trail, which nothing can rewrite"
+ok "the entry names the subject rather than the note, carries the note's id and does not carry its body — so 'everything that happened to this job' includes the notes without copying them into a table nothing can correct"
+
+# --- reading them back, and the permission split ------------------------------------------------------
+
+status="$(note_read "$unpub_support_token" job "$note_job" readsup)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-readsup.json"; fail "a support administrator could not read notes ($status)"; }
+[[ "$(cat "$WORKDIR/note-readsup.json")" == *"$note_secret"* ]] \
+  || { cat "$WORKDIR/note-readsup.json"; fail "the note is not in what support reads back"; }
+
+status="$(note_add "$unpub_support_token" "verify-adm162-supwrite-$$" "$note_body" supwrite)"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/note-supwrite.json"; fail "a support administrator added a note and got $status, want 403"; }
+ok "a support administrator reads the history and cannot add to it — reading is gated on the subject's own permission, which every role holds, and writing on notes.write, which support does not"
+
+# A subject with no notes is an empty list rather than a 404: the subject is deliberately not looked
+# up, so "no notes" and "no such subject" are the same answer here.
+status="$(note_read "$unpub_token" user "$(uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')" readempty)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-readempty.json"; fail "reading notes on a subject with none returned $status, want 200"; }
+[[ "$(cat "$WORKDIR/note-readempty.json")" == *'"data":[]'* ]] \
+  || { cat "$WORKDIR/note-readempty.json"; fail "an empty history is not an empty array; null crashes a console that iterates"; }
+ok "a subject with no notes answers with an empty array rather than a 404 — the subject is not looked up, because a note outlives it"
+
+# --- the claim the Go suite structurally cannot make --------------------------------------------------
+#
+# Read the job back **as its customer**, with the mobile credential, and fail if the note is anywhere
+# in the response. This is an assertion about internal/jobs' endpoint rather than about this one,
+# which is why it survives somebody widening that shape later.
+
+status="$(curl -s -o "$WORKDIR/note-customer-job.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $dispute_customer_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$note_job")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/note-customer-job.json"; fail "the customer could not read their own job ($status), so the check below would pass vacuously"; }
+[[ "$(cat "$WORKDIR/note-customer-job.json")" != *"$note_secret"* ]] \
+  || { cat "$WORKDIR/note-customer-job.json"; fail "a support note appeared in the customer's own view of their job"; }
+ok "the job's customer reads their own job and the note is not in it — the claim no test in internal/admin can make, because it is about another domain's endpoint"
+
+# The same job through the customer's list, which is a different shape built by a different query.
+status="$(curl -s -o "$WORKDIR/note-customer-list.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $dispute_customer_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs?limit=50")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-customer-list.json"; fail "the customer could not list their jobs ($status)"; }
+[[ "$(cat "$WORKDIR/note-customer-list.json")" != *"$note_secret"* ]] \
+  || { cat "$WORKDIR/note-customer-list.json"; fail "a support note appeared in the customer's job list"; }
+ok "and it is not in their job list either — two shapes, two queries, and the note is in neither"
+
+# --- a note that records nothing, and one about something the platform does not have -------------------
+
+status="$(note_add "$unpub_token" "verify-adm162-empty-$$" \
+  "{\"subject_type\":\"job\",\"subject_id\":\"$note_job\",\"body\":\"   \"}" empty)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/note-empty.json"; fail "an empty note returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/note-empty.json")" == *'"body"'* ]] \
+  || { cat "$WORKDIR/note-empty.json"; fail "the refusal does not name the field"; }
+
+status="$(note_add "$unpub_token" "verify-adm162-badsubj-$$" \
+  "{\"subject_type\":\"administrator\",\"subject_id\":\"$unpub_id\",\"body\":\"About a colleague.\"}" badsubj)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/note-badsubj.json"; fail "a note about an administrator returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/note-badsubj.json")" == *'"subject_type"'* ]] \
+  || { cat "$WORKDIR/note-badsubj.json"; fail "the refusal does not name the field"; }
+ok "a note with nothing in it and one about a kind of thing this table does not hold are both refused and name their field"
+
+status="$(note_read "" job "$note_job" nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/note-nocred.json"; fail "notes are readable without a credential ($status)"; }
+[[ "$(cat "$WORKDIR/note-nocred.json")" != *"$note_secret"* ]] \
+  || fail "a refused read returned the note anyway"
+ok "and the history is behind the administrator credential — without one it would be a public file on every customer the platform has had a problem with"
+
+admin_clear_limits

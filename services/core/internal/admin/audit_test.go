@@ -186,7 +186,7 @@ type adminMutation struct {
 
 // adminMutations is every state-changing administrative action the service serves today.
 //
-// Five, matching the five mutating routes in `cmd/api/routes_golden.txt` under `/v1/admin/`. The
+// Six, matching the six mutating routes in `cmd/api/routes_golden.txt` under `/v1/admin/`. The
 // pairing between this list and the served surface is checked from the other side by
 // TestEveryMutatingAdminRouteIsAudited in cmd/api, which is the only place the route table is
 // visible.
@@ -325,6 +325,36 @@ func adminMutations() []adminMutation {
 				return moderator.ID, userID
 			},
 		},
+		{
+			name:   "adding a support note",
+			action: AuditActionNoteAdded,
+
+			// The subject, not the note. See AuditActionNoteAdded: an entry naming the note
+			// would leave the account's own history with a gap where support's attention was.
+			targetType: AuditTargetUser,
+			run: func(t *testing.T, f auditFixture, ready func()) (uuid.UUID, uuid.UUID) {
+				t.Helper()
+
+				moderator, token := f.signedIn(t, "noter@example.com", RoleModerator, "10.0.55.1")
+				userID := newAccount(t, f.pool, "note-subject@example.com", "+61400550", "customer")
+				ready()
+
+				body := fmt.Sprintf(
+					`{"subject_type":"user","subject_id":%q,"body":"Rang about the damaged crates; sending photographs."}`,
+					userID)
+				req := httptest.NewRequest(http.MethodPost, "/v1/admin/notes",
+					strings.NewReader(body))
+				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+				req.Header.Set("Content-Type", "application/json")
+
+				rec := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.AddNote()).ServeHTTP(rec, req)
+				if rec.Code != http.StatusCreated {
+					t.Fatalf("adding a note: status = %d, want 201 (%s)", rec.Code, rec.Body)
+				}
+				return moderator.ID, userID
+			},
+		},
 	}
 }
 
@@ -443,6 +473,7 @@ func TestEveryAuditActionConstantIsInTheCatalogue(t *testing.T) {
 		AuditActionAdministratorSignedOut,
 		AuditActionJobUnpublished,
 		AuditActionUserStandingChanged,
+		AuditActionNoteAdded,
 	}
 
 	if len(declared) != len(AuditActions) {

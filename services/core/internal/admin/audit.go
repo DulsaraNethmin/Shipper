@@ -208,6 +208,25 @@ const (
 	// answer "was this account ever restricted" differently from "what has this account's
 	// standing been", and only the second is answerable from one filter.
 	AuditActionUserStandingChanged AuditAction = "user.standing_changed"
+
+	// AuditActionNoteAdded is a support note attached to a user or a job (SHIP-162).
+	//
+	// **The entry names the subject, not the note.** `target_type` and `target_id` are the thing
+	// the note is *about*, so a search for "everything that happened to this account" (SHIP-165)
+	// returns the notes taken about it alongside its standing changes. An entry naming the note
+	// would answer "a note was added" to a query nobody runs, and would leave the account's own
+	// history with a gap where support's attention was. The note's identifier is in the metadata,
+	// so an entry can still be traced to the row it caused.
+	//
+	// **The body is deliberately not in the entry.** `audit_log` is append-only and `admin_notes`
+	// is not (`000802` records why the two differ), so copying the body across would create an
+	// uncorrectable copy of a correctable record — and would put free-form prose about a person
+	// into the one table this platform promises never to rewrite.
+	//
+	// There is no `note.read` action and there will not be. Docs/01 §5.1 asks for audit logs of
+	// **privileged actions**; reading a queue or a history is not one, and an entry per read
+	// would bury the actions in the reads.
+	AuditActionNoteAdded AuditAction = "note.added"
 )
 
 // AuditActions is the whole catalogue, in the order the constants declare it.
@@ -223,6 +242,7 @@ var AuditActions = []AuditAction{
 	AuditActionAdministratorSignedOut,
 	AuditActionJobUnpublished,
 	AuditActionUserStandingChanged,
+	AuditActionNoteAdded,
 }
 
 // Valid reports whether a is in the catalogue.

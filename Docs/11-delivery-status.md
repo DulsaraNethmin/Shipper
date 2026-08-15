@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **738 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **747 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -509,6 +509,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-165** | M6 | `GET /v1/admin/audit` — the trail SHIP-150 writes, searchable by actor, target, date and **action**. The reader is a **second type** rather than a method on `Auditor`, so one can only append and the other can only read; there is no `UPDATE` or `DELETE` anywhere in the package and no verb but `GET` on the path. The date bounds are **half-open** so consecutive days tile, and the cursor is two-column because every entry in one transaction shares an instant **by design** — *see below* |
 | **SHIP-160** | M6 | `POST /v1/admin/jobs/{id}/unpublish` — the job moves to `Cancelled` through the one guarded transition, with the reason written into **both** `job_status_history` and `audit_log`. **No new domain event and no `internal/notifications` edit**: the transition already emits `job.status_changed`, which `StatusRules` routes to the customer, so "and the customer notified" is a consequence of the move rather than a second announcement of it. An **awarded** job is refused — Docs/02 §2 has no such row — *see below* |
 | **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
+| **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7a loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -10978,7 +10979,77 @@ Restored by `cp` from a copy taken before the mutation, confirmed by `shasum`
 (`5aa5487a3d8816361bdd337f2fdd4545b48f4a6f`) and by there being no `MUTATION` marker left in the
 file. **Not** by `git checkout`, which on an untracked file would have deleted it outright.
 
-**Nothing was needed from `internal/config` by either ticket.**
+### SHIP-162 — the claim that could only be demonstrated from outside the domain
+
+`POST /v1/admin/notes` behind `notes.write`, and `GET /v1/admin/notes` behind the **subject's** read
+permission. One collection taking the subject kind rather than two sub-resources under
+`/admin/users/{id}/notes` and `/admin/jobs/{id}/notes`, because one endpoint is one place the
+never-user-visible rule has to hold.
+
+#### "Never user-visible" is four structural things and one behavioural check
+
+The rows are in a table of their own that no user-facing endpoint reads or joins; both routes declare
+`RequireAdmin`, which is a separate credential system rather than a permission somebody could forget;
+and the note shape is returned by these two operations and appears in no other response in the API.
+
+**None of that can be established by a test in `internal/admin`**, and noticing that is most of what
+this ticket was. Every test in that package drives an administrative handler, so a note not appearing
+in an administrative response proves nothing — the interesting claim is about a **customer's**
+endpoint, in a different domain, reached with a different credential.
+
+So `scripts/verify/90-admin.sh` writes a note whose body carries the run's process id, then reads the
+job back **as its customer** over HTTP — both `GET /v1/jobs/{id}` and `GET /v1/jobs` — and fails if
+that string appears anywhere. That check is an assertion about `internal/jobs`' shapes rather than
+about this domain's, which is why it survives the failure mode the claim actually has: nobody sets
+out to publish a support note, they add a field.
+
+#### The subject is not a foreign key, and that is the case the table most exists for
+
+`subject_type` plus `subject_id`, with no FK. A note **outlives its subject** (Docs/05 §3.1), and
+support writing up why an account was closed *after* it was closed is exactly the note an existence
+check would refuse. `ON DELETE RESTRICT` would make the note block the deletion and `CASCADE` would
+delete the record of why — `audit_log.target_id` took this position first, for the same reason.
+
+The **author** is a foreign key, and the two columns differing is the decision: the author is always
+an administrator of this platform and must always be nameable, because a note whose author cannot be
+identified is a note nobody can weigh.
+
+#### There is no `notes.read`, and the read is gated on the subject instead
+
+permissions.go already recorded the decision this is built on: "notes are never user-visible, so
+there is no corresponding read permission for anyone outside the console". So a note on a user needs
+`users.read` and one on a job needs `jobs.read` — both held by **every** role including `support`,
+which is the role that most needs to read a support history and which deliberately cannot add to it.
+
+That means the permission is chosen from a value in the request, which is worth naming. It is safe
+because every role holds both, so the choice cannot widen anybody's access, and because an
+unrecognised subject is refused before the choice is made. `ReadPermissionFor` is a switch with no
+default rather than a map with a fallback, so a subject kind added later that *is* restricted becomes
+a decision somebody has to take.
+
+#### The audit entry names the subject, and deliberately does not carry the body
+
+`target_id` is the thing the note is *about*, so SHIP-165's "everything that happened to this
+account" returns the notes taken about it alongside its standing changes. An entry naming the note
+would answer a question nobody asks and leave the account's own history with a gap where support's
+attention was. The note's identifier is in the metadata; **the body is not**, because `audit_log` is
+append-only and `admin_notes` is not — copying it across would create an uncorrectable copy of a
+correctable record, and would put free-form prose about a person into the one table the platform
+promises never to rewrite.
+
+#### A one-argument `btrim` strips spaces only, which a test found and the constraint now says
+
+`ck_admin_notes_body` was written as `btrim(body) <> ''`. **PostgreSQL's one-argument `btrim` removes
+spaces — not tabs, not newlines** — so a body of a single newline satisfied the constraint while
+`strings.TrimSpace` in the service refused the same value. The two disagreed about what an empty note
+is, and the disagreement would only ever have surfaced through a connection that did not go through
+the service, which is precisely the connection a CHECK constraint exists for.
+
+Found by `TestANoteMustRecordSomething`, which tried a newline among its cases; the character set is
+now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is about**: a Go check
+and a database check that are believed to agree are two checks until something compares them.
+
+**Nothing was needed from `internal/config` by any of the five tickets.**
 
 
 ## 4. Partly done — do not treat these as finished

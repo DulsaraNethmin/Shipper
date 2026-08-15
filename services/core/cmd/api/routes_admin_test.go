@@ -52,6 +52,11 @@ var auditedAdminMutations = map[string]admin.AuditAction{
 	// and independently the right shape, because "what has happened to this account's standing"
 	// is one question a reader should be able to ask with one filter.
 	"POST /v1/admin/users/{id}/standing": admin.AuditActionUserStandingChanged,
+
+	// SHIP-162. The entry names the **subject** of the note rather than the note, so that a
+	// search for everything that happened to an account returns the notes taken about it. The
+	// note's identifier is in the metadata; the body deliberately is not.
+	"POST /v1/admin/notes": admin.AuditActionNoteAdded,
 }
 
 // administrativeMutation reports whether this route is a state change an administrator makes.

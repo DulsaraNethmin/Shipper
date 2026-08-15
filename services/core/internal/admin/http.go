@@ -64,6 +64,7 @@ type Handler struct {
 	jobs       *JobConsole
 	trail      *AuditTrail
 	enforce    *Enforcement
+	notes      *Notes
 	pool       *pgxpool.Pool
 	log        *slog.Logger
 }
@@ -100,6 +101,9 @@ type HandlerServices struct {
 	// Enforcement is the administrative outcomes of Docs/04 §6 — unpublishing a job
 	// (SHIP-160) and changing an account's standing (SHIP-161).
 	Enforcement *Enforcement
+
+	// Notes is the internal support history (SHIP-162).
+	Notes *Notes
 }
 
 // NewHandler wires the handlers to the services.
@@ -149,6 +153,12 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// first one is a nil discovered while a moderator is trying to remove a policy breach.
 		return nil, errors.New("admin: a handler needs the enforcement service")
 	}
+	if s.Notes == nil {
+		// SHIP-162. The same argument once more. A nil here would panic at the first support
+		// note somebody tried to write down, which is a moment when the console failing is
+		// the second-worst thing that happens that day.
+		return nil, errors.New("admin: a handler needs the notes service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
@@ -160,6 +170,7 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		jobs:       s.Jobs,
 		trail:      s.Trail,
 		enforce:    s.Enforcement,
+		notes:      s.Notes,
 		pool:       pool,
 		log:        log,
 	}, nil
@@ -537,6 +548,15 @@ func apiError(err error) error {
 		// rather than a bare 400. Docs/10 §4.6: a client should be told which field, and this
 		// is a field somebody typed.
 		return fieldProblem("reason", err)
+
+	case errors.Is(err, ErrNoteEmpty), errors.Is(err, ErrNoteTooLong):
+		return fieldProblem("body", err)
+
+	case errors.Is(err, ErrNoteSubjectUnrecognised):
+		return fieldProblem("subject_type", err)
+
+	case errors.Is(err, ErrNoteSubjectMissing):
+		return fieldProblem("subject_id", err)
 
 	case errors.Is(err, ErrUserNotFound):
 		// Disclosed plainly. The caller is an administrator holding a permission over accounts,
@@ -2073,4 +2093,186 @@ func userIDFrom(r *http.Request) (uuid.UUID, error) {
 			"The account id in the path is not a valid identifier.").WithCause(err)
 	}
 	return id, nil
+}
+
+// --- SHIP-162: internal support notes -------------------------------------------------------------
+
+// addNoteRequest is the body of POST /v1/admin/notes.
+//
+//	{"subject_type": "user", "subject_id": "0198f2c1-…", "body": "Rang about the damaged crates."}
+//
+// There is no author: the administrator is whoever the credential says is calling, and a body that
+// named its own author would be a support history a client writes.
+type addNoteRequest struct {
+	SubjectType string `json:"subject_type"`
+	SubjectID   string `json:"subject_id"`
+	Body        string `json:"body"`
+}
+
+// noteResponse is one support note.
+//
+// **This shape is returned by two endpoints, both under /v1/admin, and by nothing else.** That is
+// how "never user-visible" is kept true — see notes.go. A field added here reaches administrators
+// and nobody else, because there is no user-facing response that carries a note at all.
+type noteResponse struct {
+	ID string `json:"id"`
+
+	SubjectType string `json:"subject_type"`
+	SubjectID   string `json:"subject_id"`
+
+	// AuthorID is the administrator who wrote it, as an identifier. A name would be a second
+	// read of `admin_users`, and a console listing notes already knows its own administrators.
+	AuthorID string `json:"author_id"`
+
+	Body string `json:"body"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+func noteFrom(n Note) noteResponse {
+	return noteResponse{
+		ID:          n.ID.String(),
+		SubjectType: n.Subject.String(),
+		SubjectID:   n.SubjectID.String(),
+		AuthorID:    n.AuthorID.String(),
+		Body:        n.Body,
+		CreatedAt:   timestamp(n.CreatedAt),
+	}
+}
+
+// AddNote handles POST /v1/admin/notes (SHIP-162).
+//
+// Docs/01 §4.6's fifth capability, behind [PermissionNotesWrite] — which `moderator` and `owner`
+// hold and `support` does not. **Reading them needs less**, which is the right way round and is
+// deliberate: a support administrator reads the history and a moderator adds to it. See
+// [Handler.ReadNotes].
+//
+// 201 with the note, which carries the identifier and the instant the platform assigned.
+func (h *Handler) AddNote() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := h.permitted(r, PermissionNotesWrite)
+		if err != nil {
+			return err
+		}
+
+		var req addNoteRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		subject, subjectID, err := noteSubjectFrom(req.SubjectType, req.SubjectID)
+		if err != nil {
+			return err
+		}
+
+		note, err := h.notes.Add(r.Context(), AddNoteCommand{
+			Subject:   subject,
+			SubjectID: subjectID,
+			AuthorID:  grant.Administrator.ID,
+			Body:      req.Body,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusCreated, noteFrom(note))
+		return nil
+	})
+}
+
+// ReadNotes handles GET /v1/admin/notes (SHIP-162).
+//
+// # The permission is the subject's, not a note permission
+//
+// A note on a user needs `users.read`; a note on a job needs `jobs.read`. permissions.go records why
+// there is no `notes.read`: "notes are never user-visible, so there is no corresponding read
+// permission for anyone outside the console". Everyone in the console may read them, and what
+// [PermissionNotesWrite] distinguishes is who may add one.
+//
+// **The permission is therefore chosen from a value in the request**, which is a shape worth being
+// explicit about. It is safe here because both permissions are held by every role, so the choice
+// cannot widen anybody's access — and because an unrecognised subject is refused before the choice
+// is made, so there is no branch in which no permission is checked. A subject kind added later that
+// *is* restricted would make this a real decision, which is why [ReadPermissionFor] is a switch with
+// no default rather than a map lookup with a fallback.
+//
+// Not paged. See [Notes.For]: the notes on one subject are tens at most, and a cursor would need a
+// tie-break the index does not carry.
+func (h *Handler) ReadNotes() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		values := r.URL.Query()
+
+		subject, subjectID, err := noteSubjectFrom(
+			values.Get("subject_type"), values.Get("subject_id"))
+		if err != nil {
+			return err
+		}
+
+		permission, ok := ReadPermissionFor(subject)
+		if !ok {
+			// Unreachable: noteSubjectFrom refuses an unrecognised subject above. Written out
+			// rather than assumed, because the alternative to this branch is a handler that
+			// serves notes having checked no permission at all — which is the one failure this
+			// endpoint must not have, and it would be invisible.
+			return apiError(fmt.Errorf("%w: %q", ErrNoteSubjectUnrecognised, subject))
+		}
+		if _, err := h.permitted(r, permission); err != nil {
+			return err
+		}
+
+		notes, err := h.notes.For(r.Context(), subject, subjectID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Never nil on the wire. An absent list and an empty one are the same fact — nobody has
+		// written anything about this subject — and `null` crashes a console that iterates
+		// without checking, on the ordinary case rather than the rare one.
+		out := make([]noteResponse, 0, len(notes))
+		for _, n := range notes {
+			out = append(out, noteFrom(n))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, noteListResponse{Data: out})
+		return nil
+	})
+}
+
+// noteListResponse is the notes on one subject.
+//
+// **Not internal/pagination's envelope**, and that is deliberate rather than an omission: that shape
+// carries `next_cursor` and `has_more`, and publishing either on an endpoint that never pages would
+// be telling a client there is a mechanism when there is not. `data` is kept so the shape can grow
+// into the envelope on the day somebody adds paging, without the field being renamed.
+type noteListResponse struct {
+	Data []noteResponse `json:"data"`
+}
+
+// noteSubjectFrom reads and validates a subject from a request.
+//
+// One function for both endpoints, because a note is written and read against the same pair of
+// fields and the two must agree about what a valid subject is — a body that accepted a kind the
+// query refused would write notes nothing could read.
+//
+// Every problem is reported rather than the first (Docs/10 §4.6).
+func noteSubjectFrom(subjectType, subjectID string) (NoteSubject, uuid.UUID, error) {
+	var problems validate.Errors
+
+	subject := NoteSubject(strings.TrimSpace(subjectType))
+	if !subject.Valid() {
+		problems.Add("subject_type", validate.CodeInvalid,
+			"A note is about a user or a job. Use one of %s.",
+			strings.Join(noteSubjectNames(), ", "))
+	}
+
+	id := uuidParam(&problems, url.Values{"subject_id": {subjectID}}, "subject_id",
+		"That is not a valid identifier.")
+	if id == uuid.Nil && strings.TrimSpace(subjectID) == "" {
+		problems.Add("subject_id", validate.CodeRequired, "A note must say what it is about.")
+	}
+
+	if err := problems.Err(); err != nil {
+		return "", uuid.Nil, err
+	}
+	return subject, id, nil
 }

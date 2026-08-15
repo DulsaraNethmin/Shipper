@@ -339,6 +339,23 @@ var (
 	// ErrStandingUnrecognised means a standing outside `ck_users_status`s three.
 	ErrStandingUnrecognised = errors.New("admin: that is not an account standing")
 
+	// ErrNoteSubjectUnrecognised means a note named a kind of thing outside
+	// `ck_admin_notes_subject_type`s two.
+	ErrNoteSubjectUnrecognised = errors.New("admin: a note can only be about a user or a job")
+
+	// ErrNoteSubjectMissing means a note named no subject at all.
+	ErrNoteSubjectMissing = errors.New("admin: a note must say what it is about")
+
+	// ErrNoteEmpty means a note records nothing.
+	//
+	// Measured after trimming, so four thousand spaces is not a note. `ck_admin_notes_body`
+	// refuses it too; this refuses it a statement earlier, with a message a person can act on
+	// rather than a constraint name.
+	ErrNoteEmpty = errors.New("admin: a note with nothing in it records nothing")
+
+	// ErrNoteTooLong means a note is longer than the column holds.
+	ErrNoteTooLong = errors.New("admin: that note is longer than this field holds")
+
 	// ErrStandingUnchanged means the account already holds the standing it was being moved to.
 	//
 	// Refused rather than recorded. An entry saying "changed from suspended to suspended" is

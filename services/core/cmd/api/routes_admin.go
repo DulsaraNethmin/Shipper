@@ -209,6 +209,37 @@ func init() {
 
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/admin/notes",
+			Group:   GroupV1,
+
+			// RequireAdmin is the credential; `notes.write` is the permission (SHIP-148,
+			// SHIP-162). `moderator` and `owner` hold it and `support` does not — and reading
+			// the notes needs *less*, which is the right way round: a support administrator
+			// reads the history and a moderator adds to it.
+			//
+			// A collection of its own rather than a sub-resource of the subject, because a
+			// note is about a user *or* a job and one endpoint that takes the kind is one
+			// place the "never user-visible" rule has to hold. Two sub-resources under
+			// /admin/users/{id}/notes and /admin/jobs/{id}/notes would be two.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).AddNote() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/notes",
+			Group:   GroupV1,
+
+			// The permission here is the **subject's** — `users.read` or `jobs.read`, chosen
+			// in the handler from the query. permissions.go records why there is no
+			// `notes.read`: notes never leave the console, so what needs distinguishing is
+			// who may add one.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).ReadNotes() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
 
@@ -326,6 +357,14 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin enforcement: " + err.Error())
 	}
 
+	// SHIP-162. It takes the auditor above rather than one of its own, so a note and the audit
+	// entry describing it share an instant — Docs/11 §9's one row, one clock, across the two rows
+	// one action writes.
+	notes, err := admin.NewNotes(auditor, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin notes: " + err.Error())
+	}
+
 	handler, err := admin.NewHandler(admin.HandlerServices{
 		Disputes:    svc,
 		Credentials: creds,
@@ -334,6 +373,7 @@ func adminHandler(d Deps) *admin.Handler {
 		Jobs:        jobConsole,
 		Trail:       trail,
 		Enforcement: enforcement,
+		Notes:       notes,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())

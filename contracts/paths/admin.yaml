@@ -2616,3 +2616,310 @@ StandingChangeResult:
       type: string
       description: What was recorded, read back after trimming.
       example: Two unresolved no-shows in a fortnight; see the delivery exception queue.
+
+AdminNotes:
+  post:
+    operationId: adminAddNote
+    summary: Attach an internal support note to a user or a job
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    description: |
+      Docs/01 §4.6's fifth administrative capability — "add internal support notes" (SHIP-162).
+
+      ## Notes are never user-visible, and that is structural rather than promised
+
+      They live in a table of their own that **no user-facing endpoint reads and none joins**; both
+      operations here require an administrator session, which is a separate credential system a user
+      token cannot reach at all; and the note shape appears in these two responses and in no other
+      response in this API. There is no field on a job, an account or a dispute that carries one, so
+      a note cannot reach a customer by somebody widening a shape.
+
+      The dispute table records the same decision from the other side: every column of a dispute is
+      read straight back to the complainant, which is why notes were never a column on it.
+
+      ## What a note attaches to
+
+      A `user` or a `job` — **not an administrator**. A note about a colleague is a different thing
+      with different handling; the record of what an administrator did is the audit trail, which
+      nothing can rewrite.
+
+      **The subject is not checked against its table.** A note may name a job or an account that no
+      longer exists, and that is deliberate: a note outlives its subject (Docs/05 §3.1), and support
+      writing up why an account was closed *after* it was closed is the case this table most exists
+      for. An existence check would refuse exactly that note, and would buy a guarantee that stops
+      holding a second later anyway.
+
+      ## Notes are appended, not edited
+
+      There is no `PATCH` and no `DELETE`. A support note is a contemporaneous record of what
+      somebody knew at the time, and one that can be revised afterwards is worth less than one that
+      cannot — in exactly the situation it exists for.
+
+      That is a weaker guarantee than the audit trail's, which the database enforces by trigger, and
+      the difference is deliberate: the audit trail holds administrators to account, while an
+      operator correcting a note that names the wrong job is a legitimate act. The API offers no verb
+      for it; the schema does not forbid one.
+
+      ## Permission
+
+      Needs `notes.write`, which `moderator` and `owner` hold and `support` does not. **Reading them
+      needs less** — see the `GET` — and that asymmetry is the right way round: a support
+      administrator reads the history and a moderator adds to it.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/AddNoteRequest'
+    responses:
+      '201':
+        description: The note has been recorded.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminNote'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `notes.write`
+          (`admin_permission_denied`). A `support` administrator gets this, and may still read.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The subject is not a user or a job, the subject identifier is missing or malformed, or the
+          note records nothing (`validation_failed`, one `error.details` entry per field).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+  get:
+    operationId: adminReadNotes
+    summary: Read the internal notes on one user or job
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Every note on one subject, newest first.
+
+      ## The permission is the subject's, not a note permission
+
+      A note on a `user` needs `users.read`; a note on a `job` needs `jobs.read`. Both are held by
+      **every** administrator role including `support` — which is the role that most needs to read a
+      support history and which deliberately cannot add to it.
+
+      There is deliberately no `notes.read` permission. Notes never leave the console, so a
+      permission gating this read would be one that every role holds and that never refuses
+      anybody; what needs distinguishing is who may *add* one.
+
+      ## Not paged
+
+      The notes on one account or one job are tens at most and a console shows them all. The
+      response carries `data` and nothing else — no cursor and no `has_more`, because publishing
+      either would tell a client there is a paging mechanism when there is not.
+    parameters:
+      - name: subject_type
+        in: query
+        required: true
+        description: What kind of thing the notes are about.
+        schema:
+          type: string
+          enum: [user, job]
+        example: user
+      - name: subject_id
+        in: query
+        required: true
+        description: |
+          Which one. A subject with no notes answers `200` with an empty list rather than `404` —
+          the subject is not looked up, so "no notes" and "no such subject" are the same answer
+          here, and the caller establishes the second by opening the subject.
+        schema:
+          type: string
+          format: uuid
+        example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    responses:
+      '200':
+        description: The notes on that subject, newest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminNoteList'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold the subject's read permission
+          (`admin_permission_denied`). No role is in that position today — every role holds both —
+          so this is the contract describing the check rather than a case a console will meet.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The subject is not a user or a job, or its identifier is missing or malformed
+          (`validation_failed`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AddNoteRequest:
+  type: object
+  additionalProperties: false
+  required: [subject_type, subject_id, body]
+  description: |
+    There is no author — the administrator is whoever the credential says is calling, and a body
+    that named its own author would be a support history a client writes.
+  properties:
+    subject_type:
+      type: string
+      enum: [user, job]
+      description: What the note is about.
+      example: user
+    subject_id:
+      type: string
+      format: uuid
+      description: Which one. Not checked against its table — see the operation description.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    body:
+      type: string
+      minLength: 1
+      maxLength: 4000
+      description: |
+        The note, measured after trimming. Generous compared with an action's `reason`, and
+        deliberately: a reason is a sentence justifying an action and a note is prose about a
+        situation.
+      example: Rang about the damaged crates; sending photographs this afternoon.
+
+AdminNote:
+  type: object
+  additionalProperties: false
+  required: [id, subject_type, subject_id, author_id, body, created_at]
+  description: |
+    One internal support note. **This shape is returned by these two operations and by nothing else
+    in this API** — that is how "never user-visible" is kept true.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e9
+    subject_type:
+      type: string
+      enum: [user, job]
+      example: user
+    subject_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    author_id:
+      type: string
+      format: uuid
+      description: |
+        The administrator who wrote it, as an identifier. A name would be a second read of the
+        administrator table, and a console listing notes already knows its own administrators.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7ea
+    body:
+      type: string
+      description: The note, as it was stored — trimmed.
+      example: Rang about the damaged crates; sending photographs this afternoon.
+    created_at:
+      type: string
+      format: date-time
+      description: |
+        When it was written, in UTC, on the platform's clock — the same clock the audit entry
+        describing it takes, so the two sort together.
+      example: '2026-08-15T09:12:00.000Z'
+
+AdminNoteList:
+  type: object
+  additionalProperties: false
+  required: [data]
+  description: |
+    **Not the standard collection envelope**, deliberately: there is no `next_cursor` and no
+    `has_more`, because this read does not page and publishing either would describe a mechanism
+    that does not exist. `data` is kept so the shape can grow into the envelope if it ever does.
+  properties:
+    data:
+      type: array
+      description: The notes, newest first. Always an array, never `null`.
+      items:
+        $ref: '#/AdminNote'
