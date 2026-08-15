@@ -95,18 +95,87 @@ func TestARenderedBodyCarriesNothingButTheHeadlineAndTheJob(t *testing.T) {
 			continue
 		}
 
-		rendered := body(rule, job)
-		remaining := strings.ReplaceAll(rendered, rule.Headline, "")
-		remaining = strings.ReplaceAll(remaining, job.String(), "")
+		for _, channel := range Channels {
+			subject, body, err := Render(channel, rule, job)
+			if err != nil {
+				t.Fatalf("rendering %q on %s: %v", key, channel, err)
+			}
 
-		for _, fixed := range []string{"Job", "Open the Shipper app for the details.",
-			"Please do not reply to this message."} {
-			remaining = strings.ReplaceAll(remaining, fixed, "")
+			// The template source with the two values substituted by hand. If the
+			// rendered text is anything else, the renderer did something other than
+			// substitute — a conditional, a function, a third field — and that is the
+			// day SHIP-141 stops being structural.
+			tmpl := templates[channel]
+			substitute := strings.NewReplacer(
+				"{{.Headline}}", rule.Headline,
+				"{{.JobID}}", job.String(),
+			)
+
+			if want := substitute.Replace(tmpl.subjectSource); subject != want {
+				t.Errorf("the %s subject for %q rendered as %q, want %q",
+					channel, key, subject, want)
+			}
+			if want := substitute.Replace(tmpl.bodySource); body != want {
+				t.Errorf("the %s body for %q rendered as %q, want %q",
+					channel, key, body, want)
+			}
 		}
-		if strings.TrimSpace(remaining) != "" {
-			t.Errorf("the body for %q carries %q beyond its headline and the job identifier; "+
-				"anything variable in a body is somewhere an address can end up (SHIP-141)",
-				key, strings.TrimSpace(remaining))
+	}
+}
+
+// TestEveryChannelHasATemplate. A channel in the vocabulary with no copy behind it is a row the
+// dispatcher claims and can never complete, and [Rules] can start writing one with a single edit.
+func TestEveryChannelHasATemplate(t *testing.T) {
+	for _, channel := range Channels {
+		if _, ok := templates[channel]; !ok {
+			t.Errorf("%s has no template, so a rule routing to it writes rows nothing can render",
+				channel)
+		}
+	}
+	if len(templates) != len(Channels) {
+		t.Errorf("there are %d templates and %d channels; a template for a channel that does not "+
+			"exist is copy nobody will ever read", len(templates), len(Channels))
+	}
+}
+
+// TestEveryTemplateRendersFromTheClosedInput is the guard the whole design rests on (SHIP-138).
+//
+// internal/notifications/templates.go's argument is that a template cannot leak an address because
+// there is no field it could arrive in. text/template makes that enforceable: executing against a
+// struct fails on a field the struct does not have. So this is not a check that the templates are
+// well formed — it is a check that [content] is still the only thing they can read.
+func TestEveryTemplateRendersFromTheClosedInput(t *testing.T) {
+	shape := reflect.TypeOf(content{})
+	if shape.NumField() != 2 {
+		t.Fatalf("content has %d fields; adding one is a decision about privacy rather than "+
+			"about copy, and this test is where it has to be argued (SHIP-141)", shape.NumField())
+	}
+
+	for _, channel := range Channels {
+		for _, rule := range []Rule{{Headline: "A job has been awarded."}, {}} {
+			if _, _, err := Render(channel, rule, uuid.Must(uuid.NewV7())); err != nil {
+				t.Errorf("%s does not render from content alone: %v", channel, err)
+			}
+		}
+	}
+}
+
+// TestNoSubjectCanCarryANewline. A subject line with a newline in it is a header injection in most
+// mail transports, and the value that would put one there is [Rule.Headline] — which is a literal
+// somebody types into rules.go.
+func TestNoSubjectCanCarryANewline(t *testing.T) {
+	job := uuid.Must(uuid.NewV7())
+
+	for key, rule := range Rules {
+		if len(rule.To) == 0 {
+			continue
+		}
+		subject, _, err := Render(ChannelEmail, rule, job)
+		if err != nil {
+			t.Fatalf("rendering %q: %v", key, err)
+		}
+		if strings.ContainsAny(subject, "\r\n") {
+			t.Errorf("the subject for %q contains a line break: %q", key, subject)
 		}
 	}
 }

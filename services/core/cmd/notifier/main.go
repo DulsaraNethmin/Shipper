@@ -60,6 +60,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/logging"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/notifications"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/email"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/push"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/sms"
 )
 
@@ -116,12 +117,17 @@ func run() error {
 		Email: newEmailSender(cfg),
 		SMS:   newSMSSender(cfg),
 
-		// Push is left nil on purpose. SHIP-139 is the Firebase adapter and SHIP-140 the
-		// device token registry; neither exists, notifications.Rules writes no push row,
-		// and a stub that logged instead of pushing would be a channel reporting success
-		// it did not have.
-		Push: nil,
-	})
+		// SHIP-139 filled this in. It was nil at SHIP-137 because there was no Firebase
+		// adapter and no device token registry, and a stub that logged instead of pushing
+		// would have been a channel reporting a success it did not have — which is still
+		// exactly what push.Noop must not do, and does not: it records, it never rejects,
+		// and nothing marks a row sent that a real adapter would not have sent.
+		Push: newPushSender(cfg),
+	},
+		// SHIP-140. Without this the consumer resolves no push address at all, because it
+		// cannot tell a live device session from a signed-out one — see the port.
+		notifications.WithSessions(deviceSessionLookup{}),
+	)
 
 	consumer, err := newConsumer(cfg, log, pool, service)
 	if err != nil {
@@ -201,6 +207,50 @@ func newSMSSender(cfg *config.Config) notifications.SMSSender {
 		panic("cmd/notifier: sms provider: " + err.Error() +
 			" — set SMS_PROVIDER_BASE_URL, SMS_PROVIDER_API_KEY and SMS_SENDER, or run with " +
 			"SHIPPER_ENV=development to log messages to the console instead")
+	}
+	return sender
+}
+
+// newPushSender picks the push implementation for this environment (SHIP-139).
+//
+// The same shape as the two above and the same reasoning, including that push.UseNoop owns the rule
+// rather than a switch written here. The fallback leans towards the no-op harder than email's leans
+// towards the console, and internal/platform/push/fcm.go says why: a development machine that
+// dispatched for real would wake a handset belonging to whoever last held that token, and unlike an
+// email there is no address to inspect afterwards to work out who.
+//
+// # The credential is a closure, and the closure is the honest edge of this ticket
+//
+// FCM's HTTP v1 API takes a short-lived OAuth access token exchanged from a service-account JSON
+// key. **That exchange is not implemented anywhere in this repository**: it needs
+// golang.org/x/oauth2/google, a module, and the branch this ticket was built on may not edit
+// go.mod. What is here instead is the wire contract and a credential supplied from configuration,
+// which is enough to dispatch against a real project only if something else has already minted the
+// token.
+//
+// So a deployment that sets PUSH_PROJECT_ID and PUSH_CREDENTIAL reaches Firebase, and one that sets
+// neither runs the no-op. Refusing to start would be the wrong answer for the second, because push
+// is one channel of two and email is not affected — Docs/01 §4.5's records copy still goes out.
+func newPushSender(cfg *config.Config) notifications.Pusher {
+	if push.UseNoop(cfg.Env) || cfg.Push.ProjectID == "" {
+		return push.NewNoop()
+	}
+
+	sender, err := push.NewFCM(push.Options{
+		ProjectID: cfg.Push.ProjectID,
+		BaseURL:   cfg.Push.BaseURL,
+		Credential: func(context.Context) (string, error) {
+			if cfg.Push.Credential == "" {
+				return "", errors.New("PUSH_CREDENTIAL is empty; see internal/platform/push/doc.go " +
+					"on why nothing here mints one from a service-account key")
+			}
+			return cfg.Push.Credential, nil
+		},
+	})
+	if err != nil {
+		panic("cmd/notifier: push provider: " + err.Error() +
+			" — set PUSH_PROJECT_ID and PUSH_CREDENTIAL, or run with SHIPPER_ENV=development to " +
+			"log notifications instead of dispatching them")
 	}
 	return sender
 }

@@ -60,6 +60,7 @@ type Config struct {
 	Delivery    Delivery
 	Email       Email
 	SMS         SMS
+	Push        Push
 	Geocoding   Geocoding
 	Pagination  Pagination
 	Storage     Storage
@@ -359,6 +360,35 @@ type SMS struct {
 	// originating number, depending on what the gateway and the destination country permit.
 	// Australia allows both; the choice is made with the vendor.
 	Sender string
+}
+
+// Push configures the Firebase Cloud Messaging adapter (SHIP-139), consumed by cmd/notifier.
+//
+// The same shape as [Email] and [SMS] and chosen the same way — from Env, not from here. It matters
+// for the same reason SMS does and more sharply: a message reaches a real handset, and unlike an
+// email there is no address to inspect afterwards to work out whose.
+//
+// # Why there is a credential rather than a key file
+//
+// FCM's HTTP v1 API takes a short-lived OAuth access token, and Google's way of obtaining one is to
+// exchange a service-account JSON key for it. **Nothing in this repository performs that exchange**:
+// it needs golang.org/x/oauth2/google, which is a module and therefore a go.mod change SHIP-139's
+// branch could not make. See internal/platform/push/doc.go.
+//
+// So this holds the bearer credential itself, and whatever mints it is outside this service today.
+// A service-account key is on CLAUDE.md's never-commit list and this variable is not where one
+// would go: it is a token, it expires, and it belongs in the CI secret store like every other
+// credential (Docs/06 §5.2).
+type Push struct {
+	// ProjectID is the Firebase project. Empty means the no-op implementation, whatever the
+	// environment — which is the state of every deployment today, because no project exists.
+	ProjectID string
+
+	// BaseURL overrides Google's, for a test or a proxy. Empty means push.DefaultBaseURL.
+	BaseURL string
+
+	// Credential is presented to FCM as a bearer token and is never logged.
+	Credential string
 }
 
 // Argon2 is the password hashing cost.
@@ -674,6 +704,11 @@ func Load() (*Config, error) {
 			ProviderAPIKey:  l.str("SMS_PROVIDER_API_KEY", ""),
 			Sender:          l.str("SMS_SENDER", "Shipper"),
 		},
+		Push: Push{
+			ProjectID:  l.str("PUSH_PROJECT_ID", ""),
+			BaseURL:    l.str("PUSH_BASE_URL", ""),
+			Credential: l.str("PUSH_CREDENTIAL", ""),
+		},
 		Geocoding: Geocoding{
 			ProviderBaseURL: l.str("GEOCODING_BASE_URL", ""),
 			ProviderAPIKey:  l.str("GEOCODING_API_KEY", ""),
@@ -759,6 +794,11 @@ func (c Config) LogValue() slog.Value {
 		slog.String("email_sender", c.Email.Sender),
 		slog.Bool("sms_provider_configured", c.SMS.ProviderBaseURL != ""),
 		slog.String("sms_sender", c.SMS.Sender),
+		// The project, which is not secret and is the value somebody needs when a push has
+		// not arrived — a wrong one is a 404 per message, which SHIP-139 reads as the token
+		// being dead. Never the credential.
+		slog.String("push_project", c.Push.ProjectID),
+		slog.Bool("push_credential_configured", c.Push.Credential != ""),
 		// The bucket and the endpoint, never the credential. The bucket is the one worth
 		// insisting on: it is per-worktree in development, and a process writing into the
 		// wrong one succeeds at everything and puts the objects where nobody looks.

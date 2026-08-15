@@ -21,16 +21,28 @@ type postgresStore struct{}
 //
 // # ON CONFLICT DO NOTHING is the idempotence, and the count is how it is observed
 //
-// A redelivered event resolves exactly the same recipients and produces exactly the same
-// (event_id, recipient_id, channel) triples, so uq_notifications_event_recipient_channel refuses
-// every insert and this returns zero. Nothing had to remember that the event had been seen: the
-// rows are the memory, and they are the same rows a second consumer instance would be racing to
+// A redelivered event resolves exactly the same recipients and the same device tokens, so every
+// insert is refused and this returns zero. Nothing had to remember that the event had been seen:
+// the rows are the memory, and they are the same rows a second consumer instance would be racing to
 // write.
 //
 // The alternative — SELECT, then INSERT what is missing — is the version that looks equivalent and
 // is not. Two consumers reading the same message both find nothing, both insert, and one of them
 // gets a unique violation anyway; handling that is this statement, written out longhand and one
 // round trip later.
+//
+// # The conflict target is untargeted since SHIP-140, and that is a widening rather than a loosening
+//
+// It named `(event_id, recipient_id, channel)` while that was the only index it could collide with.
+// 000701 splits the rule in two, because a recipient signed in on two handsets has two push
+// addresses and one of each other kind: uq_notifications_event_recipient_channel stays, partial on
+// `channel <> 'push'`, and uq_notifications_event_recipient_device holds push to one row per
+// device. A statement can name one target, so it names neither and lets either fire.
+//
+// What that also swallows is a primary-key collision on `id`, and it is worth saying so rather than
+// leaving a reader to notice: every id here is a fresh UUIDv7 generated moments earlier, so a
+// collision is not a case this is hiding. Everything else — the foreign key on recipient_id, every
+// CHECK — still raises.
 //
 // One statement rather than a loop, so that a batch of rows for one event is one round trip inside
 // a transaction that is holding a Kafka partition's progress.
@@ -46,7 +58,7 @@ func (postgresStore) insert(ctx context.Context, r db.Runner, rows []Notificatio
 		SELECT * FROM unnest(
 		    $1::uuid[], $2::uuid[], $3::text[], $4::uuid[], $5::uuid[], $6::text[],
 		    $7::text[], $8::boolean[], $9::text[], $10::text[], $11::text[])
-		ON CONFLICT (event_id, recipient_id, channel) DO NOTHING`
+		ON CONFLICT DO NOTHING`
 
 	n := len(rows)
 	ids := make([]uuid.UUID, n)
@@ -139,8 +151,10 @@ func (postgresStore) contacts(
 }
 
 // claimUndelivered runs [DispatchClaim] and reads what it locked.
-func (postgresStore) claimUndelivered(ctx context.Context, r db.Runner, batch int) ([]Notification, error) {
-	rows, err := r.Query(ctx, DispatchClaim, batch)
+func (postgresStore) claimUndelivered(
+	ctx context.Context, r db.Runner, batch int, at time.Time,
+) ([]Notification, error) {
+	rows, err := r.Query(ctx, DispatchClaim, batch, at)
 	if err != nil {
 		return nil, fmt.Errorf("notifications: claiming undelivered notifications: %w", err)
 	}
@@ -180,14 +194,41 @@ func (postgresStore) markSent(ctx context.Context, r db.Runner, id uuid.UUID, at
 // not be lost, and a row that retires itself is a notification nobody receives and nobody is told
 // about. What bounds the retries is a person reading `attempts`, which is why SHIP-176's alerting
 // has a column to count.
-func (postgresStore) markFailed(ctx context.Context, r db.Runner, id uuid.UUID, reason string) error {
+//
+// **next_attempt_at is written here and nowhere else** (SHIP-138, 000703). Without it a permanently
+// failing row is claimed on every pass forever and, at twenty of them, nothing written afterwards
+// is ever sent. See [BackoffFor].
+func (postgresStore) markFailed(
+	ctx context.Context, r db.Runner, id uuid.UUID, reason string, retryAt time.Time,
+) error {
 	const q = `
 		UPDATE notifications
-		   SET status = 'failed', attempts = attempts + 1, last_error = $2
+		   SET status = 'failed', attempts = attempts + 1, last_error = $2, next_attempt_at = $3
 		 WHERE id = $1`
 
-	if _, err := r.Exec(ctx, q, id, reason); err != nil {
+	if _, err := r.Exec(ctx, q, id, reason, retryAt); err != nil {
 		return fmt.Errorf("notifications: marking %s failed: %w", id, err)
+	}
+	return nil
+}
+
+// markUndeliverable records an address that no longer exists (SHIP-139, 000702).
+//
+// Terminal: the claim's predicate excludes this status, so the row is never worked again. attempts
+// goes up because one was made, and last_error carries the reason so that "why did this person
+// never receive it" is answerable from the row rather than from a log that has rotated.
+//
+// sent_at stays NULL, which ck_notifications_sent_at requires of anything that is not `sent` — the
+// message was not delivered, and a timestamp here would make it look as though it had been.
+func (postgresStore) markUndeliverable(ctx context.Context, r db.Runner, id uuid.UUID) error {
+	const q = `
+		UPDATE notifications
+		   SET status = 'undeliverable', attempts = attempts + 1,
+		       last_error = 'the address was rejected by the channel and has been deregistered'
+		 WHERE id = $1`
+
+	if _, err := r.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("notifications: marking %s undeliverable: %w", id, err)
 	}
 	return nil
 }

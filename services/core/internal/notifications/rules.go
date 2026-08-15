@@ -18,16 +18,21 @@ package notifications
 // told. Docs/10 §3.4 makes those strings the document's own, which is what lets two copies be
 // diffed against the document rather than against each other.
 //
-// # Every rule routes to email and to nothing else, and that is not a narrowing of the *Done when*
+// # Every rule routes to push and to email, and to nothing else
 //
-// Docs/01 §4.5 makes push primary. There is no Firebase adapter (SHIP-139) and no device token
-// table (SHIP-140), so a push rule would produce rows with no address that nothing could ever
-// complete — see [ChannelPush]. SMS has a working sender and no product decision behind routing a
-// notification to it; see [ChannelSMS]. Email has both a sender and a document telling it to exist.
+// Docs/01 §4.5 makes push the primary channel and keeps email "for records and for anything the
+// user may need to retrieve later", so a rule that tells somebody tells them both ways. That is a
+// change SHIP-139 and SHIP-140 made possible rather than a decision this table took: SHIP-137 wrote
+// email alone because a push rule would have produced rows with no address that nothing could ever
+// complete — there was no Firebase adapter and no device token registry. Both exist now.
 //
-// The dispatcher is channel-generic regardless: it picks a sender by the row's channel and has no
-// list of its own. So a ticket that adds push adds a line here and an adapter, and changes nothing
-// else in this package.
+// **A recipient with no device registered is not an error and produces no push row.** A customer
+// who has never opened the app, or who has signed out everywhere, is reachable by email and by
+// nothing else — see [Recipient.AddressesOn]. Nothing here has to know that.
+//
+// SMS still has a working sender and no product decision behind routing a notification to it; see
+// [ChannelSMS]. The dispatcher remains channel-generic: it picks a sender by the row's channel and
+// has no list of its own, which is what made adding push one edit here and one adapter.
 
 // Audience is one party a rule tells.
 //
@@ -70,8 +75,12 @@ type Rule struct {
 	Why string
 }
 
-// email is the channel set every rule uses today, named once so that adding push is one edit.
-var email = []Channel{ChannelEmail}
+// channels is the set every rule that tells somebody uses, named once — which is what made adding
+// push a one-line change, exactly as SHIP-137 predicted it would be.
+//
+// Push first, because Docs/01 §4.5 makes it the primary channel and because the order is the order
+// rows are written in, which a test reads.
+var channels = []Channel{ChannelPush, ChannelEmail}
 
 // Rules is the routing table, keyed by event type.
 //
@@ -94,14 +103,14 @@ var Rules = map[string]Rule{
 	"job.expiry_warned": {
 		Category: CategoryJobExpiry,
 		To:       []Audience{ToJobCustomer},
-		Channels: email,
+		Channels: channels,
 		Headline: "Your job is about to stop taking offers. You can extend it in the app.",
 	},
 
 	"job.expiry_extended": {
 		Category: CategoryJobExpiry,
 		To:       []Audience{ToJobCustomer},
-		Channels: email,
+		Channels: channels,
 		Headline: "Your job will keep taking offers until its new closing date.",
 	},
 
@@ -110,14 +119,14 @@ var Rules = map[string]Rule{
 	"bid.placed": {
 		Category: CategoryBidding,
 		To:       []Audience{ToJobCustomer},
-		Channels: email,
+		Channels: channels,
 		Headline: "You have a new offer on one of your jobs.",
 	},
 
 	"bid.revised": {
 		Category: CategoryBidding,
 		To:       []Audience{ToJobCustomer},
-		Channels: email,
+		Channels: channels,
 		Headline: "An offer on one of your jobs has changed.",
 	},
 
@@ -127,28 +136,28 @@ var Rules = map[string]Rule{
 	"bid.countered": {
 		Category: CategoryBidding,
 		To:       []Audience{ToJobCustomer, ToBidProvider},
-		Channels: email,
+		Channels: channels,
 		Headline: "There is a counter-offer waiting on one of your jobs.",
 	},
 
 	"bid.withdrawn": {
 		Category: CategoryBidding,
 		To:       []Audience{ToJobCustomer},
-		Channels: email,
+		Channels: channels,
 		Headline: "An offer on one of your jobs has been withdrawn.",
 	},
 
 	"bid.rejected": {
 		Category: CategoryBidding,
 		To:       []Audience{ToBidProvider},
-		Channels: email,
+		Channels: channels,
 		Headline: "Your offer was not accepted.",
 	},
 
 	"bid.expired": {
 		Category: CategoryBidding,
 		To:       []Audience{ToBidProvider},
-		Channels: email,
+		Channels: channels,
 		Headline: "Your offer has expired on its own terms.",
 	},
 
@@ -157,7 +166,7 @@ var Rules = map[string]Rule{
 	"bid.accepted": {
 		Category: CategoryAward,
 		To:       []Audience{ToJobCustomer, ToBidProvider},
-		Channels: email,
+		Channels: channels,
 		Headline: "A job has been awarded. Both parties can see it in the app.",
 	},
 
@@ -166,14 +175,14 @@ var Rules = map[string]Rule{
 	"delivery.driver_assigned": {
 		Category: CategoryDelivery,
 		To:       []Audience{ToJobCustomer},
-		Channels: email,
+		Channels: channels,
 		Headline: "A driver has been assigned to your delivery.",
 	},
 
 	"delivery.milestone_recorded": {
 		Category: CategoryDelivery,
 		To:       []Audience{ToJobCustomer},
-		Channels: email,
+		Channels: channels,
 		Headline: "Your delivery has moved on.",
 	},
 
@@ -182,7 +191,7 @@ var Rules = map[string]Rule{
 	"delivery.proof_recorded": {
 		Category: CategoryDelivery,
 		To:       []Audience{ToJobCustomer},
-		Channels: email,
+		Channels: channels,
 		Headline: "Proof of delivery has been recorded for your job.",
 	},
 }
@@ -255,7 +264,7 @@ var StatusRules = map[string]Rule{
 	"Cancelled": {
 		Category: CategoryAward,
 		To:       []Audience{ToJobCustomer, ToAwardedProvider},
-		Channels: email,
+		Channels: channels,
 		Headline: "A job has been cancelled.",
 	},
 
@@ -265,7 +274,7 @@ var StatusRules = map[string]Rule{
 	"Completed": {
 		Category: CategoryAward,
 		To:       []Audience{ToJobCustomer, ToAwardedProvider},
-		Channels: email,
+		Channels: channels,
 		Headline: "A job has been completed and is now closed.",
 	},
 
@@ -274,7 +283,7 @@ var StatusRules = map[string]Rule{
 	"Disputed": {
 		Category: CategoryAward,
 		To:       []Audience{ToJobCustomer, ToAwardedProvider},
-		Channels: email,
+		Channels: channels,
 		Headline: "A dispute has been raised on a job. Support will be in touch.",
 	},
 }

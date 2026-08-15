@@ -379,7 +379,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **697 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **712 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -562,6 +562,9 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
 | **SHIP-137** | M5 | The notification consumer — **a service of its own, `cmd/notifier`, rather than a sixth `cmd/worker` task**, because a worker pass *is* a transaction and a consumer must commit its topic offsets strictly after one. `internal/notifications` opens: the routing table, recipient resolution through a `Parties` port `cmd/notifier` fills, and dispatch that reads a channel column and knows nothing about events. Idempotence is `uq_notifications_event_recipient_channel` rather than anything the consumer remembers. **Push is declared and unsendable** — SHIP-139 and SHIP-140 do not exist, so `Rules` writes no push row rather than rows nothing can complete — *see below* |
+| **SHIP-139** | M5 | The Firebase adapter — and **`Pusher` returns `(rejected bool, err error)`**, because a sentinel expresses "a dead token is normal traffic" and does not enforce it, and could not even have been the adapter's own: a domain may not import an adapter. `000702` adds a **fourth notification status**, `undeliverable`, because `failed` is deliberately retried forever and `sent` would be untrue. **No Firebase project exists**; the credential is a closure and the exchange from a service-account key needs a `go.mod` change — *see below* |
+| **SHIP-140** | M5 | `device_tokens` — and **sign-out clears a token with nothing writing to the table**. Sessions are *revoked*, not deleted (`000104`), so a cascade would never fire; instead no push address resolves whose session is not live, through a `Sessions` port `cmd/notifier` fills. **`internal/identity` is untouched.** `000701` also **splits the deduplication rule in two** rather than adding `address` to it, which would have made an email duplicate possible — *see below* |
+| **SHIP-138** | M5 | Per-channel templates over a **closed two-field input**, neither field from the event payload — so SHIP-141 stays structural, and a test substitutes into the template source **byte-for-byte**. Its second half was a defect rather than a policy: twenty permanently failing rows were claimed on **every pass forever** and nothing behind them was ever sent. `000703` adds `next_attempt_at`, **nullable**, and the reason it is nullable is the finding — *see below* |
 | **SHIP-147** | M6 | Administrator authentication — `admin_users` and `admin_sessions` (`000801`), `POST /v1/admin/sessions`, `DELETE /v1/admin/sessions/current`, `GET /v1/admin/me`, and the body of `newAdminGuard`. **The credential is a row, not a signed token**, which is where it parts company with `Docs/10` §5's mobile pair and why revocation is immediate. It **adds the absolute cap SHIP-39 deliberately refused**, on an argument that does not survive the change of subject. It asked **nothing of `internal/config`** — *see below* |
 | **SHIP-148** | M6 | Twelve granular permissions and three role bundles, in a **Go table rather than a grant table** — a permission model is the opposite of the thing `Docs/06` §5.3 puts server-side and changeable. Default-deny at three levels: an omitted role becomes the minimum in Go *and* in the column default, and a role with **no bundle holds nothing**. There is deliberately **no permission to delete an audit entry** — *see below* |
 | **SHIP-150** | M6 | Every admin mutation writes an audit entry — and the ticket had to **build SHIP-149's missing write helper first**, because no Go code in the repository wrote to `audit_log` at all. The entry commits **in the same transaction as the mutation**, so a refused action leaves nothing and a failed entry fails the action. Completeness is checked from both ends: the domain drives every mutation and reads the row back, and `cmd/api` holds the **served surface** to the catalogue. `created_at` takes the **injected clock**, deliberately — *see below* |
@@ -10763,6 +10766,206 @@ rather than measuring, in a brief whose own baselines were measured — which is
 recurring failure mode arriving in a document meant to prevent it. The check that caught it is
 `grep` against the golden file, and it took under a minute.
 
+
+
+### SHIP-139, SHIP-140 and SHIP-138 — M5 dispatch
+
+Three tickets on one branch, `ship-138-140-notifications-dispatch`, and deliberately a chain rather
+than three independent pieces. SHIP-137 left push "declared and unsendable": a `Pusher` port nothing
+implemented, a `push` channel in the vocabulary with no address it could carry, and `Rules` writing
+no push row rather than rows nothing could complete. **The gap was the adapter *and* the registry,
+and shipping either alone reproduces it** — an adapter with nothing to send to, or tokens nothing
+can send with.
+
+#### `rejected` is a return value, and that is the ticket's main decision
+
+`internal/platform/push/doc.go` was written before the code and its central claim is that **a
+rejected device token is normal traffic, not an error**: FCM rejects one whenever an app is
+uninstalled or its data cleared, and treating that as a dispatch failure produces an alert that
+fires forever and is eventually ignored — including on the day it means something.
+
+A sentinel error would have *expressed* that and would not have *enforced* it. `errors.Is` is
+something a caller can forget, and forgetting is invisible: every rejection counted as a failure,
+every dead handset holding a row that retries for the life of the platform. It could not even have
+been the adapter's sentinel, because a domain may not import an adapter — so it would have had to be
+declared in `notifications` and returned by a package that does not know `notifications` exists.
+
+So `Pusher.Push` returns `(rejected bool, err error)`. A first return value is named at every call
+site and the compiler notices its absence.
+
+**`000702` is the same argument applied to the row.** `000700` made `failed` deliberately
+non-terminal, so a dead handset would be reclaimed on every pass forever and counted into whatever
+SHIP-176 alerts on; `sent` would be a lie a support query cannot see through. The fourth status,
+`undeliverable`, is terminal and truthful. It is reachable from push and deliberately not from
+email: a bounce is a different fact, learned asynchronously through a webhook this MVP does not
+have.
+
+#### What SHIP-139 could not demonstrate, named rather than narrowed away
+
+**No Firebase project exists, and a service-account key is on `CLAUDE.md`'s never-commit list.** So:
+
+| What | Why not |
+|---|---|
+| A push reaching a real handset | No project, no key, no device. Nothing in this repository can create one |
+| The OAuth exchange that mints the bearer credential | Needs `golang.org/x/oauth2/google` — a module, and therefore a `go.mod` change this branch may not make. `Options.Credential` is a closure the composition root supplies, so the exchange is one closure away whenever the module lands |
+| That Google accepts the request shape | Only Google can answer that. What is held instead is the shape itself, off the wire |
+
+What *is* demonstrated is the whole path up to Google's door: `fcm_test.go` stands an `httptest`
+server in for a project and asserts the request FCM would receive — method, project in the path,
+bearer header, message body, `job_id` in `data` rather than in the visible body, Android priority —
+and what **each** of FCM's answers does to a token, across all three of its rejection codes and
+three transport failures. `scripts/verify/81-notifier.sh` runs the real consumer, writes a real push
+row addressed to a real registered handset, and asserts the adapter was handed it.
+
+#### The mutation, and what it caught
+
+Applied to `services/core/internal/platform/push/fcm.go`: the rejection branch made to
+`return false, fmt.Errorf(…)` instead of `return true, nil` — a rejected token treated as a dispatch
+error, which is exactly what `doc.go` argues against.
+
+**Four tests failed**, one per FCM rejection code plus the bare-404 case:
+`TestARejectedTokenIsReportedAndNotRaised` in all three of its sub-cases, and
+`TestA404WithNoBodyIsStillARejection`. So the package's central argument is demonstrated rather than
+merely stated — which is what wave 9's `Auditor.Record` finding was about.
+
+**What the mutation did *not* break is worth recording.** Nothing in `internal/notifications`
+failed, because the domain's rejection handling is driven by a `rejectingPusher` fake. The two
+halves are held by two different tests against two different subjects — the adapter's
+*classification* by the adapter's tests, the domain's *response* by the domain's — and neither
+covers the pair. The verify section is the only place they meet.
+
+Reverted from a copy taken beforehand, never with `git checkout`, and confirmed both ways:
+`shasum` against the copy (`fd8027fbf2a38e04dddfddf7761eb89d469eda09`, matching) **and** an empty
+`git diff`. The checksum is the half that matters — after a destructive `git checkout` the diff is
+empty too, which is the signature of the failure rather than evidence against it.
+
+#### SHIP-140: sign-out clears a token with nothing writing to `device_tokens`
+
+The *Done when* is "tokens bind to a device session and clear on sign-out", and the second clause
+decided the design. The obvious shapes both fail:
+
+* **`ON DELETE CASCADE` on `device_sessions`** never fires. `000104` *revokes* a session — sets
+  `revoked_at`, keeps the row — precisely so a device list can say "signed out three weeks ago". A
+  cascade would be a guarantee in name only.
+* **Identity writing to `device_tokens` at sign-out** is a cross-domain write into another domain's
+  table, and would need a change to `internal/identity` — which is on the never-parallelise list and
+  which this lane was told to avoid if it could.
+
+What was built instead: **nothing resolves a push address whose session is not live.** Revoking a
+session ends push delivery to that handset from the instant the revocation commits, with no
+cross-domain write, no second copy of the fact, and **`internal/identity` untouched**. The liveness
+question is a `Sessions` port filled in `cmd/notifier` — the fourth instance of the arrangement
+SHIP-113, SHIP-117 and SHIP-137 already use, written the same way on purpose. "Live" is two
+conditions rather than one: not revoked, *and* the refresh token has not lapsed, because a handset
+unopened for a month cannot open the job the notification points at either.
+
+`WithSessions` is an option rather than a fourth parameter, and the default is the safe direction: a
+service without it resolves **no** push address at all. Quietly pushing to every registered handset
+would be the dangerous default; quietly pushing to none is visible in one query.
+
+**`000701` also had to split the deduplication rule, and the shape of the split is the interesting
+part.** `uq_notifications_event_recipient_channel` was exactly right while every channel had one
+address per person. Push does not: a customer signed in on a phone and a tablet has two live tokens
+and both must be told, and under the old index the second row was refused and the tablet was never
+notified — silently, for every event. **Adding `address` to the index would have been wrong**, because
+an email address is resolved from `users` at write time, so a person who changed theirs between two
+deliveries of one event would have received it twice — the exact duplicate that index exists to
+prevent. Two partial indexes state the two rules exactly: one per person per channel for email and
+SMS, one per device for push.
+
+#### SHIP-138: the templates, and a starvation that had nothing to do with copy
+
+The templates keep SHIP-137's constraint rather than replacing it. Their input is a closed
+two-field struct, and **neither field comes from the event payload**: the job identifier, and a
+headline that is a literal typed into `Rules`. `text/template` refuses a field the struct does not
+have, so SHIP-141's rule holds structurally. The template *sources* are kept beside the parsed forms
+so a test can substitute the two values by hand and demand the rendered result **byte-for-byte** — a
+template that gained a conditional, a function call or a third field fails it. That is stronger than
+searching output for forbidden words, which only knows the words somebody thought of.
+
+**"Sends reliably" turned out to be a defect rather than a policy.** The dispatcher claims twenty
+rows ordered by age and `failed` is not terminal, so twenty addresses that will never succeed were
+claimed on every pass in perpetuity and **nothing written after them was ever sent**. The queue was
+stopped rather than slow, and every counter reported a healthy platform dispatching twenty messages
+a pass. `000703` adds `next_attempt_at` and the claim excludes a deferred row;
+`TestOneStuckRowDoesNotStopTheQueue` fails on the tree before it.
+
+**The column is nullable, and that is the finding worth carrying.** `NOT NULL DEFAULT now()` looks
+tidier and is wrong: the default comes from the *database* clock while every comparison against it
+comes from the *injected* one (`Docs/10` §6.3), so any service with a fixture clock writes rows
+already deferred past the instant it asks about and dispatches nothing at all. Six tests failed at
+once, which was the cheap version of discovering that.
+
+#### The SHIP-134 equality assertion — decided, and not by weakening it
+
+`scripts/verify/80-notifications.sh` compared `consumed_sorted == outbox_sorted`: set equality
+between everything on `shipper.job` and what this database says it published. Wave 9 proved by id
+that this breaks in two directions on a shared broker — another tree's *delete* removes your
+messages (a fence does not help; the offsets no longer exist), another tree's *publish* adds
+messages you did not expect (**no fence can fix this** — fencing narrows where you start reading,
+not what else arrives). The section's own justification for deleting the topic — safe "because no
+other section asserts on a topic it did not create" — is **scoped to sections and does not survive a
+second worktree**.
+
+**The equality was not turned into a subset check.** What changed is what the equality is *over*.
+
+The old check drew its authority from the topic being empty, and emptiness is not a property one
+worktree can establish about a shared topic. **The database is genuinely per worktree**, so
+provenance comes from there instead. Every message read is one of exactly two things and the outbox
+tells them apart:
+
+1. **completeness** — every id this run published is on the topic. The "at least once" half.
+2. **equality over what this database owns** — of the messages read, exactly those the outbox knows
+   about are exactly those this run published. Neither more nor fewer. **This is the direction the
+   old reverse check protected** — a message on the topic the outbox does not claim, meaning
+   something published without recording it — and it is still caught, because such a row *is* in
+   this database's outbox and *is not* in the published set.
+3. **provenance** — everything else is another worktree's. Counted, printed, never failed. A green
+   run now says how many foreign messages it saw, so nobody reads it as evidence that the topic was
+   theirs alone.
+
+**And the section no longer deletes `shipper.job`.** It takes a per-partition offset fence instead,
+which is what the SHIP-136 section already does for the other two topics. That removes this file as
+a *cause* of failure mode 1 for every other tree on the machine — it was the only thing in the
+harness deleting a topic other trees publish to.
+
+Three consequences, all named rather than left to be discovered:
+
+* **The residual is real and this section cannot close it.** A delete landing between this run's
+  publish and this run's read still loses messages. Only a per-tree topic prefix would fix that, and
+  that is a change to the topic set — a request, not a section's decision. `kafka_consume_fenced`
+  already survives a recreated topic (a fence beyond the end reads the whole partition), and the
+  provenance split keeps the assertion meaningful afterwards, so the failure is bounded to the
+  completeness clause alone.
+* **The SHIP-135 header read had to be fenced too.** It was `--from-beginning --max-messages 200`,
+  which worked *only* because the section above emptied the topic first. Left alone it would have
+  become the monotonic failure the SHIP-136 section documents at length.
+* **`scripts/verify-foundation.sh` now carries one stale sentence** — its `kafka_fence` note says
+  "`shipper.job` is not fenced: 80-notifications.sh deletes and recreates it". That is no longer
+  true. The file is a shared surface this lane may not edit, so it is reported rather than changed;
+  it is a one-line comment correction.
+
+Also fixed while in the file: the `events_golden` loop said **twelve** domain events against a
+golden carrying **thirteen** since SHIP-89 added `bid.expired`. Stale prose rather than lost
+coverage — the event was already read off the topic and held to its schema version by the SHIP-136
+section — but a list that undercounts is a list nobody trusts, so `bid.expired` is enumerated and
+the count corrected. The per-aggregate ordering check was narrowed from "every aggregate on the
+topic" to "every aggregate this database owns", for the same provenance reason: another tree may
+legitimately be running a build with a deliberate defect in it.
+
+#### What was asked of `internal/config`
+
+Three variables, all added and all documented in `deploy/.env.example`: `PUSH_PROJECT_ID`,
+`PUSH_BASE_URL`, `PUSH_CREDENTIAL`, in a `Push` struct shaped exactly like `Email` and `SMS`.
+**Nothing existing was renamed, moved or restructured** — this is an addition to the end of the
+same list those two are on, plus two lines in the start-up log record (the project, which is not
+secret, and whether a credential is configured — never the credential).
+
+`PUSH_PROJECT_ID` empty means the no-op implementation **in every environment**, which is the state
+of every deployment today. The fallback leans towards the no-op harder than email's leans towards
+the console, and for a sharper reason: a machine that dispatched by accident would wake a handset
+belonging to whoever last held that token, and unlike an email there is no address to inspect
+afterwards to work out whose.
 
 ## 4. Partly done — do not treat these as finished
 

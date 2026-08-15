@@ -312,21 +312,282 @@ grep -q '"msg":"sms (console, not sent)"' "$WORKDIR/notifier-sms.log" \
   || { cat "$WORKDIR/notifier-sms.log"; fail "nothing was handed to the SMS channel"; }
 ok "a row naming another channel dispatches through that channel's adapter, with no event-type branch anywhere"
 
-# --- push is declared and cannot be sent, and that is stated rather than hidden ---------------------
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-139  push dispatches to iOS and Android and handles token rejection"
+
+# **No Firebase project exists and no service-account key may be committed**, so nothing below
+# reaches Google. What is demonstrated here is everything on this side of Google's door: that a
+# rule now routes to push, that a row is addressed to a real registered handset, that the adapter
+# is handed it, and that a rejection deregisters the device instead of failing the dispatch.
 #
-# Docs/01 §4.5 makes push the primary channel. SHIP-139 is the Firebase adapter and SHIP-140 the
-# device token registry, and neither exists — so there is no address a push row could carry.
-# notifications.Rules therefore writes none, notifications.Pusher is declared for SHIP-139 to fill,
-# and cmd/notifier passes nil. This check is that the gap is where it is claimed to be rather than
-# somewhere a later ticket would trip over.
+# internal/platform/push/fcm_test.go holds the other half against an httptest server standing in
+# for a project — the request FCM would receive, and what each of its answers does to a token,
+# including all three of its rejection codes. Neither half is repeated in the other.
+#
+# The credential exchange is the one thing neither can show: FCM's HTTP v1 API takes a short-lived
+# OAuth token exchanged from a service-account key, and that exchange needs
+# golang.org/x/oauth2/google — a module, and therefore a go.mod change this branch may not make.
+# Docs/11 §3 records it as named rather than narrowed away.
+
+# --- a real device session, because a device token binds to one --------------------------------
+
+# **Registered and signed in for real rather than with mint_token.** The harness's minted token
+# carries a random `sid`, and a device token's foreign key names an actual `device_sessions` row —
+# so a minted token is exactly the case this endpoint refuses. Signing in is what produces the
+# session the whole ticket is about, and doing it here is also what lets the sign-out below be a
+# real revocation rather than an UPDATE.
+push_email="pushed-customer-$$@example.com"
+push_password="correct-horse-battery-staple"
+
+status="$(post_json "verify-push-reg-$$" /v1/auth/register \
+  "{\"email\":\"$push_email\",\"phone\":\"04183$$\",\"password\":\"$push_password\",\"role\":\"customer\"}" \
+  "$WORKDIR/push-customer.json")"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/push-customer.json"; fail "could not register the pushed customer: $status"; }
+push_customer_id="$(json "$WORKDIR/push-customer.json" '["id"]')"
+
+status="$(post_json "verify-push-login-$$" /v1/auth/login \
+  "{\"email\":\"$push_email\",\"password\":\"$push_password\",\"device_label\":\"Verify Pixel 9\"}" \
+  "$WORKDIR/push-login.json")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/push-login.json"; fail "could not sign the pushed customer in: $status"; }
+push_access="$(json "$WORKDIR/push-login.json" '["access_token"]')"
+push_refresh="$(json "$WORKDIR/push-login.json" '["refresh_token"]')"
+
+push_request() {
+  curl -s -X "$1" -o "$4" -w '%{http_code}' \
+    -H "$auth_header: Bearer $push_access" \
+    -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' \
+    ${5:+-d "$5"} "http://localhost:$VERIFY_PORT$3"
+}
+
+# --- SHIP-140: the registration, and what it binds to -------------------------------------------
+
+push_token_value="verify-fcm-token-$$"
+
+status="$(push_request POST "verify-push-token-$$" /v1/notifications/device-tokens \
+  "$WORKDIR/push-token.json" "{\"token\":\"$push_token_value\",\"platform\":\"android\"}")"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/push-token.json"; fail "registering a device token returned $status, want 201"; }
+
+# The response does not echo the token. It identifies somebody's handset and the client already
+# has it; a response body is logged by more middleware than anybody remembers.
+grep -q "$push_token_value" "$WORKDIR/push-token.json" \
+  && fail "the registration echoed the device token back in its response body"
+ok "a handset registers for push and is answered without its token being repeated"
+
+# The binding, read through `device_sessions` — which is what makes the sign-out below work with
+# nothing writing to `device_tokens` at all.
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
-  "select count(*) from notifications where channel = 'push';")" == "0" ]] \
-  || fail "a push notification was written, and nothing can send one until SHIP-139 and SHIP-140"
+  "select count(*) from device_tokens t
+     join device_sessions s on s.id = t.device_session_id
+    where t.token = '$push_token_value' and t.revoked_at is null
+      and s.user_id = '$push_customer_id' and s.revoked_at is null;")" == "1" ]] \
+  || fail "the device token is not bound to a live device session belonging to the caller"
+ok "the token binds to the device session its credential was issued against, not to the account"
+
+# Registering again is the ordinary case: Firebase hands the app a token at every launch and only
+# sometimes the same one.
+push_token_second="verify-fcm-token-second-$$"
+status="$(push_request POST "verify-push-token-2-$$" /v1/notifications/device-tokens \
+  "$WORKDIR/push-token-2.json" "{\"token\":\"$push_token_second\",\"platform\":\"android\"}")"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/push-token-2.json"; fail "re-registering returned $status, want 201"; }
+
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
-  "select count(*) from pg_constraint
-    where conname = 'ck_notifications_channel' and pg_get_constraintdef(oid) like '%push%';")" == "1" ]] \
-  || fail "the channel vocabulary has no push value, so SHIP-139 would need a migration to add one"
-ok "push is in the vocabulary, routed by nothing, and waiting on SHIP-139 rather than half-built"
+  "select count(*) from device_tokens t
+     join device_sessions s on s.id = t.device_session_id
+    where s.user_id = '$push_customer_id' and t.revoked_at is null;")" == "1" ]] \
+  || fail "the handset holds more than one live token; every notification to it would be two"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select revoked_reason from device_tokens where token = '$push_token_value';")" == "replaced" ]] \
+  || fail "the displaced token was not revoked as replaced"
+ok "a second registration from one handset leaves exactly one live token, and says why the first went"
+
+# A platform nothing ships on is a validation failure rather than a constraint violation, which is
+# the difference between a field error and a 500 with a constraint name in it.
+status="$(push_request POST "verify-push-bad-platform-$$" /v1/notifications/device-tokens \
+  "$WORKDIR/push-bad-platform.json" '{"token":"x","platform":"windows-phone"}')"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/push-bad-platform.json"; fail "an unknown platform returned $status, want 422"; }
+[[ "$(json "$WORKDIR/push-bad-platform.json" '["error"]["details"][0]["field"]')" == "platform" ]] \
+  || { cat "$WORKDIR/push-bad-platform.json"; fail "the field error does not name platform"; }
+ok "a platform this app does not ship on is a field error, not a constraint violation"
+
+# Every state-changing endpoint is refused without an idempotency key (SHIP-15).
+status="$(curl -s -X POST -o "$WORKDIR/push-no-key.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $push_access" -H 'Content-Type: application/json' \
+  -d "{\"token\":\"x\",\"platform\":\"ios\"}" \
+  "http://localhost:$VERIFY_PORT/v1/notifications/device-tokens")"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/push-no-key.json"; fail "a registration with no Idempotency-Key returned $status"; }
+ok "and it is refused without an idempotency key, like every other state-changing endpoint"
+
+# --- a push row, addressed to that handset, handed to the adapter -------------------------------
+
+push_event_id="$("$PSQL" "$DATABASE_URL" -tAqc "
+INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
+VALUES (gen_random_uuid(), 'job', '$notif_job', 'bid.placed',
+        jsonb_build_object(
+            'schema_version', 1,
+            'job_id', '$notif_job',
+            'bid_id', gen_random_uuid(),
+            'provider_id', gen_random_uuid()),
+        now())
+RETURNING id;" | tr -d ' ' | head -1)"
+[[ -n "$push_event_id" ]] || fail "could not write the event the push is about"
+
+# The job belongs to the *other* customer in this file, so the notification would go to them and
+# not to the handset just registered. Point the job at this customer for the duration: recipient
+# resolution is cmd/notifier's Parties query over `jobs`, and this is the shortest honest way to
+# make the registered handset the audience without inventing a second job.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+  -c "UPDATE jobs SET customer_id = '$push_customer_id' WHERE id = '$notif_job';" >/dev/null
+
+publish_outbox "$WORKDIR/push-publish.log" "$push_event_id"
+run_notifier "$WORKDIR/notifier-push.log" \
+  "select count(*) > 0 from notifications where event_id = '$push_event_id' and channel = 'push' and status = 'sent';"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select address from notifications where event_id = '$push_event_id' and channel = 'push';")" \
+  == "$push_token_second" ]] \
+  || { cat "$WORKDIR/notifier-push.log"; fail "no push row was addressed to the registered handset"; }
+ok "a rule routes to push and the row is addressed to the device token, not to the account"
+
+# The adapter was handed it. In development that is push.Noop, which records and never rejects —
+# a no-op that reported a rejection would deregister real devices on the strength of nothing.
+grep -q '"msg":"push (noop, not sent)"' "$WORKDIR/notifier-push.log" \
+  || { cat "$WORKDIR/notifier-push.log"; fail "nothing was handed to the push channel"; }
+
+# And the token is fingerprinted rather than logged whole. It names one person's handset, and a
+# development log is the least protected place in this system.
+grep -q "\"device\":\"$push_token_second\"" "$WORKDIR/notifier-push.log" \
+  && fail "the device token is in the log in full"
+ok "the push adapter received it, and logged a fingerprint of the handset rather than its token"
+
+# The email went out alongside it, because Docs/01 §4.5 keeps email for the record.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from notifications where event_id = '$push_event_id' and channel = 'email' and status = 'sent';")" == "1" ]] \
+  || fail "the event produced no email beside the push"
+ok "and the same event still produces the email Docs/01 §4.5 keeps for the record"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-140  tokens bind to a device session and clear on sign-out"
+
+# **The clause the whole design turns on, demonstrated against a real revocation.**
+#
+# 000104 revokes a device session rather than deleting it, so a foreign key cascade would never
+# fire. What clears the token instead is that nothing resolves a push address whose session is not
+# live — so signing out ends delivery from the instant it commits, with no cross-domain write and
+# no change to internal/identity.
+#
+# The two halves are asserted separately below because either alone would be misleading: that no
+# push is written, and that the `device_tokens` row is exactly as it was.
+push_rows_before="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_tokens t join device_sessions s on s.id = t.device_session_id
+    where s.user_id = '$push_customer_id' and t.revoked_at is null;")"
+
+status="$(curl -s -X POST -o "$WORKDIR/push-logout.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $push_access" -H "Idempotency-Key: verify-push-logout-$$" \
+  "http://localhost:$VERIFY_PORT/v1/auth/logout")"
+[[ "$status" == "204" ]] \
+  || { cat "$WORKDIR/push-logout.json"; fail "signing out returned $status, want 204"; }
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions where user_id = '$push_customer_id' and revoked_at is not null;")" == "1" ]] \
+  || fail "the sign-out did not revoke the device session"
+
+push_after_event="$("$PSQL" "$DATABASE_URL" -tAqc "
+INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
+VALUES (gen_random_uuid(), 'job', '$notif_job', 'bid.revised',
+        jsonb_build_object(
+            'schema_version', 1,
+            'job_id', '$notif_job',
+            'bid_id', gen_random_uuid(),
+            'provider_id', gen_random_uuid()),
+        now())
+RETURNING id;" | tr -d ' ' | head -1)"
+
+publish_outbox "$WORKDIR/push-after-publish.log" "$push_after_event"
+run_notifier "$WORKDIR/notifier-after.log" \
+  "select count(*) = 1 from notifications where event_id = '$push_after_event' and channel = 'email' and status = 'sent';"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from notifications where event_id = '$push_after_event' and channel = 'push';")" == "0" ]] \
+  || { cat "$WORKDIR/notifier-after.log"; fail "a push was addressed to a handset whose session had been signed out"; }
+ok "signing out ends push delivery to that handset, from the instant the revocation commits"
+
+push_rows_after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_tokens t join device_sessions s on s.id = t.device_session_id
+    where s.user_id = '$push_customer_id' and t.revoked_at is null;")"
+[[ "$push_rows_before" == "$push_rows_after" ]] \
+  || fail "signing out wrote to device_tokens; the guarantee is meant to need no cross-domain write"
+ok "and it wrote nothing to device_tokens — the token is unreachable rather than deleted"
+
+# The email still went out, which is what says the account was still notified rather than the
+# consumer having silently stopped.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from notifications where event_id = '$push_after_event' and channel = 'email';")" == "1" ]] \
+  || fail "the signed-out customer was not emailed either, so this proves nothing about push"
+ok "the account is still emailed, so the absent push is the session rule and not a dead consumer"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-138  each essential event has an email template and sends reliably"
+
+# The copy, read off the row the dispatcher sent. internal/notifications/rules_test.go holds every
+# template against its source byte-for-byte; what only this can show is that what a real event
+# produces, through a real consumer, is that same fixed text and a job identifier.
+push_body="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select body from notifications where event_id = '$push_after_event' and channel = 'email';")"
+
+grep -q "This message is about job $notif_job" <<<"$push_body" \
+  || { printf '%s\n' "$push_body"; fail "the email body does not name the job it is about"; }
+grep -q "please do not reply" <<<"$push_body" \
+  || { printf '%s\n' "$push_body"; fail "the email body has no closing"; }
+ok "an essential event's email carries its template's copy and the job it concerns"
+
+# SHIP-141's rule, on the bytes that left the building. The renderer is handed a headline the
+# routing table declares as a literal and a job identifier, and the template's input struct has no
+# third field — so this is a check that the structure held, not a redaction pass.
+notif_goods="A crate of laboratory glassware"
+if grep -qi "$notif_goods" <<<"$push_body"; then
+  fail "the goods description reached a notification body"
+fi
+if grep -qi "$push_email" <<<"$push_body"; then
+  fail "an address reached a notification body"
+fi
+ok "and it carries no goods description and no address, because the renderer never reads the job"
+
+# The reliability half. A row that failed waits before it is claimed again — without which twenty
+# permanently failing rows are claimed on every pass forever and nothing written after them is
+# ever sent.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from information_schema.columns
+    where table_name = 'notifications' and column_name = 'next_attempt_at';")" == "1" ]] \
+  || fail "notifications has no next_attempt_at, so one bad address stops the queue"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from pg_indexes where indexname = 'idx_notifications_undelivered'
+     and indexdef like '%undeliverable%';")" == "1" ]] \
+  || fail "the claim index does not exclude the terminal statuses, so the claim is not served by it"
+ok "a failed notification is deferred rather than reclaimed immediately, and the claim's index says so"
+
+# --- deregistration, which is a courtesy rather than the control --------------------------------
+#
+# The session is already revoked above, so this is the client's own tidy-up arriving after the
+# platform has already stopped addressing the handset. It answers 204 either way: a client retrying
+# after a dropped connection must not be told it did something wrong.
+status="$(curl -s -X DELETE -o "$WORKDIR/push-deregister.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $push_access" -H "Idempotency-Key: verify-push-dereg-$$" \
+  "http://localhost:$VERIFY_PORT/v1/notifications/device-tokens/current")"
+[[ "$status" == "204" || "$status" == "401" ]] \
+  || { cat "$WORKDIR/push-deregister.json"; fail "deregistering returned $status, want 204 or 401"; }
+ok "deregistering answers without complaint, whether or not anything was still registered ($status)"
+
+unset push_email push_password push_customer_id push_access push_refresh push_token_value
+unset push_token_second push_event_id push_after_event push_body push_rows_before push_rows_after
+unset push_goods notif_goods
+unset -f push_request
 
 unset notif_customer_id notif_customer_email notif_token notif_job notif_event_id notif_group
 unset notif_row notif_want notif_body notif_before notif_after notif_sent_sql notif_sms_event

@@ -47,50 +47,98 @@
 # **This is the second time cross-section state has bitten this harness** — SHIP-47's rate-limit
 # bucket was the first, where one section's failed sign-ins spent an allowance another section
 # then found empty. The recipe both times is the same: **fence what you assert on**. Here the
-# fence is `published_at > $outbox_fence`, taken after the topic is recreated and before anything
-# can publish, so the comparison is over exactly what this section's worker produced.
+# fence is `published_at > $outbox_fence`, taken before anything can publish, so the comparison is
+# over exactly what this section's worker produced.
 #
-# The next section to run the worker, or to read Kafka, has to do the same. Note in particular
-# that this section *deletes* `shipper.job`, which is safe today only because no other section
-# asserts on a topic it did not create.
+# # Scoping to a section was never enough, and wave 10 is where that came due
+#
+# The paragraph above ended, for six waves, with a note saying this section *deletes* `shipper.job`
+# and that doing so "is safe today only because no other section asserts on a topic it did not
+# create". **That justification is scoped to sections and does not survive a second worktree.**
+# `COMPOSE_PROJECT_NAME` is pinned, so five trees share one broker and one `shipper.job`, and wave 9
+# proved by id rather than by timing that both directions break:
+#
+#   1. **Another tree's delete removes your messages.** A subset check fails, and an offset fence
+#      does not help — the offsets it captured no longer exist. This file was the *cause* of that
+#      failure mode for every other tree on the machine.
+#   2. **Another tree's publish adds messages you did not expect.** An equality check fails, and
+#      **no fence can fix it**: fencing narrows where you start reading, not what else arrives.
+#
+# # What was done about it, and what was deliberately not done
+#
+# **The equality was not weakened into a subset check.** That is how a guard quietly stops guarding,
+# and wave 9 forbade it rather than doing it. What changed is *what the equality is over*.
+#
+# The old check drew its authority from the topic being empty: everything on it had to be this
+# run's, because this run had just wiped it. Emptiness is not a property one worktree can establish
+# about a shared topic — but **the database is genuinely per worktree**, so provenance can come from
+# there instead. Every message read is one of exactly two things, and the outbox can tell them
+# apart:
+#
+#   * an id this database's `outbox` holds — then it is ours, and it must be one this run
+#     published. Asserted as an **equality**, not a subset;
+#   * an id this database has never heard of — then it is another worktree's, and it is counted and
+#     named rather than failed.
+#
+# That is strictly stronger than what it replaces in the direction that matters. The reverse half of
+# the old equality existed to catch "a message on the topic the outbox does not claim", which is a
+# publish that was never recorded; that case is still caught, because such a row *is* in this
+# database's outbox and *is not* in the published set. What it no longer does is fail on a message
+# that was never this tree's business.
+#
+# **And this section no longer deletes `shipper.job`.** It takes an offset fence instead, which is
+# what the SHIP-136 section below already does for `shipper.bid` and `shipper.delivery`. That
+# removes this file as a cause of failure mode 1 for every other tree; it cannot remove failure
+# mode 1 as a possibility, because another tree running an older revision of this file still
+# deletes. `kafka_consume_fenced` survives that — a fence beyond the end reads the whole partition —
+# and the provenance split then keeps the assertion meaningful. **The residual is named rather than
+# papered over: a delete landing between this run's publish and this run's read still loses
+# messages, and only a per-tree topic prefix would close it. That is a change to the topic set and
+# therefore not this section's to make.**
+#
+# The next section to run the worker, or to read Kafka, inherits the recipe: fence on an id, take
+# provenance from the database, and never assert that a shared topic holds nothing else.
 
 ticket "SHIP-134  domain events commit with their transaction and publish at least once"
 
 outbox_topic="shipper.job"
 
-# A clean topic, so "the three messages on it" is a statement about this run. Deletion is
-# asynchronous, hence the wait: creating a topic that is still being deleted fails.
-"${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
-  --delete --topic "$outbox_topic" >/dev/null 2>&1 || true
-for _ in $(seq 1 50); do
-  "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
-    --list 2>/dev/null | tr -d '\r' | grep -qx "$outbox_topic" || break
-  sleep 0.2
-done
-
-# Recreated by the command that owns the topic set rather than by kafka-topics.sh.
+# The topic set, applied rather than the topic deleted.
 #
-# That is a change from how this section was written. It used to create the topic itself, with
-# three partitions and a comment saying SHIP-135 would take it over; **SHIP-135 has**, so the topic
-# now comes back exactly as a deployment would make it. Three partitions still, and for the reason
-# that comment gave: the key is the aggregate, so one job's events must share a partition for Kafka
-# to keep their order within it.
+# **This section used to wipe `shipper.job` here**, so that "the three messages on it" was a
+# statement about this run. Five worktrees share one broker, so that statement was never this
+# tree's to make and the wipe destroyed every other tree's messages while it was at it — see the
+# header. The topic is now left exactly as it is found.
 #
-# The command is idempotent and 50-jobs.sh has already run it once. The SHIP-135 section at the
-# foot of this file asserts the whole set, the partition count, and that a second run changes
-# nothing.
+# `cmd/topics` is idempotent and 50-jobs.sh has already run it once; this run is what guarantees the
+# topic exists at all on a machine where the stack was reset. Three partitions, for the reason the
+# original comment gave: the key is the aggregate, so one job's events must share a partition for
+# Kafka to keep their order within it. The SHIP-135 section at the foot of this file asserts the
+# whole set, the partition count, and that a second run changes nothing.
 pushd "$ROOT/services/core" >/dev/null
 go build -o "$WORKDIR/shipper-topics" ./cmd/topics
 popd >/dev/null
 KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
   "$WORKDIR/shipper-topics" >"$WORKDIR/topics-recreate.log" 2>&1 \
-  || { cat "$WORKDIR/topics-recreate.log"; fail "could not recreate $outbox_topic"; }
-ok "topic $outbox_topic recreated empty by the command that owns the topic set (SHIP-135)"
+  || { cat "$WORKDIR/topics-recreate.log"; fail "could not apply the topic set"; }
+ok "topic $outbox_topic exists with the set the catalogue owns (SHIP-135), and this section leaves it alone"
 
-# The fence. Taken from the database's own clock, after the topic is empty and before anything
-# can publish into it — no worker is running at this point, SHIP-68's having been waited on — so
-# `published_at > $outbox_fence` names exactly the events this section's worker sends to the
-# topic it just created. See the header for what happened without it.
+# **Two fences, taken together, and neither of them is a wall clock over Kafka.**
+#
+# The first is the topic's per-partition end offsets, written into the file `kafka_consume_fenced`
+# reads. The harness takes this fence at run start for `shipper.bid` and `shipper.delivery` and
+# deliberately not for `shipper.job`, because until this ticket this section emptied that topic; it
+# is taken here instead, which is *later* than run start and is what this section wants — earlier
+# sections legitimately publish job events (SHIP-68 runs the real worker), and those are not this
+# section's to assert on.
+#
+# The second is the database's own clock, and it fences the *outbox* rather than the topic. That is
+# the one place a timestamp is sound: `outbox.published_at` is written by this tree's worker into
+# this tree's database, and no other worktree can write a row there.
+#
+# Both are taken before anything publishes — no worker is running at this point, SHIP-68's having
+# been waited on — so the two describe the same window from the two ends.
+kafka_fence "$outbox_topic"
 outbox_fence="$("$PSQL" "$DATABASE_URL" -tAc "select clock_timestamp();")"
 
 # --- an event a real endpoint wrote ----------------------------------------------------------
@@ -244,28 +292,31 @@ ok "the producer was closed on SIGTERM and the worker stopped cleanly"
 
 # --- what actually reached the broker -------------------------------------------------------
 
-# Far more asked for than were written, so that a message which should not be there is read and
-# counted rather than left behind the cut. The consumer therefore always ends on its
-# no-more-messages timeout, which is a non-zero exit and not a failure, hence the `|| true`.
-consumed="$("${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-consumer.sh" \
-  --bootstrap-server localhost:9092 --topic "$outbox_topic" --from-beginning \
-  --max-messages 100 --timeout-ms 8000 2>/dev/null | tr -d '\r' || true)"
-
-printf '%s\n' "$consumed" >"$WORKDIR/outbox-consumed.json"
-consumed_ids="$(python3 -c '
-import json, sys
-print(" ".join(json.loads(line)["id"] for line in open(sys.argv[1]) if line.strip()))
-' "$WORKDIR/outbox-consumed.json")"
+# Read from this section's own offset fence rather than from the beginning of the topic.
+#
+# `--from-beginning` was correct only while this section emptied the topic first, and reading the
+# *oldest* N messages of a topic nothing empties is the monotonic failure the SHIP-136 section below
+# documents at length: it gets worse every run and never clears. `kafka_consume_fenced` starts each
+# partition at the offset recorded above and derives its own bound from `end - fence`, so it reads
+# everything appended since and stops.
+kafka_consume_fenced "$outbox_topic" "$WORKDIR/outbox-consumed.json"
 
 # What the topic holds against what the database says this worker run published — in both
 # directions, which is what makes it worth doing. A row marked published that never left is the
 # one failure the ordering of publish and mark exists to prevent; a message on the topic the
 # outbox does not claim would mean something published without recording it.
 #
-# **Fenced on `published_at > $outbox_fence`**, not on `published_at is not null`. The broad form
-# was this section's original defect: SHIP-68 runs the real worker, which drains the outbox before
-# this section wipes the topic, so rows legitimately published into a topic that no longer exists
-# would be counted as missing. The header carries the full account.
+# **The equality survives a shared broker by changing what it is over, not by becoming a subset.**
+# The header carries the argument; the short form is that the old check drew its authority from the
+# topic being empty, which is not a property one worktree can establish, and this one draws it from
+# the database, which is genuinely per worktree. Three statements:
+#
+#   1. **completeness** — every id this run published is on the topic. This is the "at least once"
+#      half, and it is the direction another tree's *delete* can still break.
+#   2. **equality over what this database owns** — of the messages read, exactly those the outbox
+#      knows about are exactly those this run published. Neither more nor fewer.
+#   3. **provenance** — everything else read is named as another worktree's, counted, and not
+#      failed. A message this database has never heard of is not evidence about this build.
 #
 # **As sets, deliberately.** The topic has three partitions and the key is the aggregate, so the
 # consumer reads three independent streams and interleaves them however it likes. Asserting a
@@ -273,31 +324,77 @@ print(" ".join(json.loads(line)["id"] for line in open(sys.argv[1]) if line.stri
 # promise — and the first run of this check did exactly that and failed, which is the shortest
 # available demonstration that "ordering is per aggregate, not global" is a real property of what
 # was built rather than a sentence in a comment.
-# Unquoted on purpose: $consumed_ids is a space-separated list and the split is what is wanted.
-# shellcheck disable=SC2086
-consumed_sorted="$(printf '%s\n' $consumed_ids | sort | tr '\n' ' ')"
-outbox_sorted="$("$PSQL" "$DATABASE_URL" -tAc \
+"$PSQL" "$DATABASE_URL" -tAc \
   "select id from outbox where aggregate_type = 'job' and published_at > '$outbox_fence' order by id;" \
-  | tr -d ' ' | sort | tr '\n' ' ')"
-[[ "$consumed_sorted" == "$outbox_sorted" ]] \
-  || fail "the topic holds [$consumed_sorted] and the outbox says this run published [$outbox_sorted]"
-ok "every event the outbox marked published is on $outbox_topic, and nothing else is"
+  | tr -d ' ' | grep . >"$WORKDIR/outbox-published.txt" || true
+"$PSQL" "$DATABASE_URL" -tAc \
+  "select id from outbox where aggregate_type = 'job' order by id;" \
+  | tr -d ' ' | grep . >"$WORKDIR/outbox-known.txt" || true
+
+python3 - "$WORKDIR/outbox-consumed.json" "$WORKDIR/outbox-published.txt" \
+  "$WORKDIR/outbox-known.txt" >"$WORKDIR/outbox-provenance.txt" 2>&1 <<'PY' \
+  || { cat "$WORKDIR/outbox-provenance.txt"; fail "the topic and this database's outbox do not agree"; }
+import json, sys
+
+consumed = []
+for line in open(sys.argv[1]):
+    if line.strip():
+        consumed.append(json.loads(line)["id"])
+published = {l.strip() for l in open(sys.argv[2]) if l.strip()}
+known = {l.strip() for l in open(sys.argv[3]) if l.strip()}
+
+# 1. Completeness. Every id this run published is readable off the topic.
+missing = sorted(published - set(consumed))
+if missing:
+    sys.exit("%d of %d events this run published are not on the topic: %s"
+             % (len(missing), len(published), " ".join(missing[:5])))
+
+# 2. Equality, over the population this database can speak for. A message on the topic that this
+#    outbox holds must be one this run published; anything else is a publish that was never
+#    recorded, which is the failure the ordering of publish and mark exists to prevent.
+ours = {i for i in consumed if i in known}
+unclaimed = sorted(ours - published)
+if unclaimed:
+    sys.exit("%d message(s) on the topic are this database's own and are not rows this run "
+             "published: %s -- something published without recording it"
+             % (len(unclaimed), " ".join(unclaimed[:5])))
+
+# 3. Provenance. Everything else is another worktree's. Counted, never failed.
+print(len(set(consumed) - known))
+PY
+outbox_foreign="$(cat "$WORKDIR/outbox-provenance.txt")"
+ok "every event this run's outbox marked published is on $outbox_topic, and every message on it this database owns is one of them"
+
+# The third statement, reported rather than asserted. A number here is not a defect: it is the
+# other worktrees on this machine, and printing it is what stops the next person reading a green
+# run as evidence that the topic was theirs alone.
+[[ "$outbox_foreign" =~ ^[0-9]+$ ]] || fail "the provenance split did not report a count: $outbox_foreign"
+ok "and $outbox_foreign message(s) on it belong to another worktree, named rather than asserted about"
 
 # Per aggregate, though, the order is exact — and that is the promise. Checked over every
-# aggregate on the topic rather than only the one this section wrote, so the jobs domain's own
-# events are held to it too.
+# aggregate **this database owns** rather than only the one this section wrote, so the jobs
+# domain's own events are held to it too.
+#
+# The narrowing from "every aggregate on the topic" is the provenance split again. Another
+# worktree's messages are on this topic and may legitimately come from a build with a deliberate
+# defect in it — a mutation being run, a half-finished ticket — and failing this tree's run over
+# that would be reporting somebody else's experiment as this build's regression.
 python3 -c '
 import json, sys
+known = {l.strip() for l in open(sys.argv[2]) if l.strip()}
 seen = {}
 for line in open(sys.argv[1]):
     if not line.strip():
         continue
     e = json.loads(line)
+    if e["id"] not in known:
+        continue
     previous = seen.get(e["aggregate_id"])
     if previous is not None and e["occurred_at"] < previous:
         sys.exit("%s published after a later event for the same aggregate" % e["id"])
     seen[e["aggregate_id"]] = e["occurred_at"]
-' "$WORKDIR/outbox-consumed.json" || fail "one aggregate's events are on the topic out of order"
+' "$WORKDIR/outbox-consumed.json" "$WORKDIR/outbox-known.txt" \
+  || fail "one aggregate's events are on the topic out of order"
 
 ours_in_order="$(python3 -c '
 import json, sys
@@ -661,9 +758,28 @@ ok "and it reaches a consumer in the envelope as well as inside the payload"
 emitted_event_id="$("$PSQL" "$DATABASE_URL" -tAc \
   "select id from outbox where aggregate_id = '$emitted_job';" | tr -d ' ')"
 
-headers="$("${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-consumer.sh" \
-  --bootstrap-server localhost:9092 --topic "$outbox_topic" --from-beginning \
-  --property print.headers=true --max-messages 200 --timeout-ms 8000 2>/dev/null | tr -d '\r' || true)"
+# **Fenced per partition, like every other read in this file since wave 10.**
+#
+# This was `--from-beginning --max-messages 200`, and it worked only because the SHIP-134 section
+# above emptied the topic first. That section no longer does — five worktrees share the broker and
+# the wipe destroyed their messages — so an unfenced read here would be the *oldest* two hundred
+# messages of a topic nothing ever empties, which is the monotonic failure the SHIP-136 section
+# documents: it gets worse every run and never clears.
+#
+# `kafka_consume_fenced` cannot be reused because headers are not part of what it prints, so this
+# is the same shape open-coded: start each partition at the recorded fence, bound by `end - fence`.
+headers=""
+while read -r partition end; do
+  start="$(awk -v p="$partition" '$1 == p { print $2 }' "$WORKDIR/kafka-fence-$outbox_topic.txt")"
+  start="${start:-0}"
+  (( start > end )) && start=0
+  (( end - start > 0 )) || continue
+  headers+="$("${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-consumer.sh" \
+    --bootstrap-server localhost:9092 --topic "$outbox_topic" \
+    --partition "$partition" --offset "$start" --property print.headers=true \
+    --max-messages "$((end - start))" --timeout-ms 15000 </dev/null 2>/dev/null | tr -d '\r' || true)"
+  headers+=$'\n'
+done < <(kafka_end_offsets "$outbox_topic")
 
 # `event-id:` appears only in the header portion, and the payload spells the field schema_version
 # with an underscore, so neither pattern can match inside a message body.
@@ -681,20 +797,25 @@ ok "the version is a Kafka header on the event a domain emitted, and on none of 
 # --- there is a schema for each domain event, and it is committed ---------------------------------
 
 # cmd/api/events_golden.txt is the catalogue rendered: topic, type, version, payload bound and the
-# payload's field set, one line per event, derived from the payload structs by reflection. A
+# payload's field set, one line per event, derived from the payload structs by reflection.
+#
+# **The list said twelve and the golden has held thirteen since SHIP-89 added `bid.expired`.** Stale
+# prose rather than lost coverage — the event was already read off the topic and held to its schema
+# version by the SHIP-136 section — but a list that undercounts is a list nobody trusts to be
+# complete, so the event is enumerated here too and the count corrected. A
 # payload that changes shape moves a line; a line that moved without its `v` moving is the defect
 # the file exists to make visible in review.
 events_golden="$ROOT/services/core/cmd/api/events_golden.txt"
 for event in \
   job:job.status_changed job:job.expiry_warned job:job.expiry_extended \
   bid:bid.placed bid:bid.revised bid:bid.withdrawn \
-  bid:bid.countered bid:bid.accepted bid:bid.rejected \
+  bid:bid.countered bid:bid.accepted bid:bid.rejected bid:bid.expired \
   delivery:delivery.driver_assigned delivery:delivery.milestone_recorded \
   delivery:delivery.proof_recorded; do
   grep -qE "^shipper\.${event%%:*} +${event#*:} +v[0-9]+ +[0-9]+ +[a-z_]+:" "$events_golden" \
     || fail "${event#*:} has no schema recorded in cmd/api/events_golden.txt"
 done
-ok "each of the twelve domain events has a recorded schema: topic, version, bound and field set"
+ok "each of the thirteen domain events has a recorded schema: topic, version, bound and field set"
 
 # The budget-privacy invariant, applied to the catalogue rather than to one payload. An event is
 # the worst place for it to appear, because it travels past every point a response body could have
@@ -704,7 +825,7 @@ if grep -qi "budget" "$events_golden"; then
 fi
 ok "and no event in the catalogue declares a budget field, in this domain or any later one"
 
-unset consumed consumed_ids consumed_sorted outbox_sorted ours_in_order emitted_type consumed_payload
+unset outbox_foreign ours_in_order emitted_type consumed_payload partition end start
 unset published ship136_remaining ship136_ids worker_pid outbox_fence outbox_token emitted_job emitted_rows
 unset committed_job rolled_back_job rolled_back_rows outbox_topic
 unset event_ids

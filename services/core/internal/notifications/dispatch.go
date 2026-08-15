@@ -3,6 +3,7 @@ package notifications
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 )
@@ -56,13 +57,31 @@ const DispatchBatch = 20
 // that matters: a text check reads the string, and a text check is satisfied by the words appearing
 // in a comment. Docs/11 §9 records that internal/bidding's equivalent lock has neither.
 //
-// idx_notifications_undelivered (000700) is partial on exactly this predicate, so a platform that
-// has sent a million notifications reads the handful it has not.
+// idx_notifications_undelivered (000702, replacing 000700's) is partial on exactly this predicate,
+// so a platform that has sent a million notifications reads the handful it has not.
+//
+// # The instant is a parameter, and that is what stops twenty bad rows stopping the queue
+//
+// SHIP-138 added `next_attempt_at` (000703). Without it, twenty rows that will never succeed are
+// claimed on every pass in perpetuity and nothing written after them is ever sent — the queue is
+// stopped rather than slow, and every counter reports a healthy platform dispatching twenty
+// messages a pass. See [BackoffFor].
+//
+// $2 is the injected clock rather than `now()`, for Docs/10 §6.3's reason: a test that has to wait
+// out a real backoff is a test nobody runs. **NULL means nothing has deferred this row** — see
+// 000703 on why the column is not `NOT NULL DEFAULT now()`, which is the shape that looks tidier
+// and silently stops a fixed-clock service from dispatching anything at all.
+//
+// **Two terminal statuses rather than one, since SHIP-139.** `undeliverable` is what a rejected
+// device token leaves behind (000702): the address is gone, no retry can help, and a row that
+// stayed claimable would be retried against a handset that no longer exists on every pass forever
+// — internal/platform/push/doc.go's "alert that fires forever and is eventually ignored".
 const DispatchClaim = `
 	SELECT id, event_id, event_type, job_id, recipient_id, channel, category, essential,
 	       address, subject, body, status, attempts
 	FROM notifications
-	WHERE status <> 'sent'
+	WHERE status NOT IN ('sent', 'undeliverable')
+	  AND (next_attempt_at IS NULL OR next_attempt_at <= $2)
 	ORDER BY created_at, id
 	FOR UPDATE SKIP LOCKED
 	LIMIT $1`
@@ -86,7 +105,7 @@ const DispatchClaim = `
 // the first is not something a later row will survive either, and the second is a wiring fault that
 // should be fixed and restarted rather than written into every row as a failure.
 func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
-	due, err := s.store.claimUndelivered(ctx, r, DispatchBatch)
+	due, err := s.store.claimUndelivered(ctx, r, DispatchBatch, s.clock.Now().UTC())
 	if err != nil {
 		return 0, err
 	}
@@ -97,21 +116,66 @@ func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
 			return 0, fmt.Errorf("notifications: %s (%s): %w", n.ID, n.Channel, err)
 		}
 
-		if sendErr := sender(ctx, n); sendErr != nil {
-			if err := s.store.markFailed(ctx, r, n.ID, sendErr.Error()); err != nil {
+		rejected, sendErr := sender(ctx, r, n)
+		switch {
+		case sendErr != nil:
+			retryAt := s.clock.Now().UTC().Add(BackoffFor(n.Attempts + 1))
+			if err := s.store.markFailed(ctx, r, n.ID, sendErr.Error(), retryAt); err != nil {
 				return 0, err
 			}
-			continue
-		}
-		if err := s.store.markSent(ctx, r, n.ID, s.clock.Now().UTC()); err != nil {
-			return 0, err
+
+		case rejected:
+			// The far end says this address no longer exists. See [Service.reject].
+			if err := s.reject(ctx, r, n); err != nil {
+				return 0, err
+			}
+
+		default:
+			if err := s.store.markSent(ctx, r, n.ID, s.clock.Now().UTC()); err != nil {
+				return 0, err
+			}
 		}
 	}
 	return len(due), nil
 }
 
+// reject records that an address is gone, and stops addressing it (SHIP-139, SHIP-140).
+//
+// # This is the branch internal/platform/push/doc.go is written around
+//
+// FCM rejects a device token whenever an app is uninstalled or its data is cleared, which happens
+// across a real install base every hour of every day. It is **normal traffic**, and the two obvious
+// things to do with it are both wrong:
+//
+//   - marking the row `failed` retries a handset that no longer exists on every pass forever, and
+//     counts itself into whatever SHIP-176 alerts on — the alert that fires constantly and is
+//     eventually ignored, including on the day it means something;
+//   - marking it `sent` is a lie a support query cannot see through.
+//
+// So the row becomes `undeliverable` (000702) — terminal and truthful — and the device is
+// deregistered so that nothing addresses it again. Both happen in the dispatch pass's transaction,
+// which means the two facts commit together: there is no window in which the platform has recorded
+// that a token is dead and still holds it as live.
+//
+// A failure here **does** fail the pass, unlike a failed send. A send that bounces is one row's
+// business; a database error while recording that a device is gone is not something the next
+// nineteen rows will survive either.
+func (s *Service) reject(ctx context.Context, r db.Runner, n Notification) error {
+	if n.Channel == ChannelPush {
+		if err := s.DeregisterToken(ctx, r, n.Address); err != nil {
+			return err
+		}
+	}
+	return s.store.markUndeliverable(ctx, r, n.ID)
+}
+
 // send is one channel's way of delivering one notification.
-type send func(ctx context.Context, n Notification) error
+//
+// It takes the runner because a rejection is recorded in the pass's transaction, and it returns
+// `rejected` for the reason [Pusher] does: a caller cannot forget a value the compiler makes it
+// name, and it could forget an errors.Is. Only push can reject today — see [Service.reject] on why
+// an email bounce is deliberately not the same fact.
+type send func(ctx context.Context, r db.Runner, n Notification) (rejected bool, err error)
 
 // senderFor picks the implementation by the row's channel.
 //
@@ -122,25 +186,57 @@ type send func(ctx context.Context, n Notification) error
 func (s *Service) senderFor(c Channel) (send, error) {
 	switch {
 	case c == ChannelEmail && s.senders.Email != nil:
-		return func(ctx context.Context, n Notification) error {
-			return s.senders.Email.Send(ctx, n.Address, n.Subject, n.Body)
+		return func(ctx context.Context, _ db.Runner, n Notification) (bool, error) {
+			// Never rejects. An email that hard-bounces is learned about
+			// asynchronously through a webhook this MVP does not have (Docs/01 §8),
+			// so the synchronous answer here is accepted or not — see 000702.
+			return false, s.senders.Email.Send(ctx, n.Address, n.Subject, n.Body)
 		}, nil
 
 	case c == ChannelSMS && s.senders.SMS != nil:
-		return func(ctx context.Context, n Notification) error {
-			return s.senders.SMS.Send(ctx, n.Address, n.Body)
+		return func(ctx context.Context, _ db.Runner, n Notification) (bool, error) {
+			return false, s.senders.SMS.Send(ctx, n.Address, n.Body)
 		}, nil
 
 	case c == ChannelPush && s.senders.Push != nil:
-		// Unreachable today: [Rules] writes no push row, because there is no device token
-		// to address one to (SHIP-140) and no adapter to send it with (SHIP-139). The case
-		// is here so that the ticket which supplies both changes this file by deleting a
-		// comment rather than by inventing a shape.
-		return func(ctx context.Context, n Notification) error {
+		// SHIP-139 and SHIP-140 filled this in. The comment that used to be here said the
+		// case existed so the ticket supplying both would delete a comment rather than
+		// invent a shape, and that is what happened — except for the first return value,
+		// which is the one thing the shape did not anticipate. [Pusher] says why.
+		return func(ctx context.Context, _ db.Runner, n Notification) (bool, error) {
 			return s.senders.Push.Push(ctx, n.Address, n.Subject, n.Body, n.JobID)
 		}, nil
 
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrNoSender, c)
 	}
+}
+
+// BackoffFor is how long a notification waits before its next attempt (SHIP-138).
+//
+// Exponential from a minute, flattening at an hour, and it **never gives up**: Docs/01 §4.5 says a
+// notification failure must not lose the event, so a row that retired itself would be a message
+// nobody receives and nobody is told about. What bounds the retries is a person reading `attempts`,
+// which is 000700's own answer and the column SHIP-176 alerts on.
+//
+// No jitter. Jitter spreads a thundering herd across a shared far end, and there is no herd here:
+// one dispatcher claims twenty rows at a time under SKIP LOCKED, and two instances already
+// interleave rather than collide.
+func BackoffFor(attempts int) time.Duration {
+	const (
+		base = time.Minute
+		max  = time.Hour
+	)
+
+	if attempts < 1 {
+		return base
+	}
+	wait := base
+	for range attempts - 1 {
+		wait *= 2
+		if wait >= max {
+			return max
+		}
+	}
+	return wait
 }
