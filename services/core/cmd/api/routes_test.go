@@ -162,7 +162,13 @@ func testDriverGuard() Guard {
 // main.go builds. When a route does declare it, a nil guard makes the router panic at startup
 // naming the class — which is how the driver half announced itself, and is the failure this helper
 // converts from fifteen edits into one.
-func testAdminGuard() Guard {
+//
+// **The paragraph above was written before SHIP-147 and the seam paid twice.** SHIP-147 filled the
+// body and the fifteen call sites did not move; SHIP-147b then gave newAdminGuard a *second* thing
+// to return — the idempotency scope resolver — and the call sites did not move again, because the
+// return type became a struct rather than the signature growing. The name is kept for that reason:
+// renaming this helper is the fifteen edits the helper exists to prevent.
+func testAdminGuard() adminAuth {
 	guard, err := newAdminGuard(testDeps().Config, nil, clock.System{})
 	if err != nil {
 		panic("cmd/api test: building the admin guard: " + err.Error())

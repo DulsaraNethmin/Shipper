@@ -183,12 +183,24 @@ func TestTheAdminClassIsServedExactlyWhenTheConstructorSuppliesAGuard(t *testing
 		t.Fatalf("building the admin guard: %v", err)
 	}
 
-	_, enforced := guardsFor(nil, admin)[RequireAdmin]
-	if enforced != (admin != nil) {
+	_, enforced := guardsFor(nil, admin.Guard)[RequireAdmin]
+	if enforced != (admin.Guard != nil) {
 		t.Errorf("newAdminGuard returned a guard: %t, but the class is enforced: %t.\n"+
 			"These must agree — a class enforced with no verifier behind it is a route that "+
 			"refuses forever, and a verifier that never reaches the map is a route that panics "+
-			"at startup for no reason.", admin != nil, enforced)
+			"at startup for no reason.", admin.Guard != nil, enforced)
+	}
+
+	// SHIP-147b's half of the same rule. The constructor now returns two things and both have to
+	// arrive: a guard with no scope resolver beside it serves every administrative route while
+	// every administrator's idempotency key shares the anonymous namespace, which is the hole
+	// SHIP-147b closed and the one shape that looks entirely healthy from outside.
+	if admin.Guard != nil && admin.Scope == nil {
+		t.Error("newAdminGuard supplied a guard and no idempotency scope resolver.\n" +
+			"httpx.ResolvePrincipal panics on a nil resolver rather than skipping it, so this " +
+			"is a startup failure — but the reason it must be one is that the alternative is " +
+			"silent: administrative routes would serve normally and two administrators would " +
+			"share `idem:v1:anonymous:<key>` (SHIP-147b, Docs/11 §9).")
 	}
 }
 
@@ -278,7 +290,7 @@ func TestTheMobileAuthenticatorNeverResolvesAnAdministratorCredentialIntoASubjec
 // one answer that must never appear is a success. That is what this asserts, and it needs no
 // database to assert it, which is what makes it a CI test rather than a verify check.
 func TestTheAdminGuardRefusesRatherThanAdmitting(t *testing.T) {
-	guard := testAdminGuard()
+	guard := testAdminGuard().Guard
 	if guard == nil {
 		t.Fatal("newAdminGuard supplies no guard, so RequireAdmin is unserved")
 	}

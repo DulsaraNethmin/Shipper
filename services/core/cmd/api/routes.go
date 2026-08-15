@@ -90,11 +90,11 @@ func newRouter(
 	idempotencyStore httpx.IdempotencyStore,
 	authenticate httpx.Authenticator,
 	driverToken Guard,
-	admin Guard,
+	admin adminAuth,
 ) http.Handler {
 	// Which middleware enforces which auth class. A class absent from this map cannot be
 	// served at all — see attach and guardsFor.
-	protected := guardsFor(driverToken, admin)
+	protected := guardsFor(driverToken, admin.Guard)
 
 	root := http.NewServeMux()
 
@@ -131,10 +131,23 @@ func newRouter(
 	// Requiring a credential stays per route, inside, because the manifest declares it per
 	// route. Resolving one is group-wide and rejects nothing: /v1/auth/refresh is public and
 	// is called by exactly the client whose token has just expired (Docs/10 §4.2).
+	//
+	// **ResolvePrincipal is beside it, and for the half of the problem ResolveSubject cannot
+	// reach** (SHIP-147b). An administrator produces no authctx.Subject on purpose, and their
+	// session is verified by RequireAdmin — which is a per-route guard, *inside* Idempotent,
+	// so it runs after the scope has been computed. Every administrative key therefore landed
+	// in the anonymous scope, and no guard could have changed that: at the moment the scope is
+	// computed there is nothing on the context to read. This is the fix Docs/11 §9 named twice
+	// and deferred twice, because it is a change to internal/httpx and to this file.
+	//
+	// It costs nothing on a read. The resolver is lazy — SubjectScope invokes it, and only
+	// when it has no subject and Idempotent has actually asked for a scope, which happens only
+	// on a state-changing request carrying a valid key.
 	root.Handle(apiPrefix+"/", http.StripPrefix(apiPrefix,
 		httpx.ResolveSubject(authenticate)(
-			httpx.Idempotent(idempotencyStore, httpx.SubjectScope)(
-				httpx.StandardErrors(v1)))))
+			httpx.ResolvePrincipal(admin.Scope)(
+				httpx.Idempotent(idempotencyStore, httpx.SubjectScope)(
+					httpx.StandardErrors(v1))))))
 
 	// Ordering is load-bearing. RequestID is outermost so both the log record and any
 	// recovered panic can be attributed to a request; Recover sits inside Logger so a

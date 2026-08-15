@@ -296,3 +296,222 @@ func TestRequireSubjectWithoutResolutionRefuses(t *testing.T) {
 		t.Fatalf("status = %d, want 401 — a guard with no resolution ahead of it must fail closed", rec.Code)
 	}
 }
+
+// --- SHIP-147b: the second resolver -------------------------------------------------------------
+
+// resolverFor recognises one credential, rejects every other, and counts how many times it was
+// asked.
+//
+// The count is what proves the laziness the file comment claims. Resolving an administrator
+// session is a database read, and a resolver called on every request would pay for one on every
+// GET whose scope is never computed.
+func resolverFor(credential string, p Principal, calls *int) PrincipalResolver {
+	return func(_ context.Context, presented string) (Principal, error) {
+		if calls != nil {
+			*calls++
+		}
+		if presented != credential {
+			return Principal{}, errNotAToken
+		}
+		return p, nil
+	}
+}
+
+// scopeOf runs a request through ResolvePrincipal and reports the scope Idempotent would compute.
+//
+// It drives the middleware rather than calling SubjectScope on a hand-built context, because the
+// context carrier is unexported and a test that reached around it would be asserting on a shape
+// this package could change without anybody noticing.
+func scopeOf(t *testing.T, credential string, resolvers ...PrincipalResolver) string {
+	t.Helper()
+
+	var scope string
+	handler := ResolvePrincipal(resolvers...)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		scope = SubjectScope(r)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/notes", nil)
+	if credential != "" {
+		req.Header.Set(HeaderAuthorization, "Bearer "+credential)
+	}
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	return scope
+}
+
+// The clause SHIP-147b exists for, at the level this package can state it: two callers of a
+// credential system that produces no authctx.Subject must not share a namespace.
+//
+// The end-to-end form — two real administrator sessions through the real router, compared on
+// their response bodies — is cmd/api's TestTwoAdministratorSessionsDoNotShareAnIdempotencyScope,
+// because it needs a database and the admin domain, and this package may have neither.
+func TestSubjectScopeSeparatesTwoPrincipals(t *testing.T) {
+	one := Principal{Kind: PrincipalAdmin, ID: "018f3a1e-0000-7000-8000-00000000000a"}
+	two := Principal{Kind: PrincipalAdmin, ID: "018f3a1e-0000-7000-8000-00000000000b"}
+
+	resolve := func(_ context.Context, presented string) (Principal, error) {
+		switch presented {
+		case "one":
+			return one, nil
+		case "two":
+			return two, nil
+		}
+		return Principal{}, errNotAToken
+	}
+
+	scopeOne, scopeTwo := scopeOf(t, "one", resolve), scopeOf(t, "two", resolve)
+
+	if scopeOne == scopeTwo {
+		t.Fatalf("two administrators share the idempotency scope %q; one that guessed the "+
+			"other's key would be handed that administrator's response body", scopeOne)
+	}
+	if scopeOne == "anonymous" || scopeTwo == "anonymous" {
+		t.Errorf("a verified principal fell back to the anonymous scope: %q, %q", scopeOne, scopeTwo)
+	}
+	if !strings.Contains(scopeOne, one.ID) || !strings.HasPrefix(scopeOne, string(PrincipalAdmin)+":") {
+		t.Errorf("scope %q does not name the administrator and the system they came from", scopeOne)
+	}
+
+	// A credential no resolver recognises is still anonymous. Every public route depends on it,
+	// and a resolver that claimed unknown credentials would give any caller a private namespace
+	// of their own choosing.
+	if got := scopeOf(t, "neither", resolve); got != "anonymous" {
+		t.Errorf("an unrecognised credential scoped to %q, want anonymous", got)
+	}
+	if got := scopeOf(t, "", resolve); got != "anonymous" {
+		t.Errorf("a request with no credential scoped to %q, want anonymous", got)
+	}
+}
+
+// A subject and a principal cannot both be genuine — the three credential systems are separate and
+// none is exchangeable for another — so this pins which wins if a wiring mistake ever produced
+// both, and it pins it towards the answer that was already there.
+func TestSubjectScopePrefersTheSubject(t *testing.T) {
+	resolve := resolverFor("both", Principal{Kind: PrincipalAdmin, ID: "an-administrator"}, nil)
+
+	var scope string
+	handler := ResolvePrincipal(resolve)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		scope = SubjectScope(r)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", nil)
+	req.Header.Set(HeaderAuthorization, "Bearer both")
+	req = req.WithContext(authctx.WithSubject(req.Context(), testSubject))
+
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if scope != "user:"+testSubject.UserID {
+		t.Errorf("scope = %q, want the subject's — an account holder's scope must not change "+
+			"because something else also recognised their credential", scope)
+	}
+}
+
+// The closed kind set, from the direction that matters: a resolver cannot put a caller into the
+// namespace an account holder is already using.
+//
+// `user:` is what SubjectScope writes for a subject, so a resolver returning PrincipalKind("user")
+// with somebody's user identifier would land in that person's scope exactly.
+func TestSubjectScopeRefusesAPrincipalItCannotNamespace(t *testing.T) {
+	for name, p := range map[string]Principal{
+		"an unknown kind":   {Kind: PrincipalKind("something"), ID: "an-id"},
+		"the user kind":     {Kind: PrincipalKind("user"), ID: testSubject.UserID},
+		"no kind at all":    {Kind: "", ID: "an-id"},
+		"no identifier":     {Kind: PrincipalAdmin, ID: ""},
+		"the anonymous one": {Kind: PrincipalKind("anonymous"), ID: "an-id"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := scopeOf(t, "credential", resolverFor("credential", p, nil))
+			if got != "anonymous" {
+				t.Errorf("SubjectScope built %q out of %+v.\n"+
+					"The kind set is closed so that a resolver in cmd/api cannot choose a "+
+					"namespace somebody else is in.", got, p)
+			}
+		})
+	}
+}
+
+// The laziness the design rests on. Resolving an administrator session is a database read; a
+// console makes several requests a second, and only its state-changing ones are ever scoped.
+func TestResolvePrincipalDoesNotResolveUntilTheScopeIsAsked(t *testing.T) {
+	calls := 0
+	p := Principal{Kind: PrincipalAdmin, ID: "an-administrator"}
+
+	var first, second string
+	handler := ResolvePrincipal(resolverFor("good", p, &calls))(
+		http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			if calls != 0 {
+				t.Errorf("the resolver ran %d times before anything asked for a scope; "+
+					"every read request would pay for a session lookup it never uses", calls)
+			}
+			first, second = SubjectScope(r), SubjectScope(r)
+		}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/notes", nil)
+	req.Header.Set(HeaderAuthorization, "Bearer good")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if calls != 1 {
+		t.Errorf("the resolver ran %d times for two scope computations, want 1 — the answer is "+
+			"memoised per request", calls)
+	}
+	if first != second || first != string(PrincipalAdmin)+":an-administrator" {
+		t.Errorf("scopes = %q and %q, want both %q", first, second, "admin:an-administrator")
+	}
+}
+
+// Resolvers are tried in order and the first that answers wins.
+//
+// This is the property that makes the driver half of Docs/11 §9 a cmd/api change rather than
+// another edit to this package: a second closure, over internal/delivery, appended to the call in
+// newRouter. Nothing here needs to know it happened.
+func TestResolvePrincipalTriesEveryResolverInOrder(t *testing.T) {
+	adminCalls, driverCalls := 0, 0
+	admin := resolverFor("an-admin-session", Principal{Kind: PrincipalAdmin, ID: "a"}, &adminCalls)
+	driver := resolverFor("a-driver-token", Principal{Kind: PrincipalDriver, ID: "d"}, &driverCalls)
+
+	if got := scopeOf(t, "a-driver-token", admin, driver); got != "driver:d" {
+		t.Errorf("scope = %q, want driver:d — the second resolver was not tried", got)
+	}
+	if adminCalls != 1 {
+		t.Errorf("the first resolver ran %d times, want 1", adminCalls)
+	}
+
+	// And the first still wins when it is the one that answers, without the second being asked.
+	adminCalls, driverCalls = 0, 0
+	if got := scopeOf(t, "an-admin-session", admin, driver); got != "admin:a" {
+		t.Errorf("scope = %q, want admin:a", got)
+	}
+	if driverCalls != 0 {
+		t.Errorf("the second resolver ran %d times after the first answered, want 0", driverCalls)
+	}
+}
+
+// A nil resolver is the wiring mistake whose consequence is silent: every administrative route
+// serves normally and every administrator shares one namespace.
+func TestResolvePrincipalRefusesANilResolver(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("ResolvePrincipal(nil) did not panic; a resolver that is not there is a " +
+				"scope that silently falls back to anonymous")
+		}
+	}()
+	ResolvePrincipal(nil)
+}
+
+// No resolvers at all is legitimate — a deployment with no credential system but the access token
+// — and must not break the subject scope or the anonymous one.
+func TestResolvePrincipalWithNoResolversIsAPassthrough(t *testing.T) {
+	if got := scopeOf(t, "anything"); got != "anonymous" {
+		t.Errorf("scope = %q, want anonymous", got)
+	}
+
+	var scope string
+	ResolvePrincipal()(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		scope = SubjectScope(r)
+	})).ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/v1/jobs", nil).
+			WithContext(authctx.WithSubject(context.Background(), testSubject)))
+
+	if scope != "user:"+testSubject.UserID {
+		t.Errorf("scope = %q, want the subject's", scope)
+	}
+}
