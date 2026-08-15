@@ -59,8 +59,24 @@
 # that runs the worker to show job expiry also drains the outbox, also sweeps for expiry warnings,
 # and will also run whatever the next ticket registers.
 #
-# Three tasks are registered today — `job-expiry` and `job-expiry-warning` (tasks_jobs.go) and
-# `outbox-publisher` (tasks_outbox.go) — and SHIP-89 and SHIP-119 each add one.
+# **Five tasks are registered today**, counted from the registry rather than from the last version
+# of this comment — `job-expiry`, `job-expiry-warning` and `job-auto-complete` (tasks_jobs.go),
+# `bid-expiry` (tasks_bidding.go) and `outbox-publisher` (tasks_outbox.go). SHIP-89 added the fourth
+# in wave 8 and SHIP-119 the fifth in wave 9, which is both of the two this comment used to name as
+# still to come.
+#
+# Do not maintain that count by hand. `cmd/worker/manifest_test.go`'s
+# `TestTheRegisteredTaskSetIsWhatItSaysItIs` pins the five names against the real registry, so a
+# sixth registration fails there with the open selector question attached — which is what makes
+# adding one a decision somebody re-read rather than something that happened. This comment went
+# stale for two consecutive waves before that test existed, and a count in prose cannot see itself
+# go out of date.
+#
+# **`outbox-publisher` is the one that does not fit rule 1 below**, and a section author has to know
+# it: every unpublished row is due the moment it is written, so "leave nothing due that you are not
+# demonstrating" is unsatisfiable against it. `scripts/verify/61-bidding.sh` works around it by
+# pointing its worker at an unreachable broker so every outbox pass fails legibly and leaves the
+# rows claimable. Docs/11 §9 carries why that workaround is still load-bearing.
 #
 # **SHIP-15r settled how a section deals with that, and the answer is a convention rather than a
 # selector on the binary.** The reasoning is in Docs/11 §3; the rule is two lines and a section
