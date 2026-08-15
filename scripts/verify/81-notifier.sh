@@ -756,9 +756,9 @@ ok "muting job_expiry succeeds and the whole screen comes back with it switched 
 #
 # Two events written together, and the pairing is what makes the negative assertion sound.
 #
-#   * a **job.expiry_warned** — the mutable category, and the same event type this customer already
-#     received a notification for earlier in this section, before the mute. So "no row" cannot be a
-#     routing gap: the identical event wrote one twenty checks ago;
+#   * a **job.expiry_warned** — the mutable category, and the same event type this same customer
+#     already received a notification for earlier in this section, before the mute existed. So "no
+#     row" cannot be a routing gap: the identical event wrote one twenty checks ago;
 #   * a **job.status_changed to Cancelled** — CategoryAward, which Docs/01 §4.5 lists as essential.
 #     It is the marker the consumer is waited on, and it is also the second clause of the *Done
 #     when*: this account has a mute in the table and is told anyway.
@@ -767,12 +767,32 @@ ok "muting job_expiry succeeds and the whole screen comes back with it switched 
 # sleep. When its notification is sent the consumer has certainly read the expiry warning too: both
 # carry the same aggregate id, the publisher orders by (occurred_at, id) and the producer keys on
 # the aggregate, so the two land on one partition in the order they were written.
+# **Its own job, and this is a trap rather than tidiness.**
+#
+# `$notif_job` is not this customer's any more. The SHIP-139 section above reassigns it —
+# `UPDATE jobs SET customer_id = '$push_customer_id'` — so that a push rule resolves to the handset
+# it registered, and the variable keeps its name afterwards. Every rule here resolves its recipient
+# through the Parties port, which reads `jobs.customer_id`, so a mute set on `$notif_customer_id`
+# would be checked against an account that no longer owns the job and the muted event would be sent.
+# That is exactly how this section failed the first time it ran.
+prefs_status="$(curl -s -X POST -o "$WORKDIR/prefs-job.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $notif_token" -H "Idempotency-Key: verify-prefs-job-$$" \
+  -H 'Content-Type: application/json' \
+  -d '{"goods_description": "A crate of laboratory glassware"}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs")"
+[[ "$prefs_status" == "201" ]] \
+  || { cat "$WORKDIR/prefs-job.json"; fail "could not create the job the mute is demonstrated on: $prefs_status"; }
+prefs_job="$(json "$WORKDIR/prefs-job.json" '["id"]')"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select customer_id from jobs where id = '$prefs_job';")" == "$notif_customer_id" ]] \
+  || fail "the job this section mutes against does not belong to the account holding the mute"
+
 prefs_muted_event="$("$PSQL" "$DATABASE_URL" -tAqc "
 INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
-VALUES (gen_random_uuid(), 'job', '$notif_job', 'job.expiry_warned',
+VALUES (gen_random_uuid(), 'job', '$prefs_job', 'job.expiry_warned',
         jsonb_build_object(
             'schema_version', 1,
-            'job_id', '$notif_job',
+            'job_id', '$prefs_job',
             'customer_id', '$notif_customer_id',
             'expires_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ'),
             'warned_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ')),
@@ -781,10 +801,10 @@ RETURNING id;" | tr -d ' ' | head -1)"
 
 prefs_essential_event="$("$PSQL" "$DATABASE_URL" -tAqc "
 INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
-VALUES (gen_random_uuid(), 'job', '$notif_job', 'job.status_changed',
+VALUES (gen_random_uuid(), 'job', '$prefs_job', 'job.status_changed',
         jsonb_build_object(
             'schema_version', 1,
-            'job_id', '$notif_job',
+            'job_id', '$prefs_job',
             'from', 'Open',
             'to', 'Cancelled',
             'actor_type', 'system',
@@ -824,6 +844,7 @@ status="$(prefs_request PUT "verify-prefs-unmute-$$" "$WORKDIR/prefs-unmuted.jso
 ok "an empty list unmutes everything rather than changing nothing, which is the silent failure it would otherwise be"
 
 unset prefs_shape prefs_muted_event prefs_essential_event notif_leaks notif_streets
+unset prefs_status prefs_job
 unset -f prefs_request
 
 unset push_email push_password push_customer_id push_access push_refresh push_token_value
