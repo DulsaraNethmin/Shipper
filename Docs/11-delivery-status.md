@@ -627,12 +627,13 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-83a** | M3 | The provider feed moves off the `{id}` slot: `GET /v1/jobs/open` and `/v1/jobs/open/{id}` become **`GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}`**, gone rather than aliased. That frees the whole four-segment `GET /v1/jobs/{id}/<literal>` space four earlier tickets each paid a workaround for, **demonstrated by registering one** rather than asserted — `TestFourSegmentJobLiteralsCanBeRegistered` attaches the real route table plus a probe route and fails if the mux refuses the pair — *see below* |
 | **SHIP-96a** | M3 | `GET /v1/fleet/jobs/{id}` widens from eligibility to **relationship**: a provider reads a job they hold any bid on — live or closed, and therefore the job they were awarded — for as long as the bid exists, in the same budget-stripped shape the feed serves. One SQL predicate (`readable` = `eligible OR the caller holds a bid`), one column list, one response type; **bidding is deliberately not widened with it**. A provider with neither relationship gets exactly what a missing job gets. The budget guard gained a **word-level** check, because a sentence defeats a closed key set — *see below* |
 | **SHIP-79a** | M3 | A provider declares **who they trade as** — `display_name` and `operates_as` on `PATCH /v1/fleet/profile`, in a new `provider_profiles` table (`000303`) — and a customer comparing offers is shown them. `fleet.PublicProfile` is the closed set, defined in the domain that owns the declaration and mapped into `bidding.ProviderSummary` by `cmd/api`, so a second discloser adds a mapping rather than a field list. **Neither the service area nor the specialties**, which SHIP-102a forbids. A rating and a completed-job count are declined on the record. **The 'same set as an admin read and the open feed' clause is unmet — neither reader exists** — *see below* |
-
 | **SHIP-134a** | M5 | The harness stops being the hazard it was asserting against. `80-notifications.sh` deleted `shipper.delivery` **twice** to stage a drifted topic, on a broker every worktree shares — so `cmd/topics` now reads the **replication factor** back as well as the partition count, and the refusal is demonstrated by asking for three replicas the single-broker stack cannot hold: **the request drifts, not the cluster.** The partition branch moved to a unit test that needs no broker. The *Done when*'s "run two `make verify` concurrently" **asks for exactly what wave 10's mutex exists to prevent**, so the reading taken is a concurrent **publisher** rather than a concurrent harness, and the provenance count is asserted rather than printed — *see below* |
-
 | **SHIP-141** | M5 | Push content redaction — **two guards, because wave 10 proved one of them insufficient.** The structural half was already there and covers what would have to arrive through the event; what this adds is a **word-level** guard over *rendered* copy, because `Rule.Headline` is free prose in a Go literal and wave 10 isolated a sentence carrying no field and no value that a thirteen-test suite passed with live. Four rules: **no digit** once the job identifier is removed, no capitalised word mid-sentence outside a **two-word** allowlist, no street type from a closed Australian list, no `@` or link. `Render` refuses with `ErrRedacted` and writes nothing. **What it cannot catch is named rather than glossed**: a lower-case goods description trips nothing, and that half is structural only — *see below* |
-
 | **SHIP-142** | M5 | `GET` and `PUT /v1/notifications/preferences` — and **"essential events cannot be muted" is a CHECK constraint, not a handler branch**: `ck_notification_preferences_category` (`000704`) admits only the categories `Docs/01` §4.5 leaves off its list, so the row cannot exist however it is written. **Presence is the mute** — no `muted boolean`, no backfill, and an account that existed yesterday receives exactly what it did. The consumer looks up preferences **only when the category is mutable**, so there is no branch in which a muted award could be honoured. The first `PUT` in this service, because the body is the complete set and `[]` means unmute everything — *see below* |
+| **SHIP-104** | M3 | The customer awards an offer — a modal naming the **price and the provider being committed to** and what awarding costs, because a mis-tap on a horizontally scrolling row of near-identical cards ends the bidding on a delivery at the wrong price and there is no un-award. The result is **read back with `?status=accepted`** rather than computed from what the award is known to do: `Docs/02` §2 makes status the platform's, and a client that derived it keeps a second copy of the state machine. No server change, no new route — *see below* |
+| **SHIP-132** | M4 | The panel that says what happened to a queued update the platform refused, opened from the **second line of SHIP-126's bar** — which said "needs attention" and gave a person nothing to act on. Three quarantine reasons get three different sentences, because *lost to server state* is about a decision somebody made and the other two are about this build. **`BlockedOperation.detail` is never rendered**, per its own note. Nothing is removed by opening or closing it; only the row's own button, which says so. A panel rather than a route **on ownership grounds**, and the file says so — *see below* |
+| **SHIP-143** | M5 | Push registration — and the deregistration **cannot be a listener on the session**, because `signOut` clears the access token before it publishes the state, so the obvious implementation sends a request with no credential and achieves nothing while looking like it worked. `core/auth` grew a `signOutHooksProvider` it fills from `main.dart`, which is `CLAUDE.md`'s composition-root rule on the client side. **The token source is a seam with nothing behind it**: no Firebase project exists and **no ticket anywhere creates one** — *see below* |
+| **SHIP-167a** | M7 | `GET /v1/app/policy` — the unsynced-nudge threshold and the proof compression budget, served beside the build floor and read from configuration on every request. The client half is where the ticket lives: **offline and never-told are two different situations and only the second gets the compiled default**, which is one `if` in `resolveAppPolicy` and the whole of what makes the endpoint reach the devices it exists for. A **budget above `STORAGE_MAX_UPLOAD_BYTES` is refused at startup** — a cross-section rule neither variable is wrong under on its own — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -12481,6 +12482,291 @@ verification tick and a join date. `received_offer.dart` and `compare_offers_scr
 it lands.
 
 **Nothing was needed from `internal/config`.**
+
+### SHIP-132 — the rung of the ladder that is about a person
+
+SHIP-126 already drew the line — *"$n updates need attention"* — and gave whoever read it nothing to
+do about it. Both of the files above this one say the same thing in their own words:
+`pending_updates_indicator.dart` ends "what lost, and to what, is SHIP-132's screen", and
+`unsynced_nudge.dart` excludes blocked work entirely because "telling a driver to walk up a hill
+about an update that will still be refused when they get there is worse than saying nothing". This
+is what that line opens.
+
+#### Three reasons and three sentences, which is the part a tidier version would collapse
+
+`refused`, `unsupported` and `unreadable` are one enum and are not one situation. **Only the first
+is "lost to server state"** — a decision somebody or something made, which is SHIP-113's
+administrative conflict arriving as a `409`. The other two are statements about *this build*: a kind
+or body version it has no name for, and a row it could not decode at all. Telling a driver their
+delivery update was rejected when in fact the app cannot read its own database would send them to
+argue with an administrator about nothing.
+
+#### `BlockedOperation.detail` is never rendered, and the test asserts on the words
+
+`queued_operation.dart` already said so — "free text for a support conversation. **Never shown as
+user-facing copy** — a screen writes its own words for the reason" — and it is an `ApiFailure`'s
+`toString`, carrying a status, a code and a request id. A panel that rendered it would look
+informative and would say `ApiErrorResponse(409, conflict, r-9f2)` to somebody on a loading dock. The
+test walks every rendered `Text` and refuses the three markers, which is the guard a key check
+structurally cannot be.
+
+#### Retained, not discarded — asserted in all three directions
+
+Opening the panel removes nothing, closing it removes nothing, dismissing the scrim removes nothing,
+and only the row's own button does. **The version that acknowledges on open is the one that reads as
+tidy**, and it is a silent drop of the one thing `Docs/02` §3.1 says must be kept. The button is
+labelled *"I have read this — remove it"* rather than *Dismiss*, because it is the only thing in the
+application that takes a recorded update away.
+
+`SyncWorker.acknowledge` is new and is on the worker rather than called straight through to
+`OperationQueue.acknowledge`, for the reason `record` is there: the queue deletes the row and
+publishes nothing, so the bar would keep counting it until the next pass — which on a phone with
+nothing left to send is never. `OperationQueue.acknowledge`'s existing guard does the rest: it
+refuses anything pending or in flight, so a panel handed the wrong identifier cannot take unsent work
+off a driver's phone.
+
+#### A panel and not a route, and the reason is partly ownership — said rather than dressed up
+
+Two reasons, and both are real. The product one: the indicator is mounted **beside** the navigator in
+`MaterialApp.router`'s builder, which is what makes it persistent (SHIP-126), so there is no
+`Navigator` above it to push onto — a route would mean moving the bar inside the navigator, undoing
+the thing that ticket was about.
+
+The other is ownership. **Adding a location means editing `core/routing/app_router.dart`, which
+another branch held this wave.** A panel needs no route constant and no `_signedInPatterns` entry. A
+route would be worth asking for only if this screen were deep-linked, and it is not: nothing sends a
+notification about a quarantined update, and SHIP-128's 24-hour rung is server-side and addressed to
+operations rather than to the driver. If that changes, the panel becomes a route and the guard entry
+goes in with it.
+
+It sits **under** `UnsyncedNudge` in the builder: work that could still be sent if somebody found
+signal is the more urgent of the two, and a driver reading about a refused update while four hours of
+unsent ones age should be told about the ageing ones first.
+
+**Nothing was needed from `internal/config`.**
+
+### SHIP-143 — and the deregistration that cannot work the obvious way
+
+#### The half a plausible implementation gets wrong, and gets wrong silently
+
+"De-registers on sign-out" reads as a listener: watch the session, and when it becomes
+`SessionSignedOut`, send the `DELETE`. **That cannot work.** `SessionController.signOut` clears the
+in-memory access token *before* it publishes the state — `session_ender.dart` documented the same
+race for `POST /v1/auth/logout` and solved it by passing the spent token — so a request fired from a
+listener travels with no credential, meets a `401`, starts a refresh, finds no refresh token either,
+and achieves nothing. One wasted request per sign-out and no deregistration at all.
+
+**And it looks like it works.** Something is sent, a future completes, nothing throws. The only
+assertion that tells the two apart is on the **credential the request carried**, which is what
+`push_registration_test.dart` asserts.
+
+So `core/auth` gained `signOutHooksProvider` — a list of `Future<void> Function(String accessToken)`,
+empty by default, dispatched with the spent token beside the logout. `Docs/07` §2 forbids `core/auth`
+knowing about a feature, so the consuming side declares the shape and `main.dart` supplies the
+closure, which is `CLAUDE.md`'s rule for `cmd/api` applied on this side of the wire.
+
+**Every hook there is a courtesy and the provider's own note says so**, because the mechanism is
+general and the next thing put on it might not be. These are dispatched, unordered against the
+logout, and their failures are swallowed — which is right for this one only because
+`contracts/paths/notifications.yaml` states that signing out ends push delivery whether or not the
+call lands. Anything whose correctness depends on landing does not belong there.
+
+#### The token source is a seam with nothing behind it, and no ticket creates the thing it needs
+
+`Docs/11` §3 already carried the platform half: *"No Firebase project exists, and a service-account
+key is on `CLAUDE.md`'s never-commit list."* The client half is worse — a Flutter app cannot fake its
+way to a token at all, because `firebase_messaging` needs `firebase_core`, which needs a
+`google-services.json` and a `GoogleService-Info.plist` that do not exist, and adding the Gradle
+plugin without the first breaks `make flutter-build` for every other lane. So the dependency is
+**deliberately not in `pubspec.yaml`**.
+
+**Nothing in `Docs/09` creates the Firebase project.** X-1 to X-9 are the D-U-N-S number, the two
+store enrolments, the legal brief, the pilot metro area, the auto-complete decision, the privacy
+policy, the terms and the prohibited-goods list. SHIP-139, SHIP-140, SHIP-143, SHIP-144 and SHIP-145
+all sit behind a project no row anywhere asks anybody to create. It is recorded here and in
+`push_token_source.dart`; it wants an X-row.
+
+**So SHIP-143 is done in reduced form and the reduction is named.** Everything except the token is
+built and demonstrated: both requests, their bodies, their idempotency keys, the credential the
+deregistration carries, when each fires, token rotation, and what happens when the platform answers
+`notifications_no_device_session`. On a device today nothing registers, which is correct — a
+registration with no dispatcher behind it is a row in a table nothing can use — and
+`push_registration_wiring_test.dart` **asserts the absence**, so that supplying a source becomes a
+deliberate change with a test pointing at the one line.
+
+#### The suite was vacuous on its first run, which is the wave-10 fixture lesson arriving again
+
+`currentDevicePlatform()` reads `Platform.isIOS`, and `flutter test` runs on macOS or Linux — so it
+answers `null`, the registrar correctly sends nothing, and **every assertion in the file passed
+against an empty list.** Thirteen green tests testing no behaviour whatsoever.
+
+The fix is the seam every other platform channel in this client already has: the platform is a
+function on `PushRegistrar`, defaulted to the real one and overridden in tests through
+`devicePlatformProvider`. Worth recording because the first version was green, would have been
+reviewed as green, and is exactly the shape wave 10's surviving mutation had — **a fixture that made
+the subject unreachable.**
+
+#### One transport method, and it is the `DELETE` counterpart of one that already existed
+
+`ApiClient.deleteNoContent`, mirroring `postNoContent` including its `headers` parameter and for the
+same two reasons: a `204` read as JSON is raised as `ApiMalformedResponse` — a success reported as a
+broken response — and this is the second call in the application that must carry a credential the
+transport will not supply.
+
+**Nothing was needed from `internal/config`.**
+
+### SHIP-104 — the one irreversible thing a customer does
+
+`POST /v1/jobs/{id}/award` has existed since SHIP-92 and no client had ever called it.
+`compare_offers_screen.dart` said so in as many words — "the award itself is SHIP-104; this screen
+deliberately ships without one rather than with a button that goes nowhere" — so this is a client
+ticket end to end: **no migration, no route, no contract change, and `routes_golden.txt` unchanged.**
+
+#### Why the confirmation is a modal and not a second tap
+
+`Docs/02` §3 has the award atomically mark one bid accepted and **every other offer on the job
+rejected** (SHIP-93), and a rejected offer can no longer be revised, withdrawn or countered. There
+is no un-award and no endpoint that would be one. The offers are a horizontally scrolling row of
+near-identical 280-wide cards under a thumb — the exact place a mis-tap happens — and the cost of
+one is somebody's delivery ended at the wrong price.
+
+So the dialog names the **two things being committed to**, the price and the provider, and states
+the consequence in a sentence: awarding closes every other offer and cannot be undone. A dialog
+reading "Are you sure?" confirms that the customer tapped something, not that they tapped the right
+thing.
+
+**The half of that most easily left untested is the refusing direction**, and it is the half a
+defect would live in: a confirmation only exercised through its accept button would pass with a
+dialog that awarded when it opened. `award_test.dart` asserts that tapping the button sends nothing
+and that cancelling leaves the offer still awardable.
+
+#### "Sees the result" is a read, not a derivation
+
+After the platform accepts, the screen re-reads the job's offers with `?status=accepted` — which
+`contracts/paths/bidding.yaml` names as how the awarded offer is read back — and shows it under a
+banner drawn from the award response itself, so something is on screen the instant the platform
+answers.
+
+**It deliberately does not rewrite the list it is holding.** The device knows what the award did in
+principle: one accepted, every live one rejected. Deriving that locally is a second copy of a state
+machine `Docs/02` §2 puts on the platform, correct until the day it is not, and the test asserts on
+the **parameter** rather than on the rows so a screen that derived it would fail.
+
+There is a consequence worth naming: the default read is `submitted`, so after an award the
+unfiltered list is **empty** — a screen that simply refreshed would draw "nobody has offered yet"
+over a delivery that had just been awarded.
+
+#### The retry guarantee does not rest on the idempotency key, and the client is written that way
+
+`ActionKey` holds a key across a retry whose outcome is unknown, as everywhere else. But the
+contract is explicit that a client must not design as though the key were the mechanism: an award
+is an update of a row that already exists, so a **fresh** key naming the **same** offer is answered
+`200` with that offer and records nothing further. A phone restarted between attempts is safe. What
+is refused is a fresh key naming a *different* offer on a job already awarded — `409 conflict`, one
+job and one accepted bid, held by a partial unique index.
+
+The failure copy follows from that. A lost connection says *try again — if the offer disappears when
+you reload, it went through*, because nothing on the device establishes whether the award happened
+and a message claiming it did not would be wrong half the time.
+
+#### Four refusal codes, three destinations, and none of them read from `message`
+
+`conflict`, `bidding_bid_closed`, `bidding_wrong_party` and `idempotency_key_reused`, each mapped to
+a sentence in `AwardState.refusal`. `Docs/07` §6 branches on `code` and never on `message`, and the
+repository test proves it by answering with a `message` that says so.
+
+**`bidding_wrong_party` is reachable even though the screen never offers a button on the customer's
+own counter**, which is the `Docs/07` §3 point in miniature: `ReceivedOffer.isAwardable` decides what
+to draw and decides nothing else, and an offer that changed hands between the draw and the tap is
+refused by the platform with this screen none the wiser.
+
+#### One layout change, recorded because it is the kind that gets reverted
+
+The card row went from 360 to 420 logical pixels high. The cards are a fixed height so their rows
+line up — that is what makes it a comparison — and the action sits below the four compared fields,
+which put it below the fold of the card's own scroll view. A primary action a customer has to scroll
+a card to find is one most of them will not find. The first run of `award_test.dart` failed on
+exactly that.
+
+**Nothing was needed from `internal/config`.**
+
+### SHIP-167a — the endpoint two shipped features asked for by name
+
+`core/sync/unsynced_nudge.dart` and `features/delivery/proof_image.dart` each end with the same
+paragraph: this number belongs server-side, `CLAUDE.md` says so, and it is compiled in anyway
+because **the feature fires on a handset that by assumption has no connection.** Both name a
+client-policy endpoint as what would close it and both name `GET /v1/app/minimum-version` as the
+shape. This is that endpoint.
+
+#### The clause that decides whether the ticket is done or merely looks it
+
+*"the app caches the last response and applies it with no connection, falling back to a compiled
+default only when it has never had one."* **Three situations, not two**, and the failure mode is
+collapsing the middle one into the last:
+
+| Situation | What applies |
+|---|---|
+| The platform answered | What it said, written to the cache |
+| No connection, and this device has been online before | **The cached answer** |
+| No connection, and this device has *never* been online | The compiled default |
+
+A build that fell back to the compiled numbers whenever it was offline reads correctly, passes an
+offline test, and **makes the endpoint have no effect at all on the devices it exists for** —
+because those devices are offline at the moment the number is used. `resolveAppPolicy` is that
+decision in three lines, deliberately separated from the providers so it can be read as a table,
+in the same spirit as `verdictFor` and `redirectFor`.
+
+**The mutation this lane was set was exactly that half-meeting**, and it failed six tests: the two
+`resolveAppPolicy` rows that name the cache, the two provider-level offline tests, the
+`isUsable` fall-one-rung row, and the "unusable answer is not written over a good cached one" row.
+See the mutation note in the wave report — **the fixture is what makes it fail**, and it is written
+about at length in `policy_fixture.dart`: the cached policy differs from the compiled default in
+*both* fields, so an assertion that sees its values can only have got them from the cache. A
+fixture caching four hours and one mebibyte would have let the wrong build produce exactly the
+right answer, which is the shape wave 10's surviving mutation had.
+
+#### What is served, and the one number deliberately not
+
+Two integers, flat rather than grouped. The build floor is keyed by platform because platforms
+multiply; nothing here does. **`longestEdge` is not served** though it sits in the same client
+policy object: 1600 pixels is a legibility judgement about a licence plate photographed from two
+metres (`Docs/01` §4.4), not an operations dial, and serving it would let a deployment trade
+evidence for bytes silently. The backlog row asks for the threshold and the budget.
+
+#### The cross-section validation rule, which is the one neither variable is wrong under alone
+
+`PROOF_COMPRESSION_BUDGET_BYTES` above `STORAGE_MAX_UPLOAD_BYTES` is refused at startup. The
+budget is what a client compresses *towards* and the bound is what the platform will *sign for*, so
+a budget above the bound tells every handset to aim at a size guaranteed to be rejected — and the
+symptom is a driver who cannot finish a delivery, with the platform's limit in the refusal and the
+client-side number nobody would think to look at. Neither variable is out of range on its own,
+which is why the check is in `validate` rather than in either loader call.
+
+#### The cache is a file, not a table in the queue's database
+
+Three reasons, in `app_policy_cache.dart`, and the third decides it: `Docs/07` §3 **clears the
+queue at sign-out**, and the policy is about the device rather than the account — it should survive
+a sign-out exactly as the compiled default does. Sharing a store with something deliberately wiped
+is how it would eventually be wiped too. It goes in `getApplicationSupportDirectory()` rather than
+the cache directory for `ProofStore`'s reason: the OS may purge the latter, and a purged policy
+puts a device that has been online for months back on the compiled numbers.
+
+#### The seam that keeps it free for the other 900 tests
+
+`appPolicyCacheProvider` is `null` until `main.dart` supplies one, and **it also decides whether a
+request is made at all**. The nudge reads this policy and lives inside `ShipperApp`, which nearly
+every widget test builds; a provider that fetched on its own would have each of them open a
+connection to whatever base URL the binary was compiled with. Third instance of the inversion
+`queue_watch.dart` and `version_gate.dart` already use, and `app_policy_wiring_test.dart` holds
+`main`'s override the same way theirs do — its absence is a build that runs on the compiled numbers
+forever, makes no request, writes no cache and fails no test.
+
+#### From `internal/config`: two fields on the existing `App` section
+
+`UNSYNCED_NUDGE_AFTER` (`4h`) and `PROOF_COMPRESSION_BUDGET_BYTES` (`1048576`), both on
+`config.App` beside SHIP-167's build floors, both read on every request. No new section, so
+`withApp` in `routes_app_test.go` needed no change — which is the property SHIP-15p rebuilt that
+fixture for.
 
 
 ## 4. Partly done — do not treat these as finished

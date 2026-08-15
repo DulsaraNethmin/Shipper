@@ -202,6 +202,28 @@ class SyncWorker {
     return discarded;
   }
 
+  /// Removes one blocked operation, because a person has read it (SHIP-132).
+  ///
+  /// **The only way a quarantined operation leaves the table**, which is what makes "retained and
+  /// shown, not discarded" (`Docs/02` §3.1) true: nothing in the worker deletes these, and this is
+  /// reached from a button somebody pressed after reading what happened to it.
+  ///
+  /// It is here rather than on the queue for [record]'s reason turned around: `OperationQueue`
+  /// removes the row and nothing republishes the snapshot, so an indicator counting blocked work
+  /// would keep counting the row until the next pass — which on a phone with nothing left to send
+  /// is never. Making the removal and the publication one call is what stops that.
+  ///
+  /// Answers whether a row was removed. `false` for an operation already gone, or for one that is
+  /// pending or in flight — `OperationQueue.acknowledge` refuses those by construction, because a
+  /// removal that could take unsent work is a removal that can drop it.
+  Future<bool> acknowledge(int id) async {
+    if (_disposed) return false;
+
+    final removed = await queue.acknowledge(id);
+    if (removed) await _publish();
+    return removed;
+  }
+
   /// Records an operation and asks for it to be sent.
   ///
   /// **The seam SHIP-129 consumes**, and the reason it is here rather than on the queue: an

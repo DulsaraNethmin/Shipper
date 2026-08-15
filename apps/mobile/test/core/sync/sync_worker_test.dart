@@ -637,4 +637,76 @@ void main() {
     expect(await harness.nextAttemptOf(enqueued.id), now.add(const Duration(minutes: 1)));
     expect(harness.alarm.armedFor, const Duration(minutes: 1));
   });
+
+  group('acknowledging a quarantined operation (SHIP-132)', () {
+    /// A queue holding one refused operation, which is the state SHIP-132's panel draws.
+    Future<SyncHarness> withOneRefused() async {
+      final harness = SyncHarness.create(
+        sender: ScriptedSender(
+          thereafter: const ApiErrorResponse(statusCode: 409, code: 'conflict', message: 'lost'),
+        ),
+      );
+      await enqueueMilestone(harness.queue);
+      await harness.worker.drain(SyncTrigger.launch);
+
+      expect((await harness.queue.snapshot()).blocked, hasLength(1));
+      return harness;
+    }
+
+    test('a person removes it, and nothing else does', () async {
+      // Docs/02 §3.1: a queued update that lost is **retained and shown**, not discarded. Nothing
+      // in the worker deletes one — a whole drain over a queue of nothing but blocked work leaves
+      // it exactly where it was, which is what makes the panel's button the only way out.
+      final harness = await withOneRefused();
+
+      await harness.worker.drain(SyncTrigger.connectivity);
+      expect((await harness.queue.snapshot()).blocked, hasLength(1));
+
+      final blocked = (await harness.queue.snapshot()).blocked.single;
+      expect(await harness.worker.acknowledge(blocked.id), isTrue);
+      expect(await harness.queue.count(), 0);
+    });
+
+    test('it republishes, so the indicator stops counting it', () async {
+      // The reason this is on the worker rather than a direct call to `OperationQueue.acknowledge`
+      // from the panel: the queue removes the row and publishes nothing, so a bar counting blocked
+      // work would keep counting it until the next pass — which on a phone with nothing left to
+      // send is never.
+      final harness = await withOneRefused();
+      final blocked = (await harness.queue.snapshot()).blocked.single;
+
+      final published = <QueueSnapshot>[];
+      final watching = harness.worker.snapshots.listen(published.add);
+      addTearDown(watching.cancel);
+
+      await harness.worker.acknowledge(blocked.id);
+      await pumpEventQueue();
+
+      expect(published, isNotEmpty, reason: 'the removal has to reach whoever is drawing the bar');
+      expect(published.last.blocked, isEmpty);
+    });
+
+    test('acknowledging the same thing twice is not an error', () async {
+      // A double tap on a phone. The second answers false and removes nothing rather than
+      // reporting a failure to somebody who did what the screen asked.
+      final harness = await withOneRefused();
+      final blocked = (await harness.queue.snapshot()).blocked.single;
+
+      expect(await harness.worker.acknowledge(blocked.id), isTrue);
+      expect(await harness.worker.acknowledge(blocked.id), isFalse);
+    });
+
+    test('it cannot take an operation that is still waiting to be sent', () async {
+      // The guard that makes this a removal rather than a drop. `OperationQueue.acknowledge`
+      // refuses anything pending or in flight by construction, so a panel handed the wrong
+      // identifier cannot take unsent work off a driver's phone.
+      final harness = SyncHarness.create(
+        sender: ScriptedSender(thereafter: const ApiUnreachable()),
+      );
+      final pending = await enqueueMilestone(harness.queue);
+
+      expect(await harness.worker.acknowledge(pending.id), isFalse);
+      expect(await harness.queue.count(), 1);
+    });
+  });
 }

@@ -28,7 +28,18 @@ mixin _$CompareOffersState {
  bool get loaded;/// The position to ask from next. **Opaque** — passed back exactly as it arrived.
  String? get nextCursor;/// Whether asking again would return anything.
  bool get hasMore;/// How the customer wants them ordered.
- OfferOrder get order;/// What the last read failed with, or `null`.
+ OfferOrder get order;/// Which offers are being read, or `null` for the platform's own default (SHIP-104).
+///
+/// `null` while the customer is comparing, which the endpoint reads as `submitted` — the offers
+/// standing right now. It becomes [BidStatus.accepted] after an award, because that is the only
+/// question worth asking then: the award rejected every other live offer in the same
+/// transaction, so the default list would come back **empty** and the screen would draw
+/// "nobody has offered yet" over a delivery that has just been awarded.
+///
+/// The contract names this as the way back in — "`?status=accepted` is how the awarded offer is
+/// read back afterwards" — so this is reading the platform's record rather than reasoning
+/// locally about what the award did to the list this device is holding.
+ BidStatus? get status;/// What the last read failed with, or `null`.
  ApiFailure? get failure;
 /// Create a copy of CompareOffersState
 /// with the given fields replaced by the non-null parameter values.
@@ -40,16 +51,16 @@ $CompareOffersStateCopyWith<CompareOffersState> get copyWith => _$CompareOffersS
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is CompareOffersState&&(identical(other.loading, loading) || other.loading == loading)&&(identical(other.loadingMore, loadingMore) || other.loadingMore == loadingMore)&&const DeepCollectionEquality().equals(other.offers, offers)&&(identical(other.loaded, loaded) || other.loaded == loaded)&&(identical(other.nextCursor, nextCursor) || other.nextCursor == nextCursor)&&(identical(other.hasMore, hasMore) || other.hasMore == hasMore)&&(identical(other.order, order) || other.order == order)&&(identical(other.failure, failure) || other.failure == failure));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is CompareOffersState&&(identical(other.loading, loading) || other.loading == loading)&&(identical(other.loadingMore, loadingMore) || other.loadingMore == loadingMore)&&const DeepCollectionEquality().equals(other.offers, offers)&&(identical(other.loaded, loaded) || other.loaded == loaded)&&(identical(other.nextCursor, nextCursor) || other.nextCursor == nextCursor)&&(identical(other.hasMore, hasMore) || other.hasMore == hasMore)&&(identical(other.order, order) || other.order == order)&&(identical(other.status, status) || other.status == status)&&(identical(other.failure, failure) || other.failure == failure));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,loading,loadingMore,const DeepCollectionEquality().hash(offers),loaded,nextCursor,hasMore,order,failure);
+int get hashCode => Object.hash(runtimeType,loading,loadingMore,const DeepCollectionEquality().hash(offers),loaded,nextCursor,hasMore,order,status,failure);
 
 @override
 String toString() {
-  return 'CompareOffersState(loading: $loading, loadingMore: $loadingMore, offers: $offers, loaded: $loaded, nextCursor: $nextCursor, hasMore: $hasMore, order: $order, failure: $failure)';
+  return 'CompareOffersState(loading: $loading, loadingMore: $loadingMore, offers: $offers, loaded: $loaded, nextCursor: $nextCursor, hasMore: $hasMore, order: $order, status: $status, failure: $failure)';
 }
 
 
@@ -60,7 +71,7 @@ abstract mixin class $CompareOffersStateCopyWith<$Res>  {
   factory $CompareOffersStateCopyWith(CompareOffersState value, $Res Function(CompareOffersState) _then) = _$CompareOffersStateCopyWithImpl;
 @useResult
 $Res call({
- bool loading, bool loadingMore, List<ReceivedOffer> offers, bool loaded, String? nextCursor, bool hasMore, OfferOrder order, ApiFailure? failure
+ bool loading, bool loadingMore, List<ReceivedOffer> offers, bool loaded, String? nextCursor, bool hasMore, OfferOrder order, BidStatus? status, ApiFailure? failure
 });
 
 
@@ -77,7 +88,7 @@ class _$CompareOffersStateCopyWithImpl<$Res>
 
 /// Create a copy of CompareOffersState
 /// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') @override $Res call({Object? loading = null,Object? loadingMore = null,Object? offers = null,Object? loaded = null,Object? nextCursor = freezed,Object? hasMore = null,Object? order = null,Object? failure = freezed,}) {
+@pragma('vm:prefer-inline') @override $Res call({Object? loading = null,Object? loadingMore = null,Object? offers = null,Object? loaded = null,Object? nextCursor = freezed,Object? hasMore = null,Object? order = null,Object? status = freezed,Object? failure = freezed,}) {
   return _then(_self.copyWith(
 loading: null == loading ? _self.loading : loading // ignore: cast_nullable_to_non_nullable
 as bool,loadingMore: null == loadingMore ? _self.loadingMore : loadingMore // ignore: cast_nullable_to_non_nullable
@@ -86,7 +97,8 @@ as List<ReceivedOffer>,loaded: null == loaded ? _self.loaded : loaded // ignore:
 as bool,nextCursor: freezed == nextCursor ? _self.nextCursor : nextCursor // ignore: cast_nullable_to_non_nullable
 as String?,hasMore: null == hasMore ? _self.hasMore : hasMore // ignore: cast_nullable_to_non_nullable
 as bool,order: null == order ? _self.order : order // ignore: cast_nullable_to_non_nullable
-as OfferOrder,failure: freezed == failure ? _self.failure : failure // ignore: cast_nullable_to_non_nullable
+as OfferOrder,status: freezed == status ? _self.status : status // ignore: cast_nullable_to_non_nullable
+as BidStatus?,failure: freezed == failure ? _self.failure : failure // ignore: cast_nullable_to_non_nullable
 as ApiFailure?,
   ));
 }
@@ -172,10 +184,10 @@ return $default(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( bool loading,  bool loadingMore,  List<ReceivedOffer> offers,  bool loaded,  String? nextCursor,  bool hasMore,  OfferOrder order,  ApiFailure? failure)?  $default,{required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( bool loading,  bool loadingMore,  List<ReceivedOffer> offers,  bool loaded,  String? nextCursor,  bool hasMore,  OfferOrder order,  BidStatus? status,  ApiFailure? failure)?  $default,{required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case _CompareOffersState() when $default != null:
-return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.nextCursor,_that.hasMore,_that.order,_that.failure);case _:
+return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.nextCursor,_that.hasMore,_that.order,_that.status,_that.failure);case _:
   return orElse();
 
 }
@@ -193,10 +205,10 @@ return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( bool loading,  bool loadingMore,  List<ReceivedOffer> offers,  bool loaded,  String? nextCursor,  bool hasMore,  OfferOrder order,  ApiFailure? failure)  $default,) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( bool loading,  bool loadingMore,  List<ReceivedOffer> offers,  bool loaded,  String? nextCursor,  bool hasMore,  OfferOrder order,  BidStatus? status,  ApiFailure? failure)  $default,) {final _that = this;
 switch (_that) {
 case _CompareOffersState():
-return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.nextCursor,_that.hasMore,_that.order,_that.failure);case _:
+return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.nextCursor,_that.hasMore,_that.order,_that.status,_that.failure);case _:
   throw StateError('Unexpected subclass');
 
 }
@@ -213,10 +225,10 @@ return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( bool loading,  bool loadingMore,  List<ReceivedOffer> offers,  bool loaded,  String? nextCursor,  bool hasMore,  OfferOrder order,  ApiFailure? failure)?  $default,) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( bool loading,  bool loadingMore,  List<ReceivedOffer> offers,  bool loaded,  String? nextCursor,  bool hasMore,  OfferOrder order,  BidStatus? status,  ApiFailure? failure)?  $default,) {final _that = this;
 switch (_that) {
 case _CompareOffersState() when $default != null:
-return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.nextCursor,_that.hasMore,_that.order,_that.failure);case _:
+return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.nextCursor,_that.hasMore,_that.order,_that.status,_that.failure);case _:
   return null;
 
 }
@@ -228,7 +240,7 @@ return $default(_that.loading,_that.loadingMore,_that.offers,_that.loaded,_that.
 
 
 class _CompareOffersState extends CompareOffersState {
-  const _CompareOffersState({this.loading = true, this.loadingMore = false, final  List<ReceivedOffer> offers = const <ReceivedOffer>[], this.loaded = false, this.nextCursor, this.hasMore = false, this.order = OfferOrder.cheapest, this.failure}): _offers = offers,super._();
+  const _CompareOffersState({this.loading = true, this.loadingMore = false, final  List<ReceivedOffer> offers = const <ReceivedOffer>[], this.loaded = false, this.nextCursor, this.hasMore = false, this.order = OfferOrder.cheapest, this.status, this.failure}): _offers = offers,super._();
   
 
 /// The **first** page is being read, or a retry after a failure is.
@@ -259,6 +271,18 @@ class _CompareOffersState extends CompareOffersState {
 @override@JsonKey() final  bool hasMore;
 /// How the customer wants them ordered.
 @override@JsonKey() final  OfferOrder order;
+/// Which offers are being read, or `null` for the platform's own default (SHIP-104).
+///
+/// `null` while the customer is comparing, which the endpoint reads as `submitted` — the offers
+/// standing right now. It becomes [BidStatus.accepted] after an award, because that is the only
+/// question worth asking then: the award rejected every other live offer in the same
+/// transaction, so the default list would come back **empty** and the screen would draw
+/// "nobody has offered yet" over a delivery that has just been awarded.
+///
+/// The contract names this as the way back in — "`?status=accepted` is how the awarded offer is
+/// read back afterwards" — so this is reading the platform's record rather than reasoning
+/// locally about what the award did to the list this device is holding.
+@override final  BidStatus? status;
 /// What the last read failed with, or `null`.
 @override final  ApiFailure? failure;
 
@@ -272,16 +296,16 @@ _$CompareOffersStateCopyWith<_CompareOffersState> get copyWith => __$CompareOffe
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is _CompareOffersState&&(identical(other.loading, loading) || other.loading == loading)&&(identical(other.loadingMore, loadingMore) || other.loadingMore == loadingMore)&&const DeepCollectionEquality().equals(other._offers, _offers)&&(identical(other.loaded, loaded) || other.loaded == loaded)&&(identical(other.nextCursor, nextCursor) || other.nextCursor == nextCursor)&&(identical(other.hasMore, hasMore) || other.hasMore == hasMore)&&(identical(other.order, order) || other.order == order)&&(identical(other.failure, failure) || other.failure == failure));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is _CompareOffersState&&(identical(other.loading, loading) || other.loading == loading)&&(identical(other.loadingMore, loadingMore) || other.loadingMore == loadingMore)&&const DeepCollectionEquality().equals(other._offers, _offers)&&(identical(other.loaded, loaded) || other.loaded == loaded)&&(identical(other.nextCursor, nextCursor) || other.nextCursor == nextCursor)&&(identical(other.hasMore, hasMore) || other.hasMore == hasMore)&&(identical(other.order, order) || other.order == order)&&(identical(other.status, status) || other.status == status)&&(identical(other.failure, failure) || other.failure == failure));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,loading,loadingMore,const DeepCollectionEquality().hash(_offers),loaded,nextCursor,hasMore,order,failure);
+int get hashCode => Object.hash(runtimeType,loading,loadingMore,const DeepCollectionEquality().hash(_offers),loaded,nextCursor,hasMore,order,status,failure);
 
 @override
 String toString() {
-  return 'CompareOffersState(loading: $loading, loadingMore: $loadingMore, offers: $offers, loaded: $loaded, nextCursor: $nextCursor, hasMore: $hasMore, order: $order, failure: $failure)';
+  return 'CompareOffersState(loading: $loading, loadingMore: $loadingMore, offers: $offers, loaded: $loaded, nextCursor: $nextCursor, hasMore: $hasMore, order: $order, status: $status, failure: $failure)';
 }
 
 
@@ -292,7 +316,7 @@ abstract mixin class _$CompareOffersStateCopyWith<$Res> implements $CompareOffer
   factory _$CompareOffersStateCopyWith(_CompareOffersState value, $Res Function(_CompareOffersState) _then) = __$CompareOffersStateCopyWithImpl;
 @override @useResult
 $Res call({
- bool loading, bool loadingMore, List<ReceivedOffer> offers, bool loaded, String? nextCursor, bool hasMore, OfferOrder order, ApiFailure? failure
+ bool loading, bool loadingMore, List<ReceivedOffer> offers, bool loaded, String? nextCursor, bool hasMore, OfferOrder order, BidStatus? status, ApiFailure? failure
 });
 
 
@@ -309,7 +333,7 @@ class __$CompareOffersStateCopyWithImpl<$Res>
 
 /// Create a copy of CompareOffersState
 /// with the given fields replaced by the non-null parameter values.
-@override @pragma('vm:prefer-inline') $Res call({Object? loading = null,Object? loadingMore = null,Object? offers = null,Object? loaded = null,Object? nextCursor = freezed,Object? hasMore = null,Object? order = null,Object? failure = freezed,}) {
+@override @pragma('vm:prefer-inline') $Res call({Object? loading = null,Object? loadingMore = null,Object? offers = null,Object? loaded = null,Object? nextCursor = freezed,Object? hasMore = null,Object? order = null,Object? status = freezed,Object? failure = freezed,}) {
   return _then(_CompareOffersState(
 loading: null == loading ? _self.loading : loading // ignore: cast_nullable_to_non_nullable
 as bool,loadingMore: null == loadingMore ? _self.loadingMore : loadingMore // ignore: cast_nullable_to_non_nullable
@@ -318,7 +342,8 @@ as List<ReceivedOffer>,loaded: null == loaded ? _self.loaded : loaded // ignore:
 as bool,nextCursor: freezed == nextCursor ? _self.nextCursor : nextCursor // ignore: cast_nullable_to_non_nullable
 as String?,hasMore: null == hasMore ? _self.hasMore : hasMore // ignore: cast_nullable_to_non_nullable
 as bool,order: null == order ? _self.order : order // ignore: cast_nullable_to_non_nullable
-as OfferOrder,failure: freezed == failure ? _self.failure : failure // ignore: cast_nullable_to_non_nullable
+as OfferOrder,status: freezed == status ? _self.status : status // ignore: cast_nullable_to_non_nullable
+as BidStatus?,failure: freezed == failure ? _self.failure : failure // ignore: cast_nullable_to_non_nullable
 as ApiFailure?,
   ));
 }

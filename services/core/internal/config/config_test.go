@@ -25,6 +25,7 @@ var allKeys = []string{
 	"STORAGE_ENDPOINT", "STORAGE_BUCKET", "STORAGE_REGION",
 	"STORAGE_ACCESS_KEY_ID", "STORAGE_SECRET_ACCESS_KEY", "STORAGE_USE_PATH_STYLE",
 	"STORAGE_PRESIGN_TTL", "STORAGE_MAX_UPLOAD_BYTES", "STORAGE_ACCEPTED_CONTENT_TYPES",
+	"UNSYNCED_NUDGE_AFTER", "PROOF_COMPRESSION_BUDGET_BYTES",
 }
 
 // deploymentStorageCredentials is a credential a staging or production configuration can
@@ -974,5 +975,97 @@ func TestLogValueOmitsTheStorageCredential(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("the startup log line does not carry %s: %s", want, rendered)
 		}
+	}
+}
+
+// TestClientPolicyDefaults — the two numbers GET /v1/app/policy serves (SHIP-167a).
+//
+// The defaults matter more here than they usually do, because they are the values a fresh clone
+// and the pilot both run on: the endpoint exists so operations can move them, and until somebody
+// does, these are what every handset is told.
+func TestClientPolicyDefaults(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.App.UnsyncedNudgeAfter != 4*time.Hour {
+		t.Errorf("UnsyncedNudgeAfter = %s, want 4h — Docs/02 §3.1's second rung",
+			cfg.App.UnsyncedNudgeAfter)
+	}
+	if cfg.App.ProofCompressionBudgetBytes != 1<<20 {
+		t.Errorf("ProofCompressionBudgetBytes = %d, want %d",
+			cfg.App.ProofCompressionBudgetBytes, 1<<20)
+	}
+}
+
+func TestClientPolicyIsReadFromTheEnvironment(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("UNSYNCED_NUDGE_AFTER", "90m")
+	t.Setenv("PROOF_COMPRESSION_BUDGET_BYTES", "524288")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.App.UnsyncedNudgeAfter != 90*time.Minute {
+		t.Errorf("UnsyncedNudgeAfter = %s, want 1h30m0s", cfg.App.UnsyncedNudgeAfter)
+	}
+	if cfg.App.ProofCompressionBudgetBytes != 524288 {
+		t.Errorf("ProofCompressionBudgetBytes = %d, want 524288", cfg.App.ProofCompressionBudgetBytes)
+	}
+}
+
+// TestClientPolicyIsRefusedWhenItCannotWork.
+//
+// Both values are policy operations may legitimately move, which is exactly why a wrong one has
+// to fail at startup rather than on a handset: a threshold of zero prompts a provider about every
+// update the instant they record it, and a budget above the platform's own bound tells every
+// device to compress towards a size the platform will refuse to sign for.
+//
+// The budget case is the one worth having: it is a **cross-section** rule, so neither variable is
+// wrong on its own and nothing in either section could catch it.
+func TestClientPolicyIsRefusedWhenItCannotWork(t *testing.T) {
+	cases := map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"a threshold of nothing at all": {
+			env:  map[string]string{"UNSYNCED_NUDGE_AFTER": "0s"},
+			want: "UNSYNCED_NUDGE_AFTER",
+		},
+		"a negative threshold": {
+			env:  map[string]string{"UNSYNCED_NUDGE_AFTER": "-1h"},
+			want: "UNSYNCED_NUDGE_AFTER",
+		},
+		"a budget that would compress a licence plate away": {
+			env:  map[string]string{"PROOF_COMPRESSION_BUDGET_BYTES": "1024"},
+			want: "PROOF_COMPRESSION_BUDGET_BYTES",
+		},
+		"a budget above what the platform will sign for": {
+			env: map[string]string{
+				"PROOF_COMPRESSION_BUDGET_BYTES": "4194304", // 4 MiB
+				"STORAGE_MAX_UPLOAD_BYTES":       "2097152", // 2 MiB
+			},
+			want: "PROOF_COMPRESSION_BUDGET_BYTES",
+		},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted %v", c.env)
+			} else if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("the error does not name the variable: %v", err)
+			}
+		})
 	}
 }

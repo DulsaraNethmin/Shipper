@@ -542,4 +542,88 @@ void main() {
       expect(encoded, isNot(contains('refrigerated')));
     });
   });
+
+  group('POST /v1/jobs/{id}/award — accepting one offer (SHIP-104)', () {
+    final accepted = <String, Object?>{..._bid, 'status': 'accepted'};
+
+    test('it is a verb on the job, and the offer travels in the body', () async {
+      // **The assertion a fake repository cannot make.** The path names the job because the job is
+      // what moves; `withdraw` and `counter` act on an offer and are `/bids/{bid_id}/…`. A client
+      // that put the bid in the path would compile, pass every widget test, and 404 on a device.
+      final wired = _repoReturning(accepted, status: 200);
+      await wired.repo.awardTo(jobId: _job, bidId: 'b1', idempotencyKey: 'k1');
+
+      final sent = wired.adapter.requests.single;
+      expect(sent.method, 'POST');
+      expect(sent.path, '/v1/jobs/$_job/award');
+      // `data` is the object handed to dio, not an encoded string — the transport encodes it on
+      // the way out. Asserting on the map is asserting on what was passed.
+      expect(sent.data, <String, Object?>{'bid_id': 'b1'});
+    });
+
+    test('it carries the idempotency key it was given', () async {
+      // Every state-changing request carries one and is refused without it (SHIP-15). Here it is
+      // also what makes a retry after a dropped connection replay the platform's answer rather
+      // than being read as a second award.
+      final wired = _repoReturning(accepted, status: 200);
+      await wired.repo.awardTo(jobId: _job, bidId: 'b1', idempotencyKey: 'the-key');
+
+      expect(wired.adapter.requests.single.headers[ApiHeaders.idempotencyKey], 'the-key');
+    });
+
+    test('the body carries nothing but the offer', () async {
+      // Unknown fields are refused by the platform, and a status is never a settable field
+      // (Docs/02 §2). A client that sent one would be told the field does not exist rather than
+      // having it ignored — which is the right answer and an avoidable round trip.
+      final wired = _repoReturning(accepted, status: 200);
+      await wired.repo.awardTo(jobId: _job, bidId: 'b1', idempotencyKey: 'k1');
+
+      final body = wired.adapter.requests.single.data as Map<String, Object?>;
+      expect(body.keys, ['bid_id']);
+    });
+
+    test('the answer is the offer that was accepted', () async {
+      final bid = await _repoOnlyReturning(accepted, status: 200)
+          .awardTo(jobId: _job, bidId: 'b1', idempotencyKey: 'k1');
+
+      expect(bid.status, BidStatus.accepted);
+      expect(bid.jobId, _job);
+    });
+
+    test('a job that can no longer be awarded arrives as its code, not its message', () async {
+      // Docs/07 §6 and CLAUDE.md: clients branch on `code`, never on `message`. Four codes lead to
+      // three different places on this endpoint and the screen picks the sentence from the code.
+      final wired = _repoReturning(
+        <String, Object?>{
+          'error': <String, Object?>{
+            'code': 'conflict',
+            'message': 'this wording is not what anything branches on',
+            'request_id': 'r1',
+          },
+        },
+        status: 409,
+      );
+
+      await expectLater(
+        wired.repo.awardTo(jobId: _job, bidId: 'b1', idempotencyKey: 'k1'),
+        throwsA(
+          isA<ApiErrorResponse>()
+              .having((f) => f.code, 'code', 'conflict')
+              .having((f) => f.statusCode, 'statusCode', 409),
+        ),
+      );
+    });
+
+    test('nothing of the job travels back, budget included', () async {
+      // The same closed-key-set guard the received offers carry, on the one response a customer
+      // sees at the moment they commit. A platform that started sending a budget — or a proxy that
+      // injected one — must not produce a model with somewhere to put it.
+      final bid = await _repoOnlyReturning(
+        <String, Object?>{...accepted, 'budget_cents': 8675309, 'max_price': 8675309},
+        status: 200,
+      ).awardTo(jobId: _job, bidId: 'b1', idempotencyKey: 'k1');
+
+      expect(jsonEncode(bid.toJson()), isNot(contains('8675309')));
+    });
+  });
 }

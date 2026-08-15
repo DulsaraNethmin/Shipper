@@ -429,6 +429,34 @@ type App struct {
 	// allowed rather than refused at startup.
 	IOSStoreURL     string
 	AndroidStoreURL string
+
+	// UnsyncedNudgeAfter is how long an update may sit unsynced on a handset before the
+	// provider is prompted to go and find signal (SHIP-167a).
+	//
+	// Docs/02 §3.1's second rung. The document is the authority for four hours; this is the
+	// dial that moves it without a store release, which is the whole of SHIP-167a's argument:
+	// it is an operations tuning knob, and Flutter has no over-the-air path for Dart code.
+	//
+	// **The client compiles a default in and that is not a duplicate of this value.** The
+	// compiled number is the floor for an install that has never once been online — the only
+	// case it is used for — because the prompt fires on a handset that by assumption has no
+	// connection and so cannot ask at the moment of use.
+	UnsyncedNudgeAfter time.Duration
+
+	// ProofCompressionBudgetBytes is the size a proof photograph is compressed towards on the
+	// device before upload (Docs/01 §5.2, SHIP-167a).
+	//
+	// **A budget, and [Storage.MaxUploadBytes] is a bound. They are different questions.** The
+	// bound is the size above which the platform refuses to sign an upload at all; this is what
+	// a driver on a metered connection in a yard should be asked to send. The budget is
+	// therefore much the smaller of the two, and validate refuses a deployment that inverts
+	// them — a client told to aim above what the platform will accept would compress to a size
+	// guaranteed to be rejected.
+	//
+	// It is a target rather than a limit on the client side: Docs/01 §4.4 makes the photograph
+	// the difference between a delivery that can be completed and one that cannot, so an image
+	// that overshoots is uploaded anyway and the platform's bound is what actually refuses one.
+	ProofCompressionBudgetBytes int
 }
 
 // HTTP configures the public API listener.
@@ -627,6 +655,27 @@ const (
 	largestMaxUploadBytes  = 64 << 20 // 64 MiB
 )
 
+// The two operational numbers the mobile client is told about itself (SHIP-167a).
+//
+// They are defaults for the *platform*, and the client compiles its own copies for an install
+// that has never been online. The two sets are held together by a test on each side rather than
+// by a shared constant — there is no mechanism that could share one, because the point of the
+// endpoint is that the values may diverge the moment operations move them.
+//
+// The nudge's four hours is Docs/02 §3.1's, and the document is the authority for the number.
+//
+// The proof budget's bounds are the same shape as the upload bounds above and are narrower: a
+// budget below the floor would compress a licence plate past legibility, which Docs/01 §4.4 makes
+// the difference between a delivery that can be completed and one that cannot; above the ceiling
+// the number has stopped describing a photograph a driver on a metered connection should send.
+const (
+	defaultUnsyncedNudgeAfter = 4 * time.Hour
+
+	defaultProofBudgetBytes  = 1 << 20   // 1 MiB
+	smallestProofBudgetBytes = 128 << 10 // 128 KiB
+	largestProofBudgetBytes  = 8 << 20   // 8 MiB
+)
+
 // maxDriverTokenTTL is a typo guard on the one TTL nothing can shorten once issued.
 //
 // Thirty days rather than a number close to the seven-day default, because the default is a product
@@ -742,6 +791,9 @@ func Load() (*Config, error) {
 			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
 			IOSStoreURL:         l.str("IOS_STORE_URL", ""),
 			AndroidStoreURL:     l.str("ANDROID_STORE_URL", ""),
+			UnsyncedNudgeAfter:  l.duration("UNSYNCED_NUDGE_AFTER", defaultUnsyncedNudgeAfter),
+			ProofCompressionBudgetBytes: l.boundedInt("PROOF_COMPRESSION_BUDGET_BYTES",
+				defaultProofBudgetBytes, smallestProofBudgetBytes, largestProofBudgetBytes),
 		},
 	}
 
@@ -1202,6 +1254,26 @@ func (l *loader) validate(cfg *Config) {
 	if cfg.Storage.DownloadTTL <= 0 {
 		l.errf("STORAGE_DOWNLOAD_TTL (%s) must be positive; no proof could be read back",
 			cfg.Storage.DownloadTTL)
+	}
+
+	// Zero or negative would prompt a provider about every update the instant it was queued,
+	// which is the escalation ladder's first rung wearing the second one's card (Docs/02 §3.1).
+	// Refused here for the reason the presign TTLs are: a deliberate `0s` parses, so nothing
+	// else would notice.
+	if cfg.App.UnsyncedNudgeAfter <= 0 {
+		l.errf("UNSYNCED_NUDGE_AFTER (%s) must be positive; a provider would be prompted about "+
+			"every update the moment they recorded it", cfg.App.UnsyncedNudgeAfter)
+	}
+
+	// The budget is what a client aims at and the bound is what the platform will sign for, so a
+	// budget above the bound tells every handset to compress towards a size guaranteed to be
+	// refused. The symptom is a driver who cannot finish a delivery and a client-side number
+	// nobody would think to look at — the platform's own limit is the one that appears in the
+	// refusal.
+	if int64(cfg.App.ProofCompressionBudgetBytes) > cfg.Storage.MaxUploadBytes {
+		l.errf("PROOF_COMPRESSION_BUDGET_BYTES (%d) cannot exceed STORAGE_MAX_UPLOAD_BYTES (%d); "+
+			"the budget is what the client compresses towards and the bound is what the platform "+
+			"will accept", cfg.App.ProofCompressionBudgetBytes, cfg.Storage.MaxUploadBytes)
 	}
 
 	// A credential with nowhere to go is the shape of a half-finished configuration, and the

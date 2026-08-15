@@ -71,6 +71,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:shipper/core/policy/app_policy_controller.dart';
 import 'package:shipper/core/queue/operation_queue.dart';
 import 'package:shipper/core/queue/queued_operation.dart';
 import 'package:shipper/core/sync/pending_updates_indicator.dart';
@@ -173,7 +174,19 @@ final class NudgePolicy {
 }
 
 /// The threshold the running application uses.
-final nudgePolicyProvider = Provider<NudgePolicy>((ref) => const NudgePolicy());
+///
+/// **It comes from the platform now (SHIP-167a).** `GET /v1/app/policy` carries
+/// `unsynced_nudge_after_seconds`, the app fetches it while it still has signal and keeps it, and
+/// a device that has been online before applies what it was told even when it is offline at the
+/// moment the prompt is due — which is every time the prompt is due. The library note above asked
+/// for exactly this endpoint; `core/policy` is the answer.
+///
+/// [NudgePolicy]'s own four hours remains the value for an install that has never once been
+/// online, and `app_policy_test.dart` holds it against `compiledUnsyncedNudgeAfterSeconds` so the
+/// two cannot drift.
+final nudgePolicyProvider = Provider<NudgePolicy>(
+  (ref) => NudgePolicy(after: ref.watch(appPolicyProvider).unsyncedNudgeAfter),
+);
 
 /// The clock the nudge reads.
 ///

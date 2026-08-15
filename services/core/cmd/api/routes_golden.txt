@@ -13,6 +13,7 @@ DELETE /v1/admin/sessions/current               admin        v1
 GET    /v1/admin/users                          admin        v1
 POST   /v1/admin/users/{id}/standing            admin        v1
 GET    /v1/app/minimum-version                  public       v1
+GET    /v1/app/policy                           public       v1
 POST   /v1/auth/login                           public       v1
 POST   /v1/auth/logout                          user         v1
 POST   /v1/auth/refresh                         public       v1

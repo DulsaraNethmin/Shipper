@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/routing/app_router.dart';
+import 'package:shipper/core/sync/blocked_updates.dart';
 import 'package:shipper/core/sync/pending_updates_indicator.dart';
 import 'package:shipper/core/sync/unsynced_nudge.dart';
 import 'package:shipper/core/version/version_gate.dart';
@@ -50,6 +51,22 @@ import 'package:shipper/shared/design_system/app_theme.dart';
 ///
 /// It costs a test nothing by the same mechanism again — it reads the queue snapshot, which is
 /// empty until `main.dart` supplies the worker, so it draws its child and opens no database.
+///
+/// ## The fourth, and why it is *inside* the nudge rather than beside it (SHIP-132)
+///
+/// [BlockedUpdates] is the panel that says what happened to an update the platform refused, opened
+/// from the indicator's second line. It wraps the column for the same reason the nudge does — it
+/// has to cover the bar it was opened from — and sits **under** the nudge because the two answer
+/// different questions and the nudge's is the more urgent: work that could still be sent if
+/// somebody found signal. A driver reading about a refused update while four hours of unsent ones
+/// are ageing should be told about the ageing ones first.
+///
+/// It is a panel and not a route, and the reason is partly ownership rather than modelling —
+/// `blocked_updates.dart` says so in its own words. The indicator it is opened from sits beside the
+/// navigator rather than inside it, so there is nothing to push onto.
+///
+/// It costs a test nothing for a fourth reason of the same shape, plus one of its own: it draws
+/// only when something has opened it, and nothing has on the first frame.
 class ShipperApp extends ConsumerWidget {
   const ShipperApp({super.key});
 
@@ -66,11 +83,13 @@ class ShipperApp extends ConsumerWidget {
       // bottom corner, and on the customer shell that is the button which publishes a delivery.
       builder: (context, child) => VersionGate(
         child: UnsyncedNudge(
-          child: Column(
-            children: <Widget>[
-              Expanded(child: child ?? const SizedBox.shrink()),
-              const PendingUpdatesIndicator(),
-            ],
+          child: BlockedUpdates(
+            child: Column(
+              children: <Widget>[
+                Expanded(child: child ?? const SizedBox.shrink()),
+                const PendingUpdatesIndicator(),
+              ],
+            ),
           ),
         ),
       ),

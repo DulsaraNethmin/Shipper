@@ -202,6 +202,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminUserStanding'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
+  /v1/app/policy:
+    $ref: './paths/app.yaml#/AppPolicy'
   /v1/auth/login:
     $ref: './paths/identity.yaml#/Login'
   /v1/auth/logout:
