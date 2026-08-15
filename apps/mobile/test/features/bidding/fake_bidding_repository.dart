@@ -4,6 +4,7 @@ import 'package:shipper/core/api/page.dart';
 import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
 import 'package:shipper/features/bidding/bidding_repository.dart';
+import 'package:shipper/features/bidding/received_offer.dart';
 
 /// An offer as the platform answers with one.
 ///
@@ -141,4 +142,119 @@ class FakeBiddingRepository implements BiddingRepository {
     if (script.isEmpty) return const ApiPage<Bid>(data: <Bid>[]);
     return script[index < script.length ? index : script.length - 1];
   }
+
+  // --- SHIP-102: the offers on the customer's job ----------------------------------------------
+
+  /// Every read of a job's offers, in order, with what it asked for.
+  ///
+  /// **The `status` is worth recording for the opposite reason it is on [reads].** This endpoint's
+  /// default is not "every status" — it is `submitted` — so a screen that sent `?status=submitted`
+  /// explicitly would draw exactly the right rows while shipping a copy of the platform's default
+  /// in a build that cannot be updated over the air. Asserting the parameter is `null` is what tells
+  /// the two apart.
+  final offerReads = <OffersCall>[];
+
+  /// The pages [offersOn] answers with, in order. The last is repeated once exhausted, which is what
+  /// a refresh of a one-page list looks like.
+  List<ApiPage<ReceivedOffer>> offerPages = <ApiPage<ReceivedOffer>>[
+    const ApiPage<ReceivedOffer>(data: <ReceivedOffer>[]),
+  ];
+
+  /// Thrown by [offersOn] instead of answering, on every call until it is cleared.
+  Object? offersFailure;
+
+  /// Held open until completed, so a test can assert what the screen shows mid-read.
+  Completer<void>? offersGate;
+
+  @override
+  Future<ApiPage<ReceivedOffer>> offersOn({
+    required String jobId,
+    BidStatus? status,
+    String? cursor,
+  }) async {
+    final index = offerReads.length;
+    offerReads.add((jobId: jobId, status: status, cursor: cursor));
+
+    final held = offersGate;
+    if (held != null) await held.future;
+
+    final thrown = offersFailure;
+    if (thrown != null) throw thrown;
+
+    if (offerPages.isEmpty) return const ApiPage<ReceivedOffer>(data: <ReceivedOffer>[]);
+    return offerPages[index < offerPages.length ? index : offerPages.length - 1];
+  }
 }
+
+// --- SHIP-102: the customer's view of the offers on their job ---------------------------------
+
+/// One offer as the platform answers with one on `GET /v1/jobs/{id}/bids/received`.
+///
+/// Built from the `ReceivedOffer` example in `contracts/paths/bidding.yaml`, so that a field renamed
+/// in the contract shows up here rather than only on a device.
+///
+/// **There is no budget parameter and there must never be one**, exactly as [aBid] has none — and
+/// on this side the reason needs stating rather than inheriting. This is the *customer's* own
+/// screen, so the instinct is that their own maximum would be harmless on it. The rule is not about
+/// who reads the shape; it is about what the client grows somewhere to put. A fixture that could
+/// carry a budget is the first place a screen could be written against a field the platform does not
+/// send, and the screen would then be one careless change away from being reachable by a provider.
+///
+/// [amountCents] is the **offering party's** price, which is a different number entirely.
+ReceivedOffer aReceivedOffer({
+  String id = '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0',
+  String jobId = '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1',
+  BidStatus status = BidStatus.submitted,
+  BidParty? offeredBy = BidParty.provider,
+  int? amountCents = 45000,
+  String? pickupAt = '2026-08-19T23:00:00.000Z',
+  String? deliverBy = '2026-08-20T07:00:00.000Z',
+  String? message,
+  String? supersededBy,
+  ProviderSummary? provider = const ProviderSummary(
+    id: '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2',
+    verified: true,
+    memberSince: '2026-03-04T22:15:07.412Z',
+  ),
+  VehicleSummary? vehicle,
+  String? createdAt = '2026-08-13T04:15:30.000Z',
+  String? updatedAt = '2026-08-13T04:15:30.000Z',
+}) {
+  return ReceivedOffer(
+    id: id,
+    jobId: jobId,
+    status: status,
+    offeredBy: offeredBy,
+    amountCents: amountCents,
+    pickupAt: pickupAt,
+    deliverBy: deliverBy,
+    message: message,
+    supersededBy: supersededBy,
+    provider: provider,
+    vehicle: vehicle,
+    createdAt: createdAt,
+    updatedAt: updatedAt,
+  );
+}
+
+/// A vehicle as the platform describes one to a customer.
+///
+/// **No registration parameter**, for the same reason the schema has no field: a plate identifies a
+/// vehicle in the physical world, and a losing bidder never published theirs to this customer.
+VehicleSummary aVehicle({
+  String id = '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5',
+  String type = 'van',
+  String make = 'Toyota',
+  String model = 'HiAce',
+  VehicleCapacity capacity = const VehicleCapacity(
+    maxWeightKg: 1200,
+    lengthCm: 300,
+    widthCm: 170,
+    heightCm: 160,
+  ),
+}) {
+  return VehicleSummary(id: id, type: type, make: make, model: model, capacity: capacity);
+}
+
+/// One recorded read of the offers on a job (SHIP-102).
+typedef OffersCall = ({String jobId, BidStatus? status, String? cursor});

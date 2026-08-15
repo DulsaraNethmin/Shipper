@@ -391,4 +391,155 @@ void main() {
       expect(jsonEncode(row), isNot(contains('8675309')));
     });
   });
+
+  group('GET /v1/jobs/{id}/bids/received — the offers on the customer’s job (SHIP-102)', () {
+    ({BiddingRepository repo, _StubAdapter adapter}) offers(Object body, {int status = 200}) {
+      final adapter = _StubAdapter((_) => _json(body, status: status));
+      final dio = buildDio(baseUrl: 'http://localhost:8092')..httpClientAdapter = adapter;
+      return (repo: ApiBiddingRepository(ApiClient(dio)), adapter: adapter);
+    }
+
+    const offer = <String, Object?>{
+      ..._bid,
+      'provider': <String, Object?>{
+        'id': '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2',
+        'verified': true,
+        'member_since': '2026-03-04T22:15:07.412Z',
+      },
+      'vehicle': <String, Object?>{
+        'id': '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5',
+        'type': 'van',
+        'make': 'Toyota',
+        'model': 'HiAce',
+        'capacity': <String, Object?>{
+          'max_weight_kg': 1200,
+          'length_cm': 300,
+          'width_cm': 170,
+          'height_cm': 160,
+        },
+      },
+    };
+
+    const page = <String, Object?>{
+      'data': [offer],
+      'next_cursor': 'MR9yZWNvcmQ',
+      'has_more': true,
+    };
+
+    test('it is five segments, because four cannot be served', () async {
+      // **The assertion a fake repository cannot make.** `GET /v1/jobs/{id}/bids` is what
+      // `Docs/09` names and what three comments in `routes_bidding.go` reserved, and it panics Go's
+      // ServeMux at registration beside `GET /v1/jobs/open/{id}` — both match `/v1/jobs/open/bids`
+      // with neither more specific. A client that "corrected" this path back to the documented one
+      // would compile, pass every widget test, and 404 on a device.
+      final wired = offers(page);
+      await wired.repo.offersOn(jobId: _job);
+
+      expect(wired.adapter.requests.single.method, 'GET');
+      expect(wired.adapter.requests.single.path, '/v1/jobs/$_job/bids/received');
+    });
+
+    test('a first read sends no parameters at all', () async {
+      // **The absent `?status=` is the assertion.** The endpoint reads an absent status as
+      // `submitted` — the offers standing now — and a client that sent it explicitly would ship a
+      // copy of the platform's default in a build with no over-the-air path.
+      final wired = offers(page);
+      await wired.repo.offersOn(jobId: _job);
+
+      expect(wired.adapter.requests.single.queryParameters, isEmpty);
+    });
+
+    test('a cursor goes back unchanged and a status by its wire name', () async {
+      final wired = offers(page);
+      await wired.repo.offersOn(jobId: _job, status: BidStatus.accepted, cursor: 'MR9yZWNvcmQ');
+
+      expect(wired.adapter.requests.single.queryParameters['status'], 'accepted');
+      expect(wired.adapter.requests.single.queryParameters['cursor'], 'MR9yZWNvcmQ');
+    });
+
+    test('BidStatus.unknown is never sent, because the endpoint refuses it', () async {
+      final wired = offers(page);
+      await wired.repo.offersOn(jobId: _job, status: BidStatus.unknown);
+
+      expect(wired.adapter.requests.single.queryParameters, isEmpty);
+    });
+
+    test('it carries no idempotency key, because a read changes nothing', () async {
+      final wired = offers(page);
+      await wired.repo.offersOn(jobId: _job);
+
+      expect(wired.adapter.requests.single.headers.keys.map((k) => k.toLowerCase()),
+          isNot(contains('idempotency-key')));
+    });
+
+    test('the envelope decodes, with the provider and the vehicle on the element', () async {
+      final read = await _repoOnlyReturning(page, status: 200).offersOn(jobId: _job);
+
+      expect(read.data, hasLength(1));
+      expect(read.nextCursor, 'MR9yZWNvcmQ');
+      expect(read.hasMore, isTrue);
+
+      final only = read.data.single;
+      expect(only.amountCents, 45000);
+      expect(only.provider?.verified, isTrue);
+      expect(only.vehicle?.description, 'Toyota HiAce');
+      expect(only.vehicle?.capacity.maxWeightKg, 1200);
+      expect(only.vehicle?.capacity.statesAnything, isTrue);
+    });
+
+    test('an offer with no vehicle decodes, because most of them have none', () async {
+      // `bids.vehicle_id` arrived at SHIP-102a, so every offer placed before it names none — as
+      // does every offer from a provider whose client does not send the field. A decode that threw
+      // on the ordinary case would be a screen that fails for most of the marketplace.
+      final read = await _repoOnlyReturning(
+        <String, Object?>{'data': [_bid], 'has_more': false},
+        status: 200,
+      ).offersOn(jobId: _job);
+
+      expect(read.data.single.vehicle, isNull);
+      expect(read.data.single.provider, isNull);
+      expect(read.hasMore, isFalse);
+      expect(read.nextCursor, isNull);
+    });
+
+    test('a job that is not the caller’s is a 404 like any other', () async {
+      // A provider asking about a job they are bidding on, a stranger, and a job that does not
+      // exist are one answer byte-identically. The client must not try to be more specific than
+      // the platform was.
+      await expectLater(
+        _repoOnlyReturning(
+          <String, Object?>{
+            'error': <String, Object?>{'code': 'not_found', 'message': 'No such job.'},
+          },
+          status: 404,
+        ).offersOn(jobId: _job),
+        throwsA(isA<ApiErrorResponse>().having((e) => e.code, 'code', 'not_found')),
+      );
+    });
+
+    test('nothing of the customer’s reaches the decoded offer', () async {
+      // The wire half of the closed key set. A platform that started sending a budget — or a
+      // proxy that injected one — must not produce a model with somewhere to put it.
+      final read = await _repoOnlyReturning(
+        <String, Object?>{
+          'data': [
+            <String, Object?>{
+              ...offer,
+              'budget_cents': 8675309,
+              'max_price': 8675309,
+              'service_area': ['VIC'],
+              'specialties': ['refrigerated'],
+            },
+          ],
+          'has_more': false,
+        },
+        status: 200,
+      ).offersOn(jobId: _job);
+
+      final encoded = jsonEncode(read.data.single.toJson());
+      expect(encoded, isNot(contains('8675309')));
+      expect(encoded, isNot(contains('VIC')));
+      expect(encoded, isNot(contains('refrigerated')));
+    });
+  });
 }

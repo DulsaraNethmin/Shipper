@@ -1,6 +1,6 @@
 /// Bidding — bids, counter-offers, negotiation, award (`Docs/07` §2).
 ///
-/// ## What is here (SHIP-100, SHIP-101)
+/// ## What is here (SHIP-100, SHIP-101, SHIP-102)
 ///
 /// `Docs/01` §4.2's first verb, and what became of it: a provider offers to carry a job, for a price
 /// and against two commitments about timing, over `POST /v1/jobs/{id}/bids` (SHIP-84) — and reads
@@ -55,8 +55,27 @@
 /// both are writes that end or change a commitment somebody else is relying on, and both want a
 /// confirmation flow rather than a button on a list.
 ///
-/// **The customer's half of bidding is not here and cannot be built.** SHIP-102 compares every
-/// offer on one job side by side, and no endpoint serves it: `routes_golden.txt` has no `GET`
-/// collection of a job's bids, and `contracts/paths/fleet.yaml` says in as many words that a
-/// customer's view of a provider is a schema that does not exist yet. See `Docs/11` §3.
+/// ## The customer's half arrived at SHIP-102a, and its privacy rule is a different one
+///
+/// This paragraph used to say the customer's half "cannot be built", because no endpoint served it.
+/// `GET /v1/jobs/{id}/bids/received` now does — at five segments, because `GET /v1/jobs/{id}/bids`
+/// cannot be registered beside `GET /v1/jobs/open/{id}`.
+///
+/// - `received_offer.dart` — the `ReceivedOffer`, `ProviderSummary` and `VehicleSummary` schemas.
+/// - `compare_offers_controller.dart` — one list per job, and sorting that is the client's.
+/// - `compare_offers_screen.dart` — the cards, side by side, with no word a budget could hide in.
+///
+/// **The rule on that side is not `Bid`'s rule and does not inherit from it.** `Bid`'s guarantee is
+/// structural — there is no job in the shape, so there is no budget to withhold. `ReceivedOffer`
+/// crosses *providers*, so what one provider could learn about another through it is the question,
+/// and the platform answers it by refusing a provider the byte-identical `404` a stranger gets
+/// rather than by leaving anything out of the shape.
+///
+/// **And the third clause of `Docs/01` §4.3 needs a guard neither of the two above can be.** A
+/// screen saying "the customer has set a maximum" carries no field and no value: it passes a closed
+/// key set over the model and a source scan over the file. `compare_offers_test.dart` asserts on the
+/// **words rendered**, which is what wave 9's finding cost to learn.
+///
+/// What is still not here: awarding (SHIP-104) and the negotiation screens (SHIP-103), which is
+/// where revise, withdraw and counter belong.
 library;
