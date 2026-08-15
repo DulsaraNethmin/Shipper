@@ -27,7 +27,7 @@ import (
 // A URL is a client's map of the product, not a diagram of the packages behind it. Placing a bid is
 // something a provider does *to a job*, so it lives under the job — the same reading that put
 // SHIP-106's driver and SHIP-111's milestones there, and the same reading that put SHIP-82's
-// `/v1/jobs/open` in routes_fleet.go. What decides which domain serves a route is who owns the rule,
+// provider feed in routes_fleet.go. What decides which domain serves a route is who owns the rule,
 // and the rules here are bidding's: one live offer per provider per job, and what an offer has to
 // contain before anybody can act on it.
 //
@@ -92,11 +92,12 @@ import (
 // their profile — and a provider asking what they have bid on is asking about their operation rather
 // than about any one job.
 //
-// **It also sidesteps `net/http`'s routing constraint rather than working around it.** A
-// four-segment `GET /v1/jobs/{id}/<literal>` panics the mux at registration while
-// `GET /v1/jobs/open/{id}` exists, so a provider list under the job tree would have had to take a
-// fifth segment or a different verb. This resource does not belong there anyway, which is the
-// happier of the two reasons.
+// **It also sidestepped `net/http`'s routing constraint rather than working around it.** A
+// four-segment `GET /v1/jobs/{id}/<literal>` panicked the mux at registration while
+// `GET /v1/jobs/open/{id}` existed, so a provider list under the job tree would have had to take a
+// fifth segment or a different verb. SHIP-83a has since removed that constraint by moving the feed
+// to `/v1/fleet/jobs/{id}`; this resource does not belong under a job anyway, which was always the
+// happier of the two reasons and is now the only one.
 //
 // `RequireUser` and not a role, for the fifth time. The list is scoped to the caller's own id in the
 // `WHERE` clause, so a customer's answer is an empty page by construction rather than by permission —
@@ -176,12 +177,12 @@ func init() {
 			Method: http.MethodGet,
 
 			// **`/jobs/{id}/bids` was the intended pattern, it is what Docs/09's SHIP-102a row
-			// names, and it cannot be served.** Three comments in this file reserved it for
-			// SHIP-102 from SHIP-84 onwards. The reservation was made before SHIP-83 declared
-			// `GET /jobs/open/{id}`, and the two cannot coexist: `open` is a literal in the
-			// `{id}` position, so both patterns match `/v1/jobs/open/bids` with neither more
-			// specific, and Go's ServeMux panics at registration rather than choosing. Measured
-			// on this branch against Go's own mux, five ways:
+			// names, and it could not be served when this route was written.** Three comments
+			// in this file reserved it for SHIP-102 from SHIP-84 onwards. The reservation was
+			// made before SHIP-83 declared `GET /jobs/open/{id}`, and the two could not coexist:
+			// `open` was a literal in the `{id}` position, so both patterns matched
+			// `/v1/jobs/open/bids` with neither more specific, and Go's ServeMux panics at
+			// registration rather than choosing. Measured then against Go's own mux, five ways:
 			//
 			//	GET /jobs/open/{id} + GET  /jobs/{id}/bids                   PANIC
 			//	GET /jobs/open/{id} + GET  /jobs/{id}/offers                 PANIC — renaming does not help
@@ -193,31 +194,24 @@ func init() {
 			// somebody will reach for: registering the intersection does **not** teach the mux
 			// which pattern wins. Go has no such rule.
 			//
-			// # Two honest options, and this takes the first
+			// # The constraint is gone and the path stays where it is
 			//
-			// **Insert a segment**, which is SHIP-115's precedent — `/jobs/{id}/delivery/detail`,
-			// `/delivery/milestones` and `/delivery/proof` are all shaped by this same
-			// collision, and that file's note ends by recording it "for whoever owns
-			// `/jobs/open/{id}`". **Or move `/jobs/open/{id}`**, which is the structural fix: it
-			// frees the whole `GET /v1/jobs/{id}/<literal>` space, which is otherwise closed to
-			// every future ticket, and this branch is unusually well placed to take it because
-			// it also owns `apps/mobile` and could move the client in the same change.
+			// Two options were open: **insert a segment**, which is SHIP-115's precedent —
+			// `/jobs/{id}/delivery/detail`, `/delivery/milestones` and `/delivery/proof` are all
+			// shaped by this same collision — or **move `/jobs/open/{id}`**, the structural fix
+			// that frees the whole `GET /v1/jobs/{id}/<literal>` space. This route took the
+			// first because the second needed `contracts/paths/fleet.yaml`,
+			// `internal/fleet/http_test.go` and the fleet verify section, three files that
+			// branch did not own. **SHIP-83a has since taken the second**: the feed is
+			// `GET /v1/fleet/jobs/{id}`, and cmd/api/routes_jobsegment_test.go demonstrates the
+			// four-segment space is free by registering one.
 			//
-			// **It takes the first, and the reason is ownership rather than modelling.** Moving
-			// the route is a breaking change to a served endpoint that SHIP-101 and SHIP-133
-			// already consume, and carrying it through means editing `contracts/paths/fleet.yaml`,
-			// `internal/fleet/http_test.go` and `scripts/verify/`'s fleet section — three files
-			// this branch does not own, in a wave with five concurrent trees. This file and
-			// routes_fleet.go were granted; the rest of the move was not. A four-line change
-			// spread across another lane's files is how a route gets dropped in a merge, which
-			// is the failure routes_golden.txt exists to catch and not one to invite.
-			//
-			// routes_fleet.go's own argument at its line 45 also still stands on the merits —
-			// the resource is a job and `/v1/jobs/open` is the collection offered to the calling
-			// provider — so the move is not obviously right, only obviously cheaper for
-			// everything that comes after it. **Docs/11 §3 records it as an open recommendation
-			// with the cost measured**, and Docs/09's SHIP-102a row names a path this service
-			// does not serve until somebody corrects it.
+			// **This path is not moving to `/jobs/{id}/bids` now that it could.** It is a
+			// published endpoint the Flutter client already calls, and Docs/06 §5.3 is why that
+			// settles it — old builds persist on devices indefinitely and Dart has no
+			// over-the-air update path, so a URL that has shipped is a contract with clients
+			// nobody can reach. `received` also earns its segment on the merits; see below.
+			// **What SHIP-83a changes is the next ticket's options, not this one's.**
 			//
 			// # Why `received` rather than a shelf like delivery's
 			//

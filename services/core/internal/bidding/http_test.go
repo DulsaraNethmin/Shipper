@@ -70,12 +70,14 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	mux.Handle("POST /v1/jobs/{id}/award", handler.Award())
 	mux.Handle("GET /v1/fleet/bids", handler.Mine())
 
-	// **Five segments, and the shape is the finding rather than a preference (SHIP-102a).** The
-	// intended `GET /v1/jobs/{id}/bids` cannot be registered beside `GET /v1/jobs/open/{id}`: both
-	// match `/v1/jobs/open/bids` with neither more specific, and Go's ServeMux panics rather than
-	// choosing. This mux carries no `/jobs/open` route, so it would accept either — the pattern here
-	// is the one cmd/api actually serves, which is the whole reason this file mounts a real mux
-	// rather than calling handlers directly.
+	// **Five segments, and the shape was a finding rather than a preference (SHIP-102a).** The
+	// intended `GET /v1/jobs/{id}/bids` could not be registered beside `GET /v1/jobs/open/{id}`:
+	// both matched `/v1/jobs/open/bids` with neither more specific, and Go's ServeMux panics rather
+	// than choosing. SHIP-83a moved that feed to `/v1/fleet/jobs/{id}` and the four-segment space is
+	// free again, but this path is published and stays where it is (`Docs/06` §5.3). This mux
+	// carries no feed route at all, so it would accept either — the pattern here is the one cmd/api
+	// actually serves, which is the whole reason this file mounts a real mux rather than calling
+	// handlers directly.
 	mux.Handle("GET /v1/jobs/{id}/bids/received", handler.Received())
 	return mux
 }
@@ -592,7 +594,7 @@ func TestNothingOfTheJobTravelsInABid(t *testing.T) {
 	} {
 		if strings.Contains(body, disclosure) {
 			t.Errorf("a bid carries %s (%q). A bid names the job it is against and nothing else: "+
-				"GET /v1/jobs/open/{id} is where a provider reads the job, and that shape is "+
+				"GET /v1/fleet/jobs/{id} is where a provider reads the job, and that shape is "+
 				"tested once (SHIP-83) rather than twice.", what, disclosure)
 		}
 	}
@@ -693,7 +695,7 @@ func TestACustomerIsRefusedRatherThanHidden(t *testing.T) {
 // bytes rather than on the status code.
 //
 // A refusal that explained itself would disclose what the status code is withholding — that the job
-// exists, and by implication what became of it. `GET /v1/jobs/open/{id}` answers the same way for the
+// exists, and by implication what became of it. `GET /v1/fleet/jobs/{id}` answers the same way for the
 // same reason (SHIP-83), so a provider gets one consistent answer whichever endpoint they reach.
 func TestARefusedJobIsIndistinguishableFromOneThatIsNotThere(t *testing.T) {
 	w := newWire(t)

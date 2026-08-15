@@ -7,7 +7,7 @@ import 'package:shipper/features/jobs/open_job.dart';
 ///
 /// ## What this is, and — more importantly — what it is not
 ///
-/// `GET /v1/jobs/open` accepts `limit` and `cursor` and **no filter of any kind**. The contract
+/// `GET /v1/fleet/jobs` accepts `limit` and `cursor` and **no filter of any kind**. The contract
 /// takes that position deliberately: eligibility is the platform's decision, and a parameter that
 /// widened or narrowed the feed would be a second place for that answer to be argued with
 /// (`Docs/07` §3). The same contract then names where narrowing does belong — "a provider

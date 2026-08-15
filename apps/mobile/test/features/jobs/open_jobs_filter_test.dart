@@ -1,6 +1,6 @@
 // SHIP-99 — "with filters", and the shape they had to take.
 //
-// GET /v1/jobs/open accepts `limit` and `cursor` and nothing else. The contract says so in as many
+// GET /v1/fleet/jobs accepts `limit` and `cursor` and nothing else. The contract says so in as many
 // words and says why: eligibility is the platform's decision, and a filter parameter would be a
 // second place for that answer to be argued with (Docs/07 §3). It then names where the narrowing
 // does belong — "a provider narrowing their own feed further is the client's business" — which is

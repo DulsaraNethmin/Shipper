@@ -16,7 +16,7 @@ import 'package:shipper/shared/formatting/dates.dart';
 /// (SHIP-100).
 ///
 /// Reached by tapping a card in the feed, or by a deep link. The route carries the id and nothing
-/// else: the job is re-read from `GET /v1/jobs/open/{id}` rather than handed across, so a screen
+/// else: the job is re-read from `GET /v1/fleet/jobs/{id}` rather than handed across, so a screen
 /// opened from a list fetched ten minutes ago shows what the platform holds now.
 ///
 /// ## The bid panel is supplied rather than imported, and that is `Docs/07` §2

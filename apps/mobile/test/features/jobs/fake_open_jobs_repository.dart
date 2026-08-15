@@ -109,7 +109,7 @@ class FakeOpenJobsRepository implements OpenJobsRepository {
   /// genuinely in flight rather than already finished.
   Completer<void>? gate;
 
-  /// The ids `GET /v1/jobs/open/{id}` was asked for, in order (SHIP-100).
+  /// The ids `GET /v1/fleet/jobs/{id}` was asked for, in order (SHIP-100).
   ///
   /// A second list rather than entries in [calls], so that `pages[attempt]` stays indexed by *feed*
   /// reads — a detail read counted as a page turn would silently hand a test the wrong page.

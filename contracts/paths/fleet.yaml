@@ -579,13 +579,20 @@ Profile:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
-OpenJobs:
+FleetJobs:
   get:
     operationId: listOpenJobs
     summary: List the jobs this provider may bid on
     tags: [Jobs]
     description: |
       The marketplace as the calling provider may bid on it, newest first (SHIP-82).
+
+      **This operation answered on `GET /v1/jobs/open` until SHIP-83a and that path is gone rather
+      than aliased.** A literal in the `{id}` position made every four-segment
+      `GET /v1/jobs/{id}/<literal>` unregisterable service-wide, which four earlier tickets each
+      paid a workaround for. `/v1/fleet/jobs` is also the truer name: this is the platform's
+      eligibility decision about *one* provider, so two callers of the same path see different
+      sets, which `/v1/jobs/open` read as a public shelf that does not exist.
 
       A job appears here only when all four of `Docs/01` §4.3's filters accept it: the provider's
       declared service area covers where it is picked up, a vehicle they have in service can carry
@@ -642,13 +649,14 @@ OpenJobs:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
-OpenJobByID:
+FleetJobByID:
   get:
     operationId: getOpenJob
     summary: Read one job this provider may bid on
     tags: [Jobs]
     description: |
-      One job out of `/v1/jobs/open`, in the same shape the feed gave it (SHIP-83).
+      One job out of `/v1/fleet/jobs`, in the same shape the feed gave it (SHIP-83; moved off
+      `/v1/jobs/open/{id}` by SHIP-83a).
 
       **This is a member of that collection and not a second view of `GET /v1/jobs/{id}`.** That
       operation is the *customer's* own job and is the one shape in this API that carries
@@ -697,7 +705,7 @@ OpenJobID:
   name: id
   in: path
   required: true
-  description: The job's identifier, as carried by an entry in `/v1/jobs/open`.
+  description: The job's identifier, as carried by an entry in `/v1/fleet/jobs`.
   schema:
     type: string
     format: uuid

@@ -15,12 +15,12 @@
 ///   to decide what is worth offering and never to decide anything else.
 /// - `open_job.dart` — the `OpenJob` schema from `contracts/paths/fleet.yaml`: a job as a
 ///   *provider* sees it, which is a second type rather than `Job` with a field hidden.
-/// - `open_jobs_repository.dart` — `GET /v1/jobs/open`, the provider's eligible feed (SHIP-82).
+/// - `open_jobs_repository.dart` — `GET /v1/fleet/jobs`, the provider's eligible feed (SHIP-82).
 /// - `open_jobs_filter.dart` — the narrowing a provider applies to their own feed, which the
 ///   endpoint deliberately accepts no parameter for.
 /// - `provider_job_feed.dart` and its controller — the provider half of the shell (SHIP-99).
 /// - `open_job_screen.dart` and its controller — one job as a provider deciding whether to bid
-///   sees it (SHIP-100), over `GET /v1/jobs/open/{id}`.
+///   sees it (SHIP-100), over `GET /v1/fleet/jobs/{id}`.
 ///
 /// **Both halves of the marketplace are in this package, and they meet nowhere.** `Docs/07` §2
 /// puts *discovery* in `jobs` and the feed is discovery, so the provider's screens live beside the

@@ -615,7 +615,7 @@ serves="$("$PSQL" "$DATABASE_URL" -tAc \
 ok "the stored declaration answers eligibility by set membership — the query SHIP-81 inherits"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-81  the eligibility filter, through SHIP-82's GET /v1/jobs/open — four filters, each shown to exclude"
+ticket "SHIP-81  the eligibility filter, through SHIP-82's GET /v1/fleet/jobs — four filters, each shown to exclude"
 
 # **SHIP-81's SQL mirror is gone, and this is what replaced it.**
 #
@@ -693,7 +693,7 @@ publish_job "$elig_job_id" Draft Open
 
 # eligible — 1 when the marketplace offers that one job to that one provider, 0 when it does not.
 #
-# **Both endpoints are asked, and they have to agree.** `GET /v1/jobs/open/{id}` answers 200 or 404,
+# **Both endpoints are asked, and they have to agree.** `GET /v1/fleet/jobs/{id}` answers 200 or 404,
 # and the feed either carries the job or does not. One SQL predicate serves both, so a disagreement
 # is a defect rather than a difference of emphasis — a provider shown a job in the feed and then
 # refused it on the detail screen is the worst of both, and it is the failure sharing the clause
@@ -704,15 +704,15 @@ publish_job "$elig_job_id" Draft Open
 eligible() {
   local detail feed status
 
-  detail="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$elig_job_id" "$WORKDIR/elig-detail.json")"
+  detail="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$elig_job_id" "$WORKDIR/elig-detail.json")"
   case "$detail" in
     200) detail=1 ;;
     404) detail=0 ;;
-    *) cat "$WORKDIR/elig-detail.json"; fail "GET /v1/jobs/open/$elig_job_id returned $detail, want 200 or 404" ;;
+    *) cat "$WORKDIR/elig-detail.json"; fail "GET /v1/fleet/jobs/$elig_job_id returned $detail, want 200 or 404" ;;
   esac
 
-  status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/elig-feed.json")"
-  [[ "$status" == "200" ]] || { cat "$WORKDIR/elig-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
+  status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=100' "$WORKDIR/elig-feed.json")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/elig-feed.json"; fail "GET /v1/fleet/jobs returned $status, want 200"; }
   feed="$(python3 - "$WORKDIR/elig-feed.json" "$elig_job_id" <<'PY'
 import json, sys
 page = json.load(open(sys.argv[1]))
@@ -726,12 +726,12 @@ print(1 if found else 0)
 PY
 )" || fail "the feed did not fit in one page of 100; this check cannot tell absent from further down"
 
-  [[ "$detail" == "$feed" ]] || fail "the feed says $feed and GET /v1/jobs/open/$elig_job_id says $detail — one predicate serves both"
+  [[ "$detail" == "$feed" ]] || fail "the feed says $feed and GET /v1/fleet/jobs/$elig_job_id says $detail — one predicate serves both"
   printf '%s' "$detail"
 }
 
 status="$(curl -s -o "$WORKDIR/open-anon.json" -w '%{http_code}' \
-  "http://localhost:$VERIFY_PORT/v1/jobs/open")"
+  "http://localhost:$VERIFY_PORT/v1/fleet/jobs")"
 [[ "$status" == "401" ]] || { cat "$WORKDIR/open-anon.json"; fail "an unauthenticated feed read returned $status, want 401"; }
 ok "the feed cannot be reached without a credential — a provider sees it because the platform filtered it"
 
@@ -811,7 +811,7 @@ publish_job "$elig_job_id" Negotiating Cancelled
 ok "job status — Negotiating stays biddable and Cancelled does not, exactly as Docs/02 §1 reads"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-82  GET /v1/jobs/open — the envelope, only eligible jobs, and paging"
+ticket "SHIP-82  GET /v1/fleet/jobs — the envelope, only eligible jobs, and paging"
 
 # **A fresh job, because the one above is Cancelled and stays that way.** Docs/02 §1 makes
 # Cancelled terminal, and moving it back would demonstrate a transition the platform does not
@@ -840,8 +840,8 @@ status="$(fleet_request POST "$fleet_customer_token" "verify-open-qld-$$" /v1/jo
 qld_job_id="$(json "$WORKDIR/open-qld.json" '["id"]')"
 publish_job "$qld_job_id" Draft Open
 
-status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/open-feed.json")"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/open-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=100' "$WORKDIR/open-feed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-feed.json"; fail "GET /v1/fleet/jobs returned $status, want 200"; }
 python3 - "$WORKDIR/open-feed.json" "$open_job_id" "$qld_job_id" <<'PY' || fail "the feed is not Docs/10 §4.5's envelope, or it carries a job outside the provider's service area"
 import json, sys
 page = json.load(open(sys.argv[1]))
@@ -879,7 +879,7 @@ import json, sys, urllib.parse, urllib.request
 
 token, port, header = sys.argv[1], sys.argv[2], sys.argv[3]
 must_appear = set(sys.argv[4:])
-base = f"http://localhost:{port}/v1/jobs/open"
+base = f"http://localhost:{port}/v1/fleet/jobs"
 
 def get(url):
     request = urllib.request.Request(url, headers={header: f"Bearer {token}"})
@@ -921,27 +921,27 @@ print(f"    {len(expected)} eligible jobs over {pages} pages of one")
 PY
 ok "paging one job at a time reaches every eligible job exactly once, and terminates"
 
-status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?cursor=not-a-cursor' "$WORKDIR/open-badcursor.json")"
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?cursor=not-a-cursor' "$WORKDIR/open-badcursor.json")"
 [[ "$status" == "400" ]] || fail "a mangled cursor returned $status, want 400"
-status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=0' "$WORKDIR/open-badlimit.json")"
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=0' "$WORKDIR/open-badlimit.json")"
 [[ "$status" == "400" ]] || fail "?limit=0 returned $status, want 400"
-status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=5000' "$WORKDIR/open-biglimit.json")"
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=5000' "$WORKDIR/open-biglimit.json")"
 [[ "$status" == "200" ]] || fail "?limit=5000 returned $status, want it narrowed to the maximum"
 ok "a mangled cursor and a bad limit are refused; an over-large limit is narrowed"
 
 # A customer reaching the provider's feed gets an empty page rather than a 403. Being eligible for
 # nothing is the truthful answer to the question, and the client renders that from an empty list.
-status="$(fleet_get "$fleet_customer_token" /v1/jobs/open "$WORKDIR/open-customer.json")"
+status="$(fleet_get "$fleet_customer_token" /v1/fleet/jobs "$WORKDIR/open-customer.json")"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/open-customer.json"; fail "a customer reading the feed returned $status, want 200"; }
 [[ "$(tr -d ' \n' < "$WORKDIR/open-customer.json")" == '{"data":[],"has_more":false}' ]] \
   || { cat "$WORKDIR/open-customer.json"; fail "a customer's feed is not an empty array"; }
 ok "a caller eligible for nothing gets an empty array, never null and never a 403"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-83  GET /v1/jobs/open/{id} — one job, no budget, and no doorstep"
+ticket "SHIP-83  GET /v1/fleet/jobs/{id} — one job, no budget, and no doorstep"
 
-status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-detail.json")"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/open-detail.json"; fail "GET /v1/jobs/open/$open_job_id returned $status, want 200"; }
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/open-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-detail.json"; fail "GET /v1/fleet/jobs/$open_job_id returned $status, want 200"; }
 
 # One shape, whatever the client did to obtain it — the rule the vehicle endpoints already follow,
 # and here it is also the privacy decision: two shapes would be two places a budget field could be
@@ -1023,7 +1023,7 @@ ok "the customer's budget is on the job and in neither response — not the word
 # platform geocodes the whole address — sending it would be sending the line as two numbers.
 "$PSQL" "$DATABASE_URL" -q -c \
   "update jobs set pickup_latitude = -37.8197, pickup_longitude = 144.9989 where id = '$open_job_id';"
-status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-detail2.json")"
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/open-detail2.json")"
 [[ "$status" == "200" ]] || fail "re-reading the job returned $status"
 for disclosure in 'Church Street' 'Bourke Street' '37.8197' '144.9989' '"line"' '"coordinate"' '"latitude"'; do
   grep -q "$disclosure" "$WORKDIR/open-detail2.json" \
@@ -1035,9 +1035,9 @@ ok "the pickup is suburb, state and postcode — never the street line, and neve
 
 # A job this provider may not bid on is indistinguishable from one that does not exist. 403 would
 # confirm the job is there, and which jobs a competitor may bid on is nobody else's business.
-status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$qld_job_id" "$WORKDIR/open-theirs.json")"
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$qld_job_id" "$WORKDIR/open-theirs.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/open-theirs.json"; fail "an ineligible job returned $status, want 404"; }
-status="$(fleet_get "$elig_provider_token" /v1/jobs/open/00000000-0000-7000-8000-000000000020 "$WORKDIR/open-nothing.json")"
+status="$(fleet_get "$elig_provider_token" /v1/fleet/jobs/00000000-0000-7000-8000-000000000020 "$WORKDIR/open-nothing.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/open-nothing.json"; fail "a job that does not exist returned $status, want 404"; }
 python3 -c "
 import json, sys
@@ -1050,6 +1050,6 @@ ok "an ineligible job answers exactly what a missing job answers — the refusal
 
 # And the customer cannot read their own job here. GET /v1/jobs/{id} is where they read it, and
 # that response is the one shape in this API that carries the budget.
-status="$(fleet_get "$fleet_customer_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-owner.json")"
+status="$(fleet_get "$fleet_customer_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/open-owner.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/open-owner.json"; fail "the owning customer read their job through the provider's route: $status"; }
 ok "the provider's route is not a second way to a job the customer owns"

@@ -93,7 +93,7 @@ abstract class OpenJobsState with _$OpenJobsState {
 ///
 /// ## The feed is the platform's answer, and the filter never touches the request
 ///
-/// `GET /v1/jobs/open` takes `limit` and `cursor` and no filter at all, which is the contract's
+/// `GET /v1/fleet/jobs` takes `limit` and `cursor` and no filter at all, which is the contract's
 /// own position: eligibility is decided by the platform against the provider's service area,
 /// vehicles, verification state and the job's own status, and a client parameter would be a second
 /// place for that to be argued with (`Docs/07` §3). Every read this controller makes is therefore

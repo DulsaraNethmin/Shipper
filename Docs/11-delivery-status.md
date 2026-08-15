@@ -583,6 +583,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
+| **SHIP-83a** | M3 | The provider feed moves off the `{id}` slot: `GET /v1/jobs/open` and `/v1/jobs/open/{id}` become **`GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}`**, gone rather than aliased. That frees the whole four-segment `GET /v1/jobs/{id}/<literal>` space four earlier tickets each paid a workaround for, **demonstrated by registering one** rather than asserted — `TestFourSegmentJobLiteralsCanBeRegistered` attaches the real route table plus a probe route and fails if the mux refuses the pair — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -11888,6 +11889,75 @@ now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is
 and a database check that are believed to agree are two checks until something compares them.
 
 **Nothing was needed from `internal/config` by any of the five tickets.**
+
+### What SHIP-83a built, and the decision `Docs/09` left to whoever took it
+
+`GET /v1/jobs/open` and `GET /v1/jobs/open/{id}` are now **`GET /v1/fleet/jobs` and
+`GET /v1/fleet/jobs/{id}`**. Same handlers, same package, same response shape; the old paths are
+**gone rather than aliased**, which the *Done when* asks for and which a redirect would not have
+satisfied — a pattern registered to answer `301` collides with a four-segment literal exactly as one
+registered to answer `200` does, because `ServeMux` refuses the pair before either handler runs.
+
+#### The destination was not in the backlog, and the row that named one named a different ticket's
+
+`Docs/09`'s SHIP-83a row says only "a path that no longer puts a literal where an identifier goes".
+Its line 252 says the move needs `contracts/paths/fleet.yaml`, `internal/fleet/http_test.go` and the
+fleet verify section — so the destination is the fleet tree — and **SHIP-96a's row independently
+names `GET /v1/fleet/jobs/{id}`**. Reading the two together settles it: one route, not two.
+
+**Decided: SHIP-83a moves the feed to `/v1/fleet/jobs` + `/v1/fleet/jobs/{id}`, and SHIP-96a widens
+that same `{id}` route rather than adding a second one.** Three reasons, in the order they weighed.
+
+1. **Two routes could not have been two shapes, and two routes with one shape is a choice a client
+   has to make for no reason.** SHIP-96a's own *Done when* says "the same budget-stripped shape the
+   open feed serves". The predicate SHIP-96a needs is a strict superset of the feed's for a single
+   job — eligible **or** holding a bid **or** awarded — so a second endpoint would answer identically
+   wherever both applied, and a client holding a job id would have to know which of its
+   relationships to the job was current before it could pick a URL. That is a decision the platform
+   has and the device does not (`Docs/07` §3).
+2. **`/fleet` is the honest prefix rather than merely a free one.** The feed is the platform's
+   eligibility decision about *one* provider: two callers of the same path see different sets.
+   `/v1/jobs/open` read as a public shelf of open jobs, which does not exist and never did.
+3. **It reproduces nothing.** `/v1/fleet/jobs` and `/v1/fleet/jobs/{id}` put no literal in any
+   identifier position, so the trap is not simply moved one prefix down — which
+   `/v1/fleet/jobs/open/{id}` or a `/v1/fleet/jobs/mine/{id}` beside the member read would have done.
+
+#### "Demonstrated by registering one" is a test rather than an endpoint, and that was deliberate
+
+`cmd/api/routes_jobsegment_test.go` hands `attachRoutes` the **real** route table plus one
+four-segment `GET /v1/jobs/{id}/segment-probe` and fails if `ServeMux` refuses the pair. Adding a
+real endpoint would have demonstrated the same fact once, on the day it was added, and left the
+guard resting on that endpoint never being removed — and would have shipped a URL no ticket asked
+for, which is a thing that acquires a client and then cannot be withdrawn (`Docs/06` §5.3).
+
+**Mutated to confirm it is real.** Restoring `Pattern: "/jobs/open/{id}"` in
+`cmd/api/routes_fleet.go` fails both new tests, the first with `ServeMux`'s own text — *"GET
+/jobs/{id}/segment-probe and GET /jobs/open/{id} both match some paths, like
+`/jobs/open/segment-probe`. But neither is more specific than the other."* Restored from a
+`/tmp/snap-c-83a` copy and confirmed by `shasum -a 256 -c`, never by `git checkout`.
+
+#### What moved with it, and the two things that deliberately did not
+
+Moved: `cmd/api/routes_fleet.go`, `routes_golden.txt` (63 lines, unchanged count),
+`contracts/paths/fleet.yaml` (the two path items renamed `FleetJobs` and `FleetJobByID`),
+`contracts/openapi.yaml`'s two `$ref` lines, `internal/fleet`'s tests, `scripts/verify/60-fleet.sh`,
+and the Dart client's `ApiOpenJobsRepository._base` with its tests.
+
+**The published paths shaped by the old collision did not move**, and that is a decision rather than
+an oversight. `GET /v1/jobs/{id}/bids/received`, `/delivery/detail`, `/delivery/milestones` and
+`/delivery/proof` could all now take the four-segment form the tickets originally wanted, and none
+of them will: they are served, the Flutter client calls them, and `Docs/06` §5.3 is decisive —
+builds persist on devices indefinitely and Dart has no over-the-air update path. **What SHIP-83a
+changes is the next ticket's options, not the last four tickets' paths.** The comments in
+`routes_bidding.go`, `routes_delivery.go`, `internal/delivery/read.go` and their contract fragments
+are corrected to past tense and now say so.
+
+**The client's own `/jobs/open/:id` `go_router` location also stays.** A location is not an
+endpoint: nothing in `go_router` resembles the `ServeMux` constraint, the two patterns there differ
+in segment count and cannot overlap, and the path is a deep-link target (`Docs/07` §5) that moving
+would strand links already sent.
+
+**Nothing was needed from `internal/config`.**
 
 
 ## 4. Partly done — do not treat these as finished

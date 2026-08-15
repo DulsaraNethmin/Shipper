@@ -121,20 +121,21 @@ func init() {
 		Route{
 			Method: http.MethodGet,
 
-			// **`/jobs/{id}/proof` was the intended pattern and it cannot be served**, which
+			// **`/jobs/{id}/proof` was the intended pattern and it could not be served**, which
 			// is a finding SHIP-115 made rather than a preference. `GET /jobs/open/{id}`
-			// (SHIP-83) puts a literal in the `{id}` position, so it and any three-segment
-			// `GET /jobs/{id}/<literal>` both match `/jobs/open/proof` with neither more
+			// (SHIP-83) put a literal in the `{id}` position, so it and any three-segment
+			// `GET /jobs/{id}/<literal>` both matched `/jobs/open/proof` with neither more
 			// specific — Go's ServeMux refuses the pair at registration and the process does
-			// not start. `POST /jobs/{id}/proof-uploads` is unaffected only because the other
+			// not start. `POST /jobs/{id}/proof-uploads` was unaffected only because the other
 			// route is a GET.
 			//
 			// So the delivery domain takes a shelf of its own under the job, and that turns
 			// out to be worth having rather than a workaround: **every read this domain adds
 			// under a job would have hit the same wall** — SHIP-116's exception, SHIP-133's
 			// tracking view, a milestone timeline — and each now has somewhere to go that
-			// composes. Docs/11 §3 records the collision for whoever owns `/jobs/open/{id}`,
-			// because it is the shape that will keep costing tickets an hour.
+			// composes. **SHIP-83a has since moved the feed to `/v1/fleet/jobs/{id}` and the
+			// four-segment space is free**, but these paths are published and stay where they
+			// are (Docs/06 §5.3); the shelf earns its keep on the composition argument alone.
 			Pattern: "/jobs/{id}/delivery/proof",
 			Group:   GroupV1,
 
@@ -277,13 +278,14 @@ func init() {
 			//
 			// # Why a fourth segment is safe here and would not be under /jobs
 			//
-			// `GET /jobs/open/{id}` puts a literal in the `{id}` position, so it and any
-			// three-segment `GET /jobs/{id}/<literal>` both match `/jobs/open/<literal>`
+			// `GET /jobs/open/{id}` put a literal in the `{id}` position, so it and any
+			// three-segment `GET /jobs/{id}/<literal>` both matched `/jobs/open/<literal>`
 			// with neither more specific, and Go's ServeMux **panics at registration**. That
-			// collision is confined to the `/jobs` tree and to `GET`: `/driver/...` is a
+			// collision was confined to the `/jobs` tree and to `GET`: `/driver/...` is a
 			// different tree with no literal in its identifier slot, and this is a POST in
-			// any case — which is the same reason `POST /jobs/{id}/proof-uploads` above is
-			// unaffected.
+			// any case — which is the same reason `POST /jobs/{id}/proof-uploads` above was
+			// unaffected. SHIP-83a moved the feed to `/v1/fleet/jobs/{id}` and the `/jobs`
+			// tree is now clear as well; nothing here depended on that either way.
 			//
 			// # The scope question this route had to answer before it could be served
 			//

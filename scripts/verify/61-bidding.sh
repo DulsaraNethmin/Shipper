@@ -261,7 +261,7 @@ PY
 ok "the bid response is a closed set of keys, and carries neither the word nor the value nor a key under another name"
 
 # Nothing of the job travels in a bid at all, which is stronger than redaction: there is no field to
-# leak because there is no job in the shape. GET /v1/jobs/open/{id} is where a provider reads the job.
+# leak because there is no job in the shape. GET /v1/fleet/jobs/{id} is where a provider reads the job.
 for disclosure in 'Church Street' 'Richmond' 'sofa' '"weight' '"pickup"'; do
   grep -q "$disclosure" "$WORKDIR/bid-place.json" \
     && { cat "$WORKDIR/bid-place.json"; fail "the bid carries '$disclosure' — a bid names its job and nothing else"; }
@@ -2450,18 +2450,20 @@ ticket "SHIP-102a  GET /v1/jobs/{id}/bids/received — a customer reads the offe
 #
 # # The path is five segments and Docs/09 says four
 #
-# `GET /v1/jobs/{id}/bids` cannot be registered: `GET /v1/jobs/open/{id}` puts a literal where the
-# job identifier goes, so both patterns match `/v1/jobs/open/bids` with neither more specific and the
-# mux refuses the pair at start-up. **The service starting at all is therefore part of what this
-# section demonstrates** — every check below runs against a binary that would not have booted if the
-# collision had been resolved wrongly.
+# `GET /v1/jobs/{id}/bids` could not be registered when this section was written: `GET
+# /v1/jobs/open/{id}` put a literal where the job identifier goes, so both patterns matched
+# `/v1/jobs/open/bids` with neither more specific and the mux refused the pair at start-up.
+# **SHIP-83a has since moved the feed to `/v1/fleet/jobs/{id}` and the four-segment space is free**
+# — cmd/api/routes_jobsegment_test.go demonstrates it by registering one. The path here stays at
+# five segments because it is already published and moving it would break every installed client
+# for a tidier URL, which is not a trade `Docs/06` §5.3 permits.
 #
 # # What only this can show
 #
 # internal/bidding/offers_test.go holds the ownership rule, the closed key set, the word guard and
 # the keyset. What only this can show is the route being served at all, at five segments, past the
-# real auth class, beside `GET /v1/jobs/open/{id}` in one running router — and against offers this
-# file placed through real endpoints on a job that really carries a budget.
+# real auth class, in one running router — and against offers this file placed through real
+# endpoints on a job that really carries a budget.
 
 # A job of its own, so that the assertions below are about offers this section placed rather than
 # about whatever state the sections above left the shared job in. It carries the same budget, which

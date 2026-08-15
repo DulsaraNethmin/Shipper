@@ -138,7 +138,7 @@ type page struct {
 func (m marketplace) feed(t *testing.T, query string) page {
 	t.Helper()
 
-	target := "/v1/jobs/open"
+	target := "/v1/fleet/jobs"
 	if query != "" {
 		target += "?" + query
 	}
@@ -239,7 +239,7 @@ func TestAnIneligibleProviderSeesAnEmptyFeed(t *testing.T) {
 
 			caller := arrange(t, m)
 
-			rec := as(t, m.router, caller, http.MethodGet, "/v1/jobs/open", "")
+			rec := as(t, m.router, caller, http.MethodGet, "/v1/fleet/jobs", "")
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200 — being eligible for nothing is an answer, "+
 					"not a failure of the request (%s)", rec.Code, rec.Body)
@@ -266,7 +266,7 @@ func TestTheFeedIsNewestFirstAndCarriesTheEnvelope(t *testing.T) {
 		published = append(published, id)
 	}
 
-	rec := m.get(t, "/v1/jobs/open")
+	rec := m.get(t, "/v1/fleet/jobs")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
@@ -401,7 +401,7 @@ func TestTheFeedRefusesAQueryItCannotHonour(t *testing.T) {
 	}
 	for name, query := range refused {
 		t.Run(name, func(t *testing.T) {
-			rec := m.get(t, "/v1/jobs/open?"+query)
+			rec := m.get(t, "/v1/fleet/jobs?"+query)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
 			}
@@ -413,7 +413,7 @@ func TestTheFeedRefusesAQueryItCannotHonour(t *testing.T) {
 	}
 
 	t.Run("a limit above the maximum is narrowed rather than refused", func(t *testing.T) {
-		rec := m.get(t, "/v1/jobs/open?limit=5000")
+		rec := m.get(t, "/v1/fleet/jobs?limit=5000")
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200 — raising the maximum later must not break a client (%s)",
 				rec.Code, rec.Body)
@@ -438,7 +438,7 @@ func TestTheProviderJobDetailIsTheJobTheFeedShowed(t *testing.T) {
 		t.Fatalf("the feed carries %d jobs, want the one just published", len(fromFeed.Data))
 	}
 
-	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	rec := m.get(t, "/v1/fleet/jobs/"+job.String())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET the job = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
@@ -543,22 +543,22 @@ func TestTheProviderResponseCarriesNoBudgetInAnyForm(t *testing.T) {
 	// endpoint and not on the other is the failure two responses invite, and it is why both are
 	// here rather than only the one SHIP-83 adds.
 	responses := map[string][]byte{
-		"the feed, GET /v1/jobs/open":                nil,
-		"the job itself, GET /v1/jobs/open/{id}":     nil,
+		"the feed, GET /v1/fleet/jobs":               nil,
+		"the job itself, GET /v1/fleet/jobs/{id}":    nil,
 		"the feed a second time, following a cursor": nil,
 	}
 
-	feed := m.get(t, "/v1/jobs/open")
+	feed := m.get(t, "/v1/fleet/jobs")
 	if feed.Code != http.StatusOK {
 		t.Fatalf("the feed = %d, want 200 (%s)", feed.Code, feed.Body)
 	}
-	responses["the feed, GET /v1/jobs/open"] = feed.Body.Bytes()
+	responses["the feed, GET /v1/fleet/jobs"] = feed.Body.Bytes()
 
-	detail := m.get(t, "/v1/jobs/open/"+job.String())
+	detail := m.get(t, "/v1/fleet/jobs/"+job.String())
 	if detail.Code != http.StatusOK {
 		t.Fatalf("the job = %d, want 200 (%s)", detail.Code, detail.Body)
 	}
-	responses["the job itself, GET /v1/jobs/open/{id}"] = detail.Body.Bytes()
+	responses["the job itself, GET /v1/fleet/jobs/{id}"] = detail.Body.Bytes()
 
 	// A second page is a different code path through the same handler — the one that renders a
 	// cursor — and a leak there would be reached only by a provider who scrolled.
@@ -568,7 +568,7 @@ func TestTheProviderResponseCarriesNoBudgetInAnyForm(t *testing.T) {
 	if !firstPage.HasMore {
 		t.Fatalf("the fixture did not produce a second page")
 	}
-	paged := m.get(t, "/v1/jobs/open?limit=1&cursor="+url.QueryEscape(firstPage.NextCursor))
+	paged := m.get(t, "/v1/fleet/jobs?limit=1&cursor="+url.QueryEscape(firstPage.NextCursor))
 	if paged.Code != http.StatusOK {
 		t.Fatalf("the second page = %d, want 200 (%s)", paged.Code, paged.Body)
 	}
@@ -722,7 +722,7 @@ func TestTheProviderJobCarriesNeitherTheStreetLineNorTheCoordinate(t *testing.T)
 			line, latitude)
 	}
 
-	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	rec := m.get(t, "/v1/fleet/jobs/"+job.String())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
@@ -813,21 +813,21 @@ func TestAJobThisProviderMayNotBidOnIsNotFound(t *testing.T) {
 
 			// It is reachable first, by the provider. Otherwise every case below would pass
 			// against an endpoint that answered 404 to everything.
-			if rec := m.get(t, "/v1/jobs/open/"+job.String()); rec.Code != http.StatusOK {
+			if rec := m.get(t, "/v1/fleet/jobs/"+job.String()); rec.Code != http.StatusOK {
 				t.Fatalf("the job was already unreachable before the test broke anything: %d (%s)",
 					rec.Code, rec.Body)
 			}
 
 			asked := ineligible(t, m, job)
 
-			refused := as(t, m.router, caller, http.MethodGet, "/v1/jobs/open/"+asked.String(), "")
+			refused := as(t, m.router, caller, http.MethodGet, "/v1/fleet/jobs/"+asked.String(), "")
 			if refused.Code != http.StatusNotFound {
 				t.Fatalf("status = %d, want 404 (%s)", refused.Code, refused.Body)
 			}
 
 			// The job that does not exist, asked for by the same caller in the same state.
 			absent := as(t, m.router, caller, http.MethodGet,
-				"/v1/jobs/open/00000000-0000-7000-8000-000000000010", "")
+				"/v1/fleet/jobs/00000000-0000-7000-8000-000000000010", "")
 			if absent.Code != http.StatusNotFound {
 				t.Fatalf("a job that does not exist = %d, want 404 (%s)", absent.Code, absent.Body)
 			}
@@ -869,7 +869,7 @@ func TestAnotherProvidersFeedIsNotReachableByAsking(t *testing.T) {
 	declare(t, m.pool, other, ProfileFields{States: &[]string{"WA"}})
 	addVehicle(t, m.pool, other, "OTHR01", Capacity{MaxWeightKg: 1200})
 
-	target := "/v1/jobs/open?provider_id=" + m.provider.String()
+	target := "/v1/fleet/jobs?provider_id=" + m.provider.String()
 	rec := as(t, m.router, other, http.MethodGet, target, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
@@ -908,7 +908,7 @@ func TestTheBiddableStatusesReachTheWireInDocs02sNames(t *testing.T) {
 	job := m.publish(t, richJob(1500))
 	transition(t, m.pool, job, m.customer, "Open", "Negotiating")
 
-	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	rec := m.get(t, "/v1/fleet/jobs/"+job.String())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("a Negotiating job = %d, want 200 — Docs/02 §1 keeps it open to eligible bids (%s)",
 			rec.Code, rec.Body)
@@ -933,7 +933,7 @@ func TestTheJobIDInThePathMustBeAnIdentifier(t *testing.T) {
 	m := newMarketplace(t)
 	m.publish(t, richJob(1500))
 
-	rec := m.get(t, "/v1/jobs/open/not-a-uuid")
+	rec := m.get(t, "/v1/fleet/jobs/not-a-uuid")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
 	}

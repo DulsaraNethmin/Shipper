@@ -1,7 +1,7 @@
 // What actually reaches the wire, checked against contracts/paths/fleet.yaml.
 //
 // The screen is tested against a fake repository, which is the right seam for it and the wrong one
-// for this: a fake cannot notice that the feed went to /v1/jobs rather than /v1/jobs/open — which
+// for this: a fake cannot notice that the feed went to /v1/jobs rather than /v1/fleet/jobs — which
 // is the *customer's* own jobs and would answer a provider with an empty page rather than an error
 // — or that a cursor was re-encoded on the way back out.
 //
@@ -73,7 +73,7 @@ const _cursor = 'MR8yMDI2LTA4LTExVDAzOjMwOjAwWh8wMTk4ZjJjMS02YjQwLTdhMTEtOWMzZS0
 
 void main() {
   group('reading the feed', () {
-    test('lists from /v1/jobs/open, which is not the customer’s own /v1/jobs', () async {
+    test('lists from /v1/fleet/jobs, which is not the customer’s own /v1/jobs', () async {
       // The path is the whole of this test. /v1/jobs is the caller's own jobs and answers a
       // provider `200` with an empty page — no error, no clue, and a feed that is silently always
       // empty.
@@ -85,7 +85,7 @@ void main() {
       final page = await repo.openJobs();
 
       expect(adapter.requests.single.method, 'GET');
-      expect(adapter.requests.single.path, '/v1/jobs/open');
+      expect(adapter.requests.single.path, '/v1/fleet/jobs');
       expect(page.data.single.status, JobStatus.open);
       expect(page.data.single.pickup?.state, 'NSW');
     });
@@ -185,8 +185,8 @@ void main() {
       await repo.openJobs(cursor: _cursor);
 
       expect(adapter.requests.map((r) => r.path).toList(), <String>[
-        '/v1/jobs/open',
-        '/v1/jobs/open',
+        '/v1/fleet/jobs',
+        '/v1/fleet/jobs',
       ]);
       expect(adapter.requests.first.queryParameters, isEmpty);
       expect(adapter.requests.last.queryParameters, <String, Object?>{'cursor': _cursor});
@@ -194,7 +194,7 @@ void main() {
   });
 
   group('reading one job', () {
-    test('reads /v1/jobs/open/{id}, which is not the owner’s /v1/jobs/{id}', () async {
+    test('reads /v1/fleet/jobs/{id}, which is not the owner’s /v1/jobs/{id}', () async {
       // The path is the whole of this test. `GET /v1/jobs/{id}` is the *owner's* view and is the one
       // shape in this API that carries the budget; a provider calling it gets `404`, and a client
       // that reached for it would be asking for the response Docs/01 §4.3 exists to keep away from
@@ -204,7 +204,7 @@ void main() {
       final job = await repo.openJob(jobId: '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0');
 
       expect(adapter.requests.single.method, 'GET');
-      expect(adapter.requests.single.path, '/v1/jobs/open/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0');
+      expect(adapter.requests.single.path, '/v1/fleet/jobs/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0');
       expect(job.status, JobStatus.open);
       expect(job.pickup?.state, 'NSW');
     });

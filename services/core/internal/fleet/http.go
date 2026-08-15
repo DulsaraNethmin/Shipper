@@ -12,14 +12,22 @@
 // platform. A vehicle belonging to another provider answers 404, byte-identically to one that does
 // not exist.
 //
-// # Two routes here are not under /fleet, and that is deliberate
+// # Two of these routes serve jobs rather than vehicles, and that is deliberate
 //
-// `GET /v1/jobs/open` and `GET /v1/jobs/open/{id}` (SHIP-82, SHIP-83) serve jobs, and they are
-// served from this domain because this domain decides which jobs a provider may bid on. Routes are
-// declared rather than registered, so the file a route is declared in follows the domain that
-// answers it rather than the first segment of its path. The rule that keeps the two apart is the
-// one the budget invariant needs: `/v1/jobs/{id}` is the customer's job and carries their budget;
-// `/v1/jobs/open/{id}` is a provider's view of one and has no field it could go in.
+// `GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}` (SHIP-82, SHIP-83, moved by SHIP-83a) serve
+// jobs, and they are served from this domain because this domain decides which jobs a provider may
+// bid on. Routes are declared rather than registered, so the file a route is declared in follows the
+// domain that answers it rather than the first segment of its path. The rule that keeps them apart
+// from the customer's read is the one the budget invariant needs: `/v1/jobs/{id}` is the customer's
+// job and carries their budget; `/v1/fleet/jobs/{id}` is a provider's view of one and has no field
+// it could go in.
+//
+// **They were under `/v1/jobs/open` until SHIP-83a and the move was structural rather than
+// cosmetic.** A literal in the `{id}` slot made `GET /v1/jobs/{id}/<literal>` unregisterable
+// service-wide — see cmd/api/routes_fleet.go for the whole argument and
+// cmd/api/routes_jobsegment_test.go for the guard. `/fleet` is also the more honest prefix: the
+// feed is the platform's eligibility decision about *one* provider, so two callers of the same path
+// see different sets, which `/v1/jobs/open` read as a public shelf that does not exist.
 //
 // **This is not the customer's view of a vehicle.** Docs/01 §4.3 lets a customer compare "provider
 // profile, vehicle, and declared capability" when they read the bids on their job, and that shape
@@ -766,7 +774,7 @@ func wireStatus(stored string) string {
 	return strings.ToLower(strings.ReplaceAll(stored, " ", "_"))
 }
 
-// OpenJobs handles GET /v1/jobs/open (SHIP-82).
+// OpenJobs handles GET /v1/fleet/jobs (SHIP-82; moved off /v1/jobs/open by SHIP-83a).
 //
 // The marketplace as this provider may bid on it: every open job the platform's eligibility filter
 // offers them, newest first, keyset-paged (Docs/10 §4.5).
@@ -818,7 +826,7 @@ func (h *Handler) OpenJobs() http.Handler {
 	})
 }
 
-// OpenJob handles GET /v1/jobs/open/{id} (SHIP-83).
+// OpenJob handles GET /v1/fleet/jobs/{id} (SHIP-83; moved off /v1/jobs/open/{id} by SHIP-83a).
 //
 // One job out of the feed, in the same shape the feed gave it. A member of the collection above
 // rather than a second view of `GET /v1/jobs/{id}`: that route is the *customer's* job, it carries

@@ -59,7 +59,7 @@ Bids:
 
       Only a **verified, eligible** provider may bid, and eligibility is the platform's decision:
       service area, vehicle capability, verification state and job status (Docs/01 §4.3). It is the
-      same filter behind `GET /v1/jobs/open`, so a job in your feed is a job you can bid on, and a
+      same filter behind `GET /v1/fleet/jobs`, so a job in your feed is a job you can bid on, and a
       job that is not answers `404` here exactly as it does there.
 
       A job you may not bid on and a job that does not exist are **the same answer**. Which jobs a
@@ -701,7 +701,7 @@ FleetBids:
 
       Each row is the same `Bid` shape every other bidding endpoint answers with. Nothing about the
       job travels in it beyond `job_id`, so **the customer's budget is not here in any form** (Docs/01
-      §4.3) — read `GET /v1/jobs/open/{id}` for the job.
+      §4.3) — read `GET /v1/fleet/jobs/{id}` for the job.
 
       ## Grouping by status
 
@@ -1235,7 +1235,7 @@ Bid:
     against the real response, so a field added here is a decision somebody records in three places
     rather than one that arrives with a schema change.
 
-    Nothing about the job travels in this shape beyond its identifier. Read `GET /v1/jobs/open/{id}`
+    Nothing about the job travels in this shape beyond its identifier. Read `GET /v1/fleet/jobs/{id}`
     for the job.
   properties:
     id:
@@ -1400,11 +1400,17 @@ ReceivedBids:
 
       ## Why the path is not `/v1/jobs/{id}/bids`
 
-      Because that pattern cannot be served. `GET /v1/jobs/open/{id}` puts a literal where the job
-      identifier goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>` both match
-      `/v1/jobs/open/bids` with neither more specific, and the router refuses the pair at start-up.
-      `POST /v1/jobs/{id}/bids` is unaffected only because it is a different method. The same
-      collision is why the delivery reads sit under `/v1/jobs/{id}/delivery/…`.
+      Because that pattern could not be served when this operation was published. The provider feed
+      was `GET /v1/jobs/open/{id}`, which put a literal where the job identifier goes, so it and any
+      four-segment `GET /v1/jobs/{id}/<literal>` both matched `/v1/jobs/open/bids` with neither more
+      specific and the router refused the pair at start-up. `POST /v1/jobs/{id}/bids` was unaffected
+      only because it is a different method, and the same collision is why the delivery reads sit
+      under `/v1/jobs/{id}/delivery/…`.
+
+      **SHIP-83a moved the feed to `/v1/fleet/jobs/{id}` and the constraint is gone. This path is
+      not moving with it**: it is already published, installed clients call it, and `Docs/06` §5.3
+      is explicit that old builds persist on devices indefinitely with no over-the-air update path
+      for Dart code.
 
       `received` also says which side is asking, which is the whole difference between this endpoint
       and `GET /v1/fleet/bids`: these are the offers you have received, those are the offers a

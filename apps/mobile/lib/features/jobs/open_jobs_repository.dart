@@ -13,16 +13,16 @@ import 'package:shipper/features/jobs/open_job.dart';
 /// screen could reach the wrong shape, which is exactly the arrangement the privacy rule is
 /// hardest to keep.
 ///
-/// The endpoint is served by `internal/fleet` even though its path begins `/v1/jobs` — `fleet`
-/// owns eligibility and `jobs` owns the customer's view of a job — which is why the shape lives in
-/// `contracts/paths/fleet.yaml`. On the client it is `features/jobs`, because `Docs/07` §2 puts
-/// **discovery** in that feature.
+/// The endpoint is served by `internal/fleet` — `fleet` owns eligibility and `jobs` owns the
+/// customer's view of a job — which is why the shape lives in `contracts/paths/fleet.yaml` and why
+/// SHIP-83a put the path under `/v1/fleet/jobs`. On the client it is `features/jobs`, because
+/// `Docs/07` §2 puts **discovery** in that feature, and the two do not have to agree.
 ///
 /// An interface with one real implementation, following `JobsRepository` and `FleetRepository` for
 /// the same reason: a widget test has to be able to hand a screen something that answers, and a
 /// stub transport under a concrete class makes every screen test a test of `dio`'s wiring as well.
 abstract interface class OpenJobsRepository {
-  /// `GET /v1/jobs/open` (SHIP-82) — one page of the jobs this provider may bid on, newest first.
+  /// `GET /v1/fleet/jobs` (SHIP-82) — one page of the jobs this provider may bid on, newest first.
   ///
   /// [cursor] is the `next_cursor` of a previous page, passed back **exactly** as it arrived. It
   /// is opaque: its encoding is the endpoint's business, and a cursor from an encoding no longer
@@ -56,7 +56,7 @@ abstract interface class OpenJobsRepository {
   /// untouched.
   Future<ApiPage<OpenJob>> openJobs({String? cursor});
 
-  /// `GET /v1/jobs/open/{id}` (SHIP-83) — one job out of the feed, in the shape the feed sends.
+  /// `GET /v1/fleet/jobs/{id}` (SHIP-83) — one job out of the feed, in the shape the feed sends.
   ///
   /// **The same type, and that is itself a privacy decision.** The platform answers both operations
   /// with `OpenJob` deliberately, and a Go test asserts the detail response is byte-identical to the
@@ -87,7 +87,7 @@ abstract interface class OpenJobsRepository {
 /// `contracts/openapi.yaml`, and what should survive that is the shape of the interface above and
 /// nothing in this class.
 ///
-/// `GET /v1/jobs/open/{id}` arrived with SHIP-100, which is the screen that needed it. Until then it
+/// `GET /v1/fleet/jobs/{id}` arrived with SHIP-100, which is the screen that needed it. Until then it
 /// was served and deliberately not modelled: an endpoint no screen calls is dead code that nothing
 /// holds to the contract.
 final class ApiOpenJobsRepository implements OpenJobsRepository {
@@ -97,7 +97,13 @@ final class ApiOpenJobsRepository implements OpenJobsRepository {
 
   /// Product endpoints live under `/v1` (SHIP-13). The base URL carries the host and nothing else,
   /// so the version prefix belongs here.
-  static const _base = '/v1/jobs/open';
+  ///
+  /// **`/v1/fleet/jobs` since SHIP-83a, and the old `/v1/jobs/open` is gone rather than aliased.**
+  /// The feed put a literal where the platform's `{id}` wildcard goes, which closed the whole
+  /// four-segment `GET /v1/jobs/{id}/<literal>` space to every ticket after it. There is no fallback
+  /// here on purpose: a client that quietly retried the old path would hide the very breakage the
+  /// move is supposed to surface at build time.
+  static const _base = '/v1/fleet/jobs';
 
   @override
   Future<ApiPage<OpenJob>> openJobs({String? cursor}) async {

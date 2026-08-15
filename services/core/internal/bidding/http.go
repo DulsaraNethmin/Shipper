@@ -938,9 +938,11 @@ func (h *Handler) History() http.Handler {
 //
 // `/v1/fleet` is where a provider's own things already live: their vehicles, their declared service
 // area, their profile. A provider asking "what have I bid on" is asking about their operation rather
-// than about a job, and the URL says so. It also sidesteps `net/http`'s routing constraint entirely
-// rather than taking another shelf under `/v1/jobs/` — `GET /v1/jobs/open/{id}` already exists, so a
-// four-segment `GET /v1/jobs/{id}/<literal>` panics the mux at registration.
+// than about a job, and the URL says so. It also sidestepped `net/http`'s routing constraint
+// entirely rather than taking another shelf under `/v1/jobs/` — `GET /v1/jobs/open/{id}` existed at
+// the time, so a four-segment `GET /v1/jobs/{id}/<literal>` panicked the mux at registration.
+// SHIP-83a has since lifted that constraint; the ownership argument above is why this path stays
+// where it is regardless.
 //
 // # Every response key is one this API already promises a provider
 //
@@ -1168,7 +1170,7 @@ func (h *Handler) database(r *http.Request) (*pgxpool.Pool, error) {
 // nobody published. It is also the answer a job that has been cancelled, awarded or expired
 // deserves, and telling those apart would tell a provider what happened to work they were not given
 // — including that somebody else won it. httpx's own description of `not_found` says the two cases
-// are deliberately indistinguishable, and `GET /v1/jobs/open/{id}` already answers the same way for
+// are deliberately indistinguishable, and `GET /v1/fleet/jobs/{id}` already answers the same way for
 // the same reasons (SHIP-83), so a provider gets one consistent answer whichever endpoint they
 // reach.
 //
@@ -1416,18 +1418,24 @@ func offerFrom(o ReceivedOffer) offerResponse {
 // # The path says `/bids/received` and the *Done when* says `/bids`, and that is a finding rather
 // than a slip
 //
-// `GET /v1/jobs/{id}/bids` **cannot be registered**. `GET /v1/jobs/open/{id}` (SHIP-83) puts a
-// literal where the `{id}` wildcard goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>`
-// both match `/v1/jobs/open/bids` with neither more specific, and Go's `ServeMux` panics at
-// registration — the process does not start. Renaming the literal does not help; `/offers` collides
-// identically. `POST /v1/jobs/{id}/bids` is unaffected only because the other route is a `GET`.
+// `GET /v1/jobs/{id}/bids` **could not be registered when this endpoint was written**.
+// `GET /v1/jobs/open/{id}` (SHIP-83) put a literal where the `{id}` wildcard goes, so it and any
+// four-segment `GET /v1/jobs/{id}/<literal>` both matched `/v1/jobs/open/bids` with neither more
+// specific, and Go's `ServeMux` panics at registration — the process does not start. Renaming the
+// literal did not help; `/offers` collided identically. `POST /v1/jobs/{id}/bids` was unaffected
+// only because the other route was a `GET`.
 //
 // SHIP-115 met this first and resolved it by taking a shelf under the job, which is why
 // `GET /jobs/{id}/delivery/detail`, `/delivery/milestones` and `/delivery/proof` are shaped the way
-// they are; that note ends by recording the collision "for whoever owns `/jobs/open/{id}`". This
-// endpoint follows the precedent rather than overturning it, and cmd/api/routes_bidding.go's
-// declaration carries the full argument for which of the two options was taken and what the other
-// one would cost.
+// they are; that note ended by recording the collision "for whoever owns `/jobs/open/{id}`".
+// **SHIP-83a is that owner and moved the feed to `/v1/fleet/jobs/{id}`, so the four-segment space is
+// now free** — cmd/api/routes_jobsegment_test.go demonstrates it by registering one.
+//
+// **This path did not move with it, and that is a decision rather than an omission.** It is a
+// published endpoint the Flutter client already calls, and `Docs/06` §5.3 settles it: old builds
+// persist on devices indefinitely and Dart has no over-the-air update path, so a URL that has
+// shipped cannot be withdrawn on the strength of it now being avoidable. `received` also says which
+// side of the negotiation is asking, which `/bids` alone did not.
 //
 // # Read-only, so no `Idempotency-Key`
 //

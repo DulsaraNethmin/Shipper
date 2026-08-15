@@ -103,11 +103,18 @@ abstract final class Routes {
   /// One open job as a **provider** sees it, and the offer they make on it (SHIP-100).
   ///
   /// A separate route from [jobDetail] rather than one screen that branches on the role, and that
-  /// is the same decision the platform made twice: `GET /v1/jobs/{id}` and `GET /v1/jobs/open/{id}`
+  /// is the same decision the platform made twice: `GET /v1/jobs/{id}` and `GET /v1/fleet/jobs/{id}`
   /// are two endpoints answering with two response shapes, because one shape carrying the budget
   /// "when the caller owns it" is the arrangement `Docs/01` §4.3 is hardest to keep. Two routes,
   /// two screens, two types, and no flag anywhere that decides which half of the marketplace is
   /// looking.
+  ///
+  /// **This in-app path deliberately did not move when SHIP-83a moved the endpoint.** A location is
+  /// not an endpoint. The platform's path had to change because `open` sitting in the `{id}`
+  /// position made `GET /v1/jobs/{id}/<literal>` unregisterable service-wide; nothing of the sort
+  /// applies here, where the two patterns differ in segment count and cannot overlap at all. What
+  /// this path *is* is a deep-link target (`Docs/07` §5), so moving it would strand links already
+  /// sent, for no gain.
   ///
   /// It does not collide with [jobDetail]: `/jobs/:id` matches exactly one segment, and this has
   /// two. `/jobs/open` on its own would be read as a job whose id is the word "open", and there is
@@ -121,9 +128,10 @@ abstract final class Routes {
   ///
   /// **`/offers` rather than `/bids`, and the client's word differs from the platform's on purpose.**
   /// The endpoint behind it is `GET /v1/jobs/{id}/bids/received`, which is itself five segments
-  /// because `GET /v1/jobs/{id}/bids` cannot be registered beside `GET /v1/jobs/open/{id}`. A
-  /// location is not an endpoint, so this one takes the word a customer would use: they are reading
-  /// the offers they have received, not browsing a collection called `bids`.
+  /// because `GET /v1/jobs/{id}/bids` could not be registered beside the feed's old
+  /// `GET /v1/jobs/open/{id}` — SHIP-83a has since freed that space and the published endpoint stays
+  /// where it is. A location is not an endpoint, so this one takes the word a customer would use:
+  /// they are reading the offers they have received, not browsing a collection called `bids`.
   ///
   /// It does not collide with [jobDetail], which matches exactly one segment; it sits **after**
   /// `/jobs/open/:id` in the router for the same reason every two-segment job route does.
@@ -186,8 +194,10 @@ abstract final class Routes {
   /// `/bids` rather than `/fleet/bids`, and the divergence from the endpoint's own path is
   /// deliberate. `GET /v1/fleet/bids` sits under `/v1/fleet` because that is where a provider's own
   /// **records** live on the platform — their vehicles, their service area, their profile — and
-  /// because a four-segment `GET /v1/jobs/{id}/<literal>` panics Go's `ServeMux` while
-  /// `GET /v1/jobs/open/{id}` exists. Neither reason is a fact about this app's navigation: [fleet]
+  /// because a four-segment `GET /v1/jobs/{id}/<literal>` panicked Go's `ServeMux` while
+  /// `GET /v1/jobs/open/{id}` existed (SHIP-83a has since moved that feed to `/v1/fleet/jobs/{id}`,
+  /// which is where a provider's records were always going). Neither reason is a fact about this
+  /// app's navigation: [fleet]
   /// here means the vehicles screen, so `/fleet/bids` would read as a third thing under the
   /// vehicles, which is what it is not.
   ///
