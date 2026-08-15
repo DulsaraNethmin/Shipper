@@ -152,6 +152,24 @@ var templates = map[Channel]channelTemplate{
 // It returns an error rather than panicking, although every template here is executed against the
 // same closed input by a test: [Consume] runs inside a transaction holding a Kafka partition's
 // progress, and a panic there stops a consumer where an error stops one message.
+//
+// # It refuses to render copy that breaks SHIP-141's rules, and this is the last writer
+//
+// [Redactions] runs over the rendered subject and the rendered body, and a problem in either is
+// [ErrRedacted] rather than a string somebody has to notice. **This is the only place a
+// notification's text is written**: [Consume] renders and inserts in the same loop, so nothing
+// reaches the `notifications` table that has not been through here.
+//
+// Both halves are checked, not only the body. On a push the *subject* is the bold line the handset
+// shows above everything else, so it is the more visible of the two on the surface this ticket is
+// about; a rule that guarded the body alone would guard the quieter half.
+//
+// Failing closed is the right trade even though it parks a Kafka partition. Every input here is a
+// compile-time literal — the templates in this file and [Rule.Headline] in rules.go — so a redaction
+// failure is a build defect that `TestNoRuleCanRenderCopyThatBreaksTheRedactionRules` catches before
+// it is deployed. Reaching this branch at runtime means something is wrong that nobody predicted,
+// and a notification nobody receives is recoverable where a street address on a stranger's lock
+// screen is not.
 func Render(channel Channel, rule Rule, jobID uuid.UUID) (subject, body string, err error) {
 	tmpl, known := templates[channel]
 	if !known {
@@ -167,6 +185,16 @@ func Render(channel Channel, rule Rule, jobID uuid.UUID) (subject, body string, 
 	body, err = execute(tmpl.body, data)
 	if err != nil {
 		return "", "", err
+	}
+
+	for _, part := range []struct {
+		what string
+		text string
+	}{{"subject", subject}, {"body", body}} {
+		if problems := Redactions(part.text); len(problems) > 0 {
+			return "", "", fmt.Errorf("notifications: the %s %s on %s: %w",
+				channel, part.what, strings.Join(problems, "; "), ErrRedacted)
+		}
 	}
 	return subject, body, nil
 }

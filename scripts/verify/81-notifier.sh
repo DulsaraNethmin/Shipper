@@ -4,10 +4,17 @@
 #
 # Sourced by scripts/verify-foundation.sh; see 00-stack.sh for what the runner provides.
 #
-# 80–89 is the notifications range (M5). This runs after 80-notifications.sh rather than inside it
-# because that file ends by deleting and reapplying the topic set to prove a drifted topic is
-# reported rather than repaired — so `shipper.delivery` does not exist for part of it, and a
-# consumer subscribed to every topic in the catalogue has to start after that is over.
+# 80–89 is the notifications range (M5). This runs after 80-notifications.sh because that file is
+# where the outbox is drained onto the topics this consumer reads.
+#
+# **The reason used to be a structural one and is no longer true (SHIP-134a).** It read: "that file
+# ends by deleting and reapplying the topic set to prove a drifted topic is reported rather than
+# repaired — so `shipper.delivery` does not exist for part of it, and a consumer subscribed to every
+# topic in the catalogue has to start after that is over". The deletion is gone: the drift refusal
+# is now demonstrated by asking `cmd/topics` for a replication factor this single-broker stack
+# cannot be holding, which touches no topic at all. There is no longer a window in which a catalogue
+# topic is absent. The ordering stays because this section needs the worker run above to have
+# happened, which is a data dependency rather than a structural one.
 #
 # # What is demonstrated here and what is demonstrated by tests
 #
@@ -212,11 +219,14 @@ ok "the message reached the console email adapter, which is what SHIPPER_ENV=dev
 
 # --- the body carries nothing it should not -------------------------------------------------------
 #
-# SHIP-141 is not this ticket, and the rule it will enforce is Docs/01 §4.4's: no address, goods
-# description or full customer name in a notification body. The reason it holds already is
-# structural — the renderer is handed a fixed headline and a job identifier and never sees the job —
-# and this is that being true of a real message rather than of a unit test's fixture. The goods
-# description on this job was chosen to be unmistakable.
+# Docs/01 §4.4's rule: no address, goods description or full customer name in a notification body.
+# **SHIP-141 is now a ticket of its own with its own section below**, and this check is the reason
+# that section could be written cheaply — it was already reading a real message rather than a unit
+# test's fixture. The goods description on this job was chosen to be unmistakable.
+#
+# What holds it is two things rather than one. The structural half is that the renderer is handed a
+# fixed headline and a job identifier and never sees the job; the word-level half is SHIP-141's, and
+# it exists because a headline is free prose in a Go literal that no structural guard covers.
 notif_body="$("$PSQL" "$DATABASE_URL" -tAc \
   "select body from notifications where event_id = '$notif_event_id';")"
 case "$notif_body" in
@@ -583,6 +593,259 @@ status="$(curl -s -X DELETE -o "$WORKDIR/push-deregister.json" -w '%{http_code}'
 [[ "$status" == "204" || "$status" == "401" ]] \
   || { cat "$WORKDIR/push-deregister.json"; fail "deregistering returned $status, want 204 or 401"; }
 ok "deregistering answers without complaint, whether or not anything was still registered ($status)"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-141  no address, goods description, or full customer name appears in a notification body"
+
+# The redaction rules applied to **rows a real consumer wrote**, which is the one thing no test in
+# internal/notifications can do.
+#
+# That package's tests run the guard over the routing table and over synthetic copy; both are the
+# platform checking its own literals. This runs it over what is in the `notifications` table after a
+# real job, a real event and a real dispatch — the same text the console adapter handed out.
+#
+# **The digit rule is the one worth doing here**, because it is the rule that does not need a
+# vocabulary. Every street number, unit, postcode, weight, quantity and amount is a digit, and the
+# job identifier is the only number a notification may carry — so the check is "remove the
+# identifiers, then find a digit", exactly as internal/notifications/redaction.go does it.
+notif_leaks="$("$PSQL" "$DATABASE_URL" -tAc "
+  select count(*) from notifications
+   where recipient_id in ('$notif_customer_id', '$push_customer_id')
+     and regexp_replace(subject || ' ' || body,
+           '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
+           '', 'g') ~ '[0-9]';")"
+[[ "$notif_leaks" == "0" ]] \
+  || fail "$notif_leaks notification(s) carry a digit that is not the job identifier — a street number, a postcode, a weight or an amount"
+ok "no notification this run wrote carries a number other than the job identifier"
+
+notif_streets="$("$PSQL" "$DATABASE_URL" -tAc "
+  select count(*) from notifications
+   where recipient_id in ('$notif_customer_id', '$push_customer_id')
+     and (subject || ' ' || body) ~*
+         '\\m(street|road|avenue|drive|lane|court|parade|highway|crescent|terrace|boulevard|esplanade)\\M';")"
+[[ "$notif_streets" == "0" ]] \
+  || fail "$notif_streets notification(s) name a street type, which is an address however it is written"
+ok "and none names a street type, which is the rule that catches an address written in lower case"
+
+# The rule that catches a person, applied to what the table actually holds.
+#
+# A capitalised word that does not start a sentence is a name, a suburb, a street or a business.
+# `Shipper` and `Job` are the two exceptions and they are the whole allowlist — anything else here
+# is prose somebody wrote into rules.go that nobody read closely enough.
+#
+# **Subject and body as separate records**, one per line, rather than concatenated. The first
+# version of this check joined them with a separator and the separator itself broke the sentence
+# scan: the email subject ends `(job <uuid>)`, so the body's first word followed a closing bracket
+# rather than a full stop and was reported as a name. The concatenation was an artefact of the
+# check; internal/notifications checks the two halves apart, and so does this.
+"$PSQL" "$DATABASE_URL" -tAc "
+  select replace(subject, E'\n', ' ') from notifications
+   where recipient_id in ('$notif_customer_id', '$push_customer_id')
+  union all
+  select replace(body, E'\n', ' ') from notifications
+   where recipient_id in ('$notif_customer_id', '$push_customer_id');" >"$WORKDIR/notif-copy.txt"
+
+python3 - "$WORKDIR/notif-copy.txt" <<'PY' || fail "a notification names a person, a place or a business"
+import re, sys
+
+allowed = {"Shipper", "Job"}
+word = re.compile(r"[A-Za-z][A-Za-z'-]*")
+uuid = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+for line in open(sys.argv[1]):
+    text = uuid.sub("", line.rstrip("\n"))
+    for m in word.finditer(text):
+        if not m.group(0)[0].isupper() or m.group(0) in allowed:
+            continue
+        # Scan back over whitespace and the punctuation that can sit after a full stop.
+        i = m.start() - 1
+        while i >= 0 and text[i] in " \t([\"'*-":
+            i -= 1
+        if i < 0 or text[i] in ".!?:;":
+            continue
+        sys.exit("%r is capitalised mid-sentence in: %s" % (m.group(0), text))
+PY
+ok "and no notification names a person, a place or a business — the rule that catches a leak written as prose"
+
+# The refusal itself, on the path that would actually be taken. Render is the only writer of a
+# notification's text, so copy that breaks the rules produces no row rather than a scrubbed one, and
+# the sentinel is distinguishable — which is what lets a consumer log it as a defect rather than as
+# a transient failure. Run the way 40-identity.sh runs its password tests, for the same reason: the
+# claim is about a branch nothing in this harness can reach without writing bad copy into the build.
+pushd "$ROOT/services/core" >/dev/null
+go test ./internal/notifications -count=1 \
+  -run 'TestRenderRefusesCopyThatWouldReachAHandset|TestNoRuleCanRenderCopyThatBreaksTheRedactionRules' \
+  >"$WORKDIR/notif-redaction.log" 2>&1 \
+  || { cat "$WORKDIR/notif-redaction.log"; fail "the redaction guard does not hold"; }
+popd >/dev/null
+ok "and a headline carrying an address, a name, a postcode or a link renders nothing at all"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-142  a user can mute non-essential categories; essential events cannot be muted"
+
+prefs_request() {
+  curl -s -X "$1" -o "$3" -w '%{http_code}' \
+    -H "$auth_header: Bearer $notif_token" \
+    -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' \
+    ${4:+-d "$4"} "http://localhost:$VERIFY_PORT/v1/notifications/preferences"
+}
+
+# --- the screen ---------------------------------------------------------------------------------
+
+status="$(prefs_request GET "verify-prefs-get-$$" "$WORKDIR/prefs.json")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/prefs.json"; fail "reading preferences returned $status, want 200"; }
+
+# Every category rather than only the muted ones, and `essential` served rather than assumed. The
+# client holds no category list: Docs/06 §5.3 keeps anything that changes under operational pressure
+# on the platform, and Flutter has no over-the-air path for Dart code.
+prefs_shape="$(python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))["categories"]
+mutable = [r["category"] for r in rows if not r["essential"]]
+muted = [r["category"] for r in rows if r["muted"]]
+print("%d %s %s" % (len(rows), ",".join(sorted(mutable)) or "-", ",".join(sorted(muted)) or "-"))
+' "$WORKDIR/prefs.json")"
+[[ "$prefs_shape" == "4 job_expiry -" ]] \
+  || { cat "$WORKDIR/prefs.json"; fail "the preference screen is [$prefs_shape], want '4 job_expiry -'"; }
+ok "the screen serves all four categories, marks exactly job_expiry mutable, and starts with nothing muted"
+
+# --- an essential category is refused -------------------------------------------------------------
+
+status="$(prefs_request PUT "verify-prefs-essential-$$" "$WORKDIR/prefs-essential.json" \
+  '{"muted": ["job_expiry", "award"]}')"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/prefs-essential.json"; fail "muting an essential category returned $status, want 422"; }
+grep -q 'notifications_category_essential' "$WORKDIR/prefs-essential.json" \
+  || { cat "$WORKDIR/prefs-essential.json"; fail "the refusal does not carry notifications_category_essential, so a client cannot branch on it"; }
+grep -q '"field":"muted.1"' "$WORKDIR/prefs-essential.json" \
+  || { cat "$WORKDIR/prefs-essential.json"; fail "the refusal does not name which element was refused"; }
+ok "muting an essential category is refused with a code and the index of the value that caused it"
+
+# And it wrote nothing at all — including the mutable category that shared the request. A handler
+# validating as it inserts would have left `job_expiry` behind.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from notification_preferences where user_id = '$notif_customer_id';")" == "0" ]] \
+  || fail "a refused preference request wrote a row for the half of it that was valid"
+ok "and a refused request writes nothing, not even the part of it that was allowed"
+
+# The control, rather than the courtesy. The handler's refusal is what gives the client a field
+# error; ck_notification_preferences_category is what makes the row impossible however it is
+# written, and only a statement that bypasses the service can show that.
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into notification_preferences (user_id, category, muted_at)
+   values ('$notif_customer_id', 'award', now());" >/dev/null 2>&1; then
+  "$PSQL" "$DATABASE_URL" -q -c \
+    "delete from notification_preferences where user_id = '$notif_customer_id' and category = 'award';" >/dev/null
+  fail "psql muted an essential category, so the guarantee is a handler branch rather than a constraint"
+fi
+ok "and an INSERT that never touches the service is refused too — the constraint is the control"
+
+# --- muting the one mutable category ----------------------------------------------------------------
+
+status="$(prefs_request PUT "verify-prefs-mute-$$" "$WORKDIR/prefs-muted.json" \
+  '{"muted": ["job_expiry"]}')"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/prefs-muted.json"; fail "muting job_expiry returned $status, want 200"; }
+grep -q '"category":"job_expiry","essential":false,"muted":true' "$WORKDIR/prefs-muted.json" \
+  || { cat "$WORKDIR/prefs-muted.json"; fail "the response does not show job_expiry muted"; }
+ok "muting job_expiry succeeds and the whole screen comes back with it switched off"
+
+# --- what a mute is for ------------------------------------------------------------------------------
+#
+# Two events written together, and the pairing is what makes the negative assertion sound.
+#
+#   * a **job.expiry_warned** — the mutable category, and the same event type this same customer
+#     already received a notification for earlier in this section, before the mute existed. So "no
+#     row" cannot be a routing gap: the identical event wrote one twenty checks ago;
+#   * a **job.status_changed to Cancelled** — CategoryAward, which Docs/01 §4.5 lists as essential.
+#     It is the marker the consumer is waited on, and it is also the second clause of the *Done
+#     when*: this account has a mute in the table and is told anyway.
+#
+# Waiting on the essential event rather than on a timeout is the difference between a check and a
+# sleep. When its notification is sent the consumer has certainly read the expiry warning too: both
+# carry the same aggregate id, the publisher orders by (occurred_at, id) and the producer keys on
+# the aggregate, so the two land on one partition in the order they were written.
+# **Its own job, and this is a trap rather than tidiness.**
+#
+# `$notif_job` is not this customer's any more. The SHIP-139 section above reassigns it —
+# `UPDATE jobs SET customer_id = '$push_customer_id'` — so that a push rule resolves to the handset
+# it registered, and the variable keeps its name afterwards. Every rule here resolves its recipient
+# through the Parties port, which reads `jobs.customer_id`, so a mute set on `$notif_customer_id`
+# would be checked against an account that no longer owns the job and the muted event would be sent.
+# That is exactly how this section failed the first time it ran.
+prefs_status="$(curl -s -X POST -o "$WORKDIR/prefs-job.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $notif_token" -H "Idempotency-Key: verify-prefs-job-$$" \
+  -H 'Content-Type: application/json' \
+  -d '{"goods_description": "A crate of laboratory glassware"}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs")"
+[[ "$prefs_status" == "201" ]] \
+  || { cat "$WORKDIR/prefs-job.json"; fail "could not create the job the mute is demonstrated on: $prefs_status"; }
+prefs_job="$(json "$WORKDIR/prefs-job.json" '["id"]')"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select customer_id from jobs where id = '$prefs_job';")" == "$notif_customer_id" ]] \
+  || fail "the job this section mutes against does not belong to the account holding the mute"
+
+prefs_muted_event="$("$PSQL" "$DATABASE_URL" -tAqc "
+INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
+VALUES (gen_random_uuid(), 'job', '$prefs_job', 'job.expiry_warned',
+        jsonb_build_object(
+            'schema_version', 1,
+            'job_id', '$prefs_job',
+            'customer_id', '$notif_customer_id',
+            'expires_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ'),
+            'warned_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ')),
+        now())
+RETURNING id;" | tr -d ' ' | head -1)"
+
+prefs_essential_event="$("$PSQL" "$DATABASE_URL" -tAqc "
+INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, occurred_at)
+VALUES (gen_random_uuid(), 'job', '$prefs_job', 'job.status_changed',
+        jsonb_build_object(
+            'schema_version', 1,
+            'job_id', '$prefs_job',
+            'from', 'Open',
+            'to', 'Cancelled',
+            'actor_type', 'system',
+            'reason', 'Demonstrating that an essential category is sent to a muted account.',
+            'actor_recorded_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ'),
+            'server_recorded_at', to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SSZ')),
+        now() + interval '1 second')
+RETURNING id;" | tr -d ' ' | head -1)"
+
+[[ -n "$prefs_muted_event" && -n "$prefs_essential_event" ]] \
+  || fail "could not write the two events the mute is demonstrated with"
+
+publish_outbox "$WORKDIR/prefs-publish.log" "$prefs_essential_event"
+run_notifier "$WORKDIR/prefs-notifier.log" \
+  "select count(*) >= 1 from notifications where event_id = '$prefs_essential_event';"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from notifications where event_id = '$prefs_essential_event';")" != "0" ]] \
+  || { cat "$WORKDIR/prefs-notifier.log"; fail "the essential event told nobody, so nothing below proves anything about the mute"; }
+ok "an essential event still reaches an account that has a mute in the table — it cannot be switched off"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from notifications where event_id = '$prefs_muted_event';")" == "0" ]] \
+  || { cat "$WORKDIR/prefs-notifier.log"; fail "the muted category wrote a notification anyway"; }
+ok "and the muted category writes no notification at all, on any channel — the identical event wrote one before the mute"
+
+# --- unmuting ------------------------------------------------------------------------------------------
+#
+# `[]` is "send me everything" and has to be accepted. An implementation reading an empty list as
+# "change nothing" fails silently, because the screen it answers with is the one the client sent.
+status="$(prefs_request PUT "verify-prefs-unmute-$$" "$WORKDIR/prefs-unmuted.json" '{"muted": []}')"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/prefs-unmuted.json"; fail "unmuting everything returned $status, want 200"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from notification_preferences where user_id = '$notif_customer_id';")" == "0" ]] \
+  || fail "an empty muted list left a preference row behind, so it was read as 'change nothing'"
+ok "an empty list unmutes everything rather than changing nothing, which is the silent failure it would otherwise be"
+
+unset prefs_shape prefs_muted_event prefs_essential_event notif_leaks notif_streets
+unset prefs_status prefs_job
+unset -f prefs_request
 
 unset push_email push_password push_customer_id push_access push_refresh push_token_value
 unset push_token_second push_event_id push_after_event push_body push_rows_before push_rows_after

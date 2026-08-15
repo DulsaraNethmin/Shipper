@@ -35,6 +35,23 @@ var (
 	// row is written, and what reaches a consumer is only the transient class.
 	ErrNoRule = errors.New("notifications: no routing rule for this event type")
 
+	// ErrRedacted is returned when rendered copy breaks SHIP-141's rules.
+	//
+	// Docs/01 §4.4: no address, no goods description and no full customer name in a
+	// notification. redaction.go carries the four rules and what each is for.
+	//
+	// It stops the message rather than scrubbing it, and the two are not close. A scrub would
+	// send something — a sentence with a hole in it, to somebody who cannot tell what was
+	// removed — and would leave the copy that produced it in rules.go for the next event to
+	// use. Refusing makes the defect visible in one place and sends nothing meanwhile.
+	//
+	// Reaching this at runtime should be impossible: every input to [Render] is a compile-time
+	// literal, and TestNoRuleCanRenderCopyThatBreaksTheRedactionRules holds the whole routing
+	// table on every channel. It is an error rather than a panic because [Consume] runs inside
+	// a transaction holding a Kafka partition's progress — a panic there stops a consumer where
+	// an error stops one message.
+	ErrRedacted = errors.New("notifications: this copy cannot be sent to a handset")
+
 	// ErrNoSender is returned when a row names a channel this process cannot send on.
 	//
 	// The row stays claimable rather than being marked failed, because the fault is in the
@@ -56,6 +73,22 @@ var (
 	// and a constraint violation arriving at the handler is a 500 with a constraint name in it.
 	ErrUnknownPlatform = errors.New("notifications: that is not a platform this app runs on")
 
+	// ErrUnknownCategory is returned for a category ck_notifications_category does not know.
+	//
+	// Checked in Go as well as in the database for the reason [ErrUnknownPlatform] is: the
+	// client is told which field was wrong, and a constraint violation arriving at the handler
+	// is a 500 with a constraint name in it.
+	ErrUnknownCategory = errors.New("notifications: that is not a notification category")
+
+	// ErrEssentialCategory is returned when somebody tries to mute a category Docs/01 §4.5
+	// calls essential (SHIP-142).
+	//
+	// **This is the courtesy and not the control.** ck_notification_preferences_category admits
+	// only the mutable categories, so the row cannot exist however it is written; this exists so
+	// that a client gets a field error naming `muted` rather than a 500 carrying a constraint
+	// name. 000704 carries the argument for having both.
+	ErrEssentialCategory = errors.New("notifications: this category cannot be muted")
+
 	// ErrNoDeviceToken is returned when a registration names no token.
 	//
 	// Distinct from the adapter's error of the same name and deliberately not shared: this
@@ -76,3 +109,17 @@ var (
 var CodeNoDeviceSession = httpx.RegisterCode("notifications_no_device_session",
 	"That credential does not name a device session, so there is nothing to register a push "+
 		"token against. Sign in again.")
+
+// CodeCategoryEssential is the field error for muting a category Docs/01 §4.5 calls essential
+// (SHIP-142).
+//
+// A code of its own rather than the generic "not one of the available options", because the two
+// mean different things to a client and one of them is actionable. An unknown category is a bug in
+// the app; an essential one is a switch the person should not have been offered, and the client's
+// correct response is to redraw the screen from `essential` in the response it already has.
+//
+// The message says *cannot* rather than *may not*: this is not a permission somebody could be
+// granted. ck_notification_preferences_category refuses the row.
+var CodeCategoryEssential = httpx.RegisterCode("notifications_category_essential",
+	"This kind of notification cannot be switched off. Docs/01 §4.5 lists the events every "+
+		"account is told about.")

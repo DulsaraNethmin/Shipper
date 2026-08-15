@@ -420,7 +420,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **786 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **802 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -624,6 +624,12 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
+
+| **SHIP-134a** | M5 | The harness stops being the hazard it was asserting against. `80-notifications.sh` deleted `shipper.delivery` **twice** to stage a drifted topic, on a broker every worktree shares — so `cmd/topics` now reads the **replication factor** back as well as the partition count, and the refusal is demonstrated by asking for three replicas the single-broker stack cannot hold: **the request drifts, not the cluster.** The partition branch moved to a unit test that needs no broker. The *Done when*'s "run two `make verify` concurrently" **asks for exactly what wave 10's mutex exists to prevent**, so the reading taken is a concurrent **publisher** rather than a concurrent harness, and the provenance count is asserted rather than printed — *see below* |
+
+| **SHIP-141** | M5 | Push content redaction — **two guards, because wave 10 proved one of them insufficient.** The structural half was already there and covers what would have to arrive through the event; what this adds is a **word-level** guard over *rendered* copy, because `Rule.Headline` is free prose in a Go literal and wave 10 isolated a sentence carrying no field and no value that a thirteen-test suite passed with live. Four rules: **no digit** once the job identifier is removed, no capitalised word mid-sentence outside a **two-word** allowlist, no street type from a closed Australian list, no `@` or link. `Render` refuses with `ErrRedacted` and writes nothing. **What it cannot catch is named rather than glossed**: a lower-case goods description trips nothing, and that half is structural only — *see below* |
+
+| **SHIP-142** | M5 | `GET` and `PUT /v1/notifications/preferences` — and **"essential events cannot be muted" is a CHECK constraint, not a handler branch**: `ck_notification_preferences_category` (`000704`) admits only the categories `Docs/01` §4.5 leaves off its list, so the row cannot exist however it is written. **Presence is the mute** — no `muted boolean`, no backfill, and an account that existed yesterday receives exactly what it did. The consumer looks up preferences **only when the category is mutable**, so there is no branch in which a muted award could be honoured. The first `PUT` in this service, because the body is the complete set and `[]` means unmute everything — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -11929,6 +11935,293 @@ now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is
 and a database check that are believed to agree are two checks until something compares them.
 
 **Nothing was needed from `internal/config` by any of the five tickets.**
+
+### SHIP-134a — the harness stops being the hazard, and a *Done when* that asks for what the mutex forbids
+
+Three points, and most of the value is in two corrections: one to a file that was still doing the
+thing its own header said had been fixed, and one to an acceptance criterion that cannot be met as
+written.
+
+#### Wave 10 fixed the wrong half, and said so honestly
+
+`80-notifications.sh` stopped deleting `shipper.job` and moved the SHIP-134 comparison's authority
+from an empty topic to the per-worktree database. That was right and it holds. What it did not
+touch is the **SHIP-135 section at the foot of the same file**, which deleted and recreated
+`shipper.delivery` — twice — to stage a topic with one partition and watch `cmd/topics` report it
+rather than repair it.
+
+So the *Done when*'s first clause was false of the file on `605ad3a`: it still deleted a topic
+another run may be reading, and `internal/delivery` has published to that topic since SHIP-136. The
+answer at the time was section **ordering** — put the SHIP-136 section above this one so it reads
+what it needs before the deletion — and **ordering is a statement about sections, which is exactly
+the unit `CLAUDE.md` records as not surviving a second worktree.** One broker serves every tree, so
+the file was deleting other trees' messages in order to make a point about its own.
+
+#### The demonstration was kept and the deletion dropped, by drifting the request rather than the cluster
+
+`cmd/topics` read the partition count back and said nothing about the **replication factor**. That
+was a real gap independent of this ticket: `plan` puts the factor on every topic it creates, so a
+topic *this command* made is right and a topic somebody made by hand is not — and a topic created
+with one replica on a three-broker cluster survives a machine going away exactly as well as no topic
+at all. `verify` now reads both.
+
+Which makes the harness demonstration free of side effects. `-replication 3` against the local
+single-broker stack asks for a shape the topics provably do not have, so `create` is a no-op —
+they all exist — and `verify` reads them back and refuses, on the same code path a hand-made topic
+reaches. The section asserts the refusal names the reason, that it says it repaired nothing, and
+that **every topic's partition count, replication factor and end offsets are unchanged across the
+refused run**. Nothing is deleted, nothing is recreated, and no other worktree can tell the section
+ran.
+
+The partition branch it no longer reaches in anger moved down to `cmd/topics/main_test.go`, where
+the decision is now a pure function over what the cluster holds: `refuseDrift` takes a map and
+returns an error, so the missing-topic branch, the one-partition branch, the under-replicated branch
+and a refusal carrying **both** reasons are all reachable with no broker attached. That is strictly
+more coverage than the deletion bought, running on every machine rather than only where the stack is
+up.
+
+#### The *Done when*'s last clause asks for the thing the mutex exists to prevent
+
+It ends: *"the section passes while a second `make verify` publishes into the same broker —
+demonstrated by running two concurrently, not argued"*. Wave 10 serialised `make verify` behind a
+machine-wide mutex **because two harnesses running at once is deterministic corruption**, so the
+criterion as literally written can only be met by disabling the guard that makes the harness safe.
+
+**The reading taken is that the hazard is the publish, not the harness.** Failure mode 2 — the one
+no fence can fix, because fencing narrows where you start reading and says nothing about what else
+arrives — needs a second *publisher*, and a second publisher is not a second harness. So the section
+starts one: `kafka-console-producer.sh`, a process that is not this codebase, putting well-formed
+envelopes on `shipper.job` with identifiers this database has never issued. Seven messages in two
+batches — five in the background across this run's own endpoint calls, fixtures and worker run, and
+two published in the precise window wave 10 named as still open, after the worker stops and before
+the consumer reads. All seven land inside the fence, so the provenance split must classify all seven
+as foreign, and the count is now **asserted at `>= 7` rather than printed**. `>=` and never `==`,
+because a genuine third worktree publishing at the same time must widen the number and must not fail
+the run.
+
+That turns wave 10's "reported rather than asserted" into a demonstration, and it changes what a
+zero means: a zero used to be the ordinary case on an idle machine and is now the signature of a
+broken provenance split.
+
+**Where this falls short of the literal text, stated rather than glossed.** It does not demonstrate
+failure mode 1 — another tree's *delete* landing mid-run — and nothing in this repository can,
+without doing it, which is the practice the ticket removed. What is asserted instead is the
+negative: at the foot of the file, every topic this run read must end at or beyond the offset this
+run fenced it at. A delete and recreate resets a partition to zero, so a robbed run now fails **by
+name, saying the topic was recreated**, where before it failed in the comparison above reporting its
+own ids as missing and left the reader to work out why. Wave 9 lost a run to exactly that reading.
+
+#### The rule that was a comment is now a check
+
+The old header justified the deletion as *"safe today only because no other section asserts on a
+topic it did not create"* — scoped to sections, on a machine where the unit is the worktree. **A
+sentence in a header cannot fail**, and that one survived six waves being wrong.
+
+It is a check now, and the shape is an exact file list rather than a search for a safe pattern:
+`00-stack.sh` is the only section that may delete a topic, because SHIP-4's round trip creates
+`shipper.verify.$$` and removes it again — a name carrying this process's pid, which no other tree
+holds and nobody reads. A text guard cannot tell a scratch topic from a catalogue one when the name
+is in a variable, and it is in one in both cases; what it can usefully do is make any new deletion a
+decision somebody has to record here. The pattern is written `-[-]delete` so the check cannot match
+its own source.
+
+#### What was not taken
+
+**The per-tree topic prefix was not built.** Wave 10 named it as the only thing that closes failure
+mode 1, and it remains true: prefixing the topic set per worktree would make every tree's traffic
+its own, and nothing short of that removes the possibility of another tree's delete. It was not
+taken because it is a change to the topic set, because the two things it would close are now closed
+another way — this file no longer deletes, and a delete that happens anyway is reported by name —
+and because a prefix that every process must agree on is a configuration surface with a failure mode
+of its own: a producer and a consumer disagreeing about it is a topic nobody reads, silently. §9
+carries it as a decision nobody has taken rather than as work left half done.
+
+**Nothing was needed from `internal/config`.** The replication factor is already
+`KAFKA_REPLICATION_FACTOR` with a `-replication` flag over it (SHIP-15m), which is what the
+demonstration uses; adding a variable here would have been a second way to say the same thing.
+
+### SHIP-141 — two guards, because the structural one has a hole wave 10 walked through
+
+Two points, and the interesting part is why the ticket was not already finished. SHIP-138's summary
+row says "so SHIP-141 stays structural", and that was true of everything the *event* could carry and
+false of the thing a person types.
+
+#### The structural guard covers the payload and stops at the routing table
+
+`facts` — everything this domain reads out of an event — has six fields, all identifiers or routing
+values. `content`, everything a template may be handed, has two, neither from the payload. A
+renderer cannot leak what it was never given, and `text/template` makes that enforceable rather than
+aspirational: a template naming a field the struct does not have fails to execute.
+
+**`Rule.Headline` is outside all of it.** It is a Go string literal in `rules.go`, edited by whoever
+writes the next ticket's copy, and nothing checked what it said. Wave 10's lane D established what
+that costs on the neighbouring invariant: it isolated the sentence *"The customer has set a
+maximum."* — no field name, no value, prose alone — and the thirteen-test budget-privacy suite passed
+with it live. **A test that asserts on a field name does not catch a leak written as prose**, and
+the same hole is the same size here: "Collect from 12 Collins Street" needs no schema change to
+reach a lock screen.
+
+#### The word-level guard, and why each of the four rules is the shape it is
+
+It runs over **rendered** text with the job identifier removed, so it sees what a handset shows
+rather than a template source — a template assembling a forbidden phrase from permitted parts would
+pass a check on its source.
+
+1. **No digit.** A street number, a unit, a postcode, a weight, a quantity and an amount are all
+   digits. It is the most effective rule here precisely because it is not a vocabulary — it does not
+   have to know what a postcode looks like. Removing the job identifier first is what lets the rule
+   be "no digits at all" rather than "no digits except these", which is the version somebody widens.
+2. **No capitalised word mid-sentence**, outside a two-word allowlist (`Shipper`, `Job`). This is
+   the rule that catches a person, and it catches one with no field name and no digits in sight. It
+   also catches a suburb, a street name and a business, which is most of an address once the number
+   has gone.
+3. **No street type**, case-insensitively, from a closed list. Australia Post publishes the set, so
+   unlike a goods vocabulary it is genuinely closed. It is the rule that catches an address written
+   in lower case, which rules 1 and 2 both miss.
+4. **No `@` and no link.** A push carrying a link is a phishing surface as well as a disclosure.
+
+`Render` returns `ErrRedacted` and **writes nothing**. It is the only writer of a notification's
+text — `Consume` renders and inserts in the same loop — so nothing reaches the table that has not
+been through it. Both the subject and the body are checked, not only the body: on a push the subject
+is the bold line the handset shows, which is the more visible half on the surface this ticket is
+about.
+
+#### What it cannot catch, stated rather than left to be found
+
+**A goods description in lower case with no digits.** "two pallets of copper piping" trips none of
+the four rules, and no textual rule distinguishes it from ordinary prose. A goods blocklist would be
+endlessly incomplete and, worse, would invite the belief that it was not. That half of the
+*Done when* is met **structurally and only structurally**, and the same is true of a name written in
+lower case. `TestTheFactsThisDomainReadsCarryNothingToLeak` is the guard those two halves have: it
+refuses a field on `facts` whose name contains any of eighteen words, so the disclosure has to be
+argued for before it can be carried.
+
+The two guards are weak in exactly the places the other is strong, which is the reason for having
+two rather than a better one.
+
+#### False positives fail the build, and that is the direction chosen
+
+"drive", "court", "lane" and "terrace" are street types and ordinary English, so copy using one is
+refused and has to be reworded. `way`, `close`, `rise`, `view`, `grove` and `quay` were left **out**
+of the list for that reason — an address using one still carries a street number and a capitalised
+street name. The sentence-start rule likewise resolves ambiguity towards permitting: a guard that
+fires on ordinary copy gets widened until it fires on nothing, which is the failure mode of every
+heuristic left in a build.
+
+#### The mutation, and what it establishes
+
+`pushBody` was mutated from `Job {{.JobID}}` to a literal carrying `12 Collins Street`, which is the
+ticket's whole content put back. **Four tests failed and the verdict is in §7's wave notes**; the
+important part is which ones and why, because the shape wave 10 warned about did occur: the tests
+that failed are the ones that read *rendered output*, and every test that asserts on a field name or
+a struct shape passed with the address live. `TestTheClosedInputIsStillClosed` passed. So did
+`TestNoNotificationFieldCanCarryABudget`. The structural suite is untouched by a leak of this shape,
+which is the whole argument for the second guard, demonstrated rather than asserted.
+
+#### What was declined
+
+**A re-check at dispatch time.** `Dispatch` reads subject and body from the table rather than from
+`Render`, so a row written by an older build could in principle carry copy this guard would refuse.
+It was not added: `Render` is the only writer, and a redaction failure at dispatch would need either
+a fifth `last_error` shape on the terminal `undeliverable` status — which SHIP-176's alerting would
+have to learn to distinguish from a dead device token — or a `failed` row retried forever. Neither is
+worth it for a case that cannot arise while `Consume` is the only path into the table. If a second
+writer ever appears, this is the paragraph to revisit.
+
+**Nothing was needed from `internal/config`.** A redaction rule with a switch is not a rule.
+
+### SHIP-142 — a mute is a row, and the thing that cannot be muted is a constraint
+
+Three points and two endpoints, and the design decisions are all about where the second clause of the
+*Done when* lives.
+
+#### The invariant is in the schema, and the handler is the courtesy
+
+"Essential events cannot be muted" is a guarantee, and a guarantee held only in Go is one an
+`INSERT` from psql walks past. `ck_notification_preferences_category` admits **only** the categories
+`Docs/01` §4.5 leaves off its list of essential events — today `job_expiry` alone — so the row cannot
+exist however it is written.
+
+The service refuses one too, and the handler refuses it with the **index** of the offending element,
+because a client is owed a field error naming `muted.1` rather than a 500 carrying a constraint
+name. That is the same division `000701` draws for a device token: the handler is the courtesy and
+the constraint is the control. `make verify` demonstrates both — the endpoint's 422 with
+`notifications_category_essential`, and then an `INSERT` from psql that never touches the service and
+is refused anyway.
+
+It also means **making a second category mutable is a migration**, deliberately. §4.5's list is a
+product decision, and the shape that lets somebody widen it by editing a Go constant is the shape
+where it gets widened without anybody noticing. `migrations/notifications_test.go` pairs the CHECK
+against `Category.Essential()` in both directions, per `Docs/10` §3.4.
+
+#### Presence is the mute, and that is what makes the migration free
+
+There is no `muted boolean`. A row means "switched off", and absence means the default — because
+there is no third state: "explicitly on" and "never touched" are the same fact about what the
+platform should send.
+
+So there is **no backfill**. Every account that existed before `000704` has no rows and receives
+exactly what it received yesterday. The alternative — one row per account per category with
+`DEFAULT false` — needs four rows written for every user in the database and then a second mechanism
+to keep new accounts in step, whose only job is to reproduce a default.
+
+`muted_at` is kept because support is asked when somebody turned this off, and the write is
+`ON CONFLICT … DO UPDATE` rather than delete-and-reinsert so that saving an unchanged screen — which
+a client does on every visit — does not reset that date to "when they last opened settings".
+
+#### The consumer only looks when the category is mutable, and that is the guarantee from the other end
+
+`Consume` calls the filter when `rule.Category.Essential()` is false and **not otherwise**. Twelve of
+the thirteen events in the catalogue never reach it, which means there is no branch in which a muted
+row for an award could be read and honoured — whatever is in the table, and whoever put it there.
+`TestAMuteDoesNotSilenceAnEssentialEvent` is that stated as a test: it mutes what can be muted, then
+consumes an award, and requires the customer to be told.
+
+A muted recipient is dropped on **every** channel rather than only on push. The unit of the
+preference is the notification: somebody who switched off expiry reminders has not asked to receive
+them by email instead, and a mute that silenced the push and sent the email would read as the
+platform ignoring them.
+
+#### `PUT` is the first in this service, and `[]` had to mean something
+
+The body is the complete muted set rather than a change to it, so the client is placing a resource at
+a location it already knows — which is what `PUT` is for, and which makes the request idempotent by
+construction rather than only by its key. Two switches flipped in one session then have no ordering
+between them.
+
+That makes `[]` meaningful: it is "unmute everything", and it has to be accepted. An implementation
+reading an empty list as "change nothing" fails **silently**, because the screen it answers with is
+the one the client just sent. It falls out of the general statement rather than being a branch —
+`DELETE … WHERE category <> ALL('{}')` removes every row — and both `make verify` and
+`TestAMutableCategoryCanBeMutedAndUnmuted` assert it.
+
+#### `essential` is served, not assumed
+
+The response carries all four categories with `essential` on each, and the client holds no category
+list. `Docs/06` §5.3 keeps anything that changes under operational pressure on the platform, and
+Flutter has no over-the-air path for Dart code — so a build with today's answer compiled into it
+would be wrong the day a second category became mutable and could not be corrected. The app disables
+the switch; the platform refuses the request (`Docs/07` §3).
+
+#### The honest size of it
+
+**This ticket buys exactly one switch.** `Category.Essential()` has said since SHIP-137 that
+`job_expiry` is the only mutable category, and `Docs/01` §4.5's essential list covers everything
+else. That is the right size rather than a shortfall: the alternative reading — that a preference
+screen should be able to switch off the message telling somebody their job has been awarded — is one
+§4.5 forecloses. What this ticket buys beyond the switch is the **mechanism**, which is where the
+work was: a table whose constraint cannot be argued with, a consumer that cannot look at it for an
+essential event, and an endpoint that tells the client which categories exist.
+
+#### What Lane D is owed and did not get
+
+**There is no client for this.** `apps/mobile/lib/features/notifications/**` belongs to another lane
+this wave and was not touched. The two endpoints, their contract fragment and their error code are
+everything a preference screen needs; the screen itself is unbuilt and has no ticket in `Docs/09`
+that names it. §9 should carry it.
+
+**Nothing was needed from `internal/config`.** The category list is derived from the Go enumeration
+and served over HTTP, which is what "server-side" means here.
 
 
 ## 4. Partly done — do not treat these as finished

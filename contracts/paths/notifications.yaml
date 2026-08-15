@@ -157,7 +157,190 @@ CurrentDeviceToken:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+Preferences:
+  get:
+    operationId: getNotificationPreferences
+    summary: Which kinds of notification this account receives
+    tags: [Notifications]
+    description: |
+      Every category, with whether this account has muted it and whether it may be muted at all
+      (SHIP-142).
+
+      **The complete list, not only the muted ones.** The client renders a switch per row and does
+      not hold the category list: `Docs/06` §5.3 keeps anything that changes under operational
+      pressure on the platform, and the mobile client has no over-the-air path for Dart code, so a
+      build with the list compiled into it would be wrong the day it changed and could not be
+      corrected.
+
+      `essential` is the same argument applied to the rule rather than to the list. A category on
+      `Docs/01` §4.5's list of essential events cannot be switched off by anybody. The app disables
+      the switch and the platform refuses the request; the disabled switch is a courtesy, not the
+      control (`Docs/07` §3).
+    responses:
+      '200':
+        description: The preference screen, in a stable order.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/NotificationPreferences'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '405':
+        $ref: '../openapi.yaml#/components/responses/MethodNotAllowed'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The platform cannot complete this right now. Retry shortly.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+  put:
+    operationId: setNotificationPreferences
+    summary: Choose which kinds of notification to switch off
+    tags: [Notifications]
+    description: |
+      Replaces the muted set with exactly the categories sent (SHIP-142).
+
+      **`PUT` and not `PATCH`, because the body is the whole state.** A preference screen sends what
+      it is showing, so the same request twice leaves the same rows, two switches flipped in one
+      session have no ordering between them, and a retry after a dropped connection changes nothing.
+      An empty `muted` array is meaningful and accepted: it unmutes everything.
+
+      ## Essential categories are refused
+
+      `Docs/01` §4.5 lists the events every account is told about — a new offer, a counter-offer, an
+      award, a cancellation, a delivery milestone, proof of delivery. Muting one of those is a `422`
+      whose field error names the index that carried it, and **no row is written for any element of
+      the request**.
+
+      Today exactly one category is mutable: `job_expiry`, the reminder that a job is about to stop
+      taking offers and the notice that its deadline moved. Both are about a decision the customer
+      can already see in the app. **Read `essential` from the response rather than assuming that
+      set** — which is the reason it is served.
+
+      It answers with the whole screen rather than `204`, so the client renders what the platform now
+      holds instead of what it just sent.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/UpdateNotificationPreferences'
+    responses:
+      '200':
+        description: The preference screen as it now stands.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/NotificationPreferences'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '405':
+        $ref: '../openapi.yaml#/components/responses/MethodNotAllowed'
+      '422':
+        description: |
+          A category that does not exist, or one that cannot be muted. Field errors name
+          `muted.<index>`, so a client can mark the switch that was refused rather than the whole
+          screen.
+
+          **Branch on `error.details[].code`.** `notifications_category_essential` means the switch
+          should not have been offered, and the correct response is to redraw the screen from
+          `essential` in the `GET`; anything else is a client bug.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The platform cannot complete this right now. Retry shortly.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # --- schemas ---------------------------------------------------------------------------------
+
+NotificationPreferences:
+  type: object
+  additionalProperties: false
+  required: [categories]
+  properties:
+    categories:
+      type: array
+      items:
+        $ref: '#/NotificationPreference'
+      description: |
+        Every category the platform has, in a stable order — not only the muted ones.
+  description: |
+    The preference screen.
+
+    An object rather than a bare array, because a bare array at the top level of a response has
+    nowhere to grow. It will: the first preference that is per channel rather than per category
+    needs a second key here.
+
+NotificationPreference:
+  type: object
+  additionalProperties: false
+  required: [category, essential, muted]
+  properties:
+    category:
+      type: string
+      enum: [bidding, award, delivery, job_expiry]
+      description: |
+        What kind of notification this row is about, from `Docs/01` §4.5's grouping.
+
+        Four rather than one per event type: a screen with thirteen switches on it is a screen
+        where the one switch that mattered is never found.
+    essential:
+      type: boolean
+      description: |
+        `false` when this category may be muted.
+
+        Read it rather than assuming which categories are mutable. It is served precisely so that
+        the set can change without a client release, and a build that hard-coded today's answer
+        could not be corrected over the air.
+    muted:
+      type: boolean
+      description: Whether this account has switched this category off.
+
+UpdateNotificationPreferences:
+  type: object
+  additionalProperties: false
+  required: [muted]
+  properties:
+    muted:
+      type: array
+      items:
+        type: string
+        enum: [bidding, award, delivery, job_expiry]
+      description: |
+        The complete set of categories to switch off — not a change to it.
+
+        Send what the screen is showing. `[]` is valid and means "send me everything". A category
+        whose `essential` is `true` is refused with a `422` naming its index.
+      example: [job_expiry]
 
 RegisterDeviceToken:
   type: object

@@ -60,4 +60,6 @@ POST   /v1/jobs/{id}/milestones                 user         v1
 POST   /v1/jobs/{id}/proof-uploads              user         v1
 POST   /v1/notifications/device-tokens          user         v1
 DELETE /v1/notifications/device-tokens/current  user         v1
+GET    /v1/notifications/preferences            user         v1
+PUT    /v1/notifications/preferences            user         v1
 GET    /v1/{$}                                  public       v1

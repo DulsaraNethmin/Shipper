@@ -286,6 +286,8 @@ paths:
     $ref: './paths/notifications.yaml#/DeviceTokens'
   /v1/notifications/device-tokens/current:
     $ref: './paths/notifications.yaml#/CurrentDeviceToken'
+  /v1/notifications/preferences:
+    $ref: './paths/notifications.yaml#/Preferences'
 
 components:
   schemas:

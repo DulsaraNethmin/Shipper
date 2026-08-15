@@ -37,6 +37,7 @@ package notifications
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -198,6 +199,159 @@ func (h *Handler) Deregister() http.Handler {
 	})
 }
 
+// --- notification preferences (SHIP-142) ------------------------------------------------------
+
+// preferenceView is one category as the preference screen shows it.
+//
+// `essential` is served rather than left for the client to know. CLAUDE.md puts anything that
+// changes under operational pressure server-side, and Flutter has no over-the-air path for Dart
+// code — so a build that hard-coded which categories may be muted would be wrong the day a second
+// one became mutable and could not be corrected. The app renders a switch per row and disables the
+// ones marked essential; the platform is what refuses a muted essential, not the disabled switch.
+type preferenceView struct {
+	Category  string `json:"category"`
+	Essential bool   `json:"essential"`
+	Muted     bool   `json:"muted"`
+}
+
+// preferencesResponse is the whole screen: every category, in a stable order.
+//
+// An object rather than a bare array, because a bare array at the top level of a response has
+// nowhere to grow — and this one will, the first time a preference is per channel rather than per
+// category.
+type preferencesResponse struct {
+	Categories []preferenceView `json:"categories"`
+}
+
+// updatePreferencesRequest is the body of PUT /v1/notifications/preferences.
+//
+// One field, and it is the **whole** muted set rather than a change to it. A preference screen sends
+// the state it is in, so the same request twice leaves the same rows and a retry after a dropped
+// connection is free. `[]` is meaningful and accepted: it is "unmute everything".
+//
+// There is no user id. The account is the caller's, from the credential.
+type updatePreferencesRequest struct {
+	Muted []string `json:"muted"`
+}
+
+// Preferences serves which categories this account has switched off.
+//
+// Every category, not only the muted ones. The client is rendering a screen and the list of
+// categories is the platform's to hold — see [preferenceView].
+func (h *Handler) Preferences() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		userID, _, err := caller(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		// A read, so it runs on the pool rather than in a transaction: there is no invariant
+		// spanning two statements here, and Docs/10 §3.2 puts the transaction boundary with
+		// whoever owns one.
+		preferences, err := h.svc.Preferences(r.Context(), pool, userID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, preferencesView(preferences))
+		return nil
+	})
+}
+
+// UpdatePreferences replaces this account's muted set.
+//
+// PUT rather than PATCH because the body is the complete state: the client is placing the resource
+// at a location it already knows, which is what PUT is for, and it makes the request idempotent by
+// construction rather than by the key alone.
+//
+// It answers with the full screen rather than 204, so the client renders what the platform now holds
+// instead of what it just sent — which are the same thing today and would not be if a category
+// stopped being mutable between the app being built and the request being made.
+func (h *Handler) UpdatePreferences() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		userID, _, err := caller(r)
+		if err != nil {
+			return err
+		}
+
+		var req updatePreferencesRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		// Checked here as well as in the service, because the client is owed the *index* of
+		// the value that was wrong. The service refuses the same things and the database
+		// refuses them again; this is the only layer that can say which element it was.
+		var problems validate.Errors
+		for i, name := range req.Muted {
+			category := Category(name)
+			switch {
+			case !category.Valid():
+				problems.OneOf(fmt.Sprintf("muted.%d", i), name, categoryNames())
+			case category.Essential():
+				problems.Add(fmt.Sprintf("muted.%d", i), CodeCategoryEssential,
+					"This kind of notification cannot be switched off.")
+			}
+		}
+		if err := problems.Err(); err != nil {
+			return err
+		}
+
+		muted := make([]Category, 0, len(req.Muted))
+		for _, name := range req.Muted {
+			muted = append(muted, Category(name))
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var preferences []Preference
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, tx db.Runner) error {
+			var txErr error
+			preferences, txErr = h.svc.SetMuted(ctx, tx, userID, muted)
+			return txErr
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, preferencesView(preferences))
+		return nil
+	})
+}
+
+// preferencesView is the domain's answer as the contract's shape.
+func preferencesView(preferences []Preference) preferencesResponse {
+	out := preferencesResponse{Categories: make([]preferenceView, 0, len(preferences))}
+	for _, preference := range preferences {
+		out.Categories = append(out.Categories, preferenceView{
+			Category:  preference.Category.String(),
+			Essential: preference.Essential,
+			Muted:     preference.Muted,
+		})
+	}
+	return out
+}
+
+// categoryNames is [Categories] as the validator wants it.
+//
+// Derived rather than typed out, so the list a client is validated against and the list
+// ck_notifications_category enforces cannot come apart.
+func categoryNames() []string {
+	names := make([]string, 0, len(Categories))
+	for _, c := range Categories {
+		names = append(names, c.String())
+	}
+	return names
+}
+
 // maxDeviceTokenLength matches ck_device_tokens_token. FCM's tokens are around 160 characters
 // today and the format has changed twice, so this is a sanity limit rather than a specification.
 const maxDeviceTokenLength = 4096
@@ -254,6 +408,18 @@ func apiError(err error) error {
 
 	case errors.Is(err, ErrNoDeviceToken):
 		problems.Required("token", "")
+		return problems.Err()
+
+	// The two the service refuses on the preference path. Both are caught in the handler above,
+	// where the *index* of the offending element is still known; these are here because a
+	// service called from anywhere else must not answer a 500 for a value a client got wrong.
+	case errors.Is(err, ErrUnknownCategory):
+		problems.OneOf("muted", "", categoryNames())
+		return problems.Err()
+
+	case errors.Is(err, ErrEssentialCategory):
+		problems.Add("muted", CodeCategoryEssential,
+			"This kind of notification cannot be switched off.")
 		return problems.Err()
 
 	default:
