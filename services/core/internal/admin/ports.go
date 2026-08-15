@@ -189,15 +189,37 @@ type Jobs interface {
 	Unpublish(ctx context.Context, r db.Runner, jobID, actorID uuid.UUID, reason string) (JobMove, error)
 }
 
-// --- SHIP-117: the delivery-exception moderation queue -------------------------------------------
+// --- SHIP-117, SHIP-157: the delivery-exception moderation queue ---------------------------------
 
-// ExceptionQueue is the jobs whose delivery evidence is a recorded reason rather than a photograph.
+// ExceptionQueue is Docs/04 §5's fourth queue: every job whose delivery is going wrong.
+//
+// # One queue on four grounds, and why it is one endpoint rather than four
+//
+// Docs/04 §5 numbers seven queues and this is the fourth of them — "delivery exceptions: overdue
+// pickup, delayed delivery, failed proof of delivery" — to which SHIP-157's *Done when* adds
+// unsynced milestones. **They are one screen because the document made them one item.** SHIP-117
+// built the failed-proof ground alone and said so at the time: moderation.go's header records that
+// "the other two are SHIP-157's, which is where the queue becomes one screen rather than one
+// endpoint".
+//
+// A second endpoint per ground would have been four cursors, four pages and four things a moderator
+// has to check in the morning — and it would have made "what is going wrong with deliveries right
+// now, oldest first" a question the console has to assemble by merging four sorted streams. Merging
+// them is what a `UNION ALL` and one ordering do for free.
+//
+// **The widening is additive at the endpoint and not at the shape.** `GET /v1/admin/moderation/
+// exceptions` keeps its path, its permission, its ordering and its paging; an entry gains a
+// [ExceptionEntry.Ground] saying why it is here and [ExceptionEntry.EntryID] replaces the
+// proof-shaped `proof_id`, because three of the four grounds are not evidenced by a proof row at
+// all. No console consumed the old shape — `apps/admin` is still a shell — so the rename is a
+// contract change and nothing more.
 //
 // # Why this is a port at all
 //
-// The rows live in `proofs`, which is `internal/delivery`'s table, and this domain may not import
-// that package — the boundary lint refuses it in both directions. cmd/api holds the implementation
-// and is the only place the two meet, exactly as [JobParties] spans `jobs` and `bidding`.
+// The rows live in `proofs` and `milestones`, which are `internal/delivery`'s tables, and in `jobs`,
+// which is `internal/jobs`'; this domain may not import either — the boundary lint refuses it in
+// both directions. cmd/api holds the implementation and is the only place the three meet, exactly as
+// [JobParties] spans `jobs` and `bidding`.
 //
 // **The vocabulary stays on the other side of the port.** [ExceptionEntry.Reason],
 // [ExceptionEntry.Milestone] and [ExceptionEntry.JobStatus] are plain strings here, and that is not
@@ -225,12 +247,71 @@ type Jobs interface {
 // reports what was recorded, and nothing about the entry changes if operations answers X-6 either
 // way. [ExceptionEntry.JobStatus] is carried for triage and means only what it says.
 type ExceptionQueue interface {
-	// ExceptionsAwaitingReview returns one page of entries, oldest first.
+	// ExceptionsAwaitingReview returns one page of entries, oldest first, across every ground.
 	//
 	// Oldest first because Docs/04 §8 sets acknowledgement targets and the oldest entry is the
 	// one closest to breaching one — the same ordering `idx_disputes_open` exists for.
-	ExceptionsAwaitingReview(ctx context.Context, r db.Runner, q QueueQuery) ([]ExceptionEntry, error)
+	//
+	// `unsyncedThreshold` is Docs/02 §3.1's twenty-four hours, passed rather than known. This
+	// domain must not hold a second copy of it: `delivery.UnsyncedAlertThreshold` is the one
+	// authority and cmd/api hands it in, which is the same arrangement [JobConsole.Statuses]
+	// uses for the status vocabulary. A constant here would agree with that one by comment.
+	ExceptionsAwaitingReview(
+		ctx context.Context,
+		r db.Runner,
+		q QueueQuery,
+		unsyncedThreshold time.Duration,
+	) ([]ExceptionEntry, error)
 }
+
+// ExceptionGround is why an entry is in the delivery-exception queue (SHIP-157).
+//
+// **This vocabulary is this domain's own**, which is the difference between it and every other
+// string on [ExceptionEntry]. `Reason`, `Milestone` and `JobStatus` are other domains' closed lists
+// and are carried through untranslated; a ground is a *moderation* concept — it names which of
+// Docs/04 §5's four situations a row is evidence of — and no other package has an opinion about it.
+type ExceptionGround string
+
+// The four grounds, in Docs/04 §5's own order with SHIP-157's addition last.
+const (
+	// GroundOverduePickup is a job past the end of its pickup window that has not been picked
+	// up. Docs/04 §5's first named ground.
+	GroundOverduePickup ExceptionGround = "overdue_pickup"
+
+	// GroundDelayedDelivery is a job past the end of its drop-off window that has not been
+	// delivered. Docs/04 §5's second.
+	GroundDelayedDelivery ExceptionGround = "delayed_delivery"
+
+	// GroundFailedProof is a delivery evidenced by a recorded reason rather than a photograph
+	// (Docs/01 §4.4). Docs/04 §5's third, and the one SHIP-117 built.
+	GroundFailedProof ExceptionGround = "failed_proof"
+
+	// GroundUnsyncedMilestone is an update that reached the platform more than
+	// `delivery.UnsyncedAlertThreshold` after the driver recorded it — Docs/02 §3.1's
+	// twenty-four-hour rung, which SHIP-128 made measurable and SHIP-157's *Done when* adds to
+	// this queue.
+	GroundUnsyncedMilestone ExceptionGround = "unsynced_milestone"
+)
+
+// ExceptionGrounds is the closed set, for validation and for a message that names the choices.
+var ExceptionGrounds = []ExceptionGround{
+	GroundOverduePickup,
+	GroundDelayedDelivery,
+	GroundFailedProof,
+	GroundUnsyncedMilestone,
+}
+
+// Valid reports whether g is one of the four.
+func (g ExceptionGround) Valid() bool {
+	for _, known := range ExceptionGrounds {
+		if g == known {
+			return true
+		}
+	}
+	return false
+}
+
+func (g ExceptionGround) String() string { return string(g) }
 
 // QueueQuery is one page of a moderation queue.
 //
@@ -242,20 +323,35 @@ type QueueQuery struct {
 
 	// After is where the previous page stopped. The zero value is the first page.
 	After QueueCursor
+
+	// Ground narrows to one of [ExceptionGrounds] (SHIP-157). Empty is every ground.
+	//
+	// **A filter rather than four endpoints.** Docs/04 §5 makes these one queue, and a moderator
+	// working through overdue pickups is narrowing a screen rather than opening a different one —
+	// so the cursor, the ordering and the shape stay the same and only the predicate changes. An
+	// unrecognised value is refused rather than ignored: an ignored filter answers with every
+	// entry, which reads exactly like "everything is on this ground" to somebody who mistyped.
+	Ground ExceptionGround
 }
 
 // QueueCursor is the position of the last entry a caller saw.
 //
-// Two fields, because `recorded_at` is not unique: two deliveries recorded in the same millisecond
-// would make a single-column cursor either skip one or repeat it. The identifier breaks the tie and
-// is what makes the ordering total.
+// **Three fields, and the third is SHIP-157's.** `recorded_at` is not unique — two deliveries
+// recorded in the same millisecond would make a single-column cursor either skip one or repeat it —
+// and once the queue unions four grounds the identifier is not enough either: `overdue_pickup` and
+// `delayed_delivery` are both keyed by the **job**, so one job whose pickup and drop-off windows end
+// at the same instant produces two entries agreeing on both other columns. The ground breaks that
+// tie and is what makes the ordering total again.
 type QueueCursor struct {
 	RecordedAt time.Time
-	ProofID    uuid.UUID
+	Ground     ExceptionGround
+	EntryID    uuid.UUID
 }
 
 // Zero reports whether this is the first page.
-func (c QueueCursor) Zero() bool { return c.ProofID == uuid.Nil && c.RecordedAt.IsZero() }
+func (c QueueCursor) Zero() bool {
+	return c.EntryID == uuid.Nil && c.Ground == "" && c.RecordedAt.IsZero()
+}
 
 // ExceptionEntry is one delivery that was evidenced by a reason rather than a photograph.
 //
@@ -268,27 +364,49 @@ func (c QueueCursor) Zero() bool { return c.ProofID == uuid.Nil && c.RecordedAt.
 // circumstances — the safest way to keep an administrative shape clear of it is for it never to have
 // carried one.
 type ExceptionEntry struct {
-	// ProofID identifies the evidence row, and is what the cursor is built from.
-	ProofID uuid.UUID
+	// Ground is why this entry is in the queue — one of [ExceptionGrounds].
+	//
+	// It is on every entry rather than implied by which fields are populated, because "the
+	// milestone is empty" is a fact about a row and not an explanation a moderator can act on.
+	Ground ExceptionGround
 
-	// JobID is the delivery to open.
+	// EntryID identifies the row this entry was derived from, and with [ExceptionEntry.Ground]
+	// and [ExceptionEntry.RecordedAt] it is what the cursor is built from.
+	//
+	// **What it identifies depends on the ground**, which is the honest shape rather than an
+	// evasion: a proof for `failed_proof`, a milestone for `unsynced_milestone`, and the job
+	// itself for the two window grounds — where there is no evidence row, because the fact is
+	// that nothing was recorded. It is not a handle a client may resolve; it exists to make the
+	// ordering total and to let a console tell two entries apart.
+	EntryID uuid.UUID
+
+	// JobID is the delivery to open. The only identifier on this shape that a client may use.
 	JobID uuid.UUID
 
-	// Milestone is which recorded claim the exception stands behind — 'Delivered' for the
-	// deliveries Docs/01 §4.4 is about, and carried rather than assumed because `proofs` does not
-	// restrict itself to one milestone kind.
+	// Milestone is which recorded claim the entry stands behind, where one exists.
+	//
+	// 'Delivered' for the deliveries Docs/01 §4.4 is about, carried rather than assumed because
+	// `proofs` does not restrict itself to one milestone kind. **Empty on the two window
+	// grounds**, where the entry exists precisely because no milestone was recorded.
 	Milestone string
 
-	// Reason is why there is no photograph, from Docs/01 §4.4's three.
+	// Reason is why there is no photograph, from Docs/01 §4.4's three. Empty on every ground but
+	// `failed_proof`, which is the only one that has an evidenced reason.
 	Reason string
 
 	// Note is the actor's own words, where they left any. Empty is ordinary: `milestones.reason`
 	// is optional, and a driver who selected a reason has already said the most important part.
 	Note string
 
-	// RecordedAt is when the platform recorded the evidence, on the platform's clock.
+	// RecordedAt is the platform's clock, and it is the fact that put this entry in the queue.
 	//
-	// Deliberately not the actor's clock. Docs/02 §3.1 keeps the two apart because a driver
+	// It means something slightly different per ground and that is deliberate rather than sloppy:
+	// when the evidence was recorded for `failed_proof`, when the update *arrived* for
+	// `unsynced_milestone`, and when the window closed for the two window grounds. In every case
+	// it is the instant from which the entry has been waiting, which is what an ordering by
+	// urgency needs and what Docs/04 §8's targets are measured from.
+	//
+	// Deliberately never the actor's clock. Docs/02 §3.1 keeps the two apart because a driver
 	// records a milestone out of signal and the device syncs later; a queue ordered by the
 	// *device's* clock could be reordered by a handset with the wrong time, which is a queue an
 	// entry can hide at the back of.

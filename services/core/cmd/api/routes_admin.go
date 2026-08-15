@@ -11,6 +11,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/admin"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
@@ -310,7 +311,13 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin credentials: " + err.Error())
 	}
 
-	moderation, err := admin.NewModeration(exceptionQueueLookup{}, d.Pool)
+	// SHIP-157. The threshold is read from `internal/delivery`, which owns Docs/02 §3.1's
+	// twenty-four hours, and handed to a domain that must not hold a second copy of it — the
+	// same arrangement the status vocabulary takes below. **This import is what makes the number
+	// have one authority**: a constant in `internal/admin` would agree with this one by comment
+	// until somebody moved one, which is Docs/10 §3.4's failure applied to a duration.
+	moderation, err := admin.NewModeration(
+		exceptionQueueLookup{}, delivery.UnsyncedAlertThreshold, d.Pool)
 	if err != nil {
 		panic("cmd/api: admin moderation: " + err.Error())
 	}
@@ -593,78 +600,182 @@ var (
 	_ admin.JobDirectory   = jobDirectory{}
 )
 
-// exceptionQueueLookup implements admin.ExceptionQueue over `delivery`'s evidence tables (SHIP-117).
+// exceptionQueueLookup implements admin.ExceptionQueue over `delivery`s and `jobs`' rows
+// (SHIP-117, SHIP-157).
 //
 // # Why the query is here rather than in a domain
 //
-// It reads `proofs` and `milestones`, which are `internal/delivery`'s, and `jobs`, which is
+// It reads `proofs` and `milestones`, which are `internal/delivery`s, and `jobs`, which is
 // `internal/jobs`'. `admin` may import neither, and the boundary lint refuses both. The composition
 // root is where a dependency between domains is visible to somebody reading how the service is
 // wired, rather than buried in `admin/postgres.go` where `proofs` would read as a table admin owns.
 // jobPartiesLookup above is the same arrangement for the same reason.
 //
-// **`internal/delivery` is untouched by this ticket**, which is the property that made SHIP-117
-// buildable at all in a wave where another track owns that package. The queue is a read of rows that
-// domain already writes, and nothing about recording an exception changes.
+// **`internal/delivery` and `internal/jobs` are untouched by both tickets**, which is the property
+// that made SHIP-117 buildable in a wave where another track owned that package and makes SHIP-157
+// buildable in one where two other lanes do. The queue is a read of rows those domains already
+// write, and nothing about recording an exception, a milestone or a window changes.
 //
 // # The vocabulary is not translated, and that is deliberate
 //
 // `exception_reason`, `milestone` and `jobs.status` come back as the strings the database holds.
-// Two of them are Docs/02's own values and the third is generated from `contracts/statuses.yaml`
+// Two of them are Docs/02s own values and the third is generated from `contracts/statuses.yaml`
 // (SHIP-56a), so a translation here would be a third copy of a list whose whole point is that there
 // is one. `delivery.ProofExceptionReason.Wire()` is the identity function on the stored form, and
-// Docs/10 §4.7's mapping for the other two belongs to the endpoints that publish them.
+// Docs/10 §4.7s mapping for the other two belongs to the endpoints that publish them.
+//
+// **The one vocabulary this file does name is the *ground*, and it is `admin`s own** — see
+// [admin.ExceptionGround]. A ground names which of Docs/04 §5s situations a row is evidence of,
+// which is a moderation concept rather than a delivery one, and the literals below are the only
+// place SQL and Go have to agree about it. TestTheExceptionGroundsAreTheOnesTheDomainDeclares is
+// what holds them together.
 type exceptionQueueLookup struct{}
 
-// ExceptionsAwaitingReview reads one page of the queue, oldest first.
+// The status sets each window ground selects on.
 //
-// # The ordering is total, and the cursor is why
+// **Written out rather than expressed as "not yet delivered", because the complement is wrong.** A
+// `Cancelled` job is not overdue for a pickup that will never happen, a `Disputed` one is already in
+// front of somebody, and a `Draft`, `Open` or `Negotiating` job past its pickup window is SHIP-68s
+// expiry sweep rather than a delivery exception — it has no provider to be late. So each set names
+// the statuses where a job is *committed and still moving*, and a status added to Docs/02 §1 in
+// future is deliberately absent from both until somebody decides which it belongs in.
 //
-// `(p.created_at, p.id)` rather than `p.created_at` alone: two deliveries recorded in the same
-// millisecond would otherwise make a single-column cursor either skip an entry or repeat one, and a
-// moderation queue that can hide a row is worse than one that shows it twice.
+// The two differ by `Picked up` and `In transit`: a job in either has been collected, so it cannot
+// be overdue for its pickup and can still be late for its delivery.
 //
-// `p.created_at` rather than `m.actor_recorded_at`, and that is the same decision Docs/02 §3.1
-// records: the actor's clock is the driver's handset, which syncs late and can be wrong, and a queue
-// ordered by it could be reordered by a device — putting an entry behind rows that arrived after it.
-// The platform's clock is what a support target is measured against (Docs/04 §8).
+// They are single-line constants on purpose: internal/admin's copy of this statement is held to it
+// by TestTheTestDoubleRunsTheStatementCmdApiRuns, which reads this file and resolves the
+// concatenation by name — and a constant split across two string literals is one that guard would
+// have to parse rather than read.
+const (
+	overduePickupStatuses = `('Awarded', 'Driver assigned', 'En route to pickup')`
+
+	delayedDeliveryStatuses = `('Awarded', 'Driver assigned', 'En route to pickup', 'Picked up', 'In transit')`
+)
+
+// ExceptionsAwaitingReview reads one page of the queue, oldest first, across all four grounds.
 //
-// # Why the join does not filter on the milestone kind
+// # One statement rather than four reads merged in Go
 //
-// Docs/01 §4.4 is about delivery, and `proofs` does not restrict itself to one milestone — so
-// filtering to 'Delivered' here would silently drop an exception recorded against a pickup the day
-// somebody allows one. The milestone is *reported* instead, and a moderator sees which claim the
-// exception stands behind. `idx_proofs_exception` is partial on `exception_reason IS NOT NULL`,
-// which is the predicate that makes this cheap; the ordering is a sort over the few rows it selects.
+// A `UNION ALL` of four selects with one ordering and one LIMIT over the top. Four reads would need
+// a transaction to describe one moment, would each need their own limit chosen without knowing how
+// the others would fill the page, and would put the merge in the handler — where a cursor over four
+// streams stops being expressible at all.
+//
+// # The ordering is total, and the cursor is why it needs three columns
+//
+// `(recorded_at, ground, entry_id)`. Two deliveries recorded in the same millisecond would make a
+// single-column cursor either skip an entry or repeat one, and a moderation queue that can hide a
+// row is worse than one that shows it twice. **The ground is SHIP-157s addition and it is
+// load-bearing**: `overdue_pickup` and `delayed_delivery` are both keyed by the *job*, so a job
+// whose pickup and drop-off windows end at the same instant produces two rows agreeing on the other
+// two columns.
+//
+// # The platform's clock throughout, and `now()` is the platform's clock
+//
+// `p.created_at` and `m.server_recorded_at` rather than `m.actor_recorded_at`, which is the decision
+// Docs/02 §3.1 records: the actor's clock is a handset's, it syncs late and it can be wrong, and a
+// queue ordered by it could be reordered by a device. The two window grounds compare against
+// `now()`, evaluated by PostgreSQL at the start of the transaction — **not the injectable clock**,
+// deliberately: `internal/clock` exists so that a *domain rule* can be tested at a chosen instant,
+// and this is a read whose entire content is "what is late as of now". A test moves the window, not
+// the clock.
+//
+// # The unsynced threshold is a parameter, never a literal
+//
+// `$1` is `delivery.UnsyncedAlertThreshold`, handed down from the composition root. Writing
+// `interval '24 hours'` here would be a second authority for Docs/02 §3.1s number that agrees with
+// the first by comment — and `internal/delivery`s own store already passes it the same way, so the
+// predicate here and the predicate there are the same expression over the same value.
+//
+// # Indexes
+//
+// `idx_proofs_exception` is partial on `exception_reason IS NOT NULL` and serves the third ground.
+// The other three are sequential scans: the unsynced predicate is over a computed difference and
+// `internal/delivery`s store already records why no expression index is prepaid for it, and the two
+// window grounds are bounded by a status set that is a small fraction of `jobs` at pilot volume.
+// **The trigger for adding one is named rather than left to judgement: the first caller that reads
+// this on a schedule rather than on a person's request.**
 func (exceptionQueueLookup) ExceptionsAwaitingReview(
 	ctx context.Context,
 	r db.Runner,
 	q admin.QueueQuery,
+	unsyncedThreshold time.Duration,
 ) ([]admin.ExceptionEntry, error) {
 	const query = `
-		SELECT p.id, p.job_id, m.milestone, p.exception_reason,
-		       coalesce(m.reason, ''), p.created_at, j.status
-		FROM proofs p
-		JOIN milestones m ON m.id = p.milestone_id
-		JOIN jobs j       ON j.id = p.job_id
-		WHERE p.exception_reason IS NOT NULL
-		  AND ($1::timestamptz IS NULL OR (p.created_at, p.id) > ($1, $2))
-		ORDER BY p.created_at, p.id
-		LIMIT $3`
+		WITH entries AS (
+		    -- Docs/04 §5, ground one: committed, past its pickup window, not collected.
+		    SELECT '` + string(admin.GroundOverduePickup) + `'::text AS ground,
+		           j.id AS entry_id, j.id AS job_id,
+		           ''::text AS milestone, ''::text AS reason, ''::text AS note,
+		           j.pickup_window_end AS recorded_at
+		    FROM jobs j
+		    WHERE j.pickup_window_end IS NOT NULL
+		      AND j.pickup_window_end < now()
+		      AND j.status IN ` + overduePickupStatuses + `
+
+		    UNION ALL
+
+		    -- Ground two: past its drop-off window and not delivered.
+		    SELECT '` + string(admin.GroundDelayedDelivery) + `'::text,
+		           j.id, j.id, ''::text, ''::text, ''::text, j.dropoff_window_end
+		    FROM jobs j
+		    WHERE j.dropoff_window_end IS NOT NULL
+		      AND j.dropoff_window_end < now()
+		      AND j.status IN ` + delayedDeliveryStatuses + `
+
+		    UNION ALL
+
+		    -- Ground three (SHIP-117): evidenced by a reason rather than a photograph.
+		    --
+		    -- The join does not filter on the milestone kind. Docs/01 §4.4 is about delivery and
+		    -- proofs does not restrict itself to one milestone, so filtering to 'Delivered'
+		    -- would silently drop an exception recorded against a pickup the day somebody allows
+		    -- one. The milestone is reported instead.
+		    SELECT '` + string(admin.GroundFailedProof) + `'::text,
+		           p.id, p.job_id, m.milestone, p.exception_reason, coalesce(m.reason, ''),
+		           p.created_at
+		    FROM proofs p
+		    JOIN milestones m ON m.id = p.milestone_id
+		    WHERE p.exception_reason IS NOT NULL
+
+		    UNION ALL
+
+		    -- Ground four (SHIP-128, surfaced here by SHIP-157): an update that reached the
+		    -- platform more than $1 after the driver recorded it. >= rather than > because
+		    -- Docs/02 §3.1 says "24 hours — operations alert", so a row exactly on the threshold
+		    -- is over it; PostgreSQL compares intervals exactly, so this is a real boundary.
+		    SELECT '` + string(admin.GroundUnsyncedMilestone) + `'::text,
+		           m.id, m.job_id, m.milestone, ''::text, coalesce(m.reason, ''),
+		           m.server_recorded_at
+		    FROM milestones m
+		    WHERE m.server_recorded_at - m.actor_recorded_at >= $1
+		)
+		SELECT e.ground, e.entry_id, e.job_id, e.milestone, e.reason, e.note,
+		       e.recorded_at, j.status
+		FROM entries e
+		JOIN jobs j ON j.id = e.job_id
+		WHERE ($2 = '' OR e.ground = $2)
+		  AND ($3::timestamptz IS NULL
+		       OR (e.recorded_at, e.ground, e.entry_id) > ($3, $4, $5))
+		ORDER BY e.recorded_at, e.ground, e.entry_id
+		LIMIT $6`
 
 	// A nil rather than a zero time for the first page: `> (NULL, …)` is NULL rather than true,
-	// so the predicate has to be skipped rather than satisfied, and the `$1 IS NULL` guard above
+	// so the predicate has to be skipped rather than satisfied, and the `$3 IS NULL` guard above
 	// is what does it. Passing the zero time would work today and would stop working the first
 	// time somebody backdated a fixture.
 	var (
 		after   any
+		ground  any
 		afterID any
 	)
 	if !q.After.Zero() {
-		after, afterID = q.After.RecordedAt, q.After.ProofID
+		after, ground, afterID = q.After.RecordedAt, q.After.Ground.String(), q.After.EntryID
 	}
 
-	rows, err := r.Query(ctx, query, after, afterID, q.Limit)
+	rows, err := r.Query(ctx, query,
+		unsyncedThreshold, q.Ground.String(), after, ground, afterID, q.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("cmd/api: reading the delivery-exception queue: %w", err)
 	}
@@ -673,7 +784,7 @@ func (exceptionQueueLookup) ExceptionsAwaitingReview(
 	var out []admin.ExceptionEntry
 	for rows.Next() {
 		var e admin.ExceptionEntry
-		if err := rows.Scan(&e.ProofID, &e.JobID, &e.Milestone, &e.Reason,
+		if err := rows.Scan(&e.Ground, &e.EntryID, &e.JobID, &e.Milestone, &e.Reason,
 			&e.Note, &e.RecordedAt, &e.JobStatus); err != nil {
 			return nil, fmt.Errorf("cmd/api: reading a delivery-exception entry: %w", err)
 		}

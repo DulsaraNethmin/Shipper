@@ -336,6 +336,14 @@ var (
 	// nothing about somebody else's job, which is a different question with a different asker.
 	ErrUserNotFound = errors.New("admin: no such account")
 
+	// ErrExceptionGroundUnrecognised means a `ground` filter outside [ExceptionGrounds] (SHIP-157).
+	//
+	// Refused rather than ignored, on the reasoning the standing filter records: an ignored
+	// filter answers with every entry, which reads exactly like "every exception is on this
+	// ground" to somebody who mistyped one — and on a moderation queue that mistake is the
+	// difference between "nothing is overdue" and "I asked the wrong question".
+	ErrExceptionGroundUnrecognised = errors.New("admin: that is not a delivery-exception ground")
+
 	// ErrStandingUnrecognised means a standing outside `ck_users_status`s three.
 	ErrStandingUnrecognised = errors.New("admin: that is not an account standing")
 

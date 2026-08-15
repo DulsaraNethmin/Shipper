@@ -568,6 +568,11 @@ func apiError(err error) error {
 		return fieldProblem("standing", fmt.Errorf(
 			"that is not an account standing; use one of %s", strings.Join(standingNames(), ", ")))
 
+	case errors.Is(err, ErrExceptionGroundUnrecognised):
+		return fieldProblem("ground", fmt.Errorf(
+			"that is not a delivery-exception ground; use one of %s",
+			strings.Join(groundNames(), ", ")))
+
 	case errors.Is(err, ErrStandingUnchanged):
 		return httpx.NewError(http.StatusConflict, CodeUserStandingUnchanged,
 			"This account already has that standing.").WithCause(err)
@@ -987,37 +992,62 @@ func (h *Handler) permitted(r *http.Request, p Permission) (Grant, error) {
 	return grant, nil
 }
 
-// --- SHIP-117: the delivery-exception moderation queue ------------------------------------------
+// --- SHIP-117, SHIP-157: the delivery-exception moderation queue ---------------------------------
 
-// exceptionEntryResponse is one delivery that was evidenced by a reason rather than a photograph.
+// exceptionEntryResponse is one delivery that is going wrong, on one of Docs/04 §5's four grounds.
 //
-// **No object key and no signed URL**, because by construction there is no photograph — a proof row
-// is one or the other and never both (`ck_proofs_photograph_or_exception`). **No customer, no
-// provider and no budget**: a queue entry is what somebody triaging needs in order to decide whether
-// to open the job, and a shape that never carried a budget cannot leak one.
+// **No object key and no signed URL**, because on the one ground that has a photograph there is by
+// construction none — a proof row is a photograph or a reason and never both
+// (`ck_proofs_photograph_or_exception`) — and a queue listing is not where a pre-signed URL is
+// issued in any case (Docs/04 §3.1). **No customer, no provider and no budget**: a queue entry is
+// what somebody triaging needs in order to decide whether to open the job, and a shape that never
+// carried a budget cannot leak one.
+//
+// # It is a union shape and `ground` is what makes that legible
+//
+// Three fields are empty on some grounds — `milestone` and `reason` on the two window grounds, and
+// `reason` on the unsynced ground. **They are always present and never null**, so a console that
+// renders without checking does not crash on the ordinary case; and `ground` is what a console
+// branches on rather than guessing from which fields are blank.
 type exceptionEntryResponse struct {
-	ProofID string `json:"proof_id"`
-	JobID   string `json:"job_id"`
+	// Ground is one of `overdue_pickup`, `delayed_delivery`, `failed_proof` or
+	// `unsynced_milestone` (SHIP-157). Clients branch on this and never on `reason`.
+	Ground string `json:"ground"`
 
+	// EntryID identifies the row the entry came from, and what that row *is* depends on the
+	// ground — a proof, a milestone, or the job itself where nothing was recorded. **It is not a
+	// handle to resolve**; it exists so the ordering is total and two entries are tellable apart.
+	// `job_id` is the identifier a console follows.
+	EntryID string `json:"entry_id"`
+
+	JobID string `json:"job_id"`
+
+	// Milestone is which recorded claim the entry stands behind. Empty on the two window
+	// grounds, where the entry exists because nothing was recorded.
 	Milestone string `json:"milestone"`
-	Reason    string `json:"reason"`
+
+	// Reason is Docs/01 §4.4's recorded reason. Empty on every ground but `failed_proof`.
+	Reason string `json:"reason"`
 
 	// Note is the actor's own words, where they left any. Always present, empty when they did
 	// not — `milestones.reason` is optional, and a `null` makes a console that renders without
 	// checking crash on the ordinary case.
 	Note string `json:"note"`
 
-	// RecordedAt is the platform's clock, not the device's. See [ExceptionEntry.RecordedAt].
+	// RecordedAt is the platform's clock, not the device's, and it is the instant this entry has
+	// been waiting since — which means the evidence, the arrival or the window's close depending
+	// on the ground. See [ExceptionEntry.RecordedAt].
 	RecordedAt string `json:"recorded_at"`
 
 	// JobStatus is where the job is now. It implies nothing about whether a job completed
-	// through this path may auto-complete, which is undecided (X-6).
+	// through the exception path may auto-complete, which is undecided (X-6).
 	JobStatus string `json:"job_status"`
 }
 
 func exceptionEntryFrom(e ExceptionEntry) exceptionEntryResponse {
 	return exceptionEntryResponse{
-		ProofID:    e.ProofID.String(),
+		Ground:     e.Ground.String(),
+		EntryID:    e.EntryID.String(),
 		JobID:      e.JobID.String(),
 		Milestone:  e.Milestone,
 		Reason:     e.Reason,
@@ -1027,16 +1057,17 @@ func exceptionEntryFrom(e ExceptionEntry) exceptionEntryResponse {
 	}
 }
 
-// ExceptionQueue handles GET /v1/admin/moderation/exceptions (SHIP-117).
+// ExceptionQueue handles GET /v1/admin/moderation/exceptions (SHIP-117, SHIP-157).
 //
-// The *Done when* is that an exception-completed job **enters the moderation queue**, and this is
-// the queue. It needs [PermissionModerationRead], which every role holds — reading a queue is what
-// the least-privileged role exists to be able to do, and acting on what is in it is a different
-// permission on a different endpoint.
+// Docs/04 §5's fourth queue, on all four grounds: overdue pickup, delayed delivery, failed proof and
+// unsynced milestones. It needs [PermissionModerationRead], which every role holds — reading a queue
+// is what the least-privileged role exists to be able to do, and acting on what is in it is a
+// different permission on a different endpoint.
 //
-// Oldest first, cursor paged, and it takes no filter: SHIP-157 is where this becomes a screen with
-// four kinds of exception on it, and a query parameter added now would be one that ticket has to
-// work around.
+// Oldest first and cursor paged, unchanged by the widening. SHIP-117 left this filterless on the
+// grounds that "a query parameter added now would be one that ticket has to work around"; SHIP-157
+// is that ticket and the parameter it wanted is `ground`, which narrows the one queue rather than
+// selecting between four.
 func (h *Handler) ExceptionQueue() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
@@ -1062,7 +1093,8 @@ func (h *Handler) ExceptionQueue() http.Handler {
 			last := entries[len(entries)-2]
 			next = pagination.Cursor{
 				timestamp(last.RecordedAt),
-				last.ProofID.String(),
+				last.Ground.String(),
+				last.EntryID.String(),
 			}.Encode()
 			entries = entries[:len(entries)-1]
 		}
@@ -1280,16 +1312,36 @@ func exceptionQueryFrom(r *http.Request) (QueueQuery, error) {
 	if err != nil {
 		return QueueQuery{}, err
 	}
-	return QueueQuery{Limit: limit, After: after}, nil
+
+	// Validated in the service rather than here, so that a task with no request behind it gets
+	// the same refusal. The handler's job is to carry the value across.
+	return QueueQuery{
+		Limit:  limit,
+		After:  after,
+		Ground: ExceptionGround(strings.TrimSpace(values.Get("ground"))),
+	}, nil
 }
 
-// decodeExceptionCursor reads the two fields the queue's ordering is total on.
+// groundNames is [ExceptionGrounds] as strings, for a validation message.
+func groundNames() []string {
+	out := make([]string, 0, len(ExceptionGrounds))
+	for _, g := range ExceptionGrounds {
+		out = append(out, g.String())
+	}
+	return out
+}
+
+// decodeExceptionCursor reads the three fields the queue's ordering is total on.
+//
+// **Three since SHIP-157**, and a cursor issued before the widening decodes to a length error rather
+// than to a wrong page. That is the correct failure: the two-field form named a proof, and a proof
+// identifier means nothing to a union whose entries are keyed by three different kinds of row.
 func decodeExceptionCursor(raw string) (QueueCursor, error) {
 	if raw == "" {
 		return QueueCursor{}, nil
 	}
 
-	fields, err := pagination.Decode(raw, 2)
+	fields, err := pagination.Decode(raw, 3)
 	if err != nil {
 		return QueueCursor{}, err
 	}
@@ -1300,13 +1352,19 @@ func decodeExceptionCursor(raw string) (QueueCursor, error) {
 			"That cursor is not one this endpoint issued.").WithCause(err)
 	}
 
-	proofID, err := uuid.Parse(fields[1])
+	ground := ExceptionGround(fields[1])
+	if !ground.Valid() {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.")
+	}
+
+	entryID, err := uuid.Parse(fields[2])
 	if err != nil {
 		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
 			"That cursor is not one this endpoint issued.").WithCause(err)
 	}
 
-	return QueueCursor{RecordedAt: recordedAt, ProofID: proofID}, nil
+	return QueueCursor{RecordedAt: recordedAt, Ground: ground, EntryID: entryID}, nil
 }
 
 // --- SHIP-152: the administrator's job and bid search ---------------------------------------------

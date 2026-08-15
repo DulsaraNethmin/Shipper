@@ -143,6 +143,37 @@ dispute_delivered_job() {
   printf '%s' "$job"
 }
 
+# dispute_awarded_job <label> — a job committed to a provider and no further (SHIP-157).
+#
+# The first status at which a job can be *overdue for its pickup*: before award nobody has undertaken
+# to collect it, and an Open job past its pickup window is SHIP-68's expiry sweep rather than a
+# delivery exception.
+dispute_awarded_job() {
+  local job
+  job="$(dispute_draft "$1")"
+  dispute_move "$job" Draft Open
+  dispute_move "$job" Open Awarded
+  dispute_award "$job" "$dispute_provider_id"
+  printf '%s' "$job"
+}
+
+# dispute_transit_job <label> — a job collected and moving, not yet delivered (SHIP-157).
+#
+# The status a *delayed delivery* is measured at: the goods are with the provider and have not
+# arrived. Built to this status rather than moved back from Delivered, because Docs/02 §2 offers no
+# transition backwards and the guard would refuse one.
+dispute_transit_job() {
+  local job
+  job="$(dispute_draft "$1")"
+  dispute_move "$job" Draft Open
+  dispute_move "$job" Open Awarded
+  dispute_award "$job" "$dispute_provider_id"
+  dispute_move "$job" Awarded 'En route to pickup'
+  dispute_move "$job" 'En route to pickup' 'Picked up'
+  dispute_move "$job" 'Picked up' 'In transit'
+  printf '%s' "$job"
+}
+
 # dispute_request <token> <key> <job-id> <body> <name> — one intake, keeping the response headers.
 #
 # The headers are the point for the retry checks: `Idempotency-Replayed` is how a check says *which*
@@ -786,8 +817,8 @@ for _ in $(seq 1 40); do
 import json, sys
 page = json.load(open(sys.argv[1]))
 items = page.get("data") or []
-found = next((i for i in items if i["proof_id"] == sys.argv[2]), None)
-photo = any(i["proof_id"] == sys.argv[3] for i in items)
+found = next((i for i in items if i["entry_id"] == sys.argv[2]), None)
+photo = any(i["entry_id"] == sys.argv[3] for i in items)
 print(json.dumps(found) if found else "")
 print("photo" if photo else "")
 print(page.get("next_cursor") or "")
@@ -811,6 +842,8 @@ printf '%s' "$queue_found" >"$WORKDIR/queue-entry.json"
   || { cat "$WORKDIR/queue-entry.json"; fail "the entry does not say which claim the exception stands behind"; }
 [[ -n "$(json "$WORKDIR/queue-entry.json" '["note"]')" ]] \
   || { cat "$WORKDIR/queue-entry.json"; fail "the driver's own words are not carried"; }
+[[ "$(json "$WORKDIR/queue-entry.json" '["ground"]')" == "failed_proof" ]] \
+  || { cat "$WORKDIR/queue-entry.json"; fail "the entry does not say which ground it is here on"; }
 ok "a delivery evidenced by a reason rather than a photograph is in the moderation queue — SHIP-117's Done when, on the wire"
 
 [[ -z "$queue_photo_seen" ]] \
@@ -830,6 +863,188 @@ ok "the entry carries no budget and no object key — there is no photograph to 
 status="$(admin_get /v1/admin/moderation/exceptions "" queue-nocred)"
 [[ "$status" == "401" ]] || { cat "$WORKDIR/admin-queue-nocred.json"; fail "the queue is readable without a credential ($status)"; }
 ok "and the queue is behind the administrator credential like every other administrative route"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-157 — the other three grounds, and the queue as one screen.
+#
+# # What only this section can show
+#
+# The queue is a `UNION ALL` of four selects that live in **cmd/api**, because they span `jobs`,
+# `proofs` and `milestones` — tables belonging to two domains `internal/admin` may not import. The Go
+# suite in that package drives the handler against a copy of the statement, and a text guard holds
+# the copy to the original; that establishes that the two agree and nothing about the one the binary
+# runs. **The served statement is demonstrated here or nowhere**, exactly as SHIP-117's third of it
+# was.
+#
+# It also shows the one thing no unit test can: that the threshold the running process passes is
+# `delivery.UnsyncedAlertThreshold` rather than a number `internal/admin` invented. The domain's
+# tests pass whatever threshold they like — that is what makes them a test of the predicate — and
+# only the wired binary reads the real constant.
+#
+# # Every assertion is fenced on this run's own rows
+#
+# `jobs`, `proofs` and `milestones` are shared with every other section, every previous run and every
+# other worktree, so a count would be a statement about the machine. Each fixture is found by the id
+# this section created, and each negative is asserted on a row it also created.
+
+ticket "SHIP-157  overdue pickup, delayed delivery, failed proof and unsynced milestones are one queue"
+
+admin_clear_limits
+
+# queue_find <ground-filter> <entry-id> — the ground the entry is on, or "" when it is not there.
+#
+# Pages to the end rather than reading the first page: the queue holds every exception this database
+# has ever seen, and a fixture written now sorts by its own recorded_at rather than to the front.
+queue_find() {
+  local filter="$1" wanted="$2" cursor="" path found=""
+
+  for _ in $(seq 1 60); do
+    path="/v1/admin/moderation/exceptions?limit=100"
+    [[ -n "$filter" ]] && path="$path&ground=$filter"
+    [[ -n "$cursor" ]] && path="$path&cursor=$cursor"
+
+    status="$(admin_get "$path" "$queue_token" queue-find)"
+    [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-queue-find.json"; fail "reading the queue returned $status"; }
+
+    python3 - "$WORKDIR/admin-queue-find.json" "$wanted" "$filter" >"$WORKDIR/queue-find.txt" <<'SCAN'
+import json, sys
+page = json.load(open(sys.argv[1]))
+items = page.get("data") or []
+match = next((i for i in items if i["entry_id"] == sys.argv[2]), None)
+# A filtered page carrying an entry on another ground is a filter that is not filtering.
+stray = [i["ground"] for i in items if sys.argv[3] and i["ground"] != sys.argv[3]]
+print(match["ground"] if match else "")
+print(",".join(sorted(set(stray))))
+print(page.get("next_cursor") or "")
+SCAN
+
+    [[ -z "$(sed -n '2p' "$WORKDIR/queue-find.txt")" ]] \
+      || fail "a page filtered to '$filter' carries entries on $(sed -n '2p' "$WORKDIR/queue-find.txt")"
+
+    found="$(sed -n '1p' "$WORKDIR/queue-find.txt")"
+    [[ -n "$found" ]] && { printf '%s' "$found"; return; }
+
+    cursor="$(sed -n '3p' "$WORKDIR/queue-find.txt")"
+    [[ -n "$cursor" ]] || break
+  done
+  printf ''
+}
+
+# --- grounds one and two: the window grounds ----------------------------------------------------
+#
+# The windows are written with SQL because no endpoint sets one after award, and each job is left at
+# the status its ground needs — which is what tells the two apart rather than firing both on one job.
+
+overdue_job="$(dispute_awarded_job overdue)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_window_end = now() - interval '2 days',
+                   dropoff_window_end = now() + interval '2 days'
+     where id = '$overdue_job';" >/dev/null \
+  || fail "the overdue job's windows could not be set"
+
+ontime_job="$(dispute_awarded_job ontime)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_window_end = now() + interval '2 days',
+                   dropoff_window_end = now() + interval '3 days'
+     where id = '$ontime_job';" >/dev/null \
+  || fail "the on-time job's windows could not be set"
+
+[[ "$(queue_find "" "$overdue_job")" == "overdue_pickup" ]] \
+  || fail "a job past its pickup window with no collection is not in the queue on overdue_pickup"
+ok "a job past its pickup window that has not been collected is in the queue — Docs/04 §5's first ground"
+
+[[ -z "$(queue_find "" "$ontime_job")" ]] \
+  || fail "a job whose windows have not closed is in the queue, so the predicate is missing"
+ok "and one whose windows have not closed is not — every predicate here passes trivially when it is absent"
+
+# Picked up and still moving: it cannot be overdue for its pickup and it can be late for its
+# delivery, which is the pair of facts that separates the two window grounds.
+transit_job="$(dispute_transit_job delayed)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_window_end = now() - interval '3 days',
+                   dropoff_window_end = now() - interval '2 days'
+     where id = '$transit_job';" >/dev/null \
+  || fail "the in-transit job's windows could not be set"
+
+[[ "$(queue_find "" "$transit_job")" == "delayed_delivery" ]] \
+  || fail "a job past its drop-off window still in transit is not in the queue on delayed_delivery"
+ok "a job past its drop-off window that has not been delivered is in the queue — Docs/04 §5's second ground"
+
+# A delivered job past its drop-off window arrived. It is late history rather than a delivery going
+# wrong, and a queue that carried it would fill with every completed job the platform has ever run.
+arrived_job="$(dispute_delivered_job arrived)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_window_end = now() - interval '3 days',
+                   dropoff_window_end = now() - interval '2 days'
+     where id = '$arrived_job';" >/dev/null \
+  || fail "the arrived job's windows could not be set"
+
+[[ -z "$(queue_find delayed_delivery "$arrived_job")" ]] \
+  || fail "a delivered job past its drop-off window is on the delayed_delivery ground; it arrived"
+ok "and a job that was delivered is not, whatever its window says — the queue is deliveries going wrong, not late history"
+
+# --- ground four: the unsynced milestone, and the threshold the process actually holds -----------
+#
+# server_recorded_at cannot be supplied — 000601's trigger refuses an INSERT that names it — so the
+# gap is made by backdating actor_recorded_at, which is how a real one arises: the handset recorded
+# it then and the platform saw it now.
+
+unsynced_job="$(dispute_transit_job unsynced)"
+
+unsynced_milestone() {
+  "$PSQL" "$DATABASE_URL" -qtAc \
+    "insert into milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
+     values (gen_random_uuid(), '$1', 'In transit', 'driver', gen_random_uuid(),
+             now() - interval '$2')
+     returning id;"
+}
+
+late_milestone="$(unsynced_milestone "$unsynced_job" '25 hours' | tr -d '[:space:]')"
+[[ -n "$late_milestone" ]] || fail "the late milestone fixture was not written"
+
+prompt_milestone="$(unsynced_milestone "$unsynced_job" '1 minute' | tr -d '[:space:]')"
+[[ -n "$prompt_milestone" ]] || fail "the prompt milestone fixture was not written"
+
+# 23 hours is the case that pins the threshold to twenty-four rather than to "some hours". A process
+# wired with an hour, or with a number internal/admin invented, puts this on the queue.
+near_milestone="$(unsynced_milestone "$unsynced_job" '23 hours' | tr -d '[:space:]')"
+[[ -n "$near_milestone" ]] || fail "the near-threshold milestone fixture was not written"
+
+[[ "$(queue_find "" "$late_milestone")" == "unsynced_milestone" ]] \
+  || fail "an update that reached the platform 25 hours after it was recorded is not in the queue"
+ok "an update that reached the platform more than a day after it was recorded is in the queue — SHIP-128's fact, surfaced"
+
+[[ -z "$(queue_find "" "$prompt_milestone")" ]] \
+  || fail "an update that arrived a minute after it was recorded is in the unsynced queue"
+[[ -z "$(queue_find "" "$near_milestone")" ]] \
+  || fail "an update 23 hours behind is in the queue, so the threshold the process holds is not Docs/02 §3.1's 24 hours"
+ok "and one 23 hours behind is not — the running process holds delivery.UnsyncedAlertThreshold rather than a number admin invented"
+
+# --- the filter, in both directions -------------------------------------------------------------
+
+[[ "$(queue_find overdue_pickup "$overdue_job")" == "overdue_pickup" ]] \
+  || fail "filtering to overdue_pickup excluded the overdue job"
+[[ -z "$(queue_find overdue_pickup "$late_milestone")" ]] \
+  || fail "filtering to overdue_pickup returned an unsynced milestone"
+ok "the ground filter narrows the one queue and returns nothing from the other three"
+
+status="$(admin_get "/v1/admin/moderation/exceptions?ground=overdue_pickups" "$queue_token" queue-bad-ground)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-queue-bad-ground.json"; fail "a mistyped ground returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-queue-bad-ground.json")" == *'"ground"'* ]] \
+  || { cat "$WORKDIR/admin-queue-bad-ground.json"; fail "the refusal does not name the field"; }
+ok "a ground the platform does not have is refused and names the field, rather than answering with every entry"
+
+# A cursor issued before the widening is two fields where three are needed. It is refused rather
+# than paged wrongly — a client holding one has a bug, and answering it would page for ever through
+# a queue it never saw.
+old_cursor="$(printf '%s|%s' '2026-08-14T02:15:30.000Z' "$queue_proof_id" | openssl base64 -A | tr '+/' '-_' | tr -d '=')"
+status="$(admin_get "/v1/admin/moderation/exceptions?cursor=$old_cursor" "$queue_token" queue-old-cursor)"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/admin-queue-old-cursor.json"; fail "a two-field cursor returned $status, want 400"; }
+ok "and a cursor from before the queue was widened is refused rather than paging wrongly"
 
 admin_clear_limits
 

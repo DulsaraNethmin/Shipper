@@ -584,6 +584,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 | **SHIP-30a** | M1 | `users.name` (`000006`, shared block), required by `POST /v1/auth/register`, collected by the app's registration screen, and matched by `GET /v1/admin/users` — so **SHIP-151's fourth term answers on the wire** after a wave partly met. The column is **nullable and that is the decision**: accounts predating it have no name and a name cannot be backfilled, so `NOT NULL` is named as a later tightening rather than faked with a default. **A required field on registration broke 37 `make verify` call sites across nine sections**, which no unit test could have shown — *see below* |
+| **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -11968,6 +11969,88 @@ a domain branch.
 
 One section's expectation changed rather than its fixture: `40-identity.sh` asserts that an empty
 registration reports every bad field at once, and the count went from four to five.
+
+#### Nothing was needed from `internal/config`
+
+
+### SHIP-157 — one queue on four grounds, and why it is not four endpoints
+
+Docs/04 §5 numbers seven moderation queues. The fourth is "delivery exceptions: overdue pickup,
+delayed delivery, failed proof of delivery", and SHIP-157's *Done when* adds unsynced milestones to
+it. SHIP-117 built the failed-proof third of it a wave ago and said what would happen next in as many
+words: `moderation.go` recorded that "the other two are SHIP-157's, which is where the queue becomes
+one screen rather than one endpoint".
+
+**So this widened `GET /v1/admin/moderation/exceptions` rather than adding three siblings**, and the
+decision was taken on the document rather than on taste. Four endpoints would be four cursors and
+four pages, and the question a moderator actually asks — *what is going wrong with deliveries, oldest
+first* — would have become a merge of four sorted streams performed by whoever writes the console. A
+`UNION ALL` and one `ORDER BY` do that once, server-side, where the cursor can stay total.
+
+The path, the permission, the ordering and the paging are unchanged. What changed is the entry: it
+gains `ground`, and `proof_id` becomes `entry_id`, because three of the four grounds have no proof
+row. No console consumed the old shape — `apps/admin` is still a shell — so this is a contract change
+and nothing more.
+
+#### The cursor needed a third field, and finding out why is worth the paragraph
+
+`(recorded_at, entry_id)` was total while every entry was a proof. It is not total across the union:
+**`overdue_pickup` and `delayed_delivery` are both keyed by the job**, so a job whose pickup and
+drop-off windows close at the same instant produces two entries agreeing on both columns. A
+two-column cursor cannot separate them, and the way it fails is by *hiding one* — the single failure
+a moderation queue must not have.
+
+`TestTheCursorIsTotalAcrossGrounds` builds exactly that job, pages one entry at a time, and requires
+both grounds back exactly once. A cursor issued before the widening decodes to a length error and is
+refused with `400`, which is the right failure: the old form named a proof, and a proof identifier
+means nothing to a union keyed by three kinds of row.
+
+#### The window grounds name their statuses rather than taking a complement
+
+`overdue_pickup` selects `Awarded`, `Driver assigned` and `En route to pickup`; `delayed_delivery`
+adds `Picked up` and `In transit`. **The complement — "not yet delivered" — is wrong in four separate
+ways.** A `Cancelled` job is not overdue for a pickup that will never happen; a `Disputed` one is
+already in front of somebody; and a `Draft`, `Open` or `Negotiating` job past its pickup window is
+SHIP-68's expiry sweep rather than a delivery exception, because it has no provider who undertook to
+collect it. Each set is written out, so a thirteenth status added to Docs/02 §1 is absent from both
+until somebody decides which it belongs in.
+
+One consequence is worth stating rather than discovering: **an entry on a window ground goes away
+when the job moves on**, and an entry on an evidence ground never does. A delivery recorded with a
+reason happened and cannot un-happen; a job that was late for its pickup and has since been collected
+is no longer late. The two asymmetries are the queue reporting the rows rather than a defect, and the
+contract says so.
+
+#### The 24-hour threshold is passed, not copied — and the test moves it
+
+`delivery.UnsyncedAlertThreshold` is Docs/02 §3.1's number and `internal/admin` may not import that
+package. **A constant in `admin` would have been a second authority that agrees by comment until
+somebody moves one**, which is Docs/10 §3.4's failure applied to a duration. So `cmd/api` reads the
+real constant and hands it to `NewModeration`, and `ExceptionsAwaitingReview` takes it as a
+parameter and binds it as `$1`.
+
+Wave 10 established that **a test which reads a constant does not test the query that interpolates
+it**, so `TestTheUnsyncedGroundUsesTheThresholdItWasGiven` builds the service three times at three
+thresholds over one row and requires the queue's *content* to change — which can only happen through
+the predicate. `make verify` closes the other half, which no unit test can: it writes a milestone
+**23 hours** behind and requires it absent, so a process wired with the wrong number fails there.
+
+A zero or negative threshold is refused at construction rather than clamped: every gap is at least
+zero, so it would put every milestone ever recorded on the unsynced ground — a queue of the whole
+table, which is the same failure as an empty one and harder to notice.
+
+#### The test double is a copy of a query, and a text guard holds it to the original
+
+`internal/admin` cannot reach the statement `cmd/api` runs, so `moderation_test.go` carries a copy —
+which is a thing that can drift, and drift here means every test in the file is about a query nothing
+serves. `TestTheTestDoubleRunsTheStatementCmdApiRuns` reads `cmd/api/routes_admin.go`, **resolves the
+Go concatenation by looking the constants up in the same file**, and compares the predicate, join and
+ordering lines. Resolving rather than restating is what makes it a guard instead of a third copy: a
+status added to `delayedDeliveryStatuses` changes what the test compares against.
+
+**It was mutation-tested rather than assumed.** Narrowing `delayedDeliveryStatuses` to
+`('Picked up', 'In transit')` in `cmd/api` failed the guard with both statements printed; the file was
+restored from a `/tmp` copy and confirmed with `shasum -a 256 -c`.
 
 #### Nothing was needed from `internal/config`
 

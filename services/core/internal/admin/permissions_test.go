@@ -47,7 +47,7 @@ func testUsers(t *testing.T) *Users {
 // [NewHandler] requires one and no test below reaches the queue endpoint.
 func testModeration(t *testing.T) *Moderation {
 	t.Helper()
-	m, err := NewModeration(testExceptionQueue{}, nil)
+	m, err := NewModeration(testExceptionQueue{}, testUnsyncedThreshold, nil)
 	if err != nil {
 		t.Fatalf("building the moderation service: %v", err)
 	}
@@ -73,7 +73,7 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the account search: %v", err)
 	}
 
-	moderation, err := NewModeration(testExceptionQueue{}, pool)
+	moderation, err := NewModeration(testExceptionQueue{}, testUnsyncedThreshold, pool)
 	if err != nil {
 		t.Fatalf("building the moderation service: %v", err)
 	}

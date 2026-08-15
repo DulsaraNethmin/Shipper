@@ -943,32 +943,51 @@ Administrator:
 AdminExceptionQueue:
   get:
     operationId: adminExceptionQueue
-    summary: Deliveries evidenced by a reason rather than a photograph
+    summary: Deliveries that are going wrong, on all four grounds
     tags: [Administration]
     security:
       - BearerAdminSession: []
     description: |
-      Docs/04 §5's fourth moderation queue, in the part of it this ticket builds: **failed proof of
-      delivery** (SHIP-117). Overdue pickup and delayed delivery join it at SHIP-157.
+      Docs/04 §5's fourth moderation queue, entire (SHIP-117, SHIP-157) — "delivery exceptions:
+      overdue pickup, delayed delivery, failed proof of delivery", plus the unsynced milestones
+      SHIP-157's own *Done when* adds.
 
-      A delivery reaches this list by being recorded with a reason in place of a photograph — the
-      exception path of Docs/01 §4.4, which exists so that a driver standing at a delivery point is
-      never unable to finish the job. Three reasons are possible and no others: `recipient_objected`,
-      `camera_unavailable`, `location_unsafe`.
+      **Four grounds, one queue, one endpoint**, because Docs/04 §5 numbers seven queues and these
+      four situations are one of them. Four endpoints would have been four cursors and four pages,
+      and the question a moderator actually asks — what is going wrong with deliveries, oldest
+      first — would have become a merge of four sorted streams performed by the console. `ground`
+      says which situation an entry is evidence of, and the same parameter narrows the queue to one
+      of them.
 
-      **The queue is a query over the evidence, not a table of flags.** There is nothing to mark as
+      | `ground` | An entry appears when |
+      |---|---|
+      | `overdue_pickup` | the job is committed to a provider, its pickup window has closed, and it has not been collected |
+      | `delayed_delivery` | its drop-off window has closed and it has not been delivered |
+      | `failed_proof` | the delivery was recorded with a reason in place of a photograph — Docs/01 §4.4's exception path, which exists so a driver standing at a delivery point is never unable to finish the job |
+      | `unsynced_milestone` | an update reached the platform more than 24 hours after the driver recorded it — Docs/02 §3.1's last rung |
+
+      **The queue is a query over the rows, not a table of flags.** There is nothing to mark as
       read, nothing to claim and nothing to tick off — Docs/04 §6's process ends in a recorded
-      decision rather than in an entry disappearing. An entry stays here for as long as the row it
-      describes exists, which is for ever.
+      decision rather than in an entry disappearing.
+
+      An entry therefore stays for exactly as long as the fact that produced it is true, and the
+      four grounds differ in what that means: a delivery recorded with a reason happened and cannot
+      un-happen, so those entries are permanent; a job that was late for its pickup window and has
+      since been collected is no longer late, so that entry goes. **That asymmetry is the queue
+      reporting the rows rather than a defect.**
 
       ## What an entry does and does not carry
 
-      There is no photograph and no signed URL, because by construction there is none — a proof row
-      is a photograph or a reason and never both. There is no customer, no provider and **no
+      There is no photograph and no signed URL. On `failed_proof` there is by construction none — a
+      proof row is a photograph or a reason and never both — and a queue listing is not where a
+      short-lived download URL is issued in any case. There is no customer, no provider and **no
       budget**: an entry is what somebody triaging needs in order to decide whether to open the job.
 
+      It is a **union shape**: `milestone` and `reason` are empty on the grounds that have neither.
+      Branch on `ground`, never on which fields are blank.
+
       `job_status` is where the job is now, for triage. It implies nothing about whether a delivery
-      completed this way may auto-complete after 72 hours; that question is open.
+      completed through the exception path may auto-complete after 72 hours; that question is open.
 
       `recorded_at` is the platform's clock, not the driver's device's. A queue ordered by a
       handset's clock could be reordered by a handset with the wrong time, which is a queue an entry
@@ -980,11 +999,31 @@ AdminExceptionQueue:
       closest to breaching one. Cursor paged: the queue grows at the end while somebody is reading
       it, and an offset would show the same entry twice or skip one.
 
+      **The cursor is keyed on `(recorded_at, ground, entry_id)`.** The ground is load-bearing
+      rather than decorative: `overdue_pickup` and `delayed_delivery` are both keyed by the job, so
+      a job whose two windows close at the same instant produces two entries that agree on
+      everything else. A cursor issued before SHIP-157 is refused with `400` rather than paging
+      wrongly.
+
       ## Permission
 
       Needs `moderation.read`, which every administrator role holds. Acting on what is in the queue
       is a different permission on a different endpoint.
     parameters:
+      - name: ground
+        in: query
+        required: false
+        description: |
+          Narrows to one of the four grounds. Absent matches every ground.
+
+          A value that is not one of the four is refused with `422` rather than ignored — an
+          ignored filter answers with every entry, which reads exactly like "everything is on this
+          ground" to somebody who mistyped one, and on a moderation queue the conclusion they then
+          draw is that nothing is overdue.
+        schema:
+          type: string
+          enum: [overdue_pickup, delayed_delivery, failed_proof, unsynced_milestone]
+        example: overdue_pickup
       - name: limit
         in: query
         required: false
@@ -1039,6 +1078,17 @@ AdminExceptionQueue:
           application/json:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          `ground` carried a value that is not one of the four (`validation_failed`), with one
+          `error.details` entry naming the field. Refused rather than ignored — see the parameter.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
       '500':
         $ref: '../openapi.yaml#/components/responses/InternalError'
       '503':
@@ -1078,14 +1128,40 @@ ExceptionQueuePage:
 ExceptionQueueEntry:
   type: object
   additionalProperties: false
-  required: [proof_id, job_id, milestone, reason, note, recorded_at, job_status]
+  required: [ground, entry_id, job_id, milestone, reason, note, recorded_at, job_status]
   description: |
-    One delivery recorded with a reason in place of a photograph.
+    One delivery that is going wrong, on one of the queue's four grounds (SHIP-157).
+
+    **This is a union shape.** `milestone` and `reason` are empty on the grounds that have no
+    milestone and no recorded reason; every field is always present and never `null`, so a console
+    that renders without checking does not crash on the ordinary case. Branch on `ground`, never
+    on which fields are blank.
   properties:
-    proof_id:
+    ground:
+      type: string
+      enum: [overdue_pickup, delayed_delivery, failed_proof, unsynced_milestone]
+      description: |
+        Why this entry is in the queue. Docs/04 §5's fourth queue names the first three and
+        SHIP-157's *Done when* adds the fourth.
+
+        - `overdue_pickup` — the job is committed to a provider, its pickup window has closed and
+          it has not been collected.
+        - `delayed_delivery` — its drop-off window has closed and it has not been delivered.
+        - `failed_proof` — the delivery was evidenced by a recorded reason rather than a
+          photograph (Docs/01 §4.4).
+        - `unsynced_milestone` — an update reached the platform more than 24 hours after the
+          driver recorded it (Docs/02 §3.1's last rung).
+      example: failed_proof
+    entry_id:
       type: string
       format: uuid
-      description: The evidence row. Also what the cursor is built from.
+      description: |
+        The row this entry was derived from, and with `ground` and `recorded_at` what the cursor
+        is built from.
+
+        **What it identifies depends on the ground** — a proof, a milestone, or the job itself on
+        the two window grounds, where the entry exists precisely because nothing was recorded. It
+        is not a handle to resolve against any endpoint; `job_id` is the identifier to follow.
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
     job_id:
       type: string
@@ -1095,16 +1171,23 @@ ExceptionQueueEntry:
     milestone:
       type: string
       description: |
-        Which recorded claim the exception stands behind — `Delivered` for the deliveries Docs/01
-        §4.4 is about. Reported rather than assumed, so an exception recorded against another
-        milestone is visible rather than silently dropped.
+        Which recorded claim the entry stands behind — `Delivered` for the deliveries Docs/01 §4.4
+        is about. Reported rather than assumed, so an exception recorded against another milestone
+        is visible rather than silently dropped.
+
+        **Empty on `overdue_pickup` and `delayed_delivery`**, where the entry exists because no
+        milestone was recorded at all.
       example: Delivered
     reason:
       type: string
-      enum: [recipient_objected, camera_unavailable, location_unsafe]
       description: |
-        Why there is no photograph, from Docs/01 §4.4's three. There is deliberately no `other`: a
-        reason nobody can group is a queue nobody can triage.
+        Why there is no photograph, from Docs/01 §4.4's three: `recipient_objected`,
+        `camera_unavailable` or `location_unsafe`. There is deliberately no `other` — a reason
+        nobody can group is a queue nobody can triage.
+
+        **Empty on every ground but `failed_proof`**, which is why this is not an enumeration: the
+        three values are the closed set of *reasons*, and "no reason was recorded" is not one of
+        them.
       example: recipient_objected
     note:
       type: string
@@ -1117,14 +1200,19 @@ ExceptionQueueEntry:
       type: string
       format: date-time
       description: |
-        When the platform recorded the evidence, in UTC, on the platform's clock — **not** the
-        driver's device's. See the operation description.
+        The instant this entry has been waiting since, in UTC, on the platform's clock — **not**
+        the driver's device's.
+
+        It is a different fact per ground and deliberately so: when the evidence was recorded for
+        `failed_proof`, when the update *arrived* for `unsynced_milestone`, and when the window
+        closed for the two window grounds. In every case it is what the queue's ordering and
+        Docs/04 §8's acknowledgement targets are measured from.
       example: '2026-08-14T02:15:30.000Z'
     job_status:
       type: string
       description: |
         Where the job is now, for triage. It implies nothing about whether a delivery completed
-        this way may auto-complete.
+        through the exception path may auto-complete.
       example: Delivered
 
 AdminUsers:
