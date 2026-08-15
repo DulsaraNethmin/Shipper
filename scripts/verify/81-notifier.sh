@@ -632,8 +632,17 @@ ok "and none names a street type, which is the rule that catches an address writ
 # A capitalised word that does not start a sentence is a name, a suburb, a street or a business.
 # `Shipper` and `Job` are the two exceptions and they are the whole allowlist — anything else here
 # is prose somebody wrote into rules.go that nobody read closely enough.
+#
+# **Subject and body as separate records**, one per line, rather than concatenated. The first
+# version of this check joined them with a separator and the separator itself broke the sentence
+# scan: the email subject ends `(job <uuid>)`, so the body's first word followed a closing bracket
+# rather than a full stop and was reported as a name. The concatenation was an artefact of the
+# check; internal/notifications checks the two halves apart, and so does this.
 "$PSQL" "$DATABASE_URL" -tAc "
-  select replace(subject || ' | ' || body, E'\n', ' ') from notifications
+  select replace(subject, E'\n', ' ') from notifications
+   where recipient_id in ('$notif_customer_id', '$push_customer_id')
+  union all
+  select replace(body, E'\n', ' ') from notifications
    where recipient_id in ('$notif_customer_id', '$push_customer_id');" >"$WORKDIR/notif-copy.txt"
 
 python3 - "$WORKDIR/notif-copy.txt" <<'PY' || fail "a notification names a person, a place or a business"
@@ -650,7 +659,7 @@ for line in open(sys.argv[1]):
             continue
         # Scan back over whitespace and the punctuation that can sit after a full stop.
         i = m.start() - 1
-        while i >= 0 and text[i] in " \t|([\"'*-":
+        while i >= 0 and text[i] in " \t([\"'*-":
             i -= 1
         if i < 0 or text[i] in ".!?:;":
             continue
