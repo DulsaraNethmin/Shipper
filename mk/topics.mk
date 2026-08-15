@@ -12,12 +12,23 @@
 # by accident are both fine. cmd/topics carries the argument for why it is a command rather than
 # something the compose stack or the worker's start-up does.
 #
-# A deployed cluster wants three replicas rather than one:
+# A deployed cluster wants three replicas rather than one, and sets it as configuration:
+#
+#     KAFKA_REPLICATION_FACTOR=3
+#
+# with the flag kept as an operator override for a one-off run:
 #
 #     go run ./cmd/topics -replication 3
 #
-# which is a flag rather than an entry in internal/config, because internal/config is a shared
-# surface — see events.DefaultReplicationFactor.
+# This paragraph said the opposite until the wave-10 reconciliation — "a flag rather than an entry
+# in internal/config, because internal/config is a shared surface". That was true when SHIP-135
+# wrote it and false from SHIP-15m onwards, which folded the setting in: it is
+# config.Kafka.ReplicationFactor, documented in deploy/.env.example, and cmd/topics reconciles the
+# two in chosenReplication with the flag winning. The reasoning the old sentence recorded is worth
+# keeping even though its conclusion flipped — a track parking work against a shared surface is
+# exactly what a prep ticket exists to absorb, and this one was absorbed rather than left standing.
+# See config.DefaultKafkaReplicationFactor and events.DefaultReplicationFactor, which a test in
+# cmd/topics holds equal so the catalogue and the configuration cannot drift apart.
 
 .PHONY: topics
 topics: ## Apply the Kafka topic set — one topic per aggregate (SHIP-135)
