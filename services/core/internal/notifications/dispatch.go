@@ -56,13 +56,18 @@ const DispatchBatch = 20
 // that matters: a text check reads the string, and a text check is satisfied by the words appearing
 // in a comment. Docs/11 §9 records that internal/bidding's equivalent lock has neither.
 //
-// idx_notifications_undelivered (000700) is partial on exactly this predicate, so a platform that
-// has sent a million notifications reads the handful it has not.
+// idx_notifications_undelivered (000702, replacing 000700's) is partial on exactly this predicate,
+// so a platform that has sent a million notifications reads the handful it has not.
+//
+// **Two terminal statuses rather than one, since SHIP-139.** `undeliverable` is what a rejected
+// device token leaves behind (000702): the address is gone, no retry can help, and a row that
+// stayed claimable would be retried against a handset that no longer exists on every pass forever
+// — internal/platform/push/doc.go's "alert that fires forever and is eventually ignored".
 const DispatchClaim = `
 	SELECT id, event_id, event_type, job_id, recipient_id, channel, category, essential,
 	       address, subject, body, status, attempts
 	FROM notifications
-	WHERE status <> 'sent'
+	WHERE status NOT IN ('sent', 'undeliverable')
 	ORDER BY created_at, id
 	FOR UPDATE SKIP LOCKED
 	LIMIT $1`
@@ -97,21 +102,64 @@ func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
 			return 0, fmt.Errorf("notifications: %s (%s): %w", n.ID, n.Channel, err)
 		}
 
-		if sendErr := sender(ctx, n); sendErr != nil {
+		rejected, sendErr := sender(ctx, r, n)
+		switch {
+		case sendErr != nil:
 			if err := s.store.markFailed(ctx, r, n.ID, sendErr.Error()); err != nil {
 				return 0, err
 			}
-			continue
-		}
-		if err := s.store.markSent(ctx, r, n.ID, s.clock.Now().UTC()); err != nil {
-			return 0, err
+
+		case rejected:
+			// The far end says this address no longer exists. See [Service.reject].
+			if err := s.reject(ctx, r, n); err != nil {
+				return 0, err
+			}
+
+		default:
+			if err := s.store.markSent(ctx, r, n.ID, s.clock.Now().UTC()); err != nil {
+				return 0, err
+			}
 		}
 	}
 	return len(due), nil
 }
 
+// reject records that an address is gone, and stops addressing it (SHIP-139, SHIP-140).
+//
+// # This is the branch internal/platform/push/doc.go is written around
+//
+// FCM rejects a device token whenever an app is uninstalled or its data is cleared, which happens
+// across a real install base every hour of every day. It is **normal traffic**, and the two obvious
+// things to do with it are both wrong:
+//
+//   - marking the row `failed` retries a handset that no longer exists on every pass forever, and
+//     counts itself into whatever SHIP-176 alerts on — the alert that fires constantly and is
+//     eventually ignored, including on the day it means something;
+//   - marking it `sent` is a lie a support query cannot see through.
+//
+// So the row becomes `undeliverable` (000702) — terminal and truthful.
+//
+// **Half of the response is missing until SHIP-140**, and it is named here rather than left to be
+// noticed: the platform should also stop addressing the handset, and it cannot, because there is no
+// device token registry to deregister anything from. Until then a dead token keeps being resolved
+// as an address and every event writes one more row that this branch immediately retires. That is
+// bounded and visible — one terminal row per event rather than an unbounded retry — which is why it
+// is worth landing the adapter ahead of the registry rather than after it.
+//
+// A failure here **does** fail the pass, unlike a failed send. A send that bounces is one row's
+// business; a database error while recording that an address is gone is not something the next
+// nineteen rows will survive either.
+func (s *Service) reject(ctx context.Context, r db.Runner, n Notification) error {
+	return s.store.markUndeliverable(ctx, r, n.ID)
+}
+
 // send is one channel's way of delivering one notification.
-type send func(ctx context.Context, n Notification) error
+//
+// It takes the runner because a rejection is recorded in the pass's transaction, and it returns
+// `rejected` for the reason [Pusher] does: a caller cannot forget a value the compiler makes it
+// name, and it could forget an errors.Is. Only push can reject today — see [Service.reject] on why
+// an email bounce is deliberately not the same fact.
+type send func(ctx context.Context, r db.Runner, n Notification) (rejected bool, err error)
 
 // senderFor picks the implementation by the row's channel.
 //
@@ -122,21 +170,24 @@ type send func(ctx context.Context, n Notification) error
 func (s *Service) senderFor(c Channel) (send, error) {
 	switch {
 	case c == ChannelEmail && s.senders.Email != nil:
-		return func(ctx context.Context, n Notification) error {
-			return s.senders.Email.Send(ctx, n.Address, n.Subject, n.Body)
+		return func(ctx context.Context, _ db.Runner, n Notification) (bool, error) {
+			// Never rejects. An email that hard-bounces is learned about
+			// asynchronously through a webhook this MVP does not have (Docs/01 §8),
+			// so the synchronous answer here is accepted or not — see 000702.
+			return false, s.senders.Email.Send(ctx, n.Address, n.Subject, n.Body)
 		}, nil
 
 	case c == ChannelSMS && s.senders.SMS != nil:
-		return func(ctx context.Context, n Notification) error {
-			return s.senders.SMS.Send(ctx, n.Address, n.Body)
+		return func(ctx context.Context, _ db.Runner, n Notification) (bool, error) {
+			return false, s.senders.SMS.Send(ctx, n.Address, n.Body)
 		}, nil
 
 	case c == ChannelPush && s.senders.Push != nil:
-		// Unreachable today: [Rules] writes no push row, because there is no device token
-		// to address one to (SHIP-140) and no adapter to send it with (SHIP-139). The case
-		// is here so that the ticket which supplies both changes this file by deleting a
-		// comment rather than by inventing a shape.
-		return func(ctx context.Context, n Notification) error {
+		// SHIP-139 and SHIP-140 filled this in. The comment that used to be here said the
+		// case existed so the ticket supplying both would delete a comment rather than
+		// invent a shape, and that is what happened — except for the first return value,
+		// which is the one thing the shape did not anticipate. [Pusher] says why.
+		return func(ctx context.Context, _ db.Runner, n Notification) (bool, error) {
 			return s.senders.Push.Push(ctx, n.Address, n.Subject, n.Body, n.JobID)
 		}, nil
 

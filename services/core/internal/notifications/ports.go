@@ -82,18 +82,36 @@ type SMSSender interface {
 	Send(ctx context.Context, to, body string) error
 }
 
-// Pusher delivers a push notification to one device, and nothing implements it.
+// Pusher delivers a push notification to one device.
 //
-// **This is the port SHIP-139 fills**, and declaring it now is the whole of what this ticket can
-// honestly do about push. internal/platform/push holds a doc.go and no code; there is no Firebase
-// adapter, and SHIP-140's device_tokens table — which would supply the `to` below — does not exist
-// either. So [Rules] routes nothing to [ChannelPush] and the dispatcher, handed a nil Pusher,
-// refuses a push row rather than dropping it.
+// SHIP-137 declared this port with nothing behind it; **SHIP-139 filled it** with
+// internal/platform/push, which has an FCM implementation and a no-op one, and SHIP-140 supplied
+// the device tokens the first argument takes. [Rules] routes to [ChannelPush] accordingly.
 //
 // The signature is deliberately the shape a device token takes rather than a user id: Docs/01 §4.5
 // requires a push to deep-link to the job it concerns and to be delivered per device, and a port
 // that took a user would push the resolution of "which devices" behind an interface this domain
 // declares for exactly the wrong reason.
+//
+// # rejected is a return value rather than a sentinel error, and that is the ticket's main decision
+//
+// internal/platform/push/doc.go argues that a rejected token is normal traffic: FCM rejects one
+// whenever an app is uninstalled or its data is cleared, and treating that as a dispatch failure
+// produces an alert that fires forever and is eventually ignored — including on the day it means
+// something.
+//
+// A sentinel error would have expressed that and would not have enforced it. errors.Is is something
+// a caller can forget, and the failure of forgetting is invisible: every rejection counted as a
+// failure, and every dead handset keeping a notification row that retries forever. It could not
+// even have been the adapter's sentinel — this package may not import an adapter — so it would have
+// had to be declared here and returned by a package that does not know this one exists.
+//
+// A first return value is none of those things. It has a name at every call site, the compiler
+// notices its absence, and a reader of any implementation can see that "the token is dead" and "the
+// send failed" are two different answers.
+//
+// rejected true with a nil error means: the message was not delivered and never will be to this
+// device. The device is deregistered (SHIP-140) and the notification is complete for that address.
 type Pusher interface {
-	Push(ctx context.Context, deviceToken, title, body string, jobID uuid.UUID) error
+	Push(ctx context.Context, deviceToken, title, body string, jobID uuid.UUID) (rejected bool, err error)
 }

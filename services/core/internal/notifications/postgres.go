@@ -23,8 +23,8 @@ type postgresStore struct{}
 //
 // A redelivered event resolves exactly the same recipients and produces exactly the same
 // (event_id, recipient_id, channel) triples, so uq_notifications_event_recipient_channel refuses
-// every insert and this returns zero. Nothing had to remember that the event had been seen: the
-// rows are the memory, and they are the same rows a second consumer instance would be racing to
+// every insert and this returns zero. Nothing had to remember that the event had been seen:
+// the rows are the memory, and they are the same rows a second consumer instance would be racing to
 // write.
 //
 // The alternative — SELECT, then INSERT what is missing — is the version that looks equivalent and
@@ -188,6 +188,27 @@ func (postgresStore) markFailed(ctx context.Context, r db.Runner, id uuid.UUID, 
 
 	if _, err := r.Exec(ctx, q, id, reason); err != nil {
 		return fmt.Errorf("notifications: marking %s failed: %w", id, err)
+	}
+	return nil
+}
+
+// markUndeliverable records an address that no longer exists (SHIP-139, 000702).
+//
+// Terminal: the claim's predicate excludes this status, so the row is never worked again. attempts
+// goes up because one was made, and last_error carries the reason so that "why did this person
+// never receive it" is answerable from the row rather than from a log that has rotated.
+//
+// sent_at stays NULL, which ck_notifications_sent_at requires of anything that is not `sent` — the
+// message was not delivered, and a timestamp here would make it look as though it had been.
+func (postgresStore) markUndeliverable(ctx context.Context, r db.Runner, id uuid.UUID) error {
+	const q = `
+		UPDATE notifications
+		   SET status = 'undeliverable', attempts = attempts + 1,
+		       last_error = 'the address was rejected by the channel and has been deregistered'
+		 WHERE id = $1`
+
+	if _, err := r.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("notifications: marking %s undeliverable: %w", id, err)
 	}
 	return nil
 }
