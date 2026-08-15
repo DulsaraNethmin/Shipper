@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/queue/queued_operation.dart';
+import 'package:shipper/core/sync/blocked_updates.dart';
 import 'package:shipper/core/sync/queue_watch.dart';
 
 /// How many updates this device is holding that Shipper does not have (SHIP-126).
@@ -40,8 +41,8 @@ import 'package:shipper/core/sync/queue_watch.dart';
 /// device with nothing pending and one quarantined update would show no indicator at all, and the
 /// user would be left guessing about the one update that most deserves attention. So it is a second
 /// line in different words — *needs attention* rather than *waiting to sync* — and the indicator is
-/// shown when **either** number is above zero. What lost, and to what, is SHIP-132's screen; this
-/// only says that waiting will not fix it.
+/// shown when **either** number is above zero. What lost, and to what, is SHIP-132's panel, which
+/// **this line opens**; this one only says that waiting will not fix it.
 class PendingUpdatesIndicator extends ConsumerWidget {
   const PendingUpdatesIndicator({super.key});
 
@@ -87,12 +88,23 @@ class PendingUpdatesIndicator extends ConsumerWidget {
                 ),
               if (waiting > 0 && stuck > 0) const SizedBox(height: 4),
               if (stuck > 0)
-                _Line(
-                  lineKey: const Key('pending-updates-blocked'),
-                  icon: Icons.error_outline,
-                  text: stuck == 1
-                      ? '1 update needs attention'
-                      : '$stuck updates need attention',
+                // **The way in to SHIP-132**, and the reason it is this line rather than a button
+                // of its own: the bar already says these updates need attention and says nothing
+                // about *what* they are or *why*. A person who reads that and cannot act on it is
+                // the case `Docs/02` §3.1's "never left guessing" is about.
+                //
+                // Tapping does not acknowledge anything. It opens the panel; the panel's own
+                // buttons are the only thing that removes an update.
+                InkWell(
+                  key: const Key('pending-updates-blocked-open'),
+                  onTap: ref.read(blockedUpdatesOpenProvider.notifier).open,
+                  child: _Line(
+                    lineKey: const Key('pending-updates-blocked'),
+                    icon: Icons.error_outline,
+                    text: stuck == 1
+                        ? '1 update needs attention'
+                        : '$stuck updates need attention',
+                  ),
                 ),
             ],
           ),

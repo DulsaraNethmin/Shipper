@@ -584,6 +584,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 | **SHIP-104** | M3 | The customer awards an offer — a modal naming the **price and the provider being committed to** and what awarding costs, because a mis-tap on a horizontally scrolling row of near-identical cards ends the bidding on a delivery at the wrong price and there is no un-award. The result is **read back with `?status=accepted`** rather than computed from what the award is known to do: `Docs/02` §2 makes status the platform's, and a client that derived it keeps a second copy of the state machine. No server change, no new route — *see below* |
+| **SHIP-132** | M4 | The panel that says what happened to a queued update the platform refused, opened from the **second line of SHIP-126's bar** — which said "needs attention" and gave a person nothing to act on. Three quarantine reasons get three different sentences, because *lost to server state* is about a decision somebody made and the other two are about this build. **`BlockedOperation.detail` is never rendered**, per its own note. Nothing is removed by opening or closing it; only the row's own button, which says so. A panel rather than a route **on ownership grounds**, and the file says so — *see below* |
 | **SHIP-143** | M5 | Push registration — and the deregistration **cannot be a listener on the session**, because `signOut` clears the access token before it publishes the state, so the obvious implementation sends a request with no credential and achieves nothing while looking like it worked. `core/auth` grew a `signOutHooksProvider` it fills from `main.dart`, which is `CLAUDE.md`'s composition-root rule on the client side. **The token source is a seam with nothing behind it**: no Firebase project exists and **no ticket anywhere creates one** — *see below* |
 | **SHIP-167a** | M7 | `GET /v1/app/policy` — the unsynced-nudge threshold and the proof compression budget, served beside the build floor and read from configuration on every request. The client half is where the ticket lives: **offline and never-told are two different situations and only the second gets the compiled default**, which is one `if` in `resolveAppPolicy` and the whole of what makes the endpoint reach the devices it exists for. A **budget above `STORAGE_MAX_UPLOAD_BYTES` is refused at startup** — a cross-section rule neither variable is wrong under on its own — *see below* |
 
@@ -11891,6 +11892,68 @@ now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is
 and a database check that are believed to agree are two checks until something compares them.
 
 **Nothing was needed from `internal/config` by any of the five tickets.**
+
+### SHIP-132 — the rung of the ladder that is about a person
+
+SHIP-126 already drew the line — *"$n updates need attention"* — and gave whoever read it nothing to
+do about it. Both of the files above this one say the same thing in their own words:
+`pending_updates_indicator.dart` ends "what lost, and to what, is SHIP-132's screen", and
+`unsynced_nudge.dart` excludes blocked work entirely because "telling a driver to walk up a hill
+about an update that will still be refused when they get there is worse than saying nothing". This
+is what that line opens.
+
+#### Three reasons and three sentences, which is the part a tidier version would collapse
+
+`refused`, `unsupported` and `unreadable` are one enum and are not one situation. **Only the first
+is "lost to server state"** — a decision somebody or something made, which is SHIP-113's
+administrative conflict arriving as a `409`. The other two are statements about *this build*: a kind
+or body version it has no name for, and a row it could not decode at all. Telling a driver their
+delivery update was rejected when in fact the app cannot read its own database would send them to
+argue with an administrator about nothing.
+
+#### `BlockedOperation.detail` is never rendered, and the test asserts on the words
+
+`queued_operation.dart` already said so — "free text for a support conversation. **Never shown as
+user-facing copy** — a screen writes its own words for the reason" — and it is an `ApiFailure`'s
+`toString`, carrying a status, a code and a request id. A panel that rendered it would look
+informative and would say `ApiErrorResponse(409, conflict, r-9f2)` to somebody on a loading dock. The
+test walks every rendered `Text` and refuses the three markers, which is the guard a key check
+structurally cannot be.
+
+#### Retained, not discarded — asserted in all three directions
+
+Opening the panel removes nothing, closing it removes nothing, dismissing the scrim removes nothing,
+and only the row's own button does. **The version that acknowledges on open is the one that reads as
+tidy**, and it is a silent drop of the one thing `Docs/02` §3.1 says must be kept. The button is
+labelled *"I have read this — remove it"* rather than *Dismiss*, because it is the only thing in the
+application that takes a recorded update away.
+
+`SyncWorker.acknowledge` is new and is on the worker rather than called straight through to
+`OperationQueue.acknowledge`, for the reason `record` is there: the queue deletes the row and
+publishes nothing, so the bar would keep counting it until the next pass — which on a phone with
+nothing left to send is never. `OperationQueue.acknowledge`'s existing guard does the rest: it
+refuses anything pending or in flight, so a panel handed the wrong identifier cannot take unsent work
+off a driver's phone.
+
+#### A panel and not a route, and the reason is partly ownership — said rather than dressed up
+
+Two reasons, and both are real. The product one: the indicator is mounted **beside** the navigator in
+`MaterialApp.router`'s builder, which is what makes it persistent (SHIP-126), so there is no
+`Navigator` above it to push onto — a route would mean moving the bar inside the navigator, undoing
+the thing that ticket was about.
+
+The other is ownership. **Adding a location means editing `core/routing/app_router.dart`, which
+another branch held this wave.** A panel needs no route constant and no `_signedInPatterns` entry. A
+route would be worth asking for only if this screen were deep-linked, and it is not: nothing sends a
+notification about a quarantined update, and SHIP-128's 24-hour rung is server-side and addressed to
+operations rather than to the driver. If that changes, the panel becomes a route and the guard entry
+goes in with it.
+
+It sits **under** `UnsyncedNudge` in the builder: work that could still be sent if somebody found
+signal is the more urgent of the two, and a driver reading about a refused update while four hours of
+unsent ones age should be told about the ageing ones first.
+
+**Nothing was needed from `internal/config`.**
 
 ### SHIP-143 — and the deregistration that cannot work the obvious way
 
