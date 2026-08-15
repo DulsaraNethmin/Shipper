@@ -49,6 +49,95 @@ MinimumVersion:
       '500':
         $ref: '../openapi.yaml#/components/responses/InternalError'
 
+AppPolicy:
+  get:
+    operationId: getAppPolicy
+    summary: Operational numbers the client applies on the device
+    tags: [App]
+    description: |
+      The client policy endpoint (SHIP-167a). Two numbers the app applies locally, both of which
+      `CLAUDE.md` says belong server-side — "anything expected to change under operational
+      pressure lives server-side, and Flutter has no over-the-air path for Dart code".
+
+      ## Why they are fetched ahead of time rather than at the moment of use
+
+      Both fire on a handset that **by assumption has no connection**: the unsynced nudge is
+      about work that has not reached the platform, and the compression happens before an upload
+      the device cannot yet make. That is the premise of the two features rather than an
+      oversight in them, so an endpoint read at the moment of use could never have worked.
+
+      So the app reads this **while it still has signal** and keeps the answer. The contract on
+      the client side, which is the half easiest to get subtly wrong:
+
+      - A response received is cached and applied.
+      - With no connection, **the cached response still applies.** Being offline is not a reason
+        to fall back — the whole point is that the value was fetched in advance.
+      - The compiled default is the floor for an install that has **never once** been online,
+        and is the only case it is used for.
+
+      ## Public and unauthenticated
+
+      For the same reason `GET /v1/app/minimum-version` is, and one more of its own: **nothing
+      here is about the caller.** There is no user in the response and no per-account value —
+      two integers, identical on every handset. Requiring a session to learn how long to wait
+      before prompting about unsynced work would ask a device with no connection for a
+      credential it refreshes over the network.
+
+      Both values are read from configuration on every request, so moving either is an
+      operational decision made by changing the environment and restarting, not by cutting a
+      release.
+    responses:
+      '200':
+        description: The numbers currently in force.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [unsynced_nudge_after_seconds, proof_compression_budget_bytes]
+              additionalProperties: false
+              description: |
+                Flat rather than grouped, unlike the version floor. The floor is keyed by
+                platform because platforms multiply; nothing here does — there is one threshold
+                and one budget, the same on every handset.
+              properties:
+                unsynced_nudge_after_seconds:
+                  type: integer
+                  minimum: 1
+                  description: |
+                    How long an update may sit unsynced on a device before the provider is
+                    prompted to go and find signal — `Docs/02` §3.1's second rung, whose
+                    document value is four hours.
+
+                    Seconds rather than a duration string, matching `retry_after_seconds` in
+                    `identity.yaml`: every client language can divide an integer, and a Go
+                    duration string would be an implementation detail on the wire.
+                  example: 14400
+                proof_compression_budget_bytes:
+                  type: integer
+                  minimum: 1
+                  description: |
+                    The size a proof photograph is compressed towards on the device before
+                    upload (`Docs/01` §5.2).
+
+                    **A budget, and `STORAGE_MAX_UPLOAD_BYTES` is the bound — they are different
+                    questions.** The bound is the size above which the platform refuses to sign
+                    an upload at all; this is what a driver on a metered connection in a yard
+                    should be asked to send, and is much the smaller of the two. Startup refuses
+                    a deployment that inverts them.
+
+                    It is a target rather than a limit on the client: `Docs/01` §4.4 makes the
+                    photograph the difference between a delivery that can be completed and one
+                    that cannot, so an image that overshoots is uploaded anyway and the
+                    platform's bound is what actually refuses one.
+                  example: 1048576
+      '405':
+        $ref: '../openapi.yaml#/components/responses/MethodNotAllowed'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+
 PlatformFloor:
   type: object
   required: [minimum_build]

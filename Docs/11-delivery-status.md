@@ -583,6 +583,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
+| **SHIP-167a** | M7 | `GET /v1/app/policy` — the unsynced-nudge threshold and the proof compression budget, served beside the build floor and read from configuration on every request. The client half is where the ticket lives: **offline and never-told are two different situations and only the second gets the compiled default**, which is one `if` in `resolveAppPolicy` and the whole of what makes the endpoint reach the devices it exists for. A **budget above `STORAGE_MAX_UPLOAD_BYTES` is refused at startup** — a cross-section rule neither variable is wrong under on its own — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -11888,6 +11889,84 @@ now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is
 and a database check that are believed to agree are two checks until something compares them.
 
 **Nothing was needed from `internal/config` by any of the five tickets.**
+
+### SHIP-167a — the endpoint two shipped features asked for by name
+
+`core/sync/unsynced_nudge.dart` and `features/delivery/proof_image.dart` each end with the same
+paragraph: this number belongs server-side, `CLAUDE.md` says so, and it is compiled in anyway
+because **the feature fires on a handset that by assumption has no connection.** Both name a
+client-policy endpoint as what would close it and both name `GET /v1/app/minimum-version` as the
+shape. This is that endpoint.
+
+#### The clause that decides whether the ticket is done or merely looks it
+
+*"the app caches the last response and applies it with no connection, falling back to a compiled
+default only when it has never had one."* **Three situations, not two**, and the failure mode is
+collapsing the middle one into the last:
+
+| Situation | What applies |
+|---|---|
+| The platform answered | What it said, written to the cache |
+| No connection, and this device has been online before | **The cached answer** |
+| No connection, and this device has *never* been online | The compiled default |
+
+A build that fell back to the compiled numbers whenever it was offline reads correctly, passes an
+offline test, and **makes the endpoint have no effect at all on the devices it exists for** —
+because those devices are offline at the moment the number is used. `resolveAppPolicy` is that
+decision in three lines, deliberately separated from the providers so it can be read as a table,
+in the same spirit as `verdictFor` and `redirectFor`.
+
+**The mutation this lane was set was exactly that half-meeting**, and it failed six tests: the two
+`resolveAppPolicy` rows that name the cache, the two provider-level offline tests, the
+`isUsable` fall-one-rung row, and the "unusable answer is not written over a good cached one" row.
+See the mutation note in the wave report — **the fixture is what makes it fail**, and it is written
+about at length in `policy_fixture.dart`: the cached policy differs from the compiled default in
+*both* fields, so an assertion that sees its values can only have got them from the cache. A
+fixture caching four hours and one mebibyte would have let the wrong build produce exactly the
+right answer, which is the shape wave 10's surviving mutation had.
+
+#### What is served, and the one number deliberately not
+
+Two integers, flat rather than grouped. The build floor is keyed by platform because platforms
+multiply; nothing here does. **`longestEdge` is not served** though it sits in the same client
+policy object: 1600 pixels is a legibility judgement about a licence plate photographed from two
+metres (`Docs/01` §4.4), not an operations dial, and serving it would let a deployment trade
+evidence for bytes silently. The backlog row asks for the threshold and the budget.
+
+#### The cross-section validation rule, which is the one neither variable is wrong under alone
+
+`PROOF_COMPRESSION_BUDGET_BYTES` above `STORAGE_MAX_UPLOAD_BYTES` is refused at startup. The
+budget is what a client compresses *towards* and the bound is what the platform will *sign for*, so
+a budget above the bound tells every handset to aim at a size guaranteed to be rejected — and the
+symptom is a driver who cannot finish a delivery, with the platform's limit in the refusal and the
+client-side number nobody would think to look at. Neither variable is out of range on its own,
+which is why the check is in `validate` rather than in either loader call.
+
+#### The cache is a file, not a table in the queue's database
+
+Three reasons, in `app_policy_cache.dart`, and the third decides it: `Docs/07` §3 **clears the
+queue at sign-out**, and the policy is about the device rather than the account — it should survive
+a sign-out exactly as the compiled default does. Sharing a store with something deliberately wiped
+is how it would eventually be wiped too. It goes in `getApplicationSupportDirectory()` rather than
+the cache directory for `ProofStore`'s reason: the OS may purge the latter, and a purged policy
+puts a device that has been online for months back on the compiled numbers.
+
+#### The seam that keeps it free for the other 900 tests
+
+`appPolicyCacheProvider` is `null` until `main.dart` supplies one, and **it also decides whether a
+request is made at all**. The nudge reads this policy and lives inside `ShipperApp`, which nearly
+every widget test builds; a provider that fetched on its own would have each of them open a
+connection to whatever base URL the binary was compiled with. Third instance of the inversion
+`queue_watch.dart` and `version_gate.dart` already use, and `app_policy_wiring_test.dart` holds
+`main`'s override the same way theirs do — its absence is a build that runs on the compiled numbers
+forever, makes no request, writes no cache and fails no test.
+
+#### From `internal/config`: two fields on the existing `App` section
+
+`UNSYNCED_NUDGE_AFTER` (`4h`) and `PROOF_COMPRESSION_BUDGET_BYTES` (`1048576`), both on
+`config.App` beside SHIP-167's build floors, both read on every request. No new section, so
+`withApp` in `routes_app_test.go` needed no change — which is the property SHIP-15p rebuilt that
+fixture for.
 
 
 ## 4. Partly done — do not treat these as finished

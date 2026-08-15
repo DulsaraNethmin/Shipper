@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/api/idempotency_key.dart';
+import 'package:shipper/core/policy/app_policy_controller.dart';
 import 'package:shipper/core/queue/operation_queue.dart';
 import 'package:shipper/core/queue/queued_operation.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
@@ -304,7 +305,20 @@ final proofCompressorProvider = Provider<ProofCompressor>((ref) {
 });
 
 /// The compression budget this build uses. See [ProofImagePolicy].
-final proofImagePolicyProvider = Provider<ProofImagePolicy>((ref) => const ProofImagePolicy());
+///
+/// **The size comes from the platform now (SHIP-167a), and the pixels do not.** `GET /v1/app/policy`
+/// carries `proof_compression_budget_bytes`, which is the operational half — what a driver on a
+/// metered connection in a yard should be asked to send, and a number `CLAUDE.md` says belongs
+/// server-side. `longestEdge` and the quality ladder stay compiled in: 1600 pixels is a legibility
+/// judgement about a licence plate photographed from two metres (`Docs/01` §4.4), not a dial
+/// operations should be able to turn, and trading evidence for bytes should be a code change
+/// somebody reviewed.
+///
+/// A device that has never been online uses [ProofImagePolicy]'s own default, which is the same
+/// mebibyte — see `compiledProofCompressionBudgetBytes`, which a test holds against it.
+final proofImagePolicyProvider = Provider<ProofImagePolicy>(
+  (ref) => ProofImagePolicy(maxBytes: ref.watch(appPolicyProvider).proofCompressionBudgetBytes),
+);
 
 /// Where compressed proof photographs are kept.
 ///

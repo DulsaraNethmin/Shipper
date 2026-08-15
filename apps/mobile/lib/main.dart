@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/app.dart';
+import 'package:shipper/core/policy/app_policy_cache.dart';
 import 'package:shipper/core/sync/queue_watch.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 import 'package:shipper/core/version/running_build.dart';
@@ -64,10 +65,22 @@ Future<void> main() async {
   // every widget test call a plugin with nothing behind it and then make an HTTP request. Without
   // this override the app runs with a gate that can never block, however high the platform raises
   // the floor, and `version_gate_wiring_test.dart` holds it for exactly that reason.
+  // The client policy's cache (SHIP-167a), and the third seam of the same shape — see the note
+  // above. `appPolicyCacheProvider` is empty until this line, and an application that never
+  // supplies one runs on the compiled four hours and one mebibyte forever, whatever the platform
+  // is configured with. It also decides whether `GET /v1/app/policy` is called at all, which is
+  // what keeps SHIP-167a free for the widget tests that build `ShipperApp`.
+  //
+  // Awaited, unlike the launch check and like `RunningBuild.read`: it is one directory lookup on a
+  // platform channel with no network in it, and the alternative — resolving it lazily inside a
+  // provider — is the plugin call in every widget test that this seam exists to prevent.
+  final policyCache = await FileAppPolicyCache.open();
+
   final container = ProviderContainer(
     overrides: [
       queueWatchProvider.overrideWith((ref) => ref.watch(syncWorkerProvider)),
       runningBuildProvider.overrideWithValue(runningBuild),
+      appPolicyCacheProvider.overrideWithValue(policyCache),
     ],
   );
   unawaited(container.read(syncWorkerProvider).start());

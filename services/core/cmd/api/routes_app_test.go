@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
@@ -142,5 +143,104 @@ func TestMinimumVersionNeedsNoAuthentication(t *testing.T) {
 	status, _ := getMinimumVersion(t, routerWithApp(t, config.App{MinimumIOSBuild: 1, MinimumAndroidBuild: 1}))
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		t.Errorf("status = %d; the upgrade gate must be reachable without credentials", status)
+	}
+}
+
+func getAppPolicy(t *testing.T, router http.Handler) (int, appPolicyResponse) {
+	t.Helper()
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/app/policy", nil))
+
+	var body appPolicyResponse
+	if rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decoding the response: %v (body %s)", err, rec.Body.String())
+		}
+	}
+	return rec.Code, body
+}
+
+// SHIP-167a's acceptance criterion, the platform half: GET /v1/app/policy serves the
+// unsynced-nudge threshold and the proof compression budget. The client half — cache, apply
+// offline, fall back only when it has never had one — is held in apps/mobile/test/core/policy.
+func TestAppPolicyServesTheThresholdAndTheBudget(t *testing.T) {
+	router := routerWithApp(t, config.App{
+		MinimumIOSBuild:             1,
+		MinimumAndroidBuild:         1,
+		UnsyncedNudgeAfter:          4 * time.Hour,
+		ProofCompressionBudgetBytes: 1 << 20,
+	})
+
+	status, body := getAppPolicy(t, router)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+
+	if body.UnsyncedNudgeAfterSeconds != 14400 {
+		t.Errorf("unsynced_nudge_after_seconds = %d, want 14400 (four hours, Docs/02 §3.1)",
+			body.UnsyncedNudgeAfterSeconds)
+	}
+	if body.ProofCompressionBudgetBytes != 1<<20 {
+		t.Errorf("proof_compression_budget_bytes = %d, want %d",
+			body.ProofCompressionBudgetBytes, 1<<20)
+	}
+}
+
+// Both numbers come from configuration, which is the whole reason the endpoint exists: they are
+// operations tuning knobs, and a client cannot be asked to wait for a store release. This is the
+// test that fails if either is replaced by a constant.
+func TestTheClientPolicyComesFromConfiguration(t *testing.T) {
+	_, first := getAppPolicy(t, routerWithApp(t, config.App{
+		UnsyncedNudgeAfter: 4 * time.Hour, ProofCompressionBudgetBytes: 1 << 20,
+	}))
+	_, second := getAppPolicy(t, routerWithApp(t, config.App{
+		UnsyncedNudgeAfter: 90 * time.Minute, ProofCompressionBudgetBytes: 512 << 10,
+	}))
+
+	if first.UnsyncedNudgeAfterSeconds == second.UnsyncedNudgeAfterSeconds {
+		t.Error("the nudge threshold did not follow the configuration; is it hard-coded?")
+	}
+	if first.ProofCompressionBudgetBytes == second.ProofCompressionBudgetBytes {
+		t.Error("the compression budget did not follow the configuration; is it hard-coded?")
+	}
+}
+
+// Nothing in the response is about the caller — two integers, identical on every handset — and
+// the app reads it on a device that may have no usable session. Requiring one would put the
+// values behind the very connection they exist to survive without.
+func TestAppPolicyNeedsNoAuthentication(t *testing.T) {
+	status, _ := getAppPolicy(t, routerWithApp(t, config.App{
+		UnsyncedNudgeAfter: time.Hour, ProofCompressionBudgetBytes: 1 << 20,
+	}))
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		t.Errorf("status = %d; the client policy must be reachable without credentials", status)
+	}
+}
+
+// The wire carries seconds, not a Go duration string.
+//
+// `retry_after_seconds` in contracts/paths/identity.yaml is the precedent, and the reason is that
+// "1h30m0s" is a fact about Go's formatter rather than about the setting. A client parsing it
+// would be parsing this service's implementation.
+func TestTheThresholdTravelsAsSeconds(t *testing.T) {
+	router := routerWithApp(t, config.App{
+		UnsyncedNudgeAfter: 90 * time.Minute, ProofCompressionBudgetBytes: 1 << 20,
+	})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/app/policy", nil))
+
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+
+	seconds, ok := raw["unsynced_nudge_after_seconds"].(float64)
+	if !ok {
+		t.Fatalf("unsynced_nudge_after_seconds = %#v, want a number", raw["unsynced_nudge_after_seconds"])
+	}
+	if int(seconds) != 5400 {
+		t.Errorf("unsynced_nudge_after_seconds = %d, want 5400", int(seconds))
 	}
 }
