@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**215 tickets, 667 points.**
+**221 tickets, 686 points.**
 
 ## How to read this
 
@@ -24,7 +24,9 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 
 **Depends on** lists real blockers only, not merely earlier tickets. Where a ticket has no dependency it can genuinely be pulled forward if you want a change of pace.
 
-**Dependencies point backwards, with exactly five forward edges across four tickets — do not write a parser that assumes otherwise, and count edges rather than rows.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, `SHIP-15m` depends on `SHIP-44` **and** `SHIP-135` — two edges from one row, which is why this sentence says which unit it is counting — and `SHIP-70a` depends on `SHIP-90`. All of them exist because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Every one of those targets is long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
+**Dependencies point backwards, with exactly seven forward edges across six tickets — do not write a parser that assumes otherwise, and count edges rather than rows.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, `SHIP-15m` depends on `SHIP-44` **and** `SHIP-135` — two edges from one row, which is why this sentence says which unit it is counting — `SHIP-30a` depends on `SHIP-151`, `SHIP-70a` depends on `SHIP-90`, and `SHIP-134a` depends on `SHIP-135`. All of them exist because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Every one of those targets is long since done, so nothing computed today changes; the risk is a future tool treating "no forward edges" as an invariant it can rely on. Compute startability from the dependency column itself, never from ticket order.
+
+**This figure is hand-maintained and has been checked by a parser rather than counted by eye.** Both totals above and the milestone table below are the same kind of number — the rows are the truth, `scripts/delivery-status.sh` reads them, and nothing reads this sentence. Whoever adds a lettered row recounts all three in the same change.
 
 **The two totals above are maintained by hand and the rows are the truth.** `scripts/delivery-status.sh` parses the rows, so `make status` is unaffected by a stale header — which is precisely why one drifted unnoticed after SHIP-15e was added. If the two disagree, correct the header.
 
@@ -36,14 +38,14 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
 | **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 38 | 106 |
-| **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 28 | 78 |
+| **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 27 | 81 |
-| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 29 | 101 |
-| **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 31 | 107 |
-| **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 13 | 45 |
-| **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 20 | 65 |
+| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 31 | 107 |
+| **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 32 | 110 |
+| **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
+| **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 21 | 67 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 20 | 58 |
-| | | **215** | **667** |
+| | | **221** | **686** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -115,13 +117,14 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M1 — Identity and access
 
 **Goal:** A person can register, verify, choose a role, and stay signed in across app restarts.  
-**Size:** 28 tickets, 78 points
+**Size:** 29 tickets, 83 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
 | SHIP-28 | users table migration | 2 | Table exists with email, phone, role, status, verification state | SHIP-7 |
 | SHIP-29 | Password hashing with a modern KDF | 2 | Passwords stored with argon2id; no reversible storage anywhere | SHIP-28 |
 | SHIP-30 | Registration endpoint | 3 | POST /v1/auth/register creates an unverified account and rejects duplicates | SHIP-29 |
+| SHIP-30a | A user's name, collected at registration | 5 | Registration requires a name and `users` holds it in a column of its own; the app's registration screen collects it; and GET /v1/admin/users matches a search term against it — so all four of SHIP-151's terms answer on the wire rather than three | SHIP-30, SHIP-151 |
 | SHIP-31 | Email verification token issue and storage | 2 | A single-use, expiring token is generated and stored on registration | SHIP-30 |
 | SHIP-32 | Email sending adapter | 3 | Emails log to console in dev and send via the provider in staging | SHIP-8 |
 | SHIP-33 | Email verification confirm endpoint | 2 | POST /v1/auth/verify-email marks the address verified and consumes the token | SHIP-31, SHIP-32 |
@@ -149,6 +152,12 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-55 | Flutter login screen | 2 | An existing user can sign in and lands in the correct role shell | SHIP-49, SHIP-41 |
 
 **SHIP-37 depended on SHIP-30 until wave 1, and no longer does.** Issuing a signed token is a pure function of a user id, a role, a session id and a clock, all of which exist once `users` does — the registration endpoint is the first *caller*, not a blocker. Under the rule in *How to read this*, that made it an earlier ticket rather than a real blocker, and the effect was to hold a two-day piece of work behind an endpoint that needs it. Amended to SHIP-28 so the identity foundation can be built alongside the endpoints that consume it. SHIP-39 and SHIP-44 continue to depend on SHIP-37, which is a real blocker in both cases.
+
+**SHIP-30a re-opens a milestone that had been complete, and that is the honest reading rather than an accounting slip.** M1 stood at 28 of 28 from wave 4 until this row was written; it now stands at 28 of 29. **Its exit criterion is untouched** — "a person can register, verify, choose a role, and stay signed in across app restarts" needs no name and is still demonstrated on a real handset. What is short is a field two later tickets assumed: `users` has never had a name column, `000002_users` never had one and registration has never asked, and the only `name` columns anywhere in the schema are `admin_users.name` and `driver_assignments.driver_name` — neither of which is a user's.
+
+**It is here rather than in M6 because a name cannot be backfilled.** SHIP-151 shipped searching users by email, phone and status, and its *Done when* says "email, phone, name, and status"; `Docs/11` §4 has carried it as partly met since. The gap is not the search — serving it is one more `OR` in `internal/admin/postgres_users.go` and one line in the contract — it is that nothing ever collected the value. That makes this registration's work, and the letter-suffix rule puts a ticket where it belongs rather than where its blockers sit.
+
+**The forward edge to SHIP-151 is deliberate and is one of the six tickets *How to read this* counts.** The column, the endpoint, the contract and the app screen are all M1 work with backward dependencies; the one clause that needs SHIP-151 is the search term, and splitting the row in two to avoid one edge would leave SHIP-151 partly met with the closing half unowned — which is the exact shape this row exists to end. **The migration is a new one in the shared block (1–99), not an edit to `000002`**: `000005_users_role_is_immutable` is the precedent, and rewriting an applied migration breaks every database that has run it.
 
 ## M2 — Jobs
 
@@ -194,7 +203,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M3 — Bidding and award
 
 **Goal:** Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one.  
-**Size:** 29 tickets, 101 points
+**Size:** 31 tickets, 107 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -216,7 +225,9 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-93 | Award closes all competing bids atomically | 3 | Every other bid on the job becomes Rejected in the same transaction | SHIP-92 |
 | SHIP-94 | Award idempotency | 3 | A retried award with the same key returns the original outcome, not an error | SHIP-92, SHIP-15 |
 | SHIP-95 | Award concurrency test suite | 5 | Tests prove correctness under double award, withdraw-during-award, and expiry-during-award races | SHIP-93, SHIP-94 |
+| SHIP-95a | Race test for the Negotiating presentation lock | 3 | An expiry sweep and an award are observed contending for the same job row — by polling pg_blocking_pids until PostgreSQL confirms it, as SHIP-95 does — and removing SKIP LOCKED from LeaveNegotiation fails the test rather than passing make check | SHIP-90, SHIP-95 |
 | SHIP-96 | Bid history visibility rules | 3 | Customer, bidding provider, and admin each see only what Docs 02 §4 permits | SHIP-88 |
+| SHIP-96a | A provider reads a job once it has left the open feed — `GET /v1/fleet/jobs/{id}`, auth class `RequireUser` | 3 | A provider holding any bid on a job, live or closed, and the provider awarded it, read that job in the same budget-stripped shape the open feed serves, for as long as the bid or the award exists; a provider with neither gets exactly what a missing job gets; the response carries no budget in any form | SHIP-83, SHIP-92, SHIP-96 |
 | SHIP-97 | Job-scoped messaging between customer and provider | 5 | Messages attach to a job and are visible only to its two parties and admins | SHIP-84 |
 | SHIP-98 | Flutter provider fleet management | 5 | Provider can manage vehicles from the app | SHIP-49, SHIP-78 |
 | SHIP-99 | Flutter provider job feed | 3 | Provider sees eligible open jobs with filters | SHIP-98, SHIP-82 |
@@ -236,10 +247,16 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 
 **The route is `GET /v1/fleet/bids` rather than anything under `/v1/jobs/`, and that is a constraint rather than a preference.** `GET /v1/jobs/open/{id}` puts a literal in the `{id}` position, so it and any `GET /v1/jobs/{id}/<literal>` both match `/v1/jobs/open/<literal>` with neither more specific — Go's `ServeMux` panics at registration and the process does not start. A provider's own bids are a fleet-side collection anyway, beside `/v1/fleet/vehicles`.
 
+**SHIP-96a closes two recorded gaps with one read, and writing it as one ticket is the point of the row.** The first is SHIP-129's, recorded in wave 7 by three lanes independently: nothing serves a job to the provider delivering it, so the milestone screen can show a job identifier and no address, no customer and no pickup window. The second is its mirror at the other end of the bid — `GET /v1/jobs/open/{id}` filters on `status IN ('Open','Negotiating')` and on the eligibility predicate, so "View the job" works while an offer is live and stops the instant the job is awarded, cancelled or expires. **The provider who wins a job loses their view of it by winning**, and every provider who lost it loses theirs in the same transaction. One read answers both, because both audiences are "a provider with a relationship to this job that is not eligibility".
+
+**What the response is, and what it is not.** It is `openJobResponse` — SHIP-83's budget-stripped shape, held to a closed key set by three separate guards — with the *authorisation* predicate changed and nothing else: eligibility is replaced by "you hold a bid on this job, or you hold the award". `GET /v1/jobs/{id}` is the customer's job and carries their budget, and one shape with a redaction step somebody has to remember is the arrangement the privacy rule is hardest to keep with. It is **not** the delivery shelf: `GET /v1/jobs/{id}/delivery/detail` (SHIP-115a) serves the driver assignment and nothing about the job itself, which is why building it did not close this. `/v1/fleet/jobs/{id}` avoids the `ServeMux` panic the paragraph above describes, and sits beside `/v1/fleet/bids` where a provider's own things already live.
+
+**SHIP-95a exists because the guard it tests is the strongest untested invariant on the board, and that was verified rather than suspected.** `LeaveNegotiation`'s `FOR UPDATE SKIP LOCKED` in `cmd/api/routes_bidding.go` is what keeps the `bids` → `jobs` lock order out of the sweep, against the award's `jobs` → `bids`; making it blocking reintroduces exactly the cycle SHIP-88's ordering exists to prevent, and `make check` exits 0 with the mutation applied. It is a **survivor by inspection**: a deadlock needs a sweep and an award racing, and a single-transaction test cannot produce that failure — one that appeared to would be testing something else. **The harness already exists.** SHIP-95 observes contention by holding a transaction open and polling `pg_blocking_pids` until PostgreSQL confirms the other backend is waiting, and wave 9 built the same shape for the delivery sweep in `TestTwoWorkersCompleteEachDeliveryExactlyOnce`. Three points is one race test per claim, extending that harness rather than writing a third.
+
 ## M4 — Delivery execution
 
 **Goal:** A driver completes a delivery with proof, offline, through a link that needs no account.  
-**Size:** 31 tickets, 107 points
+**Size:** 32 tickets, 110 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -272,6 +289,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-129 | Flutter milestone update UI | 3 | Provider records milestones with optimistic local state clearly marked pending | SHIP-125 |
 | SHIP-130 | Flutter camera capture with on-device compression | 5 | Photo captured, compressed, queued, and never written to the photo library | SHIP-129, SHIP-114 |
 | SHIP-131 | Flutter camera permission fallback | 3 | A denied permission offers the exception path instead of a dead end | SHIP-130, SHIP-116 |
+| SHIP-131a | The driver's own words on a milestone | 3 | A note typed on any screen that records a milestone — the Flutter proof-exception panel, the Flutter milestone screen and the driver portal — arrives as MilestoneRecording.reason and is read back on the customer's tracking view; it stays optional, and on the exception path it sits beside the selected reason rather than instead of one | SHIP-123, SHIP-129, SHIP-131 |
 | SHIP-132 | Flutter offline conflict reconciliation UI | 3 | The user is shown clearly when a queued update lost to server state | SHIP-125, SHIP-113 |
 | SHIP-133 | Flutter customer tracking view | 3 | Customer sees the latest confirmed milestone and proof of delivery | SHIP-77, SHIP-115 |
 
@@ -281,14 +299,21 @@ Five segments or more are safe, because the literal route has only three after `
 
 **SHIP-120a exists because three separate lanes specified it in wave 7 and none built it**, each correctly finding it belonged to another lane's ticket. The auth class is in the row for that reason: `RequireDriverToken` is the whole of why the route is separate from `POST /v1/jobs/{id}/milestones`, which is `RequireUser` and always will be. Neither token may be exchanged for the other, so the driver's route is a second entry point to the same milestone service rather than a relaxation of the first one's guard. SHIP-121 is the driver portal's screen over it.
 
+**SHIP-131a is a field the platform has always accepted and no client has ever sent.** `MilestoneRecording.reason` is in the published contract — optional, 500 characters, "what a person should know about this milestone that the milestone itself does not say" — and `internal/delivery` bounds and stores it. Measured across both client trees: the driver portal's `recordMilestone` takes `evidence`, `completion` and `recordedAt` and no note; the Flutter client sends `reason` on a job **cancellation** and on no milestone; and the Flutter tracking view *reads* one back and renders it. So the customer-facing surface can display a note that nothing in the product can write.
+
+**Why it matters more on the exception path than anywhere else.** A reasoned exception is a *selection* from a closed list of three, which is what makes it enforceable and what `ck_proofs_exception_reason` pairs with — and a closed list is only triageable in `Docs/04` §5's delivery-exception queue if the driver can say which of the three it was and why. "The recipient asked me not to photograph their door" is the sentence that turns a queue entry into a decision, and today there is nowhere to type it. `Docs/11` §3's SHIP-131 entry names the gap and says it should be a ticket; this is it.
+
+**It writes into two trees, and that is priced into how it should be scheduled rather than into the estimate.** SHIP-56a is the worked example: a ticket touching `services/core`, `apps/mobile` and `apps/driver-portal` at once lost to every ticket that opened one tree and was cut from six consecutive waves. This one opens no Go package at all — the platform half is already built — so it wants a wave in which one lane already holds `apps/mobile` or `apps/driver-portal`, or a serial slot. Do not defer it without writing down why; a deferral with no reason is how SHIP-56a went quiet.
+
 ## M5 — Notifications
 
 **Goal:** Every essential event reaches the right person, without a notification failure losing the event.  
-**Size:** 13 tickets, 45 points
+**Size:** 14 tickets, 48 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
 | SHIP-134 | Transactional outbox table and publisher | 5 | Domain events commit with their transaction and publish at least once | SHIP-4, SHIP-57 |
+| SHIP-134a | The outbox-to-topic check survives a concurrent worktree | 3 | scripts/verify/80-notifications.sh neither deletes a topic another run may be reading nor asserts set equality over one: its SHIP-134 comparison is subset-plus-completeness scoped to the outbox ids this run created, and the section passes while a second make verify publishes into the same broker — demonstrated by running two concurrently, not argued | SHIP-134, SHIP-135 |
 | SHIP-135 | Kafka topics and event schema | 3 | Topics exist with a versioned schema for each domain event | SHIP-134 |
 | SHIP-136 | Emit domain events from job, bid, and delivery transitions | 5 | Every state change in Docs 01 §4.5 emits its event from the domain, not the API layer | SHIP-135 |
 | SHIP-137 | Notification consumer service | 5 | Consumer reads events, resolves recipients, and dispatches per channel | SHIP-136 |
@@ -302,14 +327,19 @@ Five segments or more are safe, because the literal route has only three after `
 | SHIP-145 | Flutter deep link routing | 5 | Tapping a notification opens the exact job, bid, or dispute it concerns | SHIP-143 |
 | SHIP-146 | Flutter notification inbox | 3 | In-app list of recent notifications with read state | SHIP-145 |
 
+**SHIP-134a is an assertion-design ticket rather than a harness one, and that distinction is why it is a row rather than a lane's passing fix.** `80-notifications.sh` compares `consumed_sorted` against `outbox_sorted` — set **equality** over `shipper.job`. One broker serves every worktree on the machine, so a concurrent run's events land inside that set and the check fails on a tree where nothing is wrong; wave 9 saw it twice, identified by id in both cases. **No fence closes it.** Fencing narrows where a consumer starts reading and says nothing about what else arrives, so the equality has to become subset-plus-completeness over ids this run created — and somebody has to decide what completeness means once "everything on the topic" stops being the answer. That is a change to what a guard asserts, which is exactly the thing a lane must not weaken in passing.
+
+**The deletion is the other half and is the reason a fence alone is not enough either.** The section deletes and recreates `shipper.job` on every run, and its own header says that is "safe today only because no other section asserts on a topic it did not create" — a justification scoped to *sections*, which does not survive a second worktree. A delete destroys the offsets a run-start fence captured, so the neighbouring run's subset check fails reporting its own ids as missing. Once the comparison is scoped to this run's ids the deletion has nothing left to buy, which is why the row asks for both in one change. `CLAUDE.md`'s worktree table carries the operational rule meanwhile: serialise `make verify` across trees.
+
 ## M6 — Administration and moderation
 
 **Goal:** Support can see everything, act on it, and leave an auditable trail.  
-**Size:** 20 tickets, 65 points
+**Size:** 21 tickets, 67 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
 | SHIP-147 | Admin authentication, separate from user auth | 5 | Admin sign-in is independent and cannot be reached with a user token | SHIP-44, SHIP-22 |
+| SHIP-147a | The platform's password cost is configured under its own name | 2 | One argon2id cost setting, named for the platform rather than for identity, with one environment prefix; the identity and admin hashers and deploy/.env.example all read the renamed setting, no second cost knob exists anywhere, and the release note says which variable a deployment must rename | SHIP-147 |
 | SHIP-148 | Admin roles and least-privilege permissions | 3 | Permissions are granular and default to the minimum | SHIP-147 |
 | SHIP-149 | audit_log table and write helper | 3 | Append-only log capturing actor, action, target, timestamp, and reason | SHIP-7 |
 | SHIP-150 | Audit every privileged action | 5 | All admin mutations write an audit entry; verified by test | SHIP-149, SHIP-148 |
@@ -329,6 +359,10 @@ Five segments or more are safe, because the literal route has only three after `
 | SHIP-164 | Admin dispute workflow and outcome | 5 | Dispute moves through investigation to a documented outcome that unfreezes the job | SHIP-163, SHIP-150 |
 | SHIP-165 | Admin audit log viewer | 3 | Immutable history is searchable by actor, target, and date | SHIP-150 |
 | SHIP-166 | Two-person review for permanent suspension | 3 | A permanent suspension requires a second administrator's approval | SHIP-161 |
+
+**SHIP-147a sits in M6 because M6 is where the name became wrong, not because a configuration rename is administration work.** `Config.Identity.Argon2` and `IDENTITY_ARGON2_*` were accurate until SHIP-147: argon2id lived in `internal/identity` and the cost was that domain's. SHIP-15r moved the hashing to `internal/passwords` precisely so a second domain would not be the reason for a second implementation, and SHIP-147 then hashed an administrator's password with the same profile — correctly, because a second cost knob is `Docs/10` §3.4's failure one level up: two security parameters that agree by comment until somebody raises one. `cmd/api/routes_admin.go` says so in the comment beside the call and records that the field's name is now narrower than its meaning. The letter suffix puts the row at the ticket that made the statement false.
+
+**It is two points and it gets more expensive, which is the argument for not letting it drift to M7.** The change is one section in `internal/config`, one environment prefix, two `cmd/api` call sites, `deploy/.env.example` and the configuration tests — and today no deployment exists to have `IDENTITY_ARGON2_*` set in its secret store. **The environment variable is an operational contract rather than an internal name**, so the ticket's *Done when* asks for the release note as well as the rename: after the first deployment this stops being a rename and becomes a migration somebody has to sequence. That is also why it is a ticket rather than a prep-branch edit — deciding whether to accept both names for one release is a decision, not a mechanical substitution.
 
 ## M7 — Hardening and pilot readiness
 
