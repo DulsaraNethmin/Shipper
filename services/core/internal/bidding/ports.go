@@ -467,9 +467,15 @@ type Vehicles interface {
 // **It is deliberately thin, and the thinness is a finding rather than an omission.** `internal/
 // profiles` — which Docs/06 §3 gives "profile detail" and the five verification states of Docs/04
 // §4 — is `doc.go` and nothing else at wave 10, and the only provider profile that exists is
-// `fleet.Profile`, whose two fields are precisely the two this response may not carry. So there is
-// no trading name, no rating and no completed-job count to show, and this carries the two facts the
-// database can actually answer. Docs/11 §3 records what SHIP-153…SHIP-159 will add.
+// `fleet.Profile`, whose two fields are precisely the two this response may not carry. So there was
+// no trading name, no rating and no completed-job count to show, and this carried the two facts the
+// database could actually answer.
+//
+// **SHIP-79a created the trading name rather than finding one**, adding `provider_profiles` (000303)
+// and `fleet.PublicProfile` — the closed set a customer may be shown, defined once in the domain
+// that owns the declaration. A rating and a completed-job count are still absent and still declined
+// on the record: the first implies a review mechanism nobody has specified, the second a definition
+// that belongs to Docs/02 and data that belongs to another domain.
 type ProviderSummary struct {
 	// ID is the provider the negotiation is with.
 	//
@@ -491,8 +497,28 @@ type ProviderSummary struct {
 	//
 	// Not a rating and not a job count — neither exists, and "other jobs" is a thing this response
 	// may not carry at all. How long somebody has been on the platform is a fact about the account
-	// rather than about their work, and it is the only durability signal available.
+	// rather than about their work.
 	MemberSince time.Time
+
+	// DisplayName is who the provider trades as, and OperatesAs is whether that is a person or a
+	// business (SHIP-79a).
+	//
+	// **The two fields that made this summary say something about the provider rather than about
+	// their account.** Until SHIP-79a a customer comparing offers could be told an identifier,
+	// whether an email address had been confirmed, and a date — none of which is a fact about who
+	// is offering to carry their sofa. `fleet.PublicProfile` is where the closed set is defined and
+	// `cmd/api` maps it here; this package deliberately does not own the list, so a second
+	// disclosure adds a mapping rather than a second opinion about what a customer may see.
+	//
+	// Empty when the provider has not declared them, which is an ordinary state: a provider can
+	// bid before finishing their profile, and the screen renders "not stated". Never filled in from
+	// an email address or a phone number — Docs/01 §7 minimises how far those travel, and a
+	// fallback that leaked one would be worse than a blank.
+	//
+	// **Still not the service area and still not the specialties.** SHIP-102a's *Done when* forbids
+	// both by name, and widening this summary is exactly the moment somebody would add them.
+	DisplayName string
+	OperatesAs  string
 }
 
 // VehicleSummary is what a customer comparing offers may know about the vehicle one is made with

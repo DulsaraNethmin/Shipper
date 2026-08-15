@@ -468,6 +468,16 @@ func (h *Handler) List() http.Handler {
 // top-level lists — but the grains still move independently inside it, because a provider adding a
 // postcode should not have to resend every state.
 type profileRequest struct {
+	// DisplayName and OperatesAs are the public half (SHIP-79a) — the only two fields of this
+	// request a customer will ever read back.
+	//
+	// **A first declaration has to send both**, because 000303 makes both columns NOT NULL and
+	// there is no half-declared provider. Afterwards either may be sent alone. Sending
+	// `"display_name": ""` is refused rather than treated as a clearance: a provider who has told
+	// customers who they are cannot go back to being an identifier on a comparison screen.
+	DisplayName *string `json:"display_name"`
+	OperatesAs  *string `json:"operates_as"`
+
 	ServiceArea *serviceAreaRequest `json:"service_area"`
 	Specialties *[]string           `json:"specialties"`
 }
@@ -492,6 +502,9 @@ type serviceAreaRequest struct {
 func (b profileRequest) fields() ProfileFields {
 	f := ProfileFields{}
 
+	f.DisplayName = b.DisplayName
+	f.OperatesAs = b.OperatesAs
+
 	if b.ServiceArea != nil {
 		f.States = b.ServiceArea.States
 		f.Postcodes = b.ServiceArea.Postcodes
@@ -514,6 +527,16 @@ func (b profileRequest) fields() ProfileFields {
 // distinction is exactly what the client is editing. A provider who has declared nothing gets three
 // empty arrays, which a client can render and iterate without a nil check.
 type profileResponse struct {
+	// DisplayName and OperatesAs are the public half (SHIP-79a).
+	//
+	// **Omitted when undeclared rather than sent empty**, which is the treatment [vehicleResponse]
+	// gives an unstated capacity and the opposite of the lists below. The difference is what the
+	// absence means: an empty list is a real declaration ("I serve no single postcodes"), and an
+	// absent name is a provider who has not got to that part of onboarding — a state the client
+	// renders as a prompt rather than as a value.
+	DisplayName string `json:"display_name,omitempty"`
+	OperatesAs  string `json:"operates_as,omitempty"`
+
 	ServiceArea serviceAreaResponse `json:"service_area"`
 	Specialties []string            `json:"specialties"`
 }
@@ -535,6 +558,8 @@ type serviceAreaResponse struct {
 // keeps the shape of the API a decision of this file's.
 func profileFrom(p Profile) profileResponse {
 	out := profileResponse{
+		DisplayName: p.Public.DisplayName,
+		OperatesAs:  p.Public.OperatesAs.String(),
 		ServiceArea: serviceAreaResponse{States: []string{}, Postcodes: []string{}},
 		Specialties: []string{},
 	}

@@ -585,6 +585,7 @@ The file's own header says which invocation demonstrates which claim.
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 | **SHIP-83a** | M3 | The provider feed moves off the `{id}` slot: `GET /v1/jobs/open` and `/v1/jobs/open/{id}` become **`GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}`**, gone rather than aliased. That frees the whole four-segment `GET /v1/jobs/{id}/<literal>` space four earlier tickets each paid a workaround for, **demonstrated by registering one** rather than asserted — `TestFourSegmentJobLiteralsCanBeRegistered` attaches the real route table plus a probe route and fails if the mux refuses the pair — *see below* |
 | **SHIP-96a** | M3 | `GET /v1/fleet/jobs/{id}` widens from eligibility to **relationship**: a provider reads a job they hold any bid on — live or closed, and therefore the job they were awarded — for as long as the bid exists, in the same budget-stripped shape the feed serves. One SQL predicate (`readable` = `eligible OR the caller holds a bid`), one column list, one response type; **bidding is deliberately not widened with it**. A provider with neither relationship gets exactly what a missing job gets. The budget guard gained a **word-level** check, because a sentence defeats a closed key set — *see below* |
+| **SHIP-79a** | M3 | A provider declares **who they trade as** — `display_name` and `operates_as` on `PATCH /v1/fleet/profile`, in a new `provider_profiles` table (`000303`) — and a customer comparing offers is shown them. `fleet.PublicProfile` is the closed set, defined in the domain that owns the declaration and mapped into `bidding.ProviderSummary` by `cmd/api`, so a second discloser adds a mapping rather than a field list. **Neither the service area nor the specialties**, which SHIP-102a forbids. A rating and a completed-job count are declined on the record. **The 'same set as an admin read and the open feed' clause is unmet — neither reader exists** — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -12052,6 +12053,98 @@ after the caller bid, and it is the only field in the shape that says what becam
 contract's `BiddableJobStatus` became `ProviderJobStatus` and lists all twelve, and the Dart model
 already tolerated them — `@JsonKey(unknownEnumValue: JobStatus.unknown)` over the generated
 `JobStatus`, so no client change was needed.
+
+**Nothing was needed from `internal/config`.**
+
+
+### What SHIP-79a built, and the clause of its *Done when* that cannot be met
+
+A customer comparing offers is now told who is offering. `provider_profiles` (`000303`) holds
+`display_name` and `operates_as`; `PATCH /v1/fleet/profile` declares them beside the service area;
+`GET /v1/jobs/{id}/bids/received` discloses them. Before this, the answer to "who is this provider"
+was a UUID, a verification flag and a join date — three facts about an *account*, none of them about
+who is offering to carry the sofa.
+
+#### The fields, and the two that were declined on the record
+
+`Docs/09`'s SHIP-79a note deliberately does not enumerate the fields and rules two out by name: a
+rating "implies a review mechanism nobody has specified", and a completed-job count is "a figure the
+platform can derive". Both stay out. The count is the closer call and the reason is not the
+derivation — it is that "completed" is `Docs/02`'s definition (Completed? Delivered? auto-completed
+after 72 hours?) and the data is another domain's, so `fleet` would be reaching into `jobs` for a
+*decoration*, which is a far weaker case than reaching into it for the eligibility filter. It is
+additive whenever somebody owns the definition. `000303`'s header records both.
+
+`operates_as` is `Docs/01` §4.2's own distinction — "Register as an individual or business" — and it
+grants nothing: no filter reads it, no eligibility rule turns on it. Neither field is a verified
+fact; `Docs/04` §3's document review is what establishes who somebody actually is, and `verified`
+beside them is a statement about the account rather than about the name.
+
+#### The closed set is a type, which is the only part of this that survives the next reader
+
+The *Done when* asks for "a closed set" **and** for the same set to reach every read that discloses a
+provider. A list written out at each disclosure is closed until the second one is written. So
+`fleet.PublicProfile` is the set: `cmd/api`'s offeror directory takes it and maps it into
+`bidding.ProviderSummary`, and `TestThePublicProfileIsAClosedSet` parses the struct and fails on a
+field nobody decided to add. **Whoever writes the second discloser adds a mapping, not a field
+list.**
+
+That is also what keeps SHIP-102a's forbidden pair out. `Profile` still holds the service area and
+the specialties; a disclosure handed `PublicProfile` cannot reach them, where one handed a whole
+`Profile` and copying four of six fields is correct only while somebody keeps copying four.
+`fleet.Service.PublicProfiles` — the batch read `cmd/api/routes_bidding.go` had recorded as missing —
+returns that type and nothing else, so the seam has the same property as the struct.
+
+#### The clause that is **not** met, stated plainly
+
+> "…and the same set is what an admin read and the open feed disclose."
+
+**Neither reader exists, so the clause is met in reduced form and this says so rather than quietly
+counting it.** Measured on this branch: `internal/admin` discloses no provider profile at all — zero
+matches for a provider profile, `provider_service_areas` or `provider_specialties` in its non-test
+sources — and the open job feed (`GET /v1/fleet/jobs`) discloses **no provider in any form**, by
+`eligibility.go`'s own deliberate decision that nothing gives a customer's or a provider's identity
+before an award. There is nothing to align with. `internal/admin` is another lane's this wave and was
+not edited.
+
+What was done instead is the part that survives: the set is a type with a test on it, so the
+alignment is enforceable the moment a second reader appears. **A ticket that adds an administrator's
+provider read or a public directory closes this clause by mapping `fleet.PublicProfile`** — and if it
+writes its own field list instead, that is the defect this row exists to make visible.
+
+#### Three things the fixtures and the guards found, none of them predicted
+
+**`INSERT … ON CONFLICT DO UPDATE` cannot express "leave the unnamed column alone" here.** PostgreSQL
+forms and *checks* the proposed row before arbitrating the conflict, so the placeholder standing in
+for "not named" has to satisfy `ck_provider_profiles_display_name` — and the only value that would is
+a made-up name. Found by `TestAFirstDeclarationNamesBothFields` getting a 500 out of a constraint
+doing its job. The store now has an insert and an update, and `Service.Declare` reads the row under
+the lock it already holds to choose between them — the same read that refuses a half-declaration with
+`required` rather than letting it surface as a 500.
+
+**`TestEveryMutableTableHasItsUpdatedAtTrigger` caught the table without its trigger.** The column was
+there, NOT NULL, defaulting correctly on insert, and would simply never have recorded a change. That
+is the sweep working rather than a near miss, and it is the second time a `migrations` guard has paid
+for itself on a table added in a domain block.
+
+**`make migrate-up` refused `000303` because it is numbered below the database's current version**
+(SHIP-15g). Also the guard working: numbers come from reserved per-domain blocks rather than in time
+order, so a fleet migration written after an admin one is always below it. The remedy the tool prints
+— `make migrate-down n=all && make migrate-up` — was applied to this worktree's own database.
+
+#### What was deliberately not done
+
+**No pattern check on `display_name`.** A trading name that is a phone number is a way to take a deal
+off the platform, and a regular expression refusing digits refuses "3 Kings Removals" as readily as
+"0400 123 456". `Docs/04` §7's moderation is where content nobody can validate belongs and there is
+no queue for profile text yet. **Recorded as a live moderation surface with nothing behind it**, in
+`service.go` and here, rather than solved with a rule that would be wrong in both directions.
+
+**The Flutter client does not render the new fields.** `apps/mobile/lib/features/bidding/**` is
+another lane's this wave. Nothing breaks — `Docs/07` §6 has clients tolerate fields they do not
+recognise, and the generated model ignores unknown keys — but the comparison screen still shows a
+verification tick and a join date. `received_offer.dart` and `compare_offers_screen.dart` are where
+it lands.
 
 **Nothing was needed from `internal/config`.**
 

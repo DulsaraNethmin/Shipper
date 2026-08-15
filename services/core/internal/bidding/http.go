@@ -1344,6 +1344,12 @@ type offerResponse struct {
 type providerSummaryResponse struct {
 	ID string `json:"id"`
 
+	// DisplayName is who the provider trades as, and OperatesAs is `individual` or `business`
+	// (SHIP-79a). Omitted when the provider has not declared them — an ordinary state the client
+	// renders as "not stated", never as an error and never filled in from a contact detail.
+	DisplayName string `json:"display_name,omitempty"`
+	OperatesAs  string `json:"operates_as,omitempty"`
+
 	// Verified is the platform's automated verification: email and phone confirmed, on an account in
 	// good standing. The same predicate `fleet`'s eligibility filter reads, rather than a second one.
 	Verified bool `json:"verified"`
@@ -1386,6 +1392,8 @@ func offerFrom(o ReceivedOffer) offerResponse {
 		bidResponse: bidFrom(o.Bid),
 		Provider: providerSummaryResponse{
 			ID:          o.Provider.ID.String(),
+			DisplayName: o.Provider.DisplayName,
+			OperatesAs:  o.Provider.OperatesAs,
 			Verified:    o.Provider.Verified,
 			MemberSince: timestamp(o.Provider.MemberSince),
 		},

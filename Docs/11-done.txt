@@ -152,6 +152,7 @@ SHIP-77
 # M3 — Bidding and award
 SHIP-78
 SHIP-79
+SHIP-79a
 SHIP-80
 SHIP-81
 SHIP-82

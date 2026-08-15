@@ -868,12 +868,46 @@ ProviderProfileInput:
   type: object
   additionalProperties: false
   description: |
-    A partial declaration. A list that is omitted is left alone; a list that is present replaces its
+    A partial declaration. A field that is omitted is left alone; a list that is present replaces its
     predecessor, including when it is empty.
 
-    A request naming no list at all is refused: it changes nothing, and answering it with the
+    A request naming nothing at all is refused: it changes nothing, and answering it with the
     unchanged declaration would tell a client its edit was applied.
+
+    **The first declaration of the public half has to name both `display_name` and `operates_as`**,
+    and is refused with `validation_failed` naming whichever is missing. Afterwards either may be
+    sent alone. There is no half-identified provider: a customer comparing offers is shown both or
+    neither.
   properties:
+    display_name:
+      type: string
+      minLength: 2
+      maxLength: 80
+      description: |
+        Who you trade as, shown to customers comparing the offers on their job (SHIP-79a) — a
+        business name, or the name you operate under.
+
+        Repeated spaces collapse, so `Smith   Removals` and `Smith Removals` are one name.
+
+        **An empty string is refused rather than clearing it.** A list can be emptied because "I no
+        longer serve any single postcode" is a real declaration; there is no equivalent state for a
+        name, because a provider who has told customers who they are does not go back to being an
+        identifier on a comparison screen.
+
+        A **declaration, not a verified fact.** What it claims is not checked; `Docs/04` §3's
+        document review is what establishes who somebody actually is.
+      example: Yarra Valley Freight
+    operates_as:
+      type: string
+      enum: [individual, business]
+      description: |
+        Whether you trade as a person or as a registered business, in `Docs/01` §4.2's own
+        distinction. Accepted in any case.
+
+        It grants and refuses nothing: no filter reads it, no eligibility rule turns on it, and it
+        is shown to a customer for the same reason `display_name` is — an individual and a business
+        are different propositions to somebody with a piano.
+      example: business
     service_area:
       $ref: '#/ServiceAreaInput'
     specialties:
@@ -934,13 +968,32 @@ ProviderProfile:
   required: [service_area, specialties]
   additionalProperties: false
   description: |
-    What a provider has declared about the work they take.
+    What a provider has declared: who they trade as, and the work they take.
 
     **Every list is always present and never `null`**, which is the opposite of the rule `Vehicle`
     follows and right for the opposite reason: an omitted capacity means the provider has not said,
     whereas an omitted list would mean the same thing as an empty one — and here that distinction is
     exactly what the client is editing.
+
+    **`display_name` and `operates_as` follow the other rule and are omitted when undeclared**, and
+    the difference is what the absence means. An empty list is a real declaration; an absent name is
+    a provider who has not reached that part of onboarding, which the client renders as a prompt.
+
+    **Only those two are ever shown to a customer** (SHIP-79a). The service area and the specialties
+    are what a provider declares commercially and are never disclosed outside this response.
   properties:
+    display_name:
+      type: string
+      maxLength: 80
+      description: |
+        Who this provider trades as. Absent when they have not declared one.
+      example: Yarra Valley Freight
+    operates_as:
+      type: string
+      enum: [individual, business]
+      description: |
+        Whether they trade as a person or as a registered business. Absent when undeclared.
+      example: business
     service_area:
       $ref: '#/ServiceArea'
     specialties:

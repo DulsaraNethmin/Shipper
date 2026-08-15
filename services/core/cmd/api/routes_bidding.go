@@ -284,7 +284,7 @@ func biddingHandler(d Deps) *bidding.Handler {
 		awardableJobs{jobs: newJobService(d)},
 		presentedJobs{jobs: newJobService(d)},
 		offerableVehicles{fleet: fleet.NewService(d.Clock)},
-		offerorDirectory{},
+		offerorDirectory{fleet: fleet.NewService(d.Clock)},
 		d.Clock,
 	)
 
@@ -696,7 +696,7 @@ func (v offerableVehicles) Usable(
 // `provider_specialties` are not read at all — SHIP-102a's *Done when* forbids both, and the way to
 // be sure of that is not to have a statement that could return them. `jobs` is not read either, so
 // there is no budget in reach of this file.
-type offerorDirectory struct{}
+type offerorDirectory struct{ fleet *fleet.Service }
 
 // Describe reads the providers and vehicles one page of offers named.
 //
@@ -704,7 +704,7 @@ type offerorDirectory struct{}
 // [bidding.Service.Offers] renders with what it has. A page of offers must not fail because one of
 // them names something unreadable — and with `ON DELETE RESTRICT` on both references (000300,
 // 000504) the case is very nearly unreachable anyway.
-func (offerorDirectory) Describe(
+func (d offerorDirectory) Describe(
 	ctx context.Context,
 	r db.Runner,
 	offers map[uuid.UUID]bidding.Offeror,
@@ -725,7 +725,7 @@ func (offerorDirectory) Describe(
 		}
 	}
 
-	providers, err := describeProviders(ctx, r, providerIDs)
+	providers, err := d.describeProviders(ctx, r, providerIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -754,7 +754,7 @@ func (offerorDirectory) Describe(
 // this repository wants, and the alternative today is worse: a port into `fleet` for a fact `fleet`
 // derives from `identity`'s table, to answer a question neither domain asked. Docs/11 §3 records
 // SHIP-153…SHIP-159 as what collapses both copies into `profiles`.
-func describeProviders(
+func (d offerorDirectory) describeProviders(
 	ctx context.Context,
 	r db.Runner,
 	ids []uuid.UUID,
@@ -762,6 +762,29 @@ func describeProviders(
 	summaries := make(map[uuid.UUID]bidding.ProviderSummary, len(ids))
 	if len(ids) == 0 {
 		return summaries, nil
+	}
+
+	// Who each provider trades as, from `fleet` rather than from a statement here (SHIP-79a).
+	//
+	// **This is the one part of this file that is not a raw SQL statement, and the asymmetry is
+	// deliberate.** `users` is read here because the fact wanted — email and phone confirmed on an
+	// account in good standing — is a predicate `identity` does not expose and `fleet` copies. The
+	// public profile is different: `fleet.PublicProfile` *is* the closed set of what a customer may
+	// be shown, defined in the domain that owns the declaration, and reading `provider_profiles`
+	// here instead would put a second opinion about that set in a file that is not the one SHIP-79a
+	// asks to be kept in step. `fleet.Service.PublicProfiles` is the batch read this file's earlier
+	// note recorded as missing, written by SHIP-79a because a customer-facing page finally needed
+	// one.
+	//
+	// It returns [fleet.PublicProfile] and nothing else, so `provider_service_areas` and
+	// `provider_specialties` are as far out of reach here as they were when nothing read `fleet` at
+	// all — which is the property the header above claims and this must not weaken.
+	if d.fleet == nil {
+		return nil, fmt.Errorf("cmd/api: no fleet service is wired, so %d providers cannot be described", len(ids))
+	}
+	public, err := d.fleet.PublicProfiles(ctx, r, ids)
+	if err != nil {
+		return nil, err
 	}
 
 	const q = `
@@ -783,6 +806,14 @@ func describeProviders(
 		var summary bidding.ProviderSummary
 		if err := rows.Scan(&summary.ID, &summary.Verified, &summary.MemberSince); err != nil {
 			return nil, fmt.Errorf("cmd/api: describing one of %d providers: %w", len(ids), err)
+		}
+
+		// A provider who has not declared a profile is absent from the map and leaves both
+		// fields empty, which is what the client renders as "not stated". The offer stays on the
+		// screen either way: an unfinished profile is not a reason to hide a price.
+		if declared, found := public[summary.ID]; found {
+			summary.DisplayName = declared.DisplayName
+			summary.OperatesAs = declared.OperatesAs.String()
 		}
 		summaries[summary.ID] = summary
 	}
