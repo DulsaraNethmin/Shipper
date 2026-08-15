@@ -13168,16 +13168,39 @@ named as a later ticket's, so that a pending review is not something only an app
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | ~~**SHIP-118**~~ | ~~`Delivered` recordable and refused without evidence~~ | **Closed by SHIP-123 — see §3.** `000607` adds `recipient_name` and `delivery_note`, required on `Delivered` and refused on every other milestone, in the domain and in `ck_milestones_delivery_details`. `Docs/01` §4.4's field set is closed end to end |
 | ~~**SHIP-151**~~ | ~~`GET /v1/admin/users` — search by **email**, **phone** and **status**~~ | **Closed by SHIP-30a — see §3.** `000006` adds `users.name`, registration requires it, and the search matches it, so all four of the *Done when*'s terms answer on the wire. An account created before the migration has no name and is found by its address; a name cannot be backfilled, which is why the closing ticket sits in M1 |
-| **SHIP-102** | The comparison screen over `GET /v1/jobs/{id}/bids/received`: **price**, **timing** and **vehicle** served in full, laid out side by side, with a geometry assertion holding the layout | The **provider profile**. Its *Done when* is "customer compares price, timing, provider profile, and vehicle side by side", and the profile clause shipped in **deliberately reduced form** — two facts, `verified` and `member_since` (`internal/bidding/http.go:1347`). There is no trading name, rating or completed-job count anywhere in the schema: `internal/profiles` holds `doc.go` alone, and `fleet.Profile`'s only two fields are the Areas and Specialties SHIP-102a's *Done when* forbids showing a customer. **Owner: SHIP-79a.** See below |
+| **SHIP-102** | The comparison screen over `GET /v1/jobs/{id}/bids/received`: **price**, **timing** and **vehicle** served in full, laid out side by side, with a geometry assertion holding the layout | **The gap moved from data to presentation at wave 11 and did not close.** Its named owner SHIP-79a landed, so `display_name` and `operates_as` are now on the wire — `internal/bidding/http.go:1350` and `:1351`. **No client reads them**: `git grep -n 'display_name\|displayName\|operates_as\|operatesAs' -- apps/mobile` returns **nothing at all** on `5a3b8d7`, so the comparison screen still renders `verified` and `member_since` and the *Done when*'s profile clause is still met in reduced form. **This is two fields on one Flutter screen and it is owned by nobody.** See below |
+| **SHIP-139** | The Firebase adapter, `Pusher`'s two-value return, `000702`'s fourth notification status, and the whole rejection matrix asserted against a fake FCM server | **A Firebase project.** Its *Done when* is "push dispatches to iOS and Android and handles token rejection", and **nothing has ever dispatched to a device** — there is no project, no service-account key and no credential exchange. The ticket said so in its own §3 entry and could do nothing about it, because no row asked anybody to create one. **Owner: `Docs/09`'s new X-10.** See §5 |
+| **SHIP-143** | Both requests, their bodies, their idempotency keys, the credential the deregistration carries, when each fires, token rotation, and the `notifications_no_device_session` path | **The token.** `PushTokenSource` is a seam with nothing behind it, and `push_registration_wiring_test.dart` **asserts the absence** — which is the honest form and is not the thing existing. `firebase_messaging` needs `firebase_core`, which needs a `google-services.json` and a `GoogleService-Info.plist` that do not exist, so the dependency is deliberately not in `pubspec.yaml`. On a device today nothing registers. **Owner: `Docs/09`'s new X-10.** See §5 |
+| **SHIP-79a** | `display_name` and `operates_as` on `PATCH /v1/fleet/profile`, `provider_profiles` (`000303`), `fleet.PublicProfile` as the closed set, and the mapping into `bidding.ProviderSummary` | **The clause its *Done when* ends on: "the same set is what an admin read and the open feed disclose".** Neither reader exists. `routes_golden.txt` on `5a3b8d7` has no administrative provider-profile read, and `GET /v1/fleet/jobs` serves jobs rather than providers, so there is no second discloser to hold to the same set. The ticket's own §3 entry names it. **Not yet reachable** — the mapping seam is built precisely so a second discloser adds a mapping rather than a field list — but the clause is unmet and no row owns the second reader |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 
 **SHIP-65 has left this table.** Its *Done when* — "returns full job including budget" — was met
 but for the budget for two waves, and SHIP-67 closed it with the column and the proof together.
 §10's note that a ticket can be both done and partly done still stands. **SHIP-118 left this table at
-wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67. **The live rows are now three
-— SHIP-77, SHIP-151 and SHIP-102** — wave 10 struck none and added one, and the count is stated here
-because §7b's second merge finding is that a table and a sentence counting its rows are a semantic pair
-no merge tool checks.
+wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67.
+
+**The live rows are now six — SHIP-158, SHIP-77, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a — and
+the sentence that counted them was wrong when this pass arrived**, which is the third time and is
+becoming the point of the sentence rather than an aside. It read *"the live rows are now three —
+SHIP-77, SHIP-151 and SHIP-102"*. Wave 11 struck SHIP-151 and added SHIP-158, so the **count** stayed
+right by coincidence while the **names** went wrong, which is worse than an obviously stale number
+because it survives a glance. §10's parallel sentence was wrong in the same way and is corrected in
+the same pass. **A table read by a human and a sentence counting its rows are a semantic pair no
+merge tool and no gate checks** — §7c's second merge finding, now demonstrated a third time.
+
+**Four rows were added at this pass and three of them are the same shape as SHIP-118's.** SHIP-139
+and SHIP-143 owe their missing half to **X-10**, written into `Docs/09` here; SHIP-102's owner
+SHIP-79a landed and closed only the half it could. **SHIP-79a's own row is the fourth**, and it is
+the first entry in this table whose missing half is a *second reader of something already built*
+rather than a thing that does not exist.
+
+**None of the four describes work a wave-12 lane is holding**, and that was checked ticket by ticket
+against the dispatch rather than assumed: the two Firebase rows are external, SHIP-102's remaining
+half is two fields on a Flutter comparison screen no lane has opened, and SHIP-79a's is an
+administrative read and a feed disclosure that neither Lane A's verification work nor anything else
+in flight touches. **A §4 row describing a gap a concurrent lane is closing is accurate when it is
+written and stale when it is committed**, which is what bought wave 11 its only non-mechanical
+conflict.
 
 **SHIP-149 left it in the same wave**, closed by SHIP-150 building the write helper it had always
 named — so wave 9 struck two of this table's four entries and added one. That the sentence above
@@ -13262,11 +13285,25 @@ improvement rather than the one this clause needs. The code comment is left alon
 `internal/**` is not this branch's to edit and a comment that names a wave-late cross-reference is a
 smaller defect than a prep branch reaching into a domain to fix it.
 
-**This row leaves §4 when SHIP-79a lands**, on the SHIP-65 → SHIP-67 and SHIP-118 → SHIP-123 pattern,
-and it is the third worked example of a missing half with a named owner. **Lane C is building SHIP-79a
-in this wave**, so the row is written as open with the owner in flight rather than as closed — a §4
-row struck on the strength of a branch that has not merged is exactly the wishful entry §10 warns
-about.
+**This row was expected to leave §4 when SHIP-79a landed. SHIP-79a landed and it did not, and that
+is the finding.** The prediction was the SHIP-65 → SHIP-67 and SHIP-118 → SHIP-123 pattern, and it
+was made on a correct reading of where the gap was: *"what is missing is data, not presentation,
+which is why the owner is SHIP-79a and not a Flutter row."* **The data arrived and the presentation
+did not.** Measured on `5a3b8d7`: `internal/bidding/http.go` serves `display_name` and `operates_as`
+on the offers endpoint, and `git grep` over `apps/mobile` for either spelling — snake case or camel
+case — returns **nothing**. The screen still shows the two facts it showed in wave 10.
+
+**Nobody did anything wrong, which is why this is worth a paragraph rather than a correction.**
+SHIP-79a's *Done when* is about what the platform declares and discloses; it says nothing about a
+Flutter screen, and the lane met it. SHIP-102 is in `Docs/11-done.txt` and stays there on §10's rule.
+**What the pattern actually predicts is narrower than it was stated**: a §4 row with a named owner
+closes when the owner's *Done when* covers the missing half, and closes only that far otherwise.
+SHIP-118 → SHIP-123 worked because SHIP-123's *Done when* named the two fields. **A §4 row should
+name the owner's clause, not just the owner.**
+
+**What is left is small and has no owner at all**: two fields already on the wire, rendered on one
+comparison screen. It is a Flutter row nobody has written, and it is the shape §9 keeps calling a
+finding that goes quiet.
 
 ## 5. Blocked — and only by work outside this repository
 
@@ -15505,10 +15542,11 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is now in the list**, and **SHIP-77 and SHIP-151** are the two live rows in it — which is
-not a contradiction to be tidied away. That sentence named SHIP-149, SHIP-77 and SHIP-118 until this
-pass; wave 9 closed two of the three and added one, and **this is the second sentence in this file
-found counting a table's rows from memory** — §4's own is the other. Neither is checked by anything.
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is now in the list**, and its six live rows — **SHIP-158, SHIP-77, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
+not a contradiction to be tidied away. That sentence named SHIP-149, SHIP-77 and SHIP-118 two passes
+ago and SHIP-77 and SHIP-151 one pass ago, and **it has now been wrong at three consecutive
+reconciliations** — as has §4's own. Neither is checked by anything, both are maintained by hand, and
+both name a set rather than a count, which is the only reason a reader notices at all.
 
 **A ticket can be both**, and this is the shape: it landed, it is named by a commit subject, and one
 clause of what it was supposed to deliver belongs to a ticket that does not exist yet. SHIP-149
