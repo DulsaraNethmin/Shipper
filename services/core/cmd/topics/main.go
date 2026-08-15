@@ -34,6 +34,27 @@
 // every key onto a different partition, which silently ends the per-aggregate ordering the
 // publisher's whole design exists to keep. That is a decision with a migration behind it, and this
 // command's job is to say the topic is wrong rather than to make it differently wrong.
+//
+// # The replication factor is read back too (SHIP-134a)
+//
+// It was not, and the gap was invisible because the only thing that ever exercised the refusal was
+// a harness section that broke a topic on purpose to watch it complain. Creation carries the factor
+// — [plan] puts it on every [kafka.TopicConfig] — so a topic *this command* made has the right one;
+// a topic somebody made by hand does not, and that is the same failure the partition check exists
+// for. A topic created with one replica on a cluster that has three brokers survives a single
+// machine going away exactly as well as no topic at all, and nothing before this said so.
+//
+// It is refused rather than repaired for the same reason and a different mechanism: changing a
+// replication factor is a partition reassignment, which moves data between brokers under load and
+// is an operator's decision with a maintenance window behind it, not a side effect of applying a
+// schema.
+//
+// **It is also what lets the acceptance harness demonstrate the refusal without destroying
+// anything.** `scripts/verify/80-notifications.sh` used to delete `shipper.delivery` and recreate
+// it with one partition — on a broker every git worktree on the machine shares, which made this
+// repository's own harness the cause of the failure mode SHIP-134a exists to close. Asking for a
+// replication factor the local stack cannot be holding drifts the *request* rather than the
+// cluster, so the refusal is demonstrated end to end against a topic set nothing has touched.
 package main
 
 import (
@@ -142,10 +163,11 @@ func run(args []string, out io.Writer) error {
 		}
 	}
 
-	if err := verify(ctx, client, events.Topics()); err != nil {
+	if err := verify(ctx, client, events.Topics(), factor); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "every topic exists with %d partitions\n", events.TopicPartitions)
+	fmt.Fprintf(out, "every topic exists with %d partitions and %d replica(s)\n",
+		events.TopicPartitions, factor)
 	return nil
 }
 
@@ -201,41 +223,95 @@ func create(ctx context.Context, client *kafka.Client, topics []kafka.TopicConfi
 	return created, nil
 }
 
+// shape is what a topic on the cluster actually is, as against what the catalogue asks for.
+//
+// Two numbers rather than the whole [kafka.Topic], because those are the two this command has an
+// opinion about and separating them from the broker call is what lets [refuseDrift] be tested on
+// every machine with no cluster attached — which is where the partition branch is now held, since
+// SHIP-134a stopped the acceptance harness breaking a real topic to reach it.
+type shape struct {
+	partitions  int
+	replication int
+}
+
 // verify reads the cluster back and refuses a topic that is not the shape the catalogue asks for.
 //
 // Reading back rather than trusting the create is the point of the command being a step somebody
 // runs: it is also the check that a topic somebody made by hand — with one partition, in a hurry,
 // to unblock something — is found here rather than by a consumer noticing its ordering is gone.
-func verify(ctx context.Context, client *kafka.Client, want []string) error {
+func verify(ctx context.Context, client *kafka.Client, want []string, replication int) error {
+	observed, err := describe(ctx, client, want)
+	if err != nil {
+		return err
+	}
+	return refuseDrift(want, observed, replication)
+}
+
+// describe is the broker half: the metadata call and nothing else.
+func describe(ctx context.Context, client *kafka.Client, want []string) (map[string]shape, error) {
 	meta, err := client.Metadata(ctx, &kafka.MetadataRequest{Topics: want})
 	if err != nil {
-		return fmt.Errorf("reading topic metadata back: %w", err)
+		return nil, fmt.Errorf("reading topic metadata back: %w", err)
 	}
 
-	partitions := map[string]int{}
+	observed := map[string]shape{}
 	for _, t := range meta.Topics {
 		if t.Error != nil {
-			return fmt.Errorf("%s did not come back from the broker: %w", t.Name, t.Error)
+			return nil, fmt.Errorf("%s did not come back from the broker: %w", t.Name, t.Error)
 		}
-		partitions[t.Name] = len(t.Partitions)
-	}
 
+		// The assigned replica list rather than the in-sync one. A broker that is down
+		// shrinks `Isr` and leaves `Replicas` alone, so this reports how the topic was
+		// *created* — which is what drifted — rather than how the cluster is feeling.
+		//
+		// The minimum across partitions, because a reassignment interrupted halfway leaves
+		// some partitions at the new factor and some at the old, and the weakest partition is
+		// what the topic actually guarantees.
+		lowest := 0
+		for i, p := range t.Partitions {
+			if i == 0 || len(p.Replicas) < lowest {
+				lowest = len(p.Replicas)
+			}
+		}
+		observed[t.Name] = shape{partitions: len(t.Partitions), replication: lowest}
+	}
+	return observed, nil
+}
+
+// refuseDrift is the decision half: what the cluster holds against what was asked for.
+//
+// It repairs nothing and says so, and the two reasons differ. A partition count can be *increased*
+// and never reduced, and increasing it rehashes every key onto a different partition — which ends
+// the per-aggregate ordering the outbox publisher's whole design keeps. A replication factor can be
+// changed in either direction, and doing so is a partition reassignment that moves data between
+// brokers under load. The first is irreversible and the second is expensive; neither is something a
+// command that applies a schema should do to a cluster on its way past.
+func refuseDrift(want []string, observed map[string]shape, replication int) error {
 	var wrong []string
 	for _, topic := range want {
-		switch n, ok := partitions[topic]; {
-		case !ok:
+		got, ok := observed[topic]
+		if !ok {
 			wrong = append(wrong, topic+" does not exist")
-		case n != events.TopicPartitions:
+			continue
+		}
+		if got.partitions != events.TopicPartitions {
 			wrong = append(wrong, fmt.Sprintf(
 				"%s has %d partitions and the catalogue asks for %d",
-				topic, n, events.TopicPartitions))
+				topic, got.partitions, events.TopicPartitions))
+		}
+		if got.replication != replication {
+			wrong = append(wrong, fmt.Sprintf(
+				"%s has a replication factor of %d and this run asks for %d",
+				topic, got.replication, replication))
 		}
 	}
-	if len(wrong) > 0 {
-		return fmt.Errorf("%s.\nPartitions can be added and never removed, and adding one "+
-			"rehashes every key onto a different partition, which ends the per-aggregate "+
-			"ordering the outbox publisher depends on. Fix this deliberately rather than by "+
-			"re-running this command", strings.Join(wrong, "; "))
+	if len(wrong) == 0 {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%s.\nNothing here is repaired. Partitions can be added and never removed, "+
+		"and adding one rehashes every key onto a different partition, which ends the "+
+		"per-aggregate ordering the outbox publisher depends on; a replication factor is changed "+
+		"by a partition reassignment, which moves data between brokers and is an operator's "+
+		"decision with a maintenance window behind it. Fix this deliberately rather than by "+
+		"re-running this command", strings.Join(wrong, "; "))
 }

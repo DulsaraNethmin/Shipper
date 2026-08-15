@@ -4,10 +4,17 @@
 #
 # Sourced by scripts/verify-foundation.sh; see 00-stack.sh for what the runner provides.
 #
-# 80–89 is the notifications range (M5). This runs after 80-notifications.sh rather than inside it
-# because that file ends by deleting and reapplying the topic set to prove a drifted topic is
-# reported rather than repaired — so `shipper.delivery` does not exist for part of it, and a
-# consumer subscribed to every topic in the catalogue has to start after that is over.
+# 80–89 is the notifications range (M5). This runs after 80-notifications.sh because that file is
+# where the outbox is drained onto the topics this consumer reads.
+#
+# **The reason used to be a structural one and is no longer true (SHIP-134a).** It read: "that file
+# ends by deleting and reapplying the topic set to prove a drifted topic is reported rather than
+# repaired — so `shipper.delivery` does not exist for part of it, and a consumer subscribed to every
+# topic in the catalogue has to start after that is over". The deletion is gone: the drift refusal
+# is now demonstrated by asking `cmd/topics` for a replication factor this single-broker stack
+# cannot be holding, which touches no topic at all. There is no longer a window in which a catalogue
+# topic is absent. The ordering stays because this section needs the worker run above to have
+# happened, which is a data dependency rather than a structural one.
 #
 # # What is demonstrated here and what is demonstrated by tests
 #

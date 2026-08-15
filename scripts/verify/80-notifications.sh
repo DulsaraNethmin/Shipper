@@ -91,13 +91,46 @@
 # removes this file as a cause of failure mode 1 for every other tree; it cannot remove failure
 # mode 1 as a possibility, because another tree running an older revision of this file still
 # deletes. `kafka_consume_fenced` survives that — a fence beyond the end reads the whole partition —
-# and the provenance split then keeps the assertion meaningful. **The residual is named rather than
-# papered over: a delete landing between this run's publish and this run's read still loses
-# messages, and only a per-tree topic prefix would close it. That is a change to the topic set and
-# therefore not this section's to make.**
+# and the provenance split then keeps the assertion meaningful.
 #
 # The next section to run the worker, or to read Kafka, inherits the recipe: fence on an id, take
 # provenance from the database, and never assert that a shared topic holds nothing else.
+#
+# # SHIP-134a — this file stops deleting, and the concurrent case stops being argued
+#
+# Wave 10 left two things open and named them, and this is where both are answered.
+#
+# **The first is that this file still deleted a topic — just not `shipper.job`.** The SHIP-135
+# section at the foot deleted and recreated `shipper.delivery` twice, to stage a topic with the
+# wrong partition count and watch `cmd/topics` refuse to repair it. That was a genuine demonstration
+# of a genuine guard, and it made this repository's own acceptance harness the cause of failure mode
+# 1 for every other worktree on the machine — the SHIP-136 section immediately above reads that
+# topic, and so does every other tree's copy of it. **The fix keeps the demonstration and drops the
+# deletion**: `cmd/topics` now reads the *replication factor* back as well as the partition count,
+# so asking for three replicas on a single-broker stack drifts the **request** rather than the
+# cluster. The refusal is exercised end to end against a topic set nothing has touched, and the
+# partition branch it no longer reaches is held by `cmd/topics/main_test.go`, which needs no broker
+# at all. After this change no section under `scripts/verify/` deletes a Kafka topic.
+#
+# **The second is the *Done when*'s last clause**, which asks that this section pass "while a second
+# `make verify` publishes into the same broker — demonstrated by running two concurrently, not
+# argued". Two `make verify` runs is precisely what wave 10's machine-wide mutex exists to prevent,
+# so the clause as literally written cannot be met without disabling the guard that makes the
+# harness safe. **The reading taken here is that the hazard is the publish, not the harness**: what
+# breaks an assertion is foreign messages arriving on a shared topic between this run's publish and
+# this run's read, and that needs a second *publisher*, not a second harness. So this section starts
+# one — `kafka-console-producer.sh`, a process that is not this codebase, writing envelopes whose
+# ids this database has never heard of — across its own worker run, and again in the window between
+# the worker stopping and the consumer reading. The provenance count is then asserted **at least the
+# number published**, which turns wave 10's "reported rather than asserted" into a demonstration.
+# Docs/11 §3 records the reading and where it falls short.
+#
+# What that does **not** demonstrate is failure mode 1, another tree's *delete* landing mid-run.
+# Nothing in this repository can demonstrate it without doing it, which is the thing this ticket
+# removed. What is asserted instead is the negative, at the foot of this file: no topic this run
+# reads ended below the offset this run fenced it at. A delete and recreate resets a partition to
+# zero, so the check fails loudly and by name on a run that was silently robbed — where before it
+# reported its own ids as missing and left the reader to work out why.
 
 ticket "SHIP-134  domain events commit with their transaction and publish at least once"
 
@@ -140,6 +173,59 @@ ok "topic $outbox_topic exists with the set the catalogue owns (SHIP-135), and t
 # been waited on — so the two describe the same window from the two ends.
 kafka_fence "$outbox_topic"
 outbox_fence="$("$PSQL" "$DATABASE_URL" -tAc "select clock_timestamp();")"
+
+# --- a second publisher on the same broker (SHIP-134a) ----------------------------------------
+
+# **This is the *Done when*'s last clause, demonstrated rather than argued.**
+#
+# The clause asks that this section pass while a second `make verify` publishes into the same
+# broker. A second `make verify` is what the machine-wide mutex exists to prevent, so what runs here
+# is the part of it that is actually hazardous: a **publisher that is not this codebase**, putting
+# well-formed event envelopes onto `shipper.job` with identifiers this database has never issued.
+# That is indistinguishable, to everything below, from another worktree's worker draining its own
+# outbox — which is exactly what the header says the provenance split has to survive.
+#
+# Seven messages in two batches, and the split is the point:
+#
+#   * **five in the background**, started here and waited on after the worker stops, so they
+#     interleave with this section's own endpoint calls, its psql fixtures and its worker run;
+#   * **two synchronously**, published after the worker has stopped and before the consumer reads,
+#     which is the precise window wave 10 named as still open.
+#
+# Both batches land after `kafka_fence` and before `kafka_consume_fenced` recomputes the end offset,
+# so every one of the seven is inside the window this section reads. That makes the assertion below
+# an equality-or-more rather than a hope: `>= 7`, never `== 7`, because a genuine third worktree
+# publishing at the same time must widen this number and must not fail the run.
+#
+# The ids are UUIDs generated here and written to no database, so `outbox-known.txt` cannot contain
+# them and the provenance split must classify all seven as foreign. If one were ever to appear in
+# this database's outbox the equality check above would fail rather than this one — which is the
+# right way round.
+foreign_early=()
+for _ in 1 2 3 4 5; do foreign_early+=("$(uuidgen | tr 'A-Z' 'a-z')"); done
+foreign_late=()
+for _ in 1 2; do foreign_late+=("$(uuidgen | tr 'A-Z' 'a-z')"); done
+foreign_aggregate="$(uuidgen | tr 'A-Z' 'a-z')"
+
+# One line per message, which is what the console producer takes. The envelope is the shape
+# internal/events puts on the wire, so a malformed one would fail the JSON parse below rather than
+# being quietly skipped — a foreign message this section could not read would prove nothing.
+#
+# `job.status_changed` on an aggregate no database holds: the per-aggregate ordering check filters
+# to ids this database knows, so these are skipped there by construction, and the `emitted_type`
+# lookup keys on this section's own job. `occurred_at` is deliberately old, so that a foreign
+# message would sort first under any ordering assumption somebody adds later and be noticed.
+foreign_publish() {
+  local id
+  for id in "$@"; do
+    printf '{"id":"%s","type":"job.status_changed","aggregate_type":"job","aggregate_id":"%s","occurred_at":"2020-01-01T00:00:00Z","schema_version":1,"payload":{"schema_version":1,"to":"Open"}}\n' \
+      "$id" "$foreign_aggregate"
+  done | "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-console-producer.sh" \
+    --bootstrap-server localhost:9092 --topic "$outbox_topic" >/dev/null 2>&1
+}
+
+foreign_publish "${foreign_early[@]}" &
+foreign_pid=$!
 
 # --- an event a real endpoint wrote ----------------------------------------------------------
 
@@ -290,6 +376,17 @@ grep -q "stopped cleanly" "$WORKDIR/worker.log" \
   || { cat "$WORKDIR/worker.log"; fail "the worker did not shut down cleanly on SIGTERM"; }
 ok "the producer was closed on SIGTERM and the worker stopped cleanly"
 
+# The concurrent publisher, collected and then run once more (SHIP-134a).
+#
+# The background batch has been writing across everything above. Waiting on it here rather than
+# leaving it running is what makes the count below deterministic — every one of the five is on the
+# topic before the end offset is recomputed — and the second batch is then published into the exact
+# window wave 10 named: after this run's last publish, before this run's read.
+wait "$foreign_pid" 2>/dev/null || fail "the concurrent publisher could not write to $outbox_topic"
+foreign_publish "${foreign_late[@]}" \
+  || fail "the concurrent publisher could not write to $outbox_topic between the publish and the read"
+ok "a second publisher put ${#foreign_early[@]} message(s) on $outbox_topic during this run's publish and ${#foreign_late[@]} more between it and the read"
+
 # --- what actually reached the broker -------------------------------------------------------
 
 # Read from this section's own offset fence rather than from the beginning of the topic.
@@ -365,11 +462,22 @@ PY
 outbox_foreign="$(cat "$WORKDIR/outbox-provenance.txt")"
 ok "every event this run's outbox marked published is on $outbox_topic, and every message on it this database owns is one of them"
 
-# The third statement, reported rather than asserted. A number here is not a defect: it is the
-# other worktrees on this machine, and printing it is what stops the next person reading a green
-# run as evidence that the topic was theirs alone.
+# The third statement — and since SHIP-134a it is asserted rather than only reported.
+#
+# It was a printed number, on the reasoning that another worktree's traffic is not evidence about
+# this build. That is still true of the *upper* end, which is why this is `>=` and never `==`: a
+# genuine third tree publishing at the same time must widen this figure and must not fail the run.
+#
+# What changed is the lower end. This section now publishes seven foreign messages itself, so a
+# green run with a provenance count below seven means the split is not doing what the comment above
+# claims — either the consumer never saw them, or worse, it classified somebody else's message as
+# this database's own. A zero here used to be the ordinary case on an idle machine and is now the
+# signature of a broken assertion, which is the whole difference between reporting and demonstrating.
 [[ "$outbox_foreign" =~ ^[0-9]+$ ]] || fail "the provenance split did not report a count: $outbox_foreign"
-ok "and $outbox_foreign message(s) on it belong to another worktree, named rather than asserted about"
+foreign_published=$(( ${#foreign_early[@]} + ${#foreign_late[@]} ))
+(( outbox_foreign >= foreign_published )) \
+  || fail "the provenance split found $outbox_foreign foreign message(s) and this section published $foreign_published onto $outbox_topic itself — a message from another publisher was counted as this database's own, or was never read"
+ok "and $outbox_foreign message(s) on it belong to another publisher — at least the $foreign_published this section published concurrently, named rather than failed"
 
 # Per aggregate, though, the order is exact — and that is the promise. Checked over every
 # aggregate **this database owns** rather than only the one this section wrote, so the jobs
@@ -609,22 +717,36 @@ ticket "SHIP-135  topics exist with a versioned schema for each domain event"
 # reaches a consumer both in the envelope and in the payload. That is what this section does, and
 # it runs last in the file because it reads what the SHIP-134 section above put on the topic.
 #
-# # Fencing
+# # Fencing, and the topic this section no longer breaks (SHIP-134a)
 #
 # It asserts on shipper.job only through $WORKDIR/outbox-consumed.json, which the section above
-# produced from a topic it had just emptied. The one topic it manipulates is **shipper.delivery**.
+# produced under its own offset fence. **It now manipulates no topic at all.**
 #
-# **That used to be free and is not any more.** The original note read "which no code publishes to
-# yet — deliberately, so that breaking a topic on purpose cannot cost another section anything", and
-# SHIP-136 ended it: `internal/delivery` now emits three events onto that topic. So the SHIP-136
-# section is placed **above** this one rather than below, and has already read what it needs off
-# shipper.delivery before the deletion here destroys it. Whoever adds the next Kafka assertion should
-# read that ordering as load-bearing: there is no longer a topic in the set that nothing publishes
-# to, so a section that breaks one has to run after every section that reads it.
+# It used to delete and recreate **shipper.delivery**, twice, in order to stage a topic with one
+# partition and watch `cmd/topics` refuse to repair it. The original note read "which no code
+# publishes to yet — deliberately, so that breaking a topic on purpose cannot cost another section
+# anything", and SHIP-136 ended that: `internal/delivery` emits three events onto that topic. The
+# answer at the time was ordering — put the SHIP-136 section above this one, so it reads what it
+# needs before the deletion destroys it — and **ordering is a statement about sections, which does
+# not survive a second worktree.** One broker serves every tree on the machine, so this file was
+# deleting other trees' messages to make a point about its own.
+#
+# The demonstration is kept and the deletion is gone. `cmd/topics` reads the **replication factor**
+# back as well as the partition count (SHIP-134a), so `-replication 3` against this single-broker
+# stack is a request that has drifted from the cluster rather than a cluster that has drifted from
+# the catalogue — the same refusal, on the same code path, reached without touching anything. The
+# partition branch is held by `cmd/topics/main_test.go`, which needs no broker.
+#
+# **So the SHIP-136 section's placement above this one is no longer load-bearing**, and the two are
+# left in their existing order only because nothing is gained by moving them. Whoever adds the next
+# Kafka assertion inherits the rule rather than the workaround: a section may read a shared topic
+# and may publish to one, and may not delete or recreate one.
 
 topics_apply() {
+  local log="$1"
+  shift
   KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
-    "$WORKDIR/shipper-topics" >"$1" 2>&1
+    "$WORKDIR/shipper-topics" "$@" >"$log" 2>&1
 }
 
 topic_described() {
@@ -666,45 +788,57 @@ fi
   || { cat "$WORKDIR/topics-again.log"; fail "the second application did not find all three topics"; }
 ok "applying the set again creates nothing and still exits zero — safe on every deploy"
 
-# --- a topic that drifted is refused, not corrected ---------------------------------------------
+# --- a topic whose shape has drifted is refused, not corrected -----------------------------------
 
-# Staged on shipper.delivery, whose messages the SHIP-136 section above has already read — see this
-# section's header for why the ordering matters now. This is the failure the command
-# exists to catch: somebody creates a topic by hand to unblock something, with the default one
-# partition, and every consumer's ordering guarantee quietly goes with it.
-"${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
-  --delete --topic shipper.delivery >/dev/null 2>&1 || true
-for _ in $(seq 1 50); do
-  "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
-    --list 2>/dev/null | tr -d '\r' | grep -qx shipper.delivery || break
-  sleep 0.2
+# This is the failure the command exists to catch: a topic that is not the shape the catalogue asks
+# for — because somebody made it by hand to unblock something, or because the cluster it was made on
+# is not the cluster it is now being applied to — is **reported and left alone** rather than
+# silently altered into agreement.
+#
+# **Demonstrated on the request rather than on the cluster (SHIP-134a).** `-replication 3` against a
+# single-broker stack asks for a shape the topics provably do not have, so `create` is a no-op —
+# every topic exists — and `verify` reads them back and refuses. That reaches the same code path as
+# a hand-made topic without deleting anything on a broker five worktrees share; the header carries
+# the argument, and `cmd/topics/main_test.go` holds the partition and missing-topic branches with no
+# broker at all.
+#
+# The offsets before and after are what turn "left alone" into a statement rather than a hope: a
+# refused run that had quietly recreated a topic would reset them.
+#
+# Written to files rather than into an associative array: macOS ships bash 3.2 and this harness
+# stays inside it, which scripts/verify/30-http.sh records for the same reason.
+for topic in shipper.job shipper.bid shipper.delivery; do
+  kafka_end_offsets "$topic" >"$WORKDIR/drift-offsets-before-$topic.txt"
 done
-"${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
-  --create --topic shipper.delivery --partitions 1 --replication-factor 1 >/dev/null 2>&1 \
-  || fail "could not stage a one-partition shipper.delivery"
 
-if topics_apply "$WORKDIR/topics-drifted.log"; then
+if topics_apply "$WORKDIR/topics-drifted.log" -replication 3; then
   cat "$WORKDIR/topics-drifted.log"
-  fail "the command accepted shipper.delivery with one partition"
+  fail "the command accepted a topic set whose replication factor the cluster does not hold"
 fi
-grep -q "partitions" "$WORKDIR/topics-drifted.log" \
-  || { cat "$WORKDIR/topics-drifted.log"; fail "it failed without saying the partition count was wrong"; }
-[[ "$(topic_described shipper.delivery)" == *"PartitionCount: 1"* ]] \
-  || fail "the refused run changed the topic anyway; adding a partition is a decision, not a repair"
-ok "a topic somebody created by hand with one partition is reported and left alone, never repaired"
+grep -q "replication factor" "$WORKDIR/topics-drifted.log" \
+  || { cat "$WORKDIR/topics-drifted.log"; fail "it failed without saying the replication factor was wrong"; }
+grep -q "Nothing here is repaired" "$WORKDIR/topics-drifted.log" \
+  || { cat "$WORKDIR/topics-drifted.log"; fail "it failed without saying that it changed nothing"; }
+ok "a topic set the cluster does not match is reported by name, with the reason, and refused"
 
-"${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
-  --delete --topic shipper.delivery >/dev/null 2>&1 || true
-for _ in $(seq 1 50); do
-  "${COMPOSE[@]}" exec -T kafka "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server localhost:9092 \
-    --list 2>/dev/null | tr -d '\r' | grep -qx shipper.delivery || break
-  sleep 0.2
+# Nothing changed: not the partition count, not the replication factor, and not one message.
+for topic in shipper.job shipper.bid shipper.delivery; do
+  described="$(topic_described "$topic")"
+  [[ "$described" == *"PartitionCount: 3"* ]] \
+    || fail "the refused run changed $topic's partition count: ${described:-nothing at all}"
+  [[ "$described" == *"ReplicationFactor: 1"* ]] \
+    || fail "the refused run altered $topic's replication factor; a reassignment is an operator's decision, not a repair"
+  kafka_end_offsets "$topic" >"$WORKDIR/drift-offsets-after-$topic.txt"
+  diff -q "$WORKDIR/drift-offsets-before-$topic.txt" "$WORKDIR/drift-offsets-after-$topic.txt" >/dev/null \
+    || fail "$topic's offsets moved across a refused run, so something was recreated rather than reported"
 done
+ok "and the refused run left every topic exactly as it found it — shape and messages both"
+
 topics_apply "$WORKDIR/topics-restore.log" \
   || { cat "$WORKDIR/topics-restore.log"; fail "the topic set could not be applied again"; }
 [[ "$(topic_described shipper.delivery)" == *"PartitionCount: 3"* ]] \
-  || fail "shipper.delivery did not come back with three partitions"
-ok "and once the wrong topic is gone the set applies cleanly again"
+  || fail "shipper.delivery is not three partitions after the set was applied again"
+ok "and applying the set as the cluster actually is succeeds immediately afterwards"
 
 # --- the version travels with the message -------------------------------------------------------
 
@@ -825,10 +959,64 @@ if grep -qi "budget" "$events_golden"; then
 fi
 ok "and no event in the catalogue declares a budget field, in this domain or any later one"
 
-unset outbox_foreign ours_in_order emitted_type consumed_payload partition end start
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-134a  the outbox-to-topic check survives a concurrent worktree"
+
+# The negative this file can assert, having stopped being the thing it was asserting against.
+#
+# **Nothing in this repository can demonstrate failure mode 1 without causing it.** Another
+# worktree's delete landing between this run's publish and this run's read removes the offsets a
+# fence captured; the only way to show it is to delete a shared topic, which is the practice
+# SHIP-134a exists to end. So what is demonstrated is that it did not happen: every topic this run
+# read ends at or beyond the offset this run fenced it at.
+#
+# A delete and recreate resets a partition to zero, so a robbed run fails **here, by name, saying
+# the topic was recreated** — where before it failed in the comparison above reporting its own ids
+# as missing, which is the same fact stated in the least useful available way. Wave 9 lost a run to
+# exactly that reading.
+#
+# `>=` rather than `==`: this run publishes into shipper.job itself, later sections publish into
+# shipper.bid and shipper.delivery, and another worktree may legitimately be appending to all three.
+# Growth is ordinary. Only going backwards is evidence.
+for topic in shipper.job shipper.bid shipper.delivery; do
+  [[ -f "$WORKDIR/kafka-fence-$topic.txt" ]] \
+    || fail "$topic was never fenced, so nothing here can say whether it was emptied"
+  while read -r partition end; do
+    start="$(awk -v p="$partition" '$1 == p { print $2 }' "$WORKDIR/kafka-fence-$topic.txt")"
+    start="${start:-0}"
+    (( end >= start )) \
+      || fail "$topic partition $partition ends at $end and this run fenced it at $start — the topic was deleted and recreated while this run was reading it, which loses messages no fence can recover"
+  done < <(kafka_end_offsets "$topic")
+done
+ok "no topic this run read was emptied under it: every partition ends at or beyond its fence"
+
+# And the practice, held as a check rather than as a comment.
+#
+# The previous version of this rule *was* a comment — "safe today only because no other section
+# asserts on a topic it did not create" — and it survived six waves being scoped to sections on a
+# machine where the unit is the worktree. A sentence in a header cannot fail.
+#
+# **The rule is "delete only a topic you created", and one file legitimately does.**
+# `00-stack.sh` creates `shipper.verify.$$` for SHIP-4's produce-and-consume round trip and removes
+# it again; the name carries this process's pid, so no other worktree has it and nobody reads it.
+# Every other deletion is of a topic from the catalogue, shared by every tree on the machine, and
+# there are now none.
+#
+# So this is an exact file list rather than a search for a safe pattern. A text guard cannot tell a
+# scratch topic from a catalogue one when the name is in a variable — which it is, in both cases —
+# so what it can usefully do is make any new deletion a decision somebody records here.
+#
+# The pattern is written `-[-]delete` so that this check cannot match its own source.
+topic_deletes="$(grep -rl -e '-[-]delete' "$SECTIONS" 2>/dev/null | awk -F/ '{ print $NF }' \
+  | LC_ALL=C sort | tr '\n' ' ')"
+[[ "$topic_deletes" == "00-stack.sh " ]] \
+  || fail "sections deleting a Kafka topic: ${topic_deletes:-none}. Only 00-stack.sh may, because it deletes shipper.verify.\$\$ which it created in this process. One broker serves every worktree, so deleting a catalogue topic destroys another tree's messages"
+ok "and the only section that deletes a topic is the one that created its own, named with this process's pid"
+
+unset outbox_foreign foreign_published ours_in_order emitted_type consumed_payload partition end start
 unset published ship136_remaining ship136_ids worker_pid outbox_fence outbox_token emitted_job emitted_rows
 unset committed_job rolled_back_job rolled_back_rows outbox_topic
-unset event_ids
+unset event_ids foreign_early foreign_late foreign_aggregate foreign_pid
 unset described retention_stated stored_version wire_version headers events_golden event topic
-unset emitted_event_id header_line id
-unset -f outbox_request topics_apply topic_described
+unset emitted_event_id header_line id topic_deletes
+unset -f outbox_request topics_apply topic_described foreign_publish

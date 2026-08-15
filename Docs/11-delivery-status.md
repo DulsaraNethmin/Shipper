@@ -584,6 +584,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
+| **SHIP-134a** | M5 | The harness stops being the hazard it was asserting against. `80-notifications.sh` deleted `shipper.delivery` **twice** to stage a drifted topic, on a broker every worktree shares — so `cmd/topics` now reads the **replication factor** back as well as the partition count, and the refusal is demonstrated by asking for three replicas the single-broker stack cannot hold: **the request drifts, not the cluster.** The partition branch moved to a unit test that needs no broker. The *Done when*'s "run two `make verify` concurrently" **asks for exactly what wave 10's mutex exists to prevent**, so the reading taken is a concurrent **publisher** rather than a concurrent harness, and the provenance count is asserted rather than printed — *see below* |
+
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
 ### What SHIP-15a built
@@ -11888,6 +11890,110 @@ now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is
 and a database check that are believed to agree are two checks until something compares them.
 
 **Nothing was needed from `internal/config` by any of the five tickets.**
+
+### SHIP-134a — the harness stops being the hazard, and a *Done when* that asks for what the mutex forbids
+
+Three points, and most of the value is in two corrections: one to a file that was still doing the
+thing its own header said had been fixed, and one to an acceptance criterion that cannot be met as
+written.
+
+#### Wave 10 fixed the wrong half, and said so honestly
+
+`80-notifications.sh` stopped deleting `shipper.job` and moved the SHIP-134 comparison's authority
+from an empty topic to the per-worktree database. That was right and it holds. What it did not
+touch is the **SHIP-135 section at the foot of the same file**, which deleted and recreated
+`shipper.delivery` — twice — to stage a topic with one partition and watch `cmd/topics` report it
+rather than repair it.
+
+So the *Done when*'s first clause was false of the file on `605ad3a`: it still deleted a topic
+another run may be reading, and `internal/delivery` has published to that topic since SHIP-136. The
+answer at the time was section **ordering** — put the SHIP-136 section above this one so it reads
+what it needs before the deletion — and **ordering is a statement about sections, which is exactly
+the unit `CLAUDE.md` records as not surviving a second worktree.** One broker serves every tree, so
+the file was deleting other trees' messages in order to make a point about its own.
+
+#### The demonstration was kept and the deletion dropped, by drifting the request rather than the cluster
+
+`cmd/topics` read the partition count back and said nothing about the **replication factor**. That
+was a real gap independent of this ticket: `plan` puts the factor on every topic it creates, so a
+topic *this command* made is right and a topic somebody made by hand is not — and a topic created
+with one replica on a three-broker cluster survives a machine going away exactly as well as no topic
+at all. `verify` now reads both.
+
+Which makes the harness demonstration free of side effects. `-replication 3` against the local
+single-broker stack asks for a shape the topics provably do not have, so `create` is a no-op —
+they all exist — and `verify` reads them back and refuses, on the same code path a hand-made topic
+reaches. The section asserts the refusal names the reason, that it says it repaired nothing, and
+that **every topic's partition count, replication factor and end offsets are unchanged across the
+refused run**. Nothing is deleted, nothing is recreated, and no other worktree can tell the section
+ran.
+
+The partition branch it no longer reaches in anger moved down to `cmd/topics/main_test.go`, where
+the decision is now a pure function over what the cluster holds: `refuseDrift` takes a map and
+returns an error, so the missing-topic branch, the one-partition branch, the under-replicated branch
+and a refusal carrying **both** reasons are all reachable with no broker attached. That is strictly
+more coverage than the deletion bought, running on every machine rather than only where the stack is
+up.
+
+#### The *Done when*'s last clause asks for the thing the mutex exists to prevent
+
+It ends: *"the section passes while a second `make verify` publishes into the same broker —
+demonstrated by running two concurrently, not argued"*. Wave 10 serialised `make verify` behind a
+machine-wide mutex **because two harnesses running at once is deterministic corruption**, so the
+criterion as literally written can only be met by disabling the guard that makes the harness safe.
+
+**The reading taken is that the hazard is the publish, not the harness.** Failure mode 2 — the one
+no fence can fix, because fencing narrows where you start reading and says nothing about what else
+arrives — needs a second *publisher*, and a second publisher is not a second harness. So the section
+starts one: `kafka-console-producer.sh`, a process that is not this codebase, putting well-formed
+envelopes on `shipper.job` with identifiers this database has never issued. Seven messages in two
+batches — five in the background across this run's own endpoint calls, fixtures and worker run, and
+two published in the precise window wave 10 named as still open, after the worker stops and before
+the consumer reads. All seven land inside the fence, so the provenance split must classify all seven
+as foreign, and the count is now **asserted at `>= 7` rather than printed**. `>=` and never `==`,
+because a genuine third worktree publishing at the same time must widen the number and must not fail
+the run.
+
+That turns wave 10's "reported rather than asserted" into a demonstration, and it changes what a
+zero means: a zero used to be the ordinary case on an idle machine and is now the signature of a
+broken provenance split.
+
+**Where this falls short of the literal text, stated rather than glossed.** It does not demonstrate
+failure mode 1 — another tree's *delete* landing mid-run — and nothing in this repository can,
+without doing it, which is the practice the ticket removed. What is asserted instead is the
+negative: at the foot of the file, every topic this run read must end at or beyond the offset this
+run fenced it at. A delete and recreate resets a partition to zero, so a robbed run now fails **by
+name, saying the topic was recreated**, where before it failed in the comparison above reporting its
+own ids as missing and left the reader to work out why. Wave 9 lost a run to exactly that reading.
+
+#### The rule that was a comment is now a check
+
+The old header justified the deletion as *"safe today only because no other section asserts on a
+topic it did not create"* — scoped to sections, on a machine where the unit is the worktree. **A
+sentence in a header cannot fail**, and that one survived six waves being wrong.
+
+It is a check now, and the shape is an exact file list rather than a search for a safe pattern:
+`00-stack.sh` is the only section that may delete a topic, because SHIP-4's round trip creates
+`shipper.verify.$$` and removes it again — a name carrying this process's pid, which no other tree
+holds and nobody reads. A text guard cannot tell a scratch topic from a catalogue one when the name
+is in a variable, and it is in one in both cases; what it can usefully do is make any new deletion a
+decision somebody has to record here. The pattern is written `-[-]delete` so the check cannot match
+its own source.
+
+#### What was not taken
+
+**The per-tree topic prefix was not built.** Wave 10 named it as the only thing that closes failure
+mode 1, and it remains true: prefixing the topic set per worktree would make every tree's traffic
+its own, and nothing short of that removes the possibility of another tree's delete. It was not
+taken because it is a change to the topic set, because the two things it would close are now closed
+another way — this file no longer deletes, and a delete that happens anyway is reported by name —
+and because a prefix that every process must agree on is a configuration surface with a failure mode
+of its own: a producer and a consumer disagreeing about it is a topic nobody reads, silently. §9
+carries it as a decision nobody has taken rather than as work left half done.
+
+**Nothing was needed from `internal/config`.** The replication factor is already
+`KAFKA_REPLICATION_FACTOR` with a `-replication` flag over it (SHIP-15m), which is what the
+demonstration uses; adding a variable here would have been a second way to say the same thing.
 
 
 ## 4. Partly done — do not treat these as finished
