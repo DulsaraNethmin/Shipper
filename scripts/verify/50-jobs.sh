@@ -1008,15 +1008,107 @@ sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
   || fail "somebody else's job answers differently from no job at all"
 ok "a stranger cannot extend, and cannot tell the job apart from one that never existed"
 
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-70a  a job with live offers expires on its own deadline, not on its last offer's"
+
+# Docs/02 §2's expiry row reads `Open / Negotiating → Cancelled`. It said `Open` alone until this
+# ticket, which was the whole of "a live job" when SHIP-68 and SHIP-69 were written — and stopped
+# being so at SHIP-90, when a job with one unanswered offer started sitting at Negotiating. Neither
+# sweep could see it, so the deadline was enforced only after the last offer lapsed and returned the
+# job to Open.
+#
+# Every check below runs against the same worker binary the two sections above run, on a job put
+# into Negotiating through 000402's own protocol. The distinction that matters is between the
+# *status* and the deadline: every job here carries a deadline set by 000406 on publication, and
+# only one status of the two was previously visible to either sweep.
+
+negotiating_stale="$(expiring_job negotiating-stale "$warn_distant")"
+move_job "$negotiating_stale" Open Negotiating || fail "could not move the job to Negotiating"
+
+# The deadline survived the move — 000406's trigger fills a NULL and never overwrites — which is
+# what makes this a claim problem rather than a missing-deadline one.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at is not null from jobs where id = '$negotiating_stale';")" == "t" ]] \
+  || fail "the Negotiating job lost the deadline publication gave it"
+ok "a job with live offers keeps the deadline it was published with"
+
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set expires_at = now() - interval '1 hour' where id = '$negotiating_stale';" >/dev/null
+
+run_worker "$WORKDIR/worker-negotiating.log"
+
+negotiating_status="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status from jobs where id = '$negotiating_stale';")"
+[[ "$negotiating_status" == "Cancelled" ]] \
+  || { cat "$WORKDIR/worker-negotiating.log"; fail "the overdue Negotiating job is $negotiating_status after a pass, want Cancelled"; }
+ok "one pass expires it without waiting for its last offer to lapse"
+
+# Through the guard, on the row Docs/02 §2 now names. A `Negotiating->Cancelled` history row is the
+# evidence that the widening used the transition table's existing edge rather than inventing one.
+negotiating_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select h.from_status || '->' || h.to_status || ' ' || h.actor_type || ' ' || (h.actor_id is null)
+     from job_status_history h
+    where h.job_id = '$negotiating_stale' and h.to_status = 'Cancelled';")"
+[[ "$negotiating_row" == "Negotiating->Cancelled system true" ]] \
+  || fail "the recorded expiry is '$negotiating_row', want 'Negotiating->Cancelled system true'"
+ok "recorded as Negotiating->Cancelled by the platform, through the SHIP-57 guard"
+
+# The warning claim reads the same set, which is the half of the *Done when* easiest to leave
+# behind: a job warned in a status the expiry sweep cannot see is told it is about to die and then
+# never dies.
+negotiating_warn="$(expiring_job negotiating-warn "$warn_soon")"
+move_job "$negotiating_warn" Open Negotiating || fail "could not move the warning job to Negotiating"
+
+run_worker "$WORKDIR/worker-negotiating-warn.log"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+    where aggregate_id = '$negotiating_warn' and event_type = 'job.expiry_warned';")" == "1" ]] \
+  || { cat "$WORKDIR/worker-negotiating-warn.log"; fail "the Negotiating job inside the window was not warned"; }
+ok "and the warning sweep reads the same set — a Negotiating job is warned too"
+
+# Still Negotiating and marked warned. A warning moves no job whichever of the two statuses it is
+# in, so the second presentation must not have acquired a transition the first never had — and the
+# mark is what stops the next pass warning it again.
+negotiating_state="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select status || ' ' || (expiry_warned_at is not null) from jobs where id = '$negotiating_warn';")"
+[[ "$negotiating_state" == "Negotiating true" ]] \
+  || fail "the warned job is '$negotiating_state', want 'Negotiating true'"
+ok "the warned job is still Negotiating, is marked, and moved by nothing"
+
+# And the customer can act on the warning they were just sent. Docs/02 §6.3 is one mechanism in two
+# sentences — warned, *and can extend in one action* — so an extend endpoint still filtering on Open
+# alone would answer 409 to the one customer the warning was for.
+negotiating_extend="$(expiring_job negotiating-extend "$warn_distant")"
+move_job "$negotiating_extend" Open Negotiating || fail "could not move the extend job to Negotiating"
+age_job "$negotiating_extend"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-negotiating-extend-do-$$" \
+  "/v1/jobs/$negotiating_extend/extend" '{}' "$WORKDIR/jobs-negotiating-extend.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-negotiating-extend.json"; fail "extending a Negotiating job returned $status, want 200"; }
+[[ "$(json "$WORKDIR/jobs-negotiating-extend.json" '["status"]')" == "negotiating" ]] \
+  || fail "the extended job reads as $(json "$WORKDIR/jobs-negotiating-extend.json" '["status"]'), want negotiating"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select expires_at between now() + interval '13 days' and now() + interval '15 days'
+     from jobs where id = '$negotiating_extend';")" == "t" ]] \
+  || fail "the deadline did not move: $("$PSQL" "$DATABASE_URL" -tAc "select expires_at from jobs where id = '$negotiating_extend';")"
+ok "the customer keeps a job somebody has bid on alive, in one call and with no transition"
+
 # Nothing this section leaves behind is inside the warning window, which is what makes the next
 # section's worker run — and every later one — claim none of it. See the SHIP-69 header.
+#
+# **The predicate covers Negotiating as well as Open since SHIP-70a**, and repeating it here is the
+# point: this guard has to cover exactly what the sweeps now claim, or it stops guarding the status
+# this file has only just started leaving behind.
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
   "select count(*) from jobs
-    where status = 'Open' and expiry_warned_at is null
+    where status in ('Open', 'Negotiating') and expiry_warned_at is null
       and expires_at > now() and expires_at <= now() + interval '48 hours';")" == "0" ]] \
-  || fail "this file leaves an Open job inside the warning window; a later section that starts the worker would warn it"
+  || fail "this file leaves a live job inside the warning window; a later section that starts the worker would warn it"
 ok "and no job is left inside the warning window for a later section's worker to pick up"
 
 unset warn_soon warn_later warn_distant warned_job unwarned_job warned_events warned_payload
 unset warned_state extend_before extend_event aged_job capped_job rearm_job bound_job draft_to_extend
+unset negotiating_stale negotiating_warn negotiating_extend negotiating_row negotiating_state
+unset negotiating_status
 unset -f expiring_job run_worker age_job

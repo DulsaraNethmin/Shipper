@@ -292,9 +292,10 @@ func TestExpireEndsAnOpenJobAsThePlatform(t *testing.T) {
 
 // TestExpireRefusesAJobThatIsNotOpen leans on Docs/02 §2 rather than on a list of its own.
 //
-// The claim already excludes anything but Open, so this is a second line rather than the first —
-// and it is the line that would matter if a future caller expired a job it had chosen some other
-// way.
+// The claim already excludes anything but [LiveStatuses], so this is a second line rather than the
+// first — and it is the line that would matter if a future caller expired a job it had chosen some
+// other way. Awarded is the fixture because Docs/02 §6.2 makes ending one a support matter, and
+// because it is the status SHIP-70a's widening must *not* have reached.
 func TestExpireRefusesAJobThatIsNotOpen(t *testing.T) {
 	pool := pgtest.DB(t)
 	service := newTestService(&recordingSink{})
@@ -503,9 +504,9 @@ func TestWarnOfExpiryRefusesToRunOutsideATransaction(t *testing.T) {
 // TestWarnOfExpiryRefusesAJobThatIsNotOpen is the predicate on the write rather than in a read
 // before it.
 //
-// Unreachable from the sweep, which claims only Open rows and holds their locks. It is the answer
-// given to a caller that has not been written yet, and the alternative — succeeding quietly — would
-// mark a Draft as warned and emit a notification about a job nobody can see.
+// Unreachable from the sweep, which claims only [LiveStatuses] rows and holds their locks. It is the
+// answer given to a caller that has not been written yet, and the alternative — succeeding quietly —
+// would mark a Draft as warned and emit a notification about a job nobody can see.
 func TestWarnOfExpiryRefusesAJobThatIsNotOpen(t *testing.T) {
 	pool := pgtest.DB(t)
 	sink := &recordingSink{}
@@ -581,7 +582,182 @@ func TestTheExpiryEventsCarryNoBudget(t *testing.T) {
 	}
 }
 
+// --- SHIP-70a: a live job is not only an Open one -----------------------------------------------
+
+// TestLiveStatusesAgreeInGoAndSQL is Docs/10 §3.4's pairing applied to a predicate.
+//
+// [LiveStatuses] is a SQL fragment read by two claims and one write; [offered] is the Go form the
+// extend endpoint asks. They are one rule, and the failure of a drift is silent in both directions:
+// a status live in SQL but not in Go warns a customer about a job the endpoint then refuses to
+// extend, and a status live in Go but not in SQL extends a job no sweep is watching.
+//
+// So the fragment is parsed rather than restated, and every one of Docs/02 §1's twelve statuses is
+// put to both — which is what makes a status added to the document, and to one of these, fail here.
+func TestLiveStatusesAgreeInGoAndSQL(t *testing.T) {
+	inSQL := map[Status]bool{}
+	for _, quoted := range strings.Split(strings.Trim(LiveStatuses, "()"), ",") {
+		inSQL[Status(strings.Trim(strings.TrimSpace(quoted), "'"))] = true
+	}
+
+	if len(inSQL) == 0 {
+		t.Fatalf("LiveStatuses parsed to nothing from %q", LiveStatuses)
+	}
+
+	for _, status := range Statuses {
+		if inSQL[status] != offered(status) {
+			t.Errorf("%s is live in SQL=%t and in Go=%t; %q and offered() are one rule",
+				status, inSQL[status], offered(status), LiveStatuses)
+		}
+	}
+
+	// Named rather than derived, because the point of the ticket is which two they are.
+	if !offered(StatusOpen) || !offered(StatusNegotiating) {
+		t.Errorf("Docs/02 §2's expiry row names Open and Negotiating; offered() takes %t and %t",
+			offered(StatusOpen), offered(StatusNegotiating))
+	}
+	if offered(StatusAwarded) || offered(StatusDraft) {
+		t.Error("a Draft has no deadline and an Awarded job is somebody's live delivery")
+	}
+}
+
+// TestTheExpiryClaimTakesANegotiatingJobOnItsOwnDeadline is SHIP-70a's *Done when*.
+//
+// Docs/02 §6.3's deadline belongs to the job. Before this ticket both sweeps read `status = 'Open'`,
+// which was the whole of "a live job" when SHIP-68 and SHIP-69 were written and stopped being so at
+// SHIP-90 — so a job with one unanswered offer sat at Negotiating, out of sight of the sweep, and
+// its deadline was enforced only once its last offer had lapsed and returned it to Open.
+//
+// The two jobs here are the same job in the two presentations, given the same overdue deadline, so
+// the assertion is about the status and about nothing else.
+func TestTheExpiryClaimTakesANegotiatingJobOnItsOwnDeadline(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newCustomer(t, pool, "expiry-negotiating@example.com", "+61400000670")
+	now := time.Now().UTC()
+
+	open := newDraft(t, pool, customer)
+	publish(t, pool, open, customer)
+
+	negotiating := newDraft(t, pool, customer)
+	publish(t, pool, negotiating, customer)
+	move(t, pool, negotiating, StatusNegotiating, User(ActorCustomer, customer))
+
+	// The deadline survives the move to Negotiating: 000406's trigger fills a NULL and never
+	// overwrites, so this is the deadline publication gave it. Asserted rather than assumed,
+	// because a claim that could not see the job would look identical to a job with no deadline.
+	if deadlineOf(t, pool, negotiating) == nil {
+		t.Fatal("the Negotiating job lost its deadline on the way out of Open")
+	}
+
+	setDeadline(t, pool, open, now.Add(-time.Hour))
+	setDeadline(t, pool, negotiating, now.Add(-2*time.Hour))
+
+	claimed := claimExpiries(t, pool, now)
+	if len(claimed) != 2 || claimed[0] != negotiating || claimed[1] != open {
+		t.Fatalf("the claim took %v, want both live jobs longest-overdue first: [%s %s] — "+
+			"a job somebody has bid on expires on its own deadline (Docs/02 §2)",
+			claimed, negotiating, open)
+	}
+}
+
+// TestExpireEndsANegotiatingJob is the transition half, and it is the half the claim cannot prove.
+//
+// Docs/02 §2's expiry row now reads `Open / Negotiating → Cancelled`, and [Service.Transition] is
+// what has to agree — the guard already permitted `Negotiating → Cancelled` for SHIP-64's
+// cancellation, so this asserts the platform reaches it rather than that it exists.
+func TestExpireEndsANegotiatingJob(t *testing.T) {
+	pool := pgtest.DB(t)
+	sink := &recordingSink{}
+	service := newTestService(sink)
+
+	customer := newCustomer(t, pool, "expiry-negotiating-end@example.com", "+61400000671")
+	job := newDraft(t, pool, customer)
+	publish(t, pool, job, customer)
+	move(t, pool, job, StatusNegotiating, User(ActorCustomer, customer))
+
+	if err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
+		_, err := service.Expire(ctx, r, job)
+		return err
+	}); err != nil {
+		t.Fatalf("expiring the Negotiating job: %v", err)
+	}
+
+	if statusOf(t, pool, job) != StatusCancelled {
+		t.Fatalf("the job is %s, want Cancelled", statusOf(t, pool, job))
+	}
+
+	history, err := service.History(t.Context(), pool, job)
+	if err != nil {
+		t.Fatalf("reading the history: %v", err)
+	}
+	last := history[len(history)-1]
+
+	switch {
+	case last.From != StatusNegotiating || last.To != StatusCancelled:
+		t.Errorf("the recorded move is %s -> %s, want Negotiating -> Cancelled", last.From, last.To)
+	case last.Actor.Type != ActorSystem:
+		t.Errorf("the actor is %s, want the platform", last.Actor.Type)
+	case last.Reason != ExpiryReason:
+		t.Errorf("the reason is %q, want %q", last.Reason, ExpiryReason)
+	}
+}
+
+// TestTheWarningClaimTakesANegotiatingJob keeps the two sweeps reading the same set.
+//
+// SHIP-70a's *Done when* names both — "both the expiry and the expiry-warning claims match it" —
+// and the asymmetry is what would be worst: a job warned in a status the expiry sweep cannot see is
+// told it is about to expire and then never expires, which is the failure this ticket ends rather
+// than one it should invert.
+func TestTheWarningClaimTakesANegotiatingJob(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := newTestService(&recordingSink{})
+
+	customer := newCustomer(t, pool, "warning-negotiating@example.com", "+61400000672")
+	now := time.Now().UTC()
+
+	job := newDraft(t, pool, customer)
+	publish(t, pool, job, customer)
+	move(t, pool, job, StatusNegotiating, User(ActorCustomer, customer))
+	setDeadline(t, pool, job, now.Add(24*time.Hour))
+
+	if claimed := claimWarnings(t, pool, now); len(claimed) != 1 || claimed[0] != job {
+		t.Fatalf("the warning claim took %v, want [%s]", claimed, job)
+	}
+
+	// And the write behind the claim carries the same predicate, which is the second copy of
+	// the rule and the one a widening could forget: postgresStore.markExpiryWarned refuses a row
+	// it would not have claimed, so a claim without it succeeds and marks nothing.
+	warned, err := warn(t, pool, service, job)
+	if err != nil {
+		t.Fatalf("warning the Negotiating job: %v", err)
+	}
+	if warned.Status != StatusNegotiating {
+		t.Errorf("the warned job is %s, want Negotiating — a warning is not a transition", warned.Status)
+	}
+	if at := warnedAt(t, pool, job); at == nil {
+		t.Error("the job is not marked warned, so the next pass would warn it again")
+	}
+}
+
 // --- fixtures ----------------------------------------------------------------------------------
+
+// claimExpiries runs [ExpiryClaim] the way cmd/worker does, and returns what it took.
+func claimExpiries(t *testing.T, pool *pgxpool.Pool, at time.Time) []uuid.UUID {
+	t.Helper()
+
+	var claimed []uuid.UUID
+	if err := db.InTx(t.Context(), pool, func(ctx context.Context, r db.Runner) error {
+		rows, err := r.Query(ctx, ExpiryClaim, at, ExpiryBatch)
+		if err != nil {
+			return err
+		}
+		claimed, err = pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+		return err
+	}); err != nil {
+		t.Fatalf("running the expiry claim: %v", err)
+	}
+	return claimed
+}
 
 // warn runs a warning in a transaction, which is what Service.WarnOfExpiry requires.
 func warn(t *testing.T, pool *pgxpool.Pool, svc *Service, job uuid.UUID) (Job, error) {

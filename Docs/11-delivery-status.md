@@ -437,6 +437,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-68** | M2 | Job expiry — the deadline is a trigger's, the sweep is the worker's, and `make verify` runs the real binary — *see below* |
 | **SHIP-69** | M2 | The expiry warning forty-eight hours ahead — a second task over the same column, and the job is warned once per *deadline* rather than once per job — *see below* |
 | **SHIP-70** | M2 | `POST /v1/jobs/{id}/extend` — an empty body, because the platform computes the deadline. **Not a status transition**, and the pickup date still bounds it — *see below* |
+| **SHIP-70a** | M2 | Both expiry sweeps see a job with live offers. **The document changed first**: `Docs/02` §2's expiry row now reads `Open / Negotiating → Cancelled`, and the two claims, the write behind the warning, `000409`'s two partial indexes and the extend endpoint all follow it. The product question the backlog left open — what expiry does to the offers on the job — is answered **nothing**, and the reason is that SHIP-89 already answers it. `SHIP-70` had to be widened too, or the warning would have pointed at an action that refused — *see below* |
 | **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-77** | M2 | Flutter customer job detail — the timeline is derived from the current status, because the transition history the database records is served by no endpoint; and sign-out finally tells the platform — *see below* |
@@ -10698,6 +10699,106 @@ selected rather than refused" answer does not transfer.
 rather than measuring, in a brief whose own baselines were measured — which is this repository's
 recurring failure mode arriving in a document meant to prevent it. The check that caught it is
 `grep` against the golden file, and it took under a minute.
+
+### SHIP-70a — the document was widened first, and the widening reached one endpoint nobody listed
+
+`Docs/02` §2 had one expiry row and it read `Open → Cancelled`. It now reads
+`Open / Negotiating → Cancelled`, with the clause the sweep needed and could not decide for itself:
+
+> | Open / Negotiating | Cancelled | Job expires unclaimed — see §6.3. The deadline is the job's own
+> and does not wait for its last offer to lapse |
+
+**That is the whole of what changed in `Docs/02`, and the ordering was the ticket.** SHIP-90 narrowed
+SHIP-68 and SHIP-69 without either being reopened — before it, `WHERE status = 'Open'` was the whole
+of "a live job", and after it a job with one unanswered offer sits at `Negotiating` where neither
+sweep could see it. Widening the queries and leaving §2 alone would have been resolving a
+contradiction silently in code, which `CLAUDE.md` forbids; so the row moved first and five things
+followed it rather than the other way round.
+
+#### The set is written once, and the three copies that must agree are held to each other
+
+`jobs.LiveStatuses` is a SQL fragment — `('Open', 'Negotiating')` — concatenated into
+`ExpiryClaim`, `ExpiryWarningClaim` and `postgresStore.markExpiryWarned`. `jobs.offered` is its Go
+form, asked by the extend endpoint. `TestLiveStatusesAgreeInGoAndSQL` **parses the fragment** and
+puts all twelve of `Docs/02` §1's statuses to both, so the two cannot drift.
+
+Both directions of a drift are silent, which is why the pairing exists rather than a comment. A
+status live in SQL and not in Go warns a customer about a job the endpoint then refuses to extend; a
+status live in Go and not in SQL extends a job no sweep is watching. `Docs/10` §3.4 already pairs a
+Go constant list against a `CHECK` in both directions, and this is the same instrument aimed at a
+predicate.
+
+#### SHIP-70 had to move with it, and no ticket said so
+
+`Service.Extend` read `job.Status != StatusOpen`. `Docs/02` §6.3 is one mechanism in two sentences —
+"the customer is warned 48 hours before expiry **and can extend in one action**" — so the moment the
+warning claim can reach a `Negotiating` job, an extend endpoint still filtering on `Open` answers
+`409 jobs_not_extendable` to the one customer the warning was for, on the one kind of job somebody
+has actually bid on. It is now `offered(job.Status)`, and `contracts/paths/jobs.yaml` says so.
+
+This is worth recording as a shape rather than as a fix: **the ticket's *Done when* named the two
+claims, and the third consumer of the same predicate was in another ticket's file.** Nothing in
+`Docs/09` would have found it; the thing that found it was reading §6.3's sentence to the end.
+
+#### What expiring a Negotiating job does to the offers on it — nothing, and that is the answer
+
+`Docs/09`'s note says "whoever takes it decides what `Negotiating → Cancelled` means for the offers
+on the job, which is a product question the sweep cannot answer for itself." It is answered
+**nothing**, on three grounds that were checked rather than assumed:
+
+- `Docs/02` §2 **already** permits `Negotiating → Cancelled` — SHIP-64's cancellation uses it — so
+  the sweep takes an existing edge and the job ends exactly as an unbid one does. No new row, and no
+  change to `internal/jobs/model.go`'s table.
+- Every live offer runs out at its own collection time under SHIP-89, which is `Docs/09`'s own
+  argument for why this was a ticket rather than an incident, read in the other direction.
+- **No offer on a cancelled job can be accepted meanwhile.** The award moves the job to `Awarded`,
+  which `permitted` allows from `Open` and `Negotiating` and from nowhere else, so a `Cancelled` job
+  refuses every award in the same guard that refuses every other impossible move. That is checked in
+  `internal/jobs/model.go` rather than believed from the endpoint.
+
+Closing the offers here would have meant this sweep writing `bids` — a second domain's table, from a
+query `jobs` owns, for a fact SHIP-89 already produces on its own schedule. `Docs/06` §4.1 exists to
+prevent exactly that, and it would buy nothing a provider can observe.
+
+#### `000409` widens two partial indexes, and that is the part a query change alone would have missed
+
+`000406` and `000407` each built a partial index on exactly the predicate its sweep claimed with, and
+each said so. A widened claim over a narrow partial index is **correct and unplanned**: a sequential
+scan over every job the platform has ever had, every few minutes, with nothing failing to announce
+it. So `000409` drops and recreates both — a partial predicate is not alterable — keeping the names,
+because `idx_jobs_open_expiry` and `idx_jobs_open_unwarned` are cited in two migrations, one Go file
+and the migration tests, and a rename would be a change with four writers and no reader.
+
+**No deadline logic changed.** `000406`'s trigger fires on `NEW.status = 'Open' AND OLD.status IS
+DISTINCT FROM 'Open'`, and a job reaches `Negotiating` *from* `Open`, so it is already carrying the
+deadline publication gave it. `000406`'s own comment had anticipated the cycle — the trigger fills a
+NULL and never overwrites, which "stops the clock restarting every time a job cycles Negotiating →
+Open as bids expire" — and the verify section asserts the deadline survived the move rather than
+assuming it.
+
+#### The mutation, and which kind of guard each test turned out to be
+
+`ExpiryClaim` was put back to `WHERE status = 'Open'` — the pre-SHIP-70a text — and `make test` run
+whole. **One test failed: `TestTheExpiryClaimTakesANegotiatingJobOnItsOwnDeadline`**, which claims
+against a real database and compares what the claim took.
+
+`TestLiveStatusesAgreeInGoAndSQL` **did not fail**, and that is the finding worth keeping. It reads
+`LiveStatuses`, and the mutation was in `ExpiryClaim`'s own literal — so the pairing guard is a
+*text* guard over the constant and says nothing about the query that concatenates it. Wave 9's
+`FOR UPDATE OF j SKIP LOCKED` demotion is the same shape from the other side. **A pairing test and a
+behavioural test are different instruments and this ticket has both**, deliberately.
+
+The file was snapshotted to `/tmp` before the mutation and restored from that copy, never with
+`git checkout`; `shasum -a 256` matched the snapshot afterwards and `git diff` still carried the
+ticket's 57 added lines, which is the pair of checks that distinguishes "restored" from "reverted to
+the last commit".
+
+#### One stale sentence in another domain's migration, left alone deliberately
+
+`000302_vehicle_capability_index.up.sql` says "idx_jobs_open_expiry is partial on 'Open' alone", and
+after `000409` that is no longer true. It is a comment in an **applied** migration in the fleet
+block, and editing one is worse than the staleness: the file is the record of what ran. Whoever next
+touches `000302` can correct the aside; nothing reads it.
 
 
 ## 4. Partly done — do not treat these as finished
