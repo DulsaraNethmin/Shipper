@@ -437,13 +437,112 @@ func (s Specialty) normalise() Specialty {
 type Profile struct {
 	ProviderID uuid.UUID
 
+	// Public is who the provider trades as, and it is the only part of this type a customer may
+	// ever be shown (SHIP-79a). See [PublicProfile] for why that split is a type rather than a
+	// comment.
+	Public PublicProfile
+
 	// Areas is every region the provider will carry freight in, states first and each group in
 	// ascending order.
+	//
+	// **Never disclosed to a customer.** SHIP-102a's *Done when* forbids it by name: a provider's
+	// service area is a competitor's map of the market, reachable through any customer account.
 	Areas []ServiceArea
 
 	// Specialties is what they carry, in [Specialties] order rather than the order they were sent.
+	//
+	// Forbidden to a customer for the same reason as [Profile.Areas], and named in the same clause.
 	Specialties []Specialty
 }
+
+// OperatingForm is whether a provider trades as a person or as a business.
+//
+// Docs/01 §4.2's own distinction — "Register as an individual or business" — rather than a category
+// invented here. It matters to a customer with a piano and to nobody else on the platform: nothing
+// filters on it, nothing is permitted or refused by it, and it is not a verified fact. Docs/04 §3's
+// document review is what establishes who somebody actually is.
+type OperatingForm string
+
+const (
+	// OperatesAsIndividual is a sole operator trading under their own name.
+	OperatesAsIndividual OperatingForm = "individual"
+
+	// OperatesAsBusiness is a registered business.
+	OperatesAsBusiness OperatingForm = "business"
+)
+
+// OperatingForms is every value, in the order a client should offer them.
+//
+// Paired with `ck_provider_profiles_operates_as` in both directions by a test, the discipline
+// Docs/10 §3.4 requires of an enumeration held in two places.
+var OperatingForms = []OperatingForm{OperatesAsIndividual, OperatesAsBusiness}
+
+// Valid reports whether the value is one this domain knows.
+func (f OperatingForm) Valid() bool {
+	for _, known := range OperatingForms {
+		if f == known {
+			return true
+		}
+	}
+	return false
+}
+
+func (f OperatingForm) String() string { return string(f) }
+
+// normalise lower-cases and trims, so `Business ` and `business` are one value.
+func (f OperatingForm) normalise() OperatingForm {
+	return OperatingForm(strings.ToLower(strings.TrimSpace(string(f))))
+}
+
+// PublicProfile is everything about a provider that a customer may be shown, and nothing else
+// (SHIP-79a).
+//
+// # It is a type so that "the same set" has one definition rather than one per reader
+//
+// SHIP-79a's *Done when* asks for "a closed set" and for the same set to reach every read that
+// discloses a provider. A closed set written out at each disclosure is a closed set until the second
+// one is written; a type is a set the compiler carries. Today it has one reader — `cmd/api` maps it
+// into `bidding.ProviderSummary` for the customer's comparison screen — and the point of it is the
+// second, whenever an administrator's provider read or a public directory arrives. **Whoever adds
+// that reader adds a mapping, not a field list.**
+//
+// # What is deliberately not on it
+//
+// **The service area and the specialties**, which are the other half of [Profile] and are forbidden
+// to a customer by SHIP-102a's *Done when*. That is the reason this is a nested struct rather than
+// two more fields on [Profile]: a disclosure that takes `profile.Public` cannot reach them by
+// accident, whereas a disclosure that takes a `Profile` and copies four of its six fields is correct
+// only for as long as somebody keeps copying four.
+//
+// **A rating and a completed-job count**, both named and declined in Docs/09's SHIP-79a note — the
+// first implies a review mechanism nobody has specified, and the second is a figure whose definition
+// belongs to `Docs/02` and whose data belongs to another domain. 000303 records the same two.
+//
+// **Anything from `users`.** The verification flag and the join date a customer already sees come
+// from `identity`'s table and are assembled beside this rather than copied into it. Two facts with
+// two owners in one struct is the shape that goes stale.
+type PublicProfile struct {
+	ProviderID uuid.UUID
+
+	// DisplayName is what a customer sees instead of an identifier.
+	//
+	// Empty when the provider has not declared one, which is an ordinary state and not an error: a
+	// provider can bid before finishing their profile, and a screen renders "not stated" rather
+	// than failing. It is never a fallback to an email address or a phone number — Docs/01 §7's
+	// privacy rule minimises how far those travel, and a default that leaked one would be worse
+	// than a blank.
+	DisplayName string
+
+	// OperatesAs is [OperatesAsIndividual] or [OperatesAsBusiness], and empty when undeclared.
+	OperatesAs OperatingForm
+}
+
+// Declared reports whether the provider has said who they are.
+//
+// One method rather than each caller comparing to the zero value, because "has a profile" is a
+// question about the pair: 000303 makes both columns NOT NULL, so a row exists with both or there
+// is no row at all.
+func (p PublicProfile) Declared() bool { return p.DisplayName != "" }
 
 // Serves reports whether the profile covers an address in this state and postcode.
 //
@@ -493,9 +592,32 @@ type ProfileFields struct {
 	Postcodes *[]string
 
 	Specialties *[]Specialty
+
+	// DisplayName and OperatesAs are the public half (SHIP-79a), and they follow the same pointer
+	// rule as the lists above rather than a different one: absent leaves the value alone.
+	//
+	// **An empty display name is refused rather than treated as a clearance**, which is the one
+	// place this type departs from the sets beside it. A provider who has told customers who they
+	// are cannot go back to being an identifier on a comparison screen — and unlike a postcode
+	// they have withdrawn from, there is no state being described by the absence. `operates_as`
+	// likewise: 000303 makes both columns NOT NULL, so "declared, then cleared" has no
+	// representation in the schema and inventing one in the API would be inventing a state the
+	// database cannot hold.
+	DisplayName *string
+	OperatesAs  *string
 }
 
-// IsEmpty reports whether the caller named no list at all.
+// IsEmpty reports whether the caller named nothing at all.
 func (f ProfileFields) IsEmpty() bool {
-	return f.States == nil && f.Postcodes == nil && f.Specialties == nil
+	return f.States == nil && f.Postcodes == nil && f.Specialties == nil &&
+		f.DisplayName == nil && f.OperatesAs == nil
+}
+
+// declaresPublic reports whether either public field was named.
+//
+// The write of `provider_profiles` is skipped entirely when neither is, so a provider editing only
+// their service area does not touch a row they may not even have — and does not need one created
+// with an empty name that 000303 would refuse anyway.
+func (f ProfileFields) declaresPublic() bool {
+	return f.DisplayName != nil || f.OperatesAs != nil
 }

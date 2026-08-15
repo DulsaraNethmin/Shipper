@@ -16,13 +16,18 @@ import (
 //
 // # Why there is a shelf at all, and why every path on it has five segments
 //
-// SHIP-115 found the constraint and this file is what it costs. `GET /v1/jobs/open/{id}` (SHIP-83)
-// puts a literal in the `{id}` position, so it and **any** four-segment `GET /v1/jobs/{id}/<literal>`
-// both match `/v1/jobs/open/<literal>` with neither more specific — and Go's `ServeMux` panics at
-// registration rather than answering a 404 somebody debugs. `GET /v1/jobs/{id}/delivery` would stop
-// the process; `GET /v1/jobs/{id}/delivery/detail` does not. `Docs/09`'s row for this ticket names
-// both paths for that reason rather than describing a shelf, and `Docs/11` §9 carries the structural
-// fix — moving the open feed off the `{id}` slot — which is not this ticket's.
+// SHIP-115 found the constraint and this file is what it cost. `GET /v1/jobs/open/{id}` (SHIP-83)
+// put a literal in the `{id}` position, so it and **any** four-segment `GET /v1/jobs/{id}/<literal>`
+// both matched `/v1/jobs/open/<literal>` with neither more specific — and Go's `ServeMux` panics at
+// registration rather than answering a 404 somebody debugs. `GET /v1/jobs/{id}/delivery` would have
+// stopped the process; `GET /v1/jobs/{id}/delivery/detail` did not. `Docs/09`'s row for this ticket
+// names both paths for that reason rather than describing a shelf.
+//
+// **SHIP-83a has since made the structural fix**: the provider feed is `GET /v1/fleet/jobs/{id}`
+// and the four-segment space is free, demonstrated by cmd/api/routes_jobsegment_test.go. These
+// paths do not move with it — they are published, installed clients call them, and `Docs/06` §5.3
+// is why that is decisive. The shelf also composes, which is the argument that would have kept it
+// anyway: SHIP-116's exception and SHIP-133's tracking view have somewhere to go.
 //
 // # Both parties, decided from the database rather than from a role claim
 //

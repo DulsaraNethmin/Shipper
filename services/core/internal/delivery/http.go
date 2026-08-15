@@ -1615,12 +1615,13 @@ func deliveryDetailFrom(d Delivery) deliveryDetailResponse {
 
 // DeliveryDetail handles GET /v1/jobs/{id}/delivery/detail (SHIP-115a).
 //
-// # Five segments, and four would stop the process
+// # Five segments, and four would have stopped the process
 //
-// `GET /v1/jobs/{id}/delivery` and `GET /v1/jobs/open/{id}` both match `/v1/jobs/open/delivery` with
-// neither more specific, and Go's ServeMux panics at registration rather than serving a route that
-// answers oddly. This is the shelf SHIP-115 opened with `/delivery/proof` for exactly that reason;
-// see read.go's header.
+// `GET /v1/jobs/{id}/delivery` and `GET /v1/jobs/open/{id}` both matched `/v1/jobs/open/delivery`
+// with neither more specific, and Go's ServeMux panics at registration rather than serving a route
+// that answers oddly. This is the shelf SHIP-115 opened with `/delivery/proof` for exactly that
+// reason. SHIP-83a has since moved the feed to `/v1/fleet/jobs/{id}` and the path is published
+// regardless; see read.go's header for why it stays.
 //
 // RequireUser, and the auth class is not the access control: it gets a caller as far as the handler,
 // and [Service.DeliveryFor] asks the database which of two parties they are. Being neither answers

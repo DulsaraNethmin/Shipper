@@ -285,9 +285,17 @@ func TestAProviderGetsWhatAStrangerGets(t *testing.T) {
 // **`registration` is deliberately not here.** A plate is not something a losing bidder publishes to
 // the customer who did not choose them, and a field added to `vehicleSummaryResponse` would have to
 // be added here first.
+//
+// `display_name` and `operates_as` arrived with SHIP-79a, which is what turned this summary from
+// three facts about an *account* into something that says who is offering. They come from
+// `fleet.PublicProfile` — the closed set defined in the domain that owns the declaration — and the
+// service area and the specialties are still absent from both, which is the clause SHIP-102a's
+// *Done when* forbids and the one widening this shape would most easily have broken.
 var customerOfferKeys = func() map[string]bool {
 	keys := map[string]bool{
 		"provider":       true,
+		"display_name":   true,
+		"operates_as":    true,
 		"verified":       true,
 		"member_since":   true,
 		"vehicle":        true,
@@ -675,5 +683,97 @@ func TestARevisionMovesTheVehicleAndAClearanceRemovesIt(t *testing.T) {
 	}
 	if got := vehicleOnTheOffer(t); got != nil {
 		t.Errorf("after clearing, the offer still carries %s", *got)
+	}
+}
+
+// TestTheCustomerIsToldWhoIsOfferingRatherThanOnlyAnIdentifier is SHIP-79a at the read that serves
+// it, and the check on the seam rather than on either half of it.
+//
+// **Neither package can make this claim alone.** `fleet` owns the declaration and has no customer
+// endpoint; this package owns the response and may not import `fleet`; the two meet in
+// `cmd/api`'s offeror directory, which the router under test wires. So the assertion is here, driven
+// through the served route, against a declaration made through the real service.
+//
+// The rest of the *Done when* is checked beside it: the disclosed fields are a closed set
+// ([customerOfferKeys]), and none of them is the service area or the specialties — which is what
+// TestTheOfferResponseCarriesNothingItMayNot holds, on a fixture that has both to leak.
+func TestTheCustomerIsToldWhoIsOfferingRatherThanOnlyAnIdentifier(t *testing.T) {
+	w := newWire(t)
+	van := vehicleOf(t, w.pool, w.provider)
+
+	// A second provider who declares nothing, so "not stated" is exercised beside a declaration
+	// rather than assumed. An offer must stay on the comparison screen either way: an unfinished
+	// profile is not a reason to hide a price.
+	second := secondBidder(t, w.market, "who-is-offering@example.com", "+61400000861", "BID079")
+
+	if err := db.InTx(t.Context(), w.pool, func(ctx context.Context, r db.Runner) error {
+		_, err := fleet.NewService(clock.NewFixed(testInstant)).
+			Declare(ctx, r, w.provider, fleet.ProfileFields{
+				DisplayName: ptr("Yarra Valley Freight"),
+				OperatesAs:  ptr("business"),
+			})
+		return err
+	}); err != nil {
+		t.Fatalf("declaring who the provider trades as: %v", err)
+	}
+
+	if rec := w.bid(t, w.provider, "who-is-offering-1", offerWith(van)); rec.Code != http.StatusCreated {
+		t.Fatalf("the declared provider's offer = %d (%s)", rec.Code, rec.Body)
+	}
+	if rec := w.bid(t, second, "who-is-offering-2", validBody()); rec.Code != http.StatusCreated {
+		t.Fatalf("the undeclared provider's offer = %d (%s)", rec.Code, rec.Body)
+	}
+
+	rec := w.offers(t, w.customer, w.job, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("listing the offers = %d (%s)", rec.Code, rec.Body)
+	}
+
+	page := decode[struct {
+		Data []struct {
+			Provider struct {
+				ID          string `json:"id"`
+				DisplayName string `json:"display_name"`
+				OperatesAs  string `json:"operates_as"`
+				Verified    bool   `json:"verified"`
+				MemberSince string `json:"member_since"`
+			} `json:"provider"`
+		} `json:"data"`
+	}](t, rec)
+
+	if len(page.Data) != 2 {
+		t.Fatalf("the customer sees %d offers, want both: %s", len(page.Data), rec.Body)
+	}
+
+	var declared, undeclared bool
+	for _, offer := range page.Data {
+		switch offer.Provider.ID {
+		case w.provider.String():
+			declared = true
+			if offer.Provider.DisplayName != "Yarra Valley Freight" {
+				t.Errorf("display_name = %q, want %q — SHIP-79a's Done when asks for a summary "+
+					"that says something about the provider beyond whether they are verified and "+
+					"when they joined", offer.Provider.DisplayName, "Yarra Valley Freight")
+			}
+			if offer.Provider.OperatesAs != "business" {
+				t.Errorf("operates_as = %q, want business", offer.Provider.OperatesAs)
+			}
+		case second.String():
+			undeclared = true
+			// Absent rather than invented, and the offer is still here — which is the half a
+			// test written only against a declared provider would miss.
+			if offer.Provider.DisplayName != "" || offer.Provider.OperatesAs != "" {
+				t.Errorf("a provider who declared nothing is described as %q/%q",
+					offer.Provider.DisplayName, offer.Provider.OperatesAs)
+			}
+			if offer.Provider.MemberSince == "" {
+				t.Errorf("an undeclared provider lost the rest of their summary: %s", rec.Body)
+			}
+		default:
+			t.Errorf("an offer names a provider neither fixture created: %s", offer.Provider.ID)
+		}
+	}
+	if !declared || !undeclared {
+		t.Errorf("the two fixtures did not both reach the response: %s", rec.Body)
 	}
 }

@@ -131,7 +131,7 @@ func init() {
 			// first, and looking is what the least-privileged role exists to be able to do.
 			//
 			// Under /admin rather than /jobs, and not merely because the handler is admin's.
-			// `GET /v1/jobs` is the customer's own jobs and `GET /v1/jobs/open` is the
+			// `GET /v1/jobs` is the customer's own jobs and `GET /v1/fleet/jobs` is the
 			// provider's eligible feed; both are scoped to the caller by construction. This
 			// one is scoped to nothing, which is a different resource wearing the same noun,
 			// and putting it under /jobs would make the scope a property of the credential
@@ -180,9 +180,10 @@ func init() {
 			// — `support` may open any job and may not remove one, which is Docs/04 §9's
 			// least-privilege control expressed as two permissions on two endpoints.
 			//
-			// Five segments, which is safe. A four-segment `GET /v1/jobs/{id}/<literal>` would
-			// collide with `GET /v1/jobs/open/{id}` at registration; this is under /admin, is
-			// a POST, and has no literal sibling at its depth.
+			// Five segments, which is safe. A four-segment `GET /v1/jobs/{id}/<literal>` used
+			// to collide with `GET /v1/jobs/open/{id}` at registration; SHIP-83a moved that
+			// feed to `/v1/fleet/jobs/{id}` and freed the space. This route never depended on
+			// it — it is under /admin, is a POST, and has no literal sibling at its depth.
 			//
 			// POST rather than DELETE, because nothing is deleted: the job moves to
 			// `Cancelled` through the guarded transition and the row stays where it is

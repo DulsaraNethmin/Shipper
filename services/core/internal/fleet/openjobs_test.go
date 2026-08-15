@@ -138,7 +138,7 @@ type page struct {
 func (m marketplace) feed(t *testing.T, query string) page {
 	t.Helper()
 
-	target := "/v1/jobs/open"
+	target := "/v1/fleet/jobs"
 	if query != "" {
 		target += "?" + query
 	}
@@ -239,7 +239,7 @@ func TestAnIneligibleProviderSeesAnEmptyFeed(t *testing.T) {
 
 			caller := arrange(t, m)
 
-			rec := as(t, m.router, caller, http.MethodGet, "/v1/jobs/open", "")
+			rec := as(t, m.router, caller, http.MethodGet, "/v1/fleet/jobs", "")
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200 — being eligible for nothing is an answer, "+
 					"not a failure of the request (%s)", rec.Code, rec.Body)
@@ -266,7 +266,7 @@ func TestTheFeedIsNewestFirstAndCarriesTheEnvelope(t *testing.T) {
 		published = append(published, id)
 	}
 
-	rec := m.get(t, "/v1/jobs/open")
+	rec := m.get(t, "/v1/fleet/jobs")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
@@ -401,7 +401,7 @@ func TestTheFeedRefusesAQueryItCannotHonour(t *testing.T) {
 	}
 	for name, query := range refused {
 		t.Run(name, func(t *testing.T) {
-			rec := m.get(t, "/v1/jobs/open?"+query)
+			rec := m.get(t, "/v1/fleet/jobs?"+query)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
 			}
@@ -413,7 +413,7 @@ func TestTheFeedRefusesAQueryItCannotHonour(t *testing.T) {
 	}
 
 	t.Run("a limit above the maximum is narrowed rather than refused", func(t *testing.T) {
-		rec := m.get(t, "/v1/jobs/open?limit=5000")
+		rec := m.get(t, "/v1/fleet/jobs?limit=5000")
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200 — raising the maximum later must not break a client (%s)",
 				rec.Code, rec.Body)
@@ -438,7 +438,7 @@ func TestTheProviderJobDetailIsTheJobTheFeedShowed(t *testing.T) {
 		t.Fatalf("the feed carries %d jobs, want the one just published", len(fromFeed.Data))
 	}
 
-	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	rec := m.get(t, "/v1/fleet/jobs/"+job.String())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET the job = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
@@ -543,22 +543,22 @@ func TestTheProviderResponseCarriesNoBudgetInAnyForm(t *testing.T) {
 	// endpoint and not on the other is the failure two responses invite, and it is why both are
 	// here rather than only the one SHIP-83 adds.
 	responses := map[string][]byte{
-		"the feed, GET /v1/jobs/open":                nil,
-		"the job itself, GET /v1/jobs/open/{id}":     nil,
+		"the feed, GET /v1/fleet/jobs":               nil,
+		"the job itself, GET /v1/fleet/jobs/{id}":    nil,
 		"the feed a second time, following a cursor": nil,
 	}
 
-	feed := m.get(t, "/v1/jobs/open")
+	feed := m.get(t, "/v1/fleet/jobs")
 	if feed.Code != http.StatusOK {
 		t.Fatalf("the feed = %d, want 200 (%s)", feed.Code, feed.Body)
 	}
-	responses["the feed, GET /v1/jobs/open"] = feed.Body.Bytes()
+	responses["the feed, GET /v1/fleet/jobs"] = feed.Body.Bytes()
 
-	detail := m.get(t, "/v1/jobs/open/"+job.String())
+	detail := m.get(t, "/v1/fleet/jobs/"+job.String())
 	if detail.Code != http.StatusOK {
 		t.Fatalf("the job = %d, want 200 (%s)", detail.Code, detail.Body)
 	}
-	responses["the job itself, GET /v1/jobs/open/{id}"] = detail.Body.Bytes()
+	responses["the job itself, GET /v1/fleet/jobs/{id}"] = detail.Body.Bytes()
 
 	// A second page is a different code path through the same handler — the one that renders a
 	// cursor — and a leak there would be reached only by a provider who scrolled.
@@ -568,7 +568,7 @@ func TestTheProviderResponseCarriesNoBudgetInAnyForm(t *testing.T) {
 	if !firstPage.HasMore {
 		t.Fatalf("the fixture did not produce a second page")
 	}
-	paged := m.get(t, "/v1/jobs/open?limit=1&cursor="+url.QueryEscape(firstPage.NextCursor))
+	paged := m.get(t, "/v1/fleet/jobs?limit=1&cursor="+url.QueryEscape(firstPage.NextCursor))
 	if paged.Code != http.StatusOK {
 		t.Fatalf("the second page = %d, want 200 (%s)", paged.Code, paged.Body)
 	}
@@ -669,6 +669,95 @@ func assertNoBudget(t *testing.T, body []byte) {
 				rendering, body)
 		}
 	}
+
+	// 4. And not as a **sentence** — the one form the three checks above all miss (SHIP-96a).
+	assertNoBudgetProse(t, body)
+}
+
+// budgetProse is the vocabulary a "budget supplied" signal would arrive in if it arrived as words.
+//
+// **Deliberately not a list of field names.** The three checks above are a closed key set, the word
+// "budget", and the fixture's own number, and a sentence defeats all three at once: it adds no key,
+// contains no value, and does not have to say "budget" to say what Docs/01 §4.3 forbids. Wave 10
+// isolated exactly this — *"The customer has set a maximum."* placed in an existing free-text field
+// — and a thirteen-test suite passed with it live in another domain. This list is what that finding
+// costs, and it is a list of the *words a platform would reach for*, not of things it might name.
+//
+// **Every entry has to be absent from the fixture as well as from the platform**, or the guard is a
+// guard against the fixture. [richJob]'s free text is "Two-seater sofa, wrapped, no legs attached",
+// "Ute with a tailgate lifter" and "Second-floor walk-up, no lift.", and
+// TestTheBudgetProseGuardIsNotVacuous holds that.
+//
+// A customer *could* legitimately type "maximum" into their handling notes, which would fail this
+// test rather than the service — and that is the right way round: the fixture is this file's, the
+// notes are a controlled input, and a guard that tried to distinguish customer prose from platform
+// prose inside one string would be guessing.
+var budgetProse = []string{
+	"maximum",
+	"max ",
+	"ceiling",
+	"cap ",
+	"willing to pay",
+	"price range",
+	"up to $",
+	"has set a",
+	"has a limit",
+	"limit of",
+}
+
+// budgetProseIn reports the first phrase of [budgetProse] a response carries, or "".
+//
+// Split from the assertion so the guard can be tested without a fabricated *testing.T, which is the
+// only way TestTheBudgetProseGuardIsNotVacuous can assert that it *fires*.
+func budgetProseIn(body []byte) string {
+	lowered := strings.ToLower(string(body))
+	for _, phrase := range budgetProse {
+		if strings.Contains(lowered, phrase) {
+			return phrase
+		}
+	}
+	return ""
+}
+
+// assertNoBudgetProse is the word-level half of the guard.
+func assertNoBudgetProse(t *testing.T, body []byte) {
+	t.Helper()
+
+	if phrase := budgetProseIn(body); phrase != "" {
+		t.Errorf("a provider's response contains %q.\n"+
+			"  Docs/01 §4.3 forbids the customer's maximum reaching a provider as an amount, a "+
+			"band, or a \"budget supplied\" flag — and a sentence is that flag in the one form no "+
+			"key list and no value search can see. If the platform wrote this, it is a defect. If "+
+			"a customer typed it into their own free text, change the fixture rather than this "+
+			"list.\n  %s", phrase, body)
+	}
+}
+
+// TestTheBudgetProseGuardIsNotVacuous is the check on the check.
+//
+// [budgetProseIn] passes trivially if every phrase it looks for is one no response could contain,
+// which is what a later tidy-up of [budgetProse] would produce. This asserts that it fires on the
+// exact sentence wave 10 isolated, and that it does not fire on the fixture's own free text — the
+// two ways a guard like this stops meaning anything.
+func TestTheBudgetProseGuardIsNotVacuous(t *testing.T) {
+	const smuggled = `{"handling_notes":"Second-floor walk-up, no lift. The customer has set a maximum."}`
+
+	if budgetProseIn([]byte(smuggled)) == "" {
+		t.Error("the sentence wave 10 isolated — \"The customer has set a maximum.\" — passed the " +
+			"prose guard. It carries no field name and no value, so the closed key set, the word " +
+			"search and the value search all miss it; this guard is the only one that can catch " +
+			"it, and it is not catching it.")
+	}
+
+	// And the other way: the fixture's own words are not on the list, so a failure of this guard
+	// in the tests above is about the platform rather than about richJob.
+	clean := richJob(1500)
+	for _, text := range []string{clean.GoodsDescription, clean.VehicleRequirement, clean.HandlingNotes} {
+		if phrase := budgetProseIn([]byte(text)); phrase != "" {
+			t.Errorf("richJob's own text %q contains %q, so the prose guard is testing the "+
+				"fixture rather than the service", text, phrase)
+		}
+	}
 }
 
 // identifier matches a UUID as it appears in a JSON document.
@@ -722,7 +811,7 @@ func TestTheProviderJobCarriesNeitherTheStreetLineNorTheCoordinate(t *testing.T)
 			line, latitude)
 	}
 
-	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	rec := m.get(t, "/v1/fleet/jobs/"+job.String())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
@@ -813,21 +902,21 @@ func TestAJobThisProviderMayNotBidOnIsNotFound(t *testing.T) {
 
 			// It is reachable first, by the provider. Otherwise every case below would pass
 			// against an endpoint that answered 404 to everything.
-			if rec := m.get(t, "/v1/jobs/open/"+job.String()); rec.Code != http.StatusOK {
+			if rec := m.get(t, "/v1/fleet/jobs/"+job.String()); rec.Code != http.StatusOK {
 				t.Fatalf("the job was already unreachable before the test broke anything: %d (%s)",
 					rec.Code, rec.Body)
 			}
 
 			asked := ineligible(t, m, job)
 
-			refused := as(t, m.router, caller, http.MethodGet, "/v1/jobs/open/"+asked.String(), "")
+			refused := as(t, m.router, caller, http.MethodGet, "/v1/fleet/jobs/"+asked.String(), "")
 			if refused.Code != http.StatusNotFound {
 				t.Fatalf("status = %d, want 404 (%s)", refused.Code, refused.Body)
 			}
 
 			// The job that does not exist, asked for by the same caller in the same state.
 			absent := as(t, m.router, caller, http.MethodGet,
-				"/v1/jobs/open/00000000-0000-7000-8000-000000000010", "")
+				"/v1/fleet/jobs/00000000-0000-7000-8000-000000000010", "")
 			if absent.Code != http.StatusNotFound {
 				t.Fatalf("a job that does not exist = %d, want 404 (%s)", absent.Code, absent.Body)
 			}
@@ -869,7 +958,7 @@ func TestAnotherProvidersFeedIsNotReachableByAsking(t *testing.T) {
 	declare(t, m.pool, other, ProfileFields{States: &[]string{"WA"}})
 	addVehicle(t, m.pool, other, "OTHR01", Capacity{MaxWeightKg: 1200})
 
-	target := "/v1/jobs/open?provider_id=" + m.provider.String()
+	target := "/v1/fleet/jobs?provider_id=" + m.provider.String()
 	rec := as(t, m.router, other, http.MethodGet, target, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
@@ -908,7 +997,7 @@ func TestTheBiddableStatusesReachTheWireInDocs02sNames(t *testing.T) {
 	job := m.publish(t, richJob(1500))
 	transition(t, m.pool, job, m.customer, "Open", "Negotiating")
 
-	rec := m.get(t, "/v1/jobs/open/"+job.String())
+	rec := m.get(t, "/v1/fleet/jobs/"+job.String())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("a Negotiating job = %d, want 200 — Docs/02 §1 keeps it open to eligible bids (%s)",
 			rec.Code, rec.Body)
@@ -933,7 +1022,7 @@ func TestTheJobIDInThePathMustBeAnIdentifier(t *testing.T) {
 	m := newMarketplace(t)
 	m.publish(t, richJob(1500))
 
-	rec := m.get(t, "/v1/jobs/open/not-a-uuid")
+	rec := m.get(t, "/v1/fleet/jobs/not-a-uuid")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
 	}

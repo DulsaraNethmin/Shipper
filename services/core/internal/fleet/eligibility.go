@@ -60,9 +60,10 @@ import (
 //     integration tests by construction — Docs/06 §4.1 forbids mocking the database here anyway —
 //     so a renamed column is a red build in CI rather than an empty feed in production.
 //   - **The reach is confined to this one file, and a test enforces it.**
-//     TestOnlyTheEligibilityFilterReadsTheJobsTable parses the package and fails if any other
-//     non-test file names `jobs`. "Which parts of `fleet` reach into `jobs`" is therefore answered
-//     by reading one file rather than by grepping and hoping.
+//     TestOnlyTheEligibilityFilterReadsAnotherDomainsTables parses the package and fails if any
+//     other non-test file names `jobs` — or, from SHIP-96a, `bids`. "Which parts of `fleet` reach
+//     into another domain's tables" is therefore answered by reading one file rather than by
+//     grepping and hoping.
 //   - **The two job statuses this file hard-codes are paired with `ck_jobs_status`** by
 //     TestTheBiddableStatusesAreRealJobStatuses — the discipline Docs/10 §3.4 requires of every
 //     enumeration held in two places.
@@ -80,6 +81,28 @@ import (
 // SHIP-84 needs before it accepts a bid. `doc.go` requires both — "the feed itself is filtered here
 // and a bid on an ineligible job is refused here" — and two hand-written definitions of
 // eligibility would drift the first time one of them was corrected. There is one.
+//
+// **SHIP-96a adds a second predicate and does not add a second definition of eligibility.**
+// [readable] is `eligible OR the caller already holds a bid`, and it exists because reading a job
+// and bidding on one are different questions that had been answered by one clause: a provider lost
+// sight of a job at the moment it stopped being biddable, including by winning it. [eligible] is
+// unchanged, both of its readers are unchanged, and the new clause is used by exactly one reader —
+// the single-job read. Widening the filter itself would have let a stale bid buy a new offer.
+//
+// # This file now names a fifth table, and the header above said that was the threshold
+//
+// It did, and the threshold it named is the *filter* becoming "a query planner written by hand".
+// [readable]'s second clause is not that: it is one `EXISTS` on `(job_id, provider_id)`, it selects
+// no column of `bids`, and it takes part in no join. The three things offered in exchange for
+// reaching into `jobs` all hold for it unchanged — it runs against the real schema in `make check`,
+// it is confined to this one file by TestOnlyTheEligibilityFilterReadsAnotherDomainsTables, and it
+// hard-codes no enumeration that a migration could rename underneath it.
+//
+// **The port shape was reconsidered here and rejected again, on a different argument.** The
+// paging objection that ruled it out for the feed does not apply to a single job by identifier, so
+// the honest comparison is one statement against two. Two means reading the job with *no*
+// eligibility predicate once a port has said "yes, they bid" — which is a second definition of what
+// a provider may see, living in a closure in `cmd/api`, and the thing this file exists not to have.
 //
 // # A design considered and rejected: a database view
 //
@@ -224,6 +247,61 @@ const eligible = `
 		  AND (j.width_cm  IS NULL OR v.load_width_cm  IS NULL OR v.load_width_cm  >= j.width_cm)
 		  AND (j.height_cm IS NULL OR v.load_height_cm IS NULL OR v.load_height_cm >= j.height_cm))`
 
+// readable is what a provider may *read* about a job, which is deliberately wider than what they
+// may bid on (SHIP-96a).
+//
+// [eligible], **or** the caller already holds a bid on this job. Two clauses and the same two
+// parameters, so this substitutes for [eligible] wherever a whole job is read rather than filtered.
+//
+// # Why the read had to widen, and why bidding did not
+//
+// SHIP-96a's row closes two gaps that turn out to be one gap seen from both ends of a bid.
+//
+//   - **The provider who wins a job loses their view of it by winning.** [eligible] matches
+//     `status IN ('Open','Negotiating')`, so the instant the award commits, the endpoint the
+//     provider was reading the pickup address and the customer's handling notes from answers 404 —
+//     and SHIP-129's milestone screen can show a job identifier with no address, no goods and no
+//     pickup window. Three lanes recorded that independently in wave 7.
+//   - **Every provider who lost it loses theirs in the same transaction.** "View the job" works
+//     while an offer is live and stops when somebody else's is accepted, which is the moment a
+//     provider most wants to look at what they bid on.
+//
+// One clause answers both, because both audiences are the same thing: *a provider with a
+// relationship to this job that is not eligibility*. There is no third audience — a provider who
+// never bid and is not eligible is a stranger, and gets what a stranger gets.
+//
+// **Bidding is not widened with it and must not be.** [Service.EligibleFor] still reads [eligible]
+// alone, so holding an expired bid does not let a provider bid again on a job that has closed. The
+// two questions are genuinely different — "may I look at this" and "may I offer on this" — and
+// SHIP-96a's row only asks the first.
+//
+// # The bid clause names no status, and that is the *Done when* read literally
+//
+// "A provider holding **any** bid on a job, **live or closed**, and the provider awarded it … for
+// as long as the bid or the award exists." So Submitted, Countered, Accepted, Rejected, Withdrawn,
+// Expired and Superseded all grant the read, and so does a Draft — a status no endpoint can
+// currently produce, and one this clause would have to name specially to exclude, which is a rule
+// nobody has asked for.
+//
+// **The award needs no clause of its own.** SHIP-92 records it by moving the winning bid to
+// 'Accepted' — there is no `awarded_provider_id` column anywhere in `jobs` — so the awarded
+// provider is a provider holding a bid, and a second clause would be a second way to say the same
+// thing that a later schema change could make disagree with the first.
+//
+// **`offered_by` is not filtered either.** A customer's counter-offer (000502) is a row in `bids`
+// carrying the same `provider_id` as the negotiation it belongs to, so it is evidence of the same
+// relationship whichever party wrote it.
+//
+// Nothing here selects from `bids` — it is an `EXISTS` — so the disclosure boundary is still
+// [eligibleJobColumns] and still one list. A bid tells this predicate that the caller is a party
+// and tells the response nothing.
+const readable = `(` + eligible + `)
+
+	OR EXISTS (
+		SELECT 1 FROM bids b
+		WHERE b.job_id      = j.id
+		  AND b.provider_id = $1)`
+
 // Region is where one end of a job is, as a provider sees it.
 //
 // **Three parts, and the street line is not one of them**, which is a decision rather than an
@@ -249,7 +327,13 @@ type Window struct {
 	End   time.Time
 }
 
-// EligibleJob is one job a provider may bid on, in the shape the feed shows it.
+// EligibleJob is one job a provider may read, in the shape the feed shows it.
+//
+// **Named after the feed that defines the shape rather than after every caller that serves it.**
+// SHIP-96a widened the single-job read past eligibility — a provider reads a job they have bid on
+// for as long as the bid exists — and this type deliberately did not gain a second form for that.
+// One shape is what makes the budget rule keepable: two would be two places a field could be added
+// and two responses a test would have to know to check.
 //
 // **There is no budget field and there never may be**, here or in anything else this package
 // serialises. Docs/01 §4.3 and CLAUDE.md both make it an invariant, and SHIP-67's source-parsing
@@ -263,9 +347,14 @@ type Window struct {
 type EligibleJob struct {
 	ID uuid.UUID
 
-	// Status is one of [biddableStatuses] and can be nothing else, because nothing else satisfies
-	// the filter. Carried rather than assumed, because the two present differently: a job already
-	// being negotiated is one a provider is bidding against company.
+	// Status is any of the twelve in Docs/02 §1, stored form, and reaches the wire through
+	// [wireStatus].
+	//
+	// **It was one of [biddableStatuses] and nothing else until SHIP-96a**, because nothing else
+	// could satisfy the filter. [readable] admits a job the caller has bid on whatever became of
+	// it, so `Awarded`, `In transit` and `Cancelled` all arrive here now. That is the field the
+	// widened read is *for*: a provider looking at a job after the award wants to know what
+	// happened to it, and the status is the only part of this shape that says.
 	Status string
 
 	Pickup  Region
@@ -379,37 +468,49 @@ func (s *Service) EligibleJobs(ctx context.Context, r db.Runner, providerID uuid
 	return page, nil
 }
 
-// EligibleJobFor is one job out of the feed, by identifier (SHIP-83).
+// ProviderJobFor is one job as this provider may read it, by identifier (SHIP-83, widened by
+// SHIP-96a).
 //
-// **The third reader of [eligible], and it authorises and reads in one statement rather than two.**
-// SHIP-83 could have asked [Service.EligibleFor] and then read the job, and that shape was rejected
-// for two reasons that both matter:
+// **It authorises and reads in one statement rather than two.** SHIP-83 could have asked
+// [Service.EligibleFor] and then read the job, and that shape was rejected for two reasons that
+// both matter:
 //
 //   - **A second SELECT is a second definition of what a provider may see.** The read would need
-//     its own WHERE, and the only honest one is this predicate — so the choice is between naming it
-//     twice and naming it once. `doc.go` requires eligibility decided in one place.
+//     its own WHERE, and the only honest one is a predicate this file already holds — so the choice
+//     is between naming it twice and naming it once. `doc.go` requires eligibility decided in one
+//     place.
 //   - **Two statements can disagree with each other.** Between the check and the read the customer
 //     can cancel the job, and the detail view would then serve a job nobody may bid on. One
 //     statement cannot straddle that.
 //
-// [Service.EligibleFor] is unchanged and is still what SHIP-84 asks before it writes a bid: a
-// caller deciding whether to permit something wants a boolean, not a row. What keeps the three
-// readers from drifting is TestTheThreeReadersOfTheFilterAgree, which holds all of them to each
-// other across every case in this file.
+// # It reads [readable] and not [eligible], which is SHIP-96a's whole change
 //
-// **A job this provider may not bid on is [ErrJobNotOffered], and so is a job that does not
-// exist.** The two are one sentinel rather than two, because distinguishing them would need a
-// second query whose only purpose is to disclose which job identifiers exist — the reasoning
+// Until SHIP-96a this was the third reader of [eligible], and a provider therefore lost sight of a
+// job at the moment it stopped being biddable — **including by winning it.** [readable] adds the
+// bid the caller already holds, so the view survives the award, the rejection and the expiry. See
+// that constant for the reasoning; nothing about the row that comes back changes, because the
+// column list does not.
+//
+// [Service.EligibleFor] is unchanged and is still what SHIP-84 asks before it writes a bid: a
+// caller deciding whether to permit something wants a boolean, not a row, and *bidding* is still
+// governed by eligibility alone. TestTheThreeReadersOfTheFilterAgree holds all three to each other
+// for a caller who holds no bid — which is every case in that file — and
+// TestTheProviderReadIsTheFeedPlusTheCallersOwnBids is where the divergence itself is pinned:
+// strictly more, and only through the bid clause.
+//
+// **A job this provider may not read is [ErrJobNotOffered], and so is a job that does not exist.**
+// The two are one sentinel rather than two, because distinguishing them would need a second query
+// whose only purpose is to disclose which job identifiers exist — the reasoning
 // [ErrVehicleNotFound] and [ErrNotVehicleOwner] take on the wire, taken here in the domain as well
 // because there is nothing this domain could truthfully say about a job it may not read.
-func (s *Service) EligibleJobFor(ctx context.Context, r db.Runner, providerID, jobID uuid.UUID) (EligibleJob, error) {
+func (s *Service) ProviderJobFor(ctx context.Context, r db.Runner, providerID, jobID uuid.UUID) (EligibleJob, error) {
 	if providerID == uuid.Nil {
 		return EligibleJob{}, fmt.Errorf("fleet: a job request names no provider: %w", ErrNotProvider)
 	}
 	if jobID == uuid.Nil {
 		return EligibleJob{}, ErrJobNotOffered
 	}
-	return s.store.eligibleJob(ctx, r, providerID, s.clock.Now(), jobID)
+	return s.store.providerJob(ctx, r, providerID, s.clock.Now(), jobID)
 }
 
 // EligibleFor answers the same question about one job (SHIP-81).
@@ -555,23 +656,31 @@ func (postgresStore) eligibleJobs(ctx context.Context, r db.Runner, providerID u
 	return out, nil
 }
 
-// eligibleJob reads one row of the feed by identifier (SHIP-83).
+// providerJob reads one job by identifier, as the calling provider may see it (SHIP-83, widened by
+// SHIP-96a).
 //
-// The same column list and the same predicate the feed uses, with `j.id = $3` added — so the
-// detail view can show nothing the feed could not have shown, including the budget it does not
-// select. A separate column list here would be a second disclosure boundary, and the second one is
-// always the one nobody remembers to check.
+// **The same column list the feed uses**, with `j.id = $3` added — so this view can show nothing
+// the feed could not have shown, including the budget neither of them selects. A separate column
+// list here would be a second disclosure boundary, and the second one is always the one nobody
+// remembers to check. SHIP-96a widened *who may ask* and deliberately did not touch *what comes
+// back*: the answer for an awarded job is the answer for an open one, minus nothing and plus
+// nothing.
+//
+// The predicate is [readable] rather than [eligible], which is the whole of the widening. The
+// parentheses around it in that constant are load-bearing — `AND eligible OR bid` would bind the
+// `j.id = $3` to the first branch only, and every provider holding a bid on *any* job would read
+// *any* job.
 //
 // No rows is [ErrJobNotOffered] rather than an error about the database, because "no such job" and
-// "not yours to bid on" are the same answer and neither is a failure of the request.
-func (postgresStore) eligibleJob(ctx context.Context, r db.Runner, providerID uuid.UUID,
+// "not yours to see" are the same answer and neither is a failure of the request.
+func (postgresStore) providerJob(ctx context.Context, r db.Runner, providerID uuid.UUID,
 	now time.Time, jobID uuid.UUID) (EligibleJob, error) {
 
 	const q = `
 		SELECT ` + eligibleJobColumns + `
 		FROM jobs j
 		WHERE j.id = $3
-		  AND ` + eligible
+		  AND (` + readable + `)`
 
 	job, err := scanEligibleJob(r.QueryRow(ctx, q, providerID, now.UTC(), jobID))
 	switch {

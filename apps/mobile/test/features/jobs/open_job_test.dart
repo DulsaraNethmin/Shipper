@@ -16,7 +16,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/features/jobs/job_status.dart';
 import 'package:shipper/features/jobs/open_job.dart';
 
-/// A job exactly as `GET /v1/jobs/open` sends one.
+/// A job exactly as `GET /v1/fleet/jobs` sends one.
 const _wire = <String, dynamic>{
   'id': '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0',
   'status': 'open',

@@ -36,7 +36,8 @@ status="$(post_json "verify-fleet-other-$$" /v1/auth/register \
   "{\"email\":\"fleet-other-$$@example.com\",\"phone\":\"04141$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/fleet-other.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/fleet-other.json"; fail "could not register the second provider: $status"; }
-fleet_other_token="$(mint_token "$(json "$WORKDIR/fleet-other.json" '["id"]')")"
+fleet_other_id="$(json "$WORKDIR/fleet-other.json" '["id"]')"
+fleet_other_token="$(mint_token "$fleet_other_id")"
 
 status="$(post_json "verify-fleet-cust-$$" /v1/auth/register \
   "{\"email\":\"fleet-customer-$$@example.com\",\"phone\":\"04142$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
@@ -615,7 +616,7 @@ serves="$("$PSQL" "$DATABASE_URL" -tAc \
 ok "the stored declaration answers eligibility by set membership — the query SHIP-81 inherits"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-81  the eligibility filter, through SHIP-82's GET /v1/jobs/open — four filters, each shown to exclude"
+ticket "SHIP-81  the eligibility filter, through SHIP-82's GET /v1/fleet/jobs — four filters, each shown to exclude"
 
 # **SHIP-81's SQL mirror is gone, and this is what replaced it.**
 #
@@ -693,7 +694,7 @@ publish_job "$elig_job_id" Draft Open
 
 # eligible — 1 when the marketplace offers that one job to that one provider, 0 when it does not.
 #
-# **Both endpoints are asked, and they have to agree.** `GET /v1/jobs/open/{id}` answers 200 or 404,
+# **Both endpoints are asked, and they have to agree.** `GET /v1/fleet/jobs/{id}` answers 200 or 404,
 # and the feed either carries the job or does not. One SQL predicate serves both, so a disagreement
 # is a defect rather than a difference of emphasis — a provider shown a job in the feed and then
 # refused it on the detail screen is the worst of both, and it is the failure sharing the clause
@@ -704,15 +705,15 @@ publish_job "$elig_job_id" Draft Open
 eligible() {
   local detail feed status
 
-  detail="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$elig_job_id" "$WORKDIR/elig-detail.json")"
+  detail="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$elig_job_id" "$WORKDIR/elig-detail.json")"
   case "$detail" in
     200) detail=1 ;;
     404) detail=0 ;;
-    *) cat "$WORKDIR/elig-detail.json"; fail "GET /v1/jobs/open/$elig_job_id returned $detail, want 200 or 404" ;;
+    *) cat "$WORKDIR/elig-detail.json"; fail "GET /v1/fleet/jobs/$elig_job_id returned $detail, want 200 or 404" ;;
   esac
 
-  status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/elig-feed.json")"
-  [[ "$status" == "200" ]] || { cat "$WORKDIR/elig-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
+  status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=100' "$WORKDIR/elig-feed.json")"
+  [[ "$status" == "200" ]] || { cat "$WORKDIR/elig-feed.json"; fail "GET /v1/fleet/jobs returned $status, want 200"; }
   feed="$(python3 - "$WORKDIR/elig-feed.json" "$elig_job_id" <<'PY'
 import json, sys
 page = json.load(open(sys.argv[1]))
@@ -726,12 +727,12 @@ print(1 if found else 0)
 PY
 )" || fail "the feed did not fit in one page of 100; this check cannot tell absent from further down"
 
-  [[ "$detail" == "$feed" ]] || fail "the feed says $feed and GET /v1/jobs/open/$elig_job_id says $detail — one predicate serves both"
+  [[ "$detail" == "$feed" ]] || fail "the feed says $feed and GET /v1/fleet/jobs/$elig_job_id says $detail — one predicate serves both"
   printf '%s' "$detail"
 }
 
 status="$(curl -s -o "$WORKDIR/open-anon.json" -w '%{http_code}' \
-  "http://localhost:$VERIFY_PORT/v1/jobs/open")"
+  "http://localhost:$VERIFY_PORT/v1/fleet/jobs")"
 [[ "$status" == "401" ]] || { cat "$WORKDIR/open-anon.json"; fail "an unauthenticated feed read returned $status, want 401"; }
 ok "the feed cannot be reached without a credential — a provider sees it because the platform filtered it"
 
@@ -811,7 +812,7 @@ publish_job "$elig_job_id" Negotiating Cancelled
 ok "job status — Negotiating stays biddable and Cancelled does not, exactly as Docs/02 §1 reads"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-82  GET /v1/jobs/open — the envelope, only eligible jobs, and paging"
+ticket "SHIP-82  GET /v1/fleet/jobs — the envelope, only eligible jobs, and paging"
 
 # **A fresh job, because the one above is Cancelled and stays that way.** Docs/02 §1 makes
 # Cancelled terminal, and moving it back would demonstrate a transition the platform does not
@@ -840,8 +841,8 @@ status="$(fleet_request POST "$fleet_customer_token" "verify-open-qld-$$" /v1/jo
 qld_job_id="$(json "$WORKDIR/open-qld.json" '["id"]')"
 publish_job "$qld_job_id" Draft Open
 
-status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=100' "$WORKDIR/open-feed.json")"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/open-feed.json"; fail "GET /v1/jobs/open returned $status, want 200"; }
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=100' "$WORKDIR/open-feed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-feed.json"; fail "GET /v1/fleet/jobs returned $status, want 200"; }
 python3 - "$WORKDIR/open-feed.json" "$open_job_id" "$qld_job_id" <<'PY' || fail "the feed is not Docs/10 §4.5's envelope, or it carries a job outside the provider's service area"
 import json, sys
 page = json.load(open(sys.argv[1]))
@@ -879,7 +880,7 @@ import json, sys, urllib.parse, urllib.request
 
 token, port, header = sys.argv[1], sys.argv[2], sys.argv[3]
 must_appear = set(sys.argv[4:])
-base = f"http://localhost:{port}/v1/jobs/open"
+base = f"http://localhost:{port}/v1/fleet/jobs"
 
 def get(url):
     request = urllib.request.Request(url, headers={header: f"Bearer {token}"})
@@ -921,27 +922,27 @@ print(f"    {len(expected)} eligible jobs over {pages} pages of one")
 PY
 ok "paging one job at a time reaches every eligible job exactly once, and terminates"
 
-status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?cursor=not-a-cursor' "$WORKDIR/open-badcursor.json")"
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?cursor=not-a-cursor' "$WORKDIR/open-badcursor.json")"
 [[ "$status" == "400" ]] || fail "a mangled cursor returned $status, want 400"
-status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=0' "$WORKDIR/open-badlimit.json")"
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=0' "$WORKDIR/open-badlimit.json")"
 [[ "$status" == "400" ]] || fail "?limit=0 returned $status, want 400"
-status="$(fleet_get "$elig_provider_token" '/v1/jobs/open?limit=5000' "$WORKDIR/open-biglimit.json")"
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=5000' "$WORKDIR/open-biglimit.json")"
 [[ "$status" == "200" ]] || fail "?limit=5000 returned $status, want it narrowed to the maximum"
 ok "a mangled cursor and a bad limit are refused; an over-large limit is narrowed"
 
 # A customer reaching the provider's feed gets an empty page rather than a 403. Being eligible for
 # nothing is the truthful answer to the question, and the client renders that from an empty list.
-status="$(fleet_get "$fleet_customer_token" /v1/jobs/open "$WORKDIR/open-customer.json")"
+status="$(fleet_get "$fleet_customer_token" /v1/fleet/jobs "$WORKDIR/open-customer.json")"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/open-customer.json"; fail "a customer reading the feed returned $status, want 200"; }
 [[ "$(tr -d ' \n' < "$WORKDIR/open-customer.json")" == '{"data":[],"has_more":false}' ]] \
   || { cat "$WORKDIR/open-customer.json"; fail "a customer's feed is not an empty array"; }
 ok "a caller eligible for nothing gets an empty array, never null and never a 403"
 
 # ---------------------------------------------------------------------------------------
-ticket "SHIP-83  GET /v1/jobs/open/{id} — one job, no budget, and no doorstep"
+ticket "SHIP-83  GET /v1/fleet/jobs/{id} — one job, no budget, and no doorstep"
 
-status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-detail.json")"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/open-detail.json"; fail "GET /v1/jobs/open/$open_job_id returned $status, want 200"; }
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/open-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/open-detail.json"; fail "GET /v1/fleet/jobs/$open_job_id returned $status, want 200"; }
 
 # One shape, whatever the client did to obtain it — the rule the vehicle endpoints already follow,
 # and here it is also the privacy decision: two shapes would be two places a budget field could be
@@ -1023,7 +1024,7 @@ ok "the customer's budget is on the job and in neither response — not the word
 # platform geocodes the whole address — sending it would be sending the line as two numbers.
 "$PSQL" "$DATABASE_URL" -q -c \
   "update jobs set pickup_latitude = -37.8197, pickup_longitude = 144.9989 where id = '$open_job_id';"
-status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-detail2.json")"
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/open-detail2.json")"
 [[ "$status" == "200" ]] || fail "re-reading the job returned $status"
 for disclosure in 'Church Street' 'Bourke Street' '37.8197' '144.9989' '"line"' '"coordinate"' '"latitude"'; do
   grep -q "$disclosure" "$WORKDIR/open-detail2.json" \
@@ -1035,9 +1036,9 @@ ok "the pickup is suburb, state and postcode — never the street line, and neve
 
 # A job this provider may not bid on is indistinguishable from one that does not exist. 403 would
 # confirm the job is there, and which jobs a competitor may bid on is nobody else's business.
-status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$qld_job_id" "$WORKDIR/open-theirs.json")"
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$qld_job_id" "$WORKDIR/open-theirs.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/open-theirs.json"; fail "an ineligible job returned $status, want 404"; }
-status="$(fleet_get "$elig_provider_token" /v1/jobs/open/00000000-0000-7000-8000-000000000020 "$WORKDIR/open-nothing.json")"
+status="$(fleet_get "$elig_provider_token" /v1/fleet/jobs/00000000-0000-7000-8000-000000000020 "$WORKDIR/open-nothing.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/open-nothing.json"; fail "a job that does not exist returned $status, want 404"; }
 python3 -c "
 import json, sys
@@ -1050,6 +1051,149 @@ ok "an ineligible job answers exactly what a missing job answers — the refusal
 
 # And the customer cannot read their own job here. GET /v1/jobs/{id} is where they read it, and
 # that response is the one shape in this API that carries the budget.
-status="$(fleet_get "$fleet_customer_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/open-owner.json")"
+status="$(fleet_get "$fleet_customer_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/open-owner.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/open-owner.json"; fail "the owning customer read their job through the provider's route: $status"; }
 ok "the provider's route is not a second way to a job the customer owns"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-83a  the feed moved off the {id} slot, and the old path is gone rather than aliased"
+
+# **What only a running service can show.** cmd/api/routes_jobsegment_test.go proves the freed space
+# by attaching a four-segment literal to the real route table; what it cannot prove is that the
+# process this harness has been driving for the last two hundred checks came up at all. It did — the
+# collision was a *registration* panic, so every check above ran against a binary that would not have
+# started if the pair had been reintroduced.
+#
+# What is left to show here is the other half of the Done when: the old path is gone, not aliased.
+# A redirect would collide with a four-segment literal exactly as a 200 does, because ServeMux
+# refuses the pair before either handler is reached — so an alias is not a gentler migration, it is
+# the same defect wearing a 301.
+
+# **`/v1/jobs/open` answers 400 and that is the demonstration rather than a near miss.** The word
+# `open` now lands in `GET /v1/jobs/{id}`'s identifier slot and is refused for not being a UUID —
+# which is precisely the claim SHIP-83a makes: the slot holds an identifier again, and no literal is
+# shadowing it. A 404 here would mean something was still matching the old shape.
+status="$(fleet_get "$elig_provider_token" /v1/jobs/open "$WORKDIR/moved-feedpath.json")"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/moved-feedpath.json"; fail "GET /v1/jobs/open returned $status, want 400 — the word open should now be read as a job identifier and refused for not being one"; }
+python3 - "$WORKDIR/moved-feedpath.json" <<'FEEDPATH' || fail "the refusal is not the malformed-identifier one"
+import json, sys
+if json.load(open(sys.argv[1]))["error"]["code"] != "bad_request":
+    sys.exit("the old feed path is being served by something: %s" % open(sys.argv[1]).read())
+FEEDPATH
+
+# And the four-segment form matches nothing at all: no route, no redirect, no alias. A redirect
+# would collide with a four-segment literal exactly as a 200 does, because ServeMux refuses the pair
+# before either handler is reached — an alias is the same defect wearing a 301, not a gentler
+# migration. curl is not following redirects here, so one would show as its own status.
+status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/moved-detailpath.json")"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/moved-detailpath.json"; fail "GET /v1/jobs/open/{id} returned $status, want 404 — SHIP-83a removed the old path and did not alias it"; }
+ok "the old feed path is now read as a job identifier and the old detail path matches nothing — gone rather than aliased"
+
+# And the new ones answer, which is what makes the 404s above a move rather than a deletion.
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=100' "$WORKDIR/moved-feed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/moved-feed.json"; fail "GET /v1/fleet/jobs returned $status, want 200"; }
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/moved-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/moved-detail.json"; fail "GET /v1/fleet/jobs/{id} returned $status, want 200"; }
+ok "the feed and the single job answer under /v1/fleet, which is where the provider's own things already live"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-96a  GET /v1/fleet/jobs/{id} once the job has left the feed — the bid, not eligibility"
+
+# **What only the harness can show here.** internal/fleet's tests drive the handler on a mux of
+# their own against a bid row they insert; this drives the served route, past the real auth class,
+# against a job published through /v1/jobs by a real customer and moved through the guarded
+# transition. The two halves that meet only here are the route and the predicate.
+#
+# The bid is written with psql rather than through POST /v1/jobs/{id}/bids, and that is deliberate
+# rather than a shortcut: this section belongs to fleet, the bidding endpoints are 61-bidding.sh's
+# to exercise, and what SHIP-96a asserts is that a *row in bids* opens the read. Placing the offer
+# through the API would make this check depend on another section's fixtures for no extra evidence.
+
+status="$(fleet_request POST "$fleet_customer_token" "verify-ship96a-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":432199}' \
+  "$WORKDIR/awarded-job.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/awarded-job.json"; fail "creating the SHIP-96a job returned $status"; }
+awarded_job_id="$(json "$WORKDIR/awarded-job.json" '["id"]')"
+publish_job "$awarded_job_id" Draft Open
+
+# The fixture, verified rather than assumed: a privacy check against a job with nothing to leak
+# passes forever and proves nothing.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from jobs where id = '$awarded_job_id' and budget is not null;" | tr -d ' ')" == "1" ]] \
+  || fail "the SHIP-96a job carries no budget, so the disclosure checks below assert nothing"
+
+# While it is open the provider reads it because they are eligible — the SHIP-83 behaviour, restated
+# here so the 200 after the award is a widening rather than a job that never left.
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$awarded_job_id" "$WORKDIR/awarded-before.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/awarded-before.json"; fail "an eligible provider returned $status, want 200"; }
+
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into bids (id, job_id, provider_id, status, amount)
+   values (gen_random_uuid(), '$awarded_job_id', '$elig_provider_id', 'Accepted', 45000);"
+publish_job "$awarded_job_id" Open Awarded
+
+# The feed no longer carries it. This is the half that makes the next check mean something: without
+# it, a 200 below could be a job that is simply still biddable.
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=100' "$WORKDIR/awarded-feed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/awarded-feed.json"; fail "the feed returned $status"; }
+python3 -c "
+import json, sys
+page = json.load(open(sys.argv[1]))
+sys.exit(1 if any(j['id'] == sys.argv[2] for j in page['data']) else 0)
+" "$WORKDIR/awarded-feed.json" "$awarded_job_id" \
+  || fail "an awarded job is still in the open feed — SHIP-96a widens the single-job read and must not widen the feed"
+
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$awarded_job_id" "$WORKDIR/awarded-after.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/awarded-after.json"; \
+  fail "the awarded provider returned $status, want 200 — before SHIP-96a winning a job was how a provider lost sight of it"; }
+[[ "$(json "$WORKDIR/awarded-after.json" '["status"]')" == "awarded" ]] \
+  || { cat "$WORKDIR/awarded-after.json"; fail "the status is not awarded; it is the only field that says what became of the job"; }
+ok "a provider holding a bid reads the job after it leaves the feed, and the status says what became of it"
+
+# The same shape, not a fuller one. Two shapes would be two places a budget field could be added.
+python3 -c "
+import json, sys
+before = set(json.load(open(sys.argv[1])))
+after  = set(json.load(open(sys.argv[2])))
+extra  = after - before
+if extra:
+    print('the awarded read carries keys the feed shape does not:', sorted(extra))
+    sys.exit(1)
+" "$WORKDIR/awarded-before.json" "$WORKDIR/awarded-after.json" \
+  || fail "the widened read answers with a different shape"
+
+# And no budget, in any form, on the path the widening opened. The word, the amount in dollars and
+# in cents, and the sentence — the last is the form no key list and no value search can see, and it
+# is the one wave 10 proved a whole suite can miss.
+for disclosure in budget 4321.99 432199 maximum ceiling 'willing to pay' 'up to $'; do
+  grep -qi -- "$disclosure" "$WORKDIR/awarded-after.json" \
+    && { cat "$WORKDIR/awarded-after.json"; fail "the awarded provider's job carries '$disclosure'"; }
+done
+ok "the widened read carries no budget — not the word, not the value, and not a sentence about one"
+
+# A provider with neither relationship gets exactly what a missing job gets — and the control is
+# built rather than assumed. The second provider is given a bid on a **different** job first, so the
+# 404 below cannot be read as "this account holds no bids at all". That is the parenthesisation
+# check at the harness: `WHERE id = $3 AND eligible OR bid` without the brackets binds the identifier
+# to the first branch alone, and every provider holding any bid would read every job on the platform.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into bids (id, job_id, provider_id, status, amount)
+   values (gen_random_uuid(), '$elig_job_id', '$fleet_other_id', 'Submitted', 39000);"
+
+status="$(fleet_get "$fleet_other_token" "/v1/fleet/jobs/$awarded_job_id" "$WORKDIR/awarded-stranger.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/awarded-stranger.json"; fail "a provider with no bid returned $status, want 404"; }
+status="$(fleet_get "$fleet_other_token" /v1/fleet/jobs/00000000-0000-7000-8000-000000000021 "$WORKDIR/awarded-missing.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/awarded-missing.json"; fail "a job that does not exist returned $status, want 404"; }
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/awarded-stranger.json" "$WORKDIR/awarded-missing.json" \
+  || fail "a job the caller has no bid on answers differently from a job that does not exist"
+ok "a provider with neither eligibility nor a bid gets exactly what a missing job gets"

@@ -82,7 +82,7 @@ void main() {
 
     testWidgets('a customer never reads the provider feed', (tester) async {
       // Docs/07 §1: a customer should never see provider surfaces or the reverse. `GET
-      // /v1/jobs/open` does not check the caller's role — it answers a customer `200` with an
+      // /v1/fleet/jobs` does not check the caller's role — it answers a customer `200` with an
       // empty page — so "no request is made on their behalf" is the assertion that matters, not
       // "the platform refused".
       final feed = FakeOpenJobsRepository();
@@ -410,7 +410,7 @@ void main() {
     testWidgets('never ask the platform anything — the endpoint accepts no filter',
         (tester) async {
       // The property that keeps this a convenience rather than a control that disagrees with
-      // server-side eligibility. `GET /v1/jobs/open` takes `limit` and `cursor` and nothing else,
+      // server-side eligibility. `GET /v1/fleet/jobs` takes `limit` and `cursor` and nothing else,
       // so a filter that produced a request would be producing one the platform refuses.
       final feed = FakeOpenJobsRepository()
         ..pages = [

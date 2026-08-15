@@ -447,6 +447,14 @@ func TestAJobIsNotOfferedToItsOwnCustomer(t *testing.T) {
 // detail endpoint that authorised with one query and read with another would have two definitions
 // inside one handler. This holds all three to each other across every case, so a clause added to
 // the predicate for one reader cannot quietly fail to reach the others.
+//
+// **SHIP-96a qualified the third reader, and this comment is where the qualification is recorded.**
+// The single-job read is [readable] — `eligible OR the caller already holds a bid` — so it agrees
+// with the other two exactly when the caller holds no bid, and no world built by [newWorld] does.
+// That is a real limitation of this test rather than a coincidence to rely on: the divergence is
+// pinned separately by TestTheProviderReadIsTheFeedPlusTheCallersOwnBids, which places a bid and
+// asserts the read admits a job neither of the other two will. **A case added here that places a
+// bid stops this being a test about one predicate, and has to go there instead.**
 func TestTheThreeReadersOfTheFilterAgree(t *testing.T) {
 	service := newTestService()
 
@@ -483,16 +491,16 @@ func TestTheThreeReadersOfTheFilterAgree(t *testing.T) {
 			// The third reader (SHIP-83). A row when the job is offered, ErrJobNotOffered when
 			// it is not, and nothing else: any other error means the detail endpoint would have
 			// answered 500 where the feed answered truthfully.
-			job, err := service.EligibleJobFor(t.Context(), w.pool, w.provider, w.job)
+			job, err := service.ProviderJobFor(t.Context(), w.pool, w.provider, w.job)
 			switch {
 			case err == nil && !permitted:
-				t.Errorf("EligibleJobFor returned job %s that EligibleFor and the feed both refuse", job.ID)
+				t.Errorf("ProviderJobFor returned job %s that EligibleFor and the feed both refuse", job.ID)
 			case errors.Is(err, ErrJobNotOffered) && permitted:
-				t.Error("EligibleJobFor refused a job the feed carries and EligibleFor permits")
+				t.Error("ProviderJobFor refused a job the feed carries and EligibleFor permits")
 			case err != nil && !errors.Is(err, ErrJobNotOffered):
-				t.Fatalf("EligibleJobFor: %v", err)
+				t.Fatalf("ProviderJobFor: %v", err)
 			case err == nil && job.ID != w.job:
-				t.Errorf("EligibleJobFor returned %s, want the job asked for, %s", job.ID, w.job)
+				t.Errorf("ProviderJobFor returned %s, want the job asked for, %s", job.ID, w.job)
 			}
 		})
 	}
@@ -634,44 +642,52 @@ func TestTheBiddableStatusesAreRealJobStatuses(t *testing.T) {
 	}
 }
 
-// TestOnlyTheEligibilityFilterReadsTheJobsTable confines the cross-domain reach to one file.
+// TestOnlyTheEligibilityFilterReadsAnotherDomainsTables confines the cross-domain reach to one file.
 //
 // The header of eligibility.go argues that reading another domain's table in SQL is acceptable
 // *here*, and one of the three things it offers in exchange is that the reach stays auditable —
 // "which parts of fleet reach into jobs" answerable by reading one file rather than by grepping.
 // This is what makes that true tomorrow as well as today.
 //
+// **`bids` joined the list at SHIP-96a and the test grew a table rather than an exception.**
+// [readable] asks whether the caller already holds a bid, which is `internal/bidding`'s table read
+// from this package for the first time. The confinement argument is the whole reason that was
+// acceptable, so the guard has to cover it — a second permitted file, or a `bids` query in
+// `postgres.go`, is exactly the drift this catches.
+//
 // Source parsing rather than a naming convention, for the reason SHIP-67's guard gives: the thing
 // to catch is a query that does not exist yet, in a file nobody has written, and the source is the
 // complete list by construction.
-func TestOnlyTheEligibilityFilterReadsTheJobsTable(t *testing.T) {
-	// `FROM jobs`, `JOIN jobs`, `UPDATE jobs`, `INTO jobs` — the table, not the word. Prose in
+func TestOnlyTheEligibilityFilterReadsAnotherDomainsTables(t *testing.T) {
+	// `FROM jobs`, `JOIN bids`, `UPDATE jobs`, `INTO bids` — the table, not the word. Prose in
 	// this package mentions the jobs *domain* constantly and must not trip it.
-	reads := regexp.MustCompile(`(?i)\b(from|join|update|into)\s+jobs\b`)
-
 	const permitted = "eligibility.go"
-	found := false
 
-	for _, file := range fleetSourceFiles(t) {
-		source, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatalf("reading %s: %v", file, err)
-		}
-		if !reads.Match(source) {
-			continue
-		}
-		if filepath.Base(file) == permitted {
-			found = true
-			continue
-		}
-		t.Errorf("%s reads the `jobs` table. The eligibility filter's reach into another "+
-			"domain's tables is confined to %s so that it stays auditable — see the header of "+
-			"that file. If this query is genuinely needed, it belongs there.", file, permitted)
-	}
+	for _, table := range []string{"jobs", "bids"} {
+		reads := regexp.MustCompile(`(?i)\b(from|join|update|into)\s+` + table + `\b`)
+		found := false
 
-	if !found {
-		t.Errorf("no file reads the `jobs` table, so this test is checking nothing. "+
-			"%s is meant to.", permitted)
+		for _, file := range fleetSourceFiles(t) {
+			source, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("reading %s: %v", file, err)
+			}
+			if !reads.Match(source) {
+				continue
+			}
+			if filepath.Base(file) == permitted {
+				found = true
+				continue
+			}
+			t.Errorf("%s reads the `%s` table. This domain's reach into another domain's tables "+
+				"is confined to %s so that it stays auditable — see the header of that file. If "+
+				"this query is genuinely needed, it belongs there.", file, table, permitted)
+		}
+
+		if !found {
+			t.Errorf("no file reads the `%s` table, so this test is checking nothing about it. "+
+				"%s is meant to.", table, permitted)
+		}
 	}
 }
 
@@ -729,7 +745,14 @@ func TestNoProviderFacingShapeCarriesTheBudget(t *testing.T) {
 	// The column list is the other way the budget could arrive: `jobs.budget` sits three lines
 	// from `weight_kg` in the same table, and a SELECT that named it would leak through a struct
 	// field this test would then be too late to catch.
-	for name, sql := range map[string]string{"eligibleJobColumns": eligibleJobColumns, "eligible": eligible} {
+	for name, sql := range map[string]string{
+		"eligibleJobColumns": eligibleJobColumns,
+		"eligible":           eligible,
+
+		// SHIP-96a's widened predicate. It contains `eligible` and is checked in its own right
+		// anyway: a clause added to the OR branch is a clause this map would otherwise not see.
+		"readable": readable,
+	} {
 		if mentionsBudget(sql) {
 			t.Errorf("%s names the budget column. The provider's feed reads `jobs` directly, so "+
 				"the SELECT list is the disclosure boundary (Docs/01 §4.3).", name)

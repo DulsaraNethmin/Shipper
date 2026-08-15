@@ -32,7 +32,7 @@ import 'package:shipper/shared/formatting/dates.dart';
 ///
 /// ## The filters narrow what was read, and the screen says so
 ///
-/// `GET /v1/jobs/open` accepts no filter (see `open_jobs_repository.dart`), so the chips below
+/// `GET /v1/fleet/jobs` accepts no filter (see `open_jobs_repository.dart`), so the chips below
 /// hide jobs already in hand rather than asking a different question. Two consequences the screen
 /// has to be honest about, and both of them are cases a provider meets and a developer does not:
 ///
@@ -321,7 +321,7 @@ class _FacetHeading extends StatelessWidget {
 /// from being wrong and nothing would fail.
 ///
 /// **Tappable from SHIP-100**, which is where reviewing one job and placing a bid arrived, over
-/// `GET /v1/jobs/open/{id}` and `POST /v1/jobs/{id}/bids`. It `push`es rather than `go`es, so the
+/// `GET /v1/fleet/jobs/{id}` and `POST /v1/jobs/{id}/bids`. It `push`es rather than `go`es, so the
 /// back gesture returns to the feed where it was rather than rebuilding the shell — which would
 /// re-read the feed and lose both the scroll position and the provider's narrowing.
 ///

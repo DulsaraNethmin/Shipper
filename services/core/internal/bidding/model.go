@@ -109,7 +109,7 @@ func (p Party) Wire() string { return string(p) }
 //
 // A bid names the job it is against and carries no copy of it. That is a privacy decision as much as
 // a modelling one: every field of the job copied here would be a second place Docs/01 §4.3 could be
-// broken, and the provider already has `GET /v1/jobs/open/{id}` for the job itself — one shape,
+// broken, and the provider already has `GET /v1/fleet/jobs/{id}` for the job itself — one shape,
 // tested once (SHIP-83).
 type Bid struct {
 	ID    uuid.UUID

@@ -230,6 +230,10 @@ paths:
     $ref: './paths/delivery.yaml#/DriverProofUploads'
   /v1/fleet/bids:
     $ref: './paths/bidding.yaml#/FleetBids'
+  /v1/fleet/jobs:
+    $ref: './paths/fleet.yaml#/FleetJobs'
+  /v1/fleet/jobs/{id}:
+    $ref: './paths/fleet.yaml#/FleetJobByID'
   /v1/fleet/profile:
     $ref: './paths/fleet.yaml#/Profile'
   /v1/fleet/vehicles:
@@ -242,10 +246,6 @@ paths:
     $ref: './paths/fleet.yaml#/ReactivateVehicle'
   /v1/jobs:
     $ref: './paths/jobs.yaml#/Jobs'
-  /v1/jobs/open:
-    $ref: './paths/fleet.yaml#/OpenJobs'
-  /v1/jobs/open/{id}:
-    $ref: './paths/fleet.yaml#/OpenJobByID'
   /v1/jobs/{id}:
     $ref: './paths/jobs.yaml#/JobByID'
   /v1/jobs/{id}/award:

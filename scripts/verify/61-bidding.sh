@@ -261,7 +261,7 @@ PY
 ok "the bid response is a closed set of keys, and carries neither the word nor the value nor a key under another name"
 
 # Nothing of the job travels in a bid at all, which is stronger than redaction: there is no field to
-# leak because there is no job in the shape. GET /v1/jobs/open/{id} is where a provider reads the job.
+# leak because there is no job in the shape. GET /v1/fleet/jobs/{id} is where a provider reads the job.
 for disclosure in 'Church Street' 'Richmond' 'sofa' '"weight' '"pickup"'; do
   grep -q "$disclosure" "$WORKDIR/bid-place.json" \
     && { cat "$WORKDIR/bid-place.json"; fail "the bid carries '$disclosure' — a bid names its job and nothing else"; }
@@ -2450,18 +2450,20 @@ ticket "SHIP-102a  GET /v1/jobs/{id}/bids/received — a customer reads the offe
 #
 # # The path is five segments and Docs/09 says four
 #
-# `GET /v1/jobs/{id}/bids` cannot be registered: `GET /v1/jobs/open/{id}` puts a literal where the
-# job identifier goes, so both patterns match `/v1/jobs/open/bids` with neither more specific and the
-# mux refuses the pair at start-up. **The service starting at all is therefore part of what this
-# section demonstrates** — every check below runs against a binary that would not have booted if the
-# collision had been resolved wrongly.
+# `GET /v1/jobs/{id}/bids` could not be registered when this section was written: `GET
+# /v1/jobs/open/{id}` put a literal where the job identifier goes, so both patterns matched
+# `/v1/jobs/open/bids` with neither more specific and the mux refused the pair at start-up.
+# **SHIP-83a has since moved the feed to `/v1/fleet/jobs/{id}` and the four-segment space is free**
+# — cmd/api/routes_jobsegment_test.go demonstrates it by registering one. The path here stays at
+# five segments because it is already published and moving it would break every installed client
+# for a tidier URL, which is not a trade `Docs/06` §5.3 permits.
 #
 # # What only this can show
 #
 # internal/bidding/offers_test.go holds the ownership rule, the closed key set, the word guard and
 # the keyset. What only this can show is the route being served at all, at five segments, past the
-# real auth class, beside `GET /v1/jobs/open/{id}` in one running router — and against offers this
-# file placed through real endpoints on a job that really carries a budget.
+# real auth class, in one running router — and against offers this file placed through real
+# endpoints on a job that really carries a budget.
 
 # A job of its own, so that the assertions below are about offers this section placed rather than
 # about whatever state the sections above left the shared job in. It carries the same budget, which
@@ -2690,6 +2692,69 @@ status="$(offers_get "$bid_customer_token" "?cursor=not-a-cursor" badcursor)"
 status="$(offers_get "$bid_customer_token" "?status=haggling" badstatus)"
 [[ "$status" == "400" ]] || fail "an unknown status returned $status, want 400"
 ok "cursor pagination in the Docs/10 §4.5 envelope, and a cursor this endpoint did not issue is refused rather than read as the first page"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-79a  a provider profile a customer may be shown — a closed set, and none of it the service area"
+
+# **What only the harness can show.** `internal/fleet` owns the declaration and has no
+# customer-facing endpoint; `internal/bidding` owns this response and may not import `fleet`; the two
+# meet in cmd/api's offeror directory. A domain test can assert either half against a fake. Only a
+# running service proves the seam — that what a provider typed into PATCH /v1/fleet/profile is what
+# the customer's comparison screen reads back, through the real wiring.
+
+status="$(curl -s -X PATCH -o "$WORKDIR/profile-79a.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $bid_provider_token" -H "Idempotency-Key: verify-79a-declare-$$" \
+  -H 'Content-Type: application/json' \
+  -d '{"display_name":"Yarra Valley Freight","operates_as":"business","specialties":["refrigerated"],"service_area":{"postcodes":["3121"]}}' \
+  "http://localhost:$VERIFY_PORT/v1/fleet/profile")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/profile-79a.json"; fail "declaring the public profile returned $status"; }
+
+# The declaration has a service area and a specialty to leak, or the assertions below are vacuous —
+# the same fixture discipline the budget checks follow.
+python3 - "$WORKDIR/profile-79a.json" <<'DECLARED' || fail "the provider declared no area or specialty, so the disclosure checks prove nothing"
+import json, sys
+p = json.load(open(sys.argv[1]))
+if not p["service_area"]["postcodes"] or not p["specialties"]:
+    sys.exit("the declaration is empty: %s" % p)
+if p.get("display_name") != "Yarra Valley Freight" or p.get("operates_as") != "business":
+    sys.exit("the declaration did not survive: %s" % p)
+DECLARED
+
+status="$(offers_get "$bid_customer_token" "" seventy-nine-a)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-offers-seventy-nine-a.json"; fail "listing the offers returned $status"; }
+
+python3 - "$WORKDIR/bid-offers-seventy-nine-a.json" <<'SUMMARY' || fail "the customer's provider summary is wrong"
+import json, sys
+
+page = json.load(open(sys.argv[1]))
+rows = page["data"]
+if not rows:
+    sys.exit("no offers, so this proves nothing")
+
+# The closed set, at the provider summary. Anything outside it is a field somebody added without
+# deciding what a customer may see.
+permitted = {"id", "display_name", "operates_as", "verified", "member_since"}
+
+described = 0
+for row in rows:
+    provider = row["provider"]
+    extra = set(provider) - permitted
+    if extra:
+        sys.exit("the provider summary carries %s, which is not in the closed set" % sorted(extra))
+    if provider.get("display_name"):
+        described += 1
+
+if described == 0:
+    sys.exit("no offer names who is offering, which is the whole of SHIP-79a: %s" % rows)
+SUMMARY
+
+# And none of it is the declaration a competitor could use. The area and the specialty were declared
+# above through the real endpoint, so this is a search for values that genuinely exist.
+for disclosure in 3121 refrigerated service_area specialt postcode; do
+  grep -qi -- "$disclosure" "$WORKDIR/bid-offers-seventy-nine-a.json" \
+    && { cat "$WORKDIR/bid-offers-seventy-nine-a.json"; fail "the customer's offers carry '$disclosure' — SHIP-102a forbids the provider's service area and specialties"; }
+done
+ok "the customer is told who is offering, in a closed set, and none of it is the provider's service area or specialties"
 
 unset offers_job_id offers_vehicle_id offers_body offers_bid_a offers_bid_b absent_job
 unset -f offers_get

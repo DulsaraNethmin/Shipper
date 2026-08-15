@@ -40,21 +40,42 @@ import (
 // sends the set back — so there is no `/fleet/profile/states/{state}` to `DELETE`. Two operations
 // over one collection is where a client and a server stop agreeing about what is in it.
 //
-// # Why two of these routes are not under /fleet
+// # The provider's feed is under /fleet, and SHIP-83a moved it there
 //
-// SHIP-82 and SHIP-83 add `GET /v1/jobs/open` and `GET /v1/jobs/open/{id}`, and they are declared
-// here rather than in routes_jobs.go. Routes are **declared, not registered**, so the file follows
-// the domain that answers the request rather than the first segment of the path: `fleet` owns the
-// eligibility filter, so `fleet` owns the endpoints that serve it. Declaring them in the jobs file
-// would have put a `fleet.Handler` in a file the jobs track edits every wave, which is the shared
-// surface this whole arrangement exists to avoid.
+// SHIP-82 and SHIP-83 declared the feed as `GET /v1/jobs/open` and `GET /v1/jobs/open/{id}`, on the
+// argument that the path is the client's view and the resource is a job. The argument was right
+// about the resource and wrong about the cost, and **SHIP-83a reverses it**: the feed is now
+// `GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}`, and the old paths are gone rather than
+// aliased.
 //
-// The path is the client's view and it is right: the resource is a job. `/v1/jobs/open` is the
-// collection of jobs offered to the calling provider and `/v1/jobs/open/{id}` is one member of it.
-// net/http prefers the more specific pattern, so this coexists with `/v1/jobs/{id}` without either
-// file knowing about the other — and the two are deliberately different resources rather than one
-// endpoint returning two shapes: `/v1/jobs/{id}` is the customer's own job and carries the budget
-// that `Docs/01` §4.3 forbids a provider ever seeing.
+// **What the old shape cost was the whole `/v1/jobs/{id}/<literal>` space.** `/v1/jobs/open/{id}`
+// puts a literal where an identifier goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>`
+// both match `/v1/jobs/open/<literal>` with neither pattern more specific — segment 3 favours one
+// and segment 4 the other — and Go's `ServeMux` panics at registration rather than choosing. Not a
+// 404 at request time: the process does not start. Four tickets paid a workaround for it before it
+// was worth fixing — SHIP-115 took `/delivery/proof`, SHIP-115a `/delivery/detail` and
+// `/delivery/milestones`, SHIP-101a went to `/v1/fleet/bids` rather than under the job at all, and
+// SHIP-102a took `/bids/received`. Each is defensible alone; the set is a shape nobody chose.
+//
+// **`/v1/fleet/jobs` is the honest name rather than merely a free one.** `/fleet` is not a resource
+// prefix here — it is the caller's *role*, which is exactly what the collection is scoped by. There
+// is no such thing as "the open jobs" in general: the feed is the platform's eligibility decision
+// about one provider, so two providers reading the same path see different sets, and `/v1/jobs/open`
+// suggested a public shelf that does not exist. `/v1/jobs/{id}` remains the *customer's* job,
+// carrying the budget `Docs/01` §4.3 forbids a provider ever seeing, and the two are now different
+// first segments rather than two readings of one.
+//
+// **Nothing under `/v1/fleet/jobs` may put a literal in the `{id}` slot either**, or the same trap
+// is simply reproduced one prefix down — the reason SHIP-96a widens `/v1/fleet/jobs/{id}` rather
+// than adding `/v1/fleet/jobs/mine/{id}` beside it. TestFourSegmentJobLiteralsCanBeRegistered in
+// routes_jobsegment_test.go is what holds that: it attaches the real route table plus a
+// four-segment `GET /v1/jobs/{id}/<literal>` to a mux, and fails if the pair is refused.
+//
+// They are declared here rather than in routes_jobs.go for the reason they always were. Routes are
+// **declared, not registered**, so the file follows the domain that answers the request rather than
+// the first segment of the path: `fleet` owns the eligibility filter, so `fleet` owns the endpoints
+// that serve it. Declaring them in the jobs file would have put a `fleet.Handler` in a file the jobs
+// track edits every wave, which is the shared surface this whole arrangement exists to avoid.
 func init() {
 	register(
 		Route{
@@ -115,17 +136,17 @@ func init() {
 		},
 		Route{
 			Method:  http.MethodGet,
-			Pattern: "/jobs/open",
+			Pattern: "/fleet/jobs",
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).OpenJobs() },
 		},
 		Route{
 			Method:  http.MethodGet,
-			Pattern: "/jobs/open/{id}",
+			Pattern: "/fleet/jobs/{id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
-			Handler: func(d Deps) http.Handler { return fleetHandler(d).OpenJob() },
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).ProviderJob() },
 		},
 	)
 }

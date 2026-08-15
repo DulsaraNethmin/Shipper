@@ -43,7 +43,7 @@ import 'package:shipper/core/routing/app_router.dart';
 /// withhold. A customer who reached that screen would see an empty fleet, an "Add a vehicle" button,
 /// a form to fill in, and a `403` only at the end of all of it.
 ///
-/// `GET /v1/jobs/open/{id}` does refuse them — with `404`, byte-identically to a job that does not
+/// `GET /v1/fleet/jobs/{id}` does refuse them — with `404`, byte-identically to a job that does not
 /// exist, because a refusal that explained itself would disclose what the status code is
 /// withholding (SHIP-83). That is the correct answer on the wire and a poor thing to render: "we
 /// could not find that job" is not what happened. **Saying whose surface it is at the start is the

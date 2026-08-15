@@ -87,7 +87,7 @@ typedef _ClosedShape = ({
 /// The models a **provider-facing** response decodes into.
 ///
 /// A provider-facing shape is one obtained by an account that does not own the job: the feed and the
-/// job detail (`GET /v1/jobs/open`, `GET /v1/jobs/open/{id}`) and a bid (`POST /v1/jobs/{id}/bids`
+/// job detail (`GET /v1/fleet/jobs`, `GET /v1/fleet/jobs/{id}`) and a bid (`POST /v1/jobs/{id}/bids`
 /// and its four siblings). The customer's own `Job` is not one of these and is on `_allowed` above.
 final _providerFacing = <String, _ClosedShape>{
   'OpenJob': (

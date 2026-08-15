@@ -579,13 +579,20 @@ Profile:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
-OpenJobs:
+FleetJobs:
   get:
     operationId: listOpenJobs
     summary: List the jobs this provider may bid on
     tags: [Jobs]
     description: |
       The marketplace as the calling provider may bid on it, newest first (SHIP-82).
+
+      **This operation answered on `GET /v1/jobs/open` until SHIP-83a and that path is gone rather
+      than aliased.** A literal in the `{id}` position made every four-segment
+      `GET /v1/jobs/{id}/<literal>` unregisterable service-wide, which four earlier tickets each
+      paid a workaround for. `/v1/fleet/jobs` is also the truer name: this is the platform's
+      eligibility decision about *one* provider, so two callers of the same path see different
+      sets, which `/v1/jobs/open` read as a public shelf that does not exist.
 
       A job appears here only when all four of `Docs/01` §4.3's filters accept it: the provider's
       declared service area covers where it is picked up, a vehicle they have in service can carry
@@ -642,29 +649,50 @@ OpenJobs:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
-OpenJobByID:
+FleetJobByID:
   get:
     operationId: getOpenJob
-    summary: Read one job this provider may bid on
+    summary: Read one job this provider may bid on, or has bid on
     tags: [Jobs]
     description: |
-      One job out of `/v1/jobs/open`, in the same shape the feed gave it (SHIP-83).
+      One job in the same shape `/v1/fleet/jobs` sends one (SHIP-83; moved off `/v1/jobs/open/{id}`
+      by SHIP-83a, widened by SHIP-96a).
 
-      **This is a member of that collection and not a second view of `GET /v1/jobs/{id}`.** That
-      operation is the *customer's* own job and is the one shape in this API that carries
-      `budget_cents`; this one has no field it could go in. `Docs/01` §4.3 keeps the customer's
-      maximum private from providers in every form, and two shapes are far easier to keep that rule
-      with than one shape and a redaction step somebody has to remember.
+      **Two ways to be entitled to it, and the second is what SHIP-96a added.** Either the job is in
+      your feed — you are eligible to bid on it right now — **or you already hold a bid on it,
+      whatever became of that bid.** Submitted, countered, accepted, rejected, withdrawn, expired or
+      superseded: the view survives all of them, for as long as the bid exists.
 
-      **A job this provider may not bid on answers `404`, byte-identically to a job that does not
+      That second clause exists because the first, alone, took a job away from a provider at the
+      moment it stopped being biddable — **including when they won it.** The awarded provider needs
+      the pickup address and the handling notes to carry out the work, and everyone who lost needs to
+      be able to look at what they bid on. There is no separate "awarded" rule: an award *is* an
+      accepted bid.
+
+      **So `status` can be any of the twelve.** From the feed it is only ever `open` or
+      `negotiating`; here it may be `awarded`, `in_transit`, `cancelled` or anything else the job has
+      reached since you bid, and it is the field that tells you what happened. A client that assumed
+      two values from this operation will be wrong.
+
+      **What did *not* widen is what you may bid on.** Holding an expired bid does not let you place
+      a new one on a job that has closed; `POST /v1/jobs/{id}/bids` still answers to eligibility
+      alone.
+
+      **This is not a second view of `GET /v1/jobs/{id}`.** That operation is the *customer's* own
+      job and is the one shape in this API that carries `budget_cents`; this one has no field it
+      could go in, at any status. `Docs/01` §4.3 keeps the customer's maximum private from providers
+      in every form and for ever — an awarded job does not unlock it — and two shapes are far easier
+      to keep that rule with than one shape and a redaction step somebody has to remember.
+
+      **A job you have neither relationship to answers `404`, byte-identically to a job that does not
       exist.** Which jobs exist, and which of them a competitor is eligible for, is information
-      nobody published. The authorisation is the same predicate the feed runs, so a job served here
-      is a job the feed would have carried, and a job refused here is one a bid would be refused on.
+      nobody published. The two cases are one answer rather than two, so nothing in the response can
+      tell them apart.
     parameters:
       - $ref: '#/OpenJobID'
     responses:
       '200':
-        description: The job, as a provider deciding whether to bid sees it.
+        description: The job, as a provider with a relationship to it sees it.
         headers:
           X-Request-Id:
             $ref: '../openapi.yaml#/components/headers/RequestID'
@@ -697,7 +725,7 @@ OpenJobID:
   name: id
   in: path
   required: true
-  description: The job's identifier, as carried by an entry in `/v1/jobs/open`.
+  description: The job's identifier, as carried by an entry in `/v1/fleet/jobs`.
   schema:
     type: string
     format: uuid
@@ -840,12 +868,46 @@ ProviderProfileInput:
   type: object
   additionalProperties: false
   description: |
-    A partial declaration. A list that is omitted is left alone; a list that is present replaces its
+    A partial declaration. A field that is omitted is left alone; a list that is present replaces its
     predecessor, including when it is empty.
 
-    A request naming no list at all is refused: it changes nothing, and answering it with the
+    A request naming nothing at all is refused: it changes nothing, and answering it with the
     unchanged declaration would tell a client its edit was applied.
+
+    **The first declaration of the public half has to name both `display_name` and `operates_as`**,
+    and is refused with `validation_failed` naming whichever is missing. Afterwards either may be
+    sent alone. There is no half-identified provider: a customer comparing offers is shown both or
+    neither.
   properties:
+    display_name:
+      type: string
+      minLength: 2
+      maxLength: 80
+      description: |
+        Who you trade as, shown to customers comparing the offers on their job (SHIP-79a) — a
+        business name, or the name you operate under.
+
+        Repeated spaces collapse, so `Smith   Removals` and `Smith Removals` are one name.
+
+        **An empty string is refused rather than clearing it.** A list can be emptied because "I no
+        longer serve any single postcode" is a real declaration; there is no equivalent state for a
+        name, because a provider who has told customers who they are does not go back to being an
+        identifier on a comparison screen.
+
+        A **declaration, not a verified fact.** What it claims is not checked; `Docs/04` §3's
+        document review is what establishes who somebody actually is.
+      example: Yarra Valley Freight
+    operates_as:
+      type: string
+      enum: [individual, business]
+      description: |
+        Whether you trade as a person or as a registered business, in `Docs/01` §4.2's own
+        distinction. Accepted in any case.
+
+        It grants and refuses nothing: no filter reads it, no eligibility rule turns on it, and it
+        is shown to a customer for the same reason `display_name` is — an individual and a business
+        are different propositions to somebody with a piano.
+      example: business
     service_area:
       $ref: '#/ServiceAreaInput'
     specialties:
@@ -906,13 +968,32 @@ ProviderProfile:
   required: [service_area, specialties]
   additionalProperties: false
   description: |
-    What a provider has declared about the work they take.
+    What a provider has declared: who they trade as, and the work they take.
 
     **Every list is always present and never `null`**, which is the opposite of the rule `Vehicle`
     follows and right for the opposite reason: an omitted capacity means the provider has not said,
     whereas an omitted list would mean the same thing as an empty one — and here that distinction is
     exactly what the client is editing.
+
+    **`display_name` and `operates_as` follow the other rule and are omitted when undeclared**, and
+    the difference is what the absence means. An empty list is a real declaration; an absent name is
+    a provider who has not reached that part of onboarding, which the client renders as a prompt.
+
+    **Only those two are ever shown to a customer** (SHIP-79a). The service area and the specialties
+    are what a provider declares commercially and are never disclosed outside this response.
   properties:
+    display_name:
+      type: string
+      maxLength: 80
+      description: |
+        Who this provider trades as. Absent when they have not declared one.
+      example: Yarra Valley Freight
+    operates_as:
+      type: string
+      enum: [individual, business]
+      description: |
+        Whether they trade as a person or as a registered business. Absent when undeclared.
+      example: business
     service_area:
       $ref: '#/ServiceArea'
     specialties:
@@ -1109,7 +1190,7 @@ OpenJob:
   required: [id, status, created_at]
   additionalProperties: false
   description: |
-    A job as a provider deciding whether to bid on it sees it (SHIP-82, SHIP-83).
+    A job as a provider with a relationship to it sees it (SHIP-82, SHIP-83; widened by SHIP-96a).
 
     **There is no budget field, and there is no form one could take here.** `Docs/01` §4.3 keeps the
     customer's maximum private from a provider — not as an amount, not as a band, not as a
@@ -1137,7 +1218,7 @@ OpenJob:
       format: uuid
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
     status:
-      $ref: '#/BiddableJobStatus'
+      $ref: '#/ProviderJobStatus'
     pickup:
       $ref: '#/JobRegion'
     dropoff:
@@ -1254,20 +1335,37 @@ JobTimeWindow:
       format: date-time
       example: '2026-08-15T17:00:00.000Z'
 
-BiddableJobStatus:
+ProviderJobStatus:
   type: string
   description: |
-    The status of a job that is open to bids, in the wire form `Docs/10` §4.7 requires and
+    The status of a job a provider is reading, in the wire form `Docs/10` §4.7 requires and
     `Docs/02` §1 names.
 
-    **Two values, not one.** `Docs/02` §1 defines Negotiating as a job that has bids or
-    counter-offers on it and "remains open to eligible bids unless the customer closes it or awards
-    a bid" — so it is still biddable, and it is carried rather than hidden because a provider
+    **From `GET /v1/fleet/jobs` this is `open` or `negotiating` and can be nothing else**, because
+    nothing else satisfies the eligibility filter. `Docs/02` §1 defines Negotiating as a job that has
+    bids or counter-offers on it and "remains open to eligible bids unless the customer closes it or
+    awards a bid" — so it is still biddable, and it is carried rather than hidden because a provider
     bidding against company is in a different position from one bidding alone.
 
-    This is a subset of the twelve statuses in the `Job` schema, and it is a subset by construction:
-    nothing else can satisfy the eligibility filter, so no other value can appear here.
+    **From `GET /v1/fleet/jobs/{id}` it can be any of the twelve, and SHIP-96a is why.** A provider
+    reads a job they hold a bid on for as long as the bid exists, so the job may have been awarded to
+    somebody else, cancelled, delivered or disputed since. That is the point of the widened read: the
+    status is the only field in this shape that says what became of the work.
+
+    `draft` is listed for completeness rather than because it is reachable — a bid cannot be placed
+    on an unpublished job — and a client should treat the list as the twelve rather than reason about
+    which of them it can rule out.
   enum:
+    - draft
     - open
     - negotiating
+    - awarded
+    - driver_assigned
+    - en_route_to_pickup
+    - picked_up
+    - in_transit
+    - delivered
+    - completed
+    - cancelled
+    - disputed
   example: open

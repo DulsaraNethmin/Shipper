@@ -64,6 +64,16 @@ const (
 	// rather than a judgement about how much of the country a provider may cover. The provider who
 	// genuinely serves everywhere says so in eight state entries instead.
 	maxPostcodes = 1000
+
+	// A trading name has to fit on a comparison screen beside a price (SHIP-79a).
+	//
+	// **The same 80 as `ck_provider_profiles_display_name`, and the pair is tested.** Docs/10 §3.1
+	// puts coherence in the database and policy in the domain, and this is the rare value that is
+	// both: "not a paragraph" is coherence, "fits a row on a phone" is policy, and they agree at
+	// 80. The floor is 2 because a one-character trading name is a typo far more often than it is
+	// a business.
+	minDisplayName = 2
+	maxDisplayName = 80
 )
 
 // Service holds this domain's rules.
@@ -368,7 +378,86 @@ func (s *Service) Declare(ctx context.Context, r db.Runner, providerID uuid.UUID
 		}
 	}
 
+	// The public half (SHIP-79a), under the same lock and in the same transaction as the sets
+	// above. A provider editing only their service area writes nothing here — see
+	// [ProfileFields.declaresPublic] for why that matters more than it looks.
+	if fields.declaresPublic() {
+		// **One read decides two things, and it is free because the lock is already held.**
+		//
+		// 000303 makes both columns NOT NULL, so a provider who has named one field and never
+		// named the other has no legal row. Left to the store that is a constraint violation
+		// reaching the client as a 500 — an error about the database standing in for a rule about
+		// the request — so it is refused here as `required` on the field they left out.
+		//
+		// The same read chooses the statement. An `INSERT … ON CONFLICT DO UPDATE` would have
+		// needed no branch and does not work: PostgreSQL checks the proposed row *before* it
+		// arbitrates the conflict, so the placeholder standing in for "not named" would have to
+		// satisfy `ck_provider_profiles_display_name`. See [postgresStore.insertPublicProfile].
+		existing, err := s.store.publicProfile(ctx, r, providerID)
+		if err != nil {
+			return Profile{}, err
+		}
+
+		switch {
+		case existing.Declared():
+			if err := s.store.updatePublicProfile(ctx, r, providerID, fields.DisplayName, fields.OperatesAs); err != nil {
+				return Profile{}, err
+			}
+		case fields.DisplayName == nil || fields.OperatesAs == nil:
+			var e validate.Errors
+			if fields.DisplayName == nil {
+				e.Add("display_name", validate.CodeRequired,
+					"Tell customers who they are dealing with.")
+			}
+			if fields.OperatesAs == nil {
+				e.Add("operates_as", validate.CodeRequired,
+					"Say whether you operate as an individual or as a business.")
+			}
+			return Profile{}, e.Err()
+		default:
+			if err := s.store.insertPublicProfile(ctx, r, providerID, *fields.DisplayName, *fields.OperatesAs); err != nil {
+				return Profile{}, err
+			}
+		}
+	}
+
 	return s.store.profile(ctx, r, providerID)
+}
+
+// PublicProfiles is who each of these providers trades as (SHIP-79a).
+//
+// **The batch read `cmd/api/routes_bidding.go` recorded as missing**, written here now that a
+// customer-facing disclosure needs it: that file's note says a page of offers cannot use
+// `fleet.Service.Vehicle` because "a page of a hundred offers would be a hundred round trips", and
+// the same is true of anything read one provider at a time. One statement serves a whole page.
+//
+// # This method is the disclosure boundary, and that is the point of it
+//
+// It returns [PublicProfile] and nothing else — no service area, no specialties, no vehicle. A
+// caller assembling a customer-facing summary of a provider cannot reach what SHIP-102a's *Done
+// when* forbids, because the only thing it was handed is the set that may be shown. Reading the
+// whole [Profile] and copying two fields out of it would be correct only for as long as somebody
+// kept copying two.
+//
+// A provider with nothing declared is absent from the map rather than present with empty strings.
+// The caller renders what it has, because an offer must not disappear from a comparison screen
+// because its provider has not finished their profile.
+//
+// The nil provider is skipped rather than refused: this is a decoration on a page that has already
+// been authorised, and a caller assembling one from rows it has already read should not have a
+// screen fail over an identifier that cannot match anything anyway.
+func (s *Service) PublicProfiles(ctx context.Context, r db.Runner, providerIDs []uuid.UUID) (map[uuid.UUID]PublicProfile, error) {
+	wanted := make([]uuid.UUID, 0, len(providerIDs))
+	seen := make(map[uuid.UUID]bool, len(providerIDs))
+
+	for _, id := range providerIDs {
+		if id == uuid.Nil || seen[id] {
+			continue
+		}
+		seen[id] = true
+		wanted = append(wanted, id)
+	}
+	return s.store.publicProfiles(ctx, r, wanted)
 }
 
 // normalise tidies and deduplicates every supplied list, returning a copy.
@@ -388,6 +477,18 @@ func (s *Service) Declare(ctx context.Context, r db.Runner, providerID uuid.UUID
 // smaller set than the provider asked for.
 func (f ProfileFields) normalise() ProfileFields {
 	out := f
+
+	// The display name is collapsed rather than merely trimmed, the treatment a make and a model
+	// already get: "Smith   Removals" and "Smith Removals" are one business, and a name whose
+	// internal spacing survived would sort and compare as a different one.
+	if f.DisplayName != nil {
+		name := collapse(*f.DisplayName)
+		out.DisplayName = &name
+	}
+	if f.OperatesAs != nil {
+		form := string(OperatingForm(*f.OperatesAs).normalise())
+		out.OperatesAs = &form
+	}
 
 	if f.States != nil {
 		out.States = tidied(*f.States, normaliseState)
@@ -497,6 +598,8 @@ func (f ProfileFields) problems() validate.Errors {
 		}
 	}
 
+	f.publicProblems(&e)
+
 	if f.Specialties != nil {
 		specialties := *f.Specialties
 		if len(specialties) > len(Specialties) {
@@ -516,6 +619,50 @@ func (f ProfileFields) problems() validate.Errors {
 	}
 
 	return e
+}
+
+// publicProblems validates the half of a declaration a customer will read (SHIP-79a).
+//
+// # A first declaration has to name both fields, and this is where that is said
+//
+// 000303 makes both columns NOT NULL, so a row naming only one of them cannot exist. The store's
+// upsert would produce a constraint violation, which reaches a client as a 500 — an error about the
+// database standing in for a rule about the request. Refusing it here produces `required` against
+// the field the provider left out, which is what a form can render.
+//
+// **It is a rule about the *first* declaration only.** A provider who has already said who they are
+// may send either field alone, because the other one is already in the row for the upsert to keep.
+// This function cannot see the row, so it checks only what is wrong regardless — an empty name, an
+// over-long one, an unknown form. The "both on a first declaration" rule needs the row and is
+// enforced in [Service.Declare], under the lock, where the read is free.
+//
+// # There is no pattern check on the name, and that is a decision
+//
+// A trading name that is a phone number would be a way to take a deal off the platform, and a
+// regular expression refusing digits would refuse "3 Kings Removals" as readily as "0400 123 456".
+// Docs/04 §7's moderation is where content nobody can validate belongs, and Docs/05 §3 puts the
+// off-platform question with policy rather than with a validator. **Recorded rather than solved**:
+// this field is a moderation surface with no queue behind it yet, and Docs/11 §3 says so.
+func (f ProfileFields) publicProblems(e *validate.Errors) {
+	if f.DisplayName != nil {
+		switch name := *f.DisplayName; {
+		case name == "":
+			// Distinct from "not named at all", which is the pointer being nil. An empty string
+			// is a provider asking to be an identifier again, and there is no such state — see
+			// [ProfileFields].
+			e.Add("display_name", validate.CodeRequired, "Tell customers who they are dealing with.")
+		case len([]rune(name)) < minDisplayName:
+			e.Add("display_name", validate.CodeTooShort,
+				"Use at least %d characters.", minDisplayName)
+		case len([]rune(name)) > maxDisplayName:
+			e.Add("display_name", validate.CodeTooLong,
+				"Use at most %d characters.", maxDisplayName)
+		}
+	}
+
+	if f.OperatesAs != nil && !OperatingForm(*f.OperatesAs).Valid() {
+		e.Add("operates_as", validate.CodeNotAllowed, "Choose individual or business.")
+	}
 }
 
 // isPostcode reports whether value is four digits and nothing else.

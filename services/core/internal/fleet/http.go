@@ -12,14 +12,22 @@
 // platform. A vehicle belonging to another provider answers 404, byte-identically to one that does
 // not exist.
 //
-// # Two routes here are not under /fleet, and that is deliberate
+// # Two of these routes serve jobs rather than vehicles, and that is deliberate
 //
-// `GET /v1/jobs/open` and `GET /v1/jobs/open/{id}` (SHIP-82, SHIP-83) serve jobs, and they are
-// served from this domain because this domain decides which jobs a provider may bid on. Routes are
-// declared rather than registered, so the file a route is declared in follows the domain that
-// answers it rather than the first segment of its path. The rule that keeps the two apart is the
-// one the budget invariant needs: `/v1/jobs/{id}` is the customer's job and carries their budget;
-// `/v1/jobs/open/{id}` is a provider's view of one and has no field it could go in.
+// `GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}` (SHIP-82, SHIP-83, moved by SHIP-83a) serve
+// jobs, and they are served from this domain because this domain decides which jobs a provider may
+// bid on. Routes are declared rather than registered, so the file a route is declared in follows the
+// domain that answers it rather than the first segment of its path. The rule that keeps them apart
+// from the customer's read is the one the budget invariant needs: `/v1/jobs/{id}` is the customer's
+// job and carries their budget; `/v1/fleet/jobs/{id}` is a provider's view of one and has no field
+// it could go in.
+//
+// **They were under `/v1/jobs/open` until SHIP-83a and the move was structural rather than
+// cosmetic.** A literal in the `{id}` slot made `GET /v1/jobs/{id}/<literal>` unregisterable
+// service-wide — see cmd/api/routes_fleet.go for the whole argument and
+// cmd/api/routes_jobsegment_test.go for the guard. `/fleet` is also the more honest prefix: the
+// feed is the platform's eligibility decision about *one* provider, so two callers of the same path
+// see different sets, which `/v1/jobs/open` read as a public shelf that does not exist.
 //
 // **This is not the customer's view of a vehicle.** Docs/01 §4.3 lets a customer compare "provider
 // profile, vehicle, and declared capability" when they read the bids on their job, and that shape
@@ -460,6 +468,16 @@ func (h *Handler) List() http.Handler {
 // top-level lists — but the grains still move independently inside it, because a provider adding a
 // postcode should not have to resend every state.
 type profileRequest struct {
+	// DisplayName and OperatesAs are the public half (SHIP-79a) — the only two fields of this
+	// request a customer will ever read back.
+	//
+	// **A first declaration has to send both**, because 000303 makes both columns NOT NULL and
+	// there is no half-declared provider. Afterwards either may be sent alone. Sending
+	// `"display_name": ""` is refused rather than treated as a clearance: a provider who has told
+	// customers who they are cannot go back to being an identifier on a comparison screen.
+	DisplayName *string `json:"display_name"`
+	OperatesAs  *string `json:"operates_as"`
+
 	ServiceArea *serviceAreaRequest `json:"service_area"`
 	Specialties *[]string           `json:"specialties"`
 }
@@ -484,6 +502,9 @@ type serviceAreaRequest struct {
 func (b profileRequest) fields() ProfileFields {
 	f := ProfileFields{}
 
+	f.DisplayName = b.DisplayName
+	f.OperatesAs = b.OperatesAs
+
 	if b.ServiceArea != nil {
 		f.States = b.ServiceArea.States
 		f.Postcodes = b.ServiceArea.Postcodes
@@ -506,6 +527,16 @@ func (b profileRequest) fields() ProfileFields {
 // distinction is exactly what the client is editing. A provider who has declared nothing gets three
 // empty arrays, which a client can render and iterate without a nil check.
 type profileResponse struct {
+	// DisplayName and OperatesAs are the public half (SHIP-79a).
+	//
+	// **Omitted when undeclared rather than sent empty**, which is the treatment [vehicleResponse]
+	// gives an unstated capacity and the opposite of the lists below. The difference is what the
+	// absence means: an empty list is a real declaration ("I serve no single postcodes"), and an
+	// absent name is a provider who has not got to that part of onboarding — a state the client
+	// renders as a prompt rather than as a value.
+	DisplayName string `json:"display_name,omitempty"`
+	OperatesAs  string `json:"operates_as,omitempty"`
+
 	ServiceArea serviceAreaResponse `json:"service_area"`
 	Specialties []string            `json:"specialties"`
 }
@@ -527,6 +558,8 @@ type serviceAreaResponse struct {
 // keeps the shape of the API a decision of this file's.
 func profileFrom(p Profile) profileResponse {
 	out := profileResponse{
+		DisplayName: p.Public.DisplayName,
+		OperatesAs:  p.Public.OperatesAs.String(),
 		ServiceArea: serviceAreaResponse{States: []string{}, Postcodes: []string{}},
 		Specialties: []string{},
 	}
@@ -667,13 +700,18 @@ func (h *Handler) Declare() http.Handler {
 type openJobResponse struct {
 	ID string `json:"id"`
 
-	// Status is `open` or `negotiating` and can be nothing else. A job already being negotiated is
-	// one a provider is bidding against company, which is worth their knowing before they price it.
+	// Status is any of the twelve in Docs/02 §1, in the wire form Docs/10 §4.7 requires.
+	//
+	// **`open` or `negotiating` from the feed, and anything at all from the single-job read since
+	// SHIP-96a.** A job in the feed is by definition biddable; a job the caller has bid on may have
+	// been awarded to somebody else, cancelled, or delivered since, and this is the field that says
+	// so. A client must not assume the two values it used to be able to.
 	Status string `json:"status"`
 
-	// Pickup is present for every job this endpoint can return: the eligibility filter matches a
-	// declared region against the pickup state or postcode, so a job with neither cannot be here.
-	// Dropoff can be absent, because 000403 lets a customer publish before they have both ends.
+	// Pickup is present for every job either endpoint can return: the eligibility filter matches a
+	// declared region against the pickup state or postcode, so a job with neither cannot reach the
+	// feed — and a job the caller bid on was in their feed when they bid. Dropoff can be absent,
+	// because 000403 lets a customer publish before they have both ends.
 	Pickup  *regionResponse `json:"pickup,omitempty"`
 	Dropoff *regionResponse `json:"dropoff,omitempty"`
 
@@ -766,7 +804,7 @@ func wireStatus(stored string) string {
 	return strings.ToLower(strings.ReplaceAll(stored, " ", "_"))
 }
 
-// OpenJobs handles GET /v1/jobs/open (SHIP-82).
+// OpenJobs handles GET /v1/fleet/jobs (SHIP-82; moved off /v1/jobs/open by SHIP-83a).
 //
 // The marketplace as this provider may bid on it: every open job the platform's eligibility filter
 // offers them, newest first, keyset-paged (Docs/10 §4.5).
@@ -818,20 +856,27 @@ func (h *Handler) OpenJobs() http.Handler {
 	})
 }
 
-// OpenJob handles GET /v1/jobs/open/{id} (SHIP-83).
+// ProviderJob handles GET /v1/fleet/jobs/{id} (SHIP-83; moved by SHIP-83a, widened by SHIP-96a).
 //
-// One job out of the feed, in the same shape the feed gave it. A member of the collection above
-// rather than a second view of `GET /v1/jobs/{id}`: that route is the *customer's* job, it carries
-// their budget, and one shape with a redaction step somebody has to remember is the arrangement a
-// privacy rule is hardest to keep with.
+// One job as the calling provider may see it, in the same shape the feed gave it. Not a second view
+// of `GET /v1/jobs/{id}`: that route is the *customer's* job, it carries their budget, and one shape
+// with a redaction step somebody has to remember is the arrangement a privacy rule is hardest to
+// keep with.
 //
-// **A job this provider may not bid on answers 404, byte-identically to a job that does not
-// exist.** The reasoning is the one a stranger's vehicle already gets, sharpened: which jobs exist
-// on the platform, and which of them a competitor is eligible for, is information nobody published.
-// The authorisation is the same predicate the feed runs — [Service.EligibleJobFor] — so a job this
-// endpoint serves is a job the feed would have carried, and a job it refuses is one SHIP-84 will
-// refuse a bid on.
-func (h *Handler) OpenJob() http.Handler {
+// # Who may read it, which is wider than who may bid
+//
+// SHIP-83 served exactly the feed's members, so a provider's view of a job ended the moment the job
+// stopped being biddable — **including when they won it.** SHIP-96a adds the second half of the
+// relationship: a provider who holds a bid on this job, whatever became of the bid, and therefore
+// the provider who was awarded it. [readable] carries the whole argument; the shape of the response
+// does not change, and neither does what a provider may bid on.
+//
+// **A job with neither relationship answers 404, byte-identically to a job that does not exist.**
+// The reasoning is the one a stranger's vehicle already gets, sharpened: which jobs exist on the
+// platform, and which of them a competitor is eligible for, is information nobody published. One
+// sentinel out of [Service.ProviderJobFor] means the handler cannot accidentally tell the two
+// apart, because it never learns which it was.
+func (h *Handler) ProviderJob() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		providerID, err := callerID(r.Context())
 		if err != nil {
@@ -848,7 +893,7 @@ func (h *Handler) OpenJob() http.Handler {
 			return err
 		}
 
-		job, err := h.svc.EligibleJobFor(r.Context(), pool, providerID, jobID)
+		job, err := h.svc.ProviderJobFor(r.Context(), pool, providerID, jobID)
 		if err != nil {
 			return apiError(err)
 		}

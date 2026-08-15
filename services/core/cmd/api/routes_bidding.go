@@ -27,7 +27,7 @@ import (
 // A URL is a client's map of the product, not a diagram of the packages behind it. Placing a bid is
 // something a provider does *to a job*, so it lives under the job — the same reading that put
 // SHIP-106's driver and SHIP-111's milestones there, and the same reading that put SHIP-82's
-// `/v1/jobs/open` in routes_fleet.go. What decides which domain serves a route is who owns the rule,
+// provider feed in routes_fleet.go. What decides which domain serves a route is who owns the rule,
 // and the rules here are bidding's: one live offer per provider per job, and what an offer has to
 // contain before anybody can act on it.
 //
@@ -92,11 +92,12 @@ import (
 // their profile — and a provider asking what they have bid on is asking about their operation rather
 // than about any one job.
 //
-// **It also sidesteps `net/http`'s routing constraint rather than working around it.** A
-// four-segment `GET /v1/jobs/{id}/<literal>` panics the mux at registration while
-// `GET /v1/jobs/open/{id}` exists, so a provider list under the job tree would have had to take a
-// fifth segment or a different verb. This resource does not belong there anyway, which is the
-// happier of the two reasons.
+// **It also sidestepped `net/http`'s routing constraint rather than working around it.** A
+// four-segment `GET /v1/jobs/{id}/<literal>` panicked the mux at registration while
+// `GET /v1/jobs/open/{id}` existed, so a provider list under the job tree would have had to take a
+// fifth segment or a different verb. SHIP-83a has since removed that constraint by moving the feed
+// to `/v1/fleet/jobs/{id}`; this resource does not belong under a job anyway, which was always the
+// happier of the two reasons and is now the only one.
 //
 // `RequireUser` and not a role, for the fifth time. The list is scoped to the caller's own id in the
 // `WHERE` clause, so a customer's answer is an empty page by construction rather than by permission —
@@ -176,12 +177,12 @@ func init() {
 			Method: http.MethodGet,
 
 			// **`/jobs/{id}/bids` was the intended pattern, it is what Docs/09's SHIP-102a row
-			// names, and it cannot be served.** Three comments in this file reserved it for
-			// SHIP-102 from SHIP-84 onwards. The reservation was made before SHIP-83 declared
-			// `GET /jobs/open/{id}`, and the two cannot coexist: `open` is a literal in the
-			// `{id}` position, so both patterns match `/v1/jobs/open/bids` with neither more
-			// specific, and Go's ServeMux panics at registration rather than choosing. Measured
-			// on this branch against Go's own mux, five ways:
+			// names, and it could not be served when this route was written.** Three comments
+			// in this file reserved it for SHIP-102 from SHIP-84 onwards. The reservation was
+			// made before SHIP-83 declared `GET /jobs/open/{id}`, and the two could not coexist:
+			// `open` was a literal in the `{id}` position, so both patterns matched
+			// `/v1/jobs/open/bids` with neither more specific, and Go's ServeMux panics at
+			// registration rather than choosing. Measured then against Go's own mux, five ways:
 			//
 			//	GET /jobs/open/{id} + GET  /jobs/{id}/bids                   PANIC
 			//	GET /jobs/open/{id} + GET  /jobs/{id}/offers                 PANIC — renaming does not help
@@ -193,31 +194,24 @@ func init() {
 			// somebody will reach for: registering the intersection does **not** teach the mux
 			// which pattern wins. Go has no such rule.
 			//
-			// # Two honest options, and this takes the first
+			// # The constraint is gone and the path stays where it is
 			//
-			// **Insert a segment**, which is SHIP-115's precedent — `/jobs/{id}/delivery/detail`,
-			// `/delivery/milestones` and `/delivery/proof` are all shaped by this same
-			// collision, and that file's note ends by recording it "for whoever owns
-			// `/jobs/open/{id}`". **Or move `/jobs/open/{id}`**, which is the structural fix: it
-			// frees the whole `GET /v1/jobs/{id}/<literal>` space, which is otherwise closed to
-			// every future ticket, and this branch is unusually well placed to take it because
-			// it also owns `apps/mobile` and could move the client in the same change.
+			// Two options were open: **insert a segment**, which is SHIP-115's precedent —
+			// `/jobs/{id}/delivery/detail`, `/delivery/milestones` and `/delivery/proof` are all
+			// shaped by this same collision — or **move `/jobs/open/{id}`**, the structural fix
+			// that frees the whole `GET /v1/jobs/{id}/<literal>` space. This route took the
+			// first because the second needed `contracts/paths/fleet.yaml`,
+			// `internal/fleet/http_test.go` and the fleet verify section, three files that
+			// branch did not own. **SHIP-83a has since taken the second**: the feed is
+			// `GET /v1/fleet/jobs/{id}`, and cmd/api/routes_jobsegment_test.go demonstrates the
+			// four-segment space is free by registering one.
 			//
-			// **It takes the first, and the reason is ownership rather than modelling.** Moving
-			// the route is a breaking change to a served endpoint that SHIP-101 and SHIP-133
-			// already consume, and carrying it through means editing `contracts/paths/fleet.yaml`,
-			// `internal/fleet/http_test.go` and `scripts/verify/`'s fleet section — three files
-			// this branch does not own, in a wave with five concurrent trees. This file and
-			// routes_fleet.go were granted; the rest of the move was not. A four-line change
-			// spread across another lane's files is how a route gets dropped in a merge, which
-			// is the failure routes_golden.txt exists to catch and not one to invite.
-			//
-			// routes_fleet.go's own argument at its line 45 also still stands on the merits —
-			// the resource is a job and `/v1/jobs/open` is the collection offered to the calling
-			// provider — so the move is not obviously right, only obviously cheaper for
-			// everything that comes after it. **Docs/11 §3 records it as an open recommendation
-			// with the cost measured**, and Docs/09's SHIP-102a row names a path this service
-			// does not serve until somebody corrects it.
+			// **This path is not moving to `/jobs/{id}/bids` now that it could.** It is a
+			// published endpoint the Flutter client already calls, and Docs/06 §5.3 is why that
+			// settles it — old builds persist on devices indefinitely and Dart has no
+			// over-the-air update path, so a URL that has shipped is a contract with clients
+			// nobody can reach. `received` also earns its segment on the merits; see below.
+			// **What SHIP-83a changes is the next ticket's options, not this one's.**
 			//
 			// # Why `received` rather than a shelf like delivery's
 			//
@@ -290,7 +284,7 @@ func biddingHandler(d Deps) *bidding.Handler {
 		awardableJobs{jobs: newJobService(d)},
 		presentedJobs{jobs: newJobService(d)},
 		offerableVehicles{fleet: fleet.NewService(d.Clock)},
-		offerorDirectory{},
+		offerorDirectory{fleet: fleet.NewService(d.Clock)},
 		d.Clock,
 	)
 
@@ -702,7 +696,7 @@ func (v offerableVehicles) Usable(
 // `provider_specialties` are not read at all — SHIP-102a's *Done when* forbids both, and the way to
 // be sure of that is not to have a statement that could return them. `jobs` is not read either, so
 // there is no budget in reach of this file.
-type offerorDirectory struct{}
+type offerorDirectory struct{ fleet *fleet.Service }
 
 // Describe reads the providers and vehicles one page of offers named.
 //
@@ -710,7 +704,7 @@ type offerorDirectory struct{}
 // [bidding.Service.Offers] renders with what it has. A page of offers must not fail because one of
 // them names something unreadable — and with `ON DELETE RESTRICT` on both references (000300,
 // 000504) the case is very nearly unreachable anyway.
-func (offerorDirectory) Describe(
+func (d offerorDirectory) Describe(
 	ctx context.Context,
 	r db.Runner,
 	offers map[uuid.UUID]bidding.Offeror,
@@ -731,7 +725,7 @@ func (offerorDirectory) Describe(
 		}
 	}
 
-	providers, err := describeProviders(ctx, r, providerIDs)
+	providers, err := d.describeProviders(ctx, r, providerIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -760,7 +754,7 @@ func (offerorDirectory) Describe(
 // this repository wants, and the alternative today is worse: a port into `fleet` for a fact `fleet`
 // derives from `identity`'s table, to answer a question neither domain asked. Docs/11 §3 records
 // SHIP-153…SHIP-159 as what collapses both copies into `profiles`.
-func describeProviders(
+func (d offerorDirectory) describeProviders(
 	ctx context.Context,
 	r db.Runner,
 	ids []uuid.UUID,
@@ -768,6 +762,29 @@ func describeProviders(
 	summaries := make(map[uuid.UUID]bidding.ProviderSummary, len(ids))
 	if len(ids) == 0 {
 		return summaries, nil
+	}
+
+	// Who each provider trades as, from `fleet` rather than from a statement here (SHIP-79a).
+	//
+	// **This is the one part of this file that is not a raw SQL statement, and the asymmetry is
+	// deliberate.** `users` is read here because the fact wanted — email and phone confirmed on an
+	// account in good standing — is a predicate `identity` does not expose and `fleet` copies. The
+	// public profile is different: `fleet.PublicProfile` *is* the closed set of what a customer may
+	// be shown, defined in the domain that owns the declaration, and reading `provider_profiles`
+	// here instead would put a second opinion about that set in a file that is not the one SHIP-79a
+	// asks to be kept in step. `fleet.Service.PublicProfiles` is the batch read this file's earlier
+	// note recorded as missing, written by SHIP-79a because a customer-facing page finally needed
+	// one.
+	//
+	// It returns [fleet.PublicProfile] and nothing else, so `provider_service_areas` and
+	// `provider_specialties` are as far out of reach here as they were when nothing read `fleet` at
+	// all — which is the property the header above claims and this must not weaken.
+	if d.fleet == nil {
+		return nil, fmt.Errorf("cmd/api: no fleet service is wired, so %d providers cannot be described", len(ids))
+	}
+	public, err := d.fleet.PublicProfiles(ctx, r, ids)
+	if err != nil {
+		return nil, err
 	}
 
 	const q = `
@@ -789,6 +806,14 @@ func describeProviders(
 		var summary bidding.ProviderSummary
 		if err := rows.Scan(&summary.ID, &summary.Verified, &summary.MemberSince); err != nil {
 			return nil, fmt.Errorf("cmd/api: describing one of %d providers: %w", len(ids), err)
+		}
+
+		// A provider who has not declared a profile is absent from the map and leaves both
+		// fields empty, which is what the client renders as "not stated". The offer stays on the
+		// screen either way: an unfinished profile is not a reason to hide a price.
+		if declared, found := public[summary.ID]; found {
+			summary.DisplayName = declared.DisplayName
+			summary.OperatesAs = declared.OperatesAs.String()
 		}
 		summaries[summary.ID] = summary
 	}

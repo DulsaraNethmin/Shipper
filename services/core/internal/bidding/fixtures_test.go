@@ -842,8 +842,14 @@ func (v testVehicles) Usable(
 // The third and last of these copies, and the one whose fidelity the budget invariant rests on. A
 // stub returning a hand-written [ProviderSummary] would prove nothing about
 // TestTheOfferResponseCarriesNothingItMayNot, because the question that test asks is what a *real*
-// read of a real provider produces — and the two statements this mirrors are the only ones in the
+// read of a real provider produces — and the statements this mirrors are the only ones in the
 // service that touch another domain's tables on a customer's behalf.
+//
+// **The public profile is read through `fleet` rather than in SQL here, which mirrors cmd/api
+// exactly (SHIP-79a).** That file reads `users` directly and `provider_profiles` through
+// `fleet.Service.PublicProfiles`, because `fleet.PublicProfile` *is* the closed set a customer may
+// be shown and a second statement here would be a second opinion about it. A copy of the wiring
+// that copied the SQL instead would pass while the real one was broken.
 func newTestDirectory() testDirectory { return testDirectory{} }
 
 type testDirectory struct{}
@@ -872,6 +878,16 @@ func (testDirectory) Describe(
 		case errors.Is(err, db.ErrNoRows):
 		case err != nil:
 			return nil, fmt.Errorf("describing provider %s: %w", offeror.ProviderID, err)
+		}
+
+		public, err := fleet.NewService(clock.NewFixed(testInstant)).
+			PublicProfiles(ctx, r, []uuid.UUID{offeror.ProviderID})
+		if err != nil {
+			return nil, fmt.Errorf("describing who provider %s trades as: %w", offeror.ProviderID, err)
+		}
+		if declared, found := public[offeror.ProviderID]; found {
+			detail.Provider.DisplayName = declared.DisplayName
+			detail.Provider.OperatesAs = declared.OperatesAs.String()
 		}
 
 		if offeror.VehicleID != uuid.Nil {

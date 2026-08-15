@@ -468,6 +468,15 @@ func (postgresStore) replaceSpecialties(ctx context.Context, r db.Runner, provid
 func (postgresStore) profile(ctx context.Context, r db.Runner, providerID uuid.UUID) (Profile, error) {
 	profile := Profile{ProviderID: providerID}
 
+	// The public half first, because it is the one a customer can ever be shown and reading it
+	// through the same function is what keeps `GET /v1/fleet/profile` and the comparison screen
+	// from drifting about what a provider has declared (SHIP-79a).
+	public, err := postgresStore{}.publicProfile(ctx, r, providerID)
+	if err != nil {
+		return Profile{}, err
+	}
+	profile.Public = public
+
 	// States before postcodes, then ascending within each. Written as an ordering on the
 	// predicate rather than `ORDER BY scope DESC`, which sorts states first only by the accident
 	// that 's' follows 'p'.
@@ -524,6 +533,114 @@ func (postgresStore) profile(ctx context.Context, r db.Runner, providerID uuid.U
 		}
 	}
 	return profile, nil
+}
+
+// insertPublicProfile writes a provider's first declaration of who they trade as (SHIP-79a).
+//
+// **Two statements rather than one upsert, and the reason is a constraint rather than taste.** The
+// obvious shape is `INSERT … ON CONFLICT DO UPDATE` with a `COALESCE` per column, so a caller naming
+// one field leaves the other alone. It does not work: PostgreSQL forms and **checks** the proposed
+// row before it arbitrates the conflict, so the placeholder that stands in for "not named" has to
+// satisfy `ck_provider_profiles_display_name` — and the only value that would is a made-up name.
+// Found by TestAFirstDeclarationNamesBothFields, which amended one field on an existing row and got
+// a 500 out of a constraint that was doing exactly its job.
+//
+// So the caller establishes which case it is — [Service.Declare] already reads the row under the
+// lock, to refuse a half-declaration — and this is the branch where there is nothing to preserve.
+// Both values are plain strings here rather than pointers, because a first declaration that could
+// omit one is the case the read has already ruled out.
+func (postgresStore) insertPublicProfile(ctx context.Context, r db.Runner, providerID uuid.UUID,
+	displayName, operatesAs string) error {
+
+	const q = `
+		INSERT INTO provider_profiles (provider_id, display_name, operates_as)
+		VALUES ($1, $2, $3)`
+
+	if _, err := r.Exec(ctx, q, providerID, displayName, operatesAs); err != nil {
+		return fmt.Errorf("fleet: declare who %s trades as: %w", providerID, err)
+	}
+	return nil
+}
+
+// updatePublicProfile amends an existing declaration, leaving unnamed fields alone (SHIP-79a).
+//
+// `COALESCE` against the column rather than against a placeholder, which is safe here for the reason
+// it is not safe in an insert: every branch of it is a value already in the row, so a field nobody
+// named keeps a value the constraint has already accepted.
+func (postgresStore) updatePublicProfile(ctx context.Context, r db.Runner, providerID uuid.UUID,
+	displayName, operatesAs *string) error {
+
+	// `updated_at` is deliberately not set here: 000303 attaches the `set_updated_at` trigger every
+	// mutable table in this schema wears, and a statement that also wrote the column would be a
+	// second answer to when the row changed — one that a psql session amending a profile by hand
+	// would not give.
+	const q = `
+		UPDATE provider_profiles
+		SET display_name = COALESCE($2, display_name),
+		    operates_as  = COALESCE($3, operates_as)
+		WHERE provider_id = $1`
+
+	if _, err := r.Exec(ctx, q, providerID, displayName, operatesAs); err != nil {
+		return fmt.Errorf("fleet: amend who %s trades as: %w", providerID, err)
+	}
+	return nil
+}
+
+// publicProfile reads one provider's public half.
+//
+// No rows is the zero value rather than an error: a provider who has not said who they are is an
+// ordinary state, and [PublicProfile.Declared] is how a caller tells the two apart.
+func (postgresStore) publicProfile(ctx context.Context, r db.Runner, providerID uuid.UUID) (PublicProfile, error) {
+	const q = `SELECT display_name, operates_as FROM provider_profiles WHERE provider_id = $1`
+
+	public := PublicProfile{ProviderID: providerID}
+	err := r.QueryRow(ctx, q, providerID).Scan(&public.DisplayName, &public.OperatesAs)
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return PublicProfile{ProviderID: providerID}, nil
+	case err != nil:
+		return PublicProfile{}, fmt.Errorf("fleet: read who %s trades as: %w", providerID, err)
+	}
+	return public, nil
+}
+
+// publicProfiles reads the public half of many providers at once (SHIP-79a).
+//
+// **One statement for a whole page, which is the reason this exists rather than a loop over
+// [postgresStore.publicProfile].** Its caller renders a customer's comparison screen, and a page of
+// a hundred offers through the single-row read is a hundred round trips — the N+1 that
+// `cmd/api/routes_bidding.go` already records as the thing a batch read in this domain would fix.
+//
+// A provider with no row is simply absent from the map. The caller renders what it has: an offer
+// must not vanish from a comparison screen because the provider has not finished their profile.
+func (postgresStore) publicProfiles(ctx context.Context, r db.Runner, ids []uuid.UUID) (map[uuid.UUID]PublicProfile, error) {
+	found := make(map[uuid.UUID]PublicProfile, len(ids))
+	if len(ids) == 0 {
+		return found, nil
+	}
+
+	const q = `
+		SELECT provider_id, display_name, operates_as
+		FROM provider_profiles
+		WHERE provider_id = ANY($1)`
+
+	rows, err := r.Query(ctx, q, ids)
+	if err != nil {
+		return nil, fmt.Errorf("fleet: read who %d providers trade as: %w", len(ids), err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var public PublicProfile
+		if err := rows.Scan(&public.ProviderID, &public.DisplayName, &public.OperatesAs); err != nil {
+			return nil, fmt.Errorf("fleet: scanning one of %d public profiles: %w", len(ids), err)
+		}
+		found[public.ProviderID] = public
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fleet: reading %d public profiles: %w", len(ids), err)
+	}
+	return found, nil
 }
 
 // identifiers generates n UUIDv7s, in the application rather than in PostgreSQL.

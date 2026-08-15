@@ -59,7 +59,7 @@ Bids:
 
       Only a **verified, eligible** provider may bid, and eligibility is the platform's decision:
       service area, vehicle capability, verification state and job status (Docs/01 §4.3). It is the
-      same filter behind `GET /v1/jobs/open`, so a job in your feed is a job you can bid on, and a
+      same filter behind `GET /v1/fleet/jobs`, so a job in your feed is a job you can bid on, and a
       job that is not answers `404` here exactly as it does there.
 
       A job you may not bid on and a job that does not exist are **the same answer**. Which jobs a
@@ -701,7 +701,7 @@ FleetBids:
 
       Each row is the same `Bid` shape every other bidding endpoint answers with. Nothing about the
       job travels in it beyond `job_id`, so **the customer's budget is not here in any form** (Docs/01
-      §4.3) — read `GET /v1/jobs/open/{id}` for the job.
+      §4.3) — read `GET /v1/fleet/jobs/{id}` for the job.
 
       ## Grouping by status
 
@@ -1235,7 +1235,7 @@ Bid:
     against the real response, so a field added here is a decision somebody records in three places
     rather than one that arrives with a schema change.
 
-    Nothing about the job travels in this shape beyond its identifier. Read `GET /v1/jobs/open/{id}`
+    Nothing about the job travels in this shape beyond its identifier. Read `GET /v1/fleet/jobs/{id}`
     for the job.
   properties:
     id:
@@ -1400,11 +1400,17 @@ ReceivedBids:
 
       ## Why the path is not `/v1/jobs/{id}/bids`
 
-      Because that pattern cannot be served. `GET /v1/jobs/open/{id}` puts a literal where the job
-      identifier goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>` both match
-      `/v1/jobs/open/bids` with neither more specific, and the router refuses the pair at start-up.
-      `POST /v1/jobs/{id}/bids` is unaffected only because it is a different method. The same
-      collision is why the delivery reads sit under `/v1/jobs/{id}/delivery/…`.
+      Because that pattern could not be served when this operation was published. The provider feed
+      was `GET /v1/jobs/open/{id}`, which put a literal where the job identifier goes, so it and any
+      four-segment `GET /v1/jobs/{id}/<literal>` both matched `/v1/jobs/open/bids` with neither more
+      specific and the router refused the pair at start-up. `POST /v1/jobs/{id}/bids` was unaffected
+      only because it is a different method, and the same collision is why the delivery reads sit
+      under `/v1/jobs/{id}/delivery/…`.
+
+      **SHIP-83a moved the feed to `/v1/fleet/jobs/{id}` and the constraint is gone. This path is
+      not moving with it**: it is already published, installed clients call it, and `Docs/06` §5.3
+      is explicit that old builds persist on devices indefinitely with no over-the-air update path
+      for Dart code.
 
       `received` also says which side is asking, which is the whole difference between this endpoint
       and `GET /v1/fleet/bids`: these are the offers you have received, those are the offers a
@@ -1555,19 +1561,48 @@ ProviderSummary:
   additionalProperties: false
   required: [id, verified, member_since]
   description: |
-    What you may know about a provider who has offered on your job (SHIP-102a).
+    What you may know about a provider who has offered on your job (SHIP-102a, widened by SHIP-79a).
 
-    **A closed set, and a deliberately small one.** There is no trading name, no rating and no
-    completed-job count because this platform stores none of them yet — the verification tickets
-    add them. There is no service area and no specialty list because those are what a provider
-    declares commercially, and a customer's view of a provider is not a window onto it. There are no
-    other jobs of theirs, in any form.
+    **A closed set.** It was a deliberately small one at SHIP-102a because the platform stored
+    nothing else about a provider: an identifier, a verification flag and a join date, none of which
+    says who is offering to carry your sofa. SHIP-79a added `display_name` and `operates_as` and
+    created the storage for them.
+
+    Still not here, and each for its own reason. **No rating** — that implies a review mechanism
+    nobody has specified. **No completed-job count** — the platform can derive one, and the
+    definition of "completed" belongs to the job lifecycle rather than to this shape. **No service
+    area and no specialty list**: those are what a provider declares commercially, reachable through
+    any customer account, and a customer's view of a provider is not a window onto it. **No other
+    jobs of theirs, in any form.**
+
+    `display_name` and `operates_as` are **declarations, not verified facts.** A provider types
+    them; document review (`Docs/04` §3) is what establishes who somebody actually is, and `verified`
+    below is a separate statement about the account rather than about the name.
   properties:
     id:
       type: string
       format: uuid
       description: The provider's account identifier.
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    display_name:
+      type: string
+      maxLength: 80
+      description: |
+        Who the provider trades as: a business name, or the name an individual operates under.
+
+        **Absent when they have not declared one**, which is an ordinary state — a provider can
+        offer on a job before finishing their profile — and the screen should say "not stated"
+        rather than treat it as an error. It is never filled in from an email address or a phone
+        number: `Docs/01` §7 minimises how far a contact detail travels, and a default that leaked
+        one would be worse than a blank.
+      example: Yarra Valley Freight
+    operates_as:
+      type: string
+      enum: [individual, business]
+      description: |
+        Whether the provider trades as a person or as a registered business, in `Docs/01` §4.2's own
+        distinction. Absent when undeclared, alongside `display_name`.
+      example: business
     verified:
       type: boolean
       description: |

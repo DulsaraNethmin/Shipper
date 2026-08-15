@@ -624,6 +624,9 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
+| **SHIP-83a** | M3 | The provider feed moves off the `{id}` slot: `GET /v1/jobs/open` and `/v1/jobs/open/{id}` become **`GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}`**, gone rather than aliased. That frees the whole four-segment `GET /v1/jobs/{id}/<literal>` space four earlier tickets each paid a workaround for, **demonstrated by registering one** rather than asserted — `TestFourSegmentJobLiteralsCanBeRegistered` attaches the real route table plus a probe route and fails if the mux refuses the pair — *see below* |
+| **SHIP-96a** | M3 | `GET /v1/fleet/jobs/{id}` widens from eligibility to **relationship**: a provider reads a job they hold any bid on — live or closed, and therefore the job they were awarded — for as long as the bid exists, in the same budget-stripped shape the feed serves. One SQL predicate (`readable` = `eligible OR the caller holds a bid`), one column list, one response type; **bidding is deliberately not widened with it**. A provider with neither relationship gets exactly what a missing job gets. The budget guard gained a **word-level** check, because a sentence defeats a closed key set — *see below* |
+| **SHIP-79a** | M3 | A provider declares **who they trade as** — `display_name` and `operates_as` on `PATCH /v1/fleet/profile`, in a new `provider_profiles` table (`000303`) — and a customer comparing offers is shown them. `fleet.PublicProfile` is the closed set, defined in the domain that owns the declaration and mapped into `bidding.ProviderSummary` by `cmd/api`, so a second discloser adds a mapping rather than a field list. **Neither the service area nor the specialties**, which SHIP-102a forbids. A rating and a completed-job count are declined on the record. **The 'same set as an admin read and the open feed' clause is unmet — neither reader exists** — *see below* |
 
 | **SHIP-134a** | M5 | The harness stops being the hazard it was asserting against. `80-notifications.sh` deleted `shipper.delivery` **twice** to stage a drifted topic, on a broker every worktree shares — so `cmd/topics` now reads the **replication factor** back as well as the partition count, and the refusal is demonstrated by asking for three replicas the single-broker stack cannot hold: **the request drifts, not the cluster.** The partition branch moved to a unit test that needs no broker. The *Done when*'s "run two `make verify` concurrently" **asks for exactly what wave 10's mutex exists to prevent**, so the reading taken is a concurrent **publisher** rather than a concurrent harness, and the provenance count is asserted rather than printed — *see below* |
 
@@ -12222,6 +12225,262 @@ that names it. §9 should carry it.
 
 **Nothing was needed from `internal/config`.** The category list is derived from the Go enumeration
 and served over HTTP, which is what "server-side" means here.
+
+### What SHIP-83a built, and the decision `Docs/09` left to whoever took it
+
+`GET /v1/jobs/open` and `GET /v1/jobs/open/{id}` are now **`GET /v1/fleet/jobs` and
+`GET /v1/fleet/jobs/{id}`**. Same handlers, same package, same response shape; the old paths are
+**gone rather than aliased**, which the *Done when* asks for and which a redirect would not have
+satisfied — a pattern registered to answer `301` collides with a four-segment literal exactly as one
+registered to answer `200` does, because `ServeMux` refuses the pair before either handler runs.
+
+#### The destination was not in the backlog, and the row that named one named a different ticket's
+
+`Docs/09`'s SHIP-83a row says only "a path that no longer puts a literal where an identifier goes".
+Its line 252 says the move needs `contracts/paths/fleet.yaml`, `internal/fleet/http_test.go` and the
+fleet verify section — so the destination is the fleet tree — and **SHIP-96a's row independently
+names `GET /v1/fleet/jobs/{id}`**. Reading the two together settles it: one route, not two.
+
+**Decided: SHIP-83a moves the feed to `/v1/fleet/jobs` + `/v1/fleet/jobs/{id}`, and SHIP-96a widens
+that same `{id}` route rather than adding a second one.** Three reasons, in the order they weighed.
+
+1. **Two routes could not have been two shapes, and two routes with one shape is a choice a client
+   has to make for no reason.** SHIP-96a's own *Done when* says "the same budget-stripped shape the
+   open feed serves". The predicate SHIP-96a needs is a strict superset of the feed's for a single
+   job — eligible **or** holding a bid **or** awarded — so a second endpoint would answer identically
+   wherever both applied, and a client holding a job id would have to know which of its
+   relationships to the job was current before it could pick a URL. That is a decision the platform
+   has and the device does not (`Docs/07` §3).
+2. **`/fleet` is the honest prefix rather than merely a free one.** The feed is the platform's
+   eligibility decision about *one* provider: two callers of the same path see different sets.
+   `/v1/jobs/open` read as a public shelf of open jobs, which does not exist and never did.
+3. **It reproduces nothing.** `/v1/fleet/jobs` and `/v1/fleet/jobs/{id}` put no literal in any
+   identifier position, so the trap is not simply moved one prefix down — which
+   `/v1/fleet/jobs/open/{id}` or a `/v1/fleet/jobs/mine/{id}` beside the member read would have done.
+
+#### "Demonstrated by registering one" is a test rather than an endpoint, and that was deliberate
+
+`cmd/api/routes_jobsegment_test.go` hands `attachRoutes` the **real** route table plus one
+four-segment `GET /v1/jobs/{id}/segment-probe` and fails if `ServeMux` refuses the pair. Adding a
+real endpoint would have demonstrated the same fact once, on the day it was added, and left the
+guard resting on that endpoint never being removed — and would have shipped a URL no ticket asked
+for, which is a thing that acquires a client and then cannot be withdrawn (`Docs/06` §5.3).
+
+**Mutated to confirm it is real.** Restoring `Pattern: "/jobs/open/{id}"` in
+`cmd/api/routes_fleet.go` fails both new tests, the first with `ServeMux`'s own text — *"GET
+/jobs/{id}/segment-probe and GET /jobs/open/{id} both match some paths, like
+`/jobs/open/segment-probe`. But neither is more specific than the other."* Restored from a
+`/tmp/snap-c-83a` copy and confirmed by `shasum -a 256 -c`, never by `git checkout`.
+
+#### What moved with it, and the two things that deliberately did not
+
+Moved: `cmd/api/routes_fleet.go`, `routes_golden.txt` (63 lines, unchanged count),
+`contracts/paths/fleet.yaml` (the two path items renamed `FleetJobs` and `FleetJobByID`),
+`contracts/openapi.yaml`'s two `$ref` lines, `internal/fleet`'s tests, `scripts/verify/60-fleet.sh`,
+and the Dart client's `ApiOpenJobsRepository._base` with its tests.
+
+**The published paths shaped by the old collision did not move**, and that is a decision rather than
+an oversight. `GET /v1/jobs/{id}/bids/received`, `/delivery/detail`, `/delivery/milestones` and
+`/delivery/proof` could all now take the four-segment form the tickets originally wanted, and none
+of them will: they are served, the Flutter client calls them, and `Docs/06` §5.3 is decisive —
+builds persist on devices indefinitely and Dart has no over-the-air update path. **What SHIP-83a
+changes is the next ticket's options, not the last four tickets' paths.** The comments in
+`routes_bidding.go`, `routes_delivery.go`, `internal/delivery/read.go` and their contract fragments
+are corrected to past tense and now say so.
+
+**The client's own `/jobs/open/:id` `go_router` location also stays.** A location is not an
+endpoint: nothing in `go_router` resembles the `ServeMux` constraint, the two patterns there differ
+in segment count and cannot overlap, and the path is a deep-link target (`Docs/07` §5) that moving
+would strand links already sent.
+
+**Nothing was needed from `internal/config`.**
+
+
+### What SHIP-96a built, and the guard it had to add before it could claim its last clause
+
+`GET /v1/fleet/jobs/{id}` now answers to a **relationship** rather than to eligibility. Either the
+job is in the caller's feed, or the caller already holds a bid on it — Submitted, Countered,
+Accepted, Rejected, Withdrawn, Expired, Superseded or Draft — and the view lasts as long as the bid
+does. The response shape, the column list and the type are unchanged: SHIP-96a widened *who may
+ask*, and deliberately not *what comes back*.
+
+#### One gap, recorded twice from opposite ends of a bid
+
+`eligible` matches `status IN ('Open','Negotiating')`, so before this ticket **a provider lost sight
+of a job at the moment it stopped being biddable — including by winning it.** SHIP-129's milestone
+screen could show a job identifier with no address, no goods and no pickup window, which three lanes
+recorded independently in wave 7; and every provider who *lost* the job lost their view in the same
+transaction. Both audiences are one thing — "a provider with a relationship to this job that is not
+eligibility" — so one clause closes both, which is why `Docs/09` writes them as one ticket.
+
+**The award needs no clause of its own.** SHIP-92 records an award by moving the winning bid to
+`Accepted`; there is no `awarded_provider_id` column anywhere in `jobs`. The awarded provider is
+therefore a provider holding a bid, and a second clause would be a second way to say the same thing
+that a later schema change could make disagree with the first.
+
+**Bidding did not widen with the read, and that is the load-bearing half.** `Service.EligibleFor` —
+what SHIP-84 asks before it writes a bid — still reads `eligible` alone, so holding an expired bid
+buys no new offer on a job that has closed. The verify section asserts both directions on the same
+job: the feed no longer carries it, and the read still serves it.
+
+#### The fifth table, and the threshold `eligibility.go` had set for itself
+
+`readable` reads `bids`, which is `internal/bidding`'s table, and that file's own header named "a
+fifth domain's table joining this predicate" as what would change its answer about using SQL at all.
+**Considered and crossed deliberately.** The threshold it named is the *filter* becoming a
+hand-written query planner, and this is one `EXISTS` on `(job_id, provider_id)` that selects no
+column and joins nothing. The port shape was reconsidered on its merits — the paging objection that
+ruled it out for the feed does not apply to a single job by identifier — and rejected again on a
+different argument: two statements means reading the job with **no** eligibility predicate once a
+closure has said "yes, they bid", which is a second definition of what a provider may see, living in
+`cmd/api`. `TestOnlyTheEligibilityFilterReadsTheJobsTable` became
+`TestOnlyTheEligibilityFilterReadsAnotherDomainsTables` and now loops over both tables, so the
+confinement argument that made the reach acceptable still has a test behind it.
+
+#### The parentheses are the defect this could most easily have shipped
+
+`readable` is `(eligible) OR EXISTS(a bid)` and the store wraps the whole of it before adding
+`j.id = $3`. Without the outer brackets, SQL precedence binds the identifier to the first branch
+alone — **and every provider holding a bid on any job would read every job on the platform.** One
+character, no compile error, no other failing test. `TestABidOnOneJobDoesNotOpenAnother` is the
+guard; **mutated by removing the brackets, and it fails** with the message it was written to print.
+The verify section makes the same check at the harness by giving the second provider a bid on a
+different job before asserting its 404.
+
+#### The mutation this lane was given, and the finding it produced
+
+The dispatch asked for a budget put back into the provider's read **as a sentence rather than a
+field** — wave 10's shape. Applied to `openJobFrom`, appending *"The customer has set a maximum."* to
+`handling_notes`: no key added, no value present, the word "budget" nowhere.
+
+**The whole pre-existing fleet suite passed with it live.** Measured, not predicted: with the new
+prose guard disabled and the sentence in place, `go test ./internal/fleet -race` exited `ok`. The
+closed key set does not see it (no new key), the `"budget"` word search does not see it (the word is
+absent), the value search does not see it (no number), `TestNoProviderFacingShapeCarriesTheBudget`'s
+AST walk does not see it (no field), and the SQL guard does not see it (no column). **Five guards,
+none of which can catch a sentence.**
+
+So SHIP-96a adds `assertNoBudgetProse` — a phrase list searched in the serialised body, applied to
+every provider-facing job response the feed and the widened read produce — plus
+`TestTheBudgetProseGuardIsNotVacuous`, which asserts the guard fires on wave 10's exact sentence
+*and* that `richJob`'s own free text contains none of the phrases, so a failure is about the platform
+rather than about the fixture. The verify section greps for the same vocabulary. Both mutations were
+restored from `/tmp/snap-c-96a` and `/tmp/snap-c-96b` copies and confirmed with `shasum -a 256 -c`,
+never with `git checkout`.
+
+**The general lesson is a sharpening of Docs/10 §3.4's pairing rule.** A closed key set is a guard
+against *structure*, and the budget rule is not structural — `Docs/01` §4.3 forbids "a band, or a
+'budget supplied' flag", and a flag can be prose. Any shape that will hold platform-authored text
+needs a word-level guard beside its key-level one.
+
+#### Names, and one deliberately not changed
+
+`Service.EligibleJobFor` became `Service.ProviderJobFor` and `Handler.OpenJob` became
+`Handler.ProviderJob`, because neither is about eligibility any more. **`EligibleJob` — the row type
+— kept its name on purpose**: it names the shape after the feed that defines it, and both endpoints
+answer with it. Giving the widened read a type of its own would have been two shapes to keep the
+budget out of instead of one, which is the arrangement this domain exists not to have.
+
+**`status` can now be any of the twelve.** From the feed it is still only `open` or `negotiating`;
+from the single job it may be `awarded`, `cancelled`, `in_transit` or anything else the job reached
+after the caller bid, and it is the only field in the shape that says what became of the work. The
+contract's `BiddableJobStatus` became `ProviderJobStatus` and lists all twelve, and the Dart model
+already tolerated them — `@JsonKey(unknownEnumValue: JobStatus.unknown)` over the generated
+`JobStatus`, so no client change was needed.
+
+**Nothing was needed from `internal/config`.**
+
+
+### What SHIP-79a built, and the clause of its *Done when* that cannot be met
+
+A customer comparing offers is now told who is offering. `provider_profiles` (`000303`) holds
+`display_name` and `operates_as`; `PATCH /v1/fleet/profile` declares them beside the service area;
+`GET /v1/jobs/{id}/bids/received` discloses them. Before this, the answer to "who is this provider"
+was a UUID, a verification flag and a join date — three facts about an *account*, none of them about
+who is offering to carry the sofa.
+
+#### The fields, and the two that were declined on the record
+
+`Docs/09`'s SHIP-79a note deliberately does not enumerate the fields and rules two out by name: a
+rating "implies a review mechanism nobody has specified", and a completed-job count is "a figure the
+platform can derive". Both stay out. The count is the closer call and the reason is not the
+derivation — it is that "completed" is `Docs/02`'s definition (Completed? Delivered? auto-completed
+after 72 hours?) and the data is another domain's, so `fleet` would be reaching into `jobs` for a
+*decoration*, which is a far weaker case than reaching into it for the eligibility filter. It is
+additive whenever somebody owns the definition. `000303`'s header records both.
+
+`operates_as` is `Docs/01` §4.2's own distinction — "Register as an individual or business" — and it
+grants nothing: no filter reads it, no eligibility rule turns on it. Neither field is a verified
+fact; `Docs/04` §3's document review is what establishes who somebody actually is, and `verified`
+beside them is a statement about the account rather than about the name.
+
+#### The closed set is a type, which is the only part of this that survives the next reader
+
+The *Done when* asks for "a closed set" **and** for the same set to reach every read that discloses a
+provider. A list written out at each disclosure is closed until the second one is written. So
+`fleet.PublicProfile` is the set: `cmd/api`'s offeror directory takes it and maps it into
+`bidding.ProviderSummary`, and `TestThePublicProfileIsAClosedSet` parses the struct and fails on a
+field nobody decided to add. **Whoever writes the second discloser adds a mapping, not a field
+list.**
+
+That is also what keeps SHIP-102a's forbidden pair out. `Profile` still holds the service area and
+the specialties; a disclosure handed `PublicProfile` cannot reach them, where one handed a whole
+`Profile` and copying four of six fields is correct only while somebody keeps copying four.
+`fleet.Service.PublicProfiles` — the batch read `cmd/api/routes_bidding.go` had recorded as missing —
+returns that type and nothing else, so the seam has the same property as the struct.
+
+#### The clause that is **not** met, stated plainly
+
+> "…and the same set is what an admin read and the open feed disclose."
+
+**Neither reader exists, so the clause is met in reduced form and this says so rather than quietly
+counting it.** Measured on this branch: `internal/admin` discloses no provider profile at all — zero
+matches for a provider profile, `provider_service_areas` or `provider_specialties` in its non-test
+sources — and the open job feed (`GET /v1/fleet/jobs`) discloses **no provider in any form**, by
+`eligibility.go`'s own deliberate decision that nothing gives a customer's or a provider's identity
+before an award. There is nothing to align with. `internal/admin` is another lane's this wave and was
+not edited.
+
+What was done instead is the part that survives: the set is a type with a test on it, so the
+alignment is enforceable the moment a second reader appears. **A ticket that adds an administrator's
+provider read or a public directory closes this clause by mapping `fleet.PublicProfile`** — and if it
+writes its own field list instead, that is the defect this row exists to make visible.
+
+#### Three things the fixtures and the guards found, none of them predicted
+
+**`INSERT … ON CONFLICT DO UPDATE` cannot express "leave the unnamed column alone" here.** PostgreSQL
+forms and *checks* the proposed row before arbitrating the conflict, so the placeholder standing in
+for "not named" has to satisfy `ck_provider_profiles_display_name` — and the only value that would is
+a made-up name. Found by `TestAFirstDeclarationNamesBothFields` getting a 500 out of a constraint
+doing its job. The store now has an insert and an update, and `Service.Declare` reads the row under
+the lock it already holds to choose between them — the same read that refuses a half-declaration with
+`required` rather than letting it surface as a 500.
+
+**`TestEveryMutableTableHasItsUpdatedAtTrigger` caught the table without its trigger.** The column was
+there, NOT NULL, defaulting correctly on insert, and would simply never have recorded a change. That
+is the sweep working rather than a near miss, and it is the second time a `migrations` guard has paid
+for itself on a table added in a domain block.
+
+**`make migrate-up` refused `000303` because it is numbered below the database's current version**
+(SHIP-15g). Also the guard working: numbers come from reserved per-domain blocks rather than in time
+order, so a fleet migration written after an admin one is always below it. The remedy the tool prints
+— `make migrate-down n=all && make migrate-up` — was applied to this worktree's own database.
+
+#### What was deliberately not done
+
+**No pattern check on `display_name`.** A trading name that is a phone number is a way to take a deal
+off the platform, and a regular expression refusing digits refuses "3 Kings Removals" as readily as
+"0400 123 456". `Docs/04` §7's moderation is where content nobody can validate belongs and there is
+no queue for profile text yet. **Recorded as a live moderation surface with nothing behind it**, in
+`service.go` and here, rather than solved with a rule that would be wrong in both directions.
+
+**The Flutter client does not render the new fields.** `apps/mobile/lib/features/bidding/**` is
+another lane's this wave. Nothing breaks — `Docs/07` §6 has clients tolerate fields they do not
+recognise, and the generated model ignores unknown keys — but the comparison screen still shows a
+verification tick and a join date. `received_offer.dart` and `compare_offers_screen.dart` are where
+it lands.
+
+**Nothing was needed from `internal/config`.**
 
 
 ## 4. Partly done — do not treat these as finished
