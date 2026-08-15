@@ -137,28 +137,57 @@ That distinction is worth keeping in mind rather than rounding away: six domains
 | Branch | At | Holds |
 |---|---|---|
 | `main` | PR #19 | **Wave 1, released 11 August 2026.** Now well behind `develop` |
-| `develop` | wave 9 merged | Everything below. **Cut new branches from here** |
+| `develop` | wave 10 merged | Everything below. **Cut new branches from here** |
 
-**`develop` is 291 commits ahead of `main` at `360da43`, and holds nine waves.** Wave 1 was released as PR #19; everything since — SHIP-17a, the wave-2 pre-step and its three tracks, the wave-3 pre-step (SHIP-15e) and its three lanes, the wave-4 pre-step (SHIP-15g) and its four tracks, the wave-5 pre-step (SHIP-15i) and its four tracks, the wave-6 pre-step (SHIP-15m) and its four tracks, the wave-7 pre-step (SHIP-15p) and its four tracks, the wave-8 pre-step (SHIP-15r) and its five branches, and the wave-9 pre-step `ship-15t` and its four tracks — is on `develop` only. The next `develop → main` pull request is the second release, and it is now several times the size of the first.
+**`develop` is 322 commits ahead of `main` at `605ad3a`, and holds ten waves.** Wave 1 was released as PR #19; everything since — SHIP-17a, the wave-2 pre-step and its three tracks, the wave-3 pre-step (SHIP-15e) and its three lanes, the wave-4 pre-step (SHIP-15g) and its four tracks, the wave-5 pre-step (SHIP-15i) and its four tracks, the wave-6 pre-step (SHIP-15m) and its four tracks, the wave-7 pre-step (SHIP-15p) and its four tracks, the wave-8 pre-step (SHIP-15r) and its five branches, the wave-9 pre-step `ship-15t` and its four tracks, and the wave-10 pre-step `ship-15u` and its four lanes — is on `develop` only. The next `develop → main` pull request is the second release, and it is now several times the size of the first.
 
-**The release check was re-run on `360da43` rather than carried, and it passes.** `git merge-tree --write-tree main develop` and `git rev-parse develop^{tree}` both give **`e446f4fa`**, so the merge would produce exactly `develop`'s content and the revert on `main` takes nothing away. The two commands are at the foot of this section with the reason they are needed here at all.
+**The release check was re-run on `605ad3a` rather than carried, and it passes.** `git merge-tree --write-tree main develop` and `git rev-parse develop^{tree}` both give **`1abc3076b3244aaf7c849320f9bff6be77ff7a91`**, so the merge would produce exactly `develop`'s content and the revert on `main` takes nothing away. The two commands are at the foot of this section with the reason they are needed here at all.
 
 **The ref is part of the figure from this pass onwards, and that is a decision rather than a flourish.** §2's count **can never be correct in the commit that writes it**: a commit stating a count of its own branch cannot include itself, nor the merge that will later bring it to `develop`, so the number is low by a deterministic **+2 total, +1 `--first-parent`, +1 `--no-merges`** the moment anybody else reads it. **It has been published wrong four times**, which is past the point where carelessness explains it. Generating the line was the alternative and it was rejected for the same reason §3's check count is *checked* rather than generated — it would mean owning the wording of a sentence people read. Naming the ref costs three words and makes the figure self-dating. §9 carries the decision.
 
-That figure is `git rev-list --count main..360da43`, and it is worth naming the command because the other two readings differ sharply: `--first-parent` gives **60** (one per merged branch, which is the useful review unit) and `--no-merges` gives **223**. All three were re-read on this tree rather than adjusted from the last pass. The wave-9 merges took them from 259 / 55 / 196 to **291 / 60 / 223** — **32 commits, five first-parent** for the five wave-9 branches, and the first wave in which the first-parent delta equals the branch count exactly, because no reconciliation or close-out branch landed inside its window.
+That figure is `git rev-list --count main..605ad3a`, and it is worth naming the command because the other two readings differ sharply: `--first-parent` gives **65** (one per merged branch, which is the useful review unit) and `--no-merges` gives **249**. All three were re-read on this tree rather than adjusted from the last pass. The wave-10 merges took them from 291 / 60 / 223 to **322 / 65 / 249** — **31 commits, five first-parent** for the five wave-10 branches, so the first-parent delta equals the branch count for the second wave running, again because no reconciliation or close-out branch landed inside the window. **Wave 10 is the first wave to add fewer total commits than the wave before it** — 31 against wave 9's 32 — on one more delivered ticket, which is a wave that committed in larger units rather than a wave that did less.
 
-**The ref named here is `360da43` and not this branch on purpose**, which is the convention working rather than a hedge: `main..ship-15u-wave-10-prep` is larger by whatever this branch has committed by the time anybody reads it, and will be larger again by the merge that brings it across. A figure measured on a commit that is already on `develop` is true for ever.
+**The ref named here is `605ad3a` and not this branch on purpose**, which is the convention working rather than a hedge: `main..ship-15v-wave-11-prep` is larger by whatever this branch has committed by the time anybody reads it, and will be larger again by the merge that brings it across. A figure measured on a commit that is already on `develop` is true for ever.
 
 The wave-7 pass recorded the ordinary way this goes wrong and it is worth keeping: **that wave's dispatch brief circulated 206 / 45 / 152**, every one exactly one low, because they were measured at `0abdc50` before `develop`'s last commit landed. A count of `develop` taken before `develop`'s last commit is wrong by construction, and so is a count taken by the commit that writes it.
 
 **Run the revert check before cutting it.** `main`'s history contains a revert, which is the shape where a merge silently resurrects deletions, and the two commands for establishing that it is safe are below. This is not hypothetical here: PR #19 had exactly that shape.
 
+### The wave-10 branches, in merge order
+
+All five were merged locally with `--no-ff`, none through a pull request. **This is the second wave
+running whose table holds only the wave** — no reconciliation branch and no close-out landed inside
+its window, which is why §2's first-parent delta of five equals the branch count again. `ship-15u` is
+the pre-step and the four below it are the lanes; the pre-step is also wave 9's reconciliation, which
+is why no separate `ship-15…` reconciliation branch appears.
+
+| Merge commit | Branch | Tip | Brought |
+|---|---|---|---|
+| `9e4c580` | `ship-15u-wave-10-prep` | `3e5b817` | The wave-9 reconciliation and the wave-10 pre-step — eight rows written into `Docs/09`, the verify mutex rule into `CLAUDE.md`, no ticket of its own |
+| `178e44d` | `ship-138-140-notifications-dispatch` | `cbb9380` | SHIP-138, 139, 140 |
+| `4fefef8` | `ship-70a-128-jobs-and-delivery` | `c2528f0` | SHIP-70a, 113, 128 |
+| `711e25a` | `ship-102a-102-customer-offers` | `83c5c26` | SHIP-102a, 102 |
+| `605ad3a` | `ship-152-165-admin-breadth` | `549c4f8` | SHIP-152, 160, 161, 162, 165 |
+
+**Every tip was resolved with `git rev-parse` on this tree and confirmed against the merge commit's
+second parent** — `git rev-parse <merge>^2` gives the branch head the merge actually took, so a row
+whose tip and second parent disagree is a row naming the wrong branch. All five agree, and all five
+are ancestors of `605ad3a`. The *Brought* column is the per-tip difference against `Docs/11-done.txt`
+at `360da43`, not the dispatch list: **two of the four lanes delivered a ticket they were not
+dispatched** — SHIP-140 and SHIP-113 — **and one did not deliver a ticket it was**, SHIP-164. §7 has
+the reading.
+
+**No branch was cut from the pre-step this wave.** `git merge-base <tip> 3e5b817` returns `360da43`
+for all four lanes, so every one was cut from `develop` at the wave-9 close. Wave 7's rule was to cut
+from the pre-step; wave 9 measured that the base is not what prevents a conflict and wave 10 confirms
+it — the conflicts are exactly the lanes that wrote into §3, and no more. §7 has the matrix.
+
 ### The wave-9 branches, in merge order
 
-All five were merged locally with `--no-ff`, none through a pull request. **This is the first wave
+All five were merged locally with `--no-ff`, none through a pull request. **This was the first wave
 whose table holds only the wave** — no reconciliation branch and no close-out landed inside its
-window, which is why §2's first-parent delta of five equals the branch count for the first time.
-`ship-15t` is the pre-step and the four below it are the tracks.
+window, which is why §2's first-parent delta of five equalled the branch count for the first time.
+Wave 10 is the second. `ship-15t` is the pre-step and the four below it are the tracks.
 
 | Merge commit | Branch | Tip | Brought |
 |---|---|---|---|
@@ -351,7 +380,7 @@ The last two were merged locally rather than through a pull request, which is wh
 
 An earlier version of this section chased the exact pull-request number and commit count, and was wrong within a day both times — a commit cannot record the number of the pull request that merges it. **This table is always slightly behind reality, and the fix is to correct it in the next update rather than to try to make it self-aware.** It says "wave 9 merged" rather than a number, for that reason.
 
-The commit count above is the same kind of figure and gets the same treatment: **recount it at each reconciliation, never carry it forward.** It has been carried forward wrongly once — a handover brief recorded 81 when the true count at the wave-3 reconciliation was 98 — which is the cost of copying a number that a single merge invalidates. The six merges in the wave-4 table took it from 98 to 125, the seven in the wave-5 table took it from 125 to 151, the six in the wave-6 table took it from 151 to 174, the six in the wave-7 table took it from 174 to 206 — with `23618e5` on top of them making 207 — the nine in the wave-8 table took it to 259 at `ac62673`, and the five in the wave-9 table took it to **291 at `360da43`** — which is the size of the correction one wave makes. The three readings move at different rates and none can be derived from another: 60 first-parent commits is 59 merged branches plus that one direct commit, over nine waves, while 223 no-merge commits is the work itself.
+The commit count above is the same kind of figure and gets the same treatment: **recount it at each reconciliation, never carry it forward.** It has been carried forward wrongly once — a handover brief recorded 81 when the true count at the wave-3 reconciliation was 98 — which is the cost of copying a number that a single merge invalidates. The six merges in the wave-4 table took it from 98 to 125, the seven in the wave-5 table took it from 125 to 151, the six in the wave-6 table took it from 151 to 174, the six in the wave-7 table took it from 174 to 206 — with `23618e5` on top of them making 207 — the nine in the wave-8 table took it to 259 at `ac62673`, the five in the wave-9 table took it to 291 at `360da43`, and the five in the wave-10 table took it to **322 at `605ad3a`** — which is the size of the correction one wave makes. The three readings move at different rates and none can be derived from another: 65 first-parent commits is 64 merged branches plus that one direct commit, over ten waves, while 249 no-merge commits is the work itself.
 
 `main` still shows commits `develop` does not have. Those are the detour, not divergent work: wave 0 reached `main` by being merged (PR #6), reverted (PR #7), and reapplied (PR #9), and PR #19's own merge commit sits on `main` alone. The content is identical; only the shape of the history differs.
 
