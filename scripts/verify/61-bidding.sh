@@ -2496,21 +2496,26 @@ status="$(bid_post "$bid_provider_token" "verify-offers-a-$$" "/v1/jobs/$offers_
 [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-offers-a.json"; fail "the first offer returned $status"; }
 offers_bid_a="$(json "$WORKDIR/bid-offers-a.json" '["id"]')"
 
+# **A vehicle that is not the caller's, and it goes here rather than later for a reason the Go
+# tests found first.** The refusal has to be a *field* error — 422 naming `vehicle_id`, which sends a
+# client back to their own fleet list — and it is only reachable while the caller is otherwise able
+# to bid. Eligibility is checked before the vehicle is, so this attempt has to be made on a job the
+# rival can still bid on and before they have a live offer on it: run against the section's older
+# job it answers 404 about the job, and run after their own offer it answers 409, and neither says
+# anything about the vehicle.
+status="$(bid_post "$bid_rival_token" "verify-offers-steal-$$" "/v1/jobs/$offers_job_id/bids" \
+  "{\"amount_cents\":41000,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\",\"vehicle_id\":\"$offers_vehicle_id\"}" offers-steal)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-offers-steal.json"; fail "offering another provider's vehicle returned $status, want 422"; }
+[[ "$(json "$WORKDIR/bid-offers-steal.json" '["error"]["details"][0]["field"]')" == "vehicle_id" ]] \
+  || fail "the refusal does not name vehicle_id: $(cat "$WORKDIR/bid-offers-steal.json")"
+ok "an offer names a vehicle from the caller's own fleet, and another provider's is refused on the field"
+
 # The rival offers without naming a vehicle, which is the other half of the pair: `vehicle` is
 # omitted rather than sent empty, and a client can tell the two apart without a second flag.
 status="$(bid_post "$bid_rival_token" "verify-offers-b-$$" "/v1/jobs/$offers_job_id/bids" \
   "{\"amount_cents\":39900,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\"}" offers-b)"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-offers-b.json"; fail "the second offer returned $status"; }
 offers_bid_b="$(json "$WORKDIR/bid-offers-b.json" '["id"]')"
-
-# A vehicle that is not the caller's is refused as a *field* rather than as a 404 about the job —
-# 422 naming vehicle_id, which is what sends a client back to their own fleet list.
-status="$(bid_post "$bid_rival_token" "verify-offers-steal-$$" "/v1/jobs/$bid_job_id/bids" \
-  "{\"amount_cents\":41000,\"pickup_at\":\"$bid_pickup\",\"deliver_by\":\"$bid_deliver\",\"vehicle_id\":\"$offers_vehicle_id\"}" offers-steal)"
-[[ "$status" == "422" ]] || { cat "$WORKDIR/bid-offers-steal.json"; fail "offering another provider's vehicle returned $status, want 422"; }
-[[ "$(json "$WORKDIR/bid-offers-steal.json" '["error"]["details"][0]["field"]')" == "vehicle_id" ]] \
-  || fail "the refusal does not name vehicle_id: $(cat "$WORKDIR/bid-offers-steal.json")"
-ok "an offer names a vehicle from the caller's own fleet, and another provider's is refused on the field"
 
 offers_get() {
   curl -s -o "$WORKDIR/bid-offers-$3.json" -w '%{http_code}' \
@@ -2578,15 +2583,25 @@ status="$(curl -s -o "$WORKDIR/bid-offers-refused-absent.json" -w '%{http_code}'
 
 python3 - "$WORKDIR/bid-offers-refused-provider.json" "$WORKDIR/bid-offers-refused-rival.json" \
   "$WORKDIR/bid-offers-refused-absent.json" <<'PY' || fail "the three refusals are not the same answer"
-import json, re, sys
+import json, sys
 
-uuid = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# `request_id` is dropped by name rather than pattern-matched away, and that is the correction this
+# check needed: it is a 32-character hex string with no hyphens, so a UUID regular expression does
+# not touch it and three identical refusals compare as three different ones. Naming the field says
+# what is actually per-request; a looser pattern would also erase a difference worth failing on.
+#
+# **Everything else is compared verbatim**, including the code and the message. A refusal that
+# differed by a word between "not yours" and "no such job" would confirm the job exists, which is
+# the disclosure this endpoint's 404 is for.
 bodies = []
 for path in sys.argv[1:]:
     body = json.load(open(path))
     if "amount_cents" in json.dumps(body):
         sys.exit("a refusal carried an offer: %s" % body)
-    bodies.append(uuid.sub("<id>", json.dumps(body, sort_keys=True)))
+    if not isinstance(body.get("error"), dict) or "request_id" not in body["error"]:
+        sys.exit("a refusal carries no request id, so this check is comparing the wrong shape: %s" % body)
+    body["error"].pop("request_id")
+    bodies.append(json.dumps(body, sort_keys=True))
 
 if len(set(bodies)) != 1:
     sys.exit("the refusals differ: %s" % bodies)
