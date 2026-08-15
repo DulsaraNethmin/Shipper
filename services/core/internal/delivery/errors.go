@@ -183,10 +183,14 @@ var (
 	// it would discard the driver's record; a premature one succeeds unchanged as soon as the
 	// delivery reaches that point, so refusing it costs a retry.
 	//
-	// A job cancelled or disputed before it ever reached the milestone is refused here too, and
-	// **that is SHIP-113's case** rather than this one's: "a queued update that contradicts an
-	// administrative action loses… the attempt is retained in history". Retaining it is that
-	// ticket's change.
+	// **SHIP-113 took a second half away from this sentinel, and it is the half that used to
+	// lose a record.** A job cancelled, disputed or completed before the milestone ever reached
+	// it was refused here too — and the transaction rolled back, so the driver's row went with
+	// it, and the photograph attached to it. Docs/02 §3.1's fourth bullet had always said
+	// otherwise: "a queued update that contradicts an administrative action loses… the attempt
+	// is retained in history". That case is now [JobLostTheDelivery] and [OutcomeOverruled], and
+	// what remains under this sentinel is the premature milestone alone — the one a retry fixes
+	// on its own, which is why refusing it costs nothing.
 	ErrMilestoneNotPermitted = errors.New("delivery: this milestone cannot be recorded from the job's current status")
 
 	// ErrMilestoneVanished means the unique index refused a duplicate and no row exists for the

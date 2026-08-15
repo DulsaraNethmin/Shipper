@@ -377,8 +377,29 @@ Milestones:
       catches up. This one is worth retrying; there is no state in which a late milestone becomes
       recordable a second time, and none in which an early one stays refused forever.
 
-      The response is the same shape either way and says nothing about the job's status, so a client
-      that needs to know where the delivery now stands reads the job.
+      **Overruled — the job left the delivery while you were offline.** If the job was cancelled,
+      disputed or completed before your queued update arrived, it answers `201` and **the attempt is
+      kept**, with your `recorded_at` and any proof or reasoned exception recorded alongside it — but
+      the job is not moved and nothing about the administrator's decision changes. Docs/02 §3.1: "the
+      cancellation stands, the attempt is retained in history, and the app must show the driver what
+      happened rather than silently discarding their work" (SHIP-113).
+
+      **Do not retry an overruled update, and do show it to the user.** Retrying cannot change the
+      answer — a job that has left a delivery never returns to one — and the work is already stored,
+      so a retry costs a round trip and gains nothing.
+
+      ## The response says nothing about which of these happened, deliberately
+
+      The shape is the same for every outcome and never carries the job's status, so **a client that
+      needs to know where the delivery now stands reads the job.** That is where Docs/02 §3.1 puts
+      reconciliation — "the app displays optimistic local state, clearly marked as pending, and
+      reconciles to whatever the platform returns" — and it is what tells a driver their delivery was
+      overruled: the job reads `cancelled`, with the administrator's reason on its status history.
+
+      A field here could not be answered consistently in any case. Milestones are append-only and the
+      row is written before the transition is attempted, so there is nowhere to record which outcome
+      it was — and a retry answered from the stored row would have to recompute what the first
+      attempt decided.
     parameters:
       - $ref: '#/JobID'
       - $ref: '#/IdempotencyKey'
@@ -425,7 +446,7 @@ Milestones:
 
           | `error.code` | What happened |
           |---|---|
-          | `delivery_milestone_not_permitted` | The delivery has not reached this milestone yet. Keep the update and retry it once it has — see above. A milestone the job has already *passed* is recorded rather than refused |
+          | `delivery_milestone_not_permitted` | The delivery has not reached this milestone yet. Keep the update and retry it once it has — see above. A milestone the job has already *passed* is recorded rather than refused, and so is one whose job has **left** the delivery altogether (SHIP-113) |
           | `delivery_proof_required` | `delivered` was sent with neither a photograph nor a reason there is none. Send one of the two in `proof`; retrying unchanged will not help |
           | `idempotency_key_reused` | This key already recorded a *different* milestone on this job. Generate a new one |
           | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |

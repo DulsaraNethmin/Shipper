@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -608,8 +609,8 @@ func (l jobLifecycle) move(ctx context.Context, r db.Runner, m jobs.Move) (deliv
 	}
 }
 
-// refusal tells a job that has already been past this status from one that has not reached it
-// (SHIP-112).
+// refusal sorts one refusal of Docs/02 §2's table into the three things it can mean (SHIP-112,
+// SHIP-113).
 //
 // # It reads history rather than reasoning about the table
 //
@@ -617,8 +618,22 @@ func (l jobLifecycle) move(ctx context.Context, r db.Runner, m jobs.Move) (deliv
 // any permitted sequence?" — and that answer would be wrong in a way nobody would notice for a while.
 // A job cancelled or disputed at Awarded can no longer reach 'Picked up' either, and it has not moved
 // *past* the pickup; it has lost the delivery to something else. Docs/02 §3.1 keeps those two apart
-// and gives them different handling — the second is the administrative-conflict bullet, which is
-// SHIP-113 — so the test is the recorded fact, not the reachable set.
+// and gives them different handling, so the test for "already past" is the recorded fact and not the
+// reachable set.
+//
+// # The three answers, in the order they are asked
+//
+//  1. `job_status_history` holds a transition **into** the target — the job has been there, the
+//     milestone is late, and SHIP-112 absorbs it;
+//  2. the job's current status is one Docs/02 §2 offers no way back into a delivery from — it lost
+//     the delivery while the phone was offline, and SHIP-113 retains the attempt;
+//  3. neither — the delivery has simply not got there yet, and the milestone is premature.
+//
+// **The order is load-bearing and (1) must stay first.** A job that reached 'Delivered' and was then
+// disputed satisfies both of the first two for a queued 'Picked up': it has been past the pickup
+// *and* it is now in a status with no way back. It is the first of those — the work was done and
+// recorded in sequence — and answering it as an administrative conflict would tell the driver their
+// pickup had lost to something when it had not.
 //
 // # Why the composition root and not the domain
 //
@@ -645,7 +660,48 @@ func (l jobLifecycle) refusal(ctx context.Context, r db.Runner, m jobs.Move) (de
 			return delivery.JobAlreadyPast, nil
 		}
 	}
+
+	// jobs.Service.History is oldest first, so the last row's target is where the job stands.
+	// A job with no history at all is a Draft, which cannot have an accepted bid and so cannot
+	// have reached this function; it falls through to the premature answer rather than being
+	// asserted about.
+	if len(history) > 0 && outOfTheDelivery(history[len(history)-1].To) {
+		return delivery.JobLostTheDelivery, nil
+	}
 	return delivery.JobNotAssignable, nil
+}
+
+// outOfTheDeliveryStatuses are the statuses Docs/02 §2 gives a job no way back into a delivery
+// from (SHIP-113).
+//
+// # Named rather than computed, and then held to the computation
+//
+// The set could be derived at each call by searching Docs/02 §2's graph for a milestone status
+// still reachable, and that search is exactly what
+// TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays runs — against jobs.Permitted, over all
+// twelve statuses, deriving this list and failing if it differs. So the drift a hand-written list
+// invites is checked rather than trusted, and the call site still reads as three named statuses
+// somebody decided on rather than as a graph search whose result nobody can see.
+//
+// **Naming them is also what keeps SHIP-112's behaviour untouched**, which is the risk this ticket
+// carried. A plain "can the job still reach the target?" test would have swept in a job at
+// 'In transit' with a queued 'Driver assigned' — a status the delivery legitimately skipped, which
+// Docs/02 §2 says is skippable — and reported a premature-and-unreachable milestone as an
+// administrative conflict. These three are the statuses where something *ended or froze the
+// delivery*, which is the only thing Docs/02 §3.1's fourth bullet is about.
+//
+// The three are also why the answer cannot change under a retry: Cancelled and Completed are
+// terminal, and Disputed leads only to those two.
+var outOfTheDeliveryStatuses = []jobs.Status{
+	jobs.StatusCancelled,
+	jobs.StatusCompleted,
+	jobs.StatusDisputed,
+}
+
+// outOfTheDelivery reports whether a job standing in this status has lost the delivery rather than
+// merely not reached the milestone yet.
+func outOfTheDelivery(s jobs.Status) bool {
+	return slices.Contains(outOfTheDeliveryStatuses, s)
 }
 
 // acceptedBids implements delivery.Awards by reading the job's accepted bid.

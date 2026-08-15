@@ -262,8 +262,8 @@ const (
 	// is Docs/02 §3.1's own phrasing — "a queued update that arrives after a later transition has
 	// already been recorded". It is deliberately not a reachability search over Docs/02 §2's table:
 	// a job cancelled or disputed before it ever reached the status has not passed the milestone,
-	// it has lost to something else, and that is SHIP-113's "queued update contradicting an
-	// administrative action" rather than this.
+	// it has lost to something else, and that is [JobLostTheDelivery] since SHIP-113 rather than
+	// this.
 	//
 	// # An implementation that never returns this is not a compile error, and there is no
 	// mechanism that could make it one
@@ -273,6 +273,43 @@ const (
 	// by tests that record a late milestone against a real database, and by
 	// scripts/verify/70-delivery.sh against the running binary.
 	JobAlreadyPast
+
+	// JobLostTheDelivery means the job has left the delivery sequence altogether and can never
+	// reach the status this move names — it was cancelled, disputed or completed while the
+	// milestone was still sitting on somebody's phone (SHIP-113).
+	//
+	// # It is the third refusal, and Docs/02 §3.1 gives it the third handling
+	//
+	// [JobAlreadyPast] is *late* and is absorbed; [JobNotAssignable] is *premature* and is
+	// refused. This is neither. The job has not moved past the milestone and it has not yet
+	// arrived at it — **it lost the delivery to something else**, which is §3.1's fourth bullet:
+	// "a queued update that contradicts an administrative action loses. If a driver records
+	// 'Delivered' offline while an administrator cancels the job, the cancellation stands, the
+	// attempt is retained in history, and the app must show the driver what happened rather than
+	// silently discarding their work."
+	//
+	// So the milestone is **retained**, as an absorbed one is, and the job is **not moved**, as a
+	// refused one is not. Before SHIP-113 this fell into [JobNotAssignable] and the transaction
+	// was rolled back — which discarded the driver's record, and the photograph attached to it,
+	// for work that had genuinely been done. SHIP-112 put it there deliberately and named this
+	// ticket in three places rather than folding it in and finishing half of this one by accident.
+	//
+	// # "Can never reach it" is monotone, which is what makes the answer stable under a retry
+	//
+	// The statuses this covers are the ones Docs/02 §2 offers no path back to a delivery from:
+	// `Cancelled` and `Completed` are terminal, and `Disputed` leads only to those two. So a job
+	// that has lost a delivery cannot stop having lost it. That is the property [JobAlreadyPast]
+	// does not have — its question has a different answer at a different moment, which is why
+	// [Service.alreadyRecorded] refuses to re-ask it — and it is what makes this outcome safe to
+	// report the same way twice.
+	//
+	// # An implementation that never returns this degrades to the pre-SHIP-113 refusal
+	//
+	// The same shape [JobAlreadyPast] has, and it is not a compile error either. Both adapters —
+	// cmd/api/routes_delivery.go and the copy in this package's tests — are held to it by tests
+	// that cancel a job and then record against it, and by scripts/verify/70-delivery.sh against
+	// the running binary.
+	JobLostTheDelivery
 )
 
 func (m JobMove) String() string {
@@ -287,6 +324,8 @@ func (m JobMove) String() string {
 		return "not assignable"
 	case JobAlreadyPast:
 		return "already past that status"
+	case JobLostTheDelivery:
+		return "no longer on this delivery"
 	default:
 		return "unrecognised"
 	}

@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **703 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **710 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -473,6 +473,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-110** | M4 | `milestones` — the actor's clock and the server's kept apart by a trigger that refuses an insert naming the server's. No endpoint: **demonstrated by its own tests** — *see below* |
 | **SHIP-111** | M4 | `POST /v1/jobs/{id}/milestones` — what a delivery records, once per idempotency key. Redis makes the retry cheap and a partial unique index makes it correct, and `make verify` tells the two apart by deleting the cached response — *see below* |
 | **SHIP-112** | M4 | Out-of-order milestone absorption — a milestone the job has moved past is **kept and moves nothing**, where SHIP-111 refused it and rolled it back. "Backwards" is decided by whether the job has *recorded a transition into* that status, which leaves a premature milestone still refused and still retryable — *see below* |
+| **SHIP-113** | M4 | Administrative conflict resolution — a queued milestone whose job was cancelled, disputed or completed while the phone was offline is **retained rather than rolled back**, with its evidence, and the administrator's decision stands untouched. `Docs/02` §3.1's fourth bullet had described this since the first draft and the platform did the opposite; SHIP-112 left the case in the refusal branch on purpose and named this ticket. **The wire answer is deliberately indistinguishable from an absorption** and the client reconciles on the job resource, because the milestone row is written *before* the move is attempted and there is nowhere consistent to record which outcome it was — *see below* |
 | **SHIP-114** | M4 | `POST /v1/jobs/{id}/proof-uploads` and `internal/platform/storage` — a short-lived pre-signed URL the client PUTs a photograph to, **directly to the object store with this API in neither direction**. The type and the size are **signed into the URL**, so the platform's limits are enforced by the store on the request that carries the bytes rather than by us on the one that does not. **`local.go` is dropped**: one implementation, exercised locally against a real store — *see below* |
 | **SHIP-115** | M4 | `proofs` and `GET /v1/jobs/{id}/delivery/proof` — an uploaded object becomes evidence for **one recorded milestone**, and the customer and the awarded provider read it back through short-lived signed URLs issued *after* an authorisation check. Because the platform is not in the upload path it **asks the store whether the object arrived** rather than believing the client, and records what the store reports — which is also what finally puts SHIP-114's upload limits under a guard inside the domain — *see below* |
 | **SHIP-115a** | M4 | The delivery read shelf — `GET /v1/jobs/{id}/delivery/detail` and `GET /v1/jobs/{id}/delivery/milestones`, both `RequireUser`, both **five segments because four would panic the router at registration**. The milestone list is the only place a recording that moved nothing can be seen, which is why it is served rather than derived from the job's status; it pages on a keyset carrying the actor's clock *and* the identifier, because an offline batch shares one timestamp. `driver_mobile` reaches the provider who typed it and not the customer, and the domain drops it rather than the handler — *see below* |
@@ -10793,12 +10794,144 @@ The file was snapshotted to `/tmp` before the mutation and restored from that co
 ticket's 57 added lines, which is the pair of checks that distinguishes "restored" from "reverted to
 the last commit".
 
+#### It puts two `cmd/worker` tasks on the same row for the first time, and that was checked
+
+`job-expiry` and `bid-expiry` run in one binary and, until this ticket, could never contend: the
+expiry sweep claimed only `Open` jobs, and `bid-expiry`'s `LeaveNegotiation` only ever touches a
+`Negotiating` one. Widening the claim makes the same row reachable from both. **This was read rather
+than assumed, and it is safe by construction in three directions:**
+
+- **Contended.** `ExpiryClaim` holds the job row `FOR UPDATE SKIP LOCKED`; `LeaveNegotiation` takes
+  it the same way and answers `JobPresentationHeld` when it gets nothing. `leaveNegotiationIfEmpty`
+  treats that as success, so the bid sweep backs off rather than blocking or failing.
+- **Already cancelled.** `jobs.Permitted(Cancelled, Open)` is false, so `LeaveNegotiation` answers
+  `JobPresentationClosed` — whose comment already named this case before SHIP-70a existed: "the job
+  has gone somewhere this move has no opinion about — awarded, cancelled, expired".
+- **The other order.** If `bid-expiry` returns the job to `Open` first, the expiry claim still covers
+  it, because `Open` is in `LiveStatuses` too. **There is no interleaving in which the job falls out
+  of both**, which is exactly what widening to the pair — rather than switching the claim from `Open`
+  to `Negotiating` — buys.
+
+Worth stating because a correction arrived mid-wave: **`LeaveNegotiation` has two implementations,
+not one** — `cmd/api/routes_bidding.go:480` and `cmd/worker/tasks_bidding.go:188` — and every account
+of it so far, including the brief that reached this lane, cited only the first. The worker's copy is
+the one this ticket newly contends with, and it is the one checked above.
+
 #### One stale sentence in another domain's migration, left alone deliberately
 
 `000302_vehicle_capability_index.up.sql` says "idx_jobs_open_expiry is partial on 'Open' alone", and
 after `000409` that is no longer true. It is a comment in an **applied** migration in the fleet
 block, and editing one is worse than the staleness: the file is the record of what ran. Whoever next
 touches `000302` can correct the aside; nothing reads it.
+
+
+### SHIP-113 — the code catches up to a bullet the document had carried from the first draft
+
+`Docs/02` §3.1's fourth bullet has always said what happens to a queued update that contradicts an
+administrative action: "the cancellation stands, **the attempt is retained in history**, and the app
+must show the driver what happened rather than silently discarding their work." The platform did the
+opposite. A milestone recorded against a job that had been cancelled, disputed or completed answered
+`409 delivery_milestone_not_permitted` and **rolled the transaction back**, which discarded a
+driver's record of work they had genuinely done — and, because evidence is written before the move is
+attempted, their photograph or reasoned exception with it.
+
+**This is `Docs/02` running one ticket ahead of the code, and §9 recorded it so nobody filed it as a
+bug.** It is the exact mirror of SHIP-70a on the same branch, which is why the two were one lane: one
+made the document catch up, the other made the code catch up, and reversing them would have been a
+silent correctness change to the status model.
+
+#### The change is one case in one switch, and SHIP-112 had already put the seam there
+
+`delivery.JobLostTheDelivery` joins `JobAlreadyPast` and `JobNotAssignable` on the port, and
+`OutcomeOverruled` joins `OutcomeAbsorbed`. `Service.record`'s switch retains the row instead of
+returning the sentinel. That is the whole of the domain change, and it is small because SHIP-111 left
+the milestone insert independent of whether the job moved and SHIP-112 proved that seam works.
+
+`Service.AssignDriver`'s switch gained the case too, and that one is not cosmetic: the adapter now
+answers a value it did not before, and without a case there it would have fallen to `default` and
+turned a clean refusal into a 500. It answers `ErrJobNotAssignable`, unchanged on the wire — an
+assignment is an instruction about who drives *now*, not a historical claim, so it is the
+`JobAlreadyPast` argument rather than this ticket's.
+
+#### The predicate is three named statuses, and naming them is what protects SHIP-112
+
+`jobLifecycle.refusal` in `cmd/api` asks three questions in a fixed order: has the job recorded a
+transition **into** the target (absorb); is it standing in a status Docs/02 §2 gives no way back into
+a delivery from (retain); otherwise, it is premature (refuse).
+
+**The obvious implementation is a reachability search — "can the job still reach the target?" — and
+it is wrong.** Docs/02 §2 makes `Driver assigned` skippable, so a job at `In transit` can never reach
+it either; a reachability test would call a premature milestone an administrative conflict and keep
+it. So `outOfTheDeliveryStatuses` names `Cancelled`, `Completed` and `Disputed` instead — the
+statuses where something *ended or froze the delivery*, which is the only thing §3.1's bullet is
+about.
+
+The hand-written list is then held to the table it came from.
+`TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays` searches `jobs.Permitted` over all twelve
+statuses for one from which no milestone status is reachable — **counting the job's own status as
+reachable from itself**, which is the clause that correctly keeps `Delivered` out of the set — and
+derives exactly those three. A status added to Docs/02 §2, or an edge added out of `Disputed`, fails
+there rather than silently changing which milestones the platform keeps.
+
+**The order of the first two questions is load-bearing.** A job that reached `Delivered` and was then
+disputed satisfies both for a queued `Picked up`: it has been past the pickup *and* it now stands
+somewhere with no way back. It is the first — the work was done and recorded in sequence — and
+answering it as an administrative conflict would tell the driver their pickup lost to something when
+it had not. `TestAbsorptionIsAnsweredBeforeAnOverruling` is that case, and it can only be asserted on
+the outcome, because both answers retain the row and nothing in the table distinguishes them.
+
+#### The wire answer is the same 201 an absorption gets, and that is a decision rather than an omission
+
+§3.1 also asks that "the app must show the driver what happened", which reads like a field on the
+response. It is answered on the **job resource** instead, which is the same paragraph's own
+instruction — "the app displays optimistic local state, clearly marked as pending, and reconciles to
+whatever the platform returns" — and SHIP-132 is the client ticket that does it. The job reads
+`cancelled`, with the administrator's reason on its status history, and `make verify` asserts that
+reason is still what the job records after the retained milestone lands.
+
+**A field on the milestone response could not have been answered consistently anyway, and this is the
+mechanical reason rather than a preference.** `milestones` is append-only — no `UPDATE` — and the row
+is inserted *before* the move is attempted, so there is nowhere to record which of the outcomes it
+was. A retry that outlived its Redis entry lands on `Service.alreadyRecorded`, which reads the row
+back and deliberately does not re-evaluate the move; it would have to recompute what the first
+attempt decided. SHIP-112 argued the same point when it declined to add an outcome field, and this
+ticket is the one that tests the argument rather than inheriting it.
+
+**A second table recording the conflict was considered and refused.** It would have made the outcome
+storable and the reason literal, but it is a second source of truth for a fact the rows already carry
+— the milestone, its `server_recorded_at`, and the job's own status history are together the whole
+account — and that is the argument `admin.ExceptionQueue` (SHIP-117) makes at length about a flag
+column, in the same domain, for the same reason.
+
+#### What "with its reason" turned out to mean
+
+The *Done when* reads "loses and is retained **with its reason**", and the natural first reading is
+that the platform stores why the attempt lost. It does not, and does not need to: `000601`'s own
+comment had already settled it, saying the append-only trigger is "what 'the attempt is retained'
+means in `Docs/02` §3.1 — a milestone that lost to an administrative action is still a true record of
+what somebody recorded". What is retained is the attempt *and everything recorded with it* — the
+actor's clock uncorrected, `Docs/01` §4.4's recipient and note, and the photograph or reasoned
+exception. Why it lost is on the job's status history, where `ck_job_status_history_admin_reason`
+already makes an administrator's reason mandatory.
+
+#### The mutation, and one check that turned out to be asserting nothing
+
+`Service.record`'s `JobLostTheDelivery` case was put back to the pre-ticket refusal and `make test`
+run whole. **Four tests failed** — `TestADeliveredMilestoneOnACancelledJobIsRetained`,
+`TestAMilestoneOnADisputedJobIsRetained`, `TestAnOverruledMilestoneIsStillRecordedOncePerKey` and
+`TestARetainedMilestoneEmitsWithJobMovedFalse` — all of them against a real database. `service.go`
+was snapshotted to `/tmp` first and restored from that copy, never with `git checkout`; `shasum -a
+256` matched afterwards and `git diff` still carried the ticket's 49 added lines.
+
+**Separately, `make verify` caught a check of mine that proved nothing**, which is worth recording
+because it is the shape this file keeps warning about. Both the Go test and the verify section
+originally drove the "skipped status" case with `driver_assigned` on an `In transit` job — and
+`Recording.problems` refuses that milestone outright with a **422**, long before the switch under
+test is reached, because a driver is put on a job through its own endpoint. The Go test passed
+because it asserted only that *an* error came back. Both now drive a premature `in_transit` on a live
+delivery, which reaches the branch; the genuinely unreachable-but-skipped case is held by the
+derivation test against `Docs/02` §2 directly, and the verify section says so rather than pretending
+to cover it.
 
 
 ## 4. Partly done — do not treat these as finished
