@@ -63,7 +63,7 @@ ticket "SHIP-137  the consumer reads events, resolves recipients, and dispatches
 # 0418x is the notifications range. 04180 is SHIP-134's in 80-notifications.sh; this file takes
 # 04181 and 04182, and the range is recorded here because the harness has no other list of them.
 status="$(post_json "verify-notif-cust-$$" /v1/auth/register \
-  "{\"email\":\"notified-customer-$$@example.com\",\"phone\":\"04181$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"notified-customer-$$@example.com\",\"phone\":\"04181$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/notif-customer.json")"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/notif-customer.json"; fail "could not register the notified customer: $status"; }
@@ -350,7 +350,7 @@ push_email="pushed-customer-$$@example.com"
 push_password="correct-horse-battery-staple"
 
 status="$(post_json "verify-push-reg-$$" /v1/auth/register \
-  "{\"email\":\"$push_email\",\"phone\":\"04183$$\",\"password\":\"$push_password\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$push_email\",\"phone\":\"04183$$\",\"password\":\"$push_password\",\"role\":\"customer\"}" \
   "$WORKDIR/push-customer.json")"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/push-customer.json"; fail "could not register the pushed customer: $status"; }

@@ -15,7 +15,13 @@ T _$identity<T>(T value) => value;
 /// @nodoc
 mixin _$Account {
 
- String get id; String get email;/// E.164, as the platform normalised it on the way in. Shown back to the person so they can
+ String get id;/// What the account holder is called, as the platform stored it — trimmed, otherwise
+/// untouched (SHIP-30a).
+///
+/// Required, because registration now requires it and the contract marks it required on
+/// every response carrying this shape. An account created before the column existed answers
+/// with an empty string rather than a `null`, so this stays a decode that cannot throw.
+ String get name; String get email;/// E.164, as the platform normalised it on the way in. Shown back to the person so they can
 /// see which number the code was sent to.
  String get phone;/// Fixed at registration and immutable afterwards, enforced by a database trigger
 /// (SHIP-45). An unrecognised value decodes to [UserRole.unknown] rather than throwing —
@@ -38,16 +44,16 @@ $AccountCopyWith<Account> get copyWith => _$AccountCopyWithImpl<Account>(this as
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is Account&&(identical(other.id, id) || other.id == id)&&(identical(other.email, email) || other.email == email)&&(identical(other.phone, phone) || other.phone == phone)&&(identical(other.role, role) || other.role == role)&&(identical(other.emailVerified, emailVerified) || other.emailVerified == emailVerified)&&(identical(other.phoneVerified, phoneVerified) || other.phoneVerified == phoneVerified)&&(identical(other.status, status) || other.status == status)&&(identical(other.createdAt, createdAt) || other.createdAt == createdAt));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is Account&&(identical(other.id, id) || other.id == id)&&(identical(other.name, name) || other.name == name)&&(identical(other.email, email) || other.email == email)&&(identical(other.phone, phone) || other.phone == phone)&&(identical(other.role, role) || other.role == role)&&(identical(other.emailVerified, emailVerified) || other.emailVerified == emailVerified)&&(identical(other.phoneVerified, phoneVerified) || other.phoneVerified == phoneVerified)&&(identical(other.status, status) || other.status == status)&&(identical(other.createdAt, createdAt) || other.createdAt == createdAt));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
-int get hashCode => Object.hash(runtimeType,id,email,phone,role,emailVerified,phoneVerified,status,createdAt);
+int get hashCode => Object.hash(runtimeType,id,name,email,phone,role,emailVerified,phoneVerified,status,createdAt);
 
 @override
 String toString() {
-  return 'Account(id: $id, email: $email, phone: $phone, role: $role, emailVerified: $emailVerified, phoneVerified: $phoneVerified, status: $status, createdAt: $createdAt)';
+  return 'Account(id: $id, name: $name, email: $email, phone: $phone, role: $role, emailVerified: $emailVerified, phoneVerified: $phoneVerified, status: $status, createdAt: $createdAt)';
 }
 
 
@@ -58,7 +64,7 @@ abstract mixin class $AccountCopyWith<$Res>  {
   factory $AccountCopyWith(Account value, $Res Function(Account) _then) = _$AccountCopyWithImpl;
 @useResult
 $Res call({
- String id, String email, String phone,@JsonKey(unknownEnumValue: UserRole.unknown) UserRole role,@JsonKey(name: 'email_verified') bool emailVerified,@JsonKey(name: 'phone_verified') bool phoneVerified, String? status,@JsonKey(name: 'created_at') String? createdAt
+ String id, String name, String email, String phone,@JsonKey(unknownEnumValue: UserRole.unknown) UserRole role,@JsonKey(name: 'email_verified') bool emailVerified,@JsonKey(name: 'phone_verified') bool phoneVerified, String? status,@JsonKey(name: 'created_at') String? createdAt
 });
 
 
@@ -75,9 +81,10 @@ class _$AccountCopyWithImpl<$Res>
 
 /// Create a copy of Account
 /// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') @override $Res call({Object? id = null,Object? email = null,Object? phone = null,Object? role = null,Object? emailVerified = null,Object? phoneVerified = null,Object? status = freezed,Object? createdAt = freezed,}) {
+@pragma('vm:prefer-inline') @override $Res call({Object? id = null,Object? name = null,Object? email = null,Object? phone = null,Object? role = null,Object? emailVerified = null,Object? phoneVerified = null,Object? status = freezed,Object? createdAt = freezed,}) {
   return _then(_self.copyWith(
 id: null == id ? _self.id : id // ignore: cast_nullable_to_non_nullable
+as String,name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
 as String,email: null == email ? _self.email : email // ignore: cast_nullable_to_non_nullable
 as String,phone: null == phone ? _self.phone : phone // ignore: cast_nullable_to_non_nullable
 as String,role: null == role ? _self.role : role // ignore: cast_nullable_to_non_nullable
@@ -170,10 +177,10 @@ return $default(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( String id,  String email,  String phone, @JsonKey(unknownEnumValue: UserRole.unknown)  UserRole role, @JsonKey(name: 'email_verified')  bool emailVerified, @JsonKey(name: 'phone_verified')  bool phoneVerified,  String? status, @JsonKey(name: 'created_at')  String? createdAt)?  $default,{required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( String id,  String name,  String email,  String phone, @JsonKey(unknownEnumValue: UserRole.unknown)  UserRole role, @JsonKey(name: 'email_verified')  bool emailVerified, @JsonKey(name: 'phone_verified')  bool phoneVerified,  String? status, @JsonKey(name: 'created_at')  String? createdAt)?  $default,{required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case _Account() when $default != null:
-return $default(_that.id,_that.email,_that.phone,_that.role,_that.emailVerified,_that.phoneVerified,_that.status,_that.createdAt);case _:
+return $default(_that.id,_that.name,_that.email,_that.phone,_that.role,_that.emailVerified,_that.phoneVerified,_that.status,_that.createdAt);case _:
   return orElse();
 
 }
@@ -191,10 +198,10 @@ return $default(_that.id,_that.email,_that.phone,_that.role,_that.emailVerified,
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( String id,  String email,  String phone, @JsonKey(unknownEnumValue: UserRole.unknown)  UserRole role, @JsonKey(name: 'email_verified')  bool emailVerified, @JsonKey(name: 'phone_verified')  bool phoneVerified,  String? status, @JsonKey(name: 'created_at')  String? createdAt)  $default,) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( String id,  String name,  String email,  String phone, @JsonKey(unknownEnumValue: UserRole.unknown)  UserRole role, @JsonKey(name: 'email_verified')  bool emailVerified, @JsonKey(name: 'phone_verified')  bool phoneVerified,  String? status, @JsonKey(name: 'created_at')  String? createdAt)  $default,) {final _that = this;
 switch (_that) {
 case _Account():
-return $default(_that.id,_that.email,_that.phone,_that.role,_that.emailVerified,_that.phoneVerified,_that.status,_that.createdAt);case _:
+return $default(_that.id,_that.name,_that.email,_that.phone,_that.role,_that.emailVerified,_that.phoneVerified,_that.status,_that.createdAt);case _:
   throw StateError('Unexpected subclass');
 
 }
@@ -211,10 +218,10 @@ return $default(_that.id,_that.email,_that.phone,_that.role,_that.emailVerified,
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( String id,  String email,  String phone, @JsonKey(unknownEnumValue: UserRole.unknown)  UserRole role, @JsonKey(name: 'email_verified')  bool emailVerified, @JsonKey(name: 'phone_verified')  bool phoneVerified,  String? status, @JsonKey(name: 'created_at')  String? createdAt)?  $default,) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( String id,  String name,  String email,  String phone, @JsonKey(unknownEnumValue: UserRole.unknown)  UserRole role, @JsonKey(name: 'email_verified')  bool emailVerified, @JsonKey(name: 'phone_verified')  bool phoneVerified,  String? status, @JsonKey(name: 'created_at')  String? createdAt)?  $default,) {final _that = this;
 switch (_that) {
 case _Account() when $default != null:
-return $default(_that.id,_that.email,_that.phone,_that.role,_that.emailVerified,_that.phoneVerified,_that.status,_that.createdAt);case _:
+return $default(_that.id,_that.name,_that.email,_that.phone,_that.role,_that.emailVerified,_that.phoneVerified,_that.status,_that.createdAt);case _:
   return null;
 
 }
@@ -226,10 +233,17 @@ return $default(_that.id,_that.email,_that.phone,_that.role,_that.emailVerified,
 @JsonSerializable()
 
 class _Account implements Account {
-  const _Account({required this.id, required this.email, required this.phone, @JsonKey(unknownEnumValue: UserRole.unknown) required this.role, @JsonKey(name: 'email_verified') required this.emailVerified, @JsonKey(name: 'phone_verified') required this.phoneVerified, this.status, @JsonKey(name: 'created_at') this.createdAt});
+  const _Account({required this.id, required this.name, required this.email, required this.phone, @JsonKey(unknownEnumValue: UserRole.unknown) required this.role, @JsonKey(name: 'email_verified') required this.emailVerified, @JsonKey(name: 'phone_verified') required this.phoneVerified, this.status, @JsonKey(name: 'created_at') this.createdAt});
   factory _Account.fromJson(Map<String, dynamic> json) => _$AccountFromJson(json);
 
 @override final  String id;
+/// What the account holder is called, as the platform stored it — trimmed, otherwise
+/// untouched (SHIP-30a).
+///
+/// Required, because registration now requires it and the contract marks it required on
+/// every response carrying this shape. An account created before the column existed answers
+/// with an empty string rather than a `null`, so this stays a decode that cannot throw.
+@override final  String name;
 @override final  String email;
 /// E.164, as the platform normalised it on the way in. Shown back to the person so they can
 /// see which number the code was sent to.
@@ -261,16 +275,16 @@ Map<String, dynamic> toJson() {
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is _Account&&(identical(other.id, id) || other.id == id)&&(identical(other.email, email) || other.email == email)&&(identical(other.phone, phone) || other.phone == phone)&&(identical(other.role, role) || other.role == role)&&(identical(other.emailVerified, emailVerified) || other.emailVerified == emailVerified)&&(identical(other.phoneVerified, phoneVerified) || other.phoneVerified == phoneVerified)&&(identical(other.status, status) || other.status == status)&&(identical(other.createdAt, createdAt) || other.createdAt == createdAt));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is _Account&&(identical(other.id, id) || other.id == id)&&(identical(other.name, name) || other.name == name)&&(identical(other.email, email) || other.email == email)&&(identical(other.phone, phone) || other.phone == phone)&&(identical(other.role, role) || other.role == role)&&(identical(other.emailVerified, emailVerified) || other.emailVerified == emailVerified)&&(identical(other.phoneVerified, phoneVerified) || other.phoneVerified == phoneVerified)&&(identical(other.status, status) || other.status == status)&&(identical(other.createdAt, createdAt) || other.createdAt == createdAt));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
-int get hashCode => Object.hash(runtimeType,id,email,phone,role,emailVerified,phoneVerified,status,createdAt);
+int get hashCode => Object.hash(runtimeType,id,name,email,phone,role,emailVerified,phoneVerified,status,createdAt);
 
 @override
 String toString() {
-  return 'Account(id: $id, email: $email, phone: $phone, role: $role, emailVerified: $emailVerified, phoneVerified: $phoneVerified, status: $status, createdAt: $createdAt)';
+  return 'Account(id: $id, name: $name, email: $email, phone: $phone, role: $role, emailVerified: $emailVerified, phoneVerified: $phoneVerified, status: $status, createdAt: $createdAt)';
 }
 
 
@@ -281,7 +295,7 @@ abstract mixin class _$AccountCopyWith<$Res> implements $AccountCopyWith<$Res> {
   factory _$AccountCopyWith(_Account value, $Res Function(_Account) _then) = __$AccountCopyWithImpl;
 @override @useResult
 $Res call({
- String id, String email, String phone,@JsonKey(unknownEnumValue: UserRole.unknown) UserRole role,@JsonKey(name: 'email_verified') bool emailVerified,@JsonKey(name: 'phone_verified') bool phoneVerified, String? status,@JsonKey(name: 'created_at') String? createdAt
+ String id, String name, String email, String phone,@JsonKey(unknownEnumValue: UserRole.unknown) UserRole role,@JsonKey(name: 'email_verified') bool emailVerified,@JsonKey(name: 'phone_verified') bool phoneVerified, String? status,@JsonKey(name: 'created_at') String? createdAt
 });
 
 
@@ -298,9 +312,10 @@ class __$AccountCopyWithImpl<$Res>
 
 /// Create a copy of Account
 /// with the given fields replaced by the non-null parameter values.
-@override @pragma('vm:prefer-inline') $Res call({Object? id = null,Object? email = null,Object? phone = null,Object? role = null,Object? emailVerified = null,Object? phoneVerified = null,Object? status = freezed,Object? createdAt = freezed,}) {
+@override @pragma('vm:prefer-inline') $Res call({Object? id = null,Object? name = null,Object? email = null,Object? phone = null,Object? role = null,Object? emailVerified = null,Object? phoneVerified = null,Object? status = freezed,Object? createdAt = freezed,}) {
   return _then(_Account(
 id: null == id ? _self.id : id // ignore: cast_nullable_to_non_nullable
+as String,name: null == name ? _self.name : name // ignore: cast_nullable_to_non_nullable
 as String,email: null == email ? _self.email : email // ignore: cast_nullable_to_non_nullable
 as String,phone: null == phone ? _self.phone : phone // ignore: cast_nullable_to_non_nullable
 as String,role: null == role ? _self.role : role // ignore: cast_nullable_to_non_nullable

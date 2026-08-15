@@ -56,6 +56,7 @@ ResponseBody _json(Object body, {int status = 200}) {
 /// The `Account` example from the contract, verbatim.
 const _account = <String, Object?>{
   'id': '0191f3c2-8a4d-7c31-9f52-3b7e1d4a6c88',
+  'name': 'Alice Nguyen',
   'email': 'alice@example.com',
   'phone': '+61412345678',
   'role': 'customer',
@@ -84,6 +85,7 @@ void main() {
       final (:repo, :adapter) = _repoReturning(_account, status: 201);
 
       await repo.register(
+        name: 'Alice Nguyen',
         email: 'alice@example.com',
         phone: '0412 345 678',
         password: 'correct-horse-battery-staple',
@@ -96,6 +98,7 @@ void main() {
       expect(sent.path, '/v1/auth/register');
       expect(sent.headers[ApiHeaders.idempotencyKey], 'key-1');
       expect(_sentBody(sent), {
+        'name': 'Alice Nguyen',
         'email': 'alice@example.com',
         // Sent as typed. The platform normalises to E.164 and a client that normalised too
         // would be a second normaliser to disagree with.
@@ -109,6 +112,7 @@ void main() {
       final (:repo, adapter: _) = _repoReturning(_account, status: 201);
 
       final account = await repo.register(
+        name: 'Alice Nguyen',
         email: 'alice@example.com',
         phone: '0412 345 678',
         password: 'correct-horse-battery-staple',
@@ -133,6 +137,7 @@ void main() {
       );
 
       final account = await repo.register(
+        name: 'Alice Nguyen',
         email: 'alice@example.com',
         phone: '0412 345 678',
         password: 'correct-horse-battery-staple',
@@ -154,6 +159,7 @@ void main() {
       );
 
       final account = await repo.register(
+        name: 'Alice Nguyen',
         email: 'alice@example.com',
         phone: '0412 345 678',
         password: 'correct-horse-battery-staple',
@@ -173,6 +179,7 @@ void main() {
       final (:repo, adapter: _) = _repoReturning(trimmed, status: 201);
 
       final account = await repo.register(
+        name: 'Alice Nguyen',
         email: 'alice@example.com',
         phone: '0412 345 678',
         password: 'correct-horse-battery-staple',

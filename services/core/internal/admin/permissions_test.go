@@ -47,7 +47,7 @@ func testUsers(t *testing.T) *Users {
 // [NewHandler] requires one and no test below reaches the queue endpoint.
 func testModeration(t *testing.T) *Moderation {
 	t.Helper()
-	m, err := NewModeration(testExceptionQueue{}, nil)
+	m, err := NewModeration(testExceptionQueue{}, testUnsyncedThreshold, nil)
 	if err != nil {
 		t.Fatalf("building the moderation service: %v", err)
 	}
@@ -73,9 +73,14 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the account search: %v", err)
 	}
 
-	moderation, err := NewModeration(testExceptionQueue{}, pool)
+	moderation, err := NewModeration(testExceptionQueue{}, testUnsyncedThreshold, pool)
 	if err != nil {
 		t.Fatalf("building the moderation service: %v", err)
+	}
+
+	cancellations, err := NewCancellations(testCancellationQueue{}, pool)
+	if err != nil {
+		t.Fatalf("building the cancellation queue: %v", err)
 	}
 
 	jobConsole, err := NewJobConsole(&testJobDirectory{}, testJobStatuses, pool)
@@ -108,15 +113,22 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the notes service: %v", err)
 	}
 
+	suspensions, err := NewSuspensions(auditor, pool)
+	if err != nil {
+		t.Fatalf("building the suspension review: %v", err)
+	}
+
 	return HandlerServices{
-		Disputes:    testDisputeService(t),
-		Credentials: creds,
-		Moderation:  moderation,
-		Users:       users,
-		Jobs:        jobConsole,
-		Trail:       trail,
-		Enforcement: enforce,
-		Notes:       notes,
+		Disputes:      testDisputeService(t),
+		Credentials:   creds,
+		Moderation:    moderation,
+		Cancellations: cancellations,
+		Users:         users,
+		Jobs:          jobConsole,
+		Trail:         trail,
+		Enforcement:   enforce,
+		Notes:         notes,
+		Suspensions:   suspensions,
 	}
 }
 

@@ -36,6 +36,7 @@ abstract interface class IdentityRepository {
   /// this platform tells an unauthenticated caller whether an address is known, because the
   /// alternative leaves somebody who mistyped their address on a success screen.
   Future<Account> register({
+    required String name,
     required String email,
     required String phone,
     required String password,
@@ -125,6 +126,7 @@ final class ApiIdentityRepository implements IdentityRepository {
 
   @override
   Future<Account> register({
+    required String name,
     required String email,
     required String phone,
     required String password,
@@ -135,7 +137,13 @@ final class ApiIdentityRepository implements IdentityRepository {
       await _client.postJson(
         '$_base/register',
         idempotencyKey: idempotencyKey,
-        body: registerBody(email: email, phone: phone, password: password, role: role),
+        body: registerBody(
+          name: name,
+          email: email,
+          phone: phone,
+          password: password,
+          role: role,
+        ),
       ),
     );
   }
@@ -233,12 +241,14 @@ final class ApiIdentityRepository implements IdentityRepository {
 /// `phone_number` is told about the typo — which makes the key names part of the contract in a
 /// way a response's are not.
 Map<String, Object?> registerBody({
+  required String name,
   required String email,
   required String phone,
   required String password,
   required UserRole role,
 }) {
   return <String, Object?>{
+    'name': name,
     'email': email,
     'phone': phone,
     'password': password,

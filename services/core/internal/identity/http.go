@@ -61,6 +61,10 @@ func NewHandler(svc *Service, log *slog.Logger) (*Handler, error) {
 // snake_case on the wire throughout (Docs/10 §4.7), and unknown fields are refused, so a client
 // that sends `phone_number` is told about the typo rather than having it silently ignored.
 type registerRequest struct {
+	// Name is required (SHIP-30a), and it is the one field here that an endpoint which already
+	// shipped needed and this one had never collected: `GET /v1/admin/users` searches four terms
+	// and could serve three until registration started asking.
+	Name     string `json:"name"`
 	Email    string `json:"email"`
 	Phone    string `json:"phone"`
 	Password string `json:"password"`
@@ -78,7 +82,16 @@ type registerRequest struct {
 // the first access token, after the password has been presented at the endpoint that exists to
 // take it.
 type accountResponse struct {
-	ID     string `json:"id"`
+	ID string `json:"id"`
+
+	// Name is what the platform stored, trimmed as it normalised it — so a client that sent
+	// " Alice " renders back what will be searched for rather than what was typed.
+	//
+	// Always present, and empty for an account created before `000006`. That case is only
+	// reachable through the verification endpoints, which also answer with this shape: an
+	// account registered *since* cannot have an empty one.
+	Name string `json:"name"`
+
 	Email  string `json:"email"`
 	Phone  string `json:"phone"`
 	Role   string `json:"role"`
@@ -93,6 +106,7 @@ type accountResponse struct {
 func accountFrom(u User) accountResponse {
 	return accountResponse{
 		ID:            u.ID.String(),
+		Name:          u.Name,
 		Email:         u.Email,
 		Phone:         u.Phone,
 		Role:          u.Role.String(),
@@ -118,6 +132,7 @@ func (h *Handler) Register() http.Handler {
 		}
 
 		user, err := h.svc.Register(r.Context(), RegisterCommand{
+			Name:     req.Name,
 			Email:    req.Email,
 			Phone:    req.Phone,
 			Password: req.Password,

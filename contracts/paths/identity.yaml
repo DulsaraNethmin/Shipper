@@ -58,9 +58,26 @@ Register:
         application/json:
           schema:
             type: object
-            required: [email, phone, password, role]
+            required: [name, email, phone, password, role]
             additionalProperties: false
             properties:
+              name:
+                type: string
+                minLength: 1
+                maxLength: 120
+                description: |
+                  What the account holder is called (SHIP-30a). Required, trimmed before storage
+                  and never case-folded — the platform has no standing to decide how somebody
+                  spells their own name.
+
+                  **The floor is one character and that is deliberate.** Mononyms exist,
+                  single-character given names exist, and every rule anybody has written about a
+                  "real name" — two words, a space, letters only — excludes somebody real. The
+                  one thing the platform can honestly assert is that the field was answered.
+                  Where identity itself matters, Docs/04 §3 asks for a verification *document*.
+
+                  It is one of the four terms `GET /v1/admin/users` searches.
+                example: Alice Nguyen
               email:
                 type: string
                 format: email
@@ -991,7 +1008,7 @@ IdempotencyKey:
 
 Account:
   type: object
-  required: [id, email, phone, role, status, email_verified, phone_verified, created_at]
+  required: [id, name, email, phone, role, status, email_verified, phone_verified, created_at]
   additionalProperties: false
   description: |
     An account, as its own owner sees it. Verification is reported as two booleans rather than
@@ -1003,6 +1020,16 @@ Account:
       format: uuid
       description: UUIDv7, so it sorts by creation time without leaking a sequence.
       example: 0191f3c2-8a4d-7c31-9f52-3b7e1d4a6c88
+    name:
+      type: string
+      description: |
+        What the account holder is called, as the platform stored it — trimmed, otherwise
+        untouched (SHIP-30a).
+
+        Always present. **Empty for an account created before `000006`**, which is a real state
+        rather than a defect: a name cannot be backfilled, so an older account has none. Only
+        the verification endpoints can return one, because registration now requires a name.
+      example: Alice Nguyen
     email:
       type: string
       format: email

@@ -240,7 +240,7 @@ outbox_request() {
 }
 
 status="$(post_json "verify-outbox-cust-$$" /v1/auth/register \
-  "{\"email\":\"outbox-customer-$$@example.com\",\"phone\":\"04180$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"outbox-customer-$$@example.com\",\"phone\":\"04180$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/outbox-customer.json")"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/outbox-customer.json"; fail "could not register the outbox customer: $status"; }

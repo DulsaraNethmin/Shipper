@@ -69,6 +69,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(identity.bodiesFor('register').single, {
+        'name': 'Alice Nguyen',
         'email': 'alice@example.com',
         'phone': '0412 345 678',
         'password': 'correct-horse-battery-staple',
@@ -96,6 +97,47 @@ void main() {
       expect(identity.bodiesFor('register').single['email'], 'alice@example.com');
     });
 
+    // SHIP-30a. The name is collected here because it cannot be collected later: nothing
+    // backfills one, and `GET /v1/admin/users` searches four terms of which this is the fourth.
+    testWidgets('the name is sent as typed, trimmed, and nothing else touches it',
+        (tester) async {
+      final identity = FakeIdentityRepository();
+      await openRegistration(tester, identity);
+      await fillRegistration(tester, name: '  Ngô  Đình  ');
+
+      await tester.tap(find.byKey(const Key('register-submit')));
+      await tester.pumpAndSettle();
+
+      // Trimmed at the ends and untouched in the middle: the platform trims the same way, and
+      // a client that normalised further would be deciding how somebody spells their own name.
+      expect(identity.bodiesFor('register').single['name'], 'Ngô  Đình');
+    });
+
+    testWidgets('a name the platform refuses is shown under the name field', (tester) async {
+      final identity = FakeIdentityRepository()
+        ..failures['register'] = const ApiErrorResponse(
+          statusCode: 422,
+          code: 'validation_failed',
+          message: 'Some of the details you entered need attention.',
+          requestId: 'req-name',
+          details: [
+            ApiFieldError(
+              field: 'name',
+              code: 'too_long',
+              message: 'Keep this to 120 characters or fewer.',
+            ),
+          ],
+        );
+
+      await openRegistration(tester, identity);
+      await fillRegistration(tester);
+
+      await tester.tap(find.byKey(const Key('register-submit')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Keep this to 120 characters or fewer.'), findsOneWidget);
+    });
+
     testWidgets('the journey ends where it honestly can, and says so', (tester) async {
       final identity = FakeIdentityRepository();
       await registerThrough(tester, identity);
@@ -121,6 +163,7 @@ void main() {
       await tester.tap(find.byKey(const Key('register-submit')));
       await tester.pumpAndSettle();
 
+      expect(find.text('Enter your name.'), findsOneWidget);
       expect(find.text('Enter your email address.'), findsOneWidget);
       expect(find.text('Enter your mobile number.'), findsOneWidget);
       expect(find.text('Choose a password.'), findsOneWidget);

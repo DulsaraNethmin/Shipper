@@ -943,32 +943,51 @@ Administrator:
 AdminExceptionQueue:
   get:
     operationId: adminExceptionQueue
-    summary: Deliveries evidenced by a reason rather than a photograph
+    summary: Deliveries that are going wrong, on all four grounds
     tags: [Administration]
     security:
       - BearerAdminSession: []
     description: |
-      Docs/04 §5's fourth moderation queue, in the part of it this ticket builds: **failed proof of
-      delivery** (SHIP-117). Overdue pickup and delayed delivery join it at SHIP-157.
+      Docs/04 §5's fourth moderation queue, entire (SHIP-117, SHIP-157) — "delivery exceptions:
+      overdue pickup, delayed delivery, failed proof of delivery", plus the unsynced milestones
+      SHIP-157's own *Done when* adds.
 
-      A delivery reaches this list by being recorded with a reason in place of a photograph — the
-      exception path of Docs/01 §4.4, which exists so that a driver standing at a delivery point is
-      never unable to finish the job. Three reasons are possible and no others: `recipient_objected`,
-      `camera_unavailable`, `location_unsafe`.
+      **Four grounds, one queue, one endpoint**, because Docs/04 §5 numbers seven queues and these
+      four situations are one of them. Four endpoints would have been four cursors and four pages,
+      and the question a moderator actually asks — what is going wrong with deliveries, oldest
+      first — would have become a merge of four sorted streams performed by the console. `ground`
+      says which situation an entry is evidence of, and the same parameter narrows the queue to one
+      of them.
 
-      **The queue is a query over the evidence, not a table of flags.** There is nothing to mark as
+      | `ground` | An entry appears when |
+      |---|---|
+      | `overdue_pickup` | the job is committed to a provider, its pickup window has closed, and it has not been collected |
+      | `delayed_delivery` | its drop-off window has closed and it has not been delivered |
+      | `failed_proof` | the delivery was recorded with a reason in place of a photograph — Docs/01 §4.4's exception path, which exists so a driver standing at a delivery point is never unable to finish the job |
+      | `unsynced_milestone` | an update reached the platform more than 24 hours after the driver recorded it — Docs/02 §3.1's last rung |
+
+      **The queue is a query over the rows, not a table of flags.** There is nothing to mark as
       read, nothing to claim and nothing to tick off — Docs/04 §6's process ends in a recorded
-      decision rather than in an entry disappearing. An entry stays here for as long as the row it
-      describes exists, which is for ever.
+      decision rather than in an entry disappearing.
+
+      An entry therefore stays for exactly as long as the fact that produced it is true, and the
+      four grounds differ in what that means: a delivery recorded with a reason happened and cannot
+      un-happen, so those entries are permanent; a job that was late for its pickup window and has
+      since been collected is no longer late, so that entry goes. **That asymmetry is the queue
+      reporting the rows rather than a defect.**
 
       ## What an entry does and does not carry
 
-      There is no photograph and no signed URL, because by construction there is none — a proof row
-      is a photograph or a reason and never both. There is no customer, no provider and **no
+      There is no photograph and no signed URL. On `failed_proof` there is by construction none — a
+      proof row is a photograph or a reason and never both — and a queue listing is not where a
+      short-lived download URL is issued in any case. There is no customer, no provider and **no
       budget**: an entry is what somebody triaging needs in order to decide whether to open the job.
 
+      It is a **union shape**: `milestone` and `reason` are empty on the grounds that have neither.
+      Branch on `ground`, never on which fields are blank.
+
       `job_status` is where the job is now, for triage. It implies nothing about whether a delivery
-      completed this way may auto-complete after 72 hours; that question is open.
+      completed through the exception path may auto-complete after 72 hours; that question is open.
 
       `recorded_at` is the platform's clock, not the driver's device's. A queue ordered by a
       handset's clock could be reordered by a handset with the wrong time, which is a queue an entry
@@ -980,11 +999,31 @@ AdminExceptionQueue:
       closest to breaching one. Cursor paged: the queue grows at the end while somebody is reading
       it, and an offset would show the same entry twice or skip one.
 
+      **The cursor is keyed on `(recorded_at, ground, entry_id)`.** The ground is load-bearing
+      rather than decorative: `overdue_pickup` and `delayed_delivery` are both keyed by the job, so
+      a job whose two windows close at the same instant produces two entries that agree on
+      everything else. A cursor issued before SHIP-157 is refused with `400` rather than paging
+      wrongly.
+
       ## Permission
 
       Needs `moderation.read`, which every administrator role holds. Acting on what is in the queue
       is a different permission on a different endpoint.
     parameters:
+      - name: ground
+        in: query
+        required: false
+        description: |
+          Narrows to one of the four grounds. Absent matches every ground.
+
+          A value that is not one of the four is refused with `422` rather than ignored — an
+          ignored filter answers with every entry, which reads exactly like "everything is on this
+          ground" to somebody who mistyped one, and on a moderation queue the conclusion they then
+          draw is that nothing is overdue.
+        schema:
+          type: string
+          enum: [overdue_pickup, delayed_delivery, failed_proof, unsynced_milestone]
+        example: overdue_pickup
       - name: limit
         in: query
         required: false
@@ -1039,6 +1078,17 @@ AdminExceptionQueue:
           application/json:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          `ground` carried a value that is not one of the four (`validation_failed`), with one
+          `error.details` entry naming the field. Refused rather than ignored — see the parameter.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
       '500':
         $ref: '../openapi.yaml#/components/responses/InternalError'
       '503':
@@ -1078,14 +1128,40 @@ ExceptionQueuePage:
 ExceptionQueueEntry:
   type: object
   additionalProperties: false
-  required: [proof_id, job_id, milestone, reason, note, recorded_at, job_status]
+  required: [ground, entry_id, job_id, milestone, reason, note, recorded_at, job_status]
   description: |
-    One delivery recorded with a reason in place of a photograph.
+    One delivery that is going wrong, on one of the queue's four grounds (SHIP-157).
+
+    **This is a union shape.** `milestone` and `reason` are empty on the grounds that have no
+    milestone and no recorded reason; every field is always present and never `null`, so a console
+    that renders without checking does not crash on the ordinary case. Branch on `ground`, never
+    on which fields are blank.
   properties:
-    proof_id:
+    ground:
+      type: string
+      enum: [overdue_pickup, delayed_delivery, failed_proof, unsynced_milestone]
+      description: |
+        Why this entry is in the queue. Docs/04 §5's fourth queue names the first three and
+        SHIP-157's *Done when* adds the fourth.
+
+        - `overdue_pickup` — the job is committed to a provider, its pickup window has closed and
+          it has not been collected.
+        - `delayed_delivery` — its drop-off window has closed and it has not been delivered.
+        - `failed_proof` — the delivery was evidenced by a recorded reason rather than a
+          photograph (Docs/01 §4.4).
+        - `unsynced_milestone` — an update reached the platform more than 24 hours after the
+          driver recorded it (Docs/02 §3.1's last rung).
+      example: failed_proof
+    entry_id:
       type: string
       format: uuid
-      description: The evidence row. Also what the cursor is built from.
+      description: |
+        The row this entry was derived from, and with `ground` and `recorded_at` what the cursor
+        is built from.
+
+        **What it identifies depends on the ground** — a proof, a milestone, or the job itself on
+        the two window grounds, where the entry exists precisely because nothing was recorded. It
+        is not a handle to resolve against any endpoint; `job_id` is the identifier to follow.
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
     job_id:
       type: string
@@ -1095,16 +1171,23 @@ ExceptionQueueEntry:
     milestone:
       type: string
       description: |
-        Which recorded claim the exception stands behind — `Delivered` for the deliveries Docs/01
-        §4.4 is about. Reported rather than assumed, so an exception recorded against another
-        milestone is visible rather than silently dropped.
+        Which recorded claim the entry stands behind — `Delivered` for the deliveries Docs/01 §4.4
+        is about. Reported rather than assumed, so an exception recorded against another milestone
+        is visible rather than silently dropped.
+
+        **Empty on `overdue_pickup` and `delayed_delivery`**, where the entry exists because no
+        milestone was recorded at all.
       example: Delivered
     reason:
       type: string
-      enum: [recipient_objected, camera_unavailable, location_unsafe]
       description: |
-        Why there is no photograph, from Docs/01 §4.4's three. There is deliberately no `other`: a
-        reason nobody can group is a queue nobody can triage.
+        Why there is no photograph, from Docs/01 §4.4's three: `recipient_objected`,
+        `camera_unavailable` or `location_unsafe`. There is deliberately no `other` — a reason
+        nobody can group is a queue nobody can triage.
+
+        **Empty on every ground but `failed_proof`**, which is why this is not an enumeration: the
+        three values are the closed set of *reasons*, and "no reason was recorded" is not one of
+        them.
       example: recipient_objected
     note:
       type: string
@@ -1117,15 +1200,696 @@ ExceptionQueueEntry:
       type: string
       format: date-time
       description: |
-        When the platform recorded the evidence, in UTC, on the platform's clock — **not** the
-        driver's device's. See the operation description.
+        The instant this entry has been waiting since, in UTC, on the platform's clock — **not**
+        the driver's device's.
+
+        It is a different fact per ground and deliberately so: when the evidence was recorded for
+        `failed_proof`, when the update *arrived* for `unsynced_milestone`, and when the window
+        closed for the two window grounds. In every case it is what the queue's ordering and
+        Docs/04 §8's acknowledgement targets are measured from.
       example: '2026-08-14T02:15:30.000Z'
     job_status:
       type: string
       description: |
         Where the job is now, for triage. It implies nothing about whether a delivery completed
-        this way may auto-complete.
+        through the exception path may auto-complete.
       example: Delivered
+
+AdminCancellationQueue:
+  get:
+    operationId: adminCancellationQueue
+    summary: Jobs a provider had committed to and then left
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §5's **fifth** moderation queue — "cancellations after award" (SHIP-158). A different
+      endpoint from the fourth for the reason the fourth is one endpoint with four grounds: the
+      document numbers its queues, and this one asks a different question. Nobody here is late and
+      nothing is unrecorded; somebody withdrew from a commitment, and the question that raises is
+      about the **provider**.
+
+      ## "After award" is a fact about the job's history, not about a `Cancelled` job
+
+      **Docs/02 §2 has no `Awarded → Cancelled` transition.** A queue keyed on a job reaching
+      `Cancelled` would therefore list the *pre*-award cancellations — a customer changing their
+      mind, or a job expiring unclaimed — and none of the post-award ones. So this reads the history,
+      and `outcome` says which of the two shapes an entry is:
+
+      | `outcome` | What happened |
+      |---|---|
+      | `returned_to_market` | `Awarded / Driver assigned → Open`. Docs/02 §6.2: the provider cancelled after award, every prior bid was closed, and "the cancellation is **recorded against the provider**… the reliability signal that Phase 2 reputation will be built from" |
+      | `ended` | the job reached `Cancelled` after having been awarded — under Docs/02 §2 only through `Disputed → Cancelled`, an administrator resolving a dispute as a cancelled or failed delivery |
+
+      **A job may appear more than once.** One returned to the market can be awarded again and walked
+      away from again, and both belong here — that is the history this screen exists to show. `job_id`
+      is therefore not unique; `transition_id` is.
+
+      ## The provider's history
+
+      Each entry carries two counts about the provider who was carrying the job: how many post-award
+      cancellations they have in total, and how many jobs they have carried to `Completed`. **The
+      pair is deliberate** — three cancellations against four hundred deliveries is a different
+      provider from three against five, and one number cannot tell them apart. Neither figure is a
+      judgement; Docs/04 §6's process is where somebody decides.
+
+      `provider_id` is empty when no accepted bid remains on the job. That is a real state rather
+      than an error: Docs/02 §6.2 closes every bid when a provider cancels after award, so on the
+      `returned_to_market` outcome the accepted bid does not survive the operation that creates the
+      entry. Recording which offer *was* accepted after it stops being accepted is a schema change in
+      another domain and is tracked separately.
+
+      ## What an entry never carries
+
+      **No budget and no bid amount.** A customer's budget is never exposed in any form (Docs/01
+      §4.3), and the accepted bid's price is a commercial fact belonging to the job console with its
+      own disclosure decisions. `actor_type` is the *kind* of actor and never the account: Docs/02 §1
+      says support needs the kind, and naming somebody puts an accusation in a list people scan.
+
+      ## Ordering and paging
+
+      **Newest first**, and deliberately unlike the delivery-exception queue. Docs/04 §8 sets
+      acknowledgement targets against deliveries going wrong, so the oldest entry there is closest to
+      breaching one; a cancellation is already over, nothing degrades while it waits, and what
+      somebody scanning this screen wants is what has happened since they last looked.
+
+      Cursor paged on `(cancelled_at, transition_id)`.
+
+      ## Permission
+
+      Needs `moderation.read`, which every administrator role holds.
+    parameters:
+      - name: limit
+        in: query
+        required: false
+        description: How many entries to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page — a client that sent one has a bug, and
+          answering "nothing here" would let it page for ever through a queue it never saw.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of the queue, most recent first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/CancellationQueuePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `moderation.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+CancellationQueuePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/CancellationQueueEntry'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wOC0xNFQwMjoxNTozMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like and a client should not have to know the difference.
+      example: false
+
+CancellationQueueEntry:
+  type: object
+  additionalProperties: false
+  required:
+    - job_id
+    - transition_id
+    - outcome
+    - provider_id
+    - from_status
+    - actor_type
+    - reason
+    - cancelled_at
+    - provider_cancellations
+    - provider_completions
+  description: |
+    One job a provider had committed to and then left. See the operation description for what
+    "after award" means and why it is a fact about the history.
+  properties:
+    job_id:
+      type: string
+      format: uuid
+      description: |
+        The job. **Not unique on this queue** — one returned to the market can be awarded and walked
+        away from again, and both entries belong here.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    transition_id:
+      type: string
+      format: uuid
+      description: |
+        The recorded transition this entry came from, and what makes the cursor total. Not a handle
+        to resolve against any endpoint; `job_id` is the identifier to follow.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    outcome:
+      type: string
+      enum: [returned_to_market, ended]
+      description: |
+        Which of Docs/02's two post-award endings happened. Clients branch on this.
+      example: returned_to_market
+    provider_id:
+      type: string
+      description: |
+        The provider who was carrying the job, from the accepted bid. **Empty when no accepted bid
+        remains** — see the operation description.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e7
+    from_status:
+      type: string
+      description: |
+        Where the job was when it left the commitment — `Awarded`, `Driver assigned`, or `Disputed`
+        on the `ended` outcome. Carried rather than implied: a job abandoned before a driver was
+        nominated is a different conversation from one abandoned after.
+      example: Awarded
+    actor_type:
+      type: string
+      enum: [customer, provider, driver, admin, system]
+      description: |
+        Who moved it — the **kind** of actor, never the account. Docs/02 §1 says support needs the
+        kind; naming somebody puts an accusation in a list people scan.
+      example: provider
+    reason:
+      type: string
+      description: |
+        What was recorded on the transition. Always present, and empty is ordinary — a reason is
+        required only of an administrator's move.
+      example: The provider could not source a vehicle with a tailgate lifter.
+    cancelled_at:
+      type: string
+      format: date-time
+      description: The platform's clock, in UTC. Never the actor's — the ordering depends on it.
+      example: '2026-08-14T02:15:30.000Z'
+    provider_cancellations:
+      type: integer
+      description: |
+        How many post-award cancellations this provider carries in total, this one included.
+      example: 2
+    provider_completions:
+      type: integer
+      description: |
+        How many jobs this provider has carried to `Completed`. **The denominator**, and why the
+        count above is not enough on its own.
+      example: 137
+
+AdminUserSuspension:
+  post:
+    operationId: adminRequestSuspension
+    summary: Propose a permanent suspension, for a second administrator to approve
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §9's second required internal control — "two-person review for permanent account
+      suspension where practical" — in its first half (SHIP-166).
+
+      **Nothing happens to the account.** A review is recorded, with the reason the second
+      administrator is being asked to agree with, and the account keeps the standing it had. A
+      control that suspended here and collected a signature afterwards would do nothing: the person
+      is already locked out by the time anybody reviews it.
+
+      ## Why suspension and not the other two standings
+
+      `restricted` narrows what an account may *do* and is reversible in one action. **`suspended`
+      takes the account away** — the platform refuses it at sign-in *and* at token refresh — so a
+      suspended person cannot reach the platform to ask why. That is what Docs/04 §9 means by
+      permanent, and it is the only standing this platform has that means it.
+
+      `POST /v1/admin/users/{id}/standing` still serves `restricted` and `active` in one call, and
+      refuses `suspended` with `admin_suspension_needs_review`. **Reinstatement is deliberately
+      still one administrator's action**: a control that made undoing a mistake as slow as making
+      one would leave somebody locked out while two people found each other.
+
+      ## One waiting review per account
+
+      A second request while one is pending is refused with
+      `admin_suspension_review_outstanding` — approve the existing one rather than making another.
+      Two pending reviews would let one administrator approve the *other's* request while their own
+      waited, which satisfies the letter of a two-person rule with one person driving both halves.
+
+      ## Permission
+
+      Needs `users.restrict`, which `moderator` and `owner` hold and `support` does not — the same
+      permission the approval needs. The control is that there are **two people**, not that the
+      second holds something the first does not.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The account proposed for suspension.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [reason]
+            additionalProperties: false
+            properties:
+              reason:
+                type: string
+                minLength: 10
+                maxLength: 500
+                description: |
+                  Why this account should be suspended. Required **here** rather than at the
+                  approval: the second administrator is being asked to agree with a stated case,
+                  and a request carrying none would make the control a formality — somebody
+                  clicking approve on a proposition nobody made.
+
+                  There is no administrator field. Who is asking comes from the session, because a
+                  two-person control whose participants a client could name has one participant.
+                example: Three unresolved safety reports in a fortnight; see note 0198f2c1.
+    responses:
+      '202':
+        description: |
+          The review was recorded. **The account is unchanged** — `202` rather than `201` because
+          what the caller asked for has not happened and may not.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/SuspensionReview'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.restrict`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: No account with that identifier exists.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The account already has a review waiting (`admin_suspension_review_outstanding`), or is
+          already suspended (`admin_user_standing_unchanged`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The reason was missing or records nothing (`validation_failed`), with one
+          `error.details` entry naming `reason`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminSuspensions:
+  get:
+    operationId: adminPendingSuspensions
+    summary: Suspension reviews waiting for a second administrator
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      The queue a second administrator finds a request in (SHIP-166).
+
+      **Without it the control does not work.** A review nobody can see is a review nobody
+      approves, which turns a two-person rule into an account that stays active because the queue
+      was invisible.
+
+      Pending reviews only, oldest first — an account somebody has already argued for is the entry
+      closest to being forgotten. An approved review leaves the queue; it does not disappear, and
+      the account's own history keeps both audit entries.
+
+      It is **not** filtered to reviews the caller may approve. Somebody's own pending request is
+      shown to them, because they need to know it is outstanding; the refusal happens where it is
+      enforced.
+
+      ## Permission
+
+      Needs `users.read`, which every role holds **including `support`** — seeing that a suspension
+      has been proposed is looking. Acting on it is `users.restrict` on the approval endpoint.
+
+      ## Paging
+
+      A `limit` and no cursor. The pending set is bounded by how many accounts are under review at
+      once, which is a handful rather than a page; the envelope is the standard one, so adding a
+      cursor later changes no client.
+    parameters:
+      - name: limit
+        in: query
+        required: false
+        description: How many reviews to return.
+        schema:
+          type: integer
+        example: 25
+    responses:
+      '200':
+        description: The reviews waiting for a second administrator, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/SuspensionReviewPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminSuspensionApproval:
+  post:
+    operationId: adminApproveSuspension
+    summary: Agree with a proposed suspension, applying it
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      The second half of Docs/04 §9's control, and the one it turns on (SHIP-166).
+
+      **The approver may not be the administrator who requested it.** That is refused with
+      `admin_same_administrator`, and it is refused in the database as well as in the service —
+      `ck_suspension_reviews_two_people`. Application logic refusing to write is a convention, and
+      a convention does not apply to a support query typed at a psql prompt or to the next endpoint
+      somebody adds.
+
+      The approving administrator comes from the verified session and never from the request, which
+      is why this endpoint takes no body at all.
+
+      ## The suspension is applied here, in one transaction
+
+      The review's approval, the account's standing and the audit entry commit together or none of
+      them does. A review marked approved beside an account still active would read, to the next
+      person, as a suspension that was agreed and then quietly reversed.
+
+      Afterwards the account cannot sign in and cannot refresh an existing token, which is where a
+      suspension actually takes effect — an access token lives fifteen minutes and carries no
+      standing.
+
+      ## Permission
+
+      Needs `users.restrict`, the same permission the request needs. A separate approval permission
+      would make the second signature a *role* rather than a review.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The review being approved.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '200':
+        description: |
+          The review was approved and the account is now suspended. Both administrators are named.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/SuspensionReview'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.restrict`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: No review with that identifier exists.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          **`admin_same_administrator`** — the approver requested this suspension, and Docs/04 §9
+          requires two people. Also `admin_suspension_review_settled` when the review has already
+          been approved or withdrawn, and `admin_user_standing_unchanged` when the account is
+          already suspended.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+SuspensionReviewPage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/SuspensionReview'
+    next_cursor:
+      type: string
+      description: |
+        Never issued by this endpoint today — the pending set is bounded by how many accounts are
+        under review at once. Carried in the envelope so that adding paging later changes no client.
+      example: ''
+    has_more:
+      type: boolean
+      example: false
+
+SuspensionReview:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - user_id
+    - status
+    - requested_by
+    - reason
+    - approved_by
+    - approved_at
+    - created_at
+  description: |
+    One proposal to suspend an account permanently. **Both administrators are on it once approved**,
+    which is the whole record a two-person control produces.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    user_id:
+      type: string
+      format: uuid
+      description: The account proposed for suspension.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    status:
+      type: string
+      enum: [pending, approved, withdrawn]
+      description: |
+        There is deliberately **no `rejected`**. A second administrator who disagrees says so to the
+        first, and the request is withdrawn by whoever made it — recording a rejection would make
+        this a workflow with two outcomes to route, and would put a disagreement between colleagues
+        into a record of things that were *done*, when nothing was.
+
+        `withdrawn` has no endpoint yet; nothing reads it as a decision.
+      example: pending
+    requested_by:
+      type: string
+      format: uuid
+      description: The administrator who made the case.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e7
+    reason:
+      type: string
+      description: |
+        The case, recorded once at the request. The approval carries no reason of its own: two
+        free-text accounts of one decision is two things to reconcile afterwards.
+      example: Three unresolved safety reports in a fortnight; see note 0198f2c1.
+    approved_by:
+      type: string
+      description: |
+        The second administrator. **Never equal to `requested_by`** — Docs/04 §9, enforced by a
+        database constraint as well as by the service. Empty while the review is pending, rather
+        than absent, so a console that renders without checking does not crash on the ordinary case.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e9
+    approved_at:
+      type: string
+      description: When they agreed, in UTC. Empty while pending.
+      example: '2026-08-15T15:51:20.362Z'
+    created_at:
+      type: string
+      format: date-time
+      description: When the request was made, in UTC.
+      example: '2026-08-15T15:51:20.359Z'
 
 AdminUsers:
   get:
@@ -1138,18 +1902,23 @@ AdminUsers:
       Docs/01 §4.6's first administrative capability — "search users, jobs, bids, and disputes" —
       in the part of it this ticket builds (SHIP-151). Searching jobs and bids is SHIP-152.
 
-      ## What can be searched, and the one term that cannot
+      ## What can be searched
 
-      `q` matches an **email address or a phone number**, anywhere within either. One parameter for
-      both rather than two, because a support engineer has a string off a ticket and does not always
-      know which it is; a console that made them choose would be asking a question the platform can
-      answer by trying both. `status` narrows to one account standing.
+      `q` matches an **email address, a name or a phone number**, anywhere within any of them. One
+      parameter for all three rather than three, because a support engineer has a string off a
+      ticket and does not always know which it is; a console that made them choose would be asking a
+      question the platform can answer by trying each. `status` narrows to one account standing.
 
-      **There is no search by name, because the platform does not hold one.** `users` has an
-      address, a number, a role, a standing and two verification timestamps, and registration never
-      asks for a person's name — so the ticket's fourth term has no column behind it. This is
-      recorded in `Docs/11` §4 rather than served by a parameter that could only ever match
-      nothing. Whoever adds a name to registration serves it here in one line.
+      **The name arrived a wave after the rest of this endpoint.** `users` held an address, a
+      number, a role, a standing and two verification timestamps, and registration never asked for a
+      person's name — so the ticket's fourth term had no column and the gap was recorded in
+      `Docs/11` §4 rather than served by a parameter that could only ever match nothing. SHIP-30a
+      added the column and made registration require it, and this endpoint serves all four terms.
+
+      **An account created before that migration has no name**, which is a real state rather than a
+      defect: a name cannot be backfilled. Such an account is never matched by a name term — it is
+      found by its address or its number — and its `name` comes back empty rather than as a
+      placeholder that would read as a name somebody chose.
 
       ## What an account carries here, and what it never will
 
@@ -1184,9 +1953,9 @@ AdminUsers:
         in: query
         required: false
         description: |
-          Matches an email address or a phone number, anywhere within either. Absent or empty
-          matches every account, which with `status` is how "list the suspended accounts" is
-          expressed.
+          Matches an email address, a name or a phone number, anywhere within any of them. Absent
+          or empty matches every account, which with `status` is how "list the suspended accounts"
+          is expressed.
 
           **It is a string, not a pattern.** `%` and `_` are matched literally rather than as
           wildcards, so a search box cannot be turned into a full read of the table.
@@ -1314,6 +2083,7 @@ UserAccount:
   additionalProperties: false
   required:
     - id
+    - name
     - email
     - phone
     - role
@@ -1329,6 +2099,13 @@ UserAccount:
       type: string
       format: uuid
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    name:
+      type: string
+      description: |
+        What the account holder is called, collected at registration (SHIP-30a) and one of the four
+        terms `q` matches. Always present, and **empty for an account created before `000006`** —
+        a name cannot be backfilled, so the console shows the absence.
+      example: Hana Osei
     email:
       type: string
       format: email

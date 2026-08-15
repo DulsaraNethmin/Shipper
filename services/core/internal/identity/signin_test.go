@@ -588,6 +588,7 @@ func TestOneAccountsFailuresDoNotThrottleAnother(t *testing.T) {
 	svc, _, _ := signInService(t, testProfile)
 
 	other, err := svc.Register(t.Context(), RegisterCommand{
+		Name:     "Bec Okafor",
 		Email:    "other@example.com",
 		Phone:    "0412 345 679",
 		Password: "correct-horse-battery-staple",

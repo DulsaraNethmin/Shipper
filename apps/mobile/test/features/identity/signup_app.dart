@@ -169,10 +169,12 @@ Future<void> registerThrough(WidgetTester tester, FakeIdentityRepository identit
 /// Fills the registration form. Values default to ones both this device and the platform accept.
 Future<void> fillRegistration(
   WidgetTester tester, {
+  String name = 'Alice Nguyen',
   String email = 'alice@example.com',
   String phone = '0412 345 678',
   String password = 'correct-horse-battery-staple',
 }) async {
+  await tester.enterText(find.byKey(const Key('register-name')), name);
   await tester.enterText(find.byKey(const Key('register-email')), email);
   await tester.enterText(find.byKey(const Key('register-phone')), phone);
   await tester.enterText(find.byKey(const Key('register-password')), password);

@@ -31,7 +31,14 @@ import (
 // credential is selected only by the one statement that verifies it, so a new caller reaching for
 // "the user columns" cannot pull a hash into a struct that is logged or serialised. There is no such
 // statement in this package at all — `admin` never verifies a user's password.
-const userColumns = `id, email, phone, role, status, email_verified_at, phone_verified_at, created_at`
+//
+// `coalesce(name, ”)` is the only expression in the list (SHIP-30a). `users.name` is nullable
+// because accounts predating `000006` have none and a name cannot be invented for them, while
+// [UserRecord.Name] is a plain string; the coalesce turns "no name" into an empty field rather than a
+// NULL [scanUser] would have to take through a pointer. `internal/identity`s projection does the
+// same, and the two agreeing is what makes the console show what registration stored.
+const userColumns = `id, coalesce(name, '') AS name, email, phone, role, status, ` +
+	`email_verified_at, phone_verified_at, created_at`
 
 // searchUsers returns one page of accounts matching the query, newest first.
 //
@@ -47,13 +54,21 @@ const userColumns = `id, email, phone, role, status, email_verified_at, phone_ve
 // somebody typing into a search box means, and the first is a full table read on demand. See
 // [likeContains].
 //
-// **The address and the number are matched differently, and that is not tidiness.** `email` is
-// citext and is matched case-insensitively against the term as typed. A phone number is not a
+// **The address, the name and the number are matched differently, and that is not tidiness.**
+// `email` is citext and `name` is text; both take the term as typed, case-insensitively, through the
+// same `ILIKE` pattern — a person searching for "alice" means the address and the name equally, and
+// two patterns for one typed term would be two things to keep in step. A phone number is not a
 // string somebody types the way it is stored: registration normalises to E.164, so the account
 // whose owner writes `0419 312 345` on a support ticket is stored as `+61419312345` — and a
 // substring match of the first against the second finds nothing. [phonePattern] is what closes
 // that, and the empty pattern is what stops a term with no digits in it matching every number in
 // the table.
+//
+// **`name` is nullable and the predicate needs nothing extra for that.** `NULL ILIKE '%x%'` is NULL
+// rather than false, and an OR with a NULL branch is decided by its other branches — so an account
+// registered before `000006` is matched by its address and never by a name it does not have, which
+// is what should happen. A `coalesce` in the predicate would say the same thing and would cost the
+// column its ability to use an index if one is ever added.
 //
 // # The ordering is total, and the cursor is why
 //
@@ -67,7 +82,7 @@ const userColumns = `id, email, phone, role, status, email_verified_at, phone_ve
 // It does not join `jobs` and it never will. A customer's budget is never exposed in any form
 // (Docs/01 §4.3), and an administrative search that reached into the commercial side of the platform
 // would be a new place for it to escape; opening a user's jobs is SHIP-152's endpoint with its own
-// disclosure decisions. It also does not search a name, because no column holds one — see users.go.
+// disclosure decisions.
 //
 // # Scale
 //
@@ -80,7 +95,7 @@ func (postgresStore) searchUsers(ctx context.Context, r db.Runner, q UserQuery) 
 	const query = `
 		SELECT ` + userColumns + `
 		FROM users
-		WHERE ($1 = '' OR email ILIKE $2 OR ($3 <> '' AND phone LIKE $3))
+		WHERE ($1 = '' OR email ILIKE $2 OR name ILIKE $2 OR ($3 <> '' AND phone LIKE $3))
 		  AND ($4 = '' OR status = $4)
 		  AND ($5::timestamptz IS NULL OR (created_at, id) < ($5, $6))
 		ORDER BY created_at DESC, id DESC
@@ -131,7 +146,7 @@ func scanUser(row interface{ Scan(...any) error }) (UserRecord, error) {
 		emailVerifiedAt, phoneVerifiedAt *time.Time
 	)
 
-	if err := row.Scan(&u.ID, &u.Email, &u.Phone, &u.Role, &u.Standing,
+	if err := row.Scan(&u.ID, &u.Name, &u.Email, &u.Phone, &u.Role, &u.Standing,
 		&emailVerifiedAt, &phoneVerifiedAt, &u.CreatedAt); err != nil {
 		return UserRecord{}, fmt.Errorf("admin: reading an account: %w", err)
 	}

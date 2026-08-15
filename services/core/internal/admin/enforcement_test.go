@@ -463,22 +463,27 @@ func TestSupportMayOpenAJobAndMayNotRemoveOne(t *testing.T) {
 
 // --- SHIP-161 ------------------------------------------------------------------------------------
 
-// TestSuspendingAnAccountRecordsBothEndsAndWhy is SHIP-161's *Done when*.
+// TestRestrictingAnAccountRecordsBothEndsAndWhy is SHIP-161's *Done when*.
 //
 // "Account access is limited or disabled with a recorded reason." The column is `users.status`,
-// which has existed since `000002`; what this ticket adds is the administrative act, the reason and
+// which has existed since `000002`; what that ticket added is the administrative act, the reason and
 // the entry.
+//
+// **It restricts rather than suspends, and the rename is SHIP-166's.** Docs/04 §9 took permanent
+// suspension off this endpoint — one administrator may no longer do it alone — so the *limited* half
+// of "limited or disabled" is what this endpoint now demonstrates, and the disabled half is
+// TestATwoPersonReviewSuspendsTheAccount.
 //
 // **Both ends are recorded, never just the new one.** `users` keeps no version of its own and the
 // trail is append-only, so an entry saying only "restricted" could never afterwards be joined to
 // what the account held before.
-func TestSuspendingAnAccountRecordsBothEndsAndWhy(t *testing.T) {
+func TestRestrictingAnAccountRecordsBothEndsAndWhy(t *testing.T) {
 	f := newEnforcementFixture(t, RoleModerator)
 	userID := newAccount(t, f.pool, "susp-161a@example.com", "+61400161a", "provider")
 
 	const reason = "Two unresolved no-shows in a fortnight; see the delivery exception queue."
 
-	status, body := f.setStanding(t, userID, "suspended", reason)
+	status, body := f.setStanding(t, userID, "restricted", reason)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", status, body)
 	}
@@ -487,13 +492,13 @@ func TestSuspendingAnAccountRecordsBothEndsAndWhy(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatalf("decoding the response: %v (%s)", err, body)
 	}
-	if got.From != "active" || got.To != "suspended" {
-		t.Errorf("the response says %q → %q, want active → suspended; a console rendering only "+
+	if got.From != "active" || got.To != "restricted" {
+		t.Errorf("the response says %q → %q, want active → restricted; a console rendering only "+
 			"the new standing cannot tell a tightening from a loosening", got.From, got.To)
 	}
 
-	if s := standingOf(t, f.pool, userID); s != "suspended" {
-		t.Fatalf("the account is %q, want suspended", s)
+	if s := standingOf(t, f.pool, userID); s != "restricted" {
+		t.Fatalf("the account is %q, want restricted", s)
 	}
 
 	entries := entriesFor(t, f.pool, userID)
@@ -512,7 +517,7 @@ func TestSuspendingAnAccountRecordsBothEndsAndWhy(t *testing.T) {
 	if e.Reason == nil || *e.Reason != reason {
 		t.Errorf("the entry's reason is %v, want %q", e.Reason, reason)
 	}
-	if e.Metadata["from"] != "active" || e.Metadata["to"] != "suspended" {
+	if e.Metadata["from"] != "active" || e.Metadata["to"] != "restricted" {
 		t.Errorf("metadata = %v, want both ends of the change", e.Metadata)
 	}
 }
@@ -594,8 +599,8 @@ func TestEveryBadStandingRequestIsRefusedAndNamesItsField(t *testing.T) {
 
 	for i, tc := range []struct{ name, standing, reason, field string }{
 		{"a standing the platform does not have", "banned", "Repeated policy breaches on delivery.", "standing"},
-		{"no reason at all", "suspended", "", "reason"},
-		{"a reason that records nothing", "suspended", "bad", "reason"},
+		{"no reason at all", "restricted", "", "reason"},
+		{"a reason that records nothing", "restricted", "bad", "reason"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// The index rather than the case's own fields, because two of the three differ
@@ -631,7 +636,7 @@ func TestEveryBadStandingRequestIsRefusedAndNamesItsField(t *testing.T) {
 func TestAnAccountThatDoesNotExistIsAPlain404(t *testing.T) {
 	f := newEnforcementFixture(t, RoleModerator)
 
-	status, body := f.setStanding(t, uuid.New(), "suspended",
+	status, body := f.setStanding(t, uuid.New(), "restricted",
 		"Reported for repeated no-shows across three jobs.")
 	if status != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (%s)", status, body)
@@ -643,7 +648,10 @@ func TestSupportMaySearchAccountsAndMayNotRestrictOne(t *testing.T) {
 	f := newEnforcementFixture(t, RoleSupport)
 	userID := newAccount(t, f.pool, "perm-161d@example.com", "+61400161d", "provider")
 
-	status, body := f.setStanding(t, userID, "suspended",
+	// `restricted` rather than `suspended`: the permission check must be what refuses this, and
+	// SHIP-166 refuses `suspended` on this endpoint for everybody — which would make a 403 here
+	// impossible to attribute.
+	status, body := f.setStanding(t, userID, "restricted",
 		"Reported for repeated no-shows; escalating to a moderator.")
 	if status != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (%s)", status, body)
@@ -882,8 +890,10 @@ func TestEveryEnforcementActionRefusesWhenTheDatabaseIsUnreachable(t *testing.T)
 		t.Errorf("unpublishing with no database: %v, want %v", unpublishErr, ErrAdminUnavailable)
 	}
 
+	// `StandingRestricted`, because `StandingSuspended` is refused before the pool is looked at
+	// (SHIP-166) — which is the correct ordering and would make this assert the wrong thing.
 	_, standingErr := enforce.SetStanding(context.Background(), StandingCommand{
-		UserID: uuid.New(), ActorID: uuid.New(), Standing: StandingSuspended,
+		UserID: uuid.New(), ActorID: uuid.New(), Standing: StandingRestricted,
 		Reason: "Repeated policy breaches across three deliveries.",
 	})
 	if !errors.Is(standingErr, ErrAdminUnavailable) {

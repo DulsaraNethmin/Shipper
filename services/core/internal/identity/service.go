@@ -58,6 +58,22 @@ const (
 	// admit spaces, brackets and a country code. E.164 itself caps the result at fifteen
 	// digits, which normalisePhone enforces.
 	maxPhoneLength = 32
+
+	// minNameLength and maxNameLength bound what a person may call themselves (SHIP-30a).
+	//
+	// **The floor is one character and that is a decision rather than a slack default.** A name
+	// is not a credential and it is not a format: mononyms exist, single-character given names
+	// exist, and every rule anybody has ever written about "a real name" — two words, a space, a
+	// minimum length, letters only — excludes somebody real. The one thing the platform can say
+	// honestly is that the field was answered, which is what [validate.Errors.Required] and
+	// `ck_users_name` between them say. Docs/04 §3 asks for identity *evidence* where identity
+	// matters, and that is a verification document rather than a text field.
+	//
+	// The ceiling is what stops the column becoming a document store, on the same reasoning as
+	// maxPasswordLength: an unbounded text field is storage a caller controls. 120 runes is past
+	// any name in ISO/IEC 7501's machine-readable zone, which allocates 39.
+	minNameLength = 1
+	maxNameLength = 120
 )
 
 // Service holds the domain rules for identity.
@@ -124,6 +140,13 @@ func NewService(pool *pgxpool.Pool, hasher *passwords.Hasher, issuer *AccessToke
 // client validates the same fields for a better error experience and the platform still decides
 // — Docs/07 §3: the app may hide or disable, the platform rules.
 type RegisterCommand struct {
+	// Name is what the account holder is called (SHIP-30a).
+	//
+	// Required, and it is the only field here whose absence was a *later* ticket's problem
+	// rather than this one's: SHIP-151's account search names four terms and could serve three,
+	// because nothing had ever collected the fourth. Collected here because a name cannot be
+	// backfilled — an account that exists without one has no source to recover it from.
+	Name     string
 	Email    string
 	Phone    string
 	Password string
@@ -136,6 +159,10 @@ type RegisterCommand struct {
 // kept in. " Alice@Example.COM " and "alice@example.com" are one address to every mail system
 // and to the citext column; trimming after the uniqueness check would let the first through.
 func (c *RegisterCommand) Normalise() {
+	// Trimmed and never case-folded. `ck_users_name` refuses a blank name and this is what
+	// makes "   " blank rather than three characters; lower-casing it would be the platform
+	// deciding how somebody spells their own name, which it has no standing to do.
+	c.Name = strings.TrimSpace(c.Name)
 	c.Email = strings.ToLower(strings.TrimSpace(c.Email))
 	c.Phone = normalisePhone(c.Phone)
 	c.Role = Role(strings.ToLower(strings.TrimSpace(string(c.Role))))
@@ -153,6 +180,10 @@ func (c *RegisterCommand) Normalise() {
 // it.
 func (c RegisterCommand) Validate() error {
 	var v validate.Errors
+
+	if v.Required("name", c.Name) {
+		v.Length("name", c.Name, minNameLength, maxNameLength)
+	}
 
 	if v.Required("email", c.Email) {
 		v.Length("email", c.Email, 3, maxEmailLength)
@@ -237,6 +268,7 @@ func (s *Service) Register(ctx context.Context, cmd RegisterCommand) (User, erro
 
 	user := User{
 		ID:     id,
+		Name:   cmd.Name,
 		Email:  cmd.Email,
 		Phone:  cmd.Phone,
 		Role:   cmd.Role,

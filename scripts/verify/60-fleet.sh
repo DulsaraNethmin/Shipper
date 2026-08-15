@@ -26,21 +26,21 @@
 # --- the accounts these checks run as ----------------------------------------------------------
 
 status="$(post_json "verify-fleet-prov-$$" /v1/auth/register \
-  "{\"email\":\"fleet-provider-$$@example.com\",\"phone\":\"04140$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"fleet-provider-$$@example.com\",\"phone\":\"04140$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/fleet-provider.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/fleet-provider.json"; fail "could not register the fleet provider: $status"; }
 fleet_provider_id="$(json "$WORKDIR/fleet-provider.json" '["id"]')"
 fleet_provider_token="$(mint_token "$fleet_provider_id")"
 
 status="$(post_json "verify-fleet-other-$$" /v1/auth/register \
-  "{\"email\":\"fleet-other-$$@example.com\",\"phone\":\"04141$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"fleet-other-$$@example.com\",\"phone\":\"04141$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/fleet-other.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/fleet-other.json"; fail "could not register the second provider: $status"; }
 fleet_other_id="$(json "$WORKDIR/fleet-other.json" '["id"]')"
 fleet_other_token="$(mint_token "$fleet_other_id")"
 
 status="$(post_json "verify-fleet-cust-$$" /v1/auth/register \
-  "{\"email\":\"fleet-customer-$$@example.com\",\"phone\":\"04142$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"fleet-customer-$$@example.com\",\"phone\":\"04142$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/fleet-customer.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/fleet-customer.json"; fail "could not register the fleet customer: $status"; }
 fleet_customer_token="$(mint_token "$(json "$WORKDIR/fleet-customer.json" '["id"]')")"
@@ -454,7 +454,7 @@ ok "paging one vehicle at a time reaches every vehicle exactly once, and termina
 # A provider with no fleet gets an empty array rather than null. A client iterating null breaks the
 # first time a new provider opens the app, and never again in testing.
 status="$(post_json "verify-fleet-fresh-$$" /v1/auth/register \
-  "{\"email\":\"fleet-fresh-$$@example.com\",\"phone\":\"04143$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"fleet-fresh-$$@example.com\",\"phone\":\"04143$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/fleet-fresh.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/fleet-fresh.json"; fail "could not register a provider with no fleet"; }
 status="$(fleet_get "$(mint_token "$(json "$WORKDIR/fleet-fresh.json" '["id"]')")" /v1/fleet/vehicles \
@@ -635,7 +635,7 @@ ticket "SHIP-81  the eligibility filter, through SHIP-82's GET /v1/fleet/jobs â€
 # contents this check does not control.
 
 status="$(post_json "verify-elig-prov-$$" /v1/auth/register \
-  "{\"email\":\"fleet-eligible-$$@example.com\",\"phone\":\"04144$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"fleet-eligible-$$@example.com\",\"phone\":\"04144$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/elig-provider.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/elig-provider.json"; fail "could not register the eligibility provider: $status"; }
 elig_provider_id="$(json "$WORKDIR/elig-provider.json" '["id"]')"

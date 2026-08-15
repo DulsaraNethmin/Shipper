@@ -188,6 +188,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminJobUnpublish'
   /v1/admin/me:
     $ref: './paths/admin.yaml#/AdminMe'
+  /v1/admin/moderation/cancellations:
+    $ref: './paths/admin.yaml#/AdminCancellationQueue'
   /v1/admin/moderation/exceptions:
     $ref: './paths/admin.yaml#/AdminExceptionQueue'
   /v1/admin/notes:
@@ -196,10 +198,16 @@ paths:
     $ref: './paths/admin.yaml#/AdminSessions'
   /v1/admin/sessions/current:
     $ref: './paths/admin.yaml#/AdminCurrentSession'
+  /v1/admin/suspensions:
+    $ref: './paths/admin.yaml#/AdminSuspensions'
+  /v1/admin/suspensions/{id}/approval:
+    $ref: './paths/admin.yaml#/AdminSuspensionApproval'
   /v1/admin/users:
     $ref: './paths/admin.yaml#/AdminUsers'
   /v1/admin/users/{id}/standing:
     $ref: './paths/admin.yaml#/AdminUserStanding'
+  /v1/admin/users/{id}/suspension:
+    $ref: './paths/admin.yaml#/AdminUserSuspension'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
   /v1/app/policy:

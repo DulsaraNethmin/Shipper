@@ -11,6 +11,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/admin"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
@@ -102,6 +103,20 @@ func init() {
 			// role exists to be able to do.
 			Auth:    RequireAdmin,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).ExceptionQueue() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/moderation/cancellations",
+			Group:   GroupV1,
+
+			// Docs/04 §5's fifth queue (SHIP-158), beside its fourth rather than inside it:
+			// the document numbers its queues, and this one asks who withdrew from a
+			// commitment rather than which delivery is going wrong.
+			//
+			// RequireAdmin, and `moderation.read` inside the handler, like every other queue.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).CancellationQueue() },
 		},
 
 		Route{
@@ -210,6 +225,52 @@ func init() {
 
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/admin/users/{id}/suspension",
+			Group:   GroupV1,
+
+			// Docs/04 §9's two-person review, first half (SHIP-166). `users.restrict`, the
+			// same permission the approval needs — the control is that there are two people,
+			// not that either holds something the other does not.
+			//
+			// A sibling of `/standing` rather than a value on it: the two answer different
+			// shapes and different statuses, and one endpoint that sometimes changed an
+			// account and sometimes filed a request is one a console has to branch inside.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).RequestSuspension() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/suspensions",
+			Group:   GroupV1,
+
+			// The queue a second administrator finds a request in (SHIP-166). `users.read`,
+			// which every role holds including `support`: seeing that a suspension has been
+			// proposed is looking, and acting on it is the other endpoint's permission.
+			//
+			// **Without this route the control does not work** — a review nobody can see is a
+			// review nobody approves.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).PendingSuspensions() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/admin/suspensions/{id}/approval",
+			Group:   GroupV1,
+
+			// The second half, and the one the control turns on (SHIP-166). A *different*
+			// administrator agrees and the suspension is applied in the same transaction.
+			//
+			// The approver is taken from the verified session and never from the body, which
+			// is why the endpoint accepts no body at all: a two-person control whose second
+			// signature a client could name has one participant.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).ApproveSuspension() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/admin/notes",
 			Group:   GroupV1,
 
@@ -311,9 +372,31 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin credentials: " + err.Error())
 	}
 
-	moderation, err := admin.NewModeration(exceptionQueueLookup{}, d.Pool)
+	// SHIP-157. The threshold is read from `internal/delivery`, which owns Docs/02 §3.1's
+	// twenty-four hours, and handed to a domain that must not hold a second copy of it — the
+	// same arrangement the status vocabulary takes below. **This import is what makes the number
+	// have one authority**: a constant in `internal/admin` would agree with this one by comment
+	// until somebody moved one, which is Docs/10 §3.4's failure applied to a duration.
+	moderation, err := admin.NewModeration(
+		exceptionQueueLookup{}, delivery.UnsyncedAlertThreshold, d.Pool)
 	if err != nil {
 		panic("cmd/api: admin moderation: " + err.Error())
+	}
+
+	// SHIP-158. Docs/04 §5's fifth queue, over `job_status_history`, `jobs` and `bids` — three
+	// tables belonging to two domains `internal/admin` may not import, which is why the statement
+	// is a port implemented here rather than a method on that domain's store.
+	cancellations, err := admin.NewCancellations(cancellationQueueLookup{}, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin cancellations: " + err.Error())
+	}
+
+	// SHIP-166. Docs/04 §9's two-person review. It needs the auditor and nothing else: the table
+	// is this domain's own, in its own migration block, so there is no port and no statement in
+	// this file — which postgres_users.go's rule predicts.
+	suspensions, err := admin.NewSuspensions(auditor, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin suspensions: " + err.Error())
 	}
 
 	// SHIP-151. It takes the pool alone: the search reads `users`, which is a shared table this
@@ -367,14 +450,16 @@ func adminHandler(d Deps) *admin.Handler {
 	}
 
 	handler, err := admin.NewHandler(admin.HandlerServices{
-		Disputes:    svc,
-		Credentials: creds,
-		Moderation:  moderation,
-		Users:       users,
-		Jobs:        jobConsole,
-		Trail:       trail,
-		Enforcement: enforcement,
-		Notes:       notes,
+		Disputes:      svc,
+		Credentials:   creds,
+		Moderation:    moderation,
+		Cancellations: cancellations,
+		Users:         users,
+		Jobs:          jobConsole,
+		Trail:         trail,
+		Enforcement:   enforcement,
+		Notes:         notes,
+		Suspensions:   suspensions,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
@@ -588,84 +673,189 @@ func (jobPartiesLookup) PartyOn(
 // in the build where that can be established — admin names neither type and neither type names
 // admin, so nothing else links them.
 var (
-	_ admin.Jobs           = disputeLifecycle{}
-	_ admin.JobParties     = jobPartiesLookup{}
-	_ admin.ExceptionQueue = exceptionQueueLookup{}
-	_ admin.JobDirectory   = jobDirectory{}
+	_ admin.Jobs              = disputeLifecycle{}
+	_ admin.JobParties        = jobPartiesLookup{}
+	_ admin.ExceptionQueue    = exceptionQueueLookup{}
+	_ admin.CancellationQueue = cancellationQueueLookup{}
+	_ admin.JobDirectory      = jobDirectory{}
 )
 
-// exceptionQueueLookup implements admin.ExceptionQueue over `delivery`'s evidence tables (SHIP-117).
+// exceptionQueueLookup implements admin.ExceptionQueue over `delivery`s and `jobs`' rows
+// (SHIP-117, SHIP-157).
 //
 // # Why the query is here rather than in a domain
 //
-// It reads `proofs` and `milestones`, which are `internal/delivery`'s, and `jobs`, which is
+// It reads `proofs` and `milestones`, which are `internal/delivery`s, and `jobs`, which is
 // `internal/jobs`'. `admin` may import neither, and the boundary lint refuses both. The composition
 // root is where a dependency between domains is visible to somebody reading how the service is
 // wired, rather than buried in `admin/postgres.go` where `proofs` would read as a table admin owns.
 // jobPartiesLookup above is the same arrangement for the same reason.
 //
-// **`internal/delivery` is untouched by this ticket**, which is the property that made SHIP-117
-// buildable at all in a wave where another track owns that package. The queue is a read of rows that
-// domain already writes, and nothing about recording an exception changes.
+// **`internal/delivery` and `internal/jobs` are untouched by both tickets**, which is the property
+// that made SHIP-117 buildable in a wave where another track owned that package and makes SHIP-157
+// buildable in one where two other lanes do. The queue is a read of rows those domains already
+// write, and nothing about recording an exception, a milestone or a window changes.
 //
 // # The vocabulary is not translated, and that is deliberate
 //
 // `exception_reason`, `milestone` and `jobs.status` come back as the strings the database holds.
-// Two of them are Docs/02's own values and the third is generated from `contracts/statuses.yaml`
+// Two of them are Docs/02s own values and the third is generated from `contracts/statuses.yaml`
 // (SHIP-56a), so a translation here would be a third copy of a list whose whole point is that there
 // is one. `delivery.ProofExceptionReason.Wire()` is the identity function on the stored form, and
-// Docs/10 §4.7's mapping for the other two belongs to the endpoints that publish them.
+// Docs/10 §4.7s mapping for the other two belongs to the endpoints that publish them.
+//
+// **The one vocabulary this file does name is the *ground*, and it is `admin`s own** — see
+// [admin.ExceptionGround]. A ground names which of Docs/04 §5s situations a row is evidence of,
+// which is a moderation concept rather than a delivery one, and the literals below are the only
+// place SQL and Go have to agree about it. TestTheExceptionGroundsAreTheOnesTheDomainDeclares is
+// what holds them together.
 type exceptionQueueLookup struct{}
 
-// ExceptionsAwaitingReview reads one page of the queue, oldest first.
+// The status sets each window ground selects on.
 //
-// # The ordering is total, and the cursor is why
+// **Written out rather than expressed as "not yet delivered", because the complement is wrong.** A
+// `Cancelled` job is not overdue for a pickup that will never happen, a `Disputed` one is already in
+// front of somebody, and a `Draft`, `Open` or `Negotiating` job past its pickup window is SHIP-68s
+// expiry sweep rather than a delivery exception — it has no provider to be late. So each set names
+// the statuses where a job is *committed and still moving*, and a status added to Docs/02 §1 in
+// future is deliberately absent from both until somebody decides which it belongs in.
 //
-// `(p.created_at, p.id)` rather than `p.created_at` alone: two deliveries recorded in the same
-// millisecond would otherwise make a single-column cursor either skip an entry or repeat one, and a
-// moderation queue that can hide a row is worse than one that shows it twice.
+// The two differ by `Picked up` and `In transit`: a job in either has been collected, so it cannot
+// be overdue for its pickup and can still be late for its delivery.
 //
-// `p.created_at` rather than `m.actor_recorded_at`, and that is the same decision Docs/02 §3.1
-// records: the actor's clock is the driver's handset, which syncs late and can be wrong, and a queue
-// ordered by it could be reordered by a device — putting an entry behind rows that arrived after it.
-// The platform's clock is what a support target is measured against (Docs/04 §8).
+// They are single-line constants on purpose: internal/admin's copy of this statement is held to it
+// by TestTheTestDoubleRunsTheStatementCmdApiRuns, which reads this file and resolves the
+// concatenation by name — and a constant split across two string literals is one that guard would
+// have to parse rather than read.
+const (
+	overduePickupStatuses = `('Awarded', 'Driver assigned', 'En route to pickup')`
+
+	delayedDeliveryStatuses = `('Awarded', 'Driver assigned', 'En route to pickup', 'Picked up', 'In transit')`
+)
+
+// ExceptionsAwaitingReview reads one page of the queue, oldest first, across all four grounds.
 //
-// # Why the join does not filter on the milestone kind
+// # One statement rather than four reads merged in Go
 //
-// Docs/01 §4.4 is about delivery, and `proofs` does not restrict itself to one milestone — so
-// filtering to 'Delivered' here would silently drop an exception recorded against a pickup the day
-// somebody allows one. The milestone is *reported* instead, and a moderator sees which claim the
-// exception stands behind. `idx_proofs_exception` is partial on `exception_reason IS NOT NULL`,
-// which is the predicate that makes this cheap; the ordering is a sort over the few rows it selects.
+// A `UNION ALL` of four selects with one ordering and one LIMIT over the top. Four reads would need
+// a transaction to describe one moment, would each need their own limit chosen without knowing how
+// the others would fill the page, and would put the merge in the handler — where a cursor over four
+// streams stops being expressible at all.
+//
+// # The ordering is total, and the cursor is why it needs three columns
+//
+// `(recorded_at, ground, entry_id)`. Two deliveries recorded in the same millisecond would make a
+// single-column cursor either skip an entry or repeat one, and a moderation queue that can hide a
+// row is worse than one that shows it twice. **The ground is SHIP-157s addition and it is
+// load-bearing**: `overdue_pickup` and `delayed_delivery` are both keyed by the *job*, so a job
+// whose pickup and drop-off windows end at the same instant produces two rows agreeing on the other
+// two columns.
+//
+// # The platform's clock throughout, and `now()` is the platform's clock
+//
+// `p.created_at` and `m.server_recorded_at` rather than `m.actor_recorded_at`, which is the decision
+// Docs/02 §3.1 records: the actor's clock is a handset's, it syncs late and it can be wrong, and a
+// queue ordered by it could be reordered by a device. The two window grounds compare against
+// `now()`, evaluated by PostgreSQL at the start of the transaction — **not the injectable clock**,
+// deliberately: `internal/clock` exists so that a *domain rule* can be tested at a chosen instant,
+// and this is a read whose entire content is "what is late as of now". A test moves the window, not
+// the clock.
+//
+// # The unsynced threshold is a parameter, never a literal
+//
+// `$1` is `delivery.UnsyncedAlertThreshold`, handed down from the composition root. Writing
+// `interval '24 hours'` here would be a second authority for Docs/02 §3.1s number that agrees with
+// the first by comment — and `internal/delivery`s own store already passes it the same way, so the
+// predicate here and the predicate there are the same expression over the same value.
+//
+// # Indexes
+//
+// `idx_proofs_exception` is partial on `exception_reason IS NOT NULL` and serves the third ground.
+// The other three are sequential scans: the unsynced predicate is over a computed difference and
+// `internal/delivery`s store already records why no expression index is prepaid for it, and the two
+// window grounds are bounded by a status set that is a small fraction of `jobs` at pilot volume.
+// **The trigger for adding one is named rather than left to judgement: the first caller that reads
+// this on a schedule rather than on a person's request.**
 func (exceptionQueueLookup) ExceptionsAwaitingReview(
 	ctx context.Context,
 	r db.Runner,
 	q admin.QueueQuery,
+	unsyncedThreshold time.Duration,
 ) ([]admin.ExceptionEntry, error) {
 	const query = `
-		SELECT p.id, p.job_id, m.milestone, p.exception_reason,
-		       coalesce(m.reason, ''), p.created_at, j.status
-		FROM proofs p
-		JOIN milestones m ON m.id = p.milestone_id
-		JOIN jobs j       ON j.id = p.job_id
-		WHERE p.exception_reason IS NOT NULL
-		  AND ($1::timestamptz IS NULL OR (p.created_at, p.id) > ($1, $2))
-		ORDER BY p.created_at, p.id
-		LIMIT $3`
+		WITH entries AS (
+		    -- Docs/04 §5, ground one: committed, past its pickup window, not collected.
+		    SELECT '` + string(admin.GroundOverduePickup) + `'::text AS ground,
+		           j.id AS entry_id, j.id AS job_id,
+		           ''::text AS milestone, ''::text AS reason, ''::text AS note,
+		           j.pickup_window_end AS recorded_at
+		    FROM jobs j
+		    WHERE j.pickup_window_end IS NOT NULL
+		      AND j.pickup_window_end < now()
+		      AND j.status IN ` + overduePickupStatuses + `
+
+		    UNION ALL
+
+		    -- Ground two: past its drop-off window and not delivered.
+		    SELECT '` + string(admin.GroundDelayedDelivery) + `'::text,
+		           j.id, j.id, ''::text, ''::text, ''::text, j.dropoff_window_end
+		    FROM jobs j
+		    WHERE j.dropoff_window_end IS NOT NULL
+		      AND j.dropoff_window_end < now()
+		      AND j.status IN ` + delayedDeliveryStatuses + `
+
+		    UNION ALL
+
+		    -- Ground three (SHIP-117): evidenced by a reason rather than a photograph.
+		    --
+		    -- The join does not filter on the milestone kind. Docs/01 §4.4 is about delivery and
+		    -- proofs does not restrict itself to one milestone, so filtering to 'Delivered'
+		    -- would silently drop an exception recorded against a pickup the day somebody allows
+		    -- one. The milestone is reported instead.
+		    SELECT '` + string(admin.GroundFailedProof) + `'::text,
+		           p.id, p.job_id, m.milestone, p.exception_reason, coalesce(m.reason, ''),
+		           p.created_at
+		    FROM proofs p
+		    JOIN milestones m ON m.id = p.milestone_id
+		    WHERE p.exception_reason IS NOT NULL
+
+		    UNION ALL
+
+		    -- Ground four (SHIP-128, surfaced here by SHIP-157): an update that reached the
+		    -- platform more than $1 after the driver recorded it. >= rather than > because
+		    -- Docs/02 §3.1 says "24 hours — operations alert", so a row exactly on the threshold
+		    -- is over it; PostgreSQL compares intervals exactly, so this is a real boundary.
+		    SELECT '` + string(admin.GroundUnsyncedMilestone) + `'::text,
+		           m.id, m.job_id, m.milestone, ''::text, coalesce(m.reason, ''),
+		           m.server_recorded_at
+		    FROM milestones m
+		    WHERE m.server_recorded_at - m.actor_recorded_at >= $1
+		)
+		SELECT e.ground, e.entry_id, e.job_id, e.milestone, e.reason, e.note,
+		       e.recorded_at, j.status
+		FROM entries e
+		JOIN jobs j ON j.id = e.job_id
+		WHERE ($2 = '' OR e.ground = $2)
+		  AND ($3::timestamptz IS NULL
+		       OR (e.recorded_at, e.ground, e.entry_id) > ($3, $4, $5))
+		ORDER BY e.recorded_at, e.ground, e.entry_id
+		LIMIT $6`
 
 	// A nil rather than a zero time for the first page: `> (NULL, …)` is NULL rather than true,
-	// so the predicate has to be skipped rather than satisfied, and the `$1 IS NULL` guard above
+	// so the predicate has to be skipped rather than satisfied, and the `$3 IS NULL` guard above
 	// is what does it. Passing the zero time would work today and would stop working the first
 	// time somebody backdated a fixture.
 	var (
 		after   any
+		ground  any
 		afterID any
 	)
 	if !q.After.Zero() {
-		after, afterID = q.After.RecordedAt, q.After.ProofID
+		after, ground, afterID = q.After.RecordedAt, q.After.Ground.String(), q.After.EntryID
 	}
 
-	rows, err := r.Query(ctx, query, after, afterID, q.Limit)
+	rows, err := r.Query(ctx, query,
+		unsyncedThreshold, q.Ground.String(), after, ground, afterID, q.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("cmd/api: reading the delivery-exception queue: %w", err)
 	}
@@ -674,7 +864,7 @@ func (exceptionQueueLookup) ExceptionsAwaitingReview(
 	var out []admin.ExceptionEntry
 	for rows.Next() {
 		var e admin.ExceptionEntry
-		if err := rows.Scan(&e.ProofID, &e.JobID, &e.Milestone, &e.Reason,
+		if err := rows.Scan(&e.Ground, &e.EntryID, &e.JobID, &e.Milestone, &e.Reason,
 			&e.Note, &e.RecordedAt, &e.JobStatus); err != nil {
 			return nil, fmt.Errorf("cmd/api: reading a delivery-exception entry: %w", err)
 		}
@@ -682,6 +872,159 @@ func (exceptionQueueLookup) ExceptionsAwaitingReview(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("cmd/api: reading the delivery-exception queue: %w", err)
+	}
+	return out, nil
+}
+
+// --- SHIP-158: the post-award cancellation queue --------------------------------------------------
+
+// cancellationQueueLookup implements admin.CancellationQueue over `jobs`, `job_status_history` and
+// `bids`.
+//
+// Here rather than in a domain for the reason exceptionQueueLookup and jobDirectory are: the
+// statement spans two other domains' tables, `admin` may import neither, and the composition root is
+// where a dependency between domains is visible to somebody reading how the service is wired.
+type cancellationQueueLookup struct{}
+
+// providerCommitmentStatuses is where a job stands once a provider has undertaken to carry it.
+//
+// Docs/02 §2 permits `Awarded / Driver assigned → Open` and nothing later: after `Picked up` the
+// goods are in somebody's vehicle and §6.2 makes ending it a support case rather than a transition.
+// So the set is exactly the two statuses from which a provider may still walk away.
+//
+// Single-line, like the exception queue's sets, so internal/admin's copy of this statement can be
+// held to it by a guard that resolves the constant by name.
+const providerCommitmentStatuses = `('Awarded', 'Driver assigned')`
+
+// CancelledAfterAward reads one page of the queue, most recent first.
+//
+// # "After award" is a fact about the history, and Docs/02 §2 is why
+//
+// **There is no `Awarded → Cancelled` transition.** The guard refuses it, and the document is
+// deliberate about that: `Open / Negotiating → Cancelled` is the ordinary route out of the
+// marketplace, and after award a job either goes back on the market or ends through a dispute. A
+// queue that read `to_status = 'Cancelled'` and stopped there would therefore return the *pre*-award
+// cancellations and none of the post-award ones — which is the exact inverse of this ticket.
+//
+// So the queue reads two shapes, and an entry says which:
+//
+//   - **`returned_to_market`** — `Awarded / Driver assigned → Open`. Docs/02 §6.2 calls this a
+//     provider cancellation after award, closes every bid on the job and says the cancellation "is
+//     **recorded against the provider**… the reliability signal that Phase 2 reputation will be
+//     built from, and it cannot be reconstructed later if it is not captured now". This queue is
+//     where it is read.
+//   - **`ended`** — a transition into `Cancelled` on a job that had earlier reached `Awarded`, which
+//     under Docs/02 §2 can only arrive through `Disputed → Cancelled`: an administrator resolving a
+//     dispute as a cancelled or failed delivery.
+//
+// The earlier-award test is `(server_recorded_at, id)` rather than the timestamp alone, because one
+// transaction can write two history rows at the same instant and `now()` is transaction start time.
+//
+// # Neither shape has an endpoint yet, and the queue is still correct
+//
+// Nothing in the platform currently drives either transition: provider cancellation has no ticket,
+// and dispute resolution is SHIP-164. **The queue is a query over rows the guard already permits**,
+// so it fills the moment either arrives and needs no change when it does — which is the same
+// position `admin.ExceptionQueue` takes and the reason neither has a flag column. What it must not
+// do in the meantime is quietly list pre-award cancellations so that the screen looks populated.
+//
+// # The provider comes from the accepted bid, and there is a named gap
+//
+// `uq_bids_one_accepted_per_job` makes that join single-valued. **On the `returned_to_market` shape
+// the accepted bid is closed by the same operation** (Docs/02 §6.2: "all prior bids are closed, not
+// restored"), so once that path is built the join will find nothing and the entry will report no
+// provider. Closing that needs `bids` to record which offer *was* accepted after it stops being
+// accepted — a column in `internal/bidding`'s migration block, which is not this ticket's to take.
+// It is written up in Docs/11 §4 rather than papered over with a guess.
+//
+// # The two provider counts are aggregates over the whole table, deliberately
+//
+// `history` and `completions` are computed once per query rather than per row. That is more work
+// than a correlated subquery on a small page and far less on a large one, and it keeps the counts
+// consistent with each other. **The trigger for revisiting it is named**: the first time this
+// endpoint is read on a schedule rather than on a person's request, or the first `bids` table where
+// a full aggregate is not free — at which point the shape to add is a partial index on
+// `bids (provider_id) WHERE status = 'Accepted'`.
+func (cancellationQueueLookup) CancelledAfterAward(
+	ctx context.Context,
+	r db.Runner,
+	q admin.QueueQuery,
+) ([]admin.CancellationEntry, error) {
+	const query = `
+		WITH cancellations AS (
+		    SELECT h.job_id, h.id AS transition_id, h.server_recorded_at AS cancelled_at,
+		           h.from_status, h.actor_type, coalesce(h.reason, '') AS reason,
+		           CASE WHEN h.to_status = 'Open'
+		                THEN '` + string(admin.OutcomeReturnedToMarket) + `'
+		                ELSE '` + string(admin.OutcomeEnded) + `' END AS outcome
+		    FROM job_status_history h
+		    WHERE (h.to_status = 'Open' AND h.from_status IN ` + providerCommitmentStatuses + `)
+		       OR (h.to_status = 'Cancelled'
+		           AND EXISTS (SELECT 1
+		                         FROM job_status_history a
+		                        WHERE a.job_id = h.job_id
+		                          AND a.to_status = 'Awarded'
+		                          AND (a.server_recorded_at, a.id) < (h.server_recorded_at, h.id)))
+		),
+		carrier AS (
+		    SELECT c.transition_id, b.provider_id
+		    FROM cancellations c
+		    LEFT JOIN bids b ON b.job_id = c.job_id AND b.status = 'Accepted'
+		),
+		walked AS (
+		    SELECT provider_id, count(*) AS cancellations
+		    FROM carrier
+		    WHERE provider_id IS NOT NULL
+		    GROUP BY provider_id
+		),
+		completions AS (
+		    SELECT b.provider_id, count(*) AS completions
+		    FROM bids b
+		    JOIN jobs j ON j.id = b.job_id
+		    WHERE b.status = 'Accepted' AND j.status = 'Completed'
+		    GROUP BY b.provider_id
+		)
+		SELECT c.job_id, c.transition_id,
+		       coalesce(r.provider_id, '00000000-0000-0000-0000-000000000000'::uuid),
+		       c.outcome, c.from_status, c.actor_type, c.reason, c.cancelled_at,
+		       coalesce(w.cancellations, 0), coalesce(m.completions, 0)
+		FROM cancellations c
+		JOIN carrier r      ON r.transition_id = c.transition_id
+		LEFT JOIN walked w      ON w.provider_id = r.provider_id
+		LEFT JOIN completions m ON m.provider_id = r.provider_id
+		WHERE ($1::timestamptz IS NULL OR (c.cancelled_at, c.transition_id) < ($1, $2))
+		ORDER BY c.cancelled_at DESC, c.transition_id DESC
+		LIMIT $3`
+
+	// A nil rather than a zero time for the first page: `< (NULL, …)` is NULL rather than true,
+	// so the predicate has to be skipped rather than satisfied. The comparison is `<` because
+	// the order is descending — the next page is what happened *before* this one's last row.
+	var (
+		after   any
+		afterID any
+	)
+	if !q.After.Zero() {
+		after, afterID = q.After.RecordedAt, q.After.EntryID
+	}
+
+	rows, err := r.Query(ctx, query, after, afterID, q.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the post-award cancellation queue: %w", err)
+	}
+	defer rows.Close()
+
+	var out []admin.CancellationEntry
+	for rows.Next() {
+		var e admin.CancellationEntry
+		if err := rows.Scan(&e.JobID, &e.TransitionID, &e.ProviderID, &e.Outcome,
+			&e.FromStatus, &e.ActorType, &e.Reason, &e.CancelledAt,
+			&e.ProviderCancellations, &e.ProviderCompletions); err != nil {
+			return nil, fmt.Errorf("cmd/api: reading a cancellation entry: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the post-award cancellation queue: %w", err)
 	}
 	return out, nil
 }

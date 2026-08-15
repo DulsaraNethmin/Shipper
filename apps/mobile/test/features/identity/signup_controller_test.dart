@@ -24,6 +24,7 @@ ProviderContainer _container(FakeIdentityRepository identity) {
 
 Future<void> _register(ProviderContainer container, {String email = 'alice@example.com'}) async {
   await container.read(signupProvider.notifier).register(
+        name: 'Alice Nguyen',
         email: email,
         phone: '0412 345 678',
         password: 'correct-horse-battery-staple',

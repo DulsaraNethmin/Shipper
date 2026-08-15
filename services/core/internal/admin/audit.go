@@ -227,6 +227,30 @@ const (
 	// **privileged actions**; reading a queue or a history is not one, and an entry per read
 	// would bury the actions in the reads.
 	AuditActionNoteAdded AuditAction = "note.added"
+
+	// AuditActionUserSuspensionRequested is one administrator proposing a permanent suspension
+	// (SHIP-166).
+	//
+	// **An entry for something that has not happened yet**, which is unusual here and is the
+	// point: Docs/04 §9's control is that two people were involved, and a trail recording only
+	// the approval would name one of them. The request is the moment the case was made, and it
+	// carries the reason the second administrator was asked to agree with.
+	//
+	// The account's standing does not move on this action. `from` in the metadata is where the
+	// account stood when the request was made, which is what makes a later approval's `from`
+	// readable as "unchanged since" or not.
+	AuditActionUserSuspensionRequested AuditAction = "user.suspension_requested"
+
+	// AuditActionUserSuspensionApproved is the second administrator agreeing, and the suspension
+	// being applied (SHIP-166).
+	//
+	// **Separate from [AuditActionUserStandingChanged] rather than reusing it**, and the
+	// reasoning is that action's own: cmd/api's TestTheAuditedMutationsAreDistinctActions
+	// requires one action per route, and this is a different route with a different actor and a
+	// different question behind it — "who agreed to this" rather than "what was this account's
+	// standing". The metadata names both administrators, because a two-person control that
+	// records one name has not recorded what happened.
+	AuditActionUserSuspensionApproved AuditAction = "user.suspension_approved"
 )
 
 // AuditActions is the whole catalogue, in the order the constants declare it.
@@ -243,6 +267,8 @@ var AuditActions = []AuditAction{
 	AuditActionJobUnpublished,
 	AuditActionUserStandingChanged,
 	AuditActionNoteAdded,
+	AuditActionUserSuspensionRequested,
+	AuditActionUserSuspensionApproved,
 }
 
 // Valid reports whether a is in the catalogue.

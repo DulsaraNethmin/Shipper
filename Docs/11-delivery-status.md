@@ -634,6 +634,10 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-132** | M4 | The panel that says what happened to a queued update the platform refused, opened from the **second line of SHIP-126's bar** — which said "needs attention" and gave a person nothing to act on. Three quarantine reasons get three different sentences, because *lost to server state* is about a decision somebody made and the other two are about this build. **`BlockedOperation.detail` is never rendered**, per its own note. Nothing is removed by opening or closing it; only the row's own button, which says so. A panel rather than a route **on ownership grounds**, and the file says so — *see below* |
 | **SHIP-143** | M5 | Push registration — and the deregistration **cannot be a listener on the session**, because `signOut` clears the access token before it publishes the state, so the obvious implementation sends a request with no credential and achieves nothing while looking like it worked. `core/auth` grew a `signOutHooksProvider` it fills from `main.dart`, which is `CLAUDE.md`'s composition-root rule on the client side. **The token source is a seam with nothing behind it**: no Firebase project exists and **no ticket anywhere creates one** — *see below* |
 | **SHIP-167a** | M7 | `GET /v1/app/policy` — the unsynced-nudge threshold and the proof compression budget, served beside the build floor and read from configuration on every request. The client half is where the ticket lives: **offline and never-told are two different situations and only the second gets the compiled default**, which is one `if` in `resolveAppPolicy` and the whole of what makes the endpoint reach the devices it exists for. A **budget above `STORAGE_MAX_UPLOAD_BYTES` is refused at startup** — a cross-section rule neither variable is wrong under on its own — *see below* |
+| **SHIP-30a** | M1 | `users.name` (`000006`, shared block), required by `POST /v1/auth/register`, collected by the app's registration screen, and matched by `GET /v1/admin/users` — so **SHIP-151's fourth term answers on the wire** after a wave partly met. The column is **nullable and that is the decision**: accounts predating it have no name and a name cannot be backfilled, so `NOT NULL` is named as a later tightening rather than faked with a default. **A required field on registration broke 37 `make verify` call sites across nine sections**, which no unit test could have shown — *see below* |
+| **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
+| **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
+| **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -12769,14 +12773,340 @@ forever, makes no request, writes no cache and fails no test.
 fixture for.
 
 
+
+### SHIP-30a — the column that two shipped tickets had assumed
+
+`users` has never held a name. `000002_users` did not have one, registration never asked, and the only
+`name` columns in the whole schema are `admin_users.name` — an administrator's — and
+`driver_assignments.driver_name`, which is captured at assignment and belongs to a job. SHIP-151
+shipped a search whose *Done when* names four terms and could serve three; §4 carried the gap for a
+wave with nobody owning it, which is the one shape §4 says does not close by itself.
+
+Four things now exist: `000006_users_name`, a required `name` on `POST /v1/auth/register`, a name
+field on the app's registration screen, and a third `OR` in `postgresStore.searchUsers`. The last of
+those is one line, which `internal/admin/users.go` predicted a wave ago and got right; what it got
+wrong was the size, because the work was never the search — it was *collecting* a value at the one
+moment somebody is filling in a form.
+
+#### The column is nullable, and that is the decision rather than a shortcut
+
+`NOT NULL` is what "registration requires a name" would look like in the schema and it is not
+available. Every account that already exists predates the column, and **a name cannot be backfilled**
+— that is `Docs/09`'s own reason for putting this row in M1 rather than M6. A `DEFAULT ''` or a
+backfill to 'Unknown' would put a value nobody supplied into the one field whose entire purpose is
+that a person supplied it, and it would destroy the only distinction that matters: "did not say"
+against "said nothing".
+
+So the requirement lives where the value is collected, and the column records that older accounts
+have none. **The tightening is named rather than left to judgement:** once every row has a name,
+`ALTER TABLE users ALTER COLUMN name SET NOT NULL` is one migration in the same block, and
+`select count(*) from users where name is null` is the figure to point at. `TestAnAccountMayHaveNoName`
+is a test of an *absence* of a constraint, written out precisely so that a future `SET NOT NULL`
+fails somewhere a person will read it.
+
+A nameless account is therefore a real state on every surface: the search never matches it by name —
+`NULL ILIKE '%x%'` is NULL, and an OR is decided by its other branches — and its `name` comes back
+empty rather than as a placeholder that would read as a name somebody chose.
+
+#### The floor is one character, and every alternative excludes somebody real
+
+Mononyms exist, single-character given names exist, and every rule anybody has written about a "real
+name" — two words, a space, a minimum length, letters only — refuses a real person with no way to
+override it from a device. The only thing the platform can honestly assert is that the field was
+answered. Where identity itself matters, `Docs/04` §3 asks for a verification *document*, which is a
+different mechanism with a different evidence trail.
+
+The ceiling is 120 runes, on `maxPasswordLength`'s reasoning: an unbounded text field is storage a
+caller controls. `ck_users_name` bounds blankness and nothing else, because `000404` already settled
+where length limits live for this schema — they are validation limits, `Docs/06` §5.3 wants those
+changeable without a deploy, and a CHECK constraint is a migration.
+
+#### `btrim(name, E' \t\r\n')`, because SHIP-162 already paid for the one-argument form
+
+**PostgreSQL's one-argument `btrim` strips spaces only** — not tabs, not newlines. `ck_admin_notes_body`
+was written that way and a body of a single newline satisfied it while `strings.TrimSpace` in the
+service refused the same value. The character set is spelled out here for that reason, and the
+`Docs/10` §3.4 pairing is asserted twice on purpose: `TestASuppliedNameMayNotBeBlank` drives the
+constraint from `migrations`, and `TestTheDatabaseRefusesABlankName` drives it from `internal/identity`
+with the same character set the service trims. Two checks believed to agree are two checks until
+something compares them.
+
+#### What `make verify` found that no unit test could
+
+**A required field on registration broke 37 call sites across nine `scripts/verify/` sections.** Every
+Go test that registers goes through `RegisterCommand`, so the compiler and the fixtures moved
+together; every *harness* section builds its registration body as a JSON string, so all of them kept
+compiling and all of them would have failed at the first request. Seven of the nine files belong to
+other domains' lanes — `50-jobs.sh`, `51-jobs-autocomplete.sh`, `60-fleet.sh`, `61-bidding.sh`,
+`70-delivery.sh`, `80-notifications.sh`, `81-notifier.sh` — and each needed one field added to a
+literal.
+
+**That is the cost of the ticket rather than an accident of it**, and it is worth recording because
+the next required field on a widely-used endpoint will cost the same. The harness has no shared
+"register a user" helper: `post_json` is shared and the *body* is written out at each site. A helper
+would have made this one edit, and it would live in `scripts/verify-foundation.sh`, which is shared —
+so the trade is real in both directions and is left as an observation rather than a change taken from
+a domain branch.
+
+One section's expectation changed rather than its fixture: `40-identity.sh` asserts that an empty
+registration reports every bad field at once, and the count went from four to five.
+
+#### Nothing was needed from `internal/config`
+
+
+### SHIP-157 — one queue on four grounds, and why it is not four endpoints
+
+Docs/04 §5 numbers seven moderation queues. The fourth is "delivery exceptions: overdue pickup,
+delayed delivery, failed proof of delivery", and SHIP-157's *Done when* adds unsynced milestones to
+it. SHIP-117 built the failed-proof third of it a wave ago and said what would happen next in as many
+words: `moderation.go` recorded that "the other two are SHIP-157's, which is where the queue becomes
+one screen rather than one endpoint".
+
+**So this widened `GET /v1/admin/moderation/exceptions` rather than adding three siblings**, and the
+decision was taken on the document rather than on taste. Four endpoints would be four cursors and
+four pages, and the question a moderator actually asks — *what is going wrong with deliveries, oldest
+first* — would have become a merge of four sorted streams performed by whoever writes the console. A
+`UNION ALL` and one `ORDER BY` do that once, server-side, where the cursor can stay total.
+
+The path, the permission, the ordering and the paging are unchanged. What changed is the entry: it
+gains `ground`, and `proof_id` becomes `entry_id`, because three of the four grounds have no proof
+row. No console consumed the old shape — `apps/admin` is still a shell — so this is a contract change
+and nothing more.
+
+#### The cursor needed a third field, and finding out why is worth the paragraph
+
+`(recorded_at, entry_id)` was total while every entry was a proof. It is not total across the union:
+**`overdue_pickup` and `delayed_delivery` are both keyed by the job**, so a job whose pickup and
+drop-off windows close at the same instant produces two entries agreeing on both columns. A
+two-column cursor cannot separate them, and the way it fails is by *hiding one* — the single failure
+a moderation queue must not have.
+
+`TestTheCursorIsTotalAcrossGrounds` builds exactly that job, pages one entry at a time, and requires
+both grounds back exactly once. A cursor issued before the widening decodes to a length error and is
+refused with `400`, which is the right failure: the old form named a proof, and a proof identifier
+means nothing to a union keyed by three kinds of row.
+
+#### The window grounds name their statuses rather than taking a complement
+
+`overdue_pickup` selects `Awarded`, `Driver assigned` and `En route to pickup`; `delayed_delivery`
+adds `Picked up` and `In transit`. **The complement — "not yet delivered" — is wrong in four separate
+ways.** A `Cancelled` job is not overdue for a pickup that will never happen; a `Disputed` one is
+already in front of somebody; and a `Draft`, `Open` or `Negotiating` job past its pickup window is
+SHIP-68's expiry sweep rather than a delivery exception, because it has no provider who undertook to
+collect it. Each set is written out, so a thirteenth status added to Docs/02 §1 is absent from both
+until somebody decides which it belongs in.
+
+One consequence is worth stating rather than discovering: **an entry on a window ground goes away
+when the job moves on**, and an entry on an evidence ground never does. A delivery recorded with a
+reason happened and cannot un-happen; a job that was late for its pickup and has since been collected
+is no longer late. The two asymmetries are the queue reporting the rows rather than a defect, and the
+contract says so.
+
+#### The 24-hour threshold is passed, not copied — and the test moves it
+
+`delivery.UnsyncedAlertThreshold` is Docs/02 §3.1's number and `internal/admin` may not import that
+package. **A constant in `admin` would have been a second authority that agrees by comment until
+somebody moves one**, which is Docs/10 §3.4's failure applied to a duration. So `cmd/api` reads the
+real constant and hands it to `NewModeration`, and `ExceptionsAwaitingReview` takes it as a
+parameter and binds it as `$1`.
+
+Wave 10 established that **a test which reads a constant does not test the query that interpolates
+it**, so `TestTheUnsyncedGroundUsesTheThresholdItWasGiven` builds the service three times at three
+thresholds over one row and requires the queue's *content* to change — which can only happen through
+the predicate. `make verify` closes the other half, which no unit test can: it writes a milestone
+**23 hours** behind and requires it absent, so a process wired with the wrong number fails there.
+
+A zero or negative threshold is refused at construction rather than clamped: every gap is at least
+zero, so it would put every milestone ever recorded on the unsynced ground — a queue of the whole
+table, which is the same failure as an empty one and harder to notice.
+
+#### The test double is a copy of a query, and a text guard holds it to the original
+
+`internal/admin` cannot reach the statement `cmd/api` runs, so `moderation_test.go` carries a copy —
+which is a thing that can drift, and drift here means every test in the file is about a query nothing
+serves. `TestTheTestDoubleRunsTheStatementCmdApiRuns` reads `cmd/api/routes_admin.go`, **resolves the
+Go concatenation by looking the constants up in the same file**, and compares the predicate, join and
+ordering lines. Resolving rather than restating is what makes it a guard instead of a third copy: a
+status added to `delayedDeliveryStatuses` changes what the test compares against.
+
+**It was mutation-tested rather than assumed.** Narrowing `delayedDeliveryStatuses` to
+`('Picked up', 'In transit')` in `cmd/api` failed the guard with both statements printed; the file was
+restored from a `/tmp` copy and confirmed with `shasum -a 256 -c`.
+
+#### Nothing was needed from `internal/config`
+
+
+### SHIP-158 — the queue whose *Done when* names a transition that does not exist
+
+"Cancellations after award are listed with the provider's history." The obvious implementation is a
+read of `job_status_history` where `to_status = 'Cancelled'` and `from_status` is at or past
+`Awarded`, and it was written that way first. **Every test failed with the same message:
+`cannot move from Awarded to Cancelled: that transition is not permitted`.**
+
+`Docs/02` §2 is deliberate about it. The routes into `Cancelled` are `Draft → Cancelled`, `Open /
+Negotiating → Cancelled` — the customer changing their mind, or SHIP-68's expiry sweep — and
+`Disputed → Cancelled`. There is no direct route from a committed job, because §6.2 settles what
+happens instead: **a provider cancellation between `Awarded` and `Picked up` returns the job to
+`Open`**, closes every bid on it, and "the cancellation is **recorded against the provider**… the
+reliability signal that Phase 2 reputation will be built from, and it cannot be reconstructed later
+if it is not captured now."
+
+**So the naive query is not merely incomplete, it is inverted**: it returns exactly the
+cancellations that are *not* post-award, and returns them looking plausible. A screen built on it
+would have shown a busy queue of ordinary customer cancellations and none of the provider
+withdrawals the ticket exists to surface.
+
+#### What the queue reads instead, and the two outcomes
+
+A fact about the job's **history** rather than about one transition, with `outcome` saying which
+shape an entry is:
+
+- **`returned_to_market`** — `Awarded / Driver assigned → Open`, §6.2's provider cancellation.
+- **`ended`** — a transition into `Cancelled` on a job that had earlier reached `Awarded`, which
+  under §2 can only arrive through `Disputed → Cancelled`.
+
+The earlier-award test is `(server_recorded_at, id) <` rather than a timestamp comparison, because
+one transaction can write two history rows at the same instant — `now()` is transaction start time,
+which `000401` records as the property that makes the history join up with `jobs.updated_at`.
+
+**A job may appear more than once**, which is why the cursor is keyed on the transition rather than
+the job: one returned to the market can be awarded and walked away from again, and both belong here.
+
+#### Neither shape has an endpoint yet, and that is not a reason to wait
+
+Nothing in the platform drives either transition today: provider cancellation has no ticket at all,
+and dispute resolution is SHIP-164. **The queue is a query over rows the guard already permits**, so
+it fills the moment either arrives and needs no change when it does — the same position
+`admin.ExceptionQueue` takes, and the reason neither has a flag column. What it must not do in the
+meantime is list pre-award cancellations so the screen looks populated, which is what the two
+negatives in both the Go suite and `make verify` are for.
+
+#### "With the provider's history" is a count and its denominator
+
+The clause a queue of job identifiers would not meet. One cancellation is an event; whether it is a
+pattern is the question, and answering it by opening each provider's account in turn is the work the
+screen exists to remove.
+
+So an entry carries **two** counts: post-award cancellations, and jobs carried to `Completed`.
+**Three cancellations against four hundred deliveries is a different provider from three against
+five**, and a single figure cannot say so. `TestTheEntryCarriesTheProvidersHistory` uses two
+providers precisely because a platform-wide count looks correct on the first one.
+
+#### A named gap rather than a guess: the provider on a returned-to-market entry
+
+`provider_id` comes from the accepted bid, which `uq_bids_one_accepted_per_job` makes single-valued.
+**Docs/02 §6.2 closes every bid when a provider cancels after award**, so once that path is built the
+join will find nothing on precisely the outcome that most needs a provider named, and the entry will
+report none.
+
+Closing it needs `bids` to record which offer *was* accepted after it stops being accepted — a column
+in `internal/bidding`'s migration block, which this branch does not own. It is in §4 rather than
+worked around here, and the counts have the same limit for the same reason.
+
+#### The verify harness had a latent ambiguity this ticket's fixture found
+
+`dispute_move` writes a history row and then re-selects it by `(job_id, to_status)` to hand the
+guard its identifier. **That predicate is ambiguous the moment a job reaches one status twice** —
+`Draft → Open` and then `Awarded → Open`, which is this ticket's own shape — and the guard would be
+handed whichever row the planner returned first. `dispute_move_because` takes the row through
+`RETURNING` instead. The original is left alone because no existing section moves a job to a repeated
+status, but it is a trap sitting in a shared fixture.
+
+#### Nothing was needed from `internal/config`
+
+
+### SHIP-166 — the control, and the mutation that showed which layer is holding it up
+
+Docs/04 §9's second required internal control: "two-person review for permanent account suspension
+where practical". The hedge is for a platform with one administrator; this one has three roles, two
+of which hold `users.restrict`, and SHIP-147 built the sign-in that tells two people apart. So it is
+practical, and what was missing was somewhere to record a request and a rule that the approver is not
+the requester.
+
+`000803_suspension_reviews`, three routes, and **`suspended` leaves
+`POST /v1/admin/users/{id}/standing`**. One administrator may still restrict and reinstate.
+Reinstatement is deliberately *not* paired: a control that made undoing a mistake as slow as making
+one would leave somebody locked out while two people found each other, and an account wrongly
+*restored* is not the failure §9 is about.
+
+#### The suspension is applied by the approval, not by the request
+
+The account keeps its standing until the second administrator agrees. **A request that suspended
+immediately and collected a signature afterwards would be a control that does nothing** — the person
+is already locked out by the time anybody reviews it, and the second signature is paperwork. So the
+account's standing is asserted after the *request* as well as after the approval, in the Go suite and
+again in `make verify`.
+
+The approval writes the review, the standing and the audit entry in one transaction. A review marked
+approved beside an account still active reads, to the next person, as a suspension that was agreed
+and then quietly reversed.
+
+#### The mutation: removing the Go check **survived**, and that is the finding
+
+The dispatch's mutation was to let the second approver be the same administrator as the first. It was
+applied in three stages, and the verdict is worth reading in order because only the third is a
+failure of the control.
+
+| Mutation | Verdict |
+|---|---|
+| The `if review.RequestedBy == cmd.ActorID` check in `Suspensions.Approve`, removed | **Survived.** `make test` exited 0 — no test failed |
+| That, **plus** `AND requested_by <> $2` removed from the UPDATE | Caught. `TestOneAdministratorCannotCompleteATwoPersonReview` failed with **500 rather than 409** |
+| That, **plus** `ck_suspension_reviews_two_people` dropped from `000803` | Caught by three: the same test with **200 and the account suspended**, `TestTheDatabaseRefusesAReviewApprovedByItsRequester`, and `migrations.TestTheApproverMayNotBeTheRequester` |
+
+**The survivor is the useful result.** The Go `if` is not what enforces Docs/04 §9 — the UPDATE's own
+`requested_by <> $2` predicate is, because it makes the statement affect no rows and the caller maps
+that to the same `ErrSameAdministrator`. The `if` exists to make the refusal readable at the point a
+person looks for it, and removing it changes nothing a client can observe.
+
+That is exactly the wave-10 lesson in the other direction: **the guard lives in SQL, and the tests
+exercise the SQL**, so a mutation of the Go layer is invisible to them and *should* be. Had the tests
+been written against the `if` — asserting on the error value from a fake store — the first row would
+have been a failure and the control would have been proved in the one layer that is not enforcing it.
+
+Row two is the shape most worth noticing: with both application layers gone the constraint still
+refuses, but the answer degrades from a **409 a console can act on** to a **500**. The account stays
+active, so the control holds; what is lost is the message. That is the honest description of what the
+two application-level checks buy — not enforcement, but a refusal somebody can read.
+
+Restored from `/tmp/snap-a-ship166` and confirmed with `git diff` (empty) **and**
+`shasum -a 256 -c SHASUMS` (three files, all OK).
+
+#### What the route manifest caught that no domain test could
+
+The three handlers were written, wired into `HandlerServices`, covered by nine tests in
+`internal/admin` — and **not registered**. `TestEveryRouteIsInTheContract` found it: a handler that
+compiles and is absent from the route table serves a 404 to the console while every test in the
+domain passes. It is the failure `routes_golden.txt` exists for, arriving from the opposite direction
+to the one it usually does.
+
+`TestEveryMutatingAdminRouteIsAudited` then refused both new mutating routes until each named the
+audit action it writes. Both tripwires fired on this ticket, which is the first time both have fired
+on one.
+
+#### Two administrators in the trail, and no `rejected` status
+
+The request writes `user.suspension_requested` and the approval writes `user.suspension_approved`,
+with `requested_by` in its metadata. **A two-person control whose trail names one participant has not
+recorded what happened**, and the request is the moment the case was made — so an entry for something
+that has not happened yet is correct here, unusually.
+
+There is deliberately no `rejected`. A second administrator who disagrees says so to the first, and
+the request is withdrawn by whoever made it; recording a rejection would make this a workflow with
+two outcomes to route, and would put a disagreement between colleagues into the one table that
+records what was *done*, when nothing was. `withdrawn` exists in the CHECK and has no endpoint —
+named as a later ticket's, so that a pending review is not something only an approval can clear.
+
+#### Nothing was needed from `internal/config`
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
 |---|---|---|
 | ~~**SHIP-149**~~ | ~~`audit_log` table, append-only triggers, tests~~ | **Closed.** SHIP-150 built the write helper — see §3. On `7d7caf0` the only `INSERT INTO audit_log` in the repository was four statements in `migrations/schema_test.go`, and no Go code wrote an entry; `internal/admin/audit.go` and `postgres_audit.go` now do, and `migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing that could not be written while there was no Go vocabulary to pair |
+| **SHIP-158** | `GET /v1/admin/moderation/cancellations`, both outcomes, with the provider's cancellation and completion counts | **The provider on a `returned_to_market` entry, once that path is built.** `Docs/02` §6.2 closes every bid when a provider cancels after award, so no `Accepted` bid survives and the join that names the provider finds nothing — on precisely the outcome that most needs one. `bids` has no column recording which offer *was* accepted; adding one is a migration in `internal/bidding`'s block. Not yet reachable — neither transition has an endpoint — so nothing is wrong today and it will be the day one arrives |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | ~~**SHIP-118**~~ | ~~`Delivered` recordable and refused without evidence~~ | **Closed by SHIP-123 — see §3.** `000607` adds `recipient_name` and `delivery_note`, required on `Delivered` and refused on every other milestone, in the domain and in `ck_milestones_delivery_details`. `Docs/01` §4.4's field set is closed end to end |
-| **SHIP-151** | `GET /v1/admin/users` — search by **email**, **phone** and **status**, cursor paged, with the phone term normalised to the stored E.164 form | The **name**. Its *Done when* is "search users by email, phone, name, and status" and **no column anywhere in the schema holds a user's name** — `000002_users` never had one and registration never asks. The only `name` columns are `admin_users.name` and `driver_assignments.driver_name`, and neither is a user's. See below |
+| ~~**SHIP-151**~~ | ~~`GET /v1/admin/users` — search by **email**, **phone** and **status**~~ | **Closed by SHIP-30a — see §3.** `000006` adds `users.name`, registration requires it, and the search matches it, so all four of the *Done when*'s terms answer on the wire. An account created before the migration has no name and is found by its address; a name cannot be backfilled, which is why the closing ticket sits in M1 |
 | **SHIP-102** | The comparison screen over `GET /v1/jobs/{id}/bids/received`: **price**, **timing** and **vehicle** served in full, laid out side by side, with a geometry assertion holding the layout | The **provider profile**. Its *Done when* is "customer compares price, timing, provider profile, and vehicle side by side", and the profile clause shipped in **deliberately reduced form** — two facts, `verified` and `member_since` (`internal/bidding/http.go:1347`). There is no trading name, rating or completed-job count anywhere in the schema: `internal/profiles` holds `doc.go` alone, and `fleet.Profile`'s only two fields are the Areas and Specialties SHIP-102a's *Done when* forbids showing a customer. **Owner: SHIP-79a.** See below |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 

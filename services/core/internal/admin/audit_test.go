@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -312,7 +313,10 @@ func adminMutations() []adminMutation {
 
 				req := httptest.NewRequest(http.MethodPost,
 					"/v1/admin/users/"+userID.String()+"/standing",
-					strings.NewReader(`{"standing":"suspended","reason":"Repeated no-shows across three jobs."}`))
+					// `restricted` rather than `suspended`: SHIP-166 took permanent
+					// suspension off this endpoint, and the two-person route is exercised
+					// by the two rows below.
+					strings.NewReader(`{"standing":"restricted","reason":"Repeated no-shows across three jobs."}`))
 				req.SetPathValue("id", userID.String())
 				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
 				req.Header.Set("Content-Type", "application/json")
@@ -353,6 +357,88 @@ func adminMutations() []adminMutation {
 					t.Fatalf("adding a note: status = %d, want 201 (%s)", rec.Code, rec.Body)
 				}
 				return moderator.ID, userID
+			},
+		},
+		{
+			name:       "requesting a permanent suspension",
+			action:     AuditActionUserSuspensionRequested,
+			targetType: AuditTargetUser,
+			run: func(t *testing.T, f auditFixture, ready func()) (uuid.UUID, uuid.UUID) {
+				t.Helper()
+
+				moderator, token := f.signedIn(t, "susp-req@example.com", RoleModerator, "10.0.56.1")
+				userID := newAccount(t, f.pool, "susp-subject@example.com", "+61400560", "provider")
+				ready()
+
+				req := httptest.NewRequest(http.MethodPost,
+					"/v1/admin/users/"+userID.String()+"/suspension",
+					strings.NewReader(`{"reason":"Three unresolved safety reports in a fortnight."}`))
+				req.SetPathValue("id", userID.String())
+				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+				req.Header.Set("Content-Type", "application/json")
+
+				rec := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.RequestSuspension()).ServeHTTP(rec, req)
+				if rec.Code != http.StatusAccepted {
+					t.Fatalf("requesting a suspension: status = %d, want 202 (%s)",
+						rec.Code, rec.Body)
+				}
+
+				// The entry names the **account**, not the review — the same position
+				// AuditActionNoteAdded takes, so "everything that happened to this account"
+				// includes the moment somebody proposed taking it away.
+				return moderator.ID, userID
+			},
+		},
+		{
+			name:       "approving a permanent suspension",
+			action:     AuditActionUserSuspensionApproved,
+			targetType: AuditTargetUser,
+			run: func(t *testing.T, f auditFixture, ready func()) (uuid.UUID, uuid.UUID) {
+				t.Helper()
+
+				// **Two administrators, because one cannot do this** — which is the ticket.
+				// The requester's entry is written before `ready()`, so the snapshot measures
+				// the approval alone.
+				_, requesterToken := f.signedIn(t, "susp-a@example.com", RoleModerator, "10.0.57.1")
+				approver, approverToken := f.signedIn(t, "susp-b@example.com", RoleModerator, "10.0.57.2")
+
+				userID := newAccount(t, f.pool, "susp-approved@example.com", "+61400570", "provider")
+
+				request := httptest.NewRequest(http.MethodPost,
+					"/v1/admin/users/"+userID.String()+"/suspension",
+					strings.NewReader(`{"reason":"Three unresolved safety reports in a fortnight."}`))
+				request.SetPathValue("id", userID.String())
+				request.Header.Set(httpx.HeaderAuthorization, "Bearer "+requesterToken)
+				request.Header.Set("Content-Type", "application/json")
+
+				requested := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.RequestSuspension()).ServeHTTP(requested, request)
+				if requested.Code != http.StatusAccepted {
+					t.Fatalf("requesting a suspension: status = %d, want 202 (%s)",
+						requested.Code, requested.Body)
+				}
+
+				var review struct {
+					ID string `json:"id"`
+				}
+				if err := json.Unmarshal(requested.Body.Bytes(), &review); err != nil {
+					t.Fatalf("decoding the review: %v (%s)", err, requested.Body)
+				}
+				ready()
+
+				req := httptest.NewRequest(http.MethodPost,
+					"/v1/admin/suspensions/"+review.ID+"/approval", nil)
+				req.SetPathValue("id", review.ID)
+				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+approverToken)
+
+				rec := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.ApproveSuspension()).ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("approving a suspension: status = %d, want 200 (%s)",
+						rec.Code, rec.Body)
+				}
+				return approver.ID, userID
 			},
 		},
 	}
@@ -474,6 +560,8 @@ func TestEveryAuditActionConstantIsInTheCatalogue(t *testing.T) {
 		AuditActionJobUnpublished,
 		AuditActionUserStandingChanged,
 		AuditActionNoteAdded,
+		AuditActionUserSuspensionRequested,
+		AuditActionUserSuspensionApproved,
 	}
 
 	if len(declared) != len(AuditActions) {

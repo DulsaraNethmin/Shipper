@@ -67,21 +67,21 @@ ok "DELETE is refused, so the trail survives a psql prompt"
 # which is a confusing way to be told that two files disagree about a number.
 
 status="$(post_json "verify-adm-cust-$$" /v1/auth/register \
-  "{\"email\":\"dispute-customer-$$@example.com\",\"phone\":\"04190$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"dispute-customer-$$@example.com\",\"phone\":\"04190$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/dispute-customer.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/dispute-customer.json"; fail "could not register the dispute customer: $status"; }
 dispute_customer_id="$(json "$WORKDIR/dispute-customer.json" '["id"]')"
 dispute_customer_token="$(mint_token "$dispute_customer_id")"
 
 status="$(post_json "verify-adm-prov-$$" /v1/auth/register \
-  "{\"email\":\"dispute-provider-$$@example.com\",\"phone\":\"04191$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"dispute-provider-$$@example.com\",\"phone\":\"04191$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/dispute-provider.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/dispute-provider.json"; fail "could not register the dispute provider: $status"; }
 dispute_provider_id="$(json "$WORKDIR/dispute-provider.json" '["id"]')"
 dispute_provider_token="$(mint_token "$dispute_provider_id")"
 
 status="$(post_json "verify-adm-other-$$" /v1/auth/register \
-  "{\"email\":\"dispute-other-$$@example.com\",\"phone\":\"04192$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"dispute-other-$$@example.com\",\"phone\":\"04192$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/dispute-other.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/dispute-other.json"; fail "could not register the second provider: $status"; }
 dispute_other_id="$(json "$WORKDIR/dispute-other.json" '["id"]')"
@@ -120,6 +120,34 @@ COMMIT;
 SQL
 }
 
+# dispute_move_because <job> <from> <to> <actor-kind> <reason> — a guarded transition that records
+# a reason and names which kind of actor made it (SHIP-158).
+#
+# **It takes the row it wrote through RETURNING rather than re-querying on (job_id, to_status)**,
+# which dispute_move above does and which is ambiguous the moment a job reaches one status twice —
+# Draft to Open, then Awarded back to Open, which is exactly the shape this ticket is about. The
+# guard would be handed whichever row the planner returned first.
+dispute_move_because() {
+  local actor_id="$dispute_customer_id"
+  [[ "$4" == "provider" ]] && actor_id="$dispute_provider_id"
+
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -v job="$1" -v from_status="$2" -v to_status="$3" -v actor_type="$4" -v reason="$5" \
+    -v actor="$actor_id" >/dev/null <<'SQL'
+BEGIN;
+WITH written AS (
+    INSERT INTO job_status_history
+        (id, job_id, from_status, to_status, actor_type, actor_id, reason, actor_recorded_at)
+    VALUES (gen_random_uuid(), :'job', :'from_status', :'to_status', :'actor_type', :'actor',
+            :'reason', now())
+    RETURNING id
+)
+SELECT set_config('shipper.job_status_transition', (SELECT id::text FROM written), true);
+UPDATE jobs SET status = :'to_status' WHERE id = :'job';
+COMMIT;
+SQL
+}
+
 # dispute_award <job-id> <provider-id> — the accepted bid SHIP-92 will write.
 dispute_award() {
   "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -v job="$1" -v provider="$2" >/dev/null <<'SQL'
@@ -140,6 +168,37 @@ dispute_delivered_job() {
   dispute_move "$job" 'En route to pickup' 'Picked up'
   dispute_move "$job" 'Picked up' 'In transit'
   dispute_move "$job" 'In transit' Delivered
+  printf '%s' "$job"
+}
+
+# dispute_awarded_job <label> — a job committed to a provider and no further (SHIP-157).
+#
+# The first status at which a job can be *overdue for its pickup*: before award nobody has undertaken
+# to collect it, and an Open job past its pickup window is SHIP-68's expiry sweep rather than a
+# delivery exception.
+dispute_awarded_job() {
+  local job
+  job="$(dispute_draft "$1")"
+  dispute_move "$job" Draft Open
+  dispute_move "$job" Open Awarded
+  dispute_award "$job" "$dispute_provider_id"
+  printf '%s' "$job"
+}
+
+# dispute_transit_job <label> — a job collected and moving, not yet delivered (SHIP-157).
+#
+# The status a *delayed delivery* is measured at: the goods are with the provider and have not
+# arrived. Built to this status rather than moved back from Delivered, because Docs/02 §2 offers no
+# transition backwards and the guard would refuse one.
+dispute_transit_job() {
+  local job
+  job="$(dispute_draft "$1")"
+  dispute_move "$job" Draft Open
+  dispute_move "$job" Open Awarded
+  dispute_award "$job" "$dispute_provider_id"
+  dispute_move "$job" Awarded 'En route to pickup'
+  dispute_move "$job" 'En route to pickup' 'Picked up'
+  dispute_move "$job" 'Picked up' 'In transit'
   printf '%s' "$job"
 }
 
@@ -409,6 +468,19 @@ admin_id="$("$PSQL" "$DATABASE_URL" -qtAc \
 admin_signin() {
   post_json "$1" /v1/admin/sessions \
     "{\"email\":\"$2\",\"password\":\"$3\"}" "$WORKDIR/admin-$4.json"
+}
+
+# admin_post <path> <credential> <key> <body> <name> — one authenticated state-changing request
+# (SHIP-166).
+#
+# A general helper rather than a fourth endpoint-specific one like `unpublish` below: the two
+# suspension routes and every administrative POST after them take the same four things, and one more
+# near-identical function per route is how a harness ends up with six that differ by a path.
+admin_post() {
+  curl -s -X POST -o "$WORKDIR/admin-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $2" -H "Idempotency-Key: $3" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT$1"
 }
 
 # admin_get <path> <credential> <name> — one authenticated read, answering with its status.
@@ -786,8 +858,8 @@ for _ in $(seq 1 40); do
 import json, sys
 page = json.load(open(sys.argv[1]))
 items = page.get("data") or []
-found = next((i for i in items if i["proof_id"] == sys.argv[2]), None)
-photo = any(i["proof_id"] == sys.argv[3] for i in items)
+found = next((i for i in items if i["entry_id"] == sys.argv[2]), None)
+photo = any(i["entry_id"] == sys.argv[3] for i in items)
 print(json.dumps(found) if found else "")
 print("photo" if photo else "")
 print(page.get("next_cursor") or "")
@@ -811,6 +883,8 @@ printf '%s' "$queue_found" >"$WORKDIR/queue-entry.json"
   || { cat "$WORKDIR/queue-entry.json"; fail "the entry does not say which claim the exception stands behind"; }
 [[ -n "$(json "$WORKDIR/queue-entry.json" '["note"]')" ]] \
   || { cat "$WORKDIR/queue-entry.json"; fail "the driver's own words are not carried"; }
+[[ "$(json "$WORKDIR/queue-entry.json" '["ground"]')" == "failed_proof" ]] \
+  || { cat "$WORKDIR/queue-entry.json"; fail "the entry does not say which ground it is here on"; }
 ok "a delivery evidenced by a reason rather than a photograph is in the moderation queue — SHIP-117's Done when, on the wire"
 
 [[ -z "$queue_photo_seen" ]] \
@@ -830,6 +904,515 @@ ok "the entry carries no budget and no object key — there is no photograph to 
 status="$(admin_get /v1/admin/moderation/exceptions "" queue-nocred)"
 [[ "$status" == "401" ]] || { cat "$WORKDIR/admin-queue-nocred.json"; fail "the queue is readable without a credential ($status)"; }
 ok "and the queue is behind the administrator credential like every other administrative route"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-157 — the other three grounds, and the queue as one screen.
+#
+# # What only this section can show
+#
+# The queue is a `UNION ALL` of four selects that live in **cmd/api**, because they span `jobs`,
+# `proofs` and `milestones` — tables belonging to two domains `internal/admin` may not import. The Go
+# suite in that package drives the handler against a copy of the statement, and a text guard holds
+# the copy to the original; that establishes that the two agree and nothing about the one the binary
+# runs. **The served statement is demonstrated here or nowhere**, exactly as SHIP-117's third of it
+# was.
+#
+# It also shows the one thing no unit test can: that the threshold the running process passes is
+# `delivery.UnsyncedAlertThreshold` rather than a number `internal/admin` invented. The domain's
+# tests pass whatever threshold they like — that is what makes them a test of the predicate — and
+# only the wired binary reads the real constant.
+#
+# # Every assertion is fenced on this run's own rows
+#
+# `jobs`, `proofs` and `milestones` are shared with every other section, every previous run and every
+# other worktree, so a count would be a statement about the machine. Each fixture is found by the id
+# this section created, and each negative is asserted on a row it also created.
+
+ticket "SHIP-157  overdue pickup, delayed delivery, failed proof and unsynced milestones are one queue"
+
+admin_clear_limits
+
+# queue_find <ground-filter> <entry-id> — the ground the entry is on, or "" when it is not there.
+#
+# Pages to the end rather than reading the first page: the queue holds every exception this database
+# has ever seen, and a fixture written now sorts by its own recorded_at rather than to the front.
+queue_find() {
+  local filter="$1" wanted="$2" cursor="" path found=""
+
+  for _ in $(seq 1 60); do
+    path="/v1/admin/moderation/exceptions?limit=100"
+    [[ -n "$filter" ]] && path="$path&ground=$filter"
+    [[ -n "$cursor" ]] && path="$path&cursor=$cursor"
+
+    status="$(admin_get "$path" "$queue_token" queue-find)"
+    [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-queue-find.json"; fail "reading the queue returned $status"; }
+
+    python3 - "$WORKDIR/admin-queue-find.json" "$wanted" "$filter" >"$WORKDIR/queue-find.txt" <<'SCAN'
+import json, sys
+page = json.load(open(sys.argv[1]))
+items = page.get("data") or []
+match = next((i for i in items if i["entry_id"] == sys.argv[2]), None)
+# A filtered page carrying an entry on another ground is a filter that is not filtering.
+stray = [i["ground"] for i in items if sys.argv[3] and i["ground"] != sys.argv[3]]
+print(match["ground"] if match else "")
+print(",".join(sorted(set(stray))))
+print(page.get("next_cursor") or "")
+SCAN
+
+    [[ -z "$(sed -n '2p' "$WORKDIR/queue-find.txt")" ]] \
+      || fail "a page filtered to '$filter' carries entries on $(sed -n '2p' "$WORKDIR/queue-find.txt")"
+
+    found="$(sed -n '1p' "$WORKDIR/queue-find.txt")"
+    [[ -n "$found" ]] && { printf '%s' "$found"; return; }
+
+    cursor="$(sed -n '3p' "$WORKDIR/queue-find.txt")"
+    [[ -n "$cursor" ]] || break
+  done
+  printf ''
+}
+
+# --- grounds one and two: the window grounds ----------------------------------------------------
+#
+# The windows are written with SQL because no endpoint sets one after award, and each job is left at
+# the status its ground needs — which is what tells the two apart rather than firing both on one job.
+
+overdue_job="$(dispute_awarded_job overdue)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_window_end = now() - interval '2 days',
+                   dropoff_window_end = now() + interval '2 days'
+     where id = '$overdue_job';" >/dev/null \
+  || fail "the overdue job's windows could not be set"
+
+ontime_job="$(dispute_awarded_job ontime)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_window_end = now() + interval '2 days',
+                   dropoff_window_end = now() + interval '3 days'
+     where id = '$ontime_job';" >/dev/null \
+  || fail "the on-time job's windows could not be set"
+
+[[ "$(queue_find "" "$overdue_job")" == "overdue_pickup" ]] \
+  || fail "a job past its pickup window with no collection is not in the queue on overdue_pickup"
+ok "a job past its pickup window that has not been collected is in the queue — Docs/04 §5's first ground"
+
+[[ -z "$(queue_find "" "$ontime_job")" ]] \
+  || fail "a job whose windows have not closed is in the queue, so the predicate is missing"
+ok "and one whose windows have not closed is not — every predicate here passes trivially when it is absent"
+
+# Picked up and still moving: it cannot be overdue for its pickup and it can be late for its
+# delivery, which is the pair of facts that separates the two window grounds.
+transit_job="$(dispute_transit_job delayed)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_window_end = now() - interval '3 days',
+                   dropoff_window_end = now() - interval '2 days'
+     where id = '$transit_job';" >/dev/null \
+  || fail "the in-transit job's windows could not be set"
+
+[[ "$(queue_find "" "$transit_job")" == "delayed_delivery" ]] \
+  || fail "a job past its drop-off window still in transit is not in the queue on delayed_delivery"
+ok "a job past its drop-off window that has not been delivered is in the queue — Docs/04 §5's second ground"
+
+# A delivered job past its drop-off window arrived. It is late history rather than a delivery going
+# wrong, and a queue that carried it would fill with every completed job the platform has ever run.
+arrived_job="$(dispute_delivered_job arrived)"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update jobs set pickup_window_end = now() - interval '3 days',
+                   dropoff_window_end = now() - interval '2 days'
+     where id = '$arrived_job';" >/dev/null \
+  || fail "the arrived job's windows could not be set"
+
+[[ -z "$(queue_find delayed_delivery "$arrived_job")" ]] \
+  || fail "a delivered job past its drop-off window is on the delayed_delivery ground; it arrived"
+ok "and a job that was delivered is not, whatever its window says — the queue is deliveries going wrong, not late history"
+
+# --- ground four: the unsynced milestone, and the threshold the process actually holds -----------
+#
+# server_recorded_at cannot be supplied — 000601's trigger refuses an INSERT that names it — so the
+# gap is made by backdating actor_recorded_at, which is how a real one arises: the handset recorded
+# it then and the platform saw it now.
+
+unsynced_job="$(dispute_transit_job unsynced)"
+
+unsynced_milestone() {
+  "$PSQL" "$DATABASE_URL" -qtAc \
+    "insert into milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
+     values (gen_random_uuid(), '$1', 'In transit', 'driver', gen_random_uuid(),
+             now() - interval '$2')
+     returning id;"
+}
+
+late_milestone="$(unsynced_milestone "$unsynced_job" '25 hours' | tr -d '[:space:]')"
+[[ -n "$late_milestone" ]] || fail "the late milestone fixture was not written"
+
+prompt_milestone="$(unsynced_milestone "$unsynced_job" '1 minute' | tr -d '[:space:]')"
+[[ -n "$prompt_milestone" ]] || fail "the prompt milestone fixture was not written"
+
+# 23 hours is the case that pins the threshold to twenty-four rather than to "some hours". A process
+# wired with an hour, or with a number internal/admin invented, puts this on the queue.
+near_milestone="$(unsynced_milestone "$unsynced_job" '23 hours' | tr -d '[:space:]')"
+[[ -n "$near_milestone" ]] || fail "the near-threshold milestone fixture was not written"
+
+[[ "$(queue_find "" "$late_milestone")" == "unsynced_milestone" ]] \
+  || fail "an update that reached the platform 25 hours after it was recorded is not in the queue"
+ok "an update that reached the platform more than a day after it was recorded is in the queue — SHIP-128's fact, surfaced"
+
+[[ -z "$(queue_find "" "$prompt_milestone")" ]] \
+  || fail "an update that arrived a minute after it was recorded is in the unsynced queue"
+[[ -z "$(queue_find "" "$near_milestone")" ]] \
+  || fail "an update 23 hours behind is in the queue, so the threshold the process holds is not Docs/02 §3.1's 24 hours"
+ok "and one 23 hours behind is not — the running process holds delivery.UnsyncedAlertThreshold rather than a number admin invented"
+
+# --- the filter, in both directions -------------------------------------------------------------
+
+[[ "$(queue_find overdue_pickup "$overdue_job")" == "overdue_pickup" ]] \
+  || fail "filtering to overdue_pickup excluded the overdue job"
+[[ -z "$(queue_find overdue_pickup "$late_milestone")" ]] \
+  || fail "filtering to overdue_pickup returned an unsynced milestone"
+ok "the ground filter narrows the one queue and returns nothing from the other three"
+
+status="$(admin_get "/v1/admin/moderation/exceptions?ground=overdue_pickups" "$queue_token" queue-bad-ground)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/admin-queue-bad-ground.json"; fail "a mistyped ground returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-queue-bad-ground.json")" == *'"ground"'* ]] \
+  || { cat "$WORKDIR/admin-queue-bad-ground.json"; fail "the refusal does not name the field"; }
+ok "a ground the platform does not have is refused and names the field, rather than answering with every entry"
+
+# A cursor issued before the widening is two fields where three are needed. It is refused rather
+# than paged wrongly — a client holding one has a bug, and answering it would page for ever through
+# a queue it never saw.
+old_cursor="$(printf '%s|%s' '2026-08-14T02:15:30.000Z' "$queue_proof_id" | openssl base64 -A | tr '+/' '-_' | tr -d '=')"
+status="$(admin_get "/v1/admin/moderation/exceptions?cursor=$old_cursor" "$queue_token" queue-old-cursor)"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/admin-queue-old-cursor.json"; fail "a two-field cursor returned $status, want 400"; }
+ok "and a cursor from before the queue was widened is refused rather than paging wrongly"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-158 — the post-award cancellation queue.
+#
+# # What only this section can show
+#
+# The statement is a four-CTE read living in **cmd/api**, over `job_status_history`, `bids` and
+# `jobs` — three tables belonging to two domains `internal/admin` may not import. The Go suite in
+# that package drives the handler against a copy held to the original by a text guard, which
+# establishes that the two agree and nothing about the one the binary runs.
+#
+# # The finding this ticket turned on, demonstrated rather than asserted
+#
+# **Docs/02 §2 has no `Awarded → Cancelled` transition.** So a queue keyed on a job reaching
+# `Cancelled` would list the pre-award cancellations and none of the post-award ones — the exact
+# inverse of the ticket. The negatives below are what say this queue is not that one: a job cancelled
+# from `Open` and a draft the customer abandoned are both refused, and both are what the wrong
+# implementation returns.
+#
+# # Every assertion is fenced on this run's own rows
+#
+# `job_status_history` is shared with every other section, every previous run and every other
+# worktree, so a count would be a statement about the machine. Each job is found by the id this
+# section created.
+
+ticket "SHIP-158  cancellations after award are listed with the provider's history"
+
+admin_clear_limits
+
+# cancel_find <job-id> — the outcome the job is on the queue with, or "" when it is not there.
+cancel_find() {
+  local wanted="$1" cursor="" path found=""
+
+  for _ in $(seq 1 60); do
+    path="/v1/admin/moderation/cancellations?limit=100"
+    [[ -n "$cursor" ]] && path="$path&cursor=$cursor"
+
+    status="$(admin_get "$path" "$queue_token" cancel-find)"
+    [[ "$status" == "200" ]] || { cat "$WORKDIR/admin-cancel-find.json"; fail "reading the cancellation queue returned $status"; }
+
+    python3 - "$WORKDIR/admin-cancel-find.json" "$wanted" >"$WORKDIR/cancel-find.txt" <<'SCAN'
+import json, sys
+page = json.load(open(sys.argv[1]))
+items = page.get("data") or []
+match = next((i for i in items if i["job_id"] == sys.argv[2]), None)
+print(match["outcome"] if match else "")
+print(json.dumps(match) if match else "")
+print(page.get("next_cursor") or "")
+SCAN
+
+    found="$(sed -n '1p' "$WORKDIR/cancel-find.txt")"
+    if [[ -n "$found" ]]; then
+      sed -n '2p' "$WORKDIR/cancel-find.txt" >"$WORKDIR/cancel-entry.json"
+      printf '%s' "$found"
+      return
+    fi
+
+    cursor="$(sed -n '3p' "$WORKDIR/cancel-find.txt")"
+    [[ -n "$cursor" ]] || break
+  done
+  printf ''
+}
+
+# --- the two shapes Docs/02 permits -------------------------------------------------------------
+#
+# Both are driven through dispute_move, which is the guarded transition function — 000402 refuses a
+# status written any other way, so a fixture that wrote one would be testing a queue over rows the
+# platform cannot produce. Neither shape has an endpoint yet: provider cancellation has no ticket and
+# dispute resolution is SHIP-164, which is exactly why the queue is a query over rows the guard
+# already permits rather than a table something has to remember to write to.
+
+walked_job="$(dispute_awarded_job walked)"
+dispute_move_because "$walked_job" Awarded Open provider \
+  'The provider could not source a vehicle with a tailgate lifter.'
+
+ended_job="$(dispute_awarded_job ended)"
+dispute_move "$ended_job" Awarded Disputed
+dispute_move_because "$ended_job" Disputed Cancelled admin \
+  'Resolved as a failed delivery; the goods never left the depot.'
+
+[[ "$(cancel_find "$walked_job")" == "returned_to_market" ]] \
+  || fail "a provider cancellation after award is not in the queue on returned_to_market"
+[[ "$(json "$WORKDIR/cancel-entry.json" '["from_status"]')" == "Awarded" ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "the entry does not say which status the job left"; }
+[[ "$(json "$WORKDIR/cancel-entry.json" '["provider_id"]')" == "$dispute_provider_id" ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "the entry names the wrong provider"; }
+[[ -n "$(json "$WORKDIR/cancel-entry.json" '["reason"]')" ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "the recorded reason is not carried"; }
+ok "a provider cancellation after award is in the queue — Docs/02 §6.2's signal, which cannot be reconstructed later"
+
+[[ "$(cancel_find "$ended_job")" == "ended" ]] \
+  || fail "a job cancelled through a dispute after award is not in the queue on ended"
+[[ "$(json "$WORKDIR/cancel-entry.json" '["from_status"]')" == "Disputed" ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "the ended entry does not report the status it left"; }
+ok "and so is one ended through a dispute — Docs/02 §2's only route to Cancelled after award"
+
+# --- the negatives, which are what the wrong implementation returns ------------------------------
+
+open_cancelled="$(dispute_draft opencancel)"
+dispute_move "$open_cancelled" Draft Open
+dispute_move "$open_cancelled" Open Cancelled
+
+abandoned_draft="$(dispute_draft abandoned)"
+dispute_move "$abandoned_draft" Draft Cancelled
+
+[[ -z "$(cancel_find "$open_cancelled")" ]] \
+  || fail "a job cancelled from Open is in the post-award queue, so it is a list of every cancelled job"
+[[ -z "$(cancel_find "$abandoned_draft")" ]] \
+  || fail "an abandoned draft is in the post-award queue"
+ok "and a job cancelled from Open and an abandoned draft are not — there is no Awarded to Cancelled transition, so those are what a naive query returns"
+
+# --- the provider's history, which is the clause a queue of job ids would not meet ----------------
+#
+# Two cancellations against one completion for this run's provider. The figures are read off the
+# entry rather than counted here: what is being shown is that the endpoint computes them, and a
+# count taken from the database would be this section agreeing with itself.
+
+completed_job="$(dispute_delivered_job completedone)"
+dispute_move "$completed_job" Delivered Completed
+
+cancel_find "$walked_job" >/dev/null
+cancellations="$(json "$WORKDIR/cancel-entry.json" '["provider_cancellations"]')"
+completions="$(json "$WORKDIR/cancel-entry.json" '["provider_completions"]')"
+
+[[ "$cancellations" -ge 2 ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "provider_cancellations is $cancellations, and this run made two"; }
+[[ "$completions" -ge 1 ]] \
+  || { cat "$WORKDIR/cancel-entry.json"; fail "provider_completions is $completions, and this run completed one"; }
+ok "the entry carries the provider's history — the count and its denominator, because three cancellations against four hundred deliveries is not three against five"
+
+status="$(admin_get /v1/admin/moderation/cancellations "" cancel-nocred)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/admin-cancel-nocred.json"; fail "the cancellation queue is readable without a credential ($status)"; }
+ok "and the queue is behind the administrator credential like every other administrative route"
+
+# Nothing commercial. A queue entry says who walked away and how often; a price is the job console's
+# disclosure decision and a customer's budget is nobody's.
+cancel_find "$walked_job" >/dev/null
+for forbidden in budget amount price bid_amount; do
+  [[ "$(cat "$WORKDIR/cancel-entry.json")" != *"\"$forbidden\""* ]] \
+    || { cat "$WORKDIR/cancel-entry.json"; fail "the cancellation entry carries a $forbidden field"; }
+done
+ok "the entry carries no budget and no bid amount — a shape that never carried one cannot leak one"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-166 — two-person review for permanent suspension.
+#
+# # What only this section can show
+#
+# The Go suite drives both endpoints against a real database and is the stronger of the two: it
+# asserts the account is untouched by a request, that the requester's own approval is refused, and
+# that the review stays pending afterwards. **What it cannot show is that the routes are wired at
+# all** — a handler built and never registered compiles, passes every test in `internal/admin`, and
+# serves a 404 to the console. It also cannot show that `POST /v1/admin/users/{id}/standing` refuses
+# `suspended` on the built binary, which is the half a console meets first.
+#
+# # Every assertion is fenced on this run's own rows
+#
+# `suspension_reviews` is shared with every previous run and every other worktree. Each review is
+# found by the id this section created.
+
+ticket "SHIP-166  a permanent suspension requires a second administrator's approval"
+
+admin_clear_limits
+
+# Two moderators, because one cannot do this — which is the ticket. Both hold users.restrict; the
+# control is that there are two people, not that either holds something the other does not.
+requester_email="verify-susp-a-$$@example.com"
+approver_email="verify-susp-b-$$@example.com"
+for email in "$requester_email" "$approver_email"; do
+  "$PSQL" "$DATABASE_URL" -q -c \
+    "insert into admin_users (id, email, name, password_hash, role)
+     values (gen_random_uuid(), '$email', 'Verify Reviewer', '$admin_fixture_hash', 'moderator');" >/dev/null \
+    || fail "the reviewing administrator $email could not be created"
+done
+
+status="$(admin_signin "verify-susp-a-in-$$" "$requester_email" "$admin_password" susp-a-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-susp-a-in.json"; fail "the requester could not sign in ($status)"; }
+requester_token="$(json "$WORKDIR/admin-susp-a-in.json" '["token"]')"
+requester_id="$(json "$WORKDIR/admin-susp-a-in.json" '["administrator"]["id"]')"
+
+status="$(admin_signin "verify-susp-b-in-$$" "$approver_email" "$admin_password" susp-b-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-susp-b-in.json"; fail "the approver could not sign in ($status)"; }
+approver_token="$(json "$WORKDIR/admin-susp-b-in.json" '["token"]')"
+approver_id="$(json "$WORKDIR/admin-susp-b-in.json" '["administrator"]["id"]')"
+
+[[ "$requester_id" != "$approver_id" ]] \
+  || fail "the fixture signed in one administrator twice, so this section would prove nothing"
+
+# The account under review, registered through the endpoint so that it is an ordinary account rather
+# than a row this section wrote.
+susp_email="verify-susp-subject-$$@example.com"
+status="$(post_json "verify-susp-reg-$$" /v1/auth/register \
+  "{\"name\":\"Verify Harness\",\"email\":\"$susp_email\",\"phone\":\"04196$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/susp-subject.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/susp-subject.json"; fail "the account under review could not be registered: $status"; }
+susp_user_id="$(json "$WORKDIR/susp-subject.json" '["id"]')"
+
+# standing_of <user-id> — the column identity reads at sign-in and at refresh.
+standing_of() {
+  "$PSQL" "$DATABASE_URL" -qtAc "select status from users where id = '$1';" | tr -d '[:space:]'
+}
+
+# --- the old route no longer suspends ------------------------------------------------------------
+
+status="$(admin_post "/v1/admin/users/$susp_user_id/standing" "$requester_token" \
+  "verify-susp-old-$$" '{"standing":"suspended","reason":"Three unresolved safety reports in a fortnight."}' \
+  susp-old)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/admin-susp-old.json"; fail "the standing endpoint suspended on one administrator's say-so ($status)"; }
+[[ "$(cat "$WORKDIR/admin-susp-old.json")" == *'admin_suspension_needs_review'* ]] \
+  || { cat "$WORKDIR/admin-susp-old.json"; fail "the refusal does not tell the console where to go"; }
+[[ "$(standing_of "$susp_user_id")" == "active" ]] \
+  || fail "the account was suspended by the endpoint that refused to suspend it"
+ok "one administrator can no longer suspend through the standing endpoint, and is told where to go instead"
+
+# --- the request changes nothing -----------------------------------------------------------------
+
+status="$(admin_post "/v1/admin/users/$susp_user_id/suspension" "$requester_token" \
+  "verify-susp-req-$$" '{"reason":"Three unresolved safety reports in a fortnight."}' susp-req)"
+[[ "$status" == "202" ]] \
+  || { cat "$WORKDIR/admin-susp-req.json"; fail "requesting a suspension returned $status, want 202"; }
+review_id="$(json "$WORKDIR/admin-susp-req.json" '["id"]')"
+[[ -n "$review_id" ]] || fail "the request returned no review"
+[[ "$(json "$WORKDIR/admin-susp-req.json" '["status"]')" == "pending" ]] \
+  || fail "a new review is not pending"
+
+[[ "$(standing_of "$susp_user_id")" == "active" ]] \
+  || fail "the account was suspended by the *request*, so the second signature is paperwork"
+ok "a request records the case and leaves the account alone — the control is not a suspension with a signature collected afterwards"
+
+# --- the queue, without which nobody can find the request ----------------------------------------
+
+status="$(admin_get /v1/admin/suspensions "$approver_token" susp-queue)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-susp-queue.json"; fail "reading the queue returned $status"; }
+python3 - "$WORKDIR/admin-susp-queue.json" "$review_id" >"$WORKDIR/susp-in-queue.txt" <<'SCAN'
+import json, sys
+page = json.load(open(sys.argv[1]))
+match = next((r for r in (page.get("data") or []) if r["id"] == sys.argv[2]), None)
+print(match["status"] if match else "")
+SCAN
+[[ "$(cat "$WORKDIR/susp-in-queue.txt")" == "pending" ]] \
+  || fail "the pending review is not in the queue — a second administrator cannot approve what they cannot find"
+ok "and the second administrator can find it in the queue, which is what makes the control exercisable"
+
+# --- the requester cannot approve their own request ----------------------------------------------
+#
+# The one check this whole ticket exists for. It is refused three deep — in the service, in the
+# UPDATE's own predicate, and by ck_suspension_reviews_two_people — and only the built binary shows
+# that the refusal survives the wiring.
+
+status="$(admin_post "/v1/admin/suspensions/$review_id/approval" "$requester_token" \
+  "verify-susp-self-$$" '{}' susp-self)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/admin-susp-self.json"; fail "one administrator completed a two-person review alone ($status)"; }
+[[ "$(cat "$WORKDIR/admin-susp-self.json")" == *'admin_same_administrator'* ]] \
+  || { cat "$WORKDIR/admin-susp-self.json"; fail "the refusal does not say a second administrator is needed"; }
+[[ "$(standing_of "$susp_user_id")" == "active" ]] \
+  || fail "the account was suspended by a refused approval, which is the partial write the transaction prevents"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select status from suspension_reviews where id = '$review_id';" | tr -d '[:space:]')" == "pending" ]] \
+  || fail "the review is no longer pending after a refused approval, so nobody else can act on it"
+ok "the administrator who asked cannot be the one who agrees — Docs/04 §9, refused on the wire with the account untouched"
+
+# --- a second administrator can, and the suspension takes effect ----------------------------------
+
+status="$(admin_post "/v1/admin/suspensions/$review_id/approval" "$approver_token" \
+  "verify-susp-ok-$$" '{}' susp-ok)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/admin-susp-ok.json"; fail "the second administrator could not approve the review ($status)"; }
+[[ "$(json "$WORKDIR/admin-susp-ok.json" '["approved_by"]')" == "$approver_id" ]] \
+  || { cat "$WORKDIR/admin-susp-ok.json"; fail "the review names the wrong approver"; }
+[[ "$(json "$WORKDIR/admin-susp-ok.json" '["requested_by"]')" == "$requester_id" ]] \
+  || { cat "$WORKDIR/admin-susp-ok.json"; fail "the review lost the administrator who asked"; }
+[[ "$(standing_of "$susp_user_id")" == "suspended" ]] \
+  || fail "the account is not suspended after a valid approval"
+ok "a second administrator's approval applies the suspension, and the review names both people"
+
+# The suspension is real where it matters: identity refuses the account at sign-in. SHIP-161
+# established that path and this is what says a two-person review reaches it.
+status="$(post_json "verify-susp-signin-$$" /v1/auth/login \
+  "{\"email\":\"$susp_email\",\"password\":\"correct-horse-battery-staple\",\"device_label\":\"iPhone\"}" \
+  "$WORKDIR/susp-signin.json")"
+[[ "$status" != "200" ]] \
+  || { cat "$WORKDIR/susp-signin.json"; fail "a suspended account signed in, so the review changed a column nothing reads"; }
+ok "and the account cannot sign in — the review reaches the enforcement identity already had"
+
+# Refresh too, which is where a suspension actually takes effect: an access token lives fifteen
+# minutes and carries no standing, so an account refused only at sign-in keeps working until the
+# token it already holds expires. This half moved here from the SHIP-161 section, because the
+# two-person route is now the only way to reach a suspension at all.
+status="$(post_json "verify-susp-login-$$" /v1/auth/login \
+  "{\"email\":\"$susp_email\",\"password\":\"correct-horse-battery-staple\",\"device_label\":\"Verify Suspension\"}" \
+  "$WORKDIR/susp-login-refused.json")"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/susp-login-refused.json"; fail "a suspended account signed in and got $status, want 403"; }
+ok "and the refusal is a 403 rather than a bad-credentials answer — the account exists and may not be used"
+
+# --- the audit trail names both administrators ----------------------------------------------------
+
+approved_entries="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where action = 'user.suspension_approved'
+      and target_id = '$susp_user_id'
+      and actor_id = '$approver_id'
+      and metadata ->> 'requested_by' = '$requester_id';")"
+[[ "$approved_entries" == "1" ]] \
+  || fail "the approval entry does not name both administrators (found $approved_entries)"
+
+requested_entries="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where action = 'user.suspension_requested'
+      and target_id = '$susp_user_id'
+      and actor_id = '$requester_id';")"
+[[ "$requested_entries" == "1" ]] \
+  || fail "the request wrote no audit entry (found $requested_entries)"
+ok "both halves are in the trail — a two-person control that recorded one name would not have recorded what happened"
+
+# --- a settled review cannot be approved again ----------------------------------------------------
+
+status="$(admin_post "/v1/admin/suspensions/$review_id/approval" "$requester_token" \
+  "verify-susp-again-$$" '{}' susp-again)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/admin-susp-again.json"; fail "a settled review was approved again ($status)"; }
+ok "and a settled review cannot be approved twice — the record of who agreed cannot be rewritten"
 
 admin_clear_limits
 
@@ -1012,15 +1595,19 @@ admin_clear_limits
 # The 0419 prefix is this section's; 04190…04192 are the dispute fixtures above.
 search_email="verify-search-$$@example.com"
 search_phone="04193$$"
+# The name is this section's own, and it is deliberately not an ordinary one: SHIP-30a's third
+# clause is that a search term matches it, and a fixture called "Verify Harness" would be matched
+# by every other section's fixture too.
+search_name="Kirralee Wongabri"
 status="$(post_json "verify-adm-search-reg-$$" /v1/auth/register \
-  "{\"email\":\"$search_email\",\"phone\":\"$search_phone\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"$search_name\",\"email\":\"$search_email\",\"phone\":\"$search_phone\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/search-user.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/search-user.json"; fail "could not register the searchable customer: $status"; }
 search_user_id="$(json "$WORKDIR/search-user.json" '["id"]')"
 
 suspended_email="verify-search-gone-$$@example.com"
 status="$(post_json "verify-adm-search-susp-$$" /v1/auth/register \
-  "{\"email\":\"$suspended_email\",\"phone\":\"04194$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$suspended_email\",\"phone\":\"04194$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/search-suspended.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/search-suspended.json"; fail "could not register the suspended provider: $status"; }
 suspended_user_id="$(json "$WORKDIR/search-suspended.json" '["id"]')"
@@ -1065,6 +1652,37 @@ ok "an account is found by its email address, whole or in part"
   || fail "an account could not be found by its phone number"
 ok "and by its phone number, through the same parameter — support has a string and does not always know which it is"
 
+# --- SHIP-30a: the fourth term, which had no column until registration collected one ------------
+#
+# This endpoint shipped serving three of its *Done when*'s four terms because `users` held no name.
+# The clause SHIP-30a owes it is that all four now answer **on the wire**, so the account is
+# registered through `POST /v1/auth/register` above rather than inserted, and found here through
+# `GET /v1/admin/users` — the two halves of the ticket meeting at the only place they can.
+
+# The space is percent-encoded rather than sent raw: this goes into a URL and curl would send a
+# bare space as one, which is a malformed request line rather than a search for two words.
+[[ "$(search_finds "q=Kirralee%20Wongabri" "$search_user_id" search-name)" == "1" ]] \
+  || fail "an account could not be found by the whole name it registered with"
+[[ "$(search_finds "q=Wongabri" "$search_user_id" search-name-part)" == "1" ]] \
+  || fail "an account could not be found by part of its name"
+[[ "$(search_finds "q=wongabri" "$search_user_id" search-name-case)" == "1" ]] \
+  || fail "the name term is case-sensitive; a support engineer types what is on the ticket"
+ok "an account is found by its name — whole, in part, and in any case (SHIP-30a)"
+
+# The suspended provider registered as "Verify Harness" and the searchable customer did not, which
+# makes this a real negative rather than one that would pass against an empty table.
+[[ "$(search_finds "q=Kirralee%20Wongabri" "$suspended_user_id" search-name-neg)" == "0" ]] \
+  || fail "a name term matched an account with a different name"
+ok "and a name term matches that name rather than everybody"
+
+# The name reaches the response too. A predicate that matched and a shape that did not carry it
+# would leave a console unable to show what it had matched on.
+status="$(admin_get "/v1/admin/users?q=$search_phone" "$search_token" search-name-shape)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-search-name-shape.json"; fail "searching returned $status"; }
+[[ "$(json "$WORKDIR/admin-search-name-shape.json" '["data"][0]["name"]')" == "$search_name" ]] \
+  || fail "the account came back without the name it registered with"
+ok "and the name is on the response, as the account registered it"
+
 # --- the standing filter, in both directions --------------------------------------------------------
 
 [[ "$(search_finds "q=verify-search-$$&status=suspended" "$suspended_user_id" search-susp)" == "1" ]] \
@@ -1103,7 +1721,7 @@ items = page.get("data") or []
 print(",".join(sorted(items[0].keys())) if items else "")
 PY
 search_keys="$(cat "$WORKDIR/search-keys.txt")"
-[[ "$search_keys" == "created_at,email,email_verified_at,id,phone,phone_verified_at,role,status" ]] \
+[[ "$search_keys" == "created_at,email,email_verified_at,id,name,phone,phone_verified_at,role,status" ]] \
   || fail "the administrator's view of an account carries [$search_keys], which is not the closed set this shape is held to"
 ok "an account carries a closed set of account facts — no jobs, no bids, no budget and no credential material"
 
@@ -1724,15 +2342,22 @@ standing() {
 stand_email="verify-standing-$$@example.com"
 stand_password="correct-horse-battery-staple"
 status="$(post_json "verify-adm161-register-$$" /v1/auth/register \
-  "{\"email\":\"$stand_email\",\"phone\":\"04195$$\",\"password\":\"$stand_password\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$stand_email\",\"phone\":\"04195$$\",\"password\":\"$stand_password\",\"role\":\"provider\"}" \
   "$WORKDIR/standing-user.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/standing-user.json"; fail "could not register the account: $status"; }
 stand_user_id="$(json "$WORKDIR/standing-user.json" '["id"]')"
 
 # --- the permission ---------------------------------------------------------------------------------
 
+# `restricted` rather than `suspended` throughout this section, and the change is SHIP-166's.
+#
+# Docs/04 §9 took permanent suspension off this endpoint: one administrator may no longer do it
+# alone. So what this section demonstrates is the **limited** half of the *Done when*'s "limited or
+# disabled" — and the disabled half, including that a suspended account can neither sign in nor
+# refresh, is demonstrated in the SHIP-166 section above, through the two-person route that is now
+# the only way to reach it.
 stand_reason="Two unresolved no-shows in a fortnight; see the delivery exception queue."
-stand_body="{\"standing\":\"suspended\",\"reason\":\"$stand_reason\"}"
+stand_body="{\"standing\":\"restricted\",\"reason\":\"$stand_reason\"}"
 
 status="$(standing "$unpub_support_token" "verify-adm161-sup-$$" "$stand_user_id" "$stand_body" sup)"
 [[ "$status" == "403" ]] \
@@ -1751,54 +2376,45 @@ status="$(standing "$unpub_token" "verify-adm161-bad-$$" "$stand_user_id" \
   || { cat "$WORKDIR/stand-bad.json"; fail "the refusal does not name the field"; }
 
 status="$(standing "$unpub_token" "verify-adm161-noreason-$$" "$stand_user_id" \
-  '{"standing":"suspended","reason":"bad"}' noreason)"
+  '{"standing":"restricted","reason":"bad"}' noreason)"
 [[ "$status" == "422" ]] \
   || { cat "$WORKDIR/stand-noreason.json"; fail "a reason that records nothing returned $status, want 422"; }
 ok "a standing outside ck_users_status's three and a reason too short to record anything are both refused and name their field"
 
-# --- the account can use the platform, and then cannot ------------------------------------------------
+# --- the account is limited rather than disabled ------------------------------------------------------
 #
-# **This is the pair no Go test in internal/admin can make.** The domain writes a column; whether a
-# suspended account can still sign in is internal/identity's code, and the two only meet in the
-# running service.
+# **This is the pair no Go test in internal/admin can make.** The domain writes a column; what that
+# column *does* is internal/identity's code, and the two only meet in the running service.
+#
+# The distinction is the whole of Docs/04 §4's vocabulary and it is easy to lose: a **restricted**
+# account may still sign in and read — `User.CanSignIn` refuses `suspended` alone — and may not
+# trade. An implementation that refused a restricted account at sign-in would pass a check that only
+# looked for "access is limited", and would lock somebody out of the messages telling them why.
 
 status="$(post_json "verify-adm161-login1-$$" /v1/auth/login \
   "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-before.json")"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-before.json"; fail "the account could not sign in before being suspended ($status)"; }
-stand_refresh="$(json "$WORKDIR/stand-login-before.json" '["refresh_token"]')"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-before.json"; fail "the account could not sign in before being restricted ($status)"; }
 ok "the account signs in while it is active, which is the precondition the next check needs"
 
-status="$(standing "$unpub_token" "verify-adm161-suspend-$$" "$stand_user_id" "$stand_body" susp)"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-susp.json"; fail "suspending returned $status, want 200"; }
+status="$(standing "$unpub_token" "verify-adm161-limit-$$" "$stand_user_id" "$stand_body" susp)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-susp.json"; fail "restricting returned $status, want 200"; }
 [[ "$(json "$WORKDIR/stand-susp.json" '["from"]')" == "active" ]] \
   || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account held before"; }
-[[ "$(json "$WORKDIR/stand-susp.json" '["to"]')" == "suspended" ]] \
+[[ "$(json "$WORKDIR/stand-susp.json" '["to"]')" == "restricted" ]] \
   || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account holds now"; }
-[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from users where id = '$stand_user_id';")" == "suspended" ]] \
-  || fail "the account is not suspended"
-ok "an account is suspended, and the response carries both ends — a console rendering only the new standing cannot tell a tightening from a loosening"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from users where id = '$stand_user_id';")" == "restricted" ]] \
+  || fail "the account is not restricted"
+ok "an account is restricted, and the response carries both ends — a console rendering only the new standing cannot tell a tightening from a loosening"
 
 [[ "$("$PSQL" "$DATABASE_URL" -qtAc \
   "select count(*) from audit_log
     where target_id = '$stand_user_id' and target_type = 'user'
       and action = 'user.standing_changed' and actor_id = '$unpub_id'
       and reason = '$stand_reason'
-      and metadata->>'from' = 'active' and metadata->>'to' = 'suspended';")" == "1" ]] \
+      and metadata->>'from' = 'active' and metadata->>'to' = 'restricted';")" == "1" ]] \
   || fail "the change wrote no audit entry carrying the reason and both ends"
 ok "and the audit entry names the account, the administrator, the reason and both ends of the change"
 
-# The enforcement. Sign-in is refused, and so is refresh — which is where a suspension actually takes
-# effect, because an access token lives fifteen minutes and carries no standing.
-status="$(post_json "verify-adm161-login2-$$" /v1/auth/login \
-  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-after.json")"
-[[ "$status" == "403" ]] \
-  || { cat "$WORKDIR/stand-login-after.json"; fail "a suspended account signed in and got $status, want 403"; }
-
-status="$(post_json "verify-adm161-refresh-$$" /v1/auth/refresh \
-  "{\"refresh_token\":\"$stand_refresh\"}" "$WORKDIR/stand-refresh.json")"
-[[ "$status" != "200" ]] \
-  || { cat "$WORKDIR/stand-refresh.json"; fail "a suspended account refreshed its session, so the suspension does not take effect until the token expires"; }
-ok "the suspended account can no longer sign in, and the session it already had cannot be refreshed — 'account access is disabled', on the wire"
 
 # --- a no-op, and putting the account back ------------------------------------------------------------
 
@@ -1810,12 +2426,12 @@ status="$(standing "$unpub_token" "verify-adm161-noop-$$" "$stand_user_id" "$sta
 [[ "$("$PSQL" "$DATABASE_URL" -qtAc \
   "select count(*) from audit_log where target_id = '$stand_user_id';")" == "1" ]] \
   || fail "a no-op wrote a second entry, in a table whose value is that everything in it happened"
-ok "setting the standing an account already holds is refused rather than recorded — an entry saying suspended to suspended is noise in the one table that must be all signal"
+ok "setting the standing an account already holds is refused rather than recorded — an entry saying restricted to restricted is noise in the one table that must be all signal"
 
 status="$(standing "$unpub_token" "verify-adm161-reinstate-$$" "$stand_user_id" \
   '{"standing":"active","reason":"No-shows explained and evidenced; access restored after review."}' back)"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/stand-back.json"; fail "reinstating returned $status, want 200"; }
-[[ "$(json "$WORKDIR/stand-back.json" '["from"]')" == "suspended" ]] \
+[[ "$(json "$WORKDIR/stand-back.json" '["from"]')" == "restricted" ]] \
   || { cat "$WORKDIR/stand-back.json"; fail "the reinstatement does not say what the account held"; }
 
 status="$(post_json "verify-adm161-login3-$$" /v1/auth/login \

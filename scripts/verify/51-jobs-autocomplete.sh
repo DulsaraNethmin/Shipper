@@ -55,7 +55,7 @@ ticket "SHIP-119  a Delivered job with no dispute becomes Completed after 72 hou
 
 # 04134 — the jobs range is 0413x and 50-jobs.sh uses 04130 to 04133.
 status="$(post_json "verify-ac-cust-$$" /v1/auth/register \
-  "{\"email\":\"autocomplete-customer-$$@example.com\",\"phone\":\"04134$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"autocomplete-customer-$$@example.com\",\"phone\":\"04134$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/ac-customer.json")"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/ac-customer.json"; fail "could not register the auto-complete customer: $status"; }

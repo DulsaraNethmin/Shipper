@@ -231,7 +231,7 @@ reg_phone_local="04120$$"
 reg_phone_e164="+61${reg_phone_local:1}"
 
 status="$(post_json "verify-reg-$$" /v1/auth/register \
-  "{\"email\":\"$reg_email\",\"phone\":\"$reg_phone_local\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$reg_email\",\"phone\":\"$reg_phone_local\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/register.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/register.json"; fail "POST /v1/auth/register returned $status, want 201"; }
 ok "an account is created and answered with 201"
@@ -272,7 +272,7 @@ grep -q 'correct-horse-battery-staple' <<<"$stored_hash" && fail "the password i
 ok "the credential column holds an argon2id hash, not the password"
 
 status="$(post_json "verify-reg-dupe-email-$$" /v1/auth/register \
-  "{\"email\":\"$reg_email\",\"phone\":\"0499${$}0\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$reg_email\",\"phone\":\"0499${$}0\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/register-dupe-email.json")"
 [[ "$status" == "409" ]] || { cat "$WORKDIR/register-dupe-email.json"; fail "a duplicate email returned $status, want 409"; }
 [[ "$(json "$WORKDIR/register-dupe-email.json" '["error"]["code"]')" == "identity_email_taken" ]] \
@@ -283,7 +283,7 @@ ok "a second account on the same address is refused by uq_users_email"
 # normalisation these are two different strings and the index never sees a collision — which is
 # the defect that would give one handset two accounts and make an OTP ambiguous.
 status="$(post_json "verify-reg-dupe-phone-$$" /v1/auth/register \
-  "{\"email\":\"other-$$@example.com\",\"phone\":\"${reg_phone_local:0:4} ${reg_phone_local:4}\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"other-$$@example.com\",\"phone\":\"${reg_phone_local:0:4} ${reg_phone_local:4}\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/register-dupe-phone.json")"
 [[ "$status" == "409" ]] || { cat "$WORKDIR/register-dupe-phone.json"; fail "a duplicate phone returned $status, want 409"; }
 [[ "$(json "$WORKDIR/register-dupe-phone.json" '["error"]["code"]')" == "identity_phone_taken" ]] \
@@ -295,9 +295,9 @@ status="$(post_json "verify-reg-invalid-$$" /v1/auth/register \
   "$WORKDIR/register-invalid.json")"
 [[ "$status" == "422" ]] || { cat "$WORKDIR/register-invalid.json"; fail "an invalid registration returned $status, want 422"; }
 fields="$(json "$WORKDIR/register-invalid.json" '["error"]["details"]' | tr -d "[]{}'\" " | tr ',' '\n' | grep '^field:' | cut -d: -f2 | sort | tr '\n' ' ')"
-[[ "$fields" == "email password phone role " ]] \
-  || fail "the rejected fields are '$fields', want all four at once"
-ok "every bad field is reported at once, so the form takes one round trip and not four"
+[[ "$fields" == "email name password phone role " ]] \
+  || fail "the rejected fields are '$fields', want all five at once"
+ok "every bad field is reported at once, so the form takes one round trip and not five"
 
 # Registration is public — it is how a caller obtains credentials in the first place — and it is
 # still behind the idempotency middleware like every other state-changing request.
@@ -309,10 +309,64 @@ status="$(curl -s -X POST -o "$WORKDIR/register-nokey.json" -w '%{http_code}' \
 ok "it needs an Idempotency-Key, so a retry cannot produce a second account"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-30a  registration requires a name and users holds it in a column of its own"
+
+# The first two clauses of the *Done when*. The third — that GET /v1/admin/users matches a
+# search term against it — is exercised in 90-admin.sh, beside the endpoint that serves it.
+#
+# The column is the ticket's whole reason for existing: SHIP-151 shipped a search naming four
+# terms and could serve three, because nothing had ever collected the fourth and a name cannot
+# be backfilled.
+
+status="$(post_json "verify-noname-$$" /v1/auth/register \
+  "{\"email\":\"noname-$$@example.com\",\"phone\":\"04930$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/register-noname.json")"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/register-noname.json"; fail "a registration with no name returned $status, want 422"; }
+[[ "$(json "$WORKDIR/register-noname.json" '["error"]["details"][0]["field"]')" == "name" ]] \
+  || fail "the refusal does not name the name field"
+ok "a registration without a name is refused, and the refusal names the field"
+
+# Three spaces is a missing name rather than a three-character one. The service trims before it
+# validates and `ck_users_name` refuses the same value in the database, which is the Docs/10
+# §3.4 pairing — two checks believed to agree are two checks until something compares them.
+status="$(post_json "verify-blankname-$$" /v1/auth/register \
+  "{\"name\":\"   \",\"email\":\"blankname-$$@example.com\",\"phone\":\"04931$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/register-blankname.json")"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/register-blankname.json"; fail "a name of three spaces returned $status, want 422"; }
+ok "a name of whitespace is refused, because the platform trims before it judges"
+
+named_email="named-$$@example.com"
+status="$(post_json "verify-named-$$" /v1/auth/register \
+  "{\"name\":\"  Ngô  Đình  \",\"email\":\"$named_email\",\"phone\":\"04932$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/register-named.json")"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/register-named.json"; fail "a named registration returned $status, want 201"; }
+[[ "$(json "$WORKDIR/register-named.json" '["name"]')" == "Ngô  Đình" ]] \
+  || fail "the response name is '$(json "$WORKDIR/register-named.json" '["name"]')', want it trimmed at the ends and untouched inside"
+ok "a name is accepted, trimmed at the ends and otherwise left exactly as it was written"
+
+named_id="$(json "$WORKDIR/register-named.json" '["id"]')"
+stored_name="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select name from users where id = '$named_id';")"
+[[ "$stored_name" == "Ngô  Đình" ]] \
+  || fail "users.name holds '$stored_name', want 'Ngô  Đình' — the response is not the row"
+ok "users.name holds it, in a column of its own rather than derived from anything"
+
+# The database refuses what the service refuses, through a connection that does not go through
+# the service — which is the connection a CHECK constraint exists for.
+if "$PSQL" "$DATABASE_URL" -q -c \
+  "update users set name = E'\\t' where id = '$named_id';" >/dev/null 2>&1; then
+  fail "ck_users_name accepted a tab; a one-argument btrim strips spaces only"
+fi
+ok "ck_users_name refuses a tab as well as a space, which a one-argument btrim would not"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-45  the role is chosen at registration and cannot be changed afterwards"
 
 status="$(post_json "verify-provider-$$" /v1/auth/register \
-  "{\"email\":\"provider-$$@example.com\",\"phone\":\"0498$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"provider-$$@example.com\",\"phone\":\"0498$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/register-provider.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/register-provider.json"; fail "registering a provider returned $status"; }
 [[ "$(json "$WORKDIR/register-provider.json" '["role"]')" == "provider" ]] \
@@ -320,7 +374,7 @@ status="$(post_json "verify-provider-$$" /v1/auth/register \
 ok "an account is created as either customer or provider, as asked"
 
 status="$(post_json "verify-admin-role-$$" /v1/auth/register \
-  "{\"email\":\"admin-$$@example.com\",\"phone\":\"0497$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"admin\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"admin-$$@example.com\",\"phone\":\"0497$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"admin\"}" \
   "$WORKDIR/register-admin.json")"
 [[ "$status" == "422" ]] || { cat "$WORKDIR/register-admin.json"; fail "'admin' was accepted as a role (status $status)"; }
 ok "there is no third role — administrators sign in through a separate system (SHIP-147)"
@@ -992,7 +1046,7 @@ ok "the refusal is 400 with the request id in the body, not a 401 with a bearer 
 # Account standing is disclosed only to somebody who has just proved they own the account.
 suspended_email="suspended-$$@example.com"
 status="$(post_json "verify-suspend-register-$$" /v1/auth/register \
-  "{\"email\":\"$suspended_email\",\"phone\":\"04960$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$suspended_email\",\"phone\":\"04960$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
   "$WORKDIR/suspend-register.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/suspend-register.json"; fail "could not register the account to suspend ($status)"; }
 "$PSQL" "$DATABASE_URL" -q -c \
@@ -1173,7 +1227,7 @@ ticket "SHIP-46  a user can list their devices and revoke any one of them"
 # arithmetic somebody has to redo whenever a section above changes.
 devices_email="devices-$$@example.com"
 status="$(post_json "verify-devices-register-$$" /v1/auth/register \
-  "{\"email\":\"$devices_email\",\"phone\":\"04950$$\",\"password\":\"$login_password\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$devices_email\",\"phone\":\"04950$$\",\"password\":\"$login_password\",\"role\":\"provider\"}" \
   "$WORKDIR/devices-register.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/devices-register.json"; fail "could not register the device-list account ($status)"; }
 devices_user="$(json "$WORKDIR/devices-register.json" '["id"]')"
@@ -1339,7 +1393,7 @@ redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
 
 throttle_email="throttle-$$@example.com"
 status="$(post_json "verify-throttle-register-$$" /v1/auth/register \
-  "{\"email\":\"$throttle_email\",\"phone\":\"04940$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$throttle_email\",\"phone\":\"04940$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
   "$WORKDIR/throttle-register.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/throttle-register.json"; fail "could not register the throttle account ($status)"; }
 

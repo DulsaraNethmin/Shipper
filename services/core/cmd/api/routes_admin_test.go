@@ -57,6 +57,17 @@ var auditedAdminMutations = map[string]admin.AuditAction{
 	// search for everything that happened to an account returns the notes taken about it. The
 	// note's identifier is in the metadata; the body deliberately is not.
 	"POST /v1/admin/notes": admin.AuditActionNoteAdded,
+
+	// SHIP-166, and the two rows are why Docs/04 §9's control is auditable rather than merely
+	// enforced. A two-person review that recorded only its approval would name one of the two
+	// people, and the request is the moment the case was made — with the reason the second
+	// administrator was asked to agree with.
+	"POST /v1/admin/users/{id}/suspension": admin.AuditActionUserSuspensionRequested,
+
+	// The approval carries **both** administrators: the actor is the one who agreed, and
+	// `requested_by` is in the metadata. A control whose trail names one participant has not
+	// recorded what happened.
+	"POST /v1/admin/suspensions/{id}/approval": admin.AuditActionUserSuspensionApproved,
 }
 
 // administrativeMutation reports whether this route is a state change an administrator makes.

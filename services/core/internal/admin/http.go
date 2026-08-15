@@ -57,16 +57,18 @@ import (
 // for intake that is this layer: the party check, the dispute row and the status change are one
 // decision against one version of the job.
 type Handler struct {
-	svc        *Service
-	creds      *Credentials
-	moderation *Moderation
-	users      *Users
-	jobs       *JobConsole
-	trail      *AuditTrail
-	enforce    *Enforcement
-	notes      *Notes
-	pool       *pgxpool.Pool
-	log        *slog.Logger
+	svc         *Service
+	creds       *Credentials
+	moderation  *Moderation
+	cancels     *Cancellations
+	users       *Users
+	jobs        *JobConsole
+	trail       *AuditTrail
+	enforce     *Enforcement
+	notes       *Notes
+	suspensions *Suspensions
+	pool        *pgxpool.Pool
+	log         *slog.Logger
 }
 
 // HandlerServices is what a handler is built from, beyond the pool and the logger.
@@ -89,6 +91,9 @@ type HandlerServices struct {
 	// Moderation is the queues of Docs/04 §5 (SHIP-117).
 	Moderation *Moderation
 
+	// Cancellations is Docs/04 §5's fifth queue (SHIP-158).
+	Cancellations *Cancellations
+
 	// Users is the account search (SHIP-151).
 	Users *Users
 
@@ -104,6 +109,9 @@ type HandlerServices struct {
 
 	// Notes is the internal support history (SHIP-162).
 	Notes *Notes
+
+	// Suspensions is Docs/04 §9's two-person review (SHIP-166).
+	Suspensions *Suspensions
 }
 
 // NewHandler wires the handlers to the services.
@@ -128,6 +136,12 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// panic would be at the first request rather than at startup — which is the wrong way
 		// round for a collaborator that is decided once, in the composition root.
 		return nil, errors.New("admin: a handler needs the moderation queue service")
+	}
+	if s.Cancellations == nil {
+		// SHIP-158. The same argument the moderation queue above records, and it lands the
+		// same way: a nil here is a queue that panics the first time somebody opens it, which
+		// on this screen is the first time somebody is asking why a provider walked away.
+		return nil, errors.New("admin: a handler needs the post-award cancellation queue")
 	}
 	if s.Users == nil {
 		// SHIP-151. A nil here would make the search endpoint panic at the first request
@@ -159,20 +173,29 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// the second-worst thing that happens that day.
 		return nil, errors.New("admin: a handler needs the notes service")
 	}
+	if s.Suspensions == nil {
+		// SHIP-166. The same argument once more, and here it guards a *control*: a nil
+		// discovered at the first request is a two-person review that panics the first time
+		// somebody tries to exercise it, which is a moment when the console failing looks
+		// exactly like the control refusing.
+		return nil, errors.New("admin: a handler needs the suspension review service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
 	return &Handler{
-		svc:        s.Disputes,
-		creds:      s.Credentials,
-		moderation: s.Moderation,
-		users:      s.Users,
-		jobs:       s.Jobs,
-		trail:      s.Trail,
-		enforce:    s.Enforcement,
-		notes:      s.Notes,
-		pool:       pool,
-		log:        log,
+		svc:         s.Disputes,
+		creds:       s.Credentials,
+		moderation:  s.Moderation,
+		cancels:     s.Cancellations,
+		users:       s.Users,
+		jobs:        s.Jobs,
+		trail:       s.Trail,
+		enforce:     s.Enforcement,
+		notes:       s.Notes,
+		suspensions: s.Suspensions,
+		pool:        pool,
+		log:         log,
 	}, nil
 }
 
@@ -567,6 +590,40 @@ func apiError(err error) error {
 	case errors.Is(err, ErrStandingUnrecognised):
 		return fieldProblem("standing", fmt.Errorf(
 			"that is not an account standing; use one of %s", strings.Join(standingNames(), ", ")))
+
+	case errors.Is(err, ErrExceptionGroundUnrecognised):
+		return fieldProblem("ground", fmt.Errorf(
+			"that is not a delivery-exception ground; use one of %s",
+			strings.Join(groundNames(), ", ")))
+
+	// --- Docs/04 §9's two-person review (SHIP-166) -------------------------------------------
+
+	case errors.Is(err, ErrSuspensionNeedsReview):
+		return httpx.NewError(http.StatusConflict, CodeSuspensionNeedsReview,
+			"A permanent suspension needs a second administrator's approval. "+
+				"Request one instead.").WithCause(err)
+
+	case errors.Is(err, ErrSameAdministrator):
+		// 409 rather than 403. The caller holds the permission and the request is
+		// well-formed; what is refused is the *state* — this review is theirs — which is a
+		// conflict rather than a matter of authorisation. A 403 would read as "you may not
+		// approve suspensions", which is not what happened.
+		return httpx.NewError(http.StatusConflict, CodeSameAdministrator,
+			"A suspension must be approved by a different administrator from the one who "+
+				"requested it.").WithCause(err)
+
+	case errors.Is(err, ErrSuspensionReviewNotFound):
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such suspension review.").WithCause(err)
+
+	case errors.Is(err, ErrSuspensionReviewSettled):
+		return httpx.NewError(http.StatusConflict, CodeSuspensionReviewSettled,
+			"That suspension review has already been settled.").WithCause(err)
+
+	case errors.Is(err, ErrSuspensionReviewOutstanding):
+		return httpx.NewError(http.StatusConflict, CodeSuspensionReviewOutstanding,
+			"This account already has a suspension waiting for a second administrator.").
+			WithCause(err)
 
 	case errors.Is(err, ErrStandingUnchanged):
 		return httpx.NewError(http.StatusConflict, CodeUserStandingUnchanged,
@@ -987,37 +1044,62 @@ func (h *Handler) permitted(r *http.Request, p Permission) (Grant, error) {
 	return grant, nil
 }
 
-// --- SHIP-117: the delivery-exception moderation queue ------------------------------------------
+// --- SHIP-117, SHIP-157: the delivery-exception moderation queue ---------------------------------
 
-// exceptionEntryResponse is one delivery that was evidenced by a reason rather than a photograph.
+// exceptionEntryResponse is one delivery that is going wrong, on one of Docs/04 §5's four grounds.
 //
-// **No object key and no signed URL**, because by construction there is no photograph — a proof row
-// is one or the other and never both (`ck_proofs_photograph_or_exception`). **No customer, no
-// provider and no budget**: a queue entry is what somebody triaging needs in order to decide whether
-// to open the job, and a shape that never carried a budget cannot leak one.
+// **No object key and no signed URL**, because on the one ground that has a photograph there is by
+// construction none — a proof row is a photograph or a reason and never both
+// (`ck_proofs_photograph_or_exception`) — and a queue listing is not where a pre-signed URL is
+// issued in any case (Docs/04 §3.1). **No customer, no provider and no budget**: a queue entry is
+// what somebody triaging needs in order to decide whether to open the job, and a shape that never
+// carried a budget cannot leak one.
+//
+// # It is a union shape and `ground` is what makes that legible
+//
+// Three fields are empty on some grounds — `milestone` and `reason` on the two window grounds, and
+// `reason` on the unsynced ground. **They are always present and never null**, so a console that
+// renders without checking does not crash on the ordinary case; and `ground` is what a console
+// branches on rather than guessing from which fields are blank.
 type exceptionEntryResponse struct {
-	ProofID string `json:"proof_id"`
-	JobID   string `json:"job_id"`
+	// Ground is one of `overdue_pickup`, `delayed_delivery`, `failed_proof` or
+	// `unsynced_milestone` (SHIP-157). Clients branch on this and never on `reason`.
+	Ground string `json:"ground"`
 
+	// EntryID identifies the row the entry came from, and what that row *is* depends on the
+	// ground — a proof, a milestone, or the job itself where nothing was recorded. **It is not a
+	// handle to resolve**; it exists so the ordering is total and two entries are tellable apart.
+	// `job_id` is the identifier a console follows.
+	EntryID string `json:"entry_id"`
+
+	JobID string `json:"job_id"`
+
+	// Milestone is which recorded claim the entry stands behind. Empty on the two window
+	// grounds, where the entry exists because nothing was recorded.
 	Milestone string `json:"milestone"`
-	Reason    string `json:"reason"`
+
+	// Reason is Docs/01 §4.4's recorded reason. Empty on every ground but `failed_proof`.
+	Reason string `json:"reason"`
 
 	// Note is the actor's own words, where they left any. Always present, empty when they did
 	// not — `milestones.reason` is optional, and a `null` makes a console that renders without
 	// checking crash on the ordinary case.
 	Note string `json:"note"`
 
-	// RecordedAt is the platform's clock, not the device's. See [ExceptionEntry.RecordedAt].
+	// RecordedAt is the platform's clock, not the device's, and it is the instant this entry has
+	// been waiting since — which means the evidence, the arrival or the window's close depending
+	// on the ground. See [ExceptionEntry.RecordedAt].
 	RecordedAt string `json:"recorded_at"`
 
 	// JobStatus is where the job is now. It implies nothing about whether a job completed
-	// through this path may auto-complete, which is undecided (X-6).
+	// through the exception path may auto-complete, which is undecided (X-6).
 	JobStatus string `json:"job_status"`
 }
 
 func exceptionEntryFrom(e ExceptionEntry) exceptionEntryResponse {
 	return exceptionEntryResponse{
-		ProofID:    e.ProofID.String(),
+		Ground:     e.Ground.String(),
+		EntryID:    e.EntryID.String(),
 		JobID:      e.JobID.String(),
 		Milestone:  e.Milestone,
 		Reason:     e.Reason,
@@ -1027,16 +1109,17 @@ func exceptionEntryFrom(e ExceptionEntry) exceptionEntryResponse {
 	}
 }
 
-// ExceptionQueue handles GET /v1/admin/moderation/exceptions (SHIP-117).
+// ExceptionQueue handles GET /v1/admin/moderation/exceptions (SHIP-117, SHIP-157).
 //
-// The *Done when* is that an exception-completed job **enters the moderation queue**, and this is
-// the queue. It needs [PermissionModerationRead], which every role holds — reading a queue is what
-// the least-privileged role exists to be able to do, and acting on what is in it is a different
-// permission on a different endpoint.
+// Docs/04 §5's fourth queue, on all four grounds: overdue pickup, delayed delivery, failed proof and
+// unsynced milestones. It needs [PermissionModerationRead], which every role holds — reading a queue
+// is what the least-privileged role exists to be able to do, and acting on what is in it is a
+// different permission on a different endpoint.
 //
-// Oldest first, cursor paged, and it takes no filter: SHIP-157 is where this becomes a screen with
-// four kinds of exception on it, and a query parameter added now would be one that ticket has to
-// work around.
+// Oldest first and cursor paged, unchanged by the widening. SHIP-117 left this filterless on the
+// grounds that "a query parameter added now would be one that ticket has to work around"; SHIP-157
+// is that ticket and the parameter it wanted is `ground`, which narrows the one queue rather than
+// selecting between four.
 func (h *Handler) ExceptionQueue() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
@@ -1062,7 +1145,8 @@ func (h *Handler) ExceptionQueue() http.Handler {
 			last := entries[len(entries)-2]
 			next = pagination.Cursor{
 				timestamp(last.RecordedAt),
-				last.ProofID.String(),
+				last.Ground.String(),
+				last.EntryID.String(),
 			}.Encode()
 			entries = entries[:len(entries)-1]
 		}
@@ -1075,6 +1159,175 @@ func (h *Handler) ExceptionQueue() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
 		return nil
 	})
+}
+
+// --- SHIP-158: the post-award cancellation queue -------------------------------------------------
+
+// cancellationEntryResponse is one job a provider had committed to and that was then cancelled.
+//
+// **No budget and no bid amount**, which is structural: [CancellationEntry] has nowhere to put
+// either, so no change to this mapping can acquire one. Held to its key set by
+// TestTheCancellationShapeCarriesNothingCommercial.
+type cancellationEntryResponse struct {
+	// JobID is the job. **Not unique on this queue** — a job returned to the market can be
+	// awarded and walked away from again, and both appear.
+	JobID string `json:"job_id"`
+
+	// TransitionID is the history row this entry came from, and what makes the cursor total. It
+	// is not a handle to resolve; `job_id` is the identifier to follow.
+	TransitionID string `json:"transition_id"`
+
+	// Outcome is `returned_to_market` or `ended` — which of Docs/02's two post-award endings
+	// happened. Clients branch on this.
+	Outcome string `json:"outcome"`
+
+	// ProviderID is the provider who was carrying it, from the accepted bid. Empty only if no
+	// accepted bid exists, which a post-award job cannot be in — reported rather than assumed.
+	ProviderID string `json:"provider_id"`
+
+	// FromStatus is where the job was when it left the commitment — `Awarded`, `Driver assigned`
+	// or `Disputed`. Different conversations, which is why it is on the shape.
+	FromStatus string `json:"from_status"`
+
+	// ActorType is who moved it — `customer`, `provider`, `admin` or `system`. **The kind, not
+	// the account.** Docs/02 §1 says support needs the kind; naming somebody puts an accusation
+	// in a list people scan.
+	ActorType string `json:"actor_type"`
+
+	// Reason is what was recorded on the transition. Always present, and empty is ordinary:
+	// `job_status_history.reason` is required only of an administrator's move.
+	Reason string `json:"reason"`
+
+	// CancelledAt is the platform's clock, never the actor's.
+	CancelledAt string `json:"cancelled_at"`
+
+	// ProviderCancellations and ProviderCompletions are the *Done when*'s "with the provider's
+	// history", and they are a pair on purpose: three cancellations against four hundred
+	// deliveries is a different provider from three against five, and one number cannot say so.
+	ProviderCancellations int `json:"provider_cancellations"`
+	ProviderCompletions   int `json:"provider_completions"`
+}
+
+func cancellationEntryFrom(e CancellationEntry) cancellationEntryResponse {
+	providerID := ""
+	if e.ProviderID != uuid.Nil {
+		providerID = e.ProviderID.String()
+	}
+
+	return cancellationEntryResponse{
+		JobID:                 e.JobID.String(),
+		TransitionID:          e.TransitionID.String(),
+		Outcome:               e.Outcome.String(),
+		ProviderID:            providerID,
+		FromStatus:            e.FromStatus,
+		ActorType:             e.ActorType,
+		Reason:                e.Reason,
+		CancelledAt:           timestamp(e.CancelledAt),
+		ProviderCancellations: e.ProviderCancellations,
+		ProviderCompletions:   e.ProviderCompletions,
+	}
+}
+
+// CancellationQueue handles GET /v1/admin/moderation/cancellations (SHIP-158).
+//
+// Docs/04 §5's fifth queue, and a different endpoint from the fourth for the reason the fourth is one
+// endpoint with four grounds: the document numbers its queues, and this is a different screen asking
+// a different question. Nobody here is late; somebody withdrew from a commitment.
+//
+// [PermissionModerationRead], like every other queue: looking is what the least-privileged role
+// exists to be able to do, and acting on what is found is a different permission elsewhere.
+//
+// **Newest first**, unlike the exception queue and deliberately so — see [CancellationQueue].
+func (h *Handler) CancellationQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
+			return err
+		}
+
+		query, err := cancellationQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so "is there another page" is answered by the rows rather
+		// than by a second COUNT — the same arrangement every other paged read here uses.
+		query.Limit++
+
+		entries, err := h.cancels.AfterAward(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+			next = pagination.Cursor{
+				timestamp(last.CancelledAt),
+				last.TransitionID.String(),
+			}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]cancellationEntryResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, cancellationEntryFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// cancellationQueryFrom reads the page parameters.
+//
+// **Two cursor fields rather than three**, unlike the exception queue: an entry is a `job_status_history`
+// row, and that row's identifier is unique — so `(cancelled_at, transition_id)` is total without a
+// third component. The exception queue needs one because two of its grounds are keyed by the job,
+// which is a property of that union rather than of paging in general.
+func cancellationQueryFrom(r *http.Request) (QueueQuery, error) {
+	values := r.URL.Query()
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return QueueQuery{}, err
+	}
+
+	after, err := decodeCancellationCursor(values.Get("cursor"))
+	if err != nil {
+		return QueueQuery{}, err
+	}
+	return QueueQuery{Limit: limit, After: after}, nil
+}
+
+// decodeCancellationCursor reads the two fields this queue's ordering is total on.
+//
+// It reuses [QueueCursor] and leaves [QueueCursor.Ground] empty, which is honest rather than
+// convenient: the type is "where a moderation queue stopped", the exception queue needs a third
+// component to be total and this one does not, and a second near-identical struct would be two
+// things to keep in step for one absent field.
+func decodeCancellationCursor(raw string) (QueueCursor, error) {
+	if raw == "" {
+		return QueueCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return QueueCursor{}, err
+	}
+
+	cancelledAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	transitionID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return QueueCursor{RecordedAt: cancelledAt, EntryID: transitionID}, nil
 }
 
 // --- SHIP-151: the administrator's account search -----------------------------------------------
@@ -1092,6 +1345,12 @@ func (h *Handler) ExceptionQueue() http.Handler {
 // behind this to leak.
 type userResponse struct {
 	ID string `json:"id"`
+
+	// Name is what the account holder is called (SHIP-30a), and one of the four terms `q`
+	// matches. Always present, and empty for an account created before `000006` — a name cannot
+	// be backfilled, so the console shows the absence rather than a placeholder that would read
+	// as a name somebody chose.
+	Name string `json:"name"`
 
 	Email string `json:"email"`
 	Phone string `json:"phone"`
@@ -1115,6 +1374,7 @@ type userResponse struct {
 func userFrom(u UserRecord) userResponse {
 	return userResponse{
 		ID:              u.ID.String(),
+		Name:            u.Name,
 		Email:           u.Email,
 		Phone:           u.Phone,
 		Role:            u.Role,
@@ -1131,11 +1391,14 @@ func userFrom(u UserRecord) userResponse {
 // looking is what the least-privileged role exists to be able to do. Acting on what is found is
 // [PermissionUsersRestrict] on a different endpoint (SHIP-161).
 //
-// # Three of the *Done when*'s four terms are served, and the fourth has no column
+// # All four of the *Done when*'s terms are served, and the fourth arrived a wave late
 //
-// "Search users by email, phone, name, and status." `q` matches an email address or a phone number,
-// `status` narrows by standing, and **there is no name anywhere in the schema** — see users.go. The
-// gap is recorded in Docs/11 §4 rather than papered over with a field that would match nothing.
+// "Search users by email, phone, name, and status." `q` matches an email address, a **name** or a
+// phone number, and `status` narrows by standing. The name was the term with no column: nothing in
+// the schema held one and registration never asked, so this shipped serving three and the gap went
+// to Docs/11 §4 rather than being papered over with a field that would have matched nothing.
+// SHIP-30a closed it — `000006` adds `users.name`, registration requires it, and the search matches
+// it. An account registered *before* that migration has no name and is found by its address.
 //
 // # A collection, cursor paged, newest first
 //
@@ -1270,16 +1533,36 @@ func exceptionQueryFrom(r *http.Request) (QueueQuery, error) {
 	if err != nil {
 		return QueueQuery{}, err
 	}
-	return QueueQuery{Limit: limit, After: after}, nil
+
+	// Validated in the service rather than here, so that a task with no request behind it gets
+	// the same refusal. The handler's job is to carry the value across.
+	return QueueQuery{
+		Limit:  limit,
+		After:  after,
+		Ground: ExceptionGround(strings.TrimSpace(values.Get("ground"))),
+	}, nil
 }
 
-// decodeExceptionCursor reads the two fields the queue's ordering is total on.
+// groundNames is [ExceptionGrounds] as strings, for a validation message.
+func groundNames() []string {
+	out := make([]string, 0, len(ExceptionGrounds))
+	for _, g := range ExceptionGrounds {
+		out = append(out, g.String())
+	}
+	return out
+}
+
+// decodeExceptionCursor reads the three fields the queue's ordering is total on.
+//
+// **Three since SHIP-157**, and a cursor issued before the widening decodes to a length error rather
+// than to a wrong page. That is the correct failure: the two-field form named a proof, and a proof
+// identifier means nothing to a union whose entries are keyed by three different kinds of row.
 func decodeExceptionCursor(raw string) (QueueCursor, error) {
 	if raw == "" {
 		return QueueCursor{}, nil
 	}
 
-	fields, err := pagination.Decode(raw, 2)
+	fields, err := pagination.Decode(raw, 3)
 	if err != nil {
 		return QueueCursor{}, err
 	}
@@ -1290,13 +1573,19 @@ func decodeExceptionCursor(raw string) (QueueCursor, error) {
 			"That cursor is not one this endpoint issued.").WithCause(err)
 	}
 
-	proofID, err := uuid.Parse(fields[1])
+	ground := ExceptionGround(fields[1])
+	if !ground.Valid() {
+		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.")
+	}
+
+	entryID, err := uuid.Parse(fields[2])
 	if err != nil {
 		return QueueCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
 			"That cursor is not one this endpoint issued.").WithCause(err)
 	}
 
-	return QueueCursor{RecordedAt: recordedAt, ProofID: proofID}, nil
+	return QueueCursor{RecordedAt: recordedAt, Ground: ground, EntryID: entryID}, nil
 }
 
 // --- SHIP-152: the administrator's job and bid search ---------------------------------------------
@@ -2025,12 +2314,14 @@ type standingResponse struct {
 // Docs/01 §4.6's fourth capability — "restrict or suspend accounts with a recorded reason" — behind
 // [PermissionUsersRestrict], which `moderator` and `owner` hold and `support` does not.
 //
-// # One endpoint for all three standings, including putting an account back
+// # One endpoint for two of the three standings — `suspended` left it at SHIP-166
 //
-// `restricted`, `suspended` and `active` are one vocabulary (`ck_users_status`), the permission to
-// move between them is one permission, and the reason is required in every direction. A separate
-// reinstate endpoint would be a second place for the reason to become optional, and the direction is
-// already in the response and in the entry.
+// `restricted` and `active` are one vocabulary and one permission, and the reason is required in
+// both directions; a separate reinstate endpoint would be a second place for the reason to become
+// optional. **`suspended` is refused here** with `admin_suspension_needs_review`, pointing at
+// `POST /v1/admin/users/{id}/suspension` — Docs/04 §9 requires two administrators for a permanent
+// suspension, and an endpoint that did half of that quietly would be the control's worst failure
+// mode. See enforcement.go.
 //
 // # What enforcement this adds: none, deliberately
 //
@@ -2079,6 +2370,189 @@ func (h *Handler) SetStanding() http.Handler {
 		})
 		return nil
 	})
+}
+
+// --- SHIP-166: two-person review for permanent suspension ----------------------------------------
+
+// suspensionRequestBody is the body of POST /v1/admin/users/{id}/suspension.
+//
+//	{"reason": "Three unresolved safety reports in a fortnight; see note 0198f2c1."}
+//
+// A reason and nothing else. No account identifier — it is in the path — and **no administrator**:
+// who is asking comes from the verified session, because a two-person control whose participants a
+// client could name has one participant.
+type suspensionRequestBody struct {
+	Reason string `json:"reason"`
+}
+
+// suspensionReviewResponse is one review as the console sees it.
+//
+// **Both administrators are on it once a review is approved**, which is the whole record a
+// two-person control produces. `approved_by` is empty while it is pending, rather than absent, so a
+// console that renders without checking does not crash on the ordinary case.
+type suspensionReviewResponse struct {
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+
+	// Status is `pending`, `approved` or `withdrawn`. There is deliberately no `rejected` — see
+	// [ReviewWithdrawn].
+	Status string `json:"status"`
+
+	// RequestedBy is the administrator who made the case.
+	RequestedBy string `json:"requested_by"`
+
+	// Reason is that case, recorded once at the request. The approval has no reason of its own:
+	// two free-text accounts of one decision is two things to reconcile afterwards.
+	Reason string `json:"reason"`
+
+	// ApprovedBy and ApprovedAt are the second administrator. Empty while pending.
+	ApprovedBy string `json:"approved_by"`
+	ApprovedAt string `json:"approved_at"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+func suspensionReviewFrom(r SuspensionReview) suspensionReviewResponse {
+	approvedBy := ""
+	if r.ApprovedBy != uuid.Nil {
+		approvedBy = r.ApprovedBy.String()
+	}
+
+	return suspensionReviewResponse{
+		ID:          r.ID.String(),
+		UserID:      r.UserID.String(),
+		Status:      r.Status.String(),
+		RequestedBy: r.RequestedBy.String(),
+		Reason:      r.Reason,
+		ApprovedBy:  approvedBy,
+		ApprovedAt:  timestamp(r.ApprovedAt),
+		CreatedAt:   timestamp(r.CreatedAt),
+	}
+}
+
+// RequestSuspension handles POST /v1/admin/users/{id}/suspension (SHIP-166).
+//
+// The first half of Docs/04 §9's control: one administrator proposes, with a reason, and **nothing
+// happens to the account**. [PermissionUsersRestrict], which `moderator` and `owner` hold.
+//
+// `202 Accepted` rather than `201`. A review is created, but what the caller asked for — the
+// suspension — has not happened and may not; 202 is the status for "the platform has accepted this
+// and the outcome is elsewhere", and a 201 would read to a console as though the account were gone.
+func (h *Handler) RequestSuspension() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := h.permitted(r, PermissionUsersRestrict)
+		if err != nil {
+			return err
+		}
+
+		userID, err := userIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req suspensionRequestBody
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		review, err := h.suspensions.Request(r.Context(), SuspensionRequest{
+			UserID:  userID,
+			ActorID: grant.Administrator.ID,
+			Reason:  req.Reason,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusAccepted, suspensionReviewFrom(review))
+		return nil
+	})
+}
+
+// ApproveSuspension handles POST /v1/admin/suspensions/{id}/approval (SHIP-166).
+//
+// The second half, and the one the control turns on: a **different** administrator agrees, and the
+// suspension is applied in the same transaction. [PermissionUsersRestrict], the same permission the
+// request needs — the control is that there are two people, not that the second holds something the
+// first does not, and a separate approval permission would make the second signature a role rather
+// than a review.
+//
+// `admin_same_administrator` is what the requester gets back if they approve their own request. The
+// service refuses it and so does `ck_suspension_reviews_two_people`; this is the message.
+func (h *Handler) ApproveSuspension() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := h.permitted(r, PermissionUsersRestrict)
+		if err != nil {
+			return err
+		}
+
+		reviewID, err := reviewIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		review, err := h.suspensions.Approve(r.Context(), SuspensionApproval{
+			ReviewID: reviewID,
+			ActorID:  grant.Administrator.ID,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, suspensionReviewFrom(review))
+		return nil
+	})
+}
+
+// PendingSuspensions handles GET /v1/admin/suspensions (SHIP-166).
+//
+// **Without this the control does not work.** A second administrator has to be able to find a
+// request they did not make, and a review nobody can see is a review nobody approves — which turns a
+// two-person rule into an account that stays active because the queue was invisible.
+//
+// [PermissionUsersRead], which every role holds including `support`: seeing that a suspension has
+// been proposed is looking, and acting on it is the permission on the other endpoint.
+func (h *Handler) PendingSuspensions() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionUsersRead); err != nil {
+			return err
+		}
+
+		limit, err := pagination.Limit(r.URL.Query().Get("limit"))
+		if err != nil {
+			return err
+		}
+
+		reviews, err := h.suspensions.Pending(r.Context(), limit)
+		if err != nil {
+			return apiError(err)
+		}
+
+		out := make([]suspensionReviewResponse, 0, len(reviews))
+		for _, review := range reviews {
+			out = append(out, suspensionReviewFrom(review))
+		}
+
+		// No cursor. The pending set is bounded by how many accounts are under review at once,
+		// which is a handful rather than a page — see postgres_suspension.go. The envelope is
+		// the standard one either way, so widening it later changes no client.
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, ""))
+		return nil
+	})
+}
+
+// reviewIDFrom reads and parses the {id} path parameter on the suspension routes.
+//
+// A third function beside [jobIDFrom] and [userIDFrom] rather than a shared one, for the reason
+// userIDFrom records: the message names the thing, and "the account id in the path" on a review
+// route sends somebody looking in the wrong place.
+func reviewIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That suspension review id is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
 }
 
 // userIDFrom reads and parses the {id} path parameter on the account routes.
