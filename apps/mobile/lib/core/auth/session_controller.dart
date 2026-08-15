@@ -180,6 +180,12 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
     _refreshKey.settled(null);
 
     if (notifyingPlatform && spent != null && spent.isNotEmpty) {
+      // Everything else the application wants to tell the platform on its way out, given the one
+      // credential that can still authenticate it. See [signOutHooksProvider].
+      for (final hook in ref.read(signOutHooksProvider)) {
+        unawaited(_runHook(hook, spent));
+      }
+
       unawaited(_endPlatformSession(spent));
     }
 
@@ -190,6 +196,16 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
     }
 
     if (ref.mounted) state = const SessionState.signedOut();
+  }
+
+  /// Runs one sign-out hook. Never awaited by the sign-out, never rethrown.
+  Future<void> _runHook(SignOutHook hook, String accessToken) async {
+    try {
+      await hook(accessToken);
+    } catch (_) {
+      // Every hook here is a courtesy — see [signOutHooksProvider]. A failure must not change
+      // whether this device is signed out, and there is nothing a caller could do with it.
+    }
   }
 
   /// Tells the platform this device's session is over. Never awaited, never rethrown.
@@ -299,6 +315,44 @@ class SessionController extends Notifier<SessionState> implements SessionTokens 
         _ => null,
       };
 }
+
+/// Something the application tells the platform on its way out of a session (SHIP-143).
+///
+/// It is handed the **spent access token** for the same reason [SessionEnder] is: the sign-out
+/// clears the in-memory credential, the interceptor reads it at request time rather than at call
+/// time, and a fire-and-forget request dispatched through the ordinary client therefore races that
+/// clear and usually loses — going out with nothing and answering `401`.
+typedef SignOutHook = Future<void> Function(String accessToken);
+
+/// What runs on the way out, beyond ending the session itself.
+///
+/// **Empty by default, and `main.dart` supplies what belongs here.** The same inversion
+/// `queueWatchProvider` and `appPolicyCacheProvider` use, and here it is doing a second job as
+/// well: `Docs/07` §2 forbids `core/auth` knowing about a feature, and push registration lives in
+/// `features/notifications`. `core/auth` declares the shape it needs and the composition root fills
+/// it — which is `CLAUDE.md`'s rule for the Go side ("infrastructure takes a function or an
+/// interface it declares itself, and `cmd/api` supplies the closure") applied on this side of the
+/// wire.
+///
+/// ## Every hook here is a courtesy, and that is a statement about what may go in it
+///
+/// They are dispatched and not awaited, their failures are swallowed, and **nothing about signing
+/// out depends on any of them.** `Docs/07` §3 is explicit that what ends a session is the
+/// server-side revocation and that the device is catching up; a sign-out that left somebody in the
+/// signed-in shell because a train went into a tunnel would be a defect rather than a safeguard.
+///
+/// They are also **not ordered against `POST /v1/auth/logout`**, which is dispatched beside them.
+/// A hook whose request arrives after the revocation commits gets a `401` and achieves nothing.
+/// That is acceptable for exactly the things this is for and would not be for anything else:
+/// `contracts/paths/notifications.yaml` says of the one hook that exists that signing out ends push
+/// delivery whether or not it is called, and that the call "is a courtesy that makes the record
+/// legible; it is not what makes the guarantee hold". **Anything whose correctness depends on
+/// landing does not belong here.**
+///
+/// They run only when the platform is being notified at all — not on the path where a refused
+/// refresh has already told this device the session is over, where the token in hand is one the
+/// platform has just declined.
+final signOutHooksProvider = Provider<List<SignOutHook>>((ref) => const <SignOutHook>[]);
 
 /// The session, as one value the whole app reads.
 ///

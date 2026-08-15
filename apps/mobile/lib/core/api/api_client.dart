@@ -110,6 +110,35 @@ class ApiClient {
     );
   }
 
+  /// A removal the platform answers with `204 No Content` (SHIP-143).
+  ///
+  /// The `DELETE` counterpart of [postNoContent], and it exists for the same two reasons that one
+  /// does. It is state-changing, so it carries an idempotency key and is refused without one
+  /// (SHIP-15) — a phone that retries after a dropped connection must not be told it did something
+  /// wrong the second time. And a `204` through [postJson] would be raised as
+  /// [ApiMalformedResponse]: a success reported as a broken response.
+  ///
+  /// [headers] is for the same one call shape [postNoContent]'s is — a request that has to carry a
+  /// credential this transport will not supply, because the session is in the act of forgetting it.
+  /// `DELETE /v1/notifications/device-tokens/current` is sent on the way out of a session and would
+  /// otherwise race the clear and go out with nothing. See `session_ender.dart`, which argues the
+  /// whole of it, and `push_registration.dart`, which is the second caller of the same argument.
+  Future<void> deleteNoContent(
+    String path, {
+    required String idempotencyKey,
+    Map<String, Object?> headers = const <String, Object?>{},
+  }) async {
+    await _guarded(
+      () => _dio.request<Object?>(
+        path,
+        options: Options(
+          method: 'DELETE',
+          headers: {ApiHeaders.idempotencyKey: idempotencyKey, ...headers},
+        ),
+      ),
+    );
+  }
+
   /// A write whose **status** is the answer, rather than its body (SHIP-125).
   ///
   /// For the sync worker, which needs to know one thing about a queued operation — did the

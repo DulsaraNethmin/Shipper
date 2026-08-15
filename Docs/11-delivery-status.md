@@ -584,6 +584,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 | **SHIP-104** | M3 | The customer awards an offer — a modal naming the **price and the provider being committed to** and what awarding costs, because a mis-tap on a horizontally scrolling row of near-identical cards ends the bidding on a delivery at the wrong price and there is no un-award. The result is **read back with `?status=accepted`** rather than computed from what the award is known to do: `Docs/02` §2 makes status the platform's, and a client that derived it keeps a second copy of the state machine. No server change, no new route — *see below* |
+| **SHIP-143** | M5 | Push registration — and the deregistration **cannot be a listener on the session**, because `signOut` clears the access token before it publishes the state, so the obvious implementation sends a request with no credential and achieves nothing while looking like it worked. `core/auth` grew a `signOutHooksProvider` it fills from `main.dart`, which is `CLAUDE.md`'s composition-root rule on the client side. **The token source is a seam with nothing behind it**: no Firebase project exists and **no ticket anywhere creates one** — *see below* |
 | **SHIP-167a** | M7 | `GET /v1/app/policy` — the unsynced-nudge threshold and the proof compression budget, served beside the build floor and read from configuration on every request. The client half is where the ticket lives: **offline and never-told are two different situations and only the second gets the compiled default**, which is one `if` in `resolveAppPolicy` and the whole of what makes the endpoint reach the devices it exists for. A **budget above `STORAGE_MAX_UPLOAD_BYTES` is refused at startup** — a cross-section rule neither variable is wrong under on its own — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -11890,6 +11891,76 @@ now spelled out. **The general lesson is the one Docs/10 §3.4's pairing rule is
 and a database check that are believed to agree are two checks until something compares them.
 
 **Nothing was needed from `internal/config` by any of the five tickets.**
+
+### SHIP-143 — and the deregistration that cannot work the obvious way
+
+#### The half a plausible implementation gets wrong, and gets wrong silently
+
+"De-registers on sign-out" reads as a listener: watch the session, and when it becomes
+`SessionSignedOut`, send the `DELETE`. **That cannot work.** `SessionController.signOut` clears the
+in-memory access token *before* it publishes the state — `session_ender.dart` documented the same
+race for `POST /v1/auth/logout` and solved it by passing the spent token — so a request fired from a
+listener travels with no credential, meets a `401`, starts a refresh, finds no refresh token either,
+and achieves nothing. One wasted request per sign-out and no deregistration at all.
+
+**And it looks like it works.** Something is sent, a future completes, nothing throws. The only
+assertion that tells the two apart is on the **credential the request carried**, which is what
+`push_registration_test.dart` asserts.
+
+So `core/auth` gained `signOutHooksProvider` — a list of `Future<void> Function(String accessToken)`,
+empty by default, dispatched with the spent token beside the logout. `Docs/07` §2 forbids `core/auth`
+knowing about a feature, so the consuming side declares the shape and `main.dart` supplies the
+closure, which is `CLAUDE.md`'s rule for `cmd/api` applied on this side of the wire.
+
+**Every hook there is a courtesy and the provider's own note says so**, because the mechanism is
+general and the next thing put on it might not be. These are dispatched, unordered against the
+logout, and their failures are swallowed — which is right for this one only because
+`contracts/paths/notifications.yaml` states that signing out ends push delivery whether or not the
+call lands. Anything whose correctness depends on landing does not belong there.
+
+#### The token source is a seam with nothing behind it, and no ticket creates the thing it needs
+
+`Docs/11` §3 already carried the platform half: *"No Firebase project exists, and a service-account
+key is on `CLAUDE.md`'s never-commit list."* The client half is worse — a Flutter app cannot fake its
+way to a token at all, because `firebase_messaging` needs `firebase_core`, which needs a
+`google-services.json` and a `GoogleService-Info.plist` that do not exist, and adding the Gradle
+plugin without the first breaks `make flutter-build` for every other lane. So the dependency is
+**deliberately not in `pubspec.yaml`**.
+
+**Nothing in `Docs/09` creates the Firebase project.** X-1 to X-9 are the D-U-N-S number, the two
+store enrolments, the legal brief, the pilot metro area, the auto-complete decision, the privacy
+policy, the terms and the prohibited-goods list. SHIP-139, SHIP-140, SHIP-143, SHIP-144 and SHIP-145
+all sit behind a project no row anywhere asks anybody to create. It is recorded here and in
+`push_token_source.dart`; it wants an X-row.
+
+**So SHIP-143 is done in reduced form and the reduction is named.** Everything except the token is
+built and demonstrated: both requests, their bodies, their idempotency keys, the credential the
+deregistration carries, when each fires, token rotation, and what happens when the platform answers
+`notifications_no_device_session`. On a device today nothing registers, which is correct — a
+registration with no dispatcher behind it is a row in a table nothing can use — and
+`push_registration_wiring_test.dart` **asserts the absence**, so that supplying a source becomes a
+deliberate change with a test pointing at the one line.
+
+#### The suite was vacuous on its first run, which is the wave-10 fixture lesson arriving again
+
+`currentDevicePlatform()` reads `Platform.isIOS`, and `flutter test` runs on macOS or Linux — so it
+answers `null`, the registrar correctly sends nothing, and **every assertion in the file passed
+against an empty list.** Thirteen green tests testing no behaviour whatsoever.
+
+The fix is the seam every other platform channel in this client already has: the platform is a
+function on `PushRegistrar`, defaulted to the real one and overridden in tests through
+`devicePlatformProvider`. Worth recording because the first version was green, would have been
+reviewed as green, and is exactly the shape wave 10's surviving mutation had — **a fixture that made
+the subject unreachable.**
+
+#### One transport method, and it is the `DELETE` counterpart of one that already existed
+
+`ApiClient.deleteNoContent`, mirroring `postNoContent` including its `headers` parameter and for the
+same two reasons: a `204` read as JSON is raised as `ApiMalformedResponse` — a success reported as a
+broken response — and this is the second call in the application that must carry a credential the
+transport will not supply.
+
+**Nothing was needed from `internal/config`.**
 
 ### SHIP-104 — the one irreversible thing a customer does
 

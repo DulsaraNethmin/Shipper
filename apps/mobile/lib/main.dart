@@ -4,10 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/app.dart';
+import 'package:shipper/core/auth/session_controller.dart';
 import 'package:shipper/core/policy/app_policy_cache.dart';
 import 'package:shipper/core/sync/queue_watch.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 import 'package:shipper/core/version/running_build.dart';
+import 'package:shipper/features/notifications/push_registration.dart';
 
 /// Entry point.
 ///
@@ -51,7 +53,7 @@ Future<void> main() async {
 
   final runningBuild = await RunningBuild.read();
 
-  // Two seams, filled here and nowhere else, for one reason.
+  // Four seams, filled here and nowhere else, for one reason.
   //
   // `queueWatchProvider` is what the pending-updates indicator reads (SHIP-126), and it is empty
   // until it is supplied here. That inversion is deliberate and is SHIP-124's objection kept: the
@@ -65,6 +67,10 @@ Future<void> main() async {
   // every widget test call a plugin with nothing behind it and then make an HTTP request. Without
   // this override the app runs with a gate that can never block, however high the platform raises
   // the floor, and `version_gate_wiring_test.dart` holds it for exactly that reason.
+  //
+  // `appPolicyCacheProvider` is the third (SHIP-167a) and `signOutHooksProvider` the fourth
+  // (SHIP-143). Both are argued where they are filled.
+  //
   // The client policy's cache (SHIP-167a), and the third seam of the same shape — see the note
   // above. `appPolicyCacheProvider` is empty until this line, and an application that never
   // supplies one runs on the compiled four hours and one mebibyte forever, whatever the platform
@@ -81,9 +87,24 @@ Future<void> main() async {
       queueWatchProvider.overrideWith((ref) => ref.watch(syncWorkerProvider)),
       runningBuildProvider.overrideWithValue(runningBuild),
       appPolicyCacheProvider.overrideWithValue(policyCache),
+
+      // SHIP-143's other half. `core/auth` declares the shape and knows nothing about
+      // notifications; this is where the two meet, which is the composition root's whole job.
+      //
+      // The sign-out deregistration cannot be a listener on the session — the access token is
+      // cleared before the state is published, so the request would go out with no credential.
+      // `push_registration.dart` argues it. The **registration** half needs no line here: it is a
+      // listener on `pushRegistrarProvider`, which the line below reads once so that it exists.
+      signOutHooksProvider.overrideWith((ref) => <SignOutHook>[pushDeregistrationHook(ref)]),
     ],
   );
   unawaited(container.read(syncWorkerProvider).start());
+
+  // Reading it is the whole of starting it: the provider installs a listener on the session in its
+  // body, and Riverpod does not build a provider nobody has read. Without this line a signed-in
+  // launch registers nothing and no test fails — the same shape as the two overrides above, which
+  // is why `push_registration_wiring_test.dart` holds this line too.
+  container.read(pushRegistrarProvider);
 
   runApp(UncontrolledProviderScope(container: container, child: const ShipperApp()));
 }
