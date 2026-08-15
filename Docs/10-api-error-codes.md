@@ -57,6 +57,7 @@ them where the call is made, beside the thing the user was trying to do.
 | `admin_job_not_unpublishable` | A job can only be unpublished before it is awarded. Once a provider has committed, ending it is a dispute an administrator resolves — reload the job to see its current status. |
 | `admin_permission_denied` | This administrator account does not have permission to do that. Ask whoever administers the platform if you need it. |
 | `admin_session_expired` | The administrator session has ended, through inactivity or by reaching its maximum length. Sign in again. |
+| `admin_user_standing_unchanged` | This account already has that standing. Reload it — another administrator may have changed it already, and the audit trail will say who. |
 | `bidding_already_bid` | You already have a live offer on this job. Revise or withdraw it rather than placing a second. |
 | `bidding_bid_accepted` | That offer has been accepted. An accepted bid can be neither revised nor withdrawn. |
 | `bidding_bid_closed` | That offer is no longer live, so it can be neither changed nor answered. |

@@ -186,7 +186,7 @@ type adminMutation struct {
 
 // adminMutations is every state-changing administrative action the service serves today.
 //
-// Four, matching the four mutating routes in `cmd/api/routes_golden.txt` under `/v1/admin/`. The
+// Five, matching the five mutating routes in `cmd/api/routes_golden.txt` under `/v1/admin/`. The
 // pairing between this list and the served surface is checked from the other side by
 // TestEveryMutatingAdminRouteIsAudited in cmd/api, which is the only place the route table is
 // visible.
@@ -297,6 +297,32 @@ func adminMutations() []adminMutation {
 					t.Fatalf("unpublishing: status = %d, want 200 (%s)", rec.Code, rec.Body)
 				}
 				return moderator.ID, jobID
+			},
+		},
+		{
+			name:       "changing an account's standing",
+			action:     AuditActionUserStandingChanged,
+			targetType: AuditTargetUser,
+			run: func(t *testing.T, f auditFixture, ready func()) (uuid.UUID, uuid.UUID) {
+				t.Helper()
+
+				moderator, token := f.signedIn(t, "standing@example.com", RoleModerator, "10.0.54.1")
+				userID := newAccount(t, f.pool, "standing-subject@example.com", "+61400540", "provider")
+				ready()
+
+				req := httptest.NewRequest(http.MethodPost,
+					"/v1/admin/users/"+userID.String()+"/standing",
+					strings.NewReader(`{"standing":"suspended","reason":"Repeated no-shows across three jobs."}`))
+				req.SetPathValue("id", userID.String())
+				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+				req.Header.Set("Content-Type", "application/json")
+
+				rec := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.SetStanding()).ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("setting a standing: status = %d, want 200 (%s)", rec.Code, rec.Body)
+				}
+				return moderator.ID, userID
 			},
 		},
 	}
@@ -416,6 +442,7 @@ func TestEveryAuditActionConstantIsInTheCatalogue(t *testing.T) {
 		AuditActionAdministratorSignedIn,
 		AuditActionAdministratorSignedOut,
 		AuditActionJobUnpublished,
+		AuditActionUserStandingChanged,
 	}
 
 	if len(declared) != len(AuditActions) {

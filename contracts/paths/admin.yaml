@@ -2415,3 +2415,204 @@ UnpublishJobResult:
         What was recorded, read back so a console renders what the platform *stored* rather than
         what somebody typed. The two differ by trimming.
       example: Listing offers to transport a live animal, which Docs/05 prohibits.
+
+AdminUserStanding:
+  post:
+    operationId: adminSetUserStanding
+    summary: Restrict, suspend or reinstate an account
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The account whose standing is changing.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    description: |
+      Docs/01 §4.6's fourth administrative capability — "restrict or suspend accounts with a recorded
+      reason" (SHIP-161).
+
+      ## One endpoint for all three standings, reinstatement included
+
+      `active`, `restricted` and `suspended` are one vocabulary, the permission to move between them
+      is one permission, and the reason is required in **every** direction. A separate reinstate
+      endpoint would be a second place for the reason to become optional — and a trail that records a
+      restriction but not its reversal is the one that makes a person look permanently suspect.
+
+      Setting the standing an account already holds is refused (`admin_user_standing_unchanged`)
+      rather than recorded. An entry saying "changed from suspended to suspended" is noise in the one
+      table whose value is that everything in it happened, and the right response is to reload —
+      most often because another administrator got there first, which the audit trail will show.
+
+      ## What each standing does, and where that is enforced
+
+      - **`restricted`** limits the account without ending its access. A restricted provider may sign
+        in and read and **may not bid**; a restricted account can still read the message explaining
+        why it is restricted, which is the point of the standing existing at all.
+      - **`suspended`** disables access. Sign-in is refused, and so is **session refresh** — which is
+        where a suspension actually takes effect, because an access token lives fifteen minutes and
+        deliberately carries no standing so that standing is read fresh.
+      - **`active`** is an ordinary account.
+
+      None of that enforcement is added by this endpoint; it has been in the identity domain since
+      the account model was built. What this adds is the administrative act that sets the column,
+      with the reason and the entry.
+
+      Account standing is **not** provider verification, which is a separate eligibility decision
+      with five states of its own (Docs/04 §4) and its own queue.
+
+      ## Two-person review is not implemented
+
+      Docs/04 §9 asks for "two-person review for permanent account suspension where practical".
+      That is a separate ticket and there is deliberately no half of it here — no pending state and
+      no approval field, because an administrator who sees a "pending approval" that nothing enforces
+      believes there is a control.
+
+      ## Permission
+
+      Needs `users.restrict`, which `moderator` and `owner` hold and **`support` does not**. A
+      support administrator may search accounts and may not change one.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/SetStandingRequest'
+    responses:
+      '200':
+        description: The standing has changed.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/StandingChangeResult'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.restrict`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          There is no such account (`not_found`). Said plainly — the caller is an administrator
+          holding a permission over accounts, so unlike the `404` on dispute intake there is nothing
+          being kept from them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The account already holds that standing (`admin_user_standing_unchanged`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The standing is not one of the three, or the reason records nothing
+          (`validation_failed`, with one `error.details` entry per field).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+SetStandingRequest:
+  type: object
+  additionalProperties: false
+  required: [standing, reason]
+  description: |
+    No account identifier — it is in the path. **No `from`**: what the account currently holds is
+    read under a row lock rather than taken from a console that may have loaded the page five
+    minutes ago.
+  properties:
+    standing:
+      type: string
+      enum: [active, restricted, suspended]
+      description: What the account becomes.
+      example: suspended
+    reason:
+      type: string
+      minLength: 10
+      maxLength: 500
+      description: |
+        Why, measured after trimming. Required in every direction, reinstatement included. Recorded
+        in the audit log, which is append-only.
+      example: Two unresolved no-shows in a fortnight; see the delivery exception queue.
+
+StandingChangeResult:
+  type: object
+  additionalProperties: false
+  required: [user_id, from, to, reason]
+  description: |
+    **Both ends, never just the new one.** A console rendering `restricted` cannot tell a reader
+    whether that was a tightening or a loosening, and the same request performs all three
+    directions.
+  properties:
+    user_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    from:
+      type: string
+      enum: [active, restricted, suspended]
+      description: What the account held, read under the row lock at the moment of the change.
+      example: active
+    to:
+      type: string
+      enum: [active, restricted, suspended]
+      description: What it holds now.
+      example: suspended
+    reason:
+      type: string
+      description: What was recorded, read back after trimming.
+      example: Two unresolved no-shows in a fortnight; see the delivery exception queue.

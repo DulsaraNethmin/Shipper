@@ -1691,3 +1691,159 @@ status="$(curl -s -X POST -o "$WORKDIR/unpub-nokey.json" -w '%{http_code}' \
 ok "and it is refused without an Idempotency-Key — a retry after a dropped connection must not write a second entry into a table nothing can tidy"
 
 admin_clear_limits
+
+# ==========================================================================================
+ticket "SHIP-161  an administrator restricts or suspends an account, and the account loses access"
+
+admin_clear_limits
+
+# **This is the one section in this file that signs a *user* in**, and SHIP-47 limits failed
+# sign-ins per account and per network address — every request in `make verify` arrives from
+# 127.0.0.1, so one address bucket is shared with 40-identity.sh, with every other section and with
+# every previous run. The deliberate 403 below counts against it. Cleared here for the reason
+# 40-identity.sh clears it at the point sign-ins begin: a run that ended part-way through would
+# otherwise leave the bucket full and the *next* run would fail with a 429 that looks like a broken
+# endpoint.
+#
+# `admin_clear_limits` above clears `rl:v1:admin-signin:*`, which is a separate keyspace — an
+# administrator's failures and a user's against one address are separate allowances (see
+# credentials.go). This clears the user one.
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
+# standing <token> <key> <user-id> <body> <name> — one attempt, answering with its status.
+standing() {
+  curl -s -X POST -o "$WORKDIR/stand-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT/v1/admin/users/$3/standing"
+}
+
+# A real registered account, because the second half of this ticket is what happens when it tries to
+# use the platform — and that needs a password the sign-in endpoint will accept.
+stand_email="verify-standing-$$@example.com"
+stand_password="correct-horse-battery-staple"
+status="$(post_json "verify-adm161-register-$$" /v1/auth/register \
+  "{\"email\":\"$stand_email\",\"phone\":\"04195$$\",\"password\":\"$stand_password\",\"role\":\"provider\"}" \
+  "$WORKDIR/standing-user.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/standing-user.json"; fail "could not register the account: $status"; }
+stand_user_id="$(json "$WORKDIR/standing-user.json" '["id"]')"
+
+# --- the permission ---------------------------------------------------------------------------------
+
+stand_reason="Two unresolved no-shows in a fortnight; see the delivery exception queue."
+stand_body="{\"standing\":\"suspended\",\"reason\":\"$stand_reason\"}"
+
+status="$(standing "$unpub_support_token" "verify-adm161-sup-$$" "$stand_user_id" "$stand_body" sup)"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/stand-sup.json"; fail "a support administrator suspended an account and got $status, want 403"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from users where id = '$stand_user_id';")" == "active" ]] \
+  || fail "a refused change altered the account anyway"
+ok "a support administrator may search accounts and may not restrict one — the other half of the same least-privilege split"
+
+# --- a standing the platform does not have, and a reason that records nothing -------------------------
+
+status="$(standing "$unpub_token" "verify-adm161-bad-$$" "$stand_user_id" \
+  '{"standing":"banned","reason":"Repeated policy breaches on delivery."}' bad)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/stand-bad.json"; fail "a standing the platform does not have returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/stand-bad.json")" == *'"standing"'* ]] \
+  || { cat "$WORKDIR/stand-bad.json"; fail "the refusal does not name the field"; }
+
+status="$(standing "$unpub_token" "verify-adm161-noreason-$$" "$stand_user_id" \
+  '{"standing":"suspended","reason":"bad"}' noreason)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/stand-noreason.json"; fail "a reason that records nothing returned $status, want 422"; }
+ok "a standing outside ck_users_status's three and a reason too short to record anything are both refused and name their field"
+
+# --- the account can use the platform, and then cannot ------------------------------------------------
+#
+# **This is the pair no Go test in internal/admin can make.** The domain writes a column; whether a
+# suspended account can still sign in is internal/identity's code, and the two only meet in the
+# running service.
+
+status="$(post_json "verify-adm161-login1-$$" /v1/auth/login \
+  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-before.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-before.json"; fail "the account could not sign in before being suspended ($status)"; }
+stand_refresh="$(json "$WORKDIR/stand-login-before.json" '["refresh_token"]')"
+ok "the account signs in while it is active, which is the precondition the next check needs"
+
+status="$(standing "$unpub_token" "verify-adm161-suspend-$$" "$stand_user_id" "$stand_body" susp)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-susp.json"; fail "suspending returned $status, want 200"; }
+[[ "$(json "$WORKDIR/stand-susp.json" '["from"]')" == "active" ]] \
+  || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account held before"; }
+[[ "$(json "$WORKDIR/stand-susp.json" '["to"]')" == "suspended" ]] \
+  || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account holds now"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from users where id = '$stand_user_id';")" == "suspended" ]] \
+  || fail "the account is not suspended"
+ok "an account is suspended, and the response carries both ends — a console rendering only the new standing cannot tell a tightening from a loosening"
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$stand_user_id' and target_type = 'user'
+      and action = 'user.standing_changed' and actor_id = '$unpub_id'
+      and reason = '$stand_reason'
+      and metadata->>'from' = 'active' and metadata->>'to' = 'suspended';")" == "1" ]] \
+  || fail "the change wrote no audit entry carrying the reason and both ends"
+ok "and the audit entry names the account, the administrator, the reason and both ends of the change"
+
+# The enforcement. Sign-in is refused, and so is refresh — which is where a suspension actually takes
+# effect, because an access token lives fifteen minutes and carries no standing.
+status="$(post_json "verify-adm161-login2-$$" /v1/auth/login \
+  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-after.json")"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/stand-login-after.json"; fail "a suspended account signed in and got $status, want 403"; }
+
+status="$(post_json "verify-adm161-refresh-$$" /v1/auth/refresh \
+  "{\"refresh_token\":\"$stand_refresh\"}" "$WORKDIR/stand-refresh.json")"
+[[ "$status" != "200" ]] \
+  || { cat "$WORKDIR/stand-refresh.json"; fail "a suspended account refreshed its session, so the suspension does not take effect until the token expires"; }
+ok "the suspended account can no longer sign in, and the session it already had cannot be refreshed — 'account access is disabled', on the wire"
+
+# --- a no-op, and putting the account back ------------------------------------------------------------
+
+status="$(standing "$unpub_token" "verify-adm161-noop-$$" "$stand_user_id" "$stand_body" noop)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/stand-noop.json"; fail "setting the standing it already holds returned $status, want 409"; }
+[[ "$(cat "$WORKDIR/stand-noop.json")" == *'admin_user_standing_unchanged'* ]] \
+  || { cat "$WORKDIR/stand-noop.json"; fail "the refusal does not carry the code a console branches on"; }
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log where target_id = '$stand_user_id';")" == "1" ]] \
+  || fail "a no-op wrote a second entry, in a table whose value is that everything in it happened"
+ok "setting the standing an account already holds is refused rather than recorded — an entry saying suspended to suspended is noise in the one table that must be all signal"
+
+status="$(standing "$unpub_token" "verify-adm161-reinstate-$$" "$stand_user_id" \
+  '{"standing":"active","reason":"No-shows explained and evidenced; access restored after review."}' back)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-back.json"; fail "reinstating returned $status, want 200"; }
+[[ "$(json "$WORKDIR/stand-back.json" '["from"]')" == "suspended" ]] \
+  || { cat "$WORKDIR/stand-back.json"; fail "the reinstatement does not say what the account held"; }
+
+status="$(post_json "verify-adm161-login3-$$" /v1/auth/login \
+  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-back.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-back.json"; fail "a reinstated account cannot sign in ($status)"; }
+ok "and reinstatement is the same endpoint, the same permission and the same audit action — a trail recording a restriction but not its reversal makes a person look permanently suspect"
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$stand_user_id' and action = 'user.standing_changed';")" == "2" ]] \
+  || fail "the reinstatement is not on the trail beside the suspension"
+
+# `restricted` is the limited half, and it is not `suspended`: a restricted account may still sign
+# in and read, which is the point — somebody who cannot sign in cannot read why they are restricted.
+status="$(standing "$unpub_token" "verify-adm161-restrict-$$" "$stand_user_id" \
+  '{"standing":"restricted","reason":"Insurance certificate expired; bidding paused until renewed."}' restr)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/stand-restr.json"; fail "restricting returned $status, want 200"; }
+
+status="$(post_json "verify-adm161-login4-$$" /v1/auth/login \
+  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-restr.json")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/stand-login-restr.json"; fail "a restricted account cannot sign in ($status); restricted is limited access, not disabled access"; }
+ok "a restricted account still signs in and a suspended one does not — 'limited or disabled' is two standings, and an account that cannot sign in cannot read why it is restricted"
+
+status="$(standing "$unpub_token" "verify-adm161-missing-$$" \
+  "$(uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')" "$stand_body" missing)"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/stand-missing.json"; fail "an account that does not exist returned $status, want 404"; }
+ok "an account that does not exist is a plain 404 — the caller is an administrator, and unlike dispute intake nothing is being kept from them"
+
+admin_clear_limits

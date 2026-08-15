@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -18,7 +19,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 )
 
-// SHIP-160 against a real PostgreSQL, through the real transition guard.
+// SHIP-160 and SHIP-161 against a real PostgreSQL, through the real transition guard.
 //
 // # Why the guard is real here rather than stubbed
 //
@@ -29,7 +30,7 @@ import (
 //
 // # And why the audit entry is checked on every one of them
 //
-// The action takes something away from somebody. SHIP-150's rule is that the entry commits with the
+// Both actions take something away from somebody. SHIP-150's rule is that the entry commits with the
 // action or neither happens, and the direction that matters is the negative one: a refused action
 // must leave **nothing**, in a table with no way to take it back.
 //
@@ -122,6 +123,26 @@ func (f enforcementFixture) unpublish(t *testing.T, jobID uuid.UUID, reason stri
 	return rec.Code, rec.Body.String()
 }
 
+// setStanding drives POST /v1/admin/users/{id}/standing through the guard and the handler.
+func (f enforcementFixture) setStanding(t *testing.T, userID uuid.UUID, standing, reason string) (int, string) {
+	t.Helper()
+
+	body, err := json.Marshal(setStandingRequest{Standing: standing, Reason: reason})
+	if err != nil {
+		t.Fatalf("encoding the request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost,
+		"/v1/admin/users/"+userID.String()+"/standing", strings.NewReader(string(body)))
+	req.SetPathValue("id", userID.String())
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+f.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	RequireAdmin(f.auth)(f.handler.SetStanding()).ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
 // statusOf reads a job's current status.
 func statusOf(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) string {
 	t.Helper()
@@ -132,6 +153,18 @@ func statusOf(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) string {
 		t.Fatalf("reading the status of %s: %v", jobID, err)
 	}
 	return status
+}
+
+// standingOf reads an account's current standing.
+func standingOf(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) string {
+	t.Helper()
+
+	var standing string
+	if err := pool.QueryRow(t.Context(),
+		`SELECT status FROM users WHERE id = $1`, userID).Scan(&standing); err != nil {
+		t.Fatalf("reading the standing of %s: %v", userID, err)
+	}
+	return standing
 }
 
 // entriesFor is every audit entry naming this target, newest first.
@@ -428,6 +461,204 @@ func TestSupportMayOpenAJobAndMayNotRemoveOne(t *testing.T) {
 	}
 }
 
+// --- SHIP-161 ------------------------------------------------------------------------------------
+
+// TestSuspendingAnAccountRecordsBothEndsAndWhy is SHIP-161's *Done when*.
+//
+// "Account access is limited or disabled with a recorded reason." The column is `users.status`,
+// which has existed since `000002`; what this ticket adds is the administrative act, the reason and
+// the entry.
+//
+// **Both ends are recorded, never just the new one.** `users` keeps no version of its own and the
+// trail is append-only, so an entry saying only "restricted" could never afterwards be joined to
+// what the account held before.
+func TestSuspendingAnAccountRecordsBothEndsAndWhy(t *testing.T) {
+	f := newEnforcementFixture(t, RoleModerator)
+	userID := newAccount(t, f.pool, "susp-161a@example.com", "+61400161a", "provider")
+
+	const reason = "Two unresolved no-shows in a fortnight; see the delivery exception queue."
+
+	status, body := f.setStanding(t, userID, "suspended", reason)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", status, body)
+	}
+
+	var got standingResponse
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decoding the response: %v (%s)", err, body)
+	}
+	if got.From != "active" || got.To != "suspended" {
+		t.Errorf("the response says %q → %q, want active → suspended; a console rendering only "+
+			"the new standing cannot tell a tightening from a loosening", got.From, got.To)
+	}
+
+	if s := standingOf(t, f.pool, userID); s != "suspended" {
+		t.Fatalf("the account is %q, want suspended", s)
+	}
+
+	entries := entriesFor(t, f.pool, userID)
+	if len(entries) != 1 {
+		t.Fatalf("the account has %d audit entries, want exactly 1", len(entries))
+	}
+	e := entries[0]
+	if e.Action != AuditActionUserStandingChanged.String() {
+		t.Errorf("action = %q, want %q", e.Action, AuditActionUserStandingChanged)
+	}
+	if e.TargetType != AuditTargetUser {
+		t.Errorf("target_type = %q, want %q — a customer is not an administrator, and one target "+
+			"kind for both would make 'everything done to this administrator' return customers",
+			e.TargetType, AuditTargetUser)
+	}
+	if e.Reason == nil || *e.Reason != reason {
+		t.Errorf("the entry's reason is %v, want %q", e.Reason, reason)
+	}
+	if e.Metadata["from"] != "active" || e.Metadata["to"] != "suspended" {
+		t.Errorf("metadata = %v, want both ends of the change", e.Metadata)
+	}
+}
+
+// TestRestrictingAndThenReinstatingIsOneEndpointAndOneAction.
+//
+// Reinstatement is the same route, the same permission and the same audit action with the direction
+// in its metadata. A separate reinstate endpoint would be a second place for the reason to become
+// optional — and the trail that records a restriction but not its reversal is the one that makes a
+// person look permanently suspect.
+func TestRestrictingAndThenReinstatingIsOneEndpointAndOneAction(t *testing.T) {
+	f := newEnforcementFixture(t, RoleModerator)
+	userID := newAccount(t, f.pool, "reinst-161b@example.com", "+61400161b", "provider")
+
+	if status, body := f.setStanding(t, userID, "restricted",
+		"Insurance certificate expired; bidding paused until renewed."); status != http.StatusOK {
+		t.Fatalf("restricting: status = %d, want 200 (%s)", status, body)
+	}
+	if s := standingOf(t, f.pool, userID); s != "restricted" {
+		t.Fatalf("the account is %q, want restricted", s)
+	}
+
+	if status, body := f.setStanding(t, userID, "active",
+		"Renewed certificate received and checked; restriction lifted."); status != http.StatusOK {
+		t.Fatalf("reinstating: status = %d, want 200 (%s)", status, body)
+	}
+	if s := standingOf(t, f.pool, userID); s != "active" {
+		t.Fatalf("the account is %q, want active", s)
+	}
+
+	entries := entriesFor(t, f.pool, userID)
+	if len(entries) != 2 {
+		t.Fatalf("the account has %d audit entries, want 2", len(entries))
+	}
+	for _, e := range entries {
+		if e.Action != AuditActionUserStandingChanged.String() {
+			t.Errorf("action = %q, want %q — one action for every direction, so that "+
+				"'what has happened to this account's standing' is one filter",
+				e.Action, AuditActionUserStandingChanged)
+		}
+		if e.Reason == nil || *e.Reason == "" {
+			t.Error("a standing change was recorded with no reason; reinstatement needs one too")
+		}
+	}
+
+	// Newest first, so this is the reinstatement.
+	if entries[0].Metadata["from"] != "restricted" || entries[0].Metadata["to"] != "active" {
+		t.Errorf("the reinstatement's metadata is %v, want restricted → active", entries[0].Metadata)
+	}
+}
+
+// TestSettingTheStandingAnAccountAlreadyHoldsIsRefused.
+//
+// An entry saying "changed from suspended to suspended" is noise in the one table whose value is
+// that everything in it happened. The console's right response is to reload — most often because
+// another administrator got there first, which the trail will show.
+func TestSettingTheStandingAnAccountAlreadyHoldsIsRefused(t *testing.T) {
+	f := newEnforcementFixture(t, RoleModerator)
+	userID := newAccount(t, f.pool, "noop-161c@example.com", "+61400161c", "customer")
+
+	status, body := f.setStanding(t, userID, "active", "Confirming this account is in good standing.")
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (%s)", status, body)
+	}
+	if !strings.Contains(body, string(CodeUserStandingUnchanged)) {
+		t.Errorf("body = %s, want %q", body, CodeUserStandingUnchanged)
+	}
+	if entries := entriesFor(t, f.pool, userID); len(entries) != 0 {
+		t.Errorf("a no-op wrote %d audit entries", len(entries))
+	}
+}
+
+// TestEveryBadStandingRequestIsRefusedAndNamesItsField.
+//
+// A standing outside `ck_users_status`s three, and a reason that records nothing. Both are 422 in
+// validate.Errors' shape, because both are fields somebody typed.
+func TestEveryBadStandingRequestIsRefusedAndNamesItsField(t *testing.T) {
+	f := newEnforcementFixture(t, RoleModerator)
+
+	for i, tc := range []struct{ name, standing, reason, field string }{
+		{"a standing the platform does not have", "banned", "Repeated policy breaches on delivery.", "standing"},
+		{"no reason at all", "suspended", "", "reason"},
+		{"a reason that records nothing", "suspended", "bad", "reason"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The index rather than the case's own fields, because two of the three differ
+			// only in the reason — and `uq_users_email` refuses the second, which reads as a
+			// failure of the endpoint rather than of the fixture.
+			suffix := strconv.Itoa(i)
+			userID := newAccount(t, f.pool,
+				"bad-standing-"+suffix+"@example.com", "+614001610"+suffix, "customer")
+
+			status, body := f.setStanding(t, userID, tc.standing, tc.reason)
+			if status != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, want 422 (%s)", status, body)
+			}
+			if !strings.Contains(body, `"`+tc.field+`"`) {
+				t.Errorf("the refusal does not name %q: %s", tc.field, body)
+			}
+			if s := standingOf(t, f.pool, userID); s != "active" {
+				t.Errorf("the account is %q, want active — a refused change must not apply", s)
+			}
+			if entries := entriesFor(t, f.pool, userID); len(entries) != 0 {
+				t.Errorf("a refused change wrote %d audit entries", len(entries))
+			}
+		})
+	}
+}
+
+// TestAnAccountThatDoesNotExistIsAPlain404.
+//
+// Disclosed plainly, unlike the 404 on dispute intake. The caller is an administrator holding
+// `users.restrict`, every account is theirs to act on, and there is nothing being kept from them —
+// the disclosure decision on the customer-facing endpoint is about a *customer* learning that
+// somebody else's job exists.
+func TestAnAccountThatDoesNotExistIsAPlain404(t *testing.T) {
+	f := newEnforcementFixture(t, RoleModerator)
+
+	status, body := f.setStanding(t, uuid.New(), "suspended",
+		"Reported for repeated no-shows across three jobs.")
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (%s)", status, body)
+	}
+}
+
+// TestSupportMaySearchAccountsAndMayNotRestrictOne, the other half of the least-privilege control.
+func TestSupportMaySearchAccountsAndMayNotRestrictOne(t *testing.T) {
+	f := newEnforcementFixture(t, RoleSupport)
+	userID := newAccount(t, f.pool, "perm-161d@example.com", "+61400161d", "provider")
+
+	status, body := f.setStanding(t, userID, "suspended",
+		"Reported for repeated no-shows; escalating to a moderator.")
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (%s)", status, body)
+	}
+	if strings.Contains(body, PermissionUsersRestrict.String()) {
+		t.Errorf("the refusal names the permission it wanted: %s", body)
+	}
+	if s := standingOf(t, f.pool, userID); s != "active" {
+		t.Errorf("the account is %q, want active", s)
+	}
+	if entries := entriesFor(t, f.pool, userID); len(entries) != 0 {
+		t.Errorf("a refused change wrote %d audit entries", len(entries))
+	}
+}
+
 // --- the branch three packages of tests had never taken -------------------------------------------
 
 // TestAPrivilegedActionIsRefusedWhenItsAuditEntryCannotBeWritten.
@@ -463,6 +694,8 @@ func TestSupportMayOpenAJobAndMayNotRemoveOne(t *testing.T) {
 // Not merely that an error came back. It asserts the **job did not move** and **no transition was
 // recorded**, which is the actual claim — an implementation that returned the error after committing
 // would pass the first check and fail these.
+//
+// Both actions are covered, because they are two call sites and only one of them can be wrong.
 func TestAPrivilegedActionIsRefusedWhenItsAuditEntryCannotBeWritten(t *testing.T) {
 	f := newEnforcementFixture(t, RoleModerator)
 
@@ -502,6 +735,24 @@ func TestAPrivilegedActionIsRefusedWhenItsAuditEntryCannotBeWritten(t *testing.T
 		if transitions != 0 {
 			t.Errorf("%d cancellation rows survived an unwritable audit trail; the history says "+
 				"the job was removed and nothing says who removed it", transitions)
+		}
+	})
+
+	t.Run("an account's standing is not changed", func(t *testing.T) {
+		userID := newAccount(t, f.pool, "nomut2@example.com", "+61400161m2", "provider")
+
+		_, err := unwritable.SetStanding(t.Context(), StandingCommand{
+			UserID:   userID,
+			ActorID:  f.admin.ID,
+			Standing: StandingSuspended,
+			Reason:   "Repeated policy breaches across three deliveries.",
+		})
+		if err == nil {
+			t.Fatal("an account was suspended with no audit entry behind it")
+		}
+		if s := standingOf(t, f.pool, userID); s != "active" {
+			t.Errorf("the account is %q, want active — an account disabled with no record of "+
+				"who disabled it is one nobody can justify keeping disabled", s)
 		}
 	})
 }
@@ -568,6 +819,25 @@ func TestATriggerRefusalRollsTheWholeActionBack(t *testing.T) {
 				"job was removed and nothing says who removed it", transitions)
 		}
 	})
+
+	t.Run("an account's standing is not changed", func(t *testing.T) {
+		userID := newAccount(t, f.pool, "trig2@example.com", "+61400161t2", "provider")
+
+		_, err := f.enforce.SetStanding(t.Context(), StandingCommand{
+			UserID:   userID,
+			ActorID:  f.admin.ID,
+			Standing: StandingSuspended,
+			Reason:   "Repeated policy breaches across three deliveries.",
+		})
+		if err == nil {
+			t.Fatal("an account was suspended with no audit entry behind it")
+		}
+
+		if s := standingOf(t, f.pool, userID); s != "active" {
+			t.Errorf("the account is %q, want active — an account disabled with no record of "+
+				"who disabled it is one nobody can justify keeping disabled", s)
+		}
+	})
 }
 
 // TestEnforcementRefusesToBeBuiltWithoutWhatItNeeds.
@@ -610,5 +880,13 @@ func TestEveryEnforcementActionRefusesWhenTheDatabaseIsUnreachable(t *testing.T)
 	})
 	if !errors.Is(unpublishErr, ErrAdminUnavailable) {
 		t.Errorf("unpublishing with no database: %v, want %v", unpublishErr, ErrAdminUnavailable)
+	}
+
+	_, standingErr := enforce.SetStanding(context.Background(), StandingCommand{
+		UserID: uuid.New(), ActorID: uuid.New(), Standing: StandingSuspended,
+		Reason: "Repeated policy breaches across three deliveries.",
+	})
+	if !errors.Is(standingErr, ErrAdminUnavailable) {
+		t.Errorf("changing a standing with no database: %v, want %v", standingErr, ErrAdminUnavailable)
 	}
 }

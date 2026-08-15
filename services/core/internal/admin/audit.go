@@ -193,6 +193,21 @@ const (
 	// Docs/04 §9's controls read. The two are joined by nothing but the job identifier, and a
 	// reader of either should not have to find the other.
 	AuditActionJobUnpublished AuditAction = "job.unpublished"
+
+	// AuditActionUserStandingChanged is an account restricted, suspended or reinstated
+	// (SHIP-161).
+	//
+	// **One action for all three directions, not three.** cmd/api's
+	// TestTheAuditedMutationsAreDistinctActions requires one action per route and there is one
+	// route; more usefully, "what happened to this account's standing" is one question, and a
+	// reader filtering by action should get the whole history of it rather than having to know
+	// which of three verbs to ask for. Which way it moved is in the metadata, as `from` and `to`.
+	//
+	// Reinstating is on the same route and writes the same action for the same reason. Docs/04 §4
+	// treats the standings as one vocabulary; a separate `user.reinstated` would make the trail
+	// answer "was this account ever restricted" differently from "what has this account's
+	// standing been", and only the second is answerable from one filter.
+	AuditActionUserStandingChanged AuditAction = "user.standing_changed"
 )
 
 // AuditActions is the whole catalogue, in the order the constants declare it.
@@ -207,6 +222,7 @@ var AuditActions = []AuditAction{
 	AuditActionAdministratorSignedIn,
 	AuditActionAdministratorSignedOut,
 	AuditActionJobUnpublished,
+	AuditActionUserStandingChanged,
 }
 
 // Valid reports whether a is in the catalogue.
@@ -231,6 +247,14 @@ const (
 	// CHECK constraint: `audit_log` outlives its subjects (Docs/05 §3.1), so a target kind has to
 	// be able to name something the schema no longer has a table for.
 	AuditTargetJob = "job"
+
+	// AuditTargetUser is a `users` row — a customer or a provider (SHIP-161).
+	//
+	// Deliberately distinct from [AuditTargetAdministrator]. They are different account systems
+	// that cannot be exchanged for each other (SHIP-147), and an entry that called both "account"
+	// would make "everything done to this administrator" a search that also returned customers
+	// whose identifiers happened to be asked about.
+	AuditTargetUser = "user"
 )
 
 // AuditActor is who acted.

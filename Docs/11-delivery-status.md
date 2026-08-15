@@ -508,6 +508,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-152** | M6 | `GET /v1/admin/jobs` and `GET /v1/admin/jobs/{id}` — search by description, status and customer; open **any** job with every bid and every recorded transition, read in **one snapshot** so a console cannot render an `Awarded` header above a bid list with nothing accepted. The statements are in `cmd/api` because they span two other domains' tables, which is the line `postgres_users.go` drew. **Bid amounts are here and the budget is not** — Docs/02 §4 names the administrator as bid history's third reader, and leaving the budget out is a *decision* with SHIP-164 named as its revisit — *see below* |
 | **SHIP-165** | M6 | `GET /v1/admin/audit` — the trail SHIP-150 writes, searchable by actor, target, date and **action**. The reader is a **second type** rather than a method on `Auditor`, so one can only append and the other can only read; there is no `UPDATE` or `DELETE` anywhere in the package and no verb but `GET` on the path. The date bounds are **half-open** so consecutive days tile, and the cursor is two-column because every entry in one transaction shares an instant **by design** — *see below* |
 | **SHIP-160** | M6 | `POST /v1/admin/jobs/{id}/unpublish` — the job moves to `Cancelled` through the one guarded transition, with the reason written into **both** `job_status_history` and `audit_log`. **No new domain event and no `internal/notifications` edit**: the transition already emits `job.status_changed`, which `StatusRules` routes to the customer, so "and the customer notified" is a consequence of the move rather than a second announcement of it. An **awarded** job is refused — Docs/02 §2 has no such row — *see below* |
+| **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7a loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -10894,6 +10895,59 @@ It goes into `job_status_history`, which a customer's support conversation reads
 `audit_log`, which Docs/04 §9's controls read. Two tables, two readers, and neither has to find the
 other.
 
+### SHIP-161 — the enforcement already existed; what was missing was the act
+
+`POST /v1/admin/users/{id}/standing`, gated on `users.restrict` — again `moderator` and `owner`, not
+`support`.
+
+#### No migration, and no new enforcement either
+
+`users.status` has existed since `000002` with `ck_users_status CHECK (status IN
+('active','restricted','suspended'))`. And `internal/identity` already refuses a suspended account at
+sign-in **and at refresh** — which is where a suspension actually takes effect, because an access
+token lives fifteen minutes and Docs/10 §5 deliberately keeps standing out of it so that standing is
+read fresh. `User.CanBid` refuses a *restricted* provider, which is the "limited" half.
+
+**So this ticket adds no enforcement and deliberately does not.** A second check inside `admin` would
+be a second authority for one question, in a domain that cannot see the sessions it would need to
+invalidate. What was missing was the administrative act that sets the column, with the reason and the
+entry Docs/01 §4.6 asks for.
+
+That also means the *Done when* — "account access is limited or disabled" — is **only** demonstrable
+in `make verify`. No Go test in `internal/admin` can show it: the domain writes a column, and whether
+a suspended account can still sign in is another domain's code through the real HTTP surface. The
+section registers an account, signs in, suspends it, and shows sign-in refused and the refresh token
+it already held refused too.
+
+#### The recorded reason is in `audit_log`, not in a column on `users`
+
+A `restriction_reason` column was considered and rejected. It would be a **mutable copy of an
+immutable fact**, and the mutable one is the one somebody later corrects — while the append-only
+entry it was copied from says something else. SHIP-165 makes the trail searchable by target, so
+"why is this account suspended" is one query.
+
+#### One endpoint for all three standings, and both ends recorded
+
+Reinstatement is the same route, the same permission and the same audit action with the direction in
+its metadata. A separate reinstate endpoint would be a second place for the reason to become
+optional — and a trail that records a restriction but not its reversal is the one that makes a person
+look permanently suspect.
+
+The standing is read **under a row lock** before it is written, and the entry carries `from` and `to`.
+Without the lock two administrators acting at once both read `active` and both record a move from it,
+one of which never happened. `users` keeps no version of its own, so an entry saying only
+"restricted" could never afterwards be joined to what the account held before.
+
+A no-op is **refused**, not recorded: an entry saying "changed from suspended to suspended" is noise
+in the one table whose value is that everything in it happened.
+
+#### Two-person review is SHIP-166 and there is deliberately no half of it here
+
+Docs/04 §9 asks for "two-person review for permanent account suspension where practical". Nothing
+below anticipates it — no pending state, no approval column — because a half-built approval is worse
+than none: an administrator who sees a "pending approval" that nothing enforces believes there is a
+control.
+
 #### The mutation, run, and what it found about the instrument
 
 **Make one of the new privileged actions ignore the error from `Auditor.Record`, and confirm a test
@@ -10924,7 +10978,7 @@ Restored by `cp` from a copy taken before the mutation, confirmed by `shasum`
 (`5aa5487a3d8816361bdd337f2fdd4545b48f4a6f`) and by there being no `MUTATION` marker left in the
 file. **Not** by `git checkout`, which on an untracked file would have deleted it outright.
 
-**Nothing was needed from `internal/config`.**
+**Nothing was needed from `internal/config` by either ticket.**
 
 
 ## 4. Partly done — do not treat these as finished

@@ -193,6 +193,22 @@ func init() {
 
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/admin/users/{id}/standing",
+			Group:   GroupV1,
+
+			// RequireAdmin is the credential; `users.restrict` is the permission (SHIP-148,
+			// SHIP-161). `support` holds `users.read` and not this one.
+			//
+			// A named sub-resource rather than PATCH on the account, because the only field an
+			// administrator may set is this one — the role is fixed at registration by trigger
+			// (SHIP-45) and the contact details are the account holder's. A PATCH would invite
+			// a body that grows keys.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).SetStanding() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
 
@@ -300,7 +316,7 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin audit trail: " + err.Error())
 	}
 
-	// SHIP-160. It takes the same lifecycle adapter the dispute workflow does — one
+	// SHIP-160, SHIP-161. It takes the same lifecycle adapter the dispute workflow does — one
 	// `admin.Jobs` implementation with a method per move this domain needs, rather than one per
 	// caller — plus the auditor built above, so every action it performs shares the clock the
 	// rest of the transaction uses.

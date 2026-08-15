@@ -281,7 +281,7 @@ var (
 			"the platform if you need it.")
 )
 
-// The sentinels the administrative outcomes of Docs/04 §6 raise (SHIP-160).
+// The sentinels the administrative outcomes of Docs/04 §6 raise (SHIP-160, SHIP-161).
 //
 // A third block, because they are a third subject: the first is a dispute a customer raised, the
 // second is who may be here at all, and these are an administrator acting on somebody else's job or
@@ -327,13 +327,32 @@ var (
 	// who removed it, rather than offer a different action. It is the ordinary outcome of two
 	// moderators reading the same queue.
 	ErrJobAlreadyUnpublished = errors.New("admin: this job has already been unpublished")
+
+	// ErrUserNotFound means no account with that identifier exists.
+	//
+	// **Disclosed plainly, unlike [ErrJobNotFound].** The caller is an authenticated
+	// administrator holding `users.restrict`, every account is theirs to act on, and there is
+	// nothing here being kept from them — the 404 on dispute intake is a customer being told
+	// nothing about somebody else's job, which is a different question with a different asker.
+	ErrUserNotFound = errors.New("admin: no such account")
+
+	// ErrStandingUnrecognised means a standing outside `ck_users_status`s three.
+	ErrStandingUnrecognised = errors.New("admin: that is not an account standing")
+
+	// ErrStandingUnchanged means the account already holds the standing it was being moved to.
+	//
+	// Refused rather than recorded. An entry saying "changed from suspended to suspended" is
+	// noise in the one table whose value is that everything in it happened, and the console's
+	// right response is to reload — most often because another administrator got there first.
+	ErrStandingUnchanged = errors.New("admin: that account already holds that standing")
 )
 
-// The error codes the administrative outcomes answer with (SHIP-160).
+// The error codes the administrative outcomes answer with (SHIP-160, SHIP-161).
 //
-// Two, and each earns its place by leading somewhere different in the console: raise a dispute
-// instead, or reload and see who got there first. Everything else this action can refuse is already
-// served by a code that exists — a missing reason is `validation_failed` with the field named.
+// Three, and each earns its place by leading somewhere different in the console: raise a dispute
+// instead, reload and see who got there first, reload and see the current standing. Everything else
+// these actions can refuse is already served by a code that exists — a missing reason is
+// `validation_failed` with the field named, and an account that does not exist is `not_found`.
 var (
 	// CodeJobNotUnpublishable is returned when Docs/02 §2 permits no move to 'Cancelled'.
 	//
@@ -352,4 +371,12 @@ var (
 	// answer the second one gets.
 	CodeJobAlreadyUnpublished = httpx.RegisterCode("admin_job_already_unpublished",
 		"This job has already been unpublished. Reload it to see who removed it and why.")
+
+	// CodeUserStandingUnchanged is returned when the account already holds that standing.
+	//
+	// 409 for the same reason, and a distinct code because an administrator seeing it has
+	// learned something specific: somebody else has already acted, and the trail will say who.
+	CodeUserStandingUnchanged = httpx.RegisterCode("admin_user_standing_unchanged",
+		"This account already has that standing. Reload it — another administrator may have "+
+			"changed it already, and the audit trail will say who.")
 )

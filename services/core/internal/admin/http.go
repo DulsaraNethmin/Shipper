@@ -97,8 +97,8 @@ type HandlerServices struct {
 	// Trail is the audit log viewer (SHIP-165).
 	Trail *AuditTrail
 
-	// Enforcement is the administrative outcomes of Docs/04 §6 — unpublishing a
-	// policy-breaching job (SHIP-160).
+	// Enforcement is the administrative outcomes of Docs/04 §6 — unpublishing a job
+	// (SHIP-160) and changing an account's standing (SHIP-161).
 	Enforcement *Enforcement
 }
 
@@ -144,9 +144,9 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		return nil, errors.New("admin: a handler needs the audit trail reader")
 	}
 	if s.Enforcement == nil {
-		// SHIP-160. The same argument again, and it is sharpest here: this is the endpoint
-		// that takes something away from somebody, and a nil discovered at it is a nil
-		// discovered while a moderator is trying to remove a policy breach.
+		// SHIP-160, SHIP-161. The same argument again, and it is sharpest here: these are the
+		// two endpoints that take something away from somebody, and a nil discovered at the
+		// first one is a nil discovered while a moderator is trying to remove a policy breach.
 		return nil, errors.New("admin: a handler needs the enforcement service")
 	}
 	if log == nil {
@@ -537,6 +537,20 @@ func apiError(err error) error {
 		// rather than a bare 400. Docs/10 §4.6: a client should be told which field, and this
 		// is a field somebody typed.
 		return fieldProblem("reason", err)
+
+	case errors.Is(err, ErrUserNotFound):
+		// Disclosed plainly. The caller is an administrator holding a permission over accounts,
+		// and unlike the 404 on dispute intake there is nothing here being kept from them.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such account.").WithCause(err)
+
+	case errors.Is(err, ErrStandingUnrecognised):
+		return fieldProblem("standing", fmt.Errorf(
+			"that is not an account standing; use one of %s", strings.Join(standingNames(), ", ")))
+
+	case errors.Is(err, ErrStandingUnchanged):
+		return httpx.NewError(http.StatusConflict, CodeUserStandingUnchanged,
+			"This account already has that standing.").WithCause(err)
 
 	case errors.Is(err, ErrJobNotUnpublishable):
 		return httpx.NewError(http.StatusConflict, CodeJobNotUnpublishable,
@@ -1870,7 +1884,7 @@ func decodeAuditCursor(raw string) (AuditCursor, error) {
 	return AuditCursor{CreatedAt: createdAt, EntryID: entryID}, nil
 }
 
-// --- SHIP-160: the administrative outcomes of Docs/04 §6 ------------------------------------------
+// --- SHIP-160 and SHIP-161: the administrative outcomes of Docs/04 §6 -----------------------------
 
 // unpublishJobRequest is the body of POST /v1/admin/jobs/{id}/unpublish.
 //
@@ -1959,4 +1973,104 @@ func (h *Handler) UnpublishJob() http.Handler {
 		})
 		return nil
 	})
+}
+
+// setStandingRequest is the body of POST /v1/admin/users/{id}/standing.
+//
+//	{"standing": "restricted", "reason": "Two unresolved no-shows in a fortnight."}
+//
+// No account identifier — it is in the path. No `from`: what the account currently holds is read
+// under a row lock rather than taken from a console that may have loaded the page five minutes ago.
+type setStandingRequest struct {
+	Standing string `json:"standing"`
+	Reason   string `json:"reason"`
+}
+
+// standingResponse is what changed.
+//
+// **Both ends, never just the new one.** A console rendering "restricted" cannot tell a reader
+// whether that was a tightening or a loosening, and the same request is used for all three
+// directions — so the response says where the account was as well as where it is.
+type standingResponse struct {
+	UserID string `json:"user_id"`
+
+	From string `json:"from"`
+	To   string `json:"to"`
+
+	Reason string `json:"reason"`
+}
+
+// SetStanding handles POST /v1/admin/users/{id}/standing (SHIP-161).
+//
+// Docs/01 §4.6's fourth capability — "restrict or suspend accounts with a recorded reason" — behind
+// [PermissionUsersRestrict], which `moderator` and `owner` hold and `support` does not.
+//
+// # One endpoint for all three standings, including putting an account back
+//
+// `restricted`, `suspended` and `active` are one vocabulary (`ck_users_status`), the permission to
+// move between them is one permission, and the reason is required in every direction. A separate
+// reinstate endpoint would be a second place for the reason to become optional, and the direction is
+// already in the response and in the entry.
+//
+// # What enforcement this adds: none, deliberately
+//
+// `identity` already refuses a suspended account at sign-in and at refresh, and a restricted
+// provider at bidding. This is the administrative act that sets the column those checks read — see
+// enforcement.go. A second check inside `admin` would be a second authority for one question.
+//
+// # POST rather than PATCH, and standing rather than the account
+//
+// PATCH on `/v1/admin/users/{id}` would invite a body that sets several fields, and the only field
+// an administrator may set is this one — a role is fixed at registration by trigger, and an address
+// is the account holder's. A named sub-resource says what the endpoint does and cannot grow into a
+// general account editor by somebody adding a key.
+func (h *Handler) SetStanding() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := h.permitted(r, PermissionUsersRestrict)
+		if err != nil {
+			return err
+		}
+
+		userID, err := userIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req setStandingRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		change, err := h.enforce.SetStanding(r.Context(), StandingCommand{
+			UserID:   userID,
+			ActorID:  grant.Administrator.ID,
+			Standing: UserStanding(strings.TrimSpace(req.Standing)),
+			Reason:   req.Reason,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, standingResponse{
+			UserID: change.UserID.String(),
+			From:   change.From.String(),
+			To:     change.To.String(),
+			Reason: strings.TrimSpace(req.Reason),
+		})
+		return nil
+	})
+}
+
+// userIDFrom reads and parses the {id} path parameter on the account routes.
+//
+// A second function rather than a rename of [jobIDFrom], because the message names the thing: a
+// console sending a malformed identifier should be told which one, and "the job id in the path" on
+// an account route sends somebody looking in the wrong place.
+func userIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The account id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
 }
