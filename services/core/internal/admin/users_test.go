@@ -23,12 +23,14 @@ import (
 // a `WHERE` clause, and a mocked store would be a test of a slice filter written twice. `citext` on
 // the address, the LIKE escaping and the two-column cursor are all PostgreSQL behaviours.
 //
-// # The *Done when* is four terms and one of them has nothing behind it
+// # The *Done when* is four terms and all four are exercised
 //
-// "Search users by email, phone, name, and status." Email, phone and status are exercised below.
-// **Name is not, because no column holds one** — see users.go and Docs/11 §4. A test that searched
-// for a name would have to assert that nothing comes back, which reads as a passing test of a
-// working feature and is the opposite of recording the gap.
+// "Search users by email, phone, name, and status." Email, phone and status were exercised from the
+// first commit; **name had no column** and this file said so, with a note that a test searching for
+// one "would have to assert that nothing comes back, which reads as a passing test of a working
+// feature". SHIP-30a added the column, and [TestTheAccountSearchFindsByName] is that test written
+// the way round it should be — including the account with **no** name, which is what the note was
+// really protecting.
 
 // aUser inserts an account directly.
 //
@@ -116,6 +118,105 @@ func emailsOf(page pageEnvelope[userResponse]) []string {
 		out = append(out, u.Email)
 	}
 	return out
+}
+
+// aNamedUser is [aUser] for an account that has a name (SHIP-30a).
+//
+// A second helper rather than a sixth parameter on [aUser], and the reason is the property under
+// test: every existing call site inserts an account with **no** name, which is exactly the state of
+// an account created before `000006`. Widening [aUser] would have quietly given every fixture a name
+// and taken that case out of the suite.
+func aNamedUser(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	name, email, phone, role string,
+	standing UserStanding,
+	createdAt time.Time,
+) uuid.UUID {
+	t.Helper()
+
+	id := aUser(t, pool, email, phone, role, standing, createdAt)
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE users SET name = $2 WHERE id = $1`, id, name); err != nil {
+		t.Fatalf("naming %s: %v", email, err)
+	}
+	return id
+}
+
+// TestTheAccountSearchFindsByName is the *Done when*s third term, which had no column until
+// SHIP-30a.
+//
+// # It exercises the statement, not a constant
+//
+// The term goes in through the endpoint and the accounts come back out of PostgreSQL. A test that
+// asserted `searchUsers` mentions `name` would pass with the column in the projection and absent
+// from the predicate, which is the whole failure this closes — wave 10's lesson that a test reading
+// a constant does not test the query that interpolates it.
+//
+// # The nameless account is the case worth having
+//
+// `users.name` is nullable because an account created before `000006` has none, and `NULL ILIKE
+// '%…%'` is NULL rather than false. So an account with no name must be *invisible* to a name term
+// and still findable by its address — both are asserted, because a `coalesce(name,”)` in the
+// predicate would make every nameless account match a term of `”` and a bug in the other direction
+// would make them match nothing at all.
+func TestTheAccountSearchFindsByName(t *testing.T) {
+	f := newSearchFixture(t)
+
+	base := time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC)
+	aNamedUser(t, f.pool, "Hana Osei", "hana@acme.example", "+61400111222",
+		"customer", StandingActive, base)
+	aNamedUser(t, f.pool, "Raj Bhandari", "raj@acme.example", "+61400333444",
+		"provider", StandingActive, base.Add(time.Hour))
+
+	// No name: registered before the column existed.
+	aUser(t, f.pool, "wei@other.example", "+61455000111", "customer", StandingActive,
+		base.Add(2*time.Hour))
+
+	for label, tc := range map[string]struct {
+		term string
+		want []string
+	}{
+		"a given name":         {"Hana", []string{"hana@acme.example"}},
+		"a family name":        {"Bhandari", []string{"raj@acme.example"}},
+		"a whole name":         {"Raj Bhandari", []string{"raj@acme.example"}},
+		"the middle of a name": {"handa", []string{"raj@acme.example"}},
+		"a case-varied name":   {"hANA oSEI", []string{"hana@acme.example"}},
+		"a name nobody has":    {"Zephyrine", nil},
+		"an account with none": {"wei@other.example", []string{"wei@other.example"}},
+	} {
+		t.Run(label, func(t *testing.T) {
+			status, page, body := f.search(t, url.Values{"q": {tc.term}})
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (%s)", status, body)
+			}
+
+			got := emailsOf(page)
+			if len(got) != len(tc.want) {
+				t.Fatalf("searching %q found %v, want %v", tc.term, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("searching %q found %v, want %v", tc.term, got, tc.want)
+					break
+				}
+			}
+		})
+	}
+
+	// The name reaches the wire, which is the other half of "the term answers on the wire": a
+	// predicate that matched and a response that did not carry it would leave the console
+	// unable to show what it had matched on.
+	_, page, _ := f.search(t, url.Values{"q": {"Hana"}})
+	if len(page.Data) != 1 || page.Data[0].Name != "Hana Osei" {
+		t.Errorf("the matched account came back as %+v, want its name on the response", page.Data)
+	}
+
+	_, nameless, _ := f.search(t, url.Values{"q": {"wei@other.example"}})
+	if len(nameless.Data) != 1 || nameless.Data[0].Name != "" {
+		t.Errorf("an account with no name came back as %+v, want an empty name rather than "+
+			"a placeholder", nameless.Data)
+	}
 }
 
 // TestTheAccountSearchFindsByEmailAndByPhone is two of the *Done when*s four terms.
@@ -397,7 +498,7 @@ func TestTheUserSearchResponseCarriesNothingCommercial(t *testing.T) {
 	}
 
 	permitted := map[string]bool{
-		"id": true, "email": true, "phone": true, "role": true, "status": true,
+		"id": true, "name": true, "email": true, "phone": true, "role": true, "status": true,
 		"email_verified_at": true, "phone_verified_at": true, "created_at": true,
 	}
 

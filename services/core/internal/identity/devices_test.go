@@ -91,6 +91,7 @@ func TestSignOutCannotEndSomebodyElsesSession(t *testing.T) {
 	victim := signInAs(t, svc, "Somebody Else's iPhone")
 
 	stranger, err := svc.Register(t.Context(), RegisterCommand{
+		Name:     "Sam Whitlock",
 		Email:    "stranger@example.com",
 		Phone:    "0412 345 679",
 		Password: "correct-horse-battery-staple",
@@ -327,6 +328,7 @@ func TestDevicesListsNobodyElsesSessions(t *testing.T) {
 	mine := signInAs(t, svc, "Mine")
 
 	stranger, err := svc.Register(t.Context(), RegisterCommand{
+		Name:     "Sam Whitlock",
 		Email:    "stranger@example.com",
 		Phone:    "0412 345 679",
 		Password: "correct-horse-battery-staple",
@@ -431,6 +433,7 @@ func TestRevokeDeviceRefusesASessionThatIsNotTheCallers(t *testing.T) {
 	victim := signInAs(t, svc, "Somebody Else's iPhone")
 
 	stranger, err := svc.Register(t.Context(), RegisterCommand{
+		Name:     "Sam Whitlock",
 		Email:    "stranger@example.com",
 		Phone:    "0412 345 679",
 		Password: "correct-horse-battery-staple",

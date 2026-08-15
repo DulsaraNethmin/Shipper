@@ -64,7 +64,7 @@ func errorCode(t *testing.T, rec *httptest.ResponseRecorder) string {
 // declaration is read at wiring time rather than being decoration — so this also proves the
 // class is one the router can serve rather than one it panics on.
 func TestRegisterIsReachableAndPublic(t *testing.T) {
-	rec := postJSON(t, "/v1/auth/register", `{"email":"","phone":"","password":"","role":""}`)
+	rec := postJSON(t, "/v1/auth/register", `{"name":"","email":"","phone":"","password":"","role":""}`)
 
 	if rec.Code == http.StatusNotFound {
 		t.Fatal("POST /v1/auth/register is not served")
@@ -79,7 +79,7 @@ func TestRegisterIsReachableAndPublic(t *testing.T) {
 // accounts or a duplicate-address error for the account just created.
 func TestRegisterRequiresAnIdempotencyKey(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/auth/register",
-		strings.NewReader(`{"email":"a@example.com","phone":"0412345678","password":"a-long-enough-one","role":"customer"}`))
+		strings.NewReader(`{"name":"Alice Nguyen","email":"a@example.com","phone":"0412345678","password":"a-long-enough-one","role":"customer"}`))
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
@@ -99,7 +99,7 @@ func TestRegisterRequiresAnIdempotencyKey(t *testing.T) {
 // is also the property that stops an invalid request costing a connection.
 func TestRegisterValidationIsReportedPerField(t *testing.T) {
 	rec := postJSON(t, "/v1/auth/register",
-		`{"email":"not-an-address","phone":"123","password":"short","role":"driver"}`)
+		`{"name":"","email":"not-an-address","phone":"123","password":"short","role":"driver"}`)
 
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body)
@@ -126,7 +126,7 @@ func TestRegisterValidationIsReportedPerField(t *testing.T) {
 	for _, d := range body.Error.Details {
 		named[d.Field] = true
 	}
-	for _, want := range []string{"email", "phone", "password", "role"} {
+	for _, want := range []string{"name", "email", "phone", "password", "role"} {
 		if !named[want] {
 			t.Errorf("details do not name %q; a client cannot put the message beside the input. Got %v",
 				want, named)
@@ -139,7 +139,7 @@ func TestRegisterValidationIsReportedPerField(t *testing.T) {
 // required" about a field it believes it supplied (Docs/10 §4.3).
 func TestRegisterRefusesAnUnknownField(t *testing.T) {
 	rec := postJSON(t, "/v1/auth/register",
-		`{"email":"a@example.com","phone":"0412345678","pasword":"typo","role":"customer"}`)
+		`{"name":"Alice Nguyen","email":"a@example.com","phone":"0412345678","pasword":"typo","role":"customer"}`)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
@@ -159,7 +159,7 @@ func TestRegisterWithoutADatabaseIsUnavailable(t *testing.T) {
 	deps.Pool = nil
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/auth/register",
-		strings.NewReader(`{"email":"a@example.com","phone":"0412345678","password":"a-long-enough-one","role":"customer"}`))
+		strings.NewReader(`{"name":"Alice Nguyen","email":"a@example.com","phone":"0412345678","password":"a-long-enough-one","role":"customer"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
 
@@ -227,7 +227,7 @@ func TestRequestOTPWithoutADatabaseIsUnavailable(t *testing.T) {
 // panics at startup rather than being served open.
 func TestEveryIdentityRouteIsServedAndPublic(t *testing.T) {
 	for path, body := range map[string]string{
-		"/v1/auth/register":      `{"email":"","phone":"","password":"","role":""}`,
+		"/v1/auth/register":      `{"name":"","email":"","phone":"","password":"","role":""}`,
 		"/v1/auth/login":         `{"email":"","password":"","device_label":""}`,
 		"/v1/auth/verify-email":  `{"token":""}`,
 		"/v1/auth/resend-verify": `{"email":""}`,

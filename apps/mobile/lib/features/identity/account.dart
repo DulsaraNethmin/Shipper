@@ -28,6 +28,14 @@ part 'account.g.dart';
 abstract class Account with _$Account {
   const factory Account({
     required String id,
+
+    /// What the account holder is called, as the platform stored it — trimmed, otherwise
+    /// untouched (SHIP-30a).
+    ///
+    /// Required, because registration now requires it and the contract marks it required on
+    /// every response carrying this shape. An account created before the column existed answers
+    /// with an empty string rather than a `null`, so this stays a decode that cannot throw.
+    required String name,
     required String email,
 
     /// E.164, as the platform normalised it on the way in. Shown back to the person so they can

@@ -37,21 +37,21 @@
 # --- the accounts and the awarded job these checks run against ---------------------------------
 
 status="$(post_json "verify-del-cust-$$" /v1/auth/register \
-  "{\"email\":\"delivery-customer-$$@example.com\",\"phone\":\"04170$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"delivery-customer-$$@example.com\",\"phone\":\"04170$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/delivery-customer.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/delivery-customer.json"; fail "could not register the delivery customer: $status"; }
 delivery_customer_id="$(json "$WORKDIR/delivery-customer.json" '["id"]')"
 delivery_customer_token="$(mint_token "$delivery_customer_id")"
 
 status="$(post_json "verify-del-prov-$$" /v1/auth/register \
-  "{\"email\":\"delivery-provider-$$@example.com\",\"phone\":\"04171$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"delivery-provider-$$@example.com\",\"phone\":\"04171$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/delivery-provider.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/delivery-provider.json"; fail "could not register the delivery provider: $status"; }
 delivery_provider_id="$(json "$WORKDIR/delivery-provider.json" '["id"]')"
 delivery_provider_token="$(mint_token "$delivery_provider_id")"
 
 status="$(post_json "verify-del-other-$$" /v1/auth/register \
-  "{\"email\":\"delivery-other-$$@example.com\",\"phone\":\"04172$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"delivery-other-$$@example.com\",\"phone\":\"04172$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/delivery-other.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/delivery-other.json"; fail "could not register the second provider: $status"; }
 delivery_other_token="$(mint_token "$(json "$WORKDIR/delivery-other.json" '["id"]')")"

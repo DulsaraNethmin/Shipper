@@ -49,6 +49,7 @@ class RegistrationScreen extends ConsumerStatefulWidget {
 
 class _RegistrationScreenState extends ConsumerState<RegistrationScreen> {
   final _form = GlobalKey<FormState>();
+  final _name = TextEditingController();
   final _email = TextEditingController();
   final _phone = TextEditingController();
   final _password = TextEditingController();
@@ -64,6 +65,7 @@ class _RegistrationScreenState extends ConsumerState<RegistrationScreen> {
 
   @override
   void dispose() {
+    _name.dispose();
     _email.dispose();
     _phone.dispose();
     _password.dispose();
@@ -75,6 +77,7 @@ class _RegistrationScreenState extends ConsumerState<RegistrationScreen> {
     if (!(_form.currentState?.validate() ?? false)) return;
 
     final account = await ref.read(signupProvider.notifier).register(
+          name: _name.text.trim(),
           email: _email.text.trim(),
           phone: _phone.text.trim(),
           password: _password.text,
@@ -144,6 +147,25 @@ class _RegistrationScreenState extends ConsumerState<RegistrationScreen> {
                 FailureBanner(failure),
                 const SizedBox(height: 16),
               ],
+              TextFormField(
+                key: const Key('register-name'),
+                controller: _name,
+                autofillHints: const [AutofillHints.name],
+                keyboardType: TextInputType.name,
+                textCapitalization: TextCapitalization.words,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(
+                  labelText: 'Your name',
+                  // What it is *for*, rather than a rule about what it must look like. The
+                  // platform requires the field and bounds its length and imposes no shape on
+                  // it, and a helper promising "first and last name" would be the app inventing
+                  // one (SHIP-30a).
+                  helperText: 'Shown to the people you deal with on a delivery.',
+                ),
+                onChanged: (_) => _clearServerError('name'),
+                validator: (value) => _validate('name', value, Validators.name),
+              ),
+              const SizedBox(height: 16),
               TextFormField(
                 key: const Key('register-email'),
                 controller: _email,

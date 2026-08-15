@@ -1093,6 +1093,12 @@ func (h *Handler) ExceptionQueue() http.Handler {
 type userResponse struct {
 	ID string `json:"id"`
 
+	// Name is what the account holder is called (SHIP-30a), and one of the four terms `q`
+	// matches. Always present, and empty for an account created before `000006` — a name cannot
+	// be backfilled, so the console shows the absence rather than a placeholder that would read
+	// as a name somebody chose.
+	Name string `json:"name"`
+
 	Email string `json:"email"`
 	Phone string `json:"phone"`
 
@@ -1115,6 +1121,7 @@ type userResponse struct {
 func userFrom(u UserRecord) userResponse {
 	return userResponse{
 		ID:              u.ID.String(),
+		Name:            u.Name,
 		Email:           u.Email,
 		Phone:           u.Phone,
 		Role:            u.Role,
@@ -1131,11 +1138,14 @@ func userFrom(u UserRecord) userResponse {
 // looking is what the least-privileged role exists to be able to do. Acting on what is found is
 // [PermissionUsersRestrict] on a different endpoint (SHIP-161).
 //
-// # Three of the *Done when*'s four terms are served, and the fourth has no column
+// # All four of the *Done when*'s terms are served, and the fourth arrived a wave late
 //
-// "Search users by email, phone, name, and status." `q` matches an email address or a phone number,
-// `status` narrows by standing, and **there is no name anywhere in the schema** — see users.go. The
-// gap is recorded in Docs/11 §4 rather than papered over with a field that would match nothing.
+// "Search users by email, phone, name, and status." `q` matches an email address, a **name** or a
+// phone number, and `status` narrows by standing. The name was the term with no column: nothing in
+// the schema held one and registration never asked, so this shipped serving three and the gap went
+// to Docs/11 §4 rather than being papered over with a field that would have matched nothing.
+// SHIP-30a closed it — `000006` adds `users.name`, registration requires it, and the search matches
+// it. An account registered *before* that migration has no name and is found by its address.
 //
 // # A collection, cursor paged, newest first
 //

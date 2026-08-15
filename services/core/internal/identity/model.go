@@ -67,7 +67,17 @@ func (s Status) String() string { return string(s) }
 // and a struct that carries it is a struct that eventually gets logged or serialised — the
 // verification handlers return a User straight to the caller.
 type User struct {
-	ID    uuid.UUID
+	ID uuid.UUID
+
+	// Name is what the account holder is called, collected at registration (SHIP-30a).
+	//
+	// A plain string rather than a pointer, even though `users.name` is nullable. The column is
+	// nullable because accounts created before `000006` have none and a name cannot be
+	// backfilled; the empty string says that just as well, and it says it without every reader
+	// having to nil-check a field it is about to render. The verification timestamps are
+	// pointers for the opposite reason — the zero time is a real instant and "not yet" is not.
+	Name string
+
 	Email string
 	Phone string
 

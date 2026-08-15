@@ -88,11 +88,13 @@ class SignupController extends Notifier<SignupState> {
 
   /// `POST /v1/auth/register` (SHIP-51). Returns the account, or `null` if it was refused.
   Future<Account?> register({
+    required String name,
     required String email,
     required String phone,
     required String password,
   }) async {
     final body = registerBody(
+      name: name,
       email: email,
       phone: phone,
       password: password,
@@ -103,6 +105,7 @@ class SignupController extends Notifier<SignupState> {
       'register',
       body,
       (key) => ref.read(identityRepositoryProvider).register(
+            name: name,
             email: email,
             phone: phone,
             password: password,

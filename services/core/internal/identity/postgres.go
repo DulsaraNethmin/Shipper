@@ -30,7 +30,14 @@ type postgresStore struct{}
 // One constant rather than repeated column lists, so that adding a column to the struct fails
 // to compile in one place rather than silently returning a zero value from three query sites.
 // password_hash is deliberately absent — see the note on User.
-const userColumns = `id, email, phone, role, status, email_verified_at, phone_verified_at, created_at`
+//
+// `coalesce(name, ”)` is the projection's only expression, and it is deliberate rather than
+// convenient. `users.name` is nullable because accounts predating `000006` have none and a name
+// cannot be invented for them, while [User.Name] is a plain string; coalescing here means "no name"
+// arrives as the empty string at every call site rather than as a NULL each of them scans into a
+// pointer and dereferences. Exactly one statement writes the column and it never writes `”`.
+const userColumns = `id, coalesce(name, '') AS name, email, phone, role, status, ` +
+	`email_verified_at, phone_verified_at, created_at`
 
 // insertUser writes a new account and returns it as stored.
 //
@@ -38,10 +45,10 @@ const userColumns = `id, email, phone, role, status, email_verified_at, phone_ve
 // round trip to read back what was just written is a window in which it could have changed.
 func (postgresStore) insertUser(ctx context.Context, r db.Runner, u User, passwordHash string) (User, error) {
 	row := r.QueryRow(ctx, `
-		INSERT INTO users (id, email, phone, password_hash, role, status)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO users (id, name, email, phone, password_hash, role, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING `+userColumns,
-		u.ID, u.Email, u.Phone, passwordHash, u.Role, u.Status)
+		u.ID, u.Name, u.Email, u.Phone, passwordHash, u.Role, u.Status)
 
 	created, err := scanUser(row)
 	if err != nil {
@@ -79,7 +86,7 @@ func (postgresStore) credentialByEmail(ctx context.Context, r db.Runner, email s
 		hash string
 	)
 	if err := row.Scan(
-		&u.ID, &u.Email, &u.Phone, &u.Role, &u.Status,
+		&u.ID, &u.Name, &u.Email, &u.Phone, &u.Role, &u.Status,
 		&u.EmailVerifiedAt, &u.PhoneVerifiedAt, &u.CreatedAt, &hash,
 	); err != nil {
 		return User{}, "", err
@@ -128,7 +135,7 @@ func (postgresStore) userByPhone(ctx context.Context, r db.Runner, phone string)
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	if err := row.Scan(
-		&u.ID, &u.Email, &u.Phone, &u.Role, &u.Status,
+		&u.ID, &u.Name, &u.Email, &u.Phone, &u.Role, &u.Status,
 		&u.EmailVerifiedAt, &u.PhoneVerifiedAt, &u.CreatedAt,
 	); err != nil {
 		return User{}, err

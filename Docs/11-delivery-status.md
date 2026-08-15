@@ -583,6 +583,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
+| **SHIP-30a** | M1 | `users.name` (`000006`, shared block), required by `POST /v1/auth/register`, collected by the app's registration screen, and matched by `GET /v1/admin/users` — so **SHIP-151's fourth term answers on the wire** after a wave partly met. The column is **nullable and that is the decision**: accounts predating it have no name and a name cannot be backfilled, so `NOT NULL` is named as a later tightening rather than faked with a default. **A required field on registration broke 37 `make verify` call sites across nine sections**, which no unit test could have shown — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -11890,6 +11891,86 @@ and a database check that are believed to agree are two checks until something c
 **Nothing was needed from `internal/config` by any of the five tickets.**
 
 
+
+### SHIP-30a — the column that two shipped tickets had assumed
+
+`users` has never held a name. `000002_users` did not have one, registration never asked, and the only
+`name` columns in the whole schema are `admin_users.name` — an administrator's — and
+`driver_assignments.driver_name`, which is captured at assignment and belongs to a job. SHIP-151
+shipped a search whose *Done when* names four terms and could serve three; §4 carried the gap for a
+wave with nobody owning it, which is the one shape §4 says does not close by itself.
+
+Four things now exist: `000006_users_name`, a required `name` on `POST /v1/auth/register`, a name
+field on the app's registration screen, and a third `OR` in `postgresStore.searchUsers`. The last of
+those is one line, which `internal/admin/users.go` predicted a wave ago and got right; what it got
+wrong was the size, because the work was never the search — it was *collecting* a value at the one
+moment somebody is filling in a form.
+
+#### The column is nullable, and that is the decision rather than a shortcut
+
+`NOT NULL` is what "registration requires a name" would look like in the schema and it is not
+available. Every account that already exists predates the column, and **a name cannot be backfilled**
+— that is `Docs/09`'s own reason for putting this row in M1 rather than M6. A `DEFAULT ''` or a
+backfill to 'Unknown' would put a value nobody supplied into the one field whose entire purpose is
+that a person supplied it, and it would destroy the only distinction that matters: "did not say"
+against "said nothing".
+
+So the requirement lives where the value is collected, and the column records that older accounts
+have none. **The tightening is named rather than left to judgement:** once every row has a name,
+`ALTER TABLE users ALTER COLUMN name SET NOT NULL` is one migration in the same block, and
+`select count(*) from users where name is null` is the figure to point at. `TestAnAccountMayHaveNoName`
+is a test of an *absence* of a constraint, written out precisely so that a future `SET NOT NULL`
+fails somewhere a person will read it.
+
+A nameless account is therefore a real state on every surface: the search never matches it by name —
+`NULL ILIKE '%x%'` is NULL, and an OR is decided by its other branches — and its `name` comes back
+empty rather than as a placeholder that would read as a name somebody chose.
+
+#### The floor is one character, and every alternative excludes somebody real
+
+Mononyms exist, single-character given names exist, and every rule anybody has written about a "real
+name" — two words, a space, a minimum length, letters only — refuses a real person with no way to
+override it from a device. The only thing the platform can honestly assert is that the field was
+answered. Where identity itself matters, `Docs/04` §3 asks for a verification *document*, which is a
+different mechanism with a different evidence trail.
+
+The ceiling is 120 runes, on `maxPasswordLength`'s reasoning: an unbounded text field is storage a
+caller controls. `ck_users_name` bounds blankness and nothing else, because `000404` already settled
+where length limits live for this schema — they are validation limits, `Docs/06` §5.3 wants those
+changeable without a deploy, and a CHECK constraint is a migration.
+
+#### `btrim(name, E' \t\r\n')`, because SHIP-162 already paid for the one-argument form
+
+**PostgreSQL's one-argument `btrim` strips spaces only** — not tabs, not newlines. `ck_admin_notes_body`
+was written that way and a body of a single newline satisfied it while `strings.TrimSpace` in the
+service refused the same value. The character set is spelled out here for that reason, and the
+`Docs/10` §3.4 pairing is asserted twice on purpose: `TestASuppliedNameMayNotBeBlank` drives the
+constraint from `migrations`, and `TestTheDatabaseRefusesABlankName` drives it from `internal/identity`
+with the same character set the service trims. Two checks believed to agree are two checks until
+something compares them.
+
+#### What `make verify` found that no unit test could
+
+**A required field on registration broke 37 call sites across nine `scripts/verify/` sections.** Every
+Go test that registers goes through `RegisterCommand`, so the compiler and the fixtures moved
+together; every *harness* section builds its registration body as a JSON string, so all of them kept
+compiling and all of them would have failed at the first request. Seven of the nine files belong to
+other domains' lanes — `50-jobs.sh`, `51-jobs-autocomplete.sh`, `60-fleet.sh`, `61-bidding.sh`,
+`70-delivery.sh`, `80-notifications.sh`, `81-notifier.sh` — and each needed one field added to a
+literal.
+
+**That is the cost of the ticket rather than an accident of it**, and it is worth recording because
+the next required field on a widely-used endpoint will cost the same. The harness has no shared
+"register a user" helper: `post_json` is shared and the *body* is written out at each site. A helper
+would have made this one edit, and it would live in `scripts/verify-foundation.sh`, which is shared —
+so the trade is real in both directions and is left as an observation rather than a change taken from
+a domain branch.
+
+One section's expectation changed rather than its fixture: `40-identity.sh` asserts that an empty
+registration reports every bad field at once, and the count went from four to five.
+
+#### Nothing was needed from `internal/config`
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -11897,7 +11978,7 @@ and a database check that are believed to agree are two checks until something c
 | ~~**SHIP-149**~~ | ~~`audit_log` table, append-only triggers, tests~~ | **Closed.** SHIP-150 built the write helper — see §3. On `7d7caf0` the only `INSERT INTO audit_log` in the repository was four statements in `migrations/schema_test.go`, and no Go code wrote an entry; `internal/admin/audit.go` and `postgres_audit.go` now do, and `migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing that could not be written while there was no Go vocabulary to pair |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | ~~**SHIP-118**~~ | ~~`Delivered` recordable and refused without evidence~~ | **Closed by SHIP-123 — see §3.** `000607` adds `recipient_name` and `delivery_note`, required on `Delivered` and refused on every other milestone, in the domain and in `ck_milestones_delivery_details`. `Docs/01` §4.4's field set is closed end to end |
-| **SHIP-151** | `GET /v1/admin/users` — search by **email**, **phone** and **status**, cursor paged, with the phone term normalised to the stored E.164 form | The **name**. Its *Done when* is "search users by email, phone, name, and status" and **no column anywhere in the schema holds a user's name** — `000002_users` never had one and registration never asks. The only `name` columns are `admin_users.name` and `driver_assignments.driver_name`, and neither is a user's. See below |
+| ~~**SHIP-151**~~ | ~~`GET /v1/admin/users` — search by **email**, **phone** and **status**~~ | **Closed by SHIP-30a — see §3.** `000006` adds `users.name`, registration requires it, and the search matches it, so all four of the *Done when*'s terms answer on the wire. An account created before the migration has no name and is found by its address; a name cannot be backfilled, which is why the closing ticket sits in M1 |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 
 **SHIP-65 has left this table.** Its *Done when* — "returns full job including budget" — was met

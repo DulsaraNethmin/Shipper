@@ -3,10 +3,12 @@ package identity
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
@@ -118,6 +120,7 @@ func (s *recordingTexter) last(t *testing.T) sentText {
 
 func validRegistration() RegisterCommand {
 	return RegisterCommand{
+		Name:     "Alice Nguyen",
 		Email:    "alice@example.com",
 		Phone:    "0412 345 678",
 		Password: "correct-horse-battery-staple",
@@ -176,6 +179,76 @@ func TestRegisterCreatesAnUnverifiedAccount(t *testing.T) {
 	}
 	if emailVerified != nil || phoneVerified != nil {
 		t.Errorf("stored verification = %v/%v, want both null", emailVerified, phoneVerified)
+	}
+}
+
+// TestRegisterStoresTheNameInAColumnOfItsOwn is SHIP-30a's first clause.
+//
+// "Registration requires a name and `users` holds it in a column of its own." The requirement is
+// [TestRegisterValidation]'s four name cases; this is the column, read back through a second
+// connection rather than from RETURNING, because the claim is that the row holds it.
+//
+// The name is asserted **as trimmed**, which is the half worth checking: Normalise runs before
+// Validate, so what reaches the column is what a search will later be matched against. A stored
+// " Alice Nguyen " would be found by nobody typing the name.
+func TestRegisterStoresTheNameInAColumnOfItsOwn(t *testing.T) {
+	svc, pool, _ := newTestService(t)
+
+	cmd := validRegistration()
+	cmd.Name = "  Alice  Nguyen  "
+
+	user, err := svc.Register(t.Context(), cmd)
+	if err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	if user.Name != "Alice  Nguyen" {
+		t.Errorf("returned name = %q, want it trimmed but otherwise untouched", user.Name)
+	}
+
+	var stored string
+	if err := pool.QueryRow(t.Context(),
+		`SELECT name FROM users WHERE id = $1`, user.ID).Scan(&stored); err != nil {
+		t.Fatalf("reading the name back: %v", err)
+	}
+	if stored != "Alice  Nguyen" {
+		t.Errorf("stored name = %q, want %q", stored, "Alice  Nguyen")
+	}
+}
+
+// TestTheDatabaseRefusesABlankName is the Docs/10 §3.4 pairing for the name.
+//
+// The service refuses a blank name and so does `ck_users_name`, and **two checks believed to agree
+// are two checks until something compares them** — SHIP-162's `ck_admin_notes_body` disagreed with
+// `strings.TrimSpace` about a newline for a whole wave. So this drives the constraint directly,
+// past the service, with the same character set the service trims.
+//
+// It is here rather than in `migrations` because the pairing is between *this* validator and that
+// constraint; `migrations/users_name_test.go` asserts the constraint's own behaviour.
+func TestTheDatabaseRefusesABlankName(t *testing.T) {
+	_, pool, _ := newTestService(t)
+
+	for i, blank := range []string{"", " ", "\t", "\n", " \t\r\n "} {
+		id, err := uuid.NewV7()
+		if err != nil {
+			t.Fatalf("generating an id: %v", err)
+		}
+
+		// Address and number are unique per case rather than derived from the identifier: a
+		// UUIDv7 leads with a timestamp, so two generated in one millisecond share their
+		// leading characters and uq_users_phone would refuse the row before ck_users_name saw
+		// it — which is a green test of a different constraint.
+		_, err = pool.Exec(t.Context(), `
+			INSERT INTO users (id, name, email, phone, password_hash, role, status)
+			VALUES ($1, $2, $3, $4, 'not-a-hash', 'customer', 'active')`,
+			id, blank, fmt.Sprintf("blank%d@example.com", i), fmt.Sprintf("+6149010%04d", i))
+		if err == nil {
+			t.Errorf("a name of %q was accepted; the service refuses the same value", blank)
+			continue
+		}
+		if !strings.Contains(err.Error(), "ck_users_name") {
+			t.Errorf("a name of %q was refused by something other than ck_users_name: %v",
+				blank, err)
+		}
 	}
 }
 
@@ -301,7 +374,7 @@ func TestRegisterValidationReportsEveryProblemAtOnce(t *testing.T) {
 	err := RegisterCommand{}.Validate()
 
 	fields := rejectedFields(t, err)
-	for _, want := range []string{"email", "phone", "password", "role"} {
+	for _, want := range []string{"name", "email", "phone", "password", "role"} {
 		if !fields[want] {
 			t.Errorf("an empty registration did not report %q; got %v", want, fields)
 		}
@@ -322,6 +395,15 @@ func TestRegisterValidation(t *testing.T) {
 		"a password of nine":       {func(c *RegisterCommand) { c.Password = strings.Repeat("a", 9) }, "password"},
 		"a password of 129":        {func(c *RegisterCommand) { c.Password = strings.Repeat("a", 129) }, "password"},
 		"a role nobody has":        {func(c *RegisterCommand) { c.Role = "driver" }, "role"},
+
+		// SHIP-30a. Whitespace is the case worth having: Normalise trims before Validate
+		// runs, so a name of three spaces is a *missing* name rather than a three-character
+		// one — which is the same disagreement `ck_users_name` refuses in the database.
+		"no name at all":      {func(c *RegisterCommand) { c.Name = "" }, "name"},
+		"a name of spaces":    {func(c *RegisterCommand) { c.Name = "   " }, "name"},
+		"a name of a tab":     {func(c *RegisterCommand) { c.Name = "\t" }, "name"},
+		"a name of a newline": {func(c *RegisterCommand) { c.Name = "\n" }, "name"},
+		"a name of 121 runes": {func(c *RegisterCommand) { c.Name = strings.Repeat("a", 121) }, "name"},
 	}
 
 	for name, tc := range cases {

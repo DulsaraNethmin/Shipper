@@ -4,22 +4,26 @@
 // administrative *read* over another domain's rows. Docs/09 suggests pulling this forward as a
 // debugging tool, and that is what it is: the screen support opens before anything else.
 //
-// # One clause of the *Done when* has nothing to search
+// # One clause of the *Done when* had nothing to search, and SHIP-30a closed it
 //
-// "Search users by email, phone, name, and status." Three of those four are columns of `users`.
-// **There is no name.** `000002_users` has id, email, phone, password_hash, role, status, the two
-// verification timestamps and the two bookkeeping ones, and nothing anywhere else in the schema
-// holds a person's name against an account — `admin_users.name` is an administrator's and
+// "Search users by email, phone, name, and status." Three of those four were columns of `users` when
+// this shipped and the fourth was not: `000002_users` had id, email, phone, password_hash, role,
+// status, the two verification timestamps and the two bookkeeping ones, and nothing anywhere else in
+// the schema held a person's name against an account — `admin_users.name` is an administrator's and
 // `driver_assignments.driver_name` is a driver's, captured at assignment and belonging to a job.
-// Registration never asks for one (`identity.User` has no such field), so the platform does not know
-// it.
+// Registration never asked for one, so the platform did not know it.
 //
-// **This ticket does not invent one.** `users` is created in the shared migration block (1–99) and
-// Docs/11 §6 strikes SHIP-169 for exactly that reason; a column added from this branch would be a
+// **This ticket did not invent one, and that was right rather than a deferral.** `users` is created
+// in the shared migration block (1–99); a column added from an M6 search branch would have been a
 // shared-surface edit taken unilaterally, and the field belongs to registration rather than to
-// search. So the gap is recorded in Docs/11 §4 as SHIP-118's and SHIP-77's is — the same shape,
-// which §4 already names — and whoever adds a name to registration serves it here in one line: a
-// third OR in [postgresStore.searchUsers].
+// search. The gap went to Docs/11 §4 with no owner — and **§4's own rule is that a gap in that shape
+// does not close by itself**, which is why it became a backlog row instead. SHIP-30a is that row:
+// `000006` adds the column, `identity.RegisterCommand` requires it, and what this file predicted
+// would be needed here — "a third OR in [postgresStore.searchUsers]" — is exactly what it took.
+//
+// The prediction is worth reading beside the outcome. It was right about the search and wrong about
+// the size: the OR is one line, and *collecting* the value was the work, because a name cannot be
+// backfilled and it has to be asked for at the one moment somebody is filling in a form.
 //
 // # Why this domain reads `users` directly
 //
@@ -172,6 +176,15 @@ func (c UserCursor) Zero() bool { return c.UserID == uuid.Nil && c.CreatedAt.IsZ
 // verification queue is SHIP-153.
 type UserRecord struct {
 	ID uuid.UUID
+
+	// Name is what the account holder is called, collected at registration (SHIP-30a).
+	//
+	// Empty for an account created before `000006`, which is a real state rather than a defect:
+	// a name cannot be backfilled, so an older account has none and the console shows it has
+	// none. **A search term never matches an account with no name**, which is the correct
+	// behaviour and is worth stating — `NULL ILIKE '%x%'` is NULL, so those rows simply do not
+	// satisfy the name branch of the predicate.
+	Name string
 
 	Email string
 	Phone string

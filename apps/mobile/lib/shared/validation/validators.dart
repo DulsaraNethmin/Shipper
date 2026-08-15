@@ -46,6 +46,21 @@ abstract final class Validators {
   /// A run of digits, optionally with the country-code `+` in front.
   static final _dialledDigits = RegExp(r'^\+?[0-9]{9,15}$');
 
+  /// A name the app is willing to send (SHIP-30a). Presence, and nothing else.
+  ///
+  /// **It checks that the field was answered and makes no claim about what a name looks like.**
+  /// Every rule anybody has written about a "real name" — two words, a space, letters only, a
+  /// minimum length — excludes somebody real, and a device is the worst place to enforce one:
+  /// there is no over-the-air update path for Dart, so a rule that turns out to be wrong is wrong
+  /// until the next store release. The platform bounds the length (`contracts/paths/identity.yaml`
+  /// says 120) and its `details` land under this input if it is exceeded.
+  ///
+  /// Trimmed before it is judged, because the platform trims before it stores: a name of three
+  /// spaces is a missing name at both ends, and `ck_users_name` refuses it in the database too.
+  static String? name(String? value) {
+    return (value?.trim() ?? '').isEmpty ? 'Enter your name.' : null;
+  }
+
   /// An address the app is willing to send. Deliberately loose.
   ///
   /// It refuses what cannot be an address — nothing before the `@`, nothing after it, no dot in

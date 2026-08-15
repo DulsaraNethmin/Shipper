@@ -8,6 +8,7 @@ part of 'account.dart';
 
 _Account _$AccountFromJson(Map<String, dynamic> json) => _Account(
   id: json['id'] as String,
+  name: json['name'] as String,
   email: json['email'] as String,
   phone: json['phone'] as String,
   role: $enumDecode(
@@ -23,6 +24,7 @@ _Account _$AccountFromJson(Map<String, dynamic> json) => _Account(
 
 Map<String, dynamic> _$AccountToJson(_Account instance) => <String, dynamic>{
   'id': instance.id,
+  'name': instance.name,
   'email': instance.email,
   'phone': instance.phone,
   'role': _$UserRoleEnumMap[instance.role]!,

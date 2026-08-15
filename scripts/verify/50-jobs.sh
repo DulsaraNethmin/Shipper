@@ -24,20 +24,20 @@
 
 jobs_customer_email="job-customer-$$@example.com"
 status="$(post_json "verify-jobs-cust-$$" /v1/auth/register \
-  "{\"email\":\"$jobs_customer_email\",\"phone\":\"04130$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$jobs_customer_email\",\"phone\":\"04130$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/jobs-customer.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-customer.json"; fail "could not register the job customer: $status"; }
 jobs_customer_id="$(json "$WORKDIR/jobs-customer.json" '["id"]')"
 jobs_customer_token="$(mint_token "$jobs_customer_id")"
 
 status="$(post_json "verify-jobs-other-$$" /v1/auth/register \
-  "{\"email\":\"job-other-$$@example.com\",\"phone\":\"04131$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"job-other-$$@example.com\",\"phone\":\"04131$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/jobs-other.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-other.json"; fail "could not register the second customer: $status"; }
 jobs_other_token="$(mint_token "$(json "$WORKDIR/jobs-other.json" '["id"]')")"
 
 status="$(post_json "verify-jobs-prov-$$" /v1/auth/register \
-  "{\"email\":\"job-provider-$$@example.com\",\"phone\":\"04132$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"job-provider-$$@example.com\",\"phone\":\"04132$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/jobs-provider.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-provider.json"; fail "could not register the provider: $status"; }
 jobs_provider_token="$(mint_token "$(json "$WORKDIR/jobs-provider.json" '["id"]')")"
@@ -540,7 +540,7 @@ ok "a mangled cursor and a nonsense limit are refused; an over-large limit is na
 # A customer with no jobs gets an empty array rather than null. A client iterating null breaks the
 # first time a new customer opens the app, and never again in testing.
 status="$(post_json "verify-jobs-fresh-$$" /v1/auth/register \
-  "{\"email\":\"job-fresh-$$@example.com\",\"phone\":\"04133$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"job-fresh-$$@example.com\",\"phone\":\"04133$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/jobs-fresh.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-fresh.json"; fail "could not register a customer with no jobs"; }
 status="$(job_get "$(mint_token "$(json "$WORKDIR/jobs-fresh.json" '["id"]')")" /v1/jobs \

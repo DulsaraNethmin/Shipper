@@ -55,21 +55,21 @@
 # --- the accounts and the job these checks run against -----------------------------------------
 
 status="$(post_json "verify-bid-prov-$$" /v1/auth/register \
-  "{\"email\":\"bid-provider-$$@example.com\",\"phone\":\"04145$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"bid-provider-$$@example.com\",\"phone\":\"04145$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/bid-provider.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-provider.json"; fail "could not register the bidding provider: $status"; }
 bid_provider_id="$(json "$WORKDIR/bid-provider.json" '["id"]')"
 bid_provider_token="$(mint_token "$bid_provider_id")"
 
 status="$(post_json "verify-bid-rival-$$" /v1/auth/register \
-  "{\"email\":\"bid-rival-$$@example.com\",\"phone\":\"04146$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"bid-rival-$$@example.com\",\"phone\":\"04146$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/bid-rival.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-rival.json"; fail "could not register the rival provider: $status"; }
 bid_rival_id="$(json "$WORKDIR/bid-rival.json" '["id"]')"
 bid_rival_token="$(mint_token "$bid_rival_id")"
 
 status="$(post_json "verify-bid-cust-$$" /v1/auth/register \
-  "{\"email\":\"bid-customer-$$@example.com\",\"phone\":\"04147$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"bid-customer-$$@example.com\",\"phone\":\"04147$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/bid-customer.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/bid-customer.json"; fail "could not register the bidding customer: $status"; }
 bid_customer_id="$(json "$WORKDIR/bid-customer.json" '["id"]')"
@@ -1306,14 +1306,14 @@ ticket "SHIP-92  POST /v1/jobs/{id}/award — one bid accepted and the job moved
 # whole of the authorisation, and a section with one customer could not tell "the platform read
 # jobs.customer_id" from "the platform let any credential through".
 status="$(post_json "verify-award-cust-$$" /v1/auth/register \
-  "{\"email\":\"award-customer-$$@example.com\",\"phone\":\"04160$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"award-customer-$$@example.com\",\"phone\":\"04160$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/award-customer.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/award-customer.json"; fail "could not register the awarding customer: $status"; }
 award_customer_id="$(json "$WORKDIR/award-customer.json" '["id"]')"
 award_customer_token="$(mint_token "$award_customer_id")"
 
 status="$(post_json "verify-award-other-$$" /v1/auth/register \
-  "{\"email\":\"award-stranger-$$@example.com\",\"phone\":\"04161$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"award-stranger-$$@example.com\",\"phone\":\"04161$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/award-stranger.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/award-stranger.json"; fail "could not register the stranger: $status"; }
 award_stranger_token="$(mint_token "$(json "$WORKDIR/award-stranger.json" '["id"]')")"
@@ -1628,14 +1628,14 @@ ticket "SHIP-93  the award closes every other live offer, and leaves the already
 #
 # The accounts take 04162 and 04163, which is the 0416x block this file's header allocates to bidding.
 status="$(post_json "verify-sweep-p2-$$" /v1/auth/register \
-  "{\"email\":\"sweep-second-$$@example.com\",\"phone\":\"04162$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"sweep-second-$$@example.com\",\"phone\":\"04162$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/sweep-second.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/sweep-second.json"; fail "could not register the second sweep provider: $status"; }
 sweep_second_id="$(json "$WORKDIR/sweep-second.json" '["id"]')"
 sweep_second_token="$(mint_token "$sweep_second_id")"
 
 status="$(post_json "verify-sweep-p3-$$" /v1/auth/register \
-  "{\"email\":\"sweep-third-$$@example.com\",\"phone\":\"04163$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"sweep-third-$$@example.com\",\"phone\":\"04163$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/sweep-third.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/sweep-third.json"; fail "could not register the third sweep provider: $status"; }
 sweep_third_id="$(json "$WORKDIR/sweep-third.json" '["id"]')"

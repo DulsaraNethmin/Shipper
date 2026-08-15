@@ -1138,18 +1138,23 @@ AdminUsers:
       Docs/01 §4.6's first administrative capability — "search users, jobs, bids, and disputes" —
       in the part of it this ticket builds (SHIP-151). Searching jobs and bids is SHIP-152.
 
-      ## What can be searched, and the one term that cannot
+      ## What can be searched
 
-      `q` matches an **email address or a phone number**, anywhere within either. One parameter for
-      both rather than two, because a support engineer has a string off a ticket and does not always
-      know which it is; a console that made them choose would be asking a question the platform can
-      answer by trying both. `status` narrows to one account standing.
+      `q` matches an **email address, a name or a phone number**, anywhere within any of them. One
+      parameter for all three rather than three, because a support engineer has a string off a
+      ticket and does not always know which it is; a console that made them choose would be asking a
+      question the platform can answer by trying each. `status` narrows to one account standing.
 
-      **There is no search by name, because the platform does not hold one.** `users` has an
-      address, a number, a role, a standing and two verification timestamps, and registration never
-      asks for a person's name — so the ticket's fourth term has no column behind it. This is
-      recorded in `Docs/11` §4 rather than served by a parameter that could only ever match
-      nothing. Whoever adds a name to registration serves it here in one line.
+      **The name arrived a wave after the rest of this endpoint.** `users` held an address, a
+      number, a role, a standing and two verification timestamps, and registration never asked for a
+      person's name — so the ticket's fourth term had no column and the gap was recorded in
+      `Docs/11` §4 rather than served by a parameter that could only ever match nothing. SHIP-30a
+      added the column and made registration require it, and this endpoint serves all four terms.
+
+      **An account created before that migration has no name**, which is a real state rather than a
+      defect: a name cannot be backfilled. Such an account is never matched by a name term — it is
+      found by its address or its number — and its `name` comes back empty rather than as a
+      placeholder that would read as a name somebody chose.
 
       ## What an account carries here, and what it never will
 
@@ -1184,9 +1189,9 @@ AdminUsers:
         in: query
         required: false
         description: |
-          Matches an email address or a phone number, anywhere within either. Absent or empty
-          matches every account, which with `status` is how "list the suspended accounts" is
-          expressed.
+          Matches an email address, a name or a phone number, anywhere within any of them. Absent
+          or empty matches every account, which with `status` is how "list the suspended accounts"
+          is expressed.
 
           **It is a string, not a pattern.** `%` and `_` are matched literally rather than as
           wildcards, so a search box cannot be turned into a full read of the table.
@@ -1314,6 +1319,7 @@ UserAccount:
   additionalProperties: false
   required:
     - id
+    - name
     - email
     - phone
     - role
@@ -1329,6 +1335,13 @@ UserAccount:
       type: string
       format: uuid
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    name:
+      type: string
+      description: |
+        What the account holder is called, collected at registration (SHIP-30a) and one of the four
+        terms `q` matches. Always present, and **empty for an account created before `000006`** —
+        a name cannot be backfilled, so the console shows the absence.
+      example: Hana Osei
     email:
       type: string
       format: email

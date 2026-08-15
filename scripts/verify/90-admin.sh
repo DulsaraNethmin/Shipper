@@ -67,21 +67,21 @@ ok "DELETE is refused, so the trail survives a psql prompt"
 # which is a confusing way to be told that two files disagree about a number.
 
 status="$(post_json "verify-adm-cust-$$" /v1/auth/register \
-  "{\"email\":\"dispute-customer-$$@example.com\",\"phone\":\"04190$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"dispute-customer-$$@example.com\",\"phone\":\"04190$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/dispute-customer.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/dispute-customer.json"; fail "could not register the dispute customer: $status"; }
 dispute_customer_id="$(json "$WORKDIR/dispute-customer.json" '["id"]')"
 dispute_customer_token="$(mint_token "$dispute_customer_id")"
 
 status="$(post_json "verify-adm-prov-$$" /v1/auth/register \
-  "{\"email\":\"dispute-provider-$$@example.com\",\"phone\":\"04191$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"dispute-provider-$$@example.com\",\"phone\":\"04191$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/dispute-provider.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/dispute-provider.json"; fail "could not register the dispute provider: $status"; }
 dispute_provider_id="$(json "$WORKDIR/dispute-provider.json" '["id"]')"
 dispute_provider_token="$(mint_token "$dispute_provider_id")"
 
 status="$(post_json "verify-adm-other-$$" /v1/auth/register \
-  "{\"email\":\"dispute-other-$$@example.com\",\"phone\":\"04192$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"dispute-other-$$@example.com\",\"phone\":\"04192$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/dispute-other.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/dispute-other.json"; fail "could not register the second provider: $status"; }
 dispute_other_id="$(json "$WORKDIR/dispute-other.json" '["id"]')"
@@ -1012,15 +1012,19 @@ admin_clear_limits
 # The 0419 prefix is this section's; 04190…04192 are the dispute fixtures above.
 search_email="verify-search-$$@example.com"
 search_phone="04193$$"
+# The name is this section's own, and it is deliberately not an ordinary one: SHIP-30a's third
+# clause is that a search term matches it, and a fixture called "Verify Harness" would be matched
+# by every other section's fixture too.
+search_name="Kirralee Wongabri"
 status="$(post_json "verify-adm-search-reg-$$" /v1/auth/register \
-  "{\"email\":\"$search_email\",\"phone\":\"$search_phone\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "{\"name\":\"$search_name\",\"email\":\"$search_email\",\"phone\":\"$search_phone\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
   "$WORKDIR/search-user.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/search-user.json"; fail "could not register the searchable customer: $status"; }
 search_user_id="$(json "$WORKDIR/search-user.json" '["id"]')"
 
 suspended_email="verify-search-gone-$$@example.com"
 status="$(post_json "verify-adm-search-susp-$$" /v1/auth/register \
-  "{\"email\":\"$suspended_email\",\"phone\":\"04194$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$suspended_email\",\"phone\":\"04194$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/search-suspended.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/search-suspended.json"; fail "could not register the suspended provider: $status"; }
 suspended_user_id="$(json "$WORKDIR/search-suspended.json" '["id"]')"
@@ -1065,6 +1069,37 @@ ok "an account is found by its email address, whole or in part"
   || fail "an account could not be found by its phone number"
 ok "and by its phone number, through the same parameter — support has a string and does not always know which it is"
 
+# --- SHIP-30a: the fourth term, which had no column until registration collected one ------------
+#
+# This endpoint shipped serving three of its *Done when*'s four terms because `users` held no name.
+# The clause SHIP-30a owes it is that all four now answer **on the wire**, so the account is
+# registered through `POST /v1/auth/register` above rather than inserted, and found here through
+# `GET /v1/admin/users` — the two halves of the ticket meeting at the only place they can.
+
+# The space is percent-encoded rather than sent raw: this goes into a URL and curl would send a
+# bare space as one, which is a malformed request line rather than a search for two words.
+[[ "$(search_finds "q=Kirralee%20Wongabri" "$search_user_id" search-name)" == "1" ]] \
+  || fail "an account could not be found by the whole name it registered with"
+[[ "$(search_finds "q=Wongabri" "$search_user_id" search-name-part)" == "1" ]] \
+  || fail "an account could not be found by part of its name"
+[[ "$(search_finds "q=wongabri" "$search_user_id" search-name-case)" == "1" ]] \
+  || fail "the name term is case-sensitive; a support engineer types what is on the ticket"
+ok "an account is found by its name — whole, in part, and in any case (SHIP-30a)"
+
+# The suspended provider registered as "Verify Harness" and the searchable customer did not, which
+# makes this a real negative rather than one that would pass against an empty table.
+[[ "$(search_finds "q=Kirralee%20Wongabri" "$suspended_user_id" search-name-neg)" == "0" ]] \
+  || fail "a name term matched an account with a different name"
+ok "and a name term matches that name rather than everybody"
+
+# The name reaches the response too. A predicate that matched and a shape that did not carry it
+# would leave a console unable to show what it had matched on.
+status="$(admin_get "/v1/admin/users?q=$search_phone" "$search_token" search-name-shape)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-search-name-shape.json"; fail "searching returned $status"; }
+[[ "$(json "$WORKDIR/admin-search-name-shape.json" '["data"][0]["name"]')" == "$search_name" ]] \
+  || fail "the account came back without the name it registered with"
+ok "and the name is on the response, as the account registered it"
+
 # --- the standing filter, in both directions --------------------------------------------------------
 
 [[ "$(search_finds "q=verify-search-$$&status=suspended" "$suspended_user_id" search-susp)" == "1" ]] \
@@ -1103,7 +1138,7 @@ items = page.get("data") or []
 print(",".join(sorted(items[0].keys())) if items else "")
 PY
 search_keys="$(cat "$WORKDIR/search-keys.txt")"
-[[ "$search_keys" == "created_at,email,email_verified_at,id,phone,phone_verified_at,role,status" ]] \
+[[ "$search_keys" == "created_at,email,email_verified_at,id,name,phone,phone_verified_at,role,status" ]] \
   || fail "the administrator's view of an account carries [$search_keys], which is not the closed set this shape is held to"
 ok "an account carries a closed set of account facts — no jobs, no bids, no budget and no credential material"
 
@@ -1724,7 +1759,7 @@ standing() {
 stand_email="verify-standing-$$@example.com"
 stand_password="correct-horse-battery-staple"
 status="$(post_json "verify-adm161-register-$$" /v1/auth/register \
-  "{\"email\":\"$stand_email\",\"phone\":\"04195$$\",\"password\":\"$stand_password\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Harness\",\"email\":\"$stand_email\",\"phone\":\"04195$$\",\"password\":\"$stand_password\",\"role\":\"provider\"}" \
   "$WORKDIR/standing-user.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/standing-user.json"; fail "could not register the account: $status"; }
 stand_user_id="$(json "$WORKDIR/standing-user.json" '["id"]')"

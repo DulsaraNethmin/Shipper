@@ -13,6 +13,7 @@ import '../../core/auth/session_fixtures.dart';
 /// contract shows up here rather than only on a device.
 Account anAccount({
   String id = '0191f3c2-8a4d-7c31-9f52-3b7e1d4a6c88',
+  String name = 'Alice Nguyen',
   String email = 'alice@example.com',
   String phone = '+61412345678',
   UserRole role = UserRole.customer,
@@ -21,6 +22,7 @@ Account anAccount({
 }) {
   return Account(
     id: id,
+    name: name,
     email: email,
     phone: phone,
     role: role,
@@ -89,6 +91,7 @@ class FakeIdentityRepository implements IdentityRepository {
 
   @override
   Future<Account> register({
+    required String name,
     required String email,
     required String phone,
     required String password,
@@ -97,9 +100,15 @@ class FakeIdentityRepository implements IdentityRepository {
   }) {
     return _record(
       'register',
-      registerBody(email: email, phone: phone, password: password, role: role),
+      registerBody(
+        name: name,
+        email: email,
+        phone: phone,
+        password: password,
+        role: role,
+      ),
       idempotencyKey,
-      () => account = account.copyWith(email: email, role: role),
+      () => account = account.copyWith(name: name, email: email, role: role),
     );
   }
 
