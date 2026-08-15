@@ -12389,6 +12389,37 @@ detail, a milestone timeline, SHIP-133's tracking view and SHIP-152's admin read
 four-segment `GET`s in their most natural form, and every one of them will otherwise take the shelf
 or take an hour finding out why the process will not start.
 
+**A backlog row can name a path `ServeMux` refuses, and nothing checks that until a process fails to
+start.** `Docs/09`'s SHIP-102a row names `GET /v1/jobs/{id}/bids` — and that route cannot be
+registered. **Reproduced in a standalone program on this branch rather than inferred from the entry
+above**: against the existing `GET /v1/jobs/open/{id}`, registering it panics with *"both match some
+paths, like `/v1/jobs/open/bids`. But neither is more specific than the other."* Renaming the literal
+to `/offers` panics identically, `POST /v1/jobs/{id}/bids` is unaffected because the conflicting
+route is a `GET`, and `GET /v1/jobs/{id}/bids/{bid_id}/history` is safe at five segments — which is
+why the manifest already carries one and not the other.
+
+**The mechanism was known, written down in three places, and the row was written anyway.** The entry
+above records it, `cmd/api/routes_delivery.go` records it beside the route that met it and closes by
+saying it "records the collision for whoever owns `/jobs/open/{id}`", and `Docs/09`'s own SHIP-115a
+note spells it out. **So this is not a gap in what anybody knew — it is that the guard lives in the
+wrong artefact.** The panic protects *code*, at registration, which is exactly when it is most
+expensive to discover; a *document* naming a path is checked by nothing at all, and a row can sit in
+the backlog for waves specifying something the service can never serve.
+
+**The cheap habit, until somebody makes it mechanical: register the path before writing it into a
+row.** Six lines in a throwaway `main.go` against the one route that causes this — `GET
+/v1/jobs/open/{id}` — answers it in a second, and it is what confirmed that this pass's own SHIP-96a
+row is safe at `GET /v1/fleet/jobs/{id}`. **The structural fix is still the one named above**, moving
+the open feed off the `{id}` slot; it gets cheaper the earlier it is made and it has now cost four
+tickets a workaround rather than three.
+
+**SHIP-102a's row is deliberately left naming the unregistrable path in this pass.** Wave 10's Lane D
+holds both SHIP-102a and SHIP-102 and is deciding between inserting a segment, as delivery did, and
+moving the open feed, which is the structural fix and a breaking contract change. **Correcting the
+row to a path chosen here would be guessing at another lane's decision**, and a row corrected twice
+is worse than a row corrected once. Whoever reconciles wave 10 must correct it to whatever Lane D
+built, and check it against `routes_golden.txt` rather than against the ticket.
+
 **An unmapped `internal_error` sits on a reachable award path, and it was found and deliberately not
 fixed.** When `acceptBid`'s compare-and-set matches nothing — which happens if the rejection sweep
 were ever to run before the accept — the award produces an error that is none of `bidding`'s
