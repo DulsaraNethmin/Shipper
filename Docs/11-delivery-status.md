@@ -16,7 +16,7 @@
 
 **This pass adds one backlog row: `Docs/09`'s X-10, the Firebase project.** `Docs/09` moves 230 → **231** tickets and 711 → **714** points. **It is the most consequential thing on this branch and it took eleven waves to become visible**, for a reason that generalises past this one row: §5 lists only work blocked *on a Track-X ticket*, and this was blocked on nothing, because there was no ticket. SHIP-139 built a Firebase adapter against a fake FCM server, SHIP-143 shipped a token seam with a test asserting the absence, both wrote the gap into §3, and neither could act on it. §5 now carries it and SHIP-144 and SHIP-145 stop reading as startable.
 
-**The pass beneath it:** 2026-08-15, on **`ship-15v-wave-11-prep`**, the wave-10 reconciliation, running concurrently with wave 11's four code lanes rather than ahead of them. It rewrites §1's arithmetic, §2's branch table and §6's startable set against `develop` at **`605ad3a`**, writes wave 10 up as the new §7 with the nine earlier waves renumbered behind it, owes SHIP-102 its §4 row, and adds seven rows to `Docs/09` for findings that had no owner. **Every scalar below was re-measured on `605ad3a` or on this branch and says which**, by a parser written for this pass rather than read off `make status`; §6's strikes were re-read against the tree rather than carried, and one of them was removed because it had expired exactly as §6 predicted it would.
+**The pass beneath it:** 2026-08-15, on **`ship-15v-wave-11-prep`**, the wave-10 reconciliation, running concurrently with wave 11's four code lanes rather than ahead of them. It rewrites §1's arithmetic, §2's branch table and §6's startable set against `develop` at **`605ad3a`**, writes wave 10 up as that pass's §7 — which is §7a today — with the nine earlier waves renumbered behind it, owes SHIP-102 its §4 row, and adds seven rows to `Docs/09` for findings that had no owner. **Every scalar below was re-measured on `605ad3a` or on this branch and says which**, by a parser written for this pass rather than read off `make status`; §6's strikes were re-read against the tree rather than carried, and one of them was removed because it had expired exactly as §6 predicted it would.
 
 **It closes no ticket and it touches neither §3 nor `Docs/11-done.txt`**, which is the rule two consecutive waves have paid to learn: a prep pass that edits one token inside §3 buys the wave's only merge collision, because §3 is where every code lane appends. Three cross-references in §3 were made stale by the §7 renumber and are deliberately left for whoever merges.
 
@@ -24,13 +24,13 @@
 
 **Two of the seven came from lanes rather than from this pass**, which is §9's mechanism working: SHIP-147b was found empirically by a wave-10 lane watching an idempotency key collide where it should not have, and SHIP-121a from the driver-portal lane's own note. **Three were §9 entries with no owner, one of them open since wave 5** — SHIP-65a, SHIP-78a and SHIP-87a.
 
-**The pass beneath it:** 2026-08-14, on **`ship-15t-wave-9-prep`**, which is both the wave-8 reconciliation and the wave-9 pre-step in one branch — the two passes the alternation below usually separates, run together because no wave-8 reconciliation had happened. It rewrites §1's arithmetic, §2's branch tables and §6's startable set against the merged tree, writes wave 8 up as the new §7 with the seven earlier waves renumbered behind it, adds §3 entries for X-6, the `Countered` close and its own work, and adds six §9 findings wave 8 left with no owner.
+**The pass beneath it:** 2026-08-14, on **`ship-15t-wave-9-prep`**, which is both the wave-8 reconciliation and the wave-9 pre-step in one branch — the two passes the alternation below usually separates, run together because no wave-8 reconciliation had happened. It rewrites §1's arithmetic, §2's branch tables and §6's startable set against the merged tree, writes wave 8 up as that pass's §7 — which is §7c today — with the seven earlier waves renumbered behind it, adds §3 entries for X-6, the `Countered` close and its own work, and adds six §9 findings wave 8 left with no owner.
 
 **The figures in this file name the ref they were measured on, and that convention is now two passes old.** §9 records why a count published without its ref has been wrong four times. Where a figure differs between `develop` at `360da43` and this branch — which for §1 means the two backlog totals and M1's, M3's, M4's, M5's and M6's denominators — both are given.
 
 **The pass beneath it:** 2026-08-13, **SHIP-15r, the wave-8 pre-step**, which sat on top of the wave-7 reconciliation and was cut from it rather than from `develop`. It added §1's and §3's SHIP-15r entries and redid §1's arithmetic for the four rows it added to `Docs/09`, un-struck SHIP-147 in §6, closed four §9 items and §8's last live gate, and moved the `make verify` count to what it measured.
 
-**The pass beneath it:** 2026-08-13, the **wave-7 reconciliation** — the arithmetic and the narrative brought back into line after fourteen tickets landed across four tracks. It corrects §1, §2 and §6, writes wave 7 up as the new §7b with the six earlier waves renumbered behind it, closes the §8 and §9 items wave 7 settled, adds the eight it found, and moves the recipient-name gap SHIP-118 recorded into §4 where documentation ahead of code belongs.
+**The pass beneath it:** 2026-08-13, the **wave-7 reconciliation** — the arithmetic and the narrative brought back into line after fourteen tickets landed across four tracks. It corrects §1, §2 and §6, writes wave 7 up as the new §7c with the six earlier waves renumbered behind it, closes the §8 and §9 items wave 7 settled, adds the eight it found, and moves the recipient-name gap SHIP-118 recorded into §4 where documentation ahead of code belongs.
 
 **The wave-8 pre-step is SHIP-15r, and it is this pass.** The passes before it alternated — a reconciliation, then a pre-step cut from it rather than from `develop`, so that adding a ticket to the backlog moves §1's arithmetic once instead of twice. That ruling has now held for `15f`→`15g`, `15h`→`15i`, `15k`→`15m`, `15n`→`15p` and `15q`→`15r`. The mechanism the last paragraph predicted worked exactly: §6 and §9 were where SHIP-15r's paragraphs were written, one at a time, by whoever hit the surface first, and **four of its six parts arrived that way** — the `cmd/worker` question, the `git checkout` hazard, `STORAGE_DOWNLOAD_TTL`, and the read gap three lanes found independently.
 
@@ -81,7 +81,7 @@ And once more before wave 4: **SHIP-15g** (M0, 5 points), which took 205 tickets
 
 **Wave 9's pre-step is `ship-15t`, and it is the first that is *not* a backlog ticket** — so the totals above move by three rows it added rather than by a row for itself. That is a departure from SHIP-15e, 15g, 15i, 15m, 15p and 15r, and it was forced rather than chosen: `scripts/delivery-status.sh` extracts a ticket claim from every commit subject and **fails when the done list does not carry it**, so a branch that names `SHIP-15t:` in its subjects must also be a row in `Docs/09` and `Docs/11-done.txt`. It is neither, so its commits name the surface they touch — `verify:`, `Makefile:`, `Docs/11:` — exactly as `ship-15q` and `ship-15s` did. **The rule is not "pre-steps name a ticket"; it is "a subject may claim only what the done list declares"**, and this file's own paragraph about the two kinds of pass is the one that says so.
 
-**Its blocking item was the Kafka consumer**, which had made `make verify` unable to reach `90-admin.sh` on any tree — the one class of failure a wave cannot route around, because the gate that would have reported it is the gate that was broken. §3 has the account and §7 has how the wave met it.
+**Its blocking item was the Kafka consumer**, which had made `make verify` unable to reach `90-admin.sh` on any tree — the one class of failure a wave cannot route around, because the gate that would have reported it is the gate that was broken. §3 has the account and §7b has how the wave met it.
 
 **Wave 10's pre-step is `ship-15u`, and it is the second in a row that is not a backlog ticket** — so the totals move by the six rows it adds and not by a row for itself. The rule is the one wave 9 wrote down and it has now been applied deliberately rather than discovered: `scripts/delivery-status.sh` extracts a ticket claim from every commit subject and **hard-fails when the done list does not carry it**, so a branch whose subjects said `SHIP-15u:` would break `make status` for everybody. Its commits name the surface instead — `CLAUDE.md:`, `Docs/09:`, `Docs/11:`, `verify:` — exactly as `ship-15q`, `ship-15s` and `ship-15t` did.
 
@@ -144,13 +144,13 @@ which sum to 85 against a true 83 — and the three passes since have found none
 
 **Wave 11 has landed in full, with no trim and nothing delivered beyond the dispatch.** Four lanes after the pre-step, **fourteen tickets, forty-one points**, and it is the first wave since wave 7 in which the delivered set equals the dispatched set exactly. **M1 closed** on SHIP-30a. **M3's router constraint is gone**: SHIP-83a moved the open feed to `GET /v1/fleet/jobs` and freed the whole four-segment `GET /v1/jobs/{id}/<literal>` space that four earlier tickets each paid a workaround for, **demonstrated by registering a probe route** rather than asserted; SHIP-96a then widened the provider's job read from eligibility to *relationship*, so the provider who wins a job stops losing their view of it in the awarding transaction, and SHIP-79a gave a customer something to know about the provider behind an offer. **M5 became a product rather than a pipeline**: SHIP-141 redacts push content with a **word-level** guard over rendered copy — because wave 10 proved a structural one insufficient — SHIP-142 makes "essential events cannot be muted" a `CHECK` constraint rather than a handler branch, SHIP-143 registers the handset, and SHIP-134a stopped the harness being the hazard it was asserting against. **M6 gained its fifth and its two-person review**: SHIP-157's exception queue over four grounds, SHIP-158's post-award cancellations, and SHIP-166, which took `suspended` away from a single administrator. And the customer can now **award**: SHIP-104 is the last screen between comparing offers and a job being awarded. `make verify` went from **786 checks across 15 sections to 802 across 15**. §7 has the detail, including the two things worth more than the tickets.
 
-**Wave 10 landed in full but for one row.** Four lanes after the pre-step, **thirteen tickets, thirty-nine points, one trim** — SHIP-164, the dispute workflow, which was dispatched and not delivered and is now the largest startable ticket on the board. **M6 stopped being two reads and became a console's worth of platform**: SHIP-152 searches jobs and bids, SHIP-160 unpublishes, SHIP-161 restricts or suspends, SHIP-162 attaches internal notes and SHIP-165 serves the audit log back, all over SHIP-150's writer, so every one of them leaves a trail. **M5 got its transports**: SHIP-138's email dispatch, SHIP-139's Firebase adapter — which emptied the last `doc.go`-only directory under `internal/platform/` — and SHIP-140's device tokens. **And the marketplace closed its own loop**: SHIP-102a serves a customer the offers on their job and SHIP-102 compares them side by side, so a customer can now create a job, watch offers arrive and read them against each other. `make verify` went from **697 checks across 15 sections to 786 across 15**. §7 has the detail, including the one thing the wave got wrong.
+**Wave 10 landed in full but for one row.** Four lanes after the pre-step, **thirteen tickets, thirty-nine points, one trim** — SHIP-164, the dispute workflow, which was dispatched and not delivered and is now the largest startable ticket on the board. **M6 stopped being two reads and became a console's worth of platform**: SHIP-152 searches jobs and bids, SHIP-160 unpublishes, SHIP-161 restricts or suspends, SHIP-162 attaches internal notes and SHIP-165 serves the audit log back, all over SHIP-150's writer, so every one of them leaves a trail. **M5 got its transports**: SHIP-138's email dispatch, SHIP-139's Firebase adapter — which emptied the last `doc.go`-only directory under `internal/platform/` — and SHIP-140's device tokens. **And the marketplace closed its own loop**: SHIP-102a serves a customer the offers on their job and SHIP-102 compares them side by side, so a customer can now create a job, watch offers arrive and read them against each other. `make verify` went from **697 checks across 15 sections to 786 across 15**. §7a has the detail, including the one thing the wave got wrong.
 
-**Wave 9 landed in full before it.** Four branches after the pre-step, **eleven tickets, thirty-seven points, no trim taken**. **M4 is all but finished** — the driver portal's three-deep chain was bought whole and delivered whole, so a driver now opens a link, records every milestone, photographs the delivery, names who took it and the portal goes read-only; the Flutter half gained the exception panel and the customer's tracking view; and a delivered job auto-completes after seventy-two hours, which registered the fifth scheduled task. **M5 stopped being a table and a publisher**: SHIP-137's consumer runs as `cmd/notifier`, a service of its own rather than a worker task, and `internal/notifications` holds eleven Go files where it held `doc.go` alone through eight waves. `make verify` went from **642 checks across 13 sections to 697 across 15**. §7 has the detail, including three merge findings worth more than the tickets.
+**Wave 9 landed in full before it.** Four branches after the pre-step, **eleven tickets, thirty-seven points, no trim taken**. **M4 is all but finished** — the driver portal's three-deep chain was bought whole and delivered whole, so a driver now opens a link, records every milestone, photographs the delivery, names who took it and the portal goes read-only; the Flutter half gained the exception panel and the customer's tracking view; and a delivered job auto-completes after seventy-two hours, which registered the fifth scheduled task. **M5 stopped being a table and a publisher**: SHIP-137's consumer runs as `cmd/notifier`, a service of its own rather than a worker task, and `internal/notifications` holds eleven Go files where it held `doc.go` alone through eight waves. `make verify` went from **642 checks across 13 sections to 697 across 15**. §7b has the detail, including three merge findings worth more than the tickets.
 
-**Wave 8 landed in full before it.** Five branches after the pre-step, **fifteen tickets, forty-nine points, no trim taken** — the largest wave by ticket count and level with wave 7 on points. The two tickets no wave had ever been the wave for are both built: SHIP-56a, cut six consecutive times, and SHIP-136, cut three. Administrator authentication opened M6 properly after eight waves struck in §6; a bid now expires on its own terms; and the three read tickets SHIP-15r wrote were all built, so SHIP-101 and SHIP-133 have something to read and a driver can record a milestone on their own token. **`make verify` went from 476 checks to 642.** §7a has the detail, including the two things that went wrong.
+**Wave 8 landed in full before it.** Five branches after the pre-step, **fifteen tickets, forty-nine points, no trim taken** — the largest wave by ticket count and level with wave 7 on points. The two tickets no wave had ever been the wave for are both built: SHIP-56a, cut six consecutive times, and SHIP-136, cut three. Administrator authentication opened M6 properly after eight waves struck in §6; a bid now expires on its own terms; and the three read tickets SHIP-15r wrote were all built, so SHIP-101 and SHIP-133 have something to read and a driver can record a milestone on their own token. **`make verify` went from 476 checks to 642.** §7b has the detail, including the two things that went wrong.
 
-**Wave 7 landed in full before it.** Four tracks, fourteen tickets, **forty-nine points**, thirteen agent runs, **no trim taken**. The award transaction was built, raced and proved, three waves after it first became the backlog's most-deferred piece of real work; a photograph now reaches an object store the API is not in the path of, becomes evidence for one recorded milestone, and `Delivered` stopped being a status nothing could reach; the driver portal gained its first product code; and the provider's half of the app can place a bid and record a milestone. It is the largest wave both by points and by ticket count. §7b has the detail.
+**Wave 7 landed in full before it.** Four tracks, fourteen tickets, **forty-nine points**, thirteen agent runs, **no trim taken**. The award transaction was built, raced and proved, three waves after it first became the backlog's most-deferred piece of real work; a photograph now reaches an object store the API is not in the path of, becomes evidence for one recorded milestone, and `Delivered` stopped being a status nothing could reach; the driver portal gained its first product code; and the provider's half of the app can place a bid and record a milestone. It is the largest wave both by points and by ticket count. §7c has the detail.
 
 **M1 read 28 of 28 from wave 4, 28 of 29 at the wave-10 reconciliation, and 29 of 29 now — and the round trip is the record worth keeping.** The milestone never regressed: its exit criterion was met and stayed met throughout, and every one of the 28 was always done. What changed at the wave-10 pass was that a twenty-ninth row was written — SHIP-30a, a user's name collected at registration — because `users` had never had a name column, `000002_users` never had one, registration never asked, and SHIP-151 shipped in wave 9 searching three of the four terms its own *Done when* names. §4 carried that gap with **no owner and no scheduled arrival**, which is the one shape §4 says does not close by itself, until a row gave it one. **Wave 11 built it**: `000006_users_name` in the shared block, required by `POST /v1/auth/register`, collected by the app's registration screen, and matched by `GET /v1/admin/users`. The column is **nullable and that is the decision** — an account predating the migration has no name and a name cannot be backfilled, so `NOT NULL` is named as a later tightening rather than faked with a default. A person can register with a name, receive an email token and a phone OTP, confirm both, sign in, and stay signed in across app restarts on a real handset, with the role fixed at registration and immutable afterwards by a database trigger rather than by application logic. The platform half was finished in wave 3 — sign-in, sign-out, refresh-token rotation with reuse detection that invalidates the whole device session, an explicit sliding expiry on `device_sessions`, the device list and its revoke, and rate limiting that charges failed sign-ins only and fails **closed** when Redis is down. Wave 4 closed the two that were left, both Flutter: SHIP-50's refresh interceptor, which refreshes once however many requests are refused at the same instant, and SHIP-55's sign-in screen, which deleted the development session stand-in the client had been carrying since SHIP-49.
 
@@ -247,13 +247,13 @@ second parent** — `git rev-parse <merge>^2` gives the branch head the merge ac
 whose tip and second parent disagree is a row naming the wrong branch. All five agree, and all five
 are ancestors of `605ad3a`. The *Brought* column is the per-tip difference against `Docs/11-done.txt`
 at `360da43`, not the dispatch list: **two of the four lanes delivered a ticket they were not
-dispatched** — SHIP-140 and SHIP-113 — **and one did not deliver a ticket it was**, SHIP-164. §7 has
+dispatched** — SHIP-140 and SHIP-113 — **and one did not deliver a ticket it was**, SHIP-164. §7a has
 the reading.
 
 **No branch was cut from the pre-step this wave.** `git merge-base <tip> 3e5b817` returns `360da43`
 for all four lanes, so every one was cut from `develop` at the wave-9 close. Wave 7's rule was to cut
 from the pre-step; wave 9 measured that the base is not what prevents a conflict and wave 10 confirms
-it — the conflicts are exactly the lanes that wrote into §3, and no more. §7 has the matrix.
+it — the conflicts are exactly the lanes that wrote into §3, and no more. §7a has the matrix.
 
 ### The wave-9 branches, in merge order
 
@@ -286,7 +286,7 @@ resolution if anybody had reconciled the line by choosing a side.
 
 **Four conflicts, all in this file, and two of them were not unions** — which is the finding, because
 this section has recorded "both resolutions were unions" often enough for it to read as the default.
-§7a has all three merge findings; the shortest version of the important one is that **a resolution
+§7b has all three merge findings; the shortest version of the important one is that **a resolution
 must be verified against what has to be present, never against the absence of conflict markers.**
 
 ### The wave-8 branches, in merge order
@@ -345,7 +345,7 @@ four at the bottom are the wave's tracks.
 
 **Every one of the four tracks was cut from `ship-15p` rather than from `develop`, and every one of
 them merged clean.** That is the rule wave 6 found by accident on a single track, applied
-deliberately to all four — §7c has the measurement.
+deliberately to all four — §7d has the measurement.
 
 **One commit on `develop` has no branch behind it, and this table cannot represent it.** `23618e5`,
 `Docs/11-done.txt: restore the sorted position a union broke`, sits directly on `develop` above
@@ -376,7 +376,7 @@ four at the bottom are the wave's tracks.
 **The middle row is the one to read this time.** `ship-107-112` was cut from `ship-15m` rather than
 from `develop`, because it needed the driver-token guard seam that pre-step supplies — and it was the
 only one of the four tracks to merge without a conflict. The other three were cut from `develop`
-while `ship-15k` still sat unmerged, and every one of them met it in this file. §7d has the account;
+while `ship-15k` still sat unmerged, and every one of them met it in this file. §7e has the account;
 it is the cheapest process change the wave turned up.
 
 ### The wave-5 branches, in merge order
@@ -400,7 +400,7 @@ four in the middle are the wave's tracks.
 **The last row is the one to read.** `ship-15j` exists because a merge was committed while its own
 gates were still running, publishing a `develop` that carried a stale check count and a
 union-ordered route table. Nothing was lost and nothing was wrong in the tracks; the tree was
-captured before the resolutions landed. §7e has the full account, and the rule it produced —
+captured before the resolutions landed. §7f has the full account, and the rule it produced —
 **never commit or merge while a gate is running** — is in §9 as a line `CLAUDE.md` should carry.
 
 ### The wave-4 branches, in merge order
@@ -423,7 +423,7 @@ why it names no ticket in its subject.
 verify` check count for the fourth consecutive merge, and §3 summary-table rows three of the four
 tracks had not added — plus one collision that was semantic rather than textual: SHIP-68's verify
 section runs the real worker, which drains the outbox, which broke an assertion in SHIP-134's
-section the moment the two met. §7f has all of it, and both the check count and the one-binary
+section the moment the two met. §7g has all of it, and both the check count and the one-binary
 worker are now open recommendations in §9 rather than recurring surprises.
 
 ### The wave-3 branches, in merge order
@@ -449,7 +449,7 @@ All four were merged locally with `--no-ff`, none through a pull request, so the
 | — | `ship-30-36-registration-and-verification` | SHIP-30, 31, 33, 34, 36, 45 |
 | — | `ship-48-49-client-session` | SHIP-48, 49, 23a |
 
-The last two were merged locally rather than through a pull request, which is why they have no number. **Both conflicted in this file and nowhere else**, and both resolutions were unions — see §7g.
+The last two were merged locally rather than through a pull request, which is why they have no number. **Both conflicted in this file and nowhere else**, and both resolutions were unions — see §7h.
 
 An earlier version of this section chased the exact pull-request number and commit count, and was wrong within a day both times — a commit cannot record the number of the pull request that merges it. **This table is always slightly behind reality, and the fix is to correct it in the next update rather than to try to make it self-aware.** It says "wave 9 merged" rather than a number, for that reason.
 
@@ -466,7 +466,7 @@ The commit count above is the same kind of figure and gets the same treatment: *
 | #13 | `ship-22-35-web-and-adapters` | SHIP-22, 23, 32, 35, 59a |
 | #14 | `ship-29-38-credentials-and-sessions` | SHIP-29, 37, 38, and the SHIP-149 verify fix |
 
-`ship-16-21-flutter-foundation` exists and is parked at PR #11's merge, holding nothing. It is the branch the Flutter track resumed on — see §7i.
+`ship-16-21-flutter-foundation` exists and is parked at PR #11's merge, holding nothing. It is the branch the Flutter track resumed on — see §7j.
 
 **A warning worth keeping.** Reverting a merge does not undo it: the commits stay ancestors forever, so re-merging the same branch brings nothing across and reports success. If a merge to `main` is ever reverted again, the fix is to revert *the revert*, not to merge again.
 
@@ -13176,7 +13176,7 @@ but for the budget for two waves, and SHIP-67 closed it with the column and the 
 §10's note that a ticket can be both done and partly done still stands. **SHIP-118 left this table at
 wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67. **The live rows are now three
 — SHIP-77, SHIP-151 and SHIP-102** — wave 10 struck none and added one, and the count is stated here
-because §7a's second merge finding is that a table and a sentence counting its rows are a semantic pair
+because §7b's second merge finding is that a table and a sentence counting its rows are a semantic pair
 no merge tool checks.
 
 **SHIP-149 left it in the same wave**, closed by SHIP-150 building the write helper it had always
@@ -13383,7 +13383,95 @@ Plus **X-1, X-3, X-4 and X-5**, none of which is code and none of which has star
 
 **Public routes still share the anonymous idempotency scope, and that remains safe** for the reason §6 has given since SHIP-44: `replayOrRefuse` fingerprints method, path and body, so reading another caller's stored response requires sending their exact request — which, on every route on `Docs/10` §4.1's allow-list, means already holding the secret material in their body. **What is new is that administrators share it too**, which nobody had noticed until a wave-10 lane watched a key collide. It is the same posture and not a new hole, and it is a weaker property than SHIP-44 established for users on the most privileged surface there is. `Docs/09`'s new **SHIP-147b** owns it.
 
-## 7. Wave 10 — what landed
+## 7. Wave 11 — what landed
+
+One pre-step, then four lanes concurrently. **Fourteen tickets, forty-one points, no trim and
+nothing delivered beyond the dispatch** — the first wave since wave 7 where the delivered set equals
+the dispatched set in both directions.
+
+**The letters below are positional and every wave shifts them.** §7 is always the most recent wave
+and §7a the one before it, so a `§7d` written two waves ago points two waves too early today. **Read
+the wave number in the heading, not the letter**, and cite the wave when writing new prose. §9
+carries the proposal to end this, which is a decision rather than something a reconciliation may take
+on its own — and §3's four internal `§7` references are the reason it matters: they are a lane's to
+edit and not this pass's, so they cannot be corrected here and they get one letter staler each wave.
+
+| Step | Tickets | Landed |
+|---|---|---|
+| **Pre-step** (`ship-15v-wave-11-prep`) | — | Merged at `d9d8501`. The wave-10 reconciliation and the wave-11 pre-step in one branch, closing no ticket of its own and writing seven rows into `Docs/09` |
+| **Notifications and preferences** | SHIP-134a, 141, 142 | All three, 8 points |
+| **Provider job reads** | SHIP-79a, 83a, 96a | All three, 9 points. **SHIP-83a is the structural one** — the router constraint five tickets had been shaped by |
+| **Client arc** | SHIP-104, 132, 143, 167a | All four, 11 points. **SHIP-143 is done in reduced form** and says so — see §4 |
+| **Identity and admin queues** | SHIP-30a, 157, 158, 166 | All four, 13 points. **M1 closes here** |
+
+**Every figure above was measured on this tree rather than carried from a dispatch brief.** The
+ticket set is the difference between `Docs/11-done.txt` at `605ad3a` (160 declared, 490 points) and
+at `5a3b8d7` (174, 531), taken per branch tip for the attributions; the points come from `Docs/09`'s
+rows at `5a3b8d7`. Wave 1 delivered 32 points, wave 2 37, wave 3 48, wave 4 39, wave 5 37, wave 6 47,
+wave 7 49, wave 8 49, wave 9 37, wave 10 39, and wave 11 **41 across four lanes**.
+
+**A wave that delivers exactly its dispatch is worth reading rather than passing over.** Wave 10
+trimmed its largest row and made the points back on two cheap extras, and the reconciliation said
+that was not a neutral wave. Wave 11 was dispatched fourteen and delivered fourteen, with the largest
+single row at five points (SHIP-30a) and nothing above it. **The lesson wave 10's write-up drew — give
+a five-point row a lane that is not also carrying five others — was not tested here**, because no
+five-point row was scheduled beside a full lane. SHIP-164 is still the largest startable ticket on
+the board and is now the wave's standing question rather than any wave's finding.
+
+### All four lanes were cut from `develop`, and the conflict was in §4 rather than §3
+
+**Measured with `git merge-base`**: all four lane tips return `605ad3a` against the pre-step's
+`6b62b79`, so **none of them was cut from the prep branch**. That is the third wave running, and the
+third confirmation of wave 9's replacement of the wave-7 rule: **section ownership is the mechanism,
+not the branch base.**
+
+**The pairwise matrix, measured with `git merge-tree --write-tree --name-only` on the five tips:**
+
+| | prep | notif | provider | client | identity |
+|---|---|---|---|---|---|
+| **prep** | — | clean | clean | clean | **conflict** |
+| **notif** | | — | **conflict** | **conflict** | **conflict** |
+| **provider** | | | — | **conflict** | **conflict** |
+| **client** | | | | — | **conflict** |
+
+**All six pairs among the four lanes conflict, every one of them in `Docs/11-delivery-status.md` and
+in no other file** — not in code, not in a migration, not in `routes_golden.txt` and not in the
+contract, all three of which auto-merged. Every lane appends to §3, §3 is deliberately not
+`merge=union`, and that is the whole of it.
+
+**The seventh conflict is the one worth the section, and it is not §3.** `prep × identity` conflicts
+because **the identity lane wrote into §4** — `576c818` added SHIP-158's row and `d5cdc6b` struck
+SHIP-151's — while the prep pass was adding SHIP-102's row three lines above. **The prep branch
+followed its rule exactly**: it touched no §3 region at all, which is why it is clean against three of
+the four lanes and why wave 10's diagnosis was right. What nobody had written down is the other half
+of the same rule.
+
+**So the rule is symmetric and only half of it was ever stated.** Two consecutive waves recorded *a
+prep pass must not edit §3*, because the rows a lane appends land underneath it. The mirror is now
+demonstrated: **a lane must not edit §1, §2, §4, §5, §6 or §7**, because a reconciliation pass is
+rewriting those in the same window. Neither lane was wrong about the content — SHIP-158's row is
+accurate and SHIP-151's strike is correct — and both were written in a section somebody else owned,
+which is the whole of what produced the collision. It is at the head of this file now.
+
+### Two findings worth more than the tickets
+
+**A required field on registration broke 37 `make verify` call sites across nine sections, and no
+unit test could have shown it.** SHIP-30a made `name` required by `POST /v1/auth/register`, and every
+verify section that registers an account carries **its own JSON literal** — there is no shared
+"register a user" helper anywhere in `scripts/verify/`. The domain tests were green throughout,
+because a domain test constructs its own request. §9 carries the item: the harness has a shared
+`ticket`, `ok`, `fail`, `json`, `post_json` and token minting, and no shared account fixture, so the
+next required registration field costs the same 37 edits.
+
+**`Docs/02` §2 has no `Awarded → Cancelled` transition, so SHIP-158's obvious implementation is
+*inverted* rather than incomplete.** A post-award cancellation queue keyed on a job reaching
+`Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse
+of what the row asks for. The lane read `job_status_history` instead, on two outcomes, and was right
+to; what it could not do from a lane branch is settle whether `Docs/02` §2 is missing a row or whether
+the platform is missing a transition. §9 has it, and it is a document decision before it is a code
+one.
+
+## 7a. Wave 10 — what landed
 
 One pre-step, then four lanes concurrently. **Thirteen tickets, thirty-nine points, one ticket
 trimmed and two delivered beyond the dispatch.**
@@ -13497,7 +13585,7 @@ is served in the only form this platform stores.
 `000409` widens the index and the claim together, and `Docs/02` §2's expiry row was widened first, as
 the ticket's *Done when* required.
 
-## 7a. Wave 9 — what landed
+## 7b. Wave 9 — what landed
 
 One pre-step serially, then four tracks concurrently. **Eleven tickets, thirty-seven points, all
 delivered, no trim taken.**
@@ -13626,7 +13714,7 @@ database, while its own event was nowhere on the topic. §9 has the two failure 
 of them is a fencing problem. The operational half is now a row in `CLAUDE.md`'s worktree table; the
 assertion half is `Docs/09`'s SHIP-134a.
 
-## 7b. Wave 8 — what landed
+## 7c. Wave 8 — what landed
 
 One ticket serially, then five branches. **Fifteen tickets, forty-nine points, all delivered, no trim
 taken** — the largest wave by ticket count, and level with wave 7 on points.
@@ -13700,7 +13788,7 @@ What changed is the **shape**. Wave 7 ran two four-deep chains and wave 8 ran no
 so one more branch bought no more points. A chain cannot be split across tracks, and a wave of short
 chains spends its concurrency on breadth instead.
 
-## 7c. Wave 7 — what landed
+## 7d. Wave 7 — what landed
 
 One ticket serially, then four tracks concurrently. **Fourteen tickets, forty-nine points, all
 delivered, no trim taken.**
@@ -13750,7 +13838,7 @@ tests and again in `make verify`.
 
 ### Cutting every track from the prep branch removed the conflict wave 6 paid four times
 
-§7d records this as the cheapest process change available, found by accident on a single track.
+§7e records this as the cheapest process change available, found by accident on a single track.
 Wave 7 applied it deliberately to all four, and the result is measurable: **all four branches merged
 clean against `ship-15p`.** Wave 6's three tracks that were cut from `develop` while the previous
 reconciliation sat unmerged each met it in this file, and the one cut from the pre-step did not.
@@ -13759,7 +13847,7 @@ What remained was smaller and is worth naming precisely, because it is what the 
 **One pair met each other**: the Flutter track and the driver-portal track both wrote §3 prose, and
 two tracks appending to §3 is the conflict this file will always have. And **the proof branch met the
 other three at the end**, being the last of the four to merge — which is the ordinary last-merge cost
-that §7h recorded in wave 2 and which no ordering decision removes. The mechanism only removes the
+that §7i recorded in wave 2 and which no ordering decision removes. The mechanism only removes the
 conflict with the *reconciliation*; it does not remove the tracks' conflict with each other.
 
 ### The adversarial run earned its place, and the argument is now evidence rather than a recommendation
@@ -13787,13 +13875,13 @@ rather than about the specification.
 
 ### A report where every mutation was caught is the one to probe
 
-§7d recorded this after wave 6 and wave 7 gives it more evidence, which is why it is restated rather
+§7e recorded this after wave 6 and wave 7 gives it more evidence, which is why it is restated rather
 than referred to. **Four mutations survived across the whole wave, and every one of them produced a
 real change:**
 
 | What survived | What it produced |
 |---|---|
-| The driver portal deriving the job identifier from its own credential | A wire test that asks what path the process actually requested, rather than scanning source for a decode — because a scan is what §7d's budget guard was defeated by |
+| The driver portal deriving the job identifier from its own credential | A wire test that asks what path the process actually requested, rather than scanning source for a decode — because a scan is what §7e's budget guard was defeated by |
 | A staleness guard whose own suite could not arrange the interleaving | `stale_snapshot_test.dart`, which arranges it — the guard stops a stale snapshot telling a driver with no signal that Shipper has their update |
 | A missing `try`/`catch` | Its absence would have stopped the app drawing a frame at all, which no existing test reached |
 | The award's redundant compare-and-set | The note above, and the black-box inference that the liveness decision is made under the bid's row lock |
@@ -13832,7 +13920,7 @@ two of them consumed half the wave's concurrency for its whole length — and th
 well as it did in wave 6: six of the fourteen tickets closed were unblocked inside their own branch
 and never appeared in §6 at all.
 
-## 7d. Wave 6 — what landed
+## 7e. Wave 6 — what landed
 
 One ticket serially, then four tracks concurrently. **Thirteen tickets, forty-seven points, all
 delivered, no trim taken.**
@@ -13924,7 +14012,7 @@ pass" but "which ones survived, and what did each one reveal".
 
 ### One wave rule was broken, and it is worth naming
 
-**SHIP-87's and SHIP-88's commits edited §6.** §7i's wave rules say tracks do not touch §1, §2, §6
+**SHIP-87's and SHIP-88's commits edited §6.** §7j's wave rules say tracks do not touch §1, §2, §6
 or §7 and its lettered continuations — several agents doing the same arithmetic on one table is a guaranteed conflict, and this
 pass recomputed §6 from the dependency column anyway, so nothing was lost. It is recorded because
 the rule held for four waves and then quietly did not, and a rule nobody notices breaking is one
@@ -13948,7 +14036,7 @@ fits in a wave; a five-deep chain occupies one track for the whole wave whatever
 The counterpart is that a chain track unblocks a great deal at once: five of the eleven tickets that
 arrived in §6 came from this one branch.
 
-## 7e. Wave 5 — what landed
+## 7f. Wave 5 — what landed
 
 One ticket serially, then four tracks concurrently. **Eleven tickets, thirty-seven points, all
 delivered, no trim taken.**
@@ -14084,7 +14172,7 @@ more than three deep. That is the shape a wave takes once the queue is made of e
 rather than independent foundations, and it is worth planning for: a four-deep chain cannot be split
 across tracks at all, so its length rather than its point total is what decides whether it fits.
 
-## 7f. Wave 4 — what landed
+## 7g. Wave 4 — what landed
 
 One ticket serially, then four tracks concurrently — one more track than wave 3 ran. **Eleven tickets, thirty-nine points, all delivered, no trim taken**, and **M1 closed**.
 
@@ -14128,7 +14216,7 @@ Nothing collided in code. Three things needed resolving at merge time and all th
 
 Wave 1 delivered 32 points, wave 2 delivered 37, wave 3 delivered 48, and wave 4 delivered **39 across four tracks**. That is a deliberate step *down* in points and *up* in concurrency: the wave's risk was four tracks rather than three, in four domains rather than two, and it was not worth also carrying wave 3's volume. Seven agent runs, no trim, no conflict in code.
 
-## 7g. Wave 3 — what landed
+## 7h. Wave 3 — what landed
 
 One ticket serially, then three lanes concurrently. **Seventeen tickets, forty-eight points, all delivered, no trim taken.**
 
@@ -14155,7 +14243,7 @@ The one conflict was this file's `make verify` check-count line — and it is wo
 
 Wave 1 delivered 32 points, wave 2 delivered 37, wave 3 delivered **48** — a 30% step up that the plan named as the wave's real risk, taken without invoking the trim order. Three lanes, five agent runs, one conflict.
 
-## 7h. Wave 2 — what landed
+## 7i. Wave 2 — what landed
 
 Two tickets serially, then three tracks concurrently. Thirteen tickets, thirty-seven points, all delivered.
 
@@ -14191,7 +14279,7 @@ Two of SHIP-15c's mechanisms caught real mistakes within the wave: the protocol-
 - **The last merge always conflicts in this file.** Three tracks each append to §3 and §10. §10 in particular is a candidate for `merge=union` in `.gitattributes`, because a union there is always a superset and `make status` fails on a drop rather than passing quietly — unlike YAML, where a union is invalid. Recorded in §9.
 - **Agents deviate from a brief in both directions, and both need checking.** One track merged `develop` into its own branch after being told not to; its conflict resolution was nonetheless correct. Another corrected a paragraph in `Docs/07` that was outside its ownership, and was right to — the reasoning behind a decision had stopped being true. Neither was harmful; both were only visible because the diff was read against the stated ownership.
 
-## 7i. Wave 1 — what landed
+## 7j. Wave 1 — what landed
 
 Fourteen tickets across four branches. All three tracks completed, but not all at once: the Flutter track was blocked mid-wave, deferred, and finished after the block cleared.
 
@@ -14244,9 +14332,9 @@ These were settled before the tracks started, so that three agents did not answe
 - **A ticket may never depend on another ticket in the same wave on a different track.** A Flutter screen consumes an endpoint from the *previous* wave.
 - Every branch: `make check` green, caught up to `develop`, one logical change per commit, closing with the *Done when* line.
 - Merge into `develop` with `--no-ff`, never squash. Owner only.
-- Tracks do not touch **§1, §2, §6, or §7 and its lettered continuations** — several agents doing the same arithmetic on one table is a guaranteed conflict, and `make status` computes the real numbers anyway. Each track adds its own tickets to §3 and the done list; the rest is reconciled once when the wave lands, as a separate pass. Wave 2 did exactly that and it worked, and it held under four tracks three times before **wave 6 broke it**: SHIP-87's and SHIP-88's commits edited §6, correctly and unasked (§7c). **What a track must not skip is its §3 summary-table row**, which three of wave 4's four tracks did — the prose subsection is written and the index above it is forgotten. That is no longer a matter of remembering: SHIP-15i made it a `make status` failure naming every done ticket with no row, and waves 5 and 6 lost none.
-- **Gates run to completion before anything is committed or merged.** Wave 5 broke this once and got a false failure and a false pass out of it in the same session — see §7e. It is `CLAUDE.md`'s rule now, written there at SHIP-15m.
-- **Cut every track from the wave's pre-step, not from `develop`.** Wave 6 did it for one track by accident and that track was the only one of four to merge clean (§7c); **wave 7 did it for all four and all four merged clean** (§7b). What it does not remove is two tracks meeting each other in §3, which is this file's permanent conflict.
+- Tracks do not touch **§1, §2, §6, or §7 and its lettered continuations** — several agents doing the same arithmetic on one table is a guaranteed conflict, and `make status` computes the real numbers anyway. Each track adds its own tickets to §3 and the done list; the rest is reconciled once when the wave lands, as a separate pass. Wave 2 did exactly that and it worked, and it held under four tracks three times before **wave 6 broke it**: SHIP-87's and SHIP-88's commits edited §6, correctly and unasked (§7d). **What a track must not skip is its §3 summary-table row**, which three of wave 4's four tracks did — the prose subsection is written and the index above it is forgotten. That is no longer a matter of remembering: SHIP-15i made it a `make status` failure naming every done ticket with no row, and waves 5 and 6 lost none.
+- **Gates run to completion before anything is committed or merged.** Wave 5 broke this once and got a false failure and a false pass out of it in the same session — see §7f. It is `CLAUDE.md`'s rule now, written there at SHIP-15m.
+- **Cut every track from the wave's pre-step, not from `develop`.** Wave 6 did it for one track by accident and that track was the only one of four to merge clean (§7d); **wave 7 did it for all four and all four merged clean** (§7c). What it does not remove is two tracks meeting each other in §3, which is this file's permanent conflict.
 
 ## 8. Hard gates ahead
 
@@ -14266,9 +14354,9 @@ Kept, struck, because the shape recurs and this is the second instance of it. **
 
 **The section's own recurring lesson is what finally closed the last one, and it is the half worth carrying forward.** This entry twice recorded that "a gate described only as a constraint on *other* work never gets read as work itself" — and then `RequireAdmin` sat here for six waves being exactly that, with satisfied dependencies since wave 2. What moved it was not somebody re-reading §8; it was §6 and §9 accumulating the specific edits it needed until a prep ticket had a list. **So the mechanism that clears a gate of this kind is the prep ticket, and the way to speed it up is to write the edit down in §9 the first time somebody hits it**, which is what wave 7 did four times over.
 
-**~~SHIP-92…95 never parallelise.~~ Delivered — see §3 and §7c.** All four landed on `ship-92-95-award-transaction` with nothing else on it, in that order, and the instruction this entry carried for five waves is now history rather than guidance. **The reasoning is kept because it is the only part that transfers**: the lock ordering, the idempotency interaction and the race tests were one design, and two owners produce two lock orderings, which is a deadlock or a lost update. The next piece of work with that property gets the same treatment, and §6 says SHIP-136 is the closest thing currently queued — for a different reason, that it opens three domains at once.
+**~~SHIP-92…95 never parallelise.~~ Delivered — see §3 and §7d.** All four landed on `ship-92-95-award-transaction` with nothing else on it, in that order, and the instruction this entry carried for five waves is now history rather than guidance. **The reasoning is kept because it is the only part that transfers**: the lock ordering, the idempotency interaction and the race tests were one design, and two owners produce two lock orderings, which is a deadlock or a lost update. The next piece of work with that property gets the same treatment, and §6 says SHIP-136 is the closest thing currently queued — for a different reason, that it opens three domains at once.
 
-**The adversarial suggestion in this entry was taken, and it is the half worth reading now.** It read "consider using a second agent adversarially — one implements 92–94, another writes SHIP-95 from `Docs/02` §3 and `Docs/08`'s four named races *without reading the implementation*", and that is exactly what happened. **Two of the three properties the blind suite pinned were invisible to every test in the repository**, and the third turned out not to be a property at all — the award keeps its liveness rule twice and either guard alone suffices, so removing one is invisible and removing both lets an award succeed on a withdrawn offer. §7b has the account; §3's SHIP-95 entry has the mutation table. **A suite written from the same reading that produced the code proves the code agrees with itself**, and that is the sentence to carry to the next gate rather than the specific tickets.
+**The adversarial suggestion in this entry was taken, and it is the half worth reading now.** It read "consider using a second agent adversarially — one implements 92–94, another writes SHIP-95 from `Docs/02` §3 and `Docs/08`'s four named races *without reading the implementation*", and that is exactly what happened. **Two of the three properties the blind suite pinned were invisible to every test in the repository**, and the third turned out not to be a property at all — the award keeps its liveness rule twice and either guard alone suffices, so removing one is invisible and removing both lets an award succeed on a withdrawn offer. §7c has the account; §3's SHIP-95 entry has the mutation table. **A suite written from the same reading that produced the code proves the code agrees with itself**, and that is the sentence to carry to the next gate rather than the specific tickets.
 
 **~~What the owner who starts tomorrow should read first.~~ Read instead what they wrote.** §3's SHIP-88 entry was the design document that branch did not otherwise have, and the branch used it; the entries that supersede it for a reader today are §3's **SHIP-92** for the transaction as built, **SHIP-93** for what the rejection sweep deliberately does not touch, **SHIP-94** for which of the two idempotency mechanisms does which work, and **SHIP-95** for the races.
 
@@ -14470,7 +14558,7 @@ smaller than a selector.
 **`cmd/worker` is one binary, so every verify section that starts it starts every registered
 task.** SHIP-68's section demonstrates job expiry by running the real worker binary, which also
 drains the outbox — which is what broke SHIP-134's section the moment the two met at merge (§3,
-§7f). That section is fenced now and the fence is correct, but **the condition is structural rather
+§7g). That section is fenced now and the fence is correct, but **the condition is structural rather
 than a defect in either section**, and it gets sharper with every task registered. **SHIP-69
 registered the third in wave 5**, so the budget this entry gave itself is down to one: SHIP-89's bid
 expiry and SHIP-119's auto-complete are still queued behind it. What wave 5 did do was act on the
@@ -14580,7 +14668,7 @@ commit names them" tickets on a tree where nothing was wrong — and a **false p
 committed while its gates ran captured the tree before the resolutions landed and published a
 `develop` carrying a stale check count of 299 against a true 355 and a union-ordered route table.
 The second is much the worse: a false failure costs an hour, a false pass ships, and
-`ship-15j-wave-5-merge-repair` exists only to undo it. §7e has the full account.
+`ship-15j-wave-5-merge-repair` exists only to undo it. §7f has the full account.
 
 **~~`KAFKA_REPLICATION_FACTOR` is a flag rather than configuration, and the pattern is the finding
 rather than the field.~~ Half closed at SHIP-15m — see §3.** The *field* exists:
@@ -15103,7 +15191,7 @@ the reasoning: once the local stack runs a real S3-compatible store, writing a f
 implementation *so that* the answer to §4.1's own test became yes would have inverted the test.
 
 **This is the fourth documented-but-absent mechanism in this repository**, after `httpx.RegisterCode`,
-`httpx.H`/`DecodeJSON` and the worktree test isolation — and §7h already names that as the recurring
+`httpx.H`/`DecodeJSON` and the worktree test isolation — and §7i already names that as the recurring
 defect here, in the sentence "a mechanism this file claims exists is one nobody checks for". What is
 new is the *duration*: the other three were found within a wave or two of being written, and this one
 survived six waves. The reason is worth naming because it generalises: **nothing checked it because
@@ -15171,7 +15259,7 @@ because the second reader trusts it.
 *What was actually stale, and why it matters more than the two fixes.* This entry read **"Neither
 instance is fixed here — both are live code in `internal/admin` and `apps/mobile`"**, and both
 commits are ancestors of the branch it was written on. Its lane-letter attributions were wrong as
-well — §7b has the admin work on one branch and the nudge on another, and this entry named a third
+well — §7c has the admin work on one branch and the nudge on another, and this entry named a third
 and a fourth. **A finding written up after the wave that fixed it is a finding that describes a tree
 nobody has looked at**, which is the same defect in a different key as a count published without its
 ref. The next such entry should name the commit it was measured on, and a *closed* item should be
@@ -15343,7 +15431,7 @@ anything else that touches the harness.
 
 **Three cross-references in §3 were made stale by this pass's §7 renumber, and were deliberately not
 fixed.** Wave 10 is the new §7 and the nine waves behind it each moved one letter, so §3's references
-to §7a, §7d and §7e now name the wrong wave — they should read §7b, §7e and §7f. **The prep pass that
+to §7b, §7e and §7f now name the wrong wave — they should read §7c, §7f and §7g. **The prep pass that
 fixed them would have bought the wave's merge collision**, which is what happened to each of the last
 two preps for exactly one token each. §3 belongs to the code lanes during a wave. **Route the three
 corrections through whoever merges**, after the lanes have landed and before the next reconciliation
