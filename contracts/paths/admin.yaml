@@ -1450,6 +1450,447 @@ CancellationQueueEntry:
         count above is not enough on its own.
       example: 137
 
+AdminUserSuspension:
+  post:
+    operationId: adminRequestSuspension
+    summary: Propose a permanent suspension, for a second administrator to approve
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §9's second required internal control — "two-person review for permanent account
+      suspension where practical" — in its first half (SHIP-166).
+
+      **Nothing happens to the account.** A review is recorded, with the reason the second
+      administrator is being asked to agree with, and the account keeps the standing it had. A
+      control that suspended here and collected a signature afterwards would do nothing: the person
+      is already locked out by the time anybody reviews it.
+
+      ## Why suspension and not the other two standings
+
+      `restricted` narrows what an account may *do* and is reversible in one action. **`suspended`
+      takes the account away** — the platform refuses it at sign-in *and* at token refresh — so a
+      suspended person cannot reach the platform to ask why. That is what Docs/04 §9 means by
+      permanent, and it is the only standing this platform has that means it.
+
+      `POST /v1/admin/users/{id}/standing` still serves `restricted` and `active` in one call, and
+      refuses `suspended` with `admin_suspension_needs_review`. **Reinstatement is deliberately
+      still one administrator's action**: a control that made undoing a mistake as slow as making
+      one would leave somebody locked out while two people found each other.
+
+      ## One waiting review per account
+
+      A second request while one is pending is refused with
+      `admin_suspension_review_outstanding` — approve the existing one rather than making another.
+      Two pending reviews would let one administrator approve the *other's* request while their own
+      waited, which satisfies the letter of a two-person rule with one person driving both halves.
+
+      ## Permission
+
+      Needs `users.restrict`, which `moderator` and `owner` hold and `support` does not — the same
+      permission the approval needs. The control is that there are **two people**, not that the
+      second holds something the first does not.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The account proposed for suspension.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [reason]
+            additionalProperties: false
+            properties:
+              reason:
+                type: string
+                minLength: 10
+                maxLength: 500
+                description: |
+                  Why this account should be suspended. Required **here** rather than at the
+                  approval: the second administrator is being asked to agree with a stated case,
+                  and a request carrying none would make the control a formality — somebody
+                  clicking approve on a proposition nobody made.
+
+                  There is no administrator field. Who is asking comes from the session, because a
+                  two-person control whose participants a client could name has one participant.
+                example: Three unresolved safety reports in a fortnight; see note 0198f2c1.
+    responses:
+      '202':
+        description: |
+          The review was recorded. **The account is unchanged** — `202` rather than `201` because
+          what the caller asked for has not happened and may not.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/SuspensionReview'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.restrict`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: No account with that identifier exists.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The account already has a review waiting (`admin_suspension_review_outstanding`), or is
+          already suspended (`admin_user_standing_unchanged`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The reason was missing or records nothing (`validation_failed`), with one
+          `error.details` entry naming `reason`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminSuspensions:
+  get:
+    operationId: adminPendingSuspensions
+    summary: Suspension reviews waiting for a second administrator
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      The queue a second administrator finds a request in (SHIP-166).
+
+      **Without it the control does not work.** A review nobody can see is a review nobody
+      approves, which turns a two-person rule into an account that stays active because the queue
+      was invisible.
+
+      Pending reviews only, oldest first — an account somebody has already argued for is the entry
+      closest to being forgotten. An approved review leaves the queue; it does not disappear, and
+      the account's own history keeps both audit entries.
+
+      It is **not** filtered to reviews the caller may approve. Somebody's own pending request is
+      shown to them, because they need to know it is outstanding; the refusal happens where it is
+      enforced.
+
+      ## Permission
+
+      Needs `users.read`, which every role holds **including `support`** — seeing that a suspension
+      has been proposed is looking. Acting on it is `users.restrict` on the approval endpoint.
+
+      ## Paging
+
+      A `limit` and no cursor. The pending set is bounded by how many accounts are under review at
+      once, which is a handful rather than a page; the envelope is the standard one, so adding a
+      cursor later changes no client.
+    parameters:
+      - name: limit
+        in: query
+        required: false
+        description: How many reviews to return.
+        schema:
+          type: integer
+        example: 25
+    responses:
+      '200':
+        description: The reviews waiting for a second administrator, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/SuspensionReviewPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminSuspensionApproval:
+  post:
+    operationId: adminApproveSuspension
+    summary: Agree with a proposed suspension, applying it
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      The second half of Docs/04 §9's control, and the one it turns on (SHIP-166).
+
+      **The approver may not be the administrator who requested it.** That is refused with
+      `admin_same_administrator`, and it is refused in the database as well as in the service —
+      `ck_suspension_reviews_two_people`. Application logic refusing to write is a convention, and
+      a convention does not apply to a support query typed at a psql prompt or to the next endpoint
+      somebody adds.
+
+      The approving administrator comes from the verified session and never from the request, which
+      is why this endpoint takes no body at all.
+
+      ## The suspension is applied here, in one transaction
+
+      The review's approval, the account's standing and the audit entry commit together or none of
+      them does. A review marked approved beside an account still active would read, to the next
+      person, as a suspension that was agreed and then quietly reversed.
+
+      Afterwards the account cannot sign in and cannot refresh an existing token, which is where a
+      suspension actually takes effect — an access token lives fifteen minutes and carries no
+      standing.
+
+      ## Permission
+
+      Needs `users.restrict`, the same permission the request needs. A separate approval permission
+      would make the second signature a *role* rather than a review.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The review being approved.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '200':
+        description: |
+          The review was approved and the account is now suspended. Both administrators are named.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/SuspensionReview'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `users.restrict`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: No review with that identifier exists.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          **`admin_same_administrator`** — the approver requested this suspension, and Docs/04 §9
+          requires two people. Also `admin_suspension_review_settled` when the review has already
+          been approved or withdrawn, and `admin_user_standing_unchanged` when the account is
+          already suspended.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+SuspensionReviewPage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/SuspensionReview'
+    next_cursor:
+      type: string
+      description: |
+        Never issued by this endpoint today — the pending set is bounded by how many accounts are
+        under review at once. Carried in the envelope so that adding paging later changes no client.
+      example: ''
+    has_more:
+      type: boolean
+      example: false
+
+SuspensionReview:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - user_id
+    - status
+    - requested_by
+    - reason
+    - approved_by
+    - approved_at
+    - created_at
+  description: |
+    One proposal to suspend an account permanently. **Both administrators are on it once approved**,
+    which is the whole record a two-person control produces.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    user_id:
+      type: string
+      format: uuid
+      description: The account proposed for suspension.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    status:
+      type: string
+      enum: [pending, approved, withdrawn]
+      description: |
+        There is deliberately **no `rejected`**. A second administrator who disagrees says so to the
+        first, and the request is withdrawn by whoever made it — recording a rejection would make
+        this a workflow with two outcomes to route, and would put a disagreement between colleagues
+        into a record of things that were *done*, when nothing was.
+
+        `withdrawn` has no endpoint yet; nothing reads it as a decision.
+      example: pending
+    requested_by:
+      type: string
+      format: uuid
+      description: The administrator who made the case.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e7
+    reason:
+      type: string
+      description: |
+        The case, recorded once at the request. The approval carries no reason of its own: two
+        free-text accounts of one decision is two things to reconcile afterwards.
+      example: Three unresolved safety reports in a fortnight; see note 0198f2c1.
+    approved_by:
+      type: string
+      description: |
+        The second administrator. **Never equal to `requested_by`** — Docs/04 §9, enforced by a
+        database constraint as well as by the service. Empty while the review is pending, rather
+        than absent, so a console that renders without checking does not crash on the ordinary case.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e9
+    approved_at:
+      type: string
+      description: When they agreed, in UTC. Empty while pending.
+      example: '2026-08-15T15:51:20.362Z'
+    created_at:
+      type: string
+      format: date-time
+      description: When the request was made, in UTC.
+      example: '2026-08-15T15:51:20.359Z'
+
 AdminUsers:
   get:
     operationId: adminSearchUsers

@@ -11,8 +11,11 @@ GET    /v1/admin/notes                          admin        v1
 POST   /v1/admin/notes                          admin        v1
 POST   /v1/admin/sessions                       public       v1
 DELETE /v1/admin/sessions/current               admin        v1
+GET    /v1/admin/suspensions                    admin        v1
+POST   /v1/admin/suspensions/{id}/approval      admin        v1
 GET    /v1/admin/users                          admin        v1
 POST   /v1/admin/users/{id}/standing            admin        v1
+POST   /v1/admin/users/{id}/suspension          admin        v1
 GET    /v1/app/minimum-version                  public       v1
 POST   /v1/auth/login                           public       v1
 POST   /v1/auth/logout                          user         v1

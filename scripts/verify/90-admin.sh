@@ -470,6 +470,19 @@ admin_signin() {
     "{\"email\":\"$2\",\"password\":\"$3\"}" "$WORKDIR/admin-$4.json"
 }
 
+# admin_post <path> <credential> <key> <body> <name> — one authenticated state-changing request
+# (SHIP-166).
+#
+# A general helper rather than a fourth endpoint-specific one like `unpublish` below: the two
+# suspension routes and every administrative POST after them take the same four things, and one more
+# near-identical function per route is how a harness ends up with six that differ by a path.
+admin_post() {
+  curl -s -X POST -o "$WORKDIR/admin-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $2" -H "Idempotency-Key: $3" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT$1"
+}
+
 # admin_get <path> <credential> <name> — one authenticated read, answering with its status.
 #
 # The credential is passed verbatim so that the two crossing checks below can present the *other*
@@ -1217,6 +1230,178 @@ for forbidden in budget amount price bid_amount; do
     || { cat "$WORKDIR/cancel-entry.json"; fail "the cancellation entry carries a $forbidden field"; }
 done
 ok "the entry carries no budget and no bid amount — a shape that never carried one cannot leak one"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-166 — two-person review for permanent suspension.
+#
+# # What only this section can show
+#
+# The Go suite drives both endpoints against a real database and is the stronger of the two: it
+# asserts the account is untouched by a request, that the requester's own approval is refused, and
+# that the review stays pending afterwards. **What it cannot show is that the routes are wired at
+# all** — a handler built and never registered compiles, passes every test in `internal/admin`, and
+# serves a 404 to the console. It also cannot show that `POST /v1/admin/users/{id}/standing` refuses
+# `suspended` on the built binary, which is the half a console meets first.
+#
+# # Every assertion is fenced on this run's own rows
+#
+# `suspension_reviews` is shared with every previous run and every other worktree. Each review is
+# found by the id this section created.
+
+ticket "SHIP-166  a permanent suspension requires a second administrator's approval"
+
+admin_clear_limits
+
+# Two moderators, because one cannot do this — which is the ticket. Both hold users.restrict; the
+# control is that there are two people, not that either holds something the other does not.
+requester_email="verify-susp-a-$$@example.com"
+approver_email="verify-susp-b-$$@example.com"
+for email in "$requester_email" "$approver_email"; do
+  "$PSQL" "$DATABASE_URL" -q -c \
+    "insert into admin_users (id, email, name, password_hash, role)
+     values (gen_random_uuid(), '$email', 'Verify Reviewer', '$admin_fixture_hash', 'moderator');" >/dev/null \
+    || fail "the reviewing administrator $email could not be created"
+done
+
+status="$(admin_signin "verify-susp-a-in-$$" "$requester_email" "$admin_password" susp-a-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-susp-a-in.json"; fail "the requester could not sign in ($status)"; }
+requester_token="$(json "$WORKDIR/admin-susp-a-in.json" '["token"]')"
+requester_id="$(json "$WORKDIR/admin-susp-a-in.json" '["administrator"]["id"]')"
+
+status="$(admin_signin "verify-susp-b-in-$$" "$approver_email" "$admin_password" susp-b-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-susp-b-in.json"; fail "the approver could not sign in ($status)"; }
+approver_token="$(json "$WORKDIR/admin-susp-b-in.json" '["token"]')"
+approver_id="$(json "$WORKDIR/admin-susp-b-in.json" '["administrator"]["id"]')"
+
+[[ "$requester_id" != "$approver_id" ]] \
+  || fail "the fixture signed in one administrator twice, so this section would prove nothing"
+
+# The account under review, registered through the endpoint so that it is an ordinary account rather
+# than a row this section wrote.
+susp_email="verify-susp-subject-$$@example.com"
+status="$(post_json "verify-susp-reg-$$" /v1/auth/register \
+  "{\"name\":\"Verify Harness\",\"email\":\"$susp_email\",\"phone\":\"04196$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "$WORKDIR/susp-subject.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/susp-subject.json"; fail "the account under review could not be registered: $status"; }
+susp_user_id="$(json "$WORKDIR/susp-subject.json" '["id"]')"
+
+# standing_of <user-id> — the column identity reads at sign-in and at refresh.
+standing_of() {
+  "$PSQL" "$DATABASE_URL" -qtAc "select status from users where id = '$1';" | tr -d '[:space:]'
+}
+
+# --- the old route no longer suspends ------------------------------------------------------------
+
+status="$(admin_post "/v1/admin/users/$susp_user_id/standing" "$requester_token" \
+  "verify-susp-old-$$" '{"standing":"suspended","reason":"Three unresolved safety reports in a fortnight."}' \
+  susp-old)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/admin-susp-old.json"; fail "the standing endpoint suspended on one administrator's say-so ($status)"; }
+[[ "$(cat "$WORKDIR/admin-susp-old.json")" == *'admin_suspension_needs_review'* ]] \
+  || { cat "$WORKDIR/admin-susp-old.json"; fail "the refusal does not tell the console where to go"; }
+[[ "$(standing_of "$susp_user_id")" == "active" ]] \
+  || fail "the account was suspended by the endpoint that refused to suspend it"
+ok "one administrator can no longer suspend through the standing endpoint, and is told where to go instead"
+
+# --- the request changes nothing -----------------------------------------------------------------
+
+status="$(admin_post "/v1/admin/users/$susp_user_id/suspension" "$requester_token" \
+  "verify-susp-req-$$" '{"reason":"Three unresolved safety reports in a fortnight."}' susp-req)"
+[[ "$status" == "202" ]] \
+  || { cat "$WORKDIR/admin-susp-req.json"; fail "requesting a suspension returned $status, want 202"; }
+review_id="$(json "$WORKDIR/admin-susp-req.json" '["id"]')"
+[[ -n "$review_id" ]] || fail "the request returned no review"
+[[ "$(json "$WORKDIR/admin-susp-req.json" '["status"]')" == "pending" ]] \
+  || fail "a new review is not pending"
+
+[[ "$(standing_of "$susp_user_id")" == "active" ]] \
+  || fail "the account was suspended by the *request*, so the second signature is paperwork"
+ok "a request records the case and leaves the account alone — the control is not a suspension with a signature collected afterwards"
+
+# --- the queue, without which nobody can find the request ----------------------------------------
+
+status="$(admin_get /v1/admin/suspensions "$approver_token" susp-queue)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-susp-queue.json"; fail "reading the queue returned $status"; }
+python3 - "$WORKDIR/admin-susp-queue.json" "$review_id" >"$WORKDIR/susp-in-queue.txt" <<'SCAN'
+import json, sys
+page = json.load(open(sys.argv[1]))
+match = next((r for r in (page.get("data") or []) if r["id"] == sys.argv[2]), None)
+print(match["status"] if match else "")
+SCAN
+[[ "$(cat "$WORKDIR/susp-in-queue.txt")" == "pending" ]] \
+  || fail "the pending review is not in the queue — a second administrator cannot approve what they cannot find"
+ok "and the second administrator can find it in the queue, which is what makes the control exercisable"
+
+# --- the requester cannot approve their own request ----------------------------------------------
+#
+# The one check this whole ticket exists for. It is refused three deep — in the service, in the
+# UPDATE's own predicate, and by ck_suspension_reviews_two_people — and only the built binary shows
+# that the refusal survives the wiring.
+
+status="$(admin_post "/v1/admin/suspensions/$review_id/approval" "$requester_token" \
+  "verify-susp-self-$$" '{}' susp-self)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/admin-susp-self.json"; fail "one administrator completed a two-person review alone ($status)"; }
+[[ "$(cat "$WORKDIR/admin-susp-self.json")" == *'admin_same_administrator'* ]] \
+  || { cat "$WORKDIR/admin-susp-self.json"; fail "the refusal does not say a second administrator is needed"; }
+[[ "$(standing_of "$susp_user_id")" == "active" ]] \
+  || fail "the account was suspended by a refused approval, which is the partial write the transaction prevents"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select status from suspension_reviews where id = '$review_id';" | tr -d '[:space:]')" == "pending" ]] \
+  || fail "the review is no longer pending after a refused approval, so nobody else can act on it"
+ok "the administrator who asked cannot be the one who agrees — Docs/04 §9, refused on the wire with the account untouched"
+
+# --- a second administrator can, and the suspension takes effect ----------------------------------
+
+status="$(admin_post "/v1/admin/suspensions/$review_id/approval" "$approver_token" \
+  "verify-susp-ok-$$" '{}' susp-ok)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/admin-susp-ok.json"; fail "the second administrator could not approve the review ($status)"; }
+[[ "$(json "$WORKDIR/admin-susp-ok.json" '["approved_by"]')" == "$approver_id" ]] \
+  || { cat "$WORKDIR/admin-susp-ok.json"; fail "the review names the wrong approver"; }
+[[ "$(json "$WORKDIR/admin-susp-ok.json" '["requested_by"]')" == "$requester_id" ]] \
+  || { cat "$WORKDIR/admin-susp-ok.json"; fail "the review lost the administrator who asked"; }
+[[ "$(standing_of "$susp_user_id")" == "suspended" ]] \
+  || fail "the account is not suspended after a valid approval"
+ok "a second administrator's approval applies the suspension, and the review names both people"
+
+# The suspension is real where it matters: identity refuses the account at sign-in. SHIP-161
+# established that path and this is what says a two-person review reaches it.
+status="$(post_json "verify-susp-signin-$$" /v1/auth/login \
+  "{\"email\":\"$susp_email\",\"password\":\"correct-horse-battery-staple\",\"device_label\":\"iPhone\"}" \
+  "$WORKDIR/susp-signin.json")"
+[[ "$status" != "200" ]] \
+  || { cat "$WORKDIR/susp-signin.json"; fail "a suspended account signed in, so the review changed a column nothing reads"; }
+ok "and the account cannot sign in — the review reaches the enforcement identity already had"
+
+# --- the audit trail names both administrators ----------------------------------------------------
+
+approved_entries="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where action = 'user.suspension_approved'
+      and target_id = '$susp_user_id'
+      and actor_id = '$approver_id'
+      and metadata ->> 'requested_by' = '$requester_id';")"
+[[ "$approved_entries" == "1" ]] \
+  || fail "the approval entry does not name both administrators (found $approved_entries)"
+
+requested_entries="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where action = 'user.suspension_requested'
+      and target_id = '$susp_user_id'
+      and actor_id = '$requester_id';")"
+[[ "$requested_entries" == "1" ]] \
+  || fail "the request wrote no audit entry (found $requested_entries)"
+ok "both halves are in the trail — a two-person control that recorded one name would not have recorded what happened"
+
+# --- a settled review cannot be approved again ----------------------------------------------------
+
+status="$(admin_post "/v1/admin/suspensions/$review_id/approval" "$requester_token" \
+  "verify-susp-again-$$" '{}' susp-again)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/admin-susp-again.json"; fail "a settled review was approved again ($status)"; }
+ok "and a settled review cannot be approved twice — the record of who agreed cannot be rewritten"
 
 admin_clear_limits
 

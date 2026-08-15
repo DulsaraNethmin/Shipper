@@ -224,6 +224,52 @@ func init() {
 
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/admin/users/{id}/suspension",
+			Group:   GroupV1,
+
+			// Docs/04 §9's two-person review, first half (SHIP-166). `users.restrict`, the
+			// same permission the approval needs — the control is that there are two people,
+			// not that either holds something the other does not.
+			//
+			// A sibling of `/standing` rather than a value on it: the two answer different
+			// shapes and different statuses, and one endpoint that sometimes changed an
+			// account and sometimes filed a request is one a console has to branch inside.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).RequestSuspension() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/suspensions",
+			Group:   GroupV1,
+
+			// The queue a second administrator finds a request in (SHIP-166). `users.read`,
+			// which every role holds including `support`: seeing that a suspension has been
+			// proposed is looking, and acting on it is the other endpoint's permission.
+			//
+			// **Without this route the control does not work** — a review nobody can see is a
+			// review nobody approves.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).PendingSuspensions() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/admin/suspensions/{id}/approval",
+			Group:   GroupV1,
+
+			// The second half, and the one the control turns on (SHIP-166). A *different*
+			// administrator agrees and the suspension is applied in the same transaction.
+			//
+			// The approver is taken from the verified session and never from the body, which
+			// is why the endpoint accepts no body at all: a two-person control whose second
+			// signature a client could name has one participant.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).ApproveSuspension() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/admin/notes",
 			Group:   GroupV1,
 
