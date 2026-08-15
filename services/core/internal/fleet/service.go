@@ -125,12 +125,8 @@ func (s *Service) Add(ctx context.Context, r db.Runner, providerID uuid.UUID, f 
 		return Vehicle{}, err
 	}
 
-	provider, err := s.store.isProvider(ctx, r, providerID)
-	if err != nil {
+	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
 		return Vehicle{}, err
-	}
-	if !provider {
-		return Vehicle{}, fmt.Errorf("fleet: %s: %w", providerID, ErrNotProvider)
 	}
 
 	id, err := uuid.NewV7()
@@ -175,6 +171,10 @@ func (s *Service) Update(ctx context.Context, r db.Runner, providerID, vehicleID
 		return Vehicle{}, err
 	}
 
+	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
+		return Vehicle{}, err
+	}
+
 	vehicle, err := s.owned(ctx, r, providerID, vehicleID)
 	if err != nil {
 		return Vehicle{}, err
@@ -199,6 +199,9 @@ func (s *Service) Update(ctx context.Context, r db.Runner, providerID, vehicleID
 func (s *Service) Deactivate(ctx context.Context, r db.Runner, providerID, vehicleID uuid.UUID) (Vehicle, error) {
 	if _, inTx := r.(pgx.Tx); !inTx {
 		return Vehicle{}, fmt.Errorf("fleet: deactivating %s: %w", vehicleID, ErrNotInTransaction)
+	}
+	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
+		return Vehicle{}, err
 	}
 
 	vehicle, err := s.owned(ctx, r, providerID, vehicleID)
@@ -227,6 +230,9 @@ func (s *Service) Reactivate(ctx context.Context, r db.Runner, providerID, vehic
 	if _, inTx := r.(pgx.Tx); !inTx {
 		return Vehicle{}, fmt.Errorf("fleet: reactivating %s: %w", vehicleID, ErrNotInTransaction)
 	}
+	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
+		return Vehicle{}, err
+	}
 
 	vehicle, err := s.owned(ctx, r, providerID, vehicleID)
 	if err != nil {
@@ -248,7 +254,15 @@ func (s *Service) Reactivate(ctx context.Context, r db.Runner, providerID, vehic
 //
 // No lock and no transaction. This is a read, and [postgresStore.vehicle] takes the row without FOR
 // UPDATE for the reason recorded there.
+//
+// **A caller who is not a provider is refused before the vehicle is read** (SHIP-78a). It changes
+// nothing a customer could previously see — a vehicle is never theirs, so they got the same 404 —
+// and it changes what they are told, from "no such vehicle" to "only a provider account can keep a
+// fleet". See [Service.mustBeProvider].
 func (s *Service) Vehicle(ctx context.Context, r db.Runner, providerID, vehicleID uuid.UUID) (Vehicle, error) {
+	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
+		return Vehicle{}, err
+	}
 	return s.owned(ctx, r, providerID, vehicleID)
 }
 
@@ -263,8 +277,8 @@ func (s *Service) Vehicle(ctx context.Context, r db.Runner, providerID, vehicleI
 // page-size constant of this domain's own — every list endpoint needs the same answer and the
 // bounds come from configuration (SHIP-15g).
 func (s *Service) Vehicles(ctx context.Context, r db.Runner, providerID uuid.UUID, q VehicleQuery) (VehiclePage, error) {
-	if providerID == uuid.Nil {
-		return VehiclePage{}, fmt.Errorf("fleet: a fleet list names no provider: %w", ErrNotProvider)
+	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
+		return VehiclePage{}, err
 	}
 
 	limit := q.Limit
@@ -300,16 +314,24 @@ func (s *Service) Vehicles(ctx context.Context, r db.Runner, providerID uuid.UUI
 // such thing": there is no parent row in the schema, and "I have not nominated a service area yet"
 // is a truthful answer with the same shape as any other.
 //
-// No provider-account check, deliberately, and the same reading [Service.Vehicles] takes. A
-// customer's declaration is empty because they have never made one, and answering 403 to a read
-// that discloses nothing would make the client special-case a screen it never shows.
+// **A caller who is not a provider is refused, and SHIP-78a reversed this method's position on
+// that.** Until then it argued the other way, and the argument is worth recording rather than
+// deleting: a customer's declaration is empty because they have never made one, so a 403 disclosed
+// nothing a 200 did not, and it made the client special-case a screen it never shows.
+//
+// What that reasoning left out is the one Docs/07 §3 makes. "The app may hide or disable; the
+// platform decides" is only true if the platform *does* decide, and a surface that answers a
+// customer plausibly has decided nothing — it has relied on the client to keep them away, which is
+// SHIP-98 and is a presentation choice. The empty profile is also not the harmless answer it looks
+// like next to [Service.Declare], which refuses the same caller: a read that succeeds where the
+// write refuses is a screen that renders and then fails at the save button.
 //
 // No transaction: two SELECTs against one provider's rows, neither of which the other can
 // invalidate in a way that matters — a declaration is replaced under an advisory lock, so the worst
 // a concurrent write can do is put this read on one side of it or the other.
 func (s *Service) Profile(ctx context.Context, r db.Runner, providerID uuid.UUID) (Profile, error) {
-	if providerID == uuid.Nil {
-		return Profile{}, fmt.Errorf("fleet: a profile names no provider: %w", ErrNotProvider)
+	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
+		return Profile{}, err
 	}
 	return s.store.profile(ctx, r, providerID)
 }
@@ -350,12 +372,8 @@ func (s *Service) Declare(ctx context.Context, r db.Runner, providerID uuid.UUID
 		return Profile{}, err
 	}
 
-	provider, err := s.store.isProvider(ctx, r, providerID)
-	if err != nil {
+	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
 		return Profile{}, err
-	}
-	if !provider {
-		return Profile{}, fmt.Errorf("fleet: %s: %w", providerID, ErrNotProvider)
 	}
 
 	if err := s.store.lockProfile(ctx, r, providerID); err != nil {
@@ -681,6 +699,49 @@ func isPostcode(value string) bool {
 		}
 	}
 	return true
+}
+
+// mustBeProvider refuses a caller who is not a provider account (SHIP-78a).
+//
+// # Every method on this service calls it, and until SHIP-78a two of them did
+//
+// `Add` and `Declare` checked; `Update`, `Deactivate`, `Reactivate`, `Vehicle`, `Vehicles` and
+// `Profile` did not. Docs/11 §9 carried the gap from wave 5 under two different measurements, and
+// its own note is the reason to be precise about what it was and was not: **it was never a
+// disclosure.** Each of those six scopes to the caller's own identifier, so a customer reaching one
+// got an empty list or a 404 and never another provider's vehicle. What it was is an endpoint
+// declining to *refuse* somebody with no business on the surface — and Docs/07 §3's "the app may
+// hide or disable; the platform decides" is exactly the rule that makes the client's own gating
+// (SHIP-98) a presentation choice rather than the enforcement.
+//
+// # One refusal, at the first call rather than the last
+//
+// The value of checking in all eight is that a customer's *first* request to this surface is
+// refused with [ErrNotProvider] — one 403 carrying [CodeProviderOnly], which a client can act on —
+// instead of six requests answering plausibly and the seventh finally refusing. A screen that lists
+// an empty fleet and then refuses the button is a worse explanation than a screen that was never
+// reachable.
+//
+// # It reads users.role rather than the token's claim
+//
+// [postgresStore.isProvider] selects the column, which is the reading [ErrNotProvider] already
+// records: the claim is evidence about the token and the column is the fact. A missing account is
+// not a provider either — the row has gone underneath a live session, and "you may not keep a fleet"
+// is truthful about that.
+//
+// The nil identifier is refused here rather than by a separate check in each method. It cannot match
+// a row, so `isProvider` answers false, and one sentinel covers "no subject on the request" and "the
+// subject is a customer" — which are one thing to a client and were two spellings of the same error
+// in six methods before this.
+func (s *Service) mustBeProvider(ctx context.Context, r db.Runner, providerID uuid.UUID) error {
+	provider, err := s.store.isProvider(ctx, r, providerID)
+	if err != nil {
+		return err
+	}
+	if !provider {
+		return fmt.Errorf("fleet: %s: %w", providerID, ErrNotProvider)
+	}
+	return nil
 }
 
 // owned reads a vehicle and refuses one belonging to another provider.

@@ -638,6 +638,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
 | **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
+| **SHIP-78a** | M3 | Every one of `internal/fleet`'s eight service methods refuses a caller who is not a provider, with the sentinel `Add` and `Declare` already returned. **Docs/11 §9's oldest ownerless finding**, open since wave 5, and it was never a disclosure — each of the six that did not check scopes to the caller's own identifier, so a customer got an empty list or a 404 and never another provider's vehicle. What it was is a surface declining to *refuse*. `Service.Profile` reversed its own recorded position to take it — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13095,6 +13096,45 @@ the request is withdrawn by whoever made it; recording a rejection would make th
 two outcomes to route, and would put a disagreement between colleagues into the one table that
 records what was *done*, when nothing was. `withdrawn` exists in the CHECK and has no endpoint —
 named as a later ticket's, so that a pending review is not something only an approval can clear.
+
+#### Nothing was needed from `internal/config`
+
+### SHIP-78a — the oldest ownerless finding, and the position one method had to reverse to close it
+
+`isProvider` was called in `Add` and `Declare` and in no other method. `Update`, `Deactivate`,
+`Reactivate`, `Vehicle`, `Vehicles` and `Profile` did not check, and §9 carried that from wave 5 under
+two different measurements. It is closed by one helper — `Service.mustBeProvider` — called by all
+eight, returning the sentinel the other two already returned, so a customer reaching this surface
+gets one 403 carrying `fleet_provider_only` at their **first** request rather than at their seventh.
+
+**It was never a disclosure and must not be recorded as one.** Every one of the six scopes to the
+caller's own identifier, so a customer got an empty page, an empty declaration, or a 404 about a
+vehicle that was never theirs. What the gap was is an endpoint declining to refuse somebody with no
+business on it — which is exactly the condition Docs/07 §3's "the app may hide or disable; the
+platform decides" describes, with SHIP-98's client-side gating standing in for the platform's answer.
+
+#### `Service.Profile` argued the other way in its own doc comment, and the argument is kept
+
+That comment said a customer's declaration is empty because they never made one, so a 403 disclosed
+nothing a 200 did not, and refusing it would make the client special-case a screen it never shows.
+That reasoning is sound and incomplete. A read that succeeds beside a write that refuses is a screen
+which renders and then fails at the save button, and a surface whose answer to a customer depends on
+which verb they used is not a rule a client can act on. The old position is left in the file above the
+new one rather than deleted, because the next person to wonder why a read is refused will ask exactly
+that question.
+
+#### The completeness half is what makes the test more than a snapshot
+
+The acceptance criterion is a table of eight, and a table of eight says nothing about the ninth method
+somebody adds. `TestEveryServiceMethodIsClassified` reflects over `*fleet.Service` and fails when a
+method is neither in the table nor in `exemptFromProviderOnly` with a written reason. Four are exempt
+and each names why: `PublicProfiles` is SHIP-79a's customer-facing read, and `EligibleJobs`,
+`EligibleFor` and `ProviderJobFor` are governed by a SQL predicate that already carries
+`u.role = 'provider'` — a Go check beside it would be the second answer to who may bid that
+`eligibility.go` exists not to have.
+
+`TestEveryFleetMethodStillAnswersAProvider` is the other half, and without it the first test is
+satisfied by a service that refuses everybody.
 
 #### Nothing was needed from `internal/config`
 
