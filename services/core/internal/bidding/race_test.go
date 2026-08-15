@@ -4,6 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,7 +20,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 )
 
 // SHIP-95 — the award under concurrency, written from the documents rather than from the code.
@@ -894,6 +902,314 @@ func TestConcurrentAwardsOfOneOfferAllAnswerWithIt(t *testing.T) {
 			"test proved nothing about concurrency")
 	}
 	m.requireOneAward(t, m.job)
+}
+
+// --- race 5: an expiry sweep and an award contending for one job row (SHIP-95a) -------------------
+
+// sweepClaim runs [ExpiryClaim] inside a transaction the test drives by hand, and returns what it
+// locked.
+//
+// The claim rather than a hand-written `SELECT`, because the whole subject is what the sweep is
+// **holding** when it reaches the job: `FOR UPDATE SKIP LOCKED` on `bids` is what the worker takes,
+// and a test that took its own lock would be proving something about its own SQL.
+func sweepClaim(t *testing.T, r db.Runner, at time.Time) []uuid.UUID {
+	t.Helper()
+
+	rows, err := r.Query(t.Context(), ExpiryClaim, at, ExpiryBatch)
+	if err != nil {
+		t.Fatalf("claiming the due offers: %v", err)
+	}
+	defer rows.Close()
+
+	var due []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scanning a claimed offer: %v", err)
+		}
+		due = append(due, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("claiming the due offers: %v", err)
+	}
+	return due
+}
+
+// liveOffers is how many offers on a job either party could still act on.
+//
+// Read through [postgresStore.liveOffers] rather than through a `WHERE` written here, because that
+// is the predicate [Service.leaveNegotiationIfEmpty] decides on and TestTheLivePredicateIsOneRule
+// holds it to [Status.live]. A second copy would be a third opinion about what "live" means, and the
+// assertion below is precisely that the sweep left none.
+func (m market) liveOffers(t *testing.T, job uuid.UUID) int {
+	t.Helper()
+
+	live, err := m.svc.store.liveOffers(t.Context(), m.pool, job)
+	if err != nil {
+		t.Fatalf("counting the live offers on %s: %v", job, err)
+	}
+	return live
+}
+
+// deadlocked reports whether PostgreSQL killed this transaction to break a cycle.
+//
+// SQLSTATE 40P01. Named rather than matched on the message, and asserted separately from the
+// outcome each side is supposed to reach, because a deadlock is reported as an *error* — and a test
+// that accepted "one of them failed" as its pass condition would accept the deadlock as correct
+// behaviour. That is the trap [TestTheJobIsTakenBeforeTheBid] records about the award's own
+// ordering, and it applies here for the same reason.
+func deadlocked(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "40P01"
+}
+
+// TestAnExpirySweepDoesNotQueueBehindAnAwardHoldingTheJob is SHIP-95a, and it is the one race
+// Docs/08's four do not cover: **a sweep and an award contending for one `jobs` row.**
+//
+// # What is being held when the two meet, which is the whole of it
+//
+// Docs/11 §3's SHIP-88 entry records the ordering this domain keeps — `jobs` → `bids`, one
+// direction, nothing coming back — and [Presentation.LeaveNegotiation] is the one call that cannot
+// obey it. By the time `bidding` reaches it the offer has already closed, and in the expiry sweep
+// the `bids` rows were locked by the *claim*, before this package was entered at all. So the sweep
+// arrives at the job holding bids, and the award arrives at the bid holding the job. That is a
+// cycle, and `FOR UPDATE SKIP LOCKED` is the only thing that keeps it from closing.
+//
+// # The interleaving is driven by hand and then confirmed by the server
+//
+// The sweep claims both offers and is held. The award is started in the background, takes the job
+// row — which nothing else holds — and then blocks on the first offer, which the sweep has. The test
+// waits on `pg_blocking_pids` until PostgreSQL says so, exactly as SHIP-95's own tests do; only then
+// does the sweep expire what it claimed and reach the job.
+//
+// **The contention that is asserted is the award waiting on the sweep, and that is deliberate rather
+// than second best.** With `SKIP LOCKED` in place the sweep never waits for anything, so there is no
+// second block for the server to report — the absence of it *is* the property. What the wait proves
+// is that the two transactions genuinely overlapped, which is the half a free-running test cannot
+// establish about itself.
+//
+// # What fails, with `SKIP LOCKED` removed
+//
+// The sweep queues behind the award's `jobs` row, the award is already queued behind the sweep's
+// `bids` row, and PostgreSQL breaks the cycle by killing one of them with SQLSTATE 40P01 after
+// `deadlock_timeout`. Which one it kills is the server's choice, so both sides are asserted: the
+// sweep must succeed, and the award must be refused with [ErrBidClosed] rather than with a deadlock.
+// Whichever backend dies, one of those two assertions is the one that reports it.
+//
+// # And the cost the port documents is asserted rather than left as prose
+//
+// [Presentation.LeaveNegotiation] states it plainly: "under contention a job can sit at Negotiating
+// with no live offer until the next thing happens to it." That is the outcome here, and it is
+// checked — a job at Negotiating with nothing live is the *correct* end state of this race, and a
+// later change that made the sweep wait for the row would produce a tidier job status and a
+// deadlock.
+func TestAnExpirySweepDoesNotQueueBehindAnAwardHoldingTheJob(t *testing.T) {
+	m := newMarket(t)
+
+	mine, _, err := m.place(t, m.provider, m.job, offer("key-race5-mine"))
+	if err != nil {
+		t.Fatalf("placing the offer the award will take: %v", err)
+	}
+	rival := m.rival(t, 5)
+	theirs, _, err := m.place(t, rival, m.job, offer("key-race5-theirs"))
+	if err != nil {
+		t.Fatalf("placing the rival's offer: %v", err)
+	}
+	if status, _ := m.jobStatus(t, m.job); status != "Negotiating" {
+		t.Fatalf("the placements left the job at %q, so this race is not the one being run", status)
+	}
+
+	// The sweep, holding both offers and nothing else. Judged at [pastCollection], which is after
+	// both offers' own collection time — so the claim takes both and the job is left with nothing
+	// live once they are expired, which is what carries the sweep as far as the job row.
+	sweep := m.hold(t)
+	sweepPID := backendPID(t, sweep)
+
+	due := sweepClaim(t, sweep, pastCollection)
+	if len(due) != 2 {
+		t.Fatalf("the claim took %d offers, want both — the fixture is wrong, not the sweep", len(due))
+	}
+
+	// The award, which takes the job row first and is then stopped at the offer the sweep holds.
+	award := m.awardInBackground(t, m.customer, m.job, mine.ID)
+	m.waitUntilBlockedBy(t, sweepPID, award, "the award")
+
+	// Now the sweep walks on to the job, holding two `bids` rows, while the award holds the job.
+	// This is the moment the whole ticket is about.
+	expirer := NewService(events.NewOutbox(), nil, nil, nil,
+		newTestPresentation(clock.NewFixed(pastCollection)), nil, nil, clock.NewFixed(pastCollection))
+
+	var sweepErr error
+	for _, id := range due {
+		if _, sweepErr = expirer.Expire(t.Context(), sweep, id); sweepErr != nil {
+			break
+		}
+	}
+
+	if deadlocked(sweepErr) {
+		t.Fatalf("the sweep was killed to break a deadlock: %v — LeaveNegotiation waited for a `jobs` "+
+			"row while holding `bids` rows, which is the `bids` → `jobs` ordering the award's "+
+			"`jobs` → `bids` closes into a cycle", sweepErr)
+	}
+	if sweepErr != nil {
+		t.Fatalf("the sweep failed while an award held the job: %v — a presentation change must not "+
+			"fail because a real change is in flight", sweepErr)
+	}
+	// The award must still be waiting. Two very different things can have ended it early, and the
+	// deadlock is checked first because it is the one the mutation produces: with `SKIP LOCKED`
+	// removed, PostgreSQL breaks the cycle by killing a backend, and it killed *this* one in the run
+	// that established this test. Reporting that as "the two never overlapped" would be exactly
+	// backwards — they overlapped so hard the server had to intervene.
+	if award.finished() {
+		if deadlocked(award.err) {
+			t.Fatalf("the award was killed to break a deadlock: %v — the sweep waited for the `jobs` "+
+				"row while holding the `bids` rows its claim took, which is `bids` → `jobs` against "+
+				"the award's `jobs` → `bids`. That is the cycle `FOR UPDATE SKIP LOCKED` in "+
+				"LeaveNegotiation exists to keep open", award.err)
+		}
+		t.Fatalf("the award finished while the sweep still held the offers it had claimed, so the two "+
+			"never overlapped and this test proved nothing (it answered: %v)", award.err)
+	}
+
+	if err := sweep.Commit(t.Context()); err != nil {
+		t.Fatalf("committing the sweep: %v", err)
+	}
+	award.wait(t, "the award")
+
+	if deadlocked(award.err) {
+		t.Fatalf("the award was killed to break a deadlock: %v — see the sweep's own message; "+
+			"PostgreSQL chooses which side of the cycle dies, and this is the other one", award.err)
+	}
+	if !errors.Is(award.err, ErrBidClosed) {
+		t.Fatalf("the award = %v, want ErrBidClosed — the offer ran out on its own terms while the "+
+			"award was waiting for it", award.err)
+	}
+
+	found := m.statuses(t, m.job)
+	for id, status := range found {
+		if status != string(StatusExpired) {
+			t.Errorf("offer %s reads %q after the sweep, want Expired", id, status)
+		}
+	}
+	if got := found[theirs.ID]; got != string(StatusExpired) {
+		t.Errorf("the rival's offer reads %q, want Expired", got)
+	}
+	m.requireNotAwarded(t, m.job)
+
+	// The cost [Presentation.LeaveNegotiation] documents, asserted. The job is left at Negotiating
+	// with nothing live on it, because the presentation change was skipped rather than queued —
+	// which is what "biddable by everybody and awardable by nobody" means and is not a defect.
+	status, changes := m.jobStatus(t, m.job)
+	if status != "Negotiating" {
+		t.Errorf("the job reads %q, want Negotiating — the sweep skipped the row somebody else was "+
+			"holding, so nothing moved it back to Open", status)
+	}
+	if changes != 2 {
+		t.Errorf("the job has %d transitions, want two: publication and Negotiating. A third would "+
+			"mean the sweep waited for the job row and got it", changes)
+	}
+	if live := m.liveOffers(t, m.job); live != 0 {
+		t.Errorf("%d offers on the job are still live, want none", live)
+	}
+}
+
+// TestAnExpirySweepReachesTheJobWhenNobodyIsHoldingIt is the other half of the same statement, and
+// it is what stops the test above passing for the wrong reason.
+//
+// `FOR UPDATE SKIP LOCKED` returning no row is indistinguishable, in one statement, from a job that
+// does not exist — [presentedJobs.LeaveNegotiation] says so and answers [JobPresentationHeld] for
+// both. So a `LeaveNegotiation` that had stopped working altogether, or a claim that never reached
+// the job, would satisfy every assertion above: nothing moved, and nothing was meant to.
+//
+// This runs the identical sweep against the identical fixture with **nobody holding the job**, and
+// requires the move. Between the two, "skipped" is told apart from "broken".
+func TestAnExpirySweepReachesTheJobWhenNobodyIsHoldingIt(t *testing.T) {
+	m := newMarket(t)
+
+	if _, _, err := m.place(t, m.provider, m.job, offer("key-race5-uncontended-mine")); err != nil {
+		t.Fatalf("placing the offer: %v", err)
+	}
+	rival := m.rival(t, 6)
+	if _, _, err := m.place(t, rival, m.job, offer("key-race5-uncontended-theirs")); err != nil {
+		t.Fatalf("placing the rival's offer: %v", err)
+	}
+
+	claimed, err := m.sweepAt(t, pastCollection)
+	if err != nil {
+		t.Fatalf("the sweep failed: %v", err)
+	}
+	if claimed != 2 {
+		t.Fatalf("the sweep claimed %d offers, want both", claimed)
+	}
+
+	status, changes := m.jobStatus(t, m.job)
+	if status != "Open" {
+		t.Errorf("the job reads %q with nothing holding it, want Open — the sweep is meant to reach "+
+			"the job row when it is free, and a LeaveNegotiation that never reaches it at all would "+
+			"look exactly like the contended case", status)
+	}
+	if changes != 3 {
+		t.Errorf("the job has %d transitions, want three: publication, Negotiating, and back", changes)
+	}
+}
+
+// TestEveryLeaveNegotiationTakesTheJobRowWithoutWaiting pins the statement in all three copies of it.
+//
+// # Why a source guard sits beside a race, rather than instead of one
+//
+// The race above runs against this package's own [jobPresentation], because neither composition root
+// is importable from here — `cmd/api` and `cmd/worker` are `package main`, and the port exists
+// precisely so that this package names neither type. So the race proves the *property* against a
+// faithful copy, and this proves the copies have not parted company.
+//
+// **Wave 10's finding applies and is the reason this is not the whole test**: a pairing guard is a
+// text guard, and a test that reads a constant does not test the query that interpolates it. Neither
+// half is sufficient. Together they answer SHIP-95a's *Done when* — "removing `SKIP LOCKED` from
+// `LeaveNegotiation` fails the test rather than passing `make check`" — for every `LeaveNegotiation`
+// there is, which is what the sentence says.
+//
+// The fixture is in the list rather than exempt from it. It is the one the race actually drives, so
+// a copy that quietly dropped the clause there would take the race down with it silently.
+func TestEveryLeaveNegotiationTakesTheJobRowWithoutWaiting(t *testing.T) {
+	for _, file := range []string{
+		"../../cmd/api/routes_bidding.go",
+		"../../cmd/worker/tasks_bidding.go",
+		"fixtures_test.go",
+	} {
+		t.Run(path.Base(path.Dir(file))+"/"+path.Base(file), func(t *testing.T) {
+			source, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("reading %s: %v", file, err)
+			}
+
+			fset := token.NewFileSet()
+			parsed, err := parser.ParseFile(fset, file, source, 0)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", file, err)
+			}
+
+			var body string
+			for _, decl := range parsed.Decls {
+				fn, isFunc := decl.(*ast.FuncDecl)
+				if !isFunc || fn.Name.Name != "LeaveNegotiation" || fn.Body == nil {
+					continue
+				}
+				body = string(source[fn.Body.Pos()-1 : fn.Body.End()-1])
+			}
+			if body == "" {
+				t.Fatalf("%s declares no LeaveNegotiation — the guard is now looking at the wrong "+
+					"file, which is a worse failure than the one it was written for", file)
+			}
+
+			if !strings.Contains(body, "FOR UPDATE SKIP LOCKED") {
+				t.Errorf("%s's LeaveNegotiation does not take the job row with `FOR UPDATE SKIP "+
+					"LOCKED`. It is called holding `bids` rows, so a blocking lock there is "+
+					"`bids` → `jobs` against the award's `jobs` → `bids`, and the first deadlock "+
+					"is between an expiry sweep and an award — see "+
+					"TestAnExpirySweepDoesNotQueueBehindAnAwardHoldingTheJob", file)
+			}
+		})
+	}
 }
 
 // --- the lock, and the order it is taken in -------------------------------------------------------

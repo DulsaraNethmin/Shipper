@@ -639,6 +639,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
 | **SHIP-87a** | M3 | `ck_bids_offer_has_timing` restored (`000505`) — the constraint `000501` wrote, applied and removed because it would have bound SHIP-87's design. That design is made and it **inherits**, so every row the platform writes past `Draft` already states both instants. It is a `CHECK` rather than a validator because the validator is in front of one door and a worker, a repair script or a psql prompt is not behind it. **The cost `Docs/09` priced in was real and wider than the six tests it named** — ten fixture sites across five packages and two verify sections wrote a closed bid with no timing, because until now nothing refused one — *see below* |
+| **SHIP-95a** | M3 | The race nothing was running: **an expiry sweep and an award contending for one `jobs` row.** `LeaveNegotiation`'s `FOR UPDATE SKIP LOCKED` was the strongest untested invariant on the board — `make check` exited 0 with it removed. It now exits 1 in two ways: the race, driven by hand and confirmed with `pg_blocking_pids` as SHIP-95 does, and a source guard over **all three copies** of the statement. With the clause gone PostgreSQL reports a real deadlock, SQLSTATE **40P01**, in about a second. **No endpoint: demonstrated by its own tests** — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13176,6 +13177,89 @@ rather than glossed: five domain packages and two verify sections belong to othe
 are additive fixture lines in `_test.go` files and two shell fixtures, and no production code in
 another domain changes — but a merge conflict here is a real possibility and this is the row that
 says where to look.
+
+#### Nothing was needed from `internal/config`
+
+### SHIP-95a — the race that had never been run, and the deadlock it produces when the clause is removed
+
+`Docs/08` names four races and SHIP-95 ran all four. This is the fifth, and it is the one the other
+four cannot reach: **a sweep and an award contending for the same `jobs` row.**
+
+Docs/11 §3's SHIP-88 entry records the ordering this domain keeps — `jobs` → `bids`, one direction,
+nothing coming back — and `Presentation.LeaveNegotiation` is the single call that cannot obey it. By
+the time `bidding` reaches it the offer has closed, and in the expiry sweep the `bids` rows were
+locked by the **claim**, before the domain was entered at all. So the sweep arrives at the job
+holding bids while the award arrives at the bid holding the job. `FOR UPDATE SKIP LOCKED` is the only
+thing keeping that cycle open, and until this ticket **nothing failed when it was removed.**
+
+#### The interleaving is driven by hand and then confirmed by the server, which is SHIP-95's own shape
+
+`TestAnExpirySweepDoesNotQueueBehindAnAwardHoldingTheJob` opens a transaction the test drives, runs
+the real `ExpiryClaim` in it — the query `cmd/worker` runs, not a hand-written `SELECT`, because what
+the sweep is *holding* is the whole subject — and then starts an award in the background. The award
+takes the job row, which nothing else holds, and stops at the first offer. `pg_blocking_pids` is
+polled until PostgreSQL says so. Only then does the sweep expire what it claimed and walk on to the
+job.
+
+**The contention asserted is the award waiting on the sweep, and that is deliberate rather than
+second best.** With the clause in place the sweep never waits, so there is no second block for the
+server to report — the absence of it *is* the property. What the wait establishes is that the two
+transactions genuinely overlapped, which is the half a free-running test cannot establish about
+itself.
+
+#### The verdict, run rather than predicted
+
+| Mutation | Verdict |
+|---|---|
+| `SKIP LOCKED` removed from `internal/bidding/fixtures_test.go`'s `LeaveNegotiation` — the copy the race drives | **Caught.** `TestAnExpirySweepDoesNotQueueBehindAnAwardHoldingTheJob` fails in 1.49s with *"the award was killed to break a deadlock: … ERROR: deadlock detected (SQLSTATE 40P01)"* |
+| The same clause removed from `cmd/api/routes_bidding.go` and `cmd/worker/tasks_bidding.go` | **Caught.** `TestEveryLeaveNegotiationTakesTheJobRowWithoutWaiting` fails, naming the file |
+| Before this ticket, any of the three | **Survived.** `make check` exited 0, which is what `Docs/09`'s row is about |
+
+The deadlock is real rather than diagnosed: PostgreSQL detects the cycle after `deadlock_timeout` and
+kills a backend. **Which backend is the server's choice**, so both sides are asserted — the sweep must
+succeed and the award must be refused with `ErrBidClosed` — and `deadlocked()` matches SQLSTATE 40P01
+explicitly so that a deadlock can never be mistaken for a legible refusal. That is the trap
+`TestTheJobIsTakenBeforeTheBid` records about the award's own ordering: a suite that accepted "one of
+them failed" would accept the deadlock as correct behaviour. In the run that established this test the
+server killed the **award**, and the first draft of the assertion reported that as *"the two never
+overlapped"* — the precise opposite of what had happened. The check order was corrected so the deadlock
+is diagnosed first.
+
+#### Two tests rather than one, because a source guard and a race prove different things
+
+Neither composition root is importable from `internal/bidding` — both are `package main`, and the port
+exists precisely so this package names neither type — so the race runs against the package's own
+faithful copy. **Wave 10's finding applies and is why that is not the whole ticket**: a pairing guard is
+a text guard, and a test that reads a constant does not test the query that interpolates it. So
+`TestEveryLeaveNegotiationTakesTheJobRowWithoutWaiting` parses all three files and requires the clause
+in each `LeaveNegotiation` body, and fails loudly if a file stops declaring the method at all — a guard
+looking at the wrong file is worse than the failure it was written for. The fixture is in the list
+rather than exempt from it: it is the copy the race drives, so a silent drop there would take the race
+down with it.
+
+#### And a second race, because "skipped" and "broken" look identical
+
+`FOR UPDATE SKIP LOCKED` returning no row is indistinguishable in one statement from a job that does
+not exist — `presentedJobs.LeaveNegotiation` says so and answers `JobPresentationHeld` for both. A
+`LeaveNegotiation` that had stopped working altogether would satisfy every assertion in the contended
+test: nothing moved, and nothing was meant to.
+`TestAnExpirySweepReachesTheJobWhenNobodyIsHoldingIt` runs the identical sweep against the identical
+fixture with the row free and **requires** the move to Open.
+
+#### The cost the port documents is asserted rather than left as prose
+
+`Presentation.LeaveNegotiation` states it plainly: "under contention a job can sit at Negotiating with
+no live offer until the next thing happens to it." That is the end state of this race and it is
+checked — the job at Negotiating, two transitions and not three, and zero live offers, counted through
+`postgresStore.liveOffers` rather than a second `WHERE` written in the test. A later change that made
+the sweep wait for the row would produce a tidier job status and a deadlock.
+
+#### No endpoint, and no verify section
+
+The subject is a lock ordering between two transactions, one of which is a worker pass. `make verify`
+drives HTTP and cannot arrange the interleaving; a bash approximation of it would be the vacuous race
+this file's own harness exists to refuse. This is the case Docs/11 §3's opening paragraph describes —
+work that reaches no HTTP endpoint is demonstrated by its own tests and says so in the row.
 
 #### Nothing was needed from `internal/config`
 
