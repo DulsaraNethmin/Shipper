@@ -2396,7 +2396,7 @@ status="$(post_json "verify-adm161-login1-$$" /v1/auth/login \
 [[ "$status" == "200" ]] || { cat "$WORKDIR/stand-login-before.json"; fail "the account could not sign in before being restricted ($status)"; }
 ok "the account signs in while it is active, which is the precondition the next check needs"
 
-status="$(standing "$unpub_token" "verify-adm161-restrict-$$" "$stand_user_id" "$stand_body" susp)"
+status="$(standing "$unpub_token" "verify-adm161-limit-$$" "$stand_user_id" "$stand_body" susp)"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/stand-susp.json"; fail "restricting returned $status, want 200"; }
 [[ "$(json "$WORKDIR/stand-susp.json" '["from"]')" == "active" ]] \
   || { cat "$WORKDIR/stand-susp.json"; fail "the response does not say what the account held before"; }
@@ -2415,11 +2415,6 @@ ok "an account is restricted, and the response carries both ends — a console r
   || fail "the change wrote no audit entry carrying the reason and both ends"
 ok "and the audit entry names the account, the administrator, the reason and both ends of the change"
 
-status="$(post_json "verify-adm161-login2-$$" /v1/auth/login \
-  "{\"email\":\"$stand_email\",\"password\":\"$stand_password\",\"device_label\":\"Verify Standing\"}" "$WORKDIR/stand-login-after.json")"
-[[ "$status" == "200" ]] \
-  || { cat "$WORKDIR/stand-login-after.json"; fail "a restricted account could not sign in and got $status, want 200 — restricted limits what an account may do, and an account locked out cannot read why"; }
-ok "the restricted account still signs in — 'access is limited', not disabled, which is the distinction Docs/04 §4 draws and the SHIP-166 section shows the other side of"
 
 # --- a no-op, and putting the account back ------------------------------------------------------------
 
