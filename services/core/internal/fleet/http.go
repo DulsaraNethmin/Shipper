@@ -675,13 +675,18 @@ func (h *Handler) Declare() http.Handler {
 type openJobResponse struct {
 	ID string `json:"id"`
 
-	// Status is `open` or `negotiating` and can be nothing else. A job already being negotiated is
-	// one a provider is bidding against company, which is worth their knowing before they price it.
+	// Status is any of the twelve in Docs/02 §1, in the wire form Docs/10 §4.7 requires.
+	//
+	// **`open` or `negotiating` from the feed, and anything at all from the single-job read since
+	// SHIP-96a.** A job in the feed is by definition biddable; a job the caller has bid on may have
+	// been awarded to somebody else, cancelled, or delivered since, and this is the field that says
+	// so. A client must not assume the two values it used to be able to.
 	Status string `json:"status"`
 
-	// Pickup is present for every job this endpoint can return: the eligibility filter matches a
-	// declared region against the pickup state or postcode, so a job with neither cannot be here.
-	// Dropoff can be absent, because 000403 lets a customer publish before they have both ends.
+	// Pickup is present for every job either endpoint can return: the eligibility filter matches a
+	// declared region against the pickup state or postcode, so a job with neither cannot reach the
+	// feed — and a job the caller bid on was in their feed when they bid. Dropoff can be absent,
+	// because 000403 lets a customer publish before they have both ends.
 	Pickup  *regionResponse `json:"pickup,omitempty"`
 	Dropoff *regionResponse `json:"dropoff,omitempty"`
 
@@ -826,20 +831,27 @@ func (h *Handler) OpenJobs() http.Handler {
 	})
 }
 
-// OpenJob handles GET /v1/fleet/jobs/{id} (SHIP-83; moved off /v1/jobs/open/{id} by SHIP-83a).
+// ProviderJob handles GET /v1/fleet/jobs/{id} (SHIP-83; moved by SHIP-83a, widened by SHIP-96a).
 //
-// One job out of the feed, in the same shape the feed gave it. A member of the collection above
-// rather than a second view of `GET /v1/jobs/{id}`: that route is the *customer's* job, it carries
-// their budget, and one shape with a redaction step somebody has to remember is the arrangement a
-// privacy rule is hardest to keep with.
+// One job as the calling provider may see it, in the same shape the feed gave it. Not a second view
+// of `GET /v1/jobs/{id}`: that route is the *customer's* job, it carries their budget, and one shape
+// with a redaction step somebody has to remember is the arrangement a privacy rule is hardest to
+// keep with.
 //
-// **A job this provider may not bid on answers 404, byte-identically to a job that does not
-// exist.** The reasoning is the one a stranger's vehicle already gets, sharpened: which jobs exist
-// on the platform, and which of them a competitor is eligible for, is information nobody published.
-// The authorisation is the same predicate the feed runs — [Service.EligibleJobFor] — so a job this
-// endpoint serves is a job the feed would have carried, and a job it refuses is one SHIP-84 will
-// refuse a bid on.
-func (h *Handler) OpenJob() http.Handler {
+// # Who may read it, which is wider than who may bid
+//
+// SHIP-83 served exactly the feed's members, so a provider's view of a job ended the moment the job
+// stopped being biddable — **including when they won it.** SHIP-96a adds the second half of the
+// relationship: a provider who holds a bid on this job, whatever became of the bid, and therefore
+// the provider who was awarded it. [readable] carries the whole argument; the shape of the response
+// does not change, and neither does what a provider may bid on.
+//
+// **A job with neither relationship answers 404, byte-identically to a job that does not exist.**
+// The reasoning is the one a stranger's vehicle already gets, sharpened: which jobs exist on the
+// platform, and which of them a competitor is eligible for, is information nobody published. One
+// sentinel out of [Service.ProviderJobFor] means the handler cannot accidentally tell the two
+// apart, because it never learns which it was.
+func (h *Handler) ProviderJob() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		providerID, err := callerID(r.Context())
 		if err != nil {
@@ -856,7 +868,7 @@ func (h *Handler) OpenJob() http.Handler {
 			return err
 		}
 
-		job, err := h.svc.EligibleJobFor(r.Context(), pool, providerID, jobID)
+		job, err := h.svc.ProviderJobFor(r.Context(), pool, providerID, jobID)
 		if err != nil {
 			return apiError(err)
 		}

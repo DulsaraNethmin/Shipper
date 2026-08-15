@@ -584,6 +584,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 | **SHIP-83a** | M3 | The provider feed moves off the `{id}` slot: `GET /v1/jobs/open` and `/v1/jobs/open/{id}` become **`GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}`**, gone rather than aliased. That frees the whole four-segment `GET /v1/jobs/{id}/<literal>` space four earlier tickets each paid a workaround for, **demonstrated by registering one** rather than asserted — `TestFourSegmentJobLiteralsCanBeRegistered` attaches the real route table plus a probe route and fails if the mux refuses the pair — *see below* |
+| **SHIP-96a** | M3 | `GET /v1/fleet/jobs/{id}` widens from eligibility to **relationship**: a provider reads a job they hold any bid on — live or closed, and therefore the job they were awarded — for as long as the bid exists, in the same budget-stripped shape the feed serves. One SQL predicate (`readable` = `eligible OR the caller holds a bid`), one column list, one response type; **bidding is deliberately not widened with it**. A provider with neither relationship gets exactly what a missing job gets. The budget guard gained a **word-level** check, because a sentence defeats a closed key set — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -11956,6 +11957,101 @@ are corrected to past tense and now say so.
 endpoint: nothing in `go_router` resembles the `ServeMux` constraint, the two patterns there differ
 in segment count and cannot overlap, and the path is a deep-link target (`Docs/07` §5) that moving
 would strand links already sent.
+
+**Nothing was needed from `internal/config`.**
+
+
+### What SHIP-96a built, and the guard it had to add before it could claim its last clause
+
+`GET /v1/fleet/jobs/{id}` now answers to a **relationship** rather than to eligibility. Either the
+job is in the caller's feed, or the caller already holds a bid on it — Submitted, Countered,
+Accepted, Rejected, Withdrawn, Expired, Superseded or Draft — and the view lasts as long as the bid
+does. The response shape, the column list and the type are unchanged: SHIP-96a widened *who may
+ask*, and deliberately not *what comes back*.
+
+#### One gap, recorded twice from opposite ends of a bid
+
+`eligible` matches `status IN ('Open','Negotiating')`, so before this ticket **a provider lost sight
+of a job at the moment it stopped being biddable — including by winning it.** SHIP-129's milestone
+screen could show a job identifier with no address, no goods and no pickup window, which three lanes
+recorded independently in wave 7; and every provider who *lost* the job lost their view in the same
+transaction. Both audiences are one thing — "a provider with a relationship to this job that is not
+eligibility" — so one clause closes both, which is why `Docs/09` writes them as one ticket.
+
+**The award needs no clause of its own.** SHIP-92 records an award by moving the winning bid to
+`Accepted`; there is no `awarded_provider_id` column anywhere in `jobs`. The awarded provider is
+therefore a provider holding a bid, and a second clause would be a second way to say the same thing
+that a later schema change could make disagree with the first.
+
+**Bidding did not widen with the read, and that is the load-bearing half.** `Service.EligibleFor` —
+what SHIP-84 asks before it writes a bid — still reads `eligible` alone, so holding an expired bid
+buys no new offer on a job that has closed. The verify section asserts both directions on the same
+job: the feed no longer carries it, and the read still serves it.
+
+#### The fifth table, and the threshold `eligibility.go` had set for itself
+
+`readable` reads `bids`, which is `internal/bidding`'s table, and that file's own header named "a
+fifth domain's table joining this predicate" as what would change its answer about using SQL at all.
+**Considered and crossed deliberately.** The threshold it named is the *filter* becoming a
+hand-written query planner, and this is one `EXISTS` on `(job_id, provider_id)` that selects no
+column and joins nothing. The port shape was reconsidered on its merits — the paging objection that
+ruled it out for the feed does not apply to a single job by identifier — and rejected again on a
+different argument: two statements means reading the job with **no** eligibility predicate once a
+closure has said "yes, they bid", which is a second definition of what a provider may see, living in
+`cmd/api`. `TestOnlyTheEligibilityFilterReadsTheJobsTable` became
+`TestOnlyTheEligibilityFilterReadsAnotherDomainsTables` and now loops over both tables, so the
+confinement argument that made the reach acceptable still has a test behind it.
+
+#### The parentheses are the defect this could most easily have shipped
+
+`readable` is `(eligible) OR EXISTS(a bid)` and the store wraps the whole of it before adding
+`j.id = $3`. Without the outer brackets, SQL precedence binds the identifier to the first branch
+alone — **and every provider holding a bid on any job would read every job on the platform.** One
+character, no compile error, no other failing test. `TestABidOnOneJobDoesNotOpenAnother` is the
+guard; **mutated by removing the brackets, and it fails** with the message it was written to print.
+The verify section makes the same check at the harness by giving the second provider a bid on a
+different job before asserting its 404.
+
+#### The mutation this lane was given, and the finding it produced
+
+The dispatch asked for a budget put back into the provider's read **as a sentence rather than a
+field** — wave 10's shape. Applied to `openJobFrom`, appending *"The customer has set a maximum."* to
+`handling_notes`: no key added, no value present, the word "budget" nowhere.
+
+**The whole pre-existing fleet suite passed with it live.** Measured, not predicted: with the new
+prose guard disabled and the sentence in place, `go test ./internal/fleet -race` exited `ok`. The
+closed key set does not see it (no new key), the `"budget"` word search does not see it (the word is
+absent), the value search does not see it (no number), `TestNoProviderFacingShapeCarriesTheBudget`'s
+AST walk does not see it (no field), and the SQL guard does not see it (no column). **Five guards,
+none of which can catch a sentence.**
+
+So SHIP-96a adds `assertNoBudgetProse` — a phrase list searched in the serialised body, applied to
+every provider-facing job response the feed and the widened read produce — plus
+`TestTheBudgetProseGuardIsNotVacuous`, which asserts the guard fires on wave 10's exact sentence
+*and* that `richJob`'s own free text contains none of the phrases, so a failure is about the platform
+rather than about the fixture. The verify section greps for the same vocabulary. Both mutations were
+restored from `/tmp/snap-c-96a` and `/tmp/snap-c-96b` copies and confirmed with `shasum -a 256 -c`,
+never with `git checkout`.
+
+**The general lesson is a sharpening of Docs/10 §3.4's pairing rule.** A closed key set is a guard
+against *structure*, and the budget rule is not structural — `Docs/01` §4.3 forbids "a band, or a
+'budget supplied' flag", and a flag can be prose. Any shape that will hold platform-authored text
+needs a word-level guard beside its key-level one.
+
+#### Names, and one deliberately not changed
+
+`Service.EligibleJobFor` became `Service.ProviderJobFor` and `Handler.OpenJob` became
+`Handler.ProviderJob`, because neither is about eligibility any more. **`EligibleJob` — the row type
+— kept its name on purpose**: it names the shape after the feed that defines it, and both endpoints
+answer with it. Giving the widened read a type of its own would have been two shapes to keep the
+budget out of instead of one, which is the arrangement this domain exists not to have.
+
+**`status` can now be any of the twelve.** From the feed it is still only `open` or `negotiating`;
+from the single job it may be `awarded`, `cancelled`, `in_transit` or anything else the job reached
+after the caller bid, and it is the only field in the shape that says what became of the work. The
+contract's `BiddableJobStatus` became `ProviderJobStatus` and lists all twelve, and the Dart model
+already tolerated them — `@JsonKey(unknownEnumValue: JobStatus.unknown)` over the generated
+`JobStatus`, so no client change was needed.
 
 **Nothing was needed from `internal/config`.**
 

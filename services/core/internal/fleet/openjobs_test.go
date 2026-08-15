@@ -669,6 +669,95 @@ func assertNoBudget(t *testing.T, body []byte) {
 				rendering, body)
 		}
 	}
+
+	// 4. And not as a **sentence** — the one form the three checks above all miss (SHIP-96a).
+	assertNoBudgetProse(t, body)
+}
+
+// budgetProse is the vocabulary a "budget supplied" signal would arrive in if it arrived as words.
+//
+// **Deliberately not a list of field names.** The three checks above are a closed key set, the word
+// "budget", and the fixture's own number, and a sentence defeats all three at once: it adds no key,
+// contains no value, and does not have to say "budget" to say what Docs/01 §4.3 forbids. Wave 10
+// isolated exactly this — *"The customer has set a maximum."* placed in an existing free-text field
+// — and a thirteen-test suite passed with it live in another domain. This list is what that finding
+// costs, and it is a list of the *words a platform would reach for*, not of things it might name.
+//
+// **Every entry has to be absent from the fixture as well as from the platform**, or the guard is a
+// guard against the fixture. [richJob]'s free text is "Two-seater sofa, wrapped, no legs attached",
+// "Ute with a tailgate lifter" and "Second-floor walk-up, no lift.", and
+// TestTheBudgetProseGuardIsNotVacuous holds that.
+//
+// A customer *could* legitimately type "maximum" into their handling notes, which would fail this
+// test rather than the service — and that is the right way round: the fixture is this file's, the
+// notes are a controlled input, and a guard that tried to distinguish customer prose from platform
+// prose inside one string would be guessing.
+var budgetProse = []string{
+	"maximum",
+	"max ",
+	"ceiling",
+	"cap ",
+	"willing to pay",
+	"price range",
+	"up to $",
+	"has set a",
+	"has a limit",
+	"limit of",
+}
+
+// budgetProseIn reports the first phrase of [budgetProse] a response carries, or "".
+//
+// Split from the assertion so the guard can be tested without a fabricated *testing.T, which is the
+// only way TestTheBudgetProseGuardIsNotVacuous can assert that it *fires*.
+func budgetProseIn(body []byte) string {
+	lowered := strings.ToLower(string(body))
+	for _, phrase := range budgetProse {
+		if strings.Contains(lowered, phrase) {
+			return phrase
+		}
+	}
+	return ""
+}
+
+// assertNoBudgetProse is the word-level half of the guard.
+func assertNoBudgetProse(t *testing.T, body []byte) {
+	t.Helper()
+
+	if phrase := budgetProseIn(body); phrase != "" {
+		t.Errorf("a provider's response contains %q.\n"+
+			"  Docs/01 §4.3 forbids the customer's maximum reaching a provider as an amount, a "+
+			"band, or a \"budget supplied\" flag — and a sentence is that flag in the one form no "+
+			"key list and no value search can see. If the platform wrote this, it is a defect. If "+
+			"a customer typed it into their own free text, change the fixture rather than this "+
+			"list.\n  %s", phrase, body)
+	}
+}
+
+// TestTheBudgetProseGuardIsNotVacuous is the check on the check.
+//
+// [budgetProseIn] passes trivially if every phrase it looks for is one no response could contain,
+// which is what a later tidy-up of [budgetProse] would produce. This asserts that it fires on the
+// exact sentence wave 10 isolated, and that it does not fire on the fixture's own free text — the
+// two ways a guard like this stops meaning anything.
+func TestTheBudgetProseGuardIsNotVacuous(t *testing.T) {
+	const smuggled = `{"handling_notes":"Second-floor walk-up, no lift. The customer has set a maximum."}`
+
+	if budgetProseIn([]byte(smuggled)) == "" {
+		t.Error("the sentence wave 10 isolated — \"The customer has set a maximum.\" — passed the " +
+			"prose guard. It carries no field name and no value, so the closed key set, the word " +
+			"search and the value search all miss it; this guard is the only one that can catch " +
+			"it, and it is not catching it.")
+	}
+
+	// And the other way: the fixture's own words are not on the list, so a failure of this guard
+	// in the tests above is about the platform rather than about richJob.
+	clean := richJob(1500)
+	for _, text := range []string{clean.GoodsDescription, clean.VehicleRequirement, clean.HandlingNotes} {
+		if phrase := budgetProseIn([]byte(text)); phrase != "" {
+			t.Errorf("richJob's own text %q contains %q, so the prose guard is testing the "+
+				"fixture rather than the service", text, phrase)
+		}
+	}
 }
 
 // identifier matches a UUID as it appears in a JSON document.

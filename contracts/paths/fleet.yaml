@@ -652,27 +652,47 @@ FleetJobs:
 FleetJobByID:
   get:
     operationId: getOpenJob
-    summary: Read one job this provider may bid on
+    summary: Read one job this provider may bid on, or has bid on
     tags: [Jobs]
     description: |
-      One job out of `/v1/fleet/jobs`, in the same shape the feed gave it (SHIP-83; moved off
-      `/v1/jobs/open/{id}` by SHIP-83a).
+      One job in the same shape `/v1/fleet/jobs` sends one (SHIP-83; moved off `/v1/jobs/open/{id}`
+      by SHIP-83a, widened by SHIP-96a).
 
-      **This is a member of that collection and not a second view of `GET /v1/jobs/{id}`.** That
-      operation is the *customer's* own job and is the one shape in this API that carries
-      `budget_cents`; this one has no field it could go in. `Docs/01` §4.3 keeps the customer's
-      maximum private from providers in every form, and two shapes are far easier to keep that rule
-      with than one shape and a redaction step somebody has to remember.
+      **Two ways to be entitled to it, and the second is what SHIP-96a added.** Either the job is in
+      your feed — you are eligible to bid on it right now — **or you already hold a bid on it,
+      whatever became of that bid.** Submitted, countered, accepted, rejected, withdrawn, expired or
+      superseded: the view survives all of them, for as long as the bid exists.
 
-      **A job this provider may not bid on answers `404`, byte-identically to a job that does not
+      That second clause exists because the first, alone, took a job away from a provider at the
+      moment it stopped being biddable — **including when they won it.** The awarded provider needs
+      the pickup address and the handling notes to carry out the work, and everyone who lost needs to
+      be able to look at what they bid on. There is no separate "awarded" rule: an award *is* an
+      accepted bid.
+
+      **So `status` can be any of the twelve.** From the feed it is only ever `open` or
+      `negotiating`; here it may be `awarded`, `in_transit`, `cancelled` or anything else the job has
+      reached since you bid, and it is the field that tells you what happened. A client that assumed
+      two values from this operation will be wrong.
+
+      **What did *not* widen is what you may bid on.** Holding an expired bid does not let you place
+      a new one on a job that has closed; `POST /v1/jobs/{id}/bids` still answers to eligibility
+      alone.
+
+      **This is not a second view of `GET /v1/jobs/{id}`.** That operation is the *customer's* own
+      job and is the one shape in this API that carries `budget_cents`; this one has no field it
+      could go in, at any status. `Docs/01` §4.3 keeps the customer's maximum private from providers
+      in every form and for ever — an awarded job does not unlock it — and two shapes are far easier
+      to keep that rule with than one shape and a redaction step somebody has to remember.
+
+      **A job you have neither relationship to answers `404`, byte-identically to a job that does not
       exist.** Which jobs exist, and which of them a competitor is eligible for, is information
-      nobody published. The authorisation is the same predicate the feed runs, so a job served here
-      is a job the feed would have carried, and a job refused here is one a bid would be refused on.
+      nobody published. The two cases are one answer rather than two, so nothing in the response can
+      tell them apart.
     parameters:
       - $ref: '#/OpenJobID'
     responses:
       '200':
-        description: The job, as a provider deciding whether to bid sees it.
+        description: The job, as a provider with a relationship to it sees it.
         headers:
           X-Request-Id:
             $ref: '../openapi.yaml#/components/headers/RequestID'
@@ -1117,7 +1137,7 @@ OpenJob:
   required: [id, status, created_at]
   additionalProperties: false
   description: |
-    A job as a provider deciding whether to bid on it sees it (SHIP-82, SHIP-83).
+    A job as a provider with a relationship to it sees it (SHIP-82, SHIP-83; widened by SHIP-96a).
 
     **There is no budget field, and there is no form one could take here.** `Docs/01` §4.3 keeps the
     customer's maximum private from a provider — not as an amount, not as a band, not as a
@@ -1145,7 +1165,7 @@ OpenJob:
       format: uuid
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
     status:
-      $ref: '#/BiddableJobStatus'
+      $ref: '#/ProviderJobStatus'
     pickup:
       $ref: '#/JobRegion'
     dropoff:
@@ -1262,20 +1282,37 @@ JobTimeWindow:
       format: date-time
       example: '2026-08-15T17:00:00.000Z'
 
-BiddableJobStatus:
+ProviderJobStatus:
   type: string
   description: |
-    The status of a job that is open to bids, in the wire form `Docs/10` §4.7 requires and
+    The status of a job a provider is reading, in the wire form `Docs/10` §4.7 requires and
     `Docs/02` §1 names.
 
-    **Two values, not one.** `Docs/02` §1 defines Negotiating as a job that has bids or
-    counter-offers on it and "remains open to eligible bids unless the customer closes it or awards
-    a bid" — so it is still biddable, and it is carried rather than hidden because a provider
+    **From `GET /v1/fleet/jobs` this is `open` or `negotiating` and can be nothing else**, because
+    nothing else satisfies the eligibility filter. `Docs/02` §1 defines Negotiating as a job that has
+    bids or counter-offers on it and "remains open to eligible bids unless the customer closes it or
+    awards a bid" — so it is still biddable, and it is carried rather than hidden because a provider
     bidding against company is in a different position from one bidding alone.
 
-    This is a subset of the twelve statuses in the `Job` schema, and it is a subset by construction:
-    nothing else can satisfy the eligibility filter, so no other value can appear here.
+    **From `GET /v1/fleet/jobs/{id}` it can be any of the twelve, and SHIP-96a is why.** A provider
+    reads a job they hold a bid on for as long as the bid exists, so the job may have been awarded to
+    somebody else, cancelled, delivered or disputed since. That is the point of the widened read: the
+    status is the only field in this shape that says what became of the work.
+
+    `draft` is listed for completeness rather than because it is reachable — a bid cannot be placed
+    on an unpublished job — and a client should treat the list as the twelve rather than reason about
+    which of them it can rule out.
   enum:
+    - draft
     - open
     - negotiating
+    - awarded
+    - driver_assigned
+    - en_route_to_pickup
+    - picked_up
+    - in_transit
+    - delivered
+    - completed
+    - cancelled
+    - disputed
   example: open

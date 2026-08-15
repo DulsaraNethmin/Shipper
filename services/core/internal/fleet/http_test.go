@@ -56,7 +56,7 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	// cmd/api/routes_fleet.go, and note that the patterns here have to match that file exactly —
 	// a route mounted here and nowhere else is an endpoint that exists only in the tests.
 	mux.Handle("GET /v1/fleet/jobs", handler.OpenJobs())
-	mux.Handle("GET /v1/fleet/jobs/{id}", handler.OpenJob())
+	mux.Handle("GET /v1/fleet/jobs/{id}", handler.ProviderJob())
 	return mux
 }
 

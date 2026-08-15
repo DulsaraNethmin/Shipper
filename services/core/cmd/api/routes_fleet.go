@@ -146,7 +146,7 @@ func init() {
 			Pattern: "/fleet/jobs/{id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
-			Handler: func(d Deps) http.Handler { return fleetHandler(d).OpenJob() },
+			Handler: func(d Deps) http.Handler { return fleetHandler(d).ProviderJob() },
 		},
 	)
 }

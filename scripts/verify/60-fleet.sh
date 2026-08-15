@@ -36,7 +36,8 @@ status="$(post_json "verify-fleet-other-$$" /v1/auth/register \
   "{\"email\":\"fleet-other-$$@example.com\",\"phone\":\"04141$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/fleet-other.json")"
 [[ "$status" == "201" ]] || { cat "$WORKDIR/fleet-other.json"; fail "could not register the second provider: $status"; }
-fleet_other_token="$(mint_token "$(json "$WORKDIR/fleet-other.json" '["id"]')")"
+fleet_other_id="$(json "$WORKDIR/fleet-other.json" '["id"]')"
+fleet_other_token="$(mint_token "$fleet_other_id")"
 
 status="$(post_json "verify-fleet-cust-$$" /v1/auth/register \
   "{\"email\":\"fleet-customer-$$@example.com\",\"phone\":\"04142$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
@@ -1053,3 +1054,103 @@ ok "an ineligible job answers exactly what a missing job answers — the refusal
 status="$(fleet_get "$fleet_customer_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/open-owner.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/open-owner.json"; fail "the owning customer read their job through the provider's route: $status"; }
 ok "the provider's route is not a second way to a job the customer owns"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-96a  GET /v1/fleet/jobs/{id} once the job has left the feed — the bid, not eligibility"
+
+# **What only the harness can show here.** internal/fleet's tests drive the handler on a mux of
+# their own against a bid row they insert; this drives the served route, past the real auth class,
+# against a job published through /v1/jobs by a real customer and moved through the guarded
+# transition. The two halves that meet only here are the route and the predicate.
+#
+# The bid is written with psql rather than through POST /v1/jobs/{id}/bids, and that is deliberate
+# rather than a shortcut: this section belongs to fleet, the bidding endpoints are 61-bidding.sh's
+# to exercise, and what SHIP-96a asserts is that a *row in bids* opens the read. Placing the offer
+# through the API would make this check depend on another section's fixtures for no extra evidence.
+
+status="$(fleet_request POST "$fleet_customer_token" "verify-ship96a-job-$$" /v1/jobs \
+  '{"pickup":{"line":"5 Church Street","suburb":"Richmond","state":"VIC","postcode":"3121"},
+    "dropoff":{"line":"1 Bourke Street","suburb":"Melbourne","state":"VIC","postcode":"3000"},
+    "goods_description":"Two-seater sofa","weight_kg":80,"length_cm":190,"width_cm":90,"height_cm":80,
+    "budget_cents":432199}' \
+  "$WORKDIR/awarded-job.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/awarded-job.json"; fail "creating the SHIP-96a job returned $status"; }
+awarded_job_id="$(json "$WORKDIR/awarded-job.json" '["id"]')"
+publish_job "$awarded_job_id" Draft Open
+
+# The fixture, verified rather than assumed: a privacy check against a job with nothing to leak
+# passes forever and proves nothing.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from jobs where id = '$awarded_job_id' and budget is not null;" | tr -d ' ')" == "1" ]] \
+  || fail "the SHIP-96a job carries no budget, so the disclosure checks below assert nothing"
+
+# While it is open the provider reads it because they are eligible — the SHIP-83 behaviour, restated
+# here so the 200 after the award is a widening rather than a job that never left.
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$awarded_job_id" "$WORKDIR/awarded-before.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/awarded-before.json"; fail "an eligible provider returned $status, want 200"; }
+
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into bids (id, job_id, provider_id, status, amount)
+   values (gen_random_uuid(), '$awarded_job_id', '$elig_provider_id', 'Accepted', 45000);"
+publish_job "$awarded_job_id" Open Awarded
+
+# The feed no longer carries it. This is the half that makes the next check mean something: without
+# it, a 200 below could be a job that is simply still biddable.
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=100' "$WORKDIR/awarded-feed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/awarded-feed.json"; fail "the feed returned $status"; }
+python3 -c "
+import json, sys
+page = json.load(open(sys.argv[1]))
+sys.exit(1 if any(j['id'] == sys.argv[2] for j in page['data']) else 0)
+" "$WORKDIR/awarded-feed.json" "$awarded_job_id" \
+  || fail "an awarded job is still in the open feed — SHIP-96a widens the single-job read and must not widen the feed"
+
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$awarded_job_id" "$WORKDIR/awarded-after.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/awarded-after.json"; \
+  fail "the awarded provider returned $status, want 200 — before SHIP-96a winning a job was how a provider lost sight of it"; }
+[[ "$(json "$WORKDIR/awarded-after.json" '["status"]')" == "awarded" ]] \
+  || { cat "$WORKDIR/awarded-after.json"; fail "the status is not awarded; it is the only field that says what became of the job"; }
+ok "a provider holding a bid reads the job after it leaves the feed, and the status says what became of it"
+
+# The same shape, not a fuller one. Two shapes would be two places a budget field could be added.
+python3 -c "
+import json, sys
+before = set(json.load(open(sys.argv[1])))
+after  = set(json.load(open(sys.argv[2])))
+extra  = after - before
+if extra:
+    print('the awarded read carries keys the feed shape does not:', sorted(extra))
+    sys.exit(1)
+" "$WORKDIR/awarded-before.json" "$WORKDIR/awarded-after.json" \
+  || fail "the widened read answers with a different shape"
+
+# And no budget, in any form, on the path the widening opened. The word, the amount in dollars and
+# in cents, and the sentence — the last is the form no key list and no value search can see, and it
+# is the one wave 10 proved a whole suite can miss.
+for disclosure in budget 4321.99 432199 maximum ceiling 'willing to pay' 'up to $'; do
+  grep -qi -- "$disclosure" "$WORKDIR/awarded-after.json" \
+    && { cat "$WORKDIR/awarded-after.json"; fail "the awarded provider's job carries '$disclosure'"; }
+done
+ok "the widened read carries no budget — not the word, not the value, and not a sentence about one"
+
+# A provider with neither relationship gets exactly what a missing job gets — and the control is
+# built rather than assumed. The second provider is given a bid on a **different** job first, so the
+# 404 below cannot be read as "this account holds no bids at all". That is the parenthesisation
+# check at the harness: `WHERE id = $3 AND eligible OR bid` without the brackets binds the identifier
+# to the first branch alone, and every provider holding any bid would read every job on the platform.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into bids (id, job_id, provider_id, status, amount)
+   values (gen_random_uuid(), '$elig_job_id', '$fleet_other_id', 'Submitted', 39000);"
+
+status="$(fleet_get "$fleet_other_token" "/v1/fleet/jobs/$awarded_job_id" "$WORKDIR/awarded-stranger.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/awarded-stranger.json"; fail "a provider with no bid returned $status, want 404"; }
+status="$(fleet_get "$fleet_other_token" /v1/fleet/jobs/00000000-0000-7000-8000-000000000021 "$WORKDIR/awarded-missing.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/awarded-missing.json"; fail "a job that does not exist returned $status, want 404"; }
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/awarded-stranger.json" "$WORKDIR/awarded-missing.json" \
+  || fail "a job the caller has no bid on answers differently from a job that does not exist"
+ok "a provider with neither eligibility nor a bid gets exactly what a missing job gets"
