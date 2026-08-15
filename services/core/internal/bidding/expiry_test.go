@@ -36,7 +36,7 @@ import (
 func (m market) sweepAt(t *testing.T, at time.Time) (int, error) {
 	t.Helper()
 
-	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(at)), clock.NewFixed(at))
+	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(at)), nil, nil, clock.NewFixed(at))
 
 	var claimed int
 	err := db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
@@ -228,7 +228,7 @@ func TestAnExpiryOutsideATransactionIsRefused(t *testing.T) {
 		t.Fatalf("placing the offer: %v", err)
 	}
 
-	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(pastCollection)), clock.NewFixed(pastCollection))
+	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(pastCollection)), nil, nil, clock.NewFixed(pastCollection))
 	if _, err := service.Expire(t.Context(), m.pool, bid.ID); !errors.Is(err, ErrNotInTransaction) {
 		t.Fatalf("expiring on the pool answered %v, want ErrNotInTransaction", err)
 	}
@@ -252,7 +252,7 @@ func TestExpiringAnOfferThatIsNotDueIsReportedRatherThanDone(t *testing.T) {
 	}
 
 	// Judged an hour after placement, when the offer collects in forty-seven hours' time.
-	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(testInstant.Add(time.Hour))), clock.NewFixed(testInstant.Add(time.Hour)))
+	service := NewService(events.NewOutbox(), nil, nil, nil, newTestPresentation(clock.NewFixed(testInstant.Add(time.Hour))), nil, nil, clock.NewFixed(testInstant.Add(time.Hour)))
 	err = db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
 		_, err := service.Expire(ctx, r, bid.ID)
 		return err
@@ -314,7 +314,8 @@ func TestTheExpirySweepFreesTheProviderToBidAgain(t *testing.T) {
 	// time — so its own timing is in the future and the validator accepts it.
 	at := clock.NewFixed(pastCollection)
 	later := NewService(events.NewOutbox(), fleet.NewService(at),
-		newTestNegotiation(at), newTestAwarding(at), newTestPresentation(at), at)
+		newTestNegotiation(at), newTestAwarding(at), newTestPresentation(at),
+		newTestVehicles(at), newTestDirectory(), at)
 
 	second := Offer{
 		AmountCents: 47000,

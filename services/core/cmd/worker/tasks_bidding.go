@@ -56,8 +56,14 @@ func init() {
 		// "all active bids expire" first, so an expiry that took the last live offer on a
 		// job has to return that job to Open — through `jobs`' one guarded function, in the
 		// transaction that closed the offer.
+		// The vehicle and directory ports are nil for the reason the first three are: a sweep
+		// expires offers and never writes a vehicle or renders one, so wiring them would be
+		// wiring a dependency this task cannot reach. `bidding.Service` refuses rather than
+		// assumes if a nil port is ever asked (SHIP-102a), so a task that grew a use for one
+		// would fail loudly here rather than store an unchecked commitment.
 		service := bidding.NewService(events.NewOutbox(), nil, nil, nil,
-			presentedJobs{jobs: jobs.NewService(events.NewOutbox(), d.Clock, nil)}, d.Clock)
+			presentedJobs{jobs: jobs.NewService(events.NewOutbox(), d.Clock, nil)},
+			nil, nil, d.Clock)
 
 		return Task{
 			Name:    "bid-expiry",

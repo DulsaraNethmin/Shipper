@@ -240,6 +240,8 @@ paths:
     $ref: './paths/bidding.yaml#/AwardJob'
   /v1/jobs/{id}/bids:
     $ref: './paths/bidding.yaml#/Bids'
+  /v1/jobs/{id}/bids/received:
+    $ref: './paths/bidding.yaml#/ReceivedBids'
   /v1/jobs/{id}/bids/{bid_id}:
     $ref: './paths/bidding.yaml#/BidByID'
   /v1/jobs/{id}/bids/{bid_id}/counter:

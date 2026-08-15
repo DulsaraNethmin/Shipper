@@ -36,6 +36,7 @@ GET    /v1/jobs/{id}                            user         v1
 PATCH  /v1/jobs/{id}                            user         v1
 POST   /v1/jobs/{id}/award                      user         v1
 POST   /v1/jobs/{id}/bids                       user         v1
+GET    /v1/jobs/{id}/bids/received              user         v1
 PATCH  /v1/jobs/{id}/bids/{bid_id}              user         v1
 POST   /v1/jobs/{id}/bids/{bid_id}/counter      user         v1
 GET    /v1/jobs/{id}/bids/{bid_id}/history      user         v1

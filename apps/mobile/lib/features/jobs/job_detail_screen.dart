@@ -193,6 +193,8 @@ class JobDetailScreen extends ConsumerWidget {
           children: [
             _Timeline(job),
             const SizedBox(height: 12),
+            _CompareOffers(jobId: jobId),
+            const SizedBox(height: 12),
             _TrackThisDelivery(jobId: jobId),
           ],
         ),
@@ -409,6 +411,42 @@ class _TrackThisDelivery extends StatelessWidget {
         onPressed: () => context.push(Routes.trackingFor(jobId)),
         icon: const Icon(Icons.local_shipping_outlined),
         label: const Text('Track this delivery'),
+      ),
+    );
+  }
+}
+
+/// The way in to the offers on this job (SHIP-102).
+///
+/// ## Offered on every job, whatever the status, for [_TrackThisDelivery]'s reason
+///
+/// The obvious refinement is to hide it until an offer exists. It is not taken: a rule on the device
+/// about when a screen is worth showing is a copy of the platform's own answer living where nobody
+/// maintains it, and this one would need to know how many offers a job has before it could draw the
+/// button that finds out.
+///
+/// **The platform makes it safe to offer.** `GET /v1/jobs/{id}/bids/received` answers a job's owner
+/// with an empty page rather than a refusal — a job published five minutes ago has no offers and
+/// nothing is wrong — and `CompareOffersScreen` is written for exactly that state.
+///
+/// **It shows no count**, deliberately. A number here would have to come from a read this screen
+/// does not make, and one that was fetched and then went stale would tell a customer there were
+/// three offers on a job that has five. The offers screen counts them, having read them.
+class _CompareOffers extends StatelessWidget {
+  const _CompareOffers({required this.jobId});
+
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: OutlinedButton.icon(
+        key: const Key('compare-offers'),
+        // `push` rather than `go`, so the back gesture returns to the job where it was.
+        onPressed: () => context.push(Routes.jobOffersFor(jobId)),
+        icon: const Icon(Icons.compare_arrows),
+        label: const Text('Compare offers'),
       ),
     );
   }

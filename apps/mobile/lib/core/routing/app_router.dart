@@ -7,6 +7,7 @@ import 'package:shipper/core/auth/session_state.dart';
 import 'package:shipper/core/health/health_screen.dart';
 import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
+import 'package:shipper/features/bidding/compare_offers_screen.dart';
 import 'package:shipper/features/bidding/my_bids_screen.dart';
 import 'package:shipper/features/bidding/place_bid_panel.dart';
 import 'package:shipper/features/delivery/delivery_screen.dart';
@@ -115,6 +116,21 @@ abstract final class Routes {
 
   /// [openJobDetail] for one job.
   static String openJobDetailFor(String jobId) => '/jobs/open/$jobId';
+
+  /// The offers on one of the customer's own jobs, compared side by side (SHIP-102).
+  ///
+  /// **`/offers` rather than `/bids`, and the client's word differs from the platform's on purpose.**
+  /// The endpoint behind it is `GET /v1/jobs/{id}/bids/received`, which is itself five segments
+  /// because `GET /v1/jobs/{id}/bids` cannot be registered beside `GET /v1/jobs/open/{id}`. A
+  /// location is not an endpoint, so this one takes the word a customer would use: they are reading
+  /// the offers they have received, not browsing a collection called `bids`.
+  ///
+  /// It does not collide with [jobDetail], which matches exactly one segment; it sits **after**
+  /// `/jobs/open/:id` in the router for the same reason every two-segment job route does.
+  static const jobOffers = '/jobs/:id/offers';
+
+  /// [jobOffers] for one job.
+  static String jobOffersFor(String jobId) => '/jobs/$jobId/offers';
 
   /// Recording the milestones of one delivery, as the awarded **provider** (SHIP-129).
   ///
@@ -296,6 +312,13 @@ final _signedInPatterns = <RegExp>[
   // one is deep-linked as well as pushed: `Docs/07` §5 sends a milestone notification to the job it
   // concerns, so forgetting this line is a notification that lands on the home shell.
   RegExp(r'^/jobs/[^/]+/tracking$'),
+
+  // The customer comparing the offers on their own job (SHIP-102). A sixth pattern, same
+  // reasoning, and it is pushed from the job screen rather than deep-linked — which makes
+  // forgetting this line a **button that appears to do nothing**, since the guard silently
+  // redirects to the home shell rather than failing. `compare_offers_test.dart` reaches the screen
+  // by tapping that button for exactly this reason, and it caught the omission on the first run.
+  RegExp(r'^/jobs/[^/]+/offers$'),
 
   // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
   // route reachable only through an identifier looks, from the outside, like a card that does
@@ -502,6 +525,12 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.jobDetail,
         builder: (context, state) => JobDetailScreen(
+          jobId: state.pathParameters['id'] ?? '',
+        ),
+      ),
+      GoRoute(
+        path: Routes.jobOffers,
+        builder: (context, state) => CompareOffersScreen(
           jobId: state.pathParameters['id'] ?? '',
         ),
       ),

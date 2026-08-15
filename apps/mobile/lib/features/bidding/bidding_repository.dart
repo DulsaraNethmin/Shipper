@@ -4,10 +4,12 @@ import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/api/page.dart';
 import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
+import 'package:shipper/features/bidding/received_offer.dart';
 
-/// What a provider offers against a job (SHIP-84), and what they have offered so far (SHIP-101).
+/// What a provider offers against a job (SHIP-84), what they have offered so far (SHIP-101), and
+/// what a customer has been offered on theirs (SHIP-102).
 ///
-/// Two methods. The three endpoints `contracts/paths/bidding.yaml` serves and this does not —
+/// Three methods. The three endpoints `contracts/paths/bidding.yaml` serves and this does not —
 /// revise, withdraw and counter — are **served and deliberately not modelled**: an endpoint no
 /// screen calls is dead code that nothing holds to the contract, which is the position
 /// `OpenJobsRepository` took about `/v1/jobs/open/{id}` until the screen that needed it arrived.
@@ -102,6 +104,48 @@ abstract interface class BiddingRepository {
   ///
   /// No idempotency key: a read changes nothing and the middleware lets read-only methods through.
   Future<ApiPage<Bid>> myBids({BidStatus? status, String? cursor});
+
+  /// `GET /v1/jobs/{id}/bids/received` (SHIP-102a) — one page of the offers on a job this customer
+  /// owns, newest first.
+  ///
+  /// ## The path is five segments and the ticket says four, which is a routing fact
+  ///
+  /// `GET /v1/jobs/{id}/bids` **cannot be served**. `GET /v1/jobs/open/{id}` puts a literal where
+  /// the job identifier goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>` both match
+  /// `/v1/jobs/open/bids` with neither more specific, and the router refuses the pair at start-up —
+  /// the same collision that shaped `/v1/jobs/{id}/delivery/…`. `POST /v1/jobs/{id}/bids` is
+  /// unaffected only because it is a different method, which is why placing a bid is the shorter
+  /// path and reading them is not.
+  ///
+  /// ## Whose offers, and what a provider gets
+  ///
+  /// The job has to be the caller's. A provider calling this — **including one bidding on that very
+  /// job** — gets the byte-identical `404` a stranger gets and a job that does not exist gets. This
+  /// is the one endpoint that would otherwise hand a competitor every rival's price on a job in a
+  /// single request, so a client must not try to be more specific than the platform was: there is
+  /// nothing to distinguish and nothing to tell a user beyond "no such job".
+  ///
+  /// ## What arrives, and the one thing that does not
+  ///
+  /// Each element is a [ReceivedOffer]: the price, the two timing commitments, a closed
+  /// [ProviderSummary], and a [VehicleSummary] when the offer names one. **No budget in any form**
+  /// — nothing of the job travels beyond the job's identifier — and no service area, specialties or
+  /// other jobs of the provider's.
+  ///
+  /// ## Which offers
+  ///
+  /// [status] narrows to one of `Docs/02` §4's eight, in SQL. **Omitting it is not "every status"**
+  /// on this endpoint, unlike [myBids]: the default is `submitted`, the offers standing right now,
+  /// because this is a comparison rather than a record and an offer that was withdrawn is not one
+  /// the customer can act on. `?status=accepted` is how the awarded offer is read back afterwards.
+  ///
+  /// [cursor] is opaque and passed back exactly as it arrived. No idempotency key: a read changes
+  /// nothing.
+  Future<ApiPage<ReceivedOffer>> offersOn({
+    required String jobId,
+    BidStatus? status,
+    String? cursor,
+  });
 }
 
 /// The real one, over [ApiClient].
@@ -147,6 +191,29 @@ final class ApiBiddingRepository implements BiddingRepository {
         },
       ),
       Bid.fromJson,
+    );
+  }
+
+  @override
+  Future<ApiPage<ReceivedOffer>> offersOn({
+    required String jobId,
+    BidStatus? status,
+    String? cursor,
+  }) async {
+    return ApiPage.fromJson(
+      await _client.getJson(
+        // `/received` rather than `/bids`, and the reason is in the interface above: the four
+        // segment form cannot be registered beside `GET /v1/jobs/open/{id}`.
+        '/v1/jobs/$jobId/bids/received',
+        query: <String, dynamic>{
+          // `unknown` is this client's own value for a status it has never heard of, and is not one
+          // of the eight the endpoint enumerates — sending it would be a `400`. `limit` is absent
+          // deliberately: the page size is server configuration (`Docs/10` §4.5).
+          if (status != null && status != BidStatus.unknown) 'status': status.wireName,
+          if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+        },
+      ),
+      ReceivedOffer.fromJson,
     );
   }
 }

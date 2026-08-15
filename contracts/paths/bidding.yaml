@@ -1007,6 +1007,20 @@ BidPlacement:
         Conditions accompanying the offer, in your own words — access, timing caveats, what the price
         includes. Optional.
       example: Can collect from the loading dock any time after eight.
+    vehicle_id:
+      type: string
+      format: uuid
+      description: |
+        The vehicle you are offering, from `GET /v1/fleet/vehicles` (SHIP-102a). Optional.
+
+        **It must be your own and in service.** All three refusals — no such vehicle, another
+        provider's, and one you have deactivated — are the same `422` naming `vehicle_id`, because
+        telling them apart would let anybody enumerate a competitor's fleet one identifier at a time.
+
+        Omit it and the offer states no vehicle. The customer's comparison screen shows it as
+        unstated, which is the truth about the offer; every offer placed before this field existed
+        is in that case. A vehicle you deactivate *after* offering it keeps standing on the offer.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
 
 BidRevision:
   type: object
@@ -1048,6 +1062,20 @@ BidRevision:
       description: |
         Replaces the conditions accompanying the offer. Send it blank to remove them.
       example: Two people and a tail lift; the price includes both.
+    vehicle_id:
+      type: string
+      description: |
+        The vehicle you are offering (SHIP-102a). **Send it blank to state no vehicle at all**,
+        exactly as a blank `message` removes the conditions — `null` and omitting it both leave the
+        vehicle alone, which is the treatment every optional field in this API gives them.
+
+        Checked only when it changes: re-pricing an offer you made with a truck you have since taken
+        out of service is not refused, because the offer already stands on it.
+
+        **A revision is the only way the vehicle on a negotiation ever moves.** A counter-offer
+        carries forward whatever the offer it answers named — the vehicle is your commitment, and a
+        customer countering on price must not silently drop it out of the comparison.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
 
 BidWithdrawal:
   type: object
@@ -1357,3 +1385,257 @@ IdempotencyKey:
     type: string
     maxLength: 255
   example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
+
+ReceivedBids:
+  get:
+    operationId: receivedBids
+    summary: List the offers on your own job
+    tags: [Bidding]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Every live offer on one of your jobs, newest first (SHIP-102a). This is the read behind the
+      customer's bid-comparison screen: price, timing, who is offering, and what they are offering
+      it with, side by side.
+
+      ## Why the path is not `/v1/jobs/{id}/bids`
+
+      Because that pattern cannot be served. `GET /v1/jobs/open/{id}` puts a literal where the job
+      identifier goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>` both match
+      `/v1/jobs/open/bids` with neither more specific, and the router refuses the pair at start-up.
+      `POST /v1/jobs/{id}/bids` is unaffected only because it is a different method. The same
+      collision is why the delivery reads sit under `/v1/jobs/{id}/delivery/…`.
+
+      `received` also says which side is asking, which is the whole difference between this endpoint
+      and `GET /v1/fleet/bids`: these are the offers you have received, those are the offers a
+      provider has made.
+
+      ## Whose offers
+
+      Yours. The job has to be one you own — a provider gets exactly what a stranger gets, which is
+      the same `404` a job that does not exist gets. That matters here more than anywhere else in
+      this API: this is the one endpoint that would otherwise hand a competing provider every rival's
+      price on a job in a single request.
+
+      ## What each element carries
+
+      Every field of `Bid`, plus:
+
+      - **`provider`** — a closed summary of who made the offer. It is deliberately small, and the
+        reason is worth stating: the only provider profile this platform stores today is the service
+        area and the specialties, and neither may appear here. What is left is whether the account
+        has cleared verification and how long it has been on the platform. Ratings, completed jobs
+        and trading names arrive with the verification tickets.
+      - **`vehicle`** — the vehicle the offer is made with, and its declared capability. Omitted when
+        the offer names none, which is every offer placed before providers could state one.
+
+      **No provider's service area, specialties or other jobs are here, in any form.** Neither is
+      your own budget — nothing of the job travels in this response beyond `job_id`.
+
+      ## Which offers
+
+      The live ones by default: the offer standing right now in each negotiation, which is the set
+      you can actually award. Use `?status=` to reach the rest — `accepted` after you have awarded,
+      `superseded` for what a negotiation looked like before your counter displaced it.
+
+      Read-only, so no `Idempotency-Key`.
+    parameters:
+      - $ref: '#/JobID'
+      - name: status
+        in: query
+        required: false
+        description: |
+          Narrow to one of Docs/02 §4's eight bid statuses, in the same lower snake case the `status`
+          field uses. **Omitting it is not "every status"** — it is `submitted`, the offers standing
+          now, because this is a comparison rather than a record.
+        schema:
+          type: string
+          enum: [draft, submitted, countered, accepted, rejected, withdrawn, expired, superseded]
+        example: submitted
+      - $ref: '#/Limit'
+      - $ref: '#/CursorParameter'
+    responses:
+      '200':
+        description: |
+          One page of the offers on your job, newest first. Sort them by price on the client — the
+          cursor is over a stable ordering, which a price is not.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ReceivedOfferList'
+      '400':
+        description: |
+          A job id that is not an identifier, an unknown `status`, a `limit` that is not a positive
+          whole number, or a `cursor` this endpoint did not issue (`bad_request`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        description: |
+          No such job (`not_found`). **Byte-identical for a job that does not exist, a job belonging
+          to another customer, and a provider asking about a job they are bidding on.** One answer
+          for all three, deliberately: a refusal that distinguished them would confirm that somebody
+          else's job exists.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ReceivedOfferList:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    One page of the offers on your job, newest first — the collection envelope every collection in
+    this API uses (SHIP-102a).
+  properties:
+    data:
+      type: array
+      description: |
+        The offers, newest first. An element is the offer standing in one negotiation unless
+        `?status=` asked for something else.
+      items:
+        $ref: '#/ReceivedOffer'
+    next_cursor:
+      type: string
+      description: |
+        Opaque. Pass it back as `?cursor=` for the next page. Omitted on the last page.
+      example: MR9yZWNvcmQ
+    has_more:
+      type: boolean
+      description: Whether `next_cursor` names another page.
+      example: true
+
+ReceivedOffer:
+  type: object
+  additionalProperties: false
+  required: [id, job_id, status, offered_by, amount_cents, pickup_at, deliver_by, provider, created_at, updated_at]
+  description: |
+    One offer on your job, as the customer comparing it sees it (SHIP-102a).
+
+    Every field of `Bid`, plus `provider` and — when the offer names one — `vehicle`. The two extra
+    objects are what Docs/01 §4.3 means by comparing "provider profile, vehicle, and declared
+    capability"; the rest of the shape is identical to what the provider who made the offer sees, so
+    a client that knows `Bid` already knows most of this.
+  allOf:
+    - $ref: '#/Bid'
+    - type: object
+      properties:
+        provider:
+          $ref: '#/ProviderSummary'
+        vehicle:
+          $ref: '#/VehicleSummary'
+
+ProviderSummary:
+  type: object
+  additionalProperties: false
+  required: [id, verified, member_since]
+  description: |
+    What you may know about a provider who has offered on your job (SHIP-102a).
+
+    **A closed set, and a deliberately small one.** There is no trading name, no rating and no
+    completed-job count because this platform stores none of them yet — the verification tickets
+    add them. There is no service area and no specialty list because those are what a provider
+    declares commercially, and a customer's view of a provider is not a window onto it. There are no
+    other jobs of theirs, in any form.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: The provider's account identifier.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    verified:
+      type: boolean
+      description: |
+        Whether this provider has cleared the platform's verification: contact details confirmed, on
+        an account in good standing. The same test the job feed applies before offering them work,
+        so a provider who can bid on your job is a provider this says `true` about.
+      example: true
+    member_since:
+      type: string
+      format: date-time
+      description: |
+        RFC 3339, UTC. When the provider's account was created. Render it day-first.
+      example: '2026-03-04T22:15:07.412Z'
+
+VehicleSummary:
+  type: object
+  additionalProperties: false
+  required: [id, type, capacity]
+  description: |
+    The vehicle an offer is made with (SHIP-102a).
+
+    **The registration is not here.** A plate identifies a vehicle in the physical world and you are
+    choosing between offers rather than meeting a driver; the awarded provider's vehicle reaches you
+    again through the delivery once there is something to meet.
+
+    A vehicle the provider has since taken out of service still appears, because the offer was made
+    with it and that is what you are comparing.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    type:
+      type: string
+      description: The kind of vehicle, as the provider registered it.
+      example: van
+    make:
+      type: string
+      description: Omitted when the provider did not state one.
+      example: Toyota
+    model:
+      type: string
+      description: Omitted when the provider did not state one.
+      example: HiAce
+    capacity:
+      $ref: '#/Capacity'
+
+Capacity:
+  type: object
+  additionalProperties: false
+  required: [max_weight_kg, length_cm, width_cm, height_cm]
+  description: |
+    What the vehicle can carry, as declared — Docs/01 §4.3's "declared capability".
+
+    **Zero means unstated rather than nothing.** Every field is always present, so a client can say
+    "not stated" without having to tell a missing key from a declared zero. Weight is kilograms and
+    the three dimensions are centimetres.
+  properties:
+    max_weight_kg:
+      type: number
+      format: double
+      example: 1200
+    length_cm:
+      type: integer
+      example: 300
+    width_cm:
+      type: integer
+      example: 170
+    height_cm:
+      type: integer
+      example: 160
