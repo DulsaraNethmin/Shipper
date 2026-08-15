@@ -11898,13 +11898,16 @@ and a database check that are believed to agree are two checks until something c
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | ~~**SHIP-118**~~ | ~~`Delivered` recordable and refused without evidence~~ | **Closed by SHIP-123 — see §3.** `000607` adds `recipient_name` and `delivery_note`, required on `Delivered` and refused on every other milestone, in the domain and in `ck_milestones_delivery_details`. `Docs/01` §4.4's field set is closed end to end |
 | **SHIP-151** | `GET /v1/admin/users` — search by **email**, **phone** and **status**, cursor paged, with the phone term normalised to the stored E.164 form | The **name**. Its *Done when* is "search users by email, phone, name, and status" and **no column anywhere in the schema holds a user's name** — `000002_users` never had one and registration never asks. The only `name` columns are `admin_users.name` and `driver_assignments.driver_name`, and neither is a user's. See below |
+| **SHIP-102** | The comparison screen over `GET /v1/jobs/{id}/bids/received`: **price**, **timing** and **vehicle** served in full, laid out side by side, with a geometry assertion holding the layout | The **provider profile**. Its *Done when* is "customer compares price, timing, provider profile, and vehicle side by side", and the profile clause shipped in **deliberately reduced form** — two facts, `verified` and `member_since` (`internal/bidding/http.go:1347`). There is no trading name, rating or completed-job count anywhere in the schema: `internal/profiles` holds `doc.go` alone, and `fleet.Profile`'s only two fields are the Areas and Specialties SHIP-102a's *Done when* forbids showing a customer. **Owner: SHIP-79a.** See below |
 | ~~**SHIP-134**~~ | ~~`outbox` table, `internal/events` writer~~ | **Closed.** The publisher landed — see §3. `outbox`, the writer and the drain are all in place; what remains is SHIP-135's topics and schema and SHIP-136's emission from the remaining domains, and those are tickets rather than a gap in this one |
 
 **SHIP-65 has left this table.** Its *Done when* — "returns full job including budget" — was met
 but for the budget for two waves, and SHIP-67 closed it with the column and the proof together.
 §10's note that a ticket can be both done and partly done still stands. **SHIP-118 left this table at
-wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67, so SHIP-77 and SHIP-151 are
-the live examples now.
+wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67. **The live rows are now three
+— SHIP-77, SHIP-151 and SHIP-102** — wave 10 struck none and added one, and the count is stated here
+because §7's second merge finding is that a table and a sentence counting its rows are a semantic pair
+no merge tool checks.
 
 **SHIP-149 left it in the same wave**, closed by SHIP-150 building the write helper it had always
 named — so wave 9 struck two of this table's four entries and added one. That the sentence above
@@ -11958,6 +11961,42 @@ as SHIP-30a, which is an argument for taking the two together.
 the wire, and removing the row would hard-fail `make status` rather than make the record more
 truthful. **SHIP-30a does not change that** — it closes the fourth term, at which point this row
 leaves §4 the way SHIP-65 and SHIP-118 did.
+
+**SHIP-102 is the SHIP-118 shape, and the row is written here at the wave that landed it rather than
+a wave later.** `Docs/09`'s SHIP-79a paragraph asked for exactly this — *"whoever reconciles the wave
+that lands SHIP-102 should add it to `Docs/11` §4 with this row as its named owner"* — so this is the
+mechanism closing on schedule rather than a gap discovered. Three of the four terms are served in
+full and were re-checked against `routes_golden.txt` on `605ad3a` before this row was written: price
+is `amount_cents`, timing is the two commitments, and the vehicle is `vehicle` with its declared
+capability, all on line 46's `GET /v1/jobs/{id}/bids/received`. **The fourth is served in the only
+form this platform stores**, and the screen says so on itself rather than implying it.
+
+**What is missing is data, not presentation, which is why the owner is SHIP-79a and not a Flutter
+row.** Measured on `605ad3a`: `internal/profiles` is `doc.go` and nothing else, eleven waves in;
+`fleet.Profile` (`internal/fleet/model.go:437`) holds `ProviderID`, `Areas` and `Specialties`, and the
+last two are precisely what SHIP-102a's *Done when* forbids disclosing to a customer, because they are
+a competitor's map of the market. There is no trading name, no rating and no completed-job count in
+any of the twenty-two tables. A screen can only render what exists, so SHIP-102 rendered the two facts
+`users` can answer and named the absence out loud — which is the honest thing to do with what it had,
+and is not the same as meeting the clause.
+
+**One cross-reference in the code and in §3 points at the wrong ticket, and this pass corrects it
+here rather than in either.** `internal/bidding/http.go`'s `offerResponse` comment and §3's SHIP-102a
+and SHIP-102 entries all say the gap is closed by **SHIP-153…SHIP-159**. That was a reasonable reading
+when it was written and it is now the weaker of the two answers: §6 strikes SHIP-153 in this pass as
+*every dependency met and unbuildable in fact*, because `Docs/04` §4's five verification states exist
+in no table at all — so the chain named as the closer is itself blocked on a prerequisite that had no
+row until this pass wrote one. **SHIP-79a is the owner of this §4 row**; SHIP-79b and SHIP-153…159
+would additionally give a customer a verification state richer than a boolean, which is a second
+improvement rather than the one this clause needs. The code comment is left alone deliberately —
+`internal/**` is not this branch's to edit and a comment that names a wave-late cross-reference is a
+smaller defect than a prep branch reaching into a domain to fix it.
+
+**This row leaves §4 when SHIP-79a lands**, on the SHIP-65 → SHIP-67 and SHIP-118 → SHIP-123 pattern,
+and it is the third worked example of a missing half with a named owner. **Lane C is building SHIP-79a
+in this wave**, so the row is written as open with the owner in flight rather than as closed — a §4
+row struck on the strength of a branch that has not merged is exactly the wishful entry §10 warns
+about.
 
 ## 5. Blocked — and only by work outside this repository
 
