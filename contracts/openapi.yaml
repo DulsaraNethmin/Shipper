@@ -184,6 +184,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminJobs'
   /v1/admin/jobs/{id}:
     $ref: './paths/admin.yaml#/AdminJob'
+  /v1/admin/jobs/{id}/unpublish:
+    $ref: './paths/admin.yaml#/AdminJobUnpublish'
   /v1/admin/me:
     $ref: './paths/admin.yaml#/AdminMe'
   /v1/admin/moderation/exceptions:

@@ -178,6 +178,21 @@ const (
 	// entry — nothing acts, so there is nothing to attribute — and that asymmetry is honest: this
 	// records a person leaving, not a timer firing.
 	AuditActionAdministratorSignedOut AuditAction = "administrator.signed_out"
+
+	// AuditActionJobUnpublished is a policy-breaching job taken off the marketplace (SHIP-160).
+	//
+	// **The first entry in this catalogue whose target is not an administrator**, which is why
+	// [AuditTargetJob] exists. The reason is required rather than optional: Docs/01 §4.6 says
+	// "remove or unpublish policy-breaching jobs" and SHIP-160's *Done when* says "with a
+	// recorded reason", and a removal nobody has to justify is the one an administrator can make
+	// carelessly.
+	//
+	// The same reason is written twice, into two tables, and that is deliberate rather than
+	// redundant. `job_status_history` records why the *job* moved, which is what a customer's
+	// support conversation reads; `audit_log` records what the *administrator* did, which is what
+	// Docs/04 §9's controls read. The two are joined by nothing but the job identifier, and a
+	// reader of either should not have to find the other.
+	AuditActionJobUnpublished AuditAction = "job.unpublished"
 )
 
 // AuditActions is the whole catalogue, in the order the constants declare it.
@@ -191,6 +206,7 @@ var AuditActions = []AuditAction{
 	AuditActionAdministratorCreated,
 	AuditActionAdministratorSignedIn,
 	AuditActionAdministratorSignedOut,
+	AuditActionJobUnpublished,
 }
 
 // Valid reports whether a is in the catalogue.
@@ -208,6 +224,13 @@ func (a AuditAction) String() string { return string(a) }
 const (
 	// AuditTargetAdministrator is an `admin_users` row.
 	AuditTargetAdministrator = "administrator"
+
+	// AuditTargetJob is a `jobs` row (SHIP-160).
+	//
+	// Named for the thing rather than for the table, which is the point of the column having no
+	// CHECK constraint: `audit_log` outlives its subjects (Docs/05 §3.1), so a target kind has to
+	// be able to name something the schema no longer has a table for.
+	AuditTargetJob = "job"
 )
 
 // AuditActor is who acted.

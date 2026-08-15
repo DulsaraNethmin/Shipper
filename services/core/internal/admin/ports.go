@@ -98,6 +98,26 @@ const (
 	// Awarded, Driver assigned, En route to pickup, Picked up, In transit and Delivered, and
 	// from nowhere else.
 	JobNotDisputable
+
+	// JobAlreadyRemoved means the job was already 'Cancelled' when an administrator moved to
+	// unpublish it (SHIP-160).
+	//
+	// Distinct from [JobNotRemovable] for the reason [JobAlreadyDisputed] is distinct from
+	// [JobNotDisputable]: a job already off the marketplace has refused nothing, and the
+	// console's answer is "somebody got there first" rather than "this cannot be done". It is
+	// the ordinary outcome of two moderators reading the same queue, which is why it is worth
+	// telling apart at all.
+	JobAlreadyRemoved
+
+	// JobNotRemovable means Docs/02 §2 has no row from the job's status to 'Cancelled'.
+	//
+	// The document permits it from Draft, Open and Negotiating — the statuses in which nobody is
+	// yet committed — and from 'Disputed', which is SHIP-164's resolution rather than this. **So
+	// an awarded job is not unpublishable**, and that is the document's decision rather than a
+	// limitation of this port: a provider has committed and may have travelled, and Docs/02 §6.2
+	// makes ending it after that a support case. An administrator who needs one stopped raises a
+	// dispute and resolves it, which is the path that records both sides.
+	JobNotRemovable
 )
 
 func (m JobMove) String() string {
@@ -110,6 +130,10 @@ func (m JobMove) String() string {
 		return "already disputed"
 	case JobNotDisputable:
 		return "not disputable"
+	case JobAlreadyRemoved:
+		return "already unpublished"
+	case JobNotRemovable:
+		return "not unpublishable"
 	default:
 		return "unrecognised"
 	}
@@ -141,6 +165,28 @@ type Jobs interface {
 	// refusal. A refusal comes back as a [JobMove] with a nil error, because "Docs/02 does not
 	// permit this" is an answer rather than a fault.
 	MoveToDisputed(ctx context.Context, r db.Runner, jobID, actorID uuid.UUID, party Party, reason string) (JobMove, error)
+
+	// Unpublish runs Docs/02 §2's move to 'Cancelled' on an administrator's behalf, inside the
+	// caller's transaction (SHIP-160).
+	//
+	// # A second named move rather than a status parameter
+	//
+	// The obvious shape is `Move(jobID, status, reason)`, and it is the one thing this port must
+	// not be. CLAUDE.md's invariant is that job status is never a settable field, and a port
+	// taking the target status would put the choice in *this* domain — the transition table's
+	// second opinion arriving through the back door. Each move this domain needs is a method,
+	// named for what it is for, which is why SHIP-164 will add two more rather than widening one.
+	//
+	// # The reason is not optional, at three levels
+	//
+	// SHIP-160's *Done when* requires one; `ck_job_status_history_admin_reason` requires one of
+	// any administrator's transition; and the guarded function refuses the move without one. The
+	// service checks it before opening a transaction, so the failure names the field rather than
+	// a constraint.
+	//
+	// A non-nil error is a failure of the mechanism. A refusal comes back as a [JobMove] with a
+	// nil error, because "Docs/02 does not permit this" is an answer rather than a fault.
+	Unpublish(ctx context.Context, r db.Runner, jobID, actorID uuid.UUID, reason string) (JobMove, error)
 }
 
 // --- SHIP-117: the delivery-exception moderation queue -------------------------------------------

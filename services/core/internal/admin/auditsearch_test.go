@@ -46,7 +46,7 @@ type auditSearchFixture struct {
 func newAuditSearchFixture(t *testing.T) auditSearchFixture {
 	t.Helper()
 
-	creds, auth, pool, _ := adminAuth(t)
+	creds, auth, pool, sessionClock := adminAuth(t)
 
 	// **A clock of its own, separate from the one the sessions run on, and that is not tidiness.**
 	// The date axis is exercised by advancing time a day at a time, and the administrator session
@@ -63,7 +63,7 @@ func newAuditSearchFixture(t *testing.T) auditSearchFixture {
 		t.Fatalf("building the audit writer: %v", err)
 	}
 
-	handler, err := NewHandler(testServices(t, creds, pool), pool, testLogger())
+	handler, err := NewHandler(testServices(t, creds, pool, sessionClock), pool, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}

@@ -315,7 +315,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **697 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **738 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -507,6 +507,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-179** | M7 | Camera and notification purpose strings, and a test that stops them drifting |
 | **SHIP-152** | M6 | `GET /v1/admin/jobs` and `GET /v1/admin/jobs/{id}` — search by description, status and customer; open **any** job with every bid and every recorded transition, read in **one snapshot** so a console cannot render an `Awarded` header above a bid list with nothing accepted. The statements are in `cmd/api` because they span two other domains' tables, which is the line `postgres_users.go` drew. **Bid amounts are here and the budget is not** — Docs/02 §4 names the administrator as bid history's third reader, and leaving the budget out is a *decision* with SHIP-164 named as its revisit — *see below* |
 | **SHIP-165** | M6 | `GET /v1/admin/audit` — the trail SHIP-150 writes, searchable by actor, target, date and **action**. The reader is a **second type** rather than a method on `Auditor`, so one can only append and the other can only read; there is no `UPDATE` or `DELETE` anywhere in the package and no verb but `GET` on the path. The date bounds are **half-open** so consecutive days tile, and the cursor is two-column because every entry in one transaction shares an instant **by design** — *see below* |
+| **SHIP-160** | M6 | `POST /v1/admin/jobs/{id}/unpublish` — the job moves to `Cancelled` through the one guarded transition, with the reason written into **both** `job_status_history` and `audit_log`. **No new domain event and no `internal/notifications` edit**: the transition already emits `job.status_changed`, which `StatusRules` routes to the customer, so "and the customer notified" is a consequence of the move rather than a second announcement of it. An **awarded** job is refused — Docs/02 §2 has no such row — *see below* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7a loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -10843,7 +10844,87 @@ the three axes the *Done when* names. The fourth filter, action, has none and is
 the other three have already narrowed. A migration adding one belongs to whoever has a row count to
 point at.
 
-**Nothing was needed from `internal/config` by either ticket.**
+### SHIP-160 — a removal is a status, and the notification is a consequence rather than an event
+
+`POST /v1/admin/jobs/{id}/unpublish`, `RequireAdmin`, gated on `jobs.unpublish` — which `moderator`
+and `owner` hold and **`support` does not**. Reading a job is `jobs.read` and every role has it;
+taking one off the marketplace is a different permission on a different endpoint, which is Docs/04
+§9's least-privilege control expressed as something a test can fail.
+
+#### Nothing is deleted, which is why the verb is not DELETE
+
+The job moves to `Cancelled` through the one guarded function. Docs/02 §2 has exactly one row for it
+— `Open / Negotiating → Cancelled`, "customer cancels before award; **admin may intervene**" — so an
+unpublished job *is* a cancelled job, moved by an administrator, with a reason on the transition.
+
+**There is no `unpublished` status and no hidden flag**, and that was the decision worth taking
+slowly: a second way for a job to be off the marketplace would be a second thing every feed, every
+eligibility query and every expiry sweep had to know about, and one of them would eventually not.
+
+It follows that an **awarded job cannot be unpublished**, and that is the document's decision rather
+than a limitation. A provider has committed and may have travelled; Docs/02 §6.2 makes ending it
+after that a support case. The administrator's path is a dispute they then resolve (SHIP-164), which
+records both sides. The port names no source status and checks none — it asks for the move and
+translates the refusal, so the transition table stays the only copy.
+
+#### "And the customer notified" needed no notification code at all
+
+This is the finding rather than a shortcut. The guarded transition emits `job.status_changed` inside
+the same transaction, and `notifications.StatusRules["Cancelled"]` already routes it to the job's
+customer **and** the awarded provider, by email, under "A job has been cancelled."
+
+An `admin.job_unpublished` event was considered and rejected. It would have been a **second
+announcement of one state change** — precisely the failure those rules are written to prevent, where
+a recipient who learns the platform emails twice starts ignoring the first one — and it would have
+needed a routing rule in a package this branch does not own, plus a line in `events_golden.txt` and
+in another lane's verify file. Nothing outside `internal/admin` and `cmd/api` was touched.
+
+What the customer is *not* told is the reason. Docs/04 §6 step 5 asks for "a clear, non-sensitive
+reason where appropriate", and the reason here is an administrator's note about a policy breach;
+rendering it into an email is a copy decision belonging to whoever writes that template.
+
+#### The reason is required, bounded, and written into two tables
+
+Ten to five hundred characters after trimming. The floor is what makes "with a recorded reason" mean
+something — an empty string and a single character both satisfy a required field without recording
+anything, and in the trail the second looks exactly like a reason. The ceiling stops `audit_log`
+becoming a document store.
+
+It goes into `job_status_history`, which a customer's support conversation reads, and into
+`audit_log`, which Docs/04 §9's controls read. Two tables, two readers, and neither has to find the
+other.
+
+#### The mutation, run, and what it found about the instrument
+
+**Make one of the new privileged actions ignore the error from `Auditor.Record`, and confirm a test
+fails.** It was run twice, and the first attempt is the more useful half.
+
+| Mutation | Outcome |
+|---|---|
+| `Enforcement.Unpublish` swallows `Auditor.Record`'s error, against a test that makes the **INSERT fail with a trigger** | **Not caught.** Every test still passed |
+| The same mutation, against a test whose audit write fails **before any SQL is issued** (a nil auditor, constructed past the constructor's refusal) | **Caught** — `TestAPrivilegedActionIsRefusedWhenItsAuditEntryCannotBeWritten/a_job_is_not_unpublished`: the job reached `Cancelled` with nothing recording who removed it |
+
+**The trigger is the obvious instrument and it does not discriminate**, which is worth writing down
+because it is the instrument anybody would reach for. PostgreSQL aborts the whole transaction as soon
+as a statement in it raises, so every later statement fails and the COMMIT reports the abort — the
+error reaches the caller *whether or not the code checks it*. A test built on it establishes the
+rollback and says nothing about the `if err != nil`.
+
+Both tests are kept, apart, and each says which claim it supports:
+`TestATriggerRefusalRollsTheWholeActionBack` for the rollback, and the nil-auditor test for the
+check. **This is the same shape as wave 9's `FOR UPDATE … SKIP LOCKED` finding** — a guard can be
+textually present, or behaviourally real, and knowing which kind a test proves is the whole
+difference. Wave 9's version was a comment that read as a clause; this one is a test that reads as a
+check.
+
+`TestEveryAdminMutationWritesAnAuditEntry` also passed under the mutation, for the same reason: it
+drives a database where the insert succeeds.
+
+Restored by `cp` from a copy taken before the mutation, confirmed by `shasum`
+(`5aa5487a3d8816361bdd337f2fdd4545b48f4a6f`) and by there being no `MUTATION` marker left in the
+file. **Not** by `git checkout`, which on an untracked file would have deleted it outright.
+
+**Nothing was needed from `internal/config`.**
 
 
 ## 4. Partly done — do not treat these as finished

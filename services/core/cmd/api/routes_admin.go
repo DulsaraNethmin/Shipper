@@ -172,6 +172,27 @@ func init() {
 
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/admin/jobs/{id}/unpublish",
+			Group:   GroupV1,
+
+			// RequireAdmin is the credential; `jobs.unpublish` is the permission, checked in
+			// the handler (SHIP-148, SHIP-160). **Not the same permission as reading the job**
+			// — `support` may open any job and may not remove one, which is Docs/04 §9's
+			// least-privilege control expressed as two permissions on two endpoints.
+			//
+			// Five segments, which is safe. A four-segment `GET /v1/jobs/{id}/<literal>` would
+			// collide with `GET /v1/jobs/open/{id}` at registration; this is under /admin, is
+			// a POST, and has no literal sibling at its depth.
+			//
+			// POST rather than DELETE, because nothing is deleted: the job moves to
+			// `Cancelled` through the guarded transition and the row stays where it is
+			// (Docs/05 §3.1). A DELETE verb would describe the opposite of what happens.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).UnpublishJob() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
 
@@ -279,6 +300,16 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin audit trail: " + err.Error())
 	}
 
+	// SHIP-160. It takes the same lifecycle adapter the dispute workflow does — one
+	// `admin.Jobs` implementation with a method per move this domain needs, rather than one per
+	// caller — plus the auditor built above, so every action it performs shares the clock the
+	// rest of the transaction uses.
+	enforcement, err := admin.NewEnforcement(
+		disputeLifecycle{jobs: newJobService(d)}, auditor, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin enforcement: " + err.Error())
+	}
+
 	handler, err := admin.NewHandler(admin.HandlerServices{
 		Disputes:    svc,
 		Credentials: creds,
@@ -286,6 +317,7 @@ func adminHandler(d Deps) *admin.Handler {
 		Users:       users,
 		Jobs:        jobConsole,
 		Trail:       trail,
+		Enforcement: enforcement,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
@@ -357,6 +389,60 @@ func (l disputeLifecycle) MoveToDisputed(
 		return admin.JobAlreadyDisputed, nil
 	case errors.Is(err, jobs.ErrTransitionNotPermitted):
 		return admin.JobNotDisputable, nil
+	default:
+		return admin.JobMoveUnrecognised, err
+	}
+}
+
+// Unpublish runs Docs/02 §2's `Draft / Open / Negotiating → Cancelled` through the one guarded
+// function, inside the caller's transaction (SHIP-160).
+//
+// # The actor is an administrator, and that is the whole difference from MoveToDisputed
+//
+// `jobs.ActorAdmin` rather than a party, so `job_status_history` records that the platform's staff
+// moved the job rather than its customer. The reason is **required** of that actor by
+// `ck_job_status_history_admin_reason` and by `Move.validate`, and `admin` refuses an empty one a
+// layer earlier so the failure names the field.
+//
+// # Which statuses this can move from is Docs/02 §2's decision, not this adapter's
+//
+// The guard's own table permits Cancelled from Draft, Open, Negotiating and Disputed. This method
+// names no source status and checks none: it asks for the move and translates the refusal. An
+// awarded job therefore comes back as JobNotRemovable, because the document has no such row — a
+// provider has committed, and Docs/02 §6.2 makes ending it after that a support case. Encoding that
+// list here would be the transition table's second copy.
+//
+// # 'Disputed' is a source the guard permits and this route will not see
+//
+// A disputed job is unfrozen by SHIP-164 resolving the dispute, which is a different action with
+// different evidence and its own audit entry. Nothing here prevents the move; what prevents it is
+// that a moderator working the queue reaches a disputed job through the dispute. If that turns out
+// to matter, the check belongs in `admin` beside the permission, not in this translation.
+//
+// RecordedAt is left zero, so jobs.Transition uses the platform's clock for both. Correct here: an
+// administrator is a person at a screen, online, and there is only one clock for the act.
+func (l disputeLifecycle) Unpublish(
+	ctx context.Context,
+	r db.Runner,
+	jobID, actorID uuid.UUID,
+	reason string,
+) (admin.JobMove, error) {
+	_, err := l.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusCancelled,
+		Actor:  jobs.User(jobs.ActorAdmin, actorID),
+		Reason: reason,
+	})
+
+	switch {
+	case err == nil:
+		return admin.JobMoved, nil
+	case errors.Is(err, jobs.ErrJobNotFound):
+		return admin.JobNotFound, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return admin.JobAlreadyRemoved, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted):
+		return admin.JobNotRemovable, nil
 	default:
 		return admin.JobMoveUnrecognised, err
 	}

@@ -2217,3 +2217,201 @@ AuditEntry:
         than by the column default, so an entry sorts correctly against the session, dispute and
         status-history rows it describes.
       example: '2026-08-14T09:00:00.000Z'
+
+AdminJobUnpublish:
+  post:
+    operationId: adminUnpublishJob
+    summary: Unpublish a policy-breaching job
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The job to remove from the marketplace.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    description: |
+      Docs/01 §4.6's third administrative capability — "remove or unpublish policy-breaching jobs"
+      (SHIP-160) — with the reason it requires.
+
+      ## Nothing is deleted, and that is why this is not a `DELETE`
+
+      The job moves to `cancelled` through the one guarded transition every status change in this
+      platform passes. Its status history records who moved it, when, and why; the row stays exactly
+      where it was, because Docs/05 §3.1 keeps records. There is no `unpublished` status and no
+      hidden flag — a second way for a job to be off the marketplace would be a second thing every
+      feed, every eligibility query and every expiry sweep had to know about, and one of them would
+      eventually not.
+
+      ## Only before the job is awarded
+
+      Docs/02 §2 permits `cancelled` from `draft`, `open` and `negotiating` — the statuses in which
+      nobody is yet committed. **An awarded job cannot be unpublished**: a provider has committed and
+      may have travelled, and Docs/02 §6.2 makes ending it after that a support case. The path is a
+      dispute an administrator then resolves, which records both sides. That answers
+      `admin_job_not_unpublishable`.
+
+      A job somebody has already removed answers `admin_job_already_unpublished` instead — a
+      different code, because the console's response is to reload and show who removed it rather
+      than to offer the action again. On a queue two moderators are reading, this is the answer the
+      second one gets.
+
+      ## The reason is required, and it is recorded twice
+
+      Not a formality: an empty string and a single character both satisfy a required field without
+      recording anything, and this is the field a later reader has no way to reconstruct. Between 10
+      and 500 characters after trimming; outside that it is a `422` naming `reason`.
+
+      It is written into the job's **status history**, which is what a customer's support
+      conversation reads, and into the **audit log**, which is what Docs/04 §9's controls read. The
+      two answer different questions to different readers, and neither should have to find the other.
+
+      ## The customer is notified, and no separate event arranges it
+
+      The transition emits `job.status_changed` in the same transaction, and the notification rules
+      already route a move to `cancelled` to the job's customer and the awarded provider. A second
+      event announcing the same state change would mean two messages about one thing, which is worse
+      than the second being redundant — a recipient who learns this platform emails twice starts
+      ignoring the first one.
+
+      The reason is **not** in that message. It is an administrator's internal note about a policy
+      breach; what a customer is told is a copy decision belonging to whoever writes that template.
+
+      ## Permission
+
+      Needs `jobs.unpublish`, which `moderator` and `owner` hold and **`support` does not** — a
+      support administrator may open any job and may not remove one. That split is Docs/04 §9's
+      least-privilege control expressed as two permissions on two endpoints.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/UnpublishJobRequest'
+    responses:
+      '200':
+        description: The job has been removed from the marketplace.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/UnpublishJobResult'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `jobs.unpublish`
+          (`admin_permission_denied`). A `support` administrator gets this.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: There is no such job (`not_found`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The job is past the point of being unpublishable
+          (`admin_job_not_unpublishable`), or somebody has already removed it
+          (`admin_job_already_unpublished`). Two codes rather than one, because the console's
+          response differs: offer a dispute, or reload and show who removed it.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The reason records nothing, or is longer than the field holds (`validation_failed`, with a
+          `reason` entry in `error.details`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+UnpublishJobRequest:
+  type: object
+  additionalProperties: false
+  required: [reason]
+  description: |
+    One field. There is no job identifier — it is in the path — and no actor: the administrator is
+    whoever the credential says is calling, and a body that named its own actor would be an audit
+    trail the client writes. Unknown fields are refused rather than ignored.
+  properties:
+    reason:
+      type: string
+      minLength: 10
+      maxLength: 500
+      description: |
+        Why the job is being removed, measured after trimming. Recorded in the job's status history
+        and in the audit log.
+      example: Listing offers to transport a live animal, which Docs/05 prohibits.
+
+UnpublishJobResult:
+  type: object
+  additionalProperties: false
+  required: [job_id, status, reason]
+  properties:
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    status:
+      type: string
+      description: |
+        Where the job is now. Always `Cancelled` — Docs/02 §1's stored form, consistently with every
+        other administrative shape.
+      example: Cancelled
+    reason:
+      type: string
+      description: |
+        What was recorded, read back so a console renders what the platform *stored* rather than
+        what somebody typed. The two differ by trimming.
+      example: Listing offers to transport a live animal, which Docs/05 prohibits.

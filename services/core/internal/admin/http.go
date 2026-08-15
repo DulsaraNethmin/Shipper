@@ -38,6 +38,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -62,6 +63,7 @@ type Handler struct {
 	users      *Users
 	jobs       *JobConsole
 	trail      *AuditTrail
+	enforce    *Enforcement
 	pool       *pgxpool.Pool
 	log        *slog.Logger
 }
@@ -94,6 +96,10 @@ type HandlerServices struct {
 
 	// Trail is the audit log viewer (SHIP-165).
 	Trail *AuditTrail
+
+	// Enforcement is the administrative outcomes of Docs/04 §6 — unpublishing a
+	// policy-breaching job (SHIP-160).
+	Enforcement *Enforcement
 }
 
 // NewHandler wires the handlers to the services.
@@ -137,6 +143,12 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// support question rather than at startup.
 		return nil, errors.New("admin: a handler needs the audit trail reader")
 	}
+	if s.Enforcement == nil {
+		// SHIP-160. The same argument again, and it is sharpest here: this is the endpoint
+		// that takes something away from somebody, and a nil discovered at it is a nil
+		// discovered while a moderator is trying to remove a policy breach.
+		return nil, errors.New("admin: a handler needs the enforcement service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
@@ -147,6 +159,7 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		users:      s.Users,
 		jobs:       s.Jobs,
 		trail:      s.Trail,
+		enforce:    s.Enforcement,
 		pool:       pool,
 		log:        log,
 	}, nil
@@ -516,6 +529,23 @@ func apiError(err error) error {
 		return httpx.NewError(http.StatusForbidden, CodeAdminPermissionDenied,
 			"This administrator account does not have permission to do that.").WithCause(err)
 
+	// --- the administrative outcomes of Docs/04 §6 (SHIP-160, SHIP-161) ----------------------
+
+	case errors.Is(err, ErrReasonRequired), errors.Is(err, ErrReasonTooShort),
+		errors.Is(err, ErrReasonTooLong):
+		// A field-level failure in validate.Errors' shape, so it answers 422 naming `reason`
+		// rather than a bare 400. Docs/10 §4.6: a client should be told which field, and this
+		// is a field somebody typed.
+		return fieldProblem("reason", err)
+
+	case errors.Is(err, ErrJobNotUnpublishable):
+		return httpx.NewError(http.StatusConflict, CodeJobNotUnpublishable,
+			"A job can only be unpublished before it is awarded.").WithCause(err)
+
+	case errors.Is(err, ErrJobAlreadyUnpublished):
+		return httpx.NewError(http.StatusConflict, CodeJobAlreadyUnpublished,
+			"This job has already been unpublished.").WithCause(err)
+
 	case errors.Is(err, ErrAdminUnavailable):
 		// 503 rather than 500: a dependency is not answering, and retrying is the right
 		// advice. The rate limiter reaches here when Redis is unreachable, which is the
@@ -534,6 +564,35 @@ func apiError(err error) error {
 		}
 		return err
 	}
+}
+
+// fieldProblem renders a domain error as a one-field validation failure.
+//
+// The domain answers in its own terms because [Enforcement] is also reachable from a future task
+// with no request behind it, and the field name belongs at the transport edge — which is where
+// Docs/10 §4.6's "one details entry per field" is a rule about a response shape rather than about a
+// service's vocabulary.
+//
+// The `admin: ` prefix is stripped: it identifies the package to a Go reader and means nothing to
+// somebody looking at a console.
+func fieldProblem(field string, err error) error {
+	var problems validate.Errors
+	problems.Add(field, validate.CodeInvalid, "%s",
+		capitaliseFirst(strings.TrimPrefix(err.Error(), "admin: "))+".")
+	return problems.Err()
+}
+
+// capitaliseFirst upper-cases the first rune, so a sentinel's message reads as a sentence.
+//
+// Docs/10 §4.4 wants a client to branch on the code and show the message; a message starting
+// lower-case reads as a fragment somebody forgot to finish.
+func capitaliseFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
 }
 
 // --- administrator authentication (SHIP-147) -----------------------------------------------------
@@ -1809,4 +1868,95 @@ func decodeAuditCursor(raw string) (AuditCursor, error) {
 	}
 
 	return AuditCursor{CreatedAt: createdAt, EntryID: entryID}, nil
+}
+
+// --- SHIP-160: the administrative outcomes of Docs/04 §6 ------------------------------------------
+
+// unpublishJobRequest is the body of POST /v1/admin/jobs/{id}/unpublish.
+//
+//	{"reason": "Listing offers to move a live animal, which Docs/05 prohibits."}
+//
+// One field, and no job identifier: the job is in the path. No actor either — the administrator is
+// whoever the credential says is calling, and a body that named its own actor would be an audit
+// trail the client writes. httpx.DecodeJSON refuses unknown fields, so a console sending either is
+// told the field does not exist rather than having it quietly ignored.
+type unpublishJobRequest struct {
+	Reason string `json:"reason"`
+}
+
+// unpublishJobResponse is what the console is told afterwards.
+//
+// The job's new status **is** echoed here, unlike on dispute intake where it deliberately is not.
+// The difference is the audience: that response goes to a customer whose client already knows what
+// raising a dispute does, and this one goes to a console rendering a row it must now redraw. It is
+// the stored form, consistently with every other administrative shape.
+type unpublishJobResponse struct {
+	JobID  string `json:"job_id"`
+	Status string `json:"status"`
+
+	// Reason is read back so a console can render what was recorded without a second request —
+	// and, more usefully, so that what the platform *stored* is what the operator sees rather
+	// than what they typed. The two differ by trimming.
+	Reason string `json:"reason"`
+}
+
+// UnpublishJob handles POST /v1/admin/jobs/{id}/unpublish (SHIP-160).
+//
+// Docs/01 §4.6's third capability — "remove or unpublish policy-breaching jobs" — behind
+// [PermissionJobsUnpublish], which `moderator` and `owner` hold and `support` does not. Reading the
+// job is `jobs.read` and every role has it; taking it off the marketplace is a different permission
+// on a different endpoint, which is the whole shape of Docs/04 §9's least-privilege control.
+//
+// # It is a POST with an Idempotency-Key, and the key matters here more than usual
+//
+// Every state-changing endpoint takes one (SHIP-15) and this one is refused without it. A retry
+// after a dropped connection must not produce two audit entries about one removal — and unlike a
+// second bid or a second milestone, a duplicate entry in an append-only table cannot be tidied up
+// afterwards.
+//
+// # Why "unpublish" and not DELETE
+//
+// Nothing is deleted. The job moves to `Cancelled` through the one guarded function, its history
+// records who moved it and why, and the row stays exactly where it was — Docs/05 §3.1 keeps records,
+// and a `DELETE` verb on this path would describe the opposite of what happens.
+func (h *Handler) UnpublishJob() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		// The grant is used rather than discarded: the entry is attributed to whoever acted,
+		// and taking the actor from the grant means a handler cannot record one without
+		// having stated the permission it was acting under.
+		grant, err := h.permitted(r, PermissionJobsUnpublish)
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req unpublishJobRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		if err := h.enforce.Unpublish(r.Context(), UnpublishCommand{
+			JobID:   jobID,
+			ActorID: grant.Administrator.ID,
+			Reason:  req.Reason,
+		}); err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, unpublishJobResponse{
+			JobID: jobID.String(),
+
+			// The stored form of Docs/02 §1's terminal status, written out rather than read
+			// back from the job. The transition committed, and the guard is what decides
+			// where it went — a second read to confirm would be this domain asking whether
+			// the function it just called did what it says.
+			Status: "Cancelled",
+			Reason: strings.TrimSpace(req.Reason),
+		})
+		return nil
+	})
 }

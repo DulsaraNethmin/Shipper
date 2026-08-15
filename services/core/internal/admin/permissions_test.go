@@ -11,7 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 )
 
 // testDisputeService is a [Service] the administrator handlers do not use.
@@ -63,7 +65,7 @@ func testModeration(t *testing.T) *Moderation {
 // The pool may be nil. Every service in this package accepts one, because the process starts with an
 // unreachable database on purpose, and the tests that pass nil are the ones whose endpoint never
 // reaches it.
-func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool) HandlerServices {
+func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk clock.Clock) HandlerServices {
 	t.Helper()
 
 	users, err := NewUsers(pool)
@@ -76,7 +78,7 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool) HandlerS
 		t.Fatalf("building the moderation service: %v", err)
 	}
 
-	jobs, err := NewJobConsole(&testJobDirectory{}, testJobStatuses, pool)
+	jobConsole, err := NewJobConsole(&testJobDirectory{}, testJobStatuses, pool)
 	if err != nil {
 		t.Fatalf("building the job search: %v", err)
 	}
@@ -86,13 +88,29 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool) HandlerS
 		t.Fatalf("building the audit trail: %v", err)
 	}
 
+	// SHIP-160, SHIP-161. The auditor takes the clock the caller's other rows take, because an
+	// entry has to sort against the session and status-history rows it describes (Docs/11 §9 —
+	// one row, one clock). A clock of this helper's own would make every assertion about an
+	// entry's instant fail for a reason that has nothing to do with the ticket under test.
+	auditor, err := NewAuditor(clk)
+	if err != nil {
+		t.Fatalf("building the audit writer: %v", err)
+	}
+
+	enforce, err := NewEnforcement(
+		testJobs{svc: jobs.NewService(events.NewOutbox(), clk, nil)}, auditor, pool)
+	if err != nil {
+		t.Fatalf("building enforcement: %v", err)
+	}
+
 	return HandlerServices{
 		Disputes:    testDisputeService(t),
 		Credentials: creds,
 		Moderation:  moderation,
 		Users:       users,
-		Jobs:        jobs,
+		Jobs:        jobConsole,
 		Trail:       trail,
+		Enforcement: enforce,
 	}
 }
 
@@ -318,7 +336,7 @@ func TestARoleCannotBeWidenedByWhatIsHandedToACaller(t *testing.T) {
 // The body must not name the permission. A refusal that enumerated what the platform can do would
 // make the console's own surface readable by anybody with the least-privileged account.
 func TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission(t *testing.T) {
-	creds, auth, _, _ := adminAuth(t)
+	creds, auth, _, clk := adminAuth(t)
 	anAdministrator(t, creds, "support-only@example.com", RoleSupport)
 
 	issued, _, err := signIn(t, creds, "support-only@example.com", testPassword, "10.0.10.1")
@@ -326,7 +344,7 @@ func TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission(t *t
 		t.Fatalf("signing in: %v", err)
 	}
 
-	handler, err := NewHandler(testServices(t, creds, nil), nil, testLogger())
+	handler, err := NewHandler(testServices(t, creds, nil, clk), nil, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -363,7 +381,7 @@ func TestAnUnpermittedAdministratorIsRefusedWithoutBeingToldWhichPermission(t *t
 // otherwise let through: that being *allowed* to create an administrator does not mean the created
 // one inherits anything.
 func TestAnOwnerCreatesAnAdministratorAndTheDefaultIsStillTheMinimum(t *testing.T) {
-	creds, auth, _, _ := adminAuth(t)
+	creds, auth, _, clk := adminAuth(t)
 	anAdministrator(t, creds, "owner@example.com", RoleOwner)
 
 	issued, _, err := signIn(t, creds, "owner@example.com", testPassword, "10.0.11.1")
@@ -371,7 +389,7 @@ func TestAnOwnerCreatesAnAdministratorAndTheDefaultIsStillTheMinimum(t *testing.
 		t.Fatalf("signing in: %v", err)
 	}
 
-	handler, err := NewHandler(testServices(t, creds, nil), nil, testLogger())
+	handler, err := NewHandler(testServices(t, creds, nil, clk), nil, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}

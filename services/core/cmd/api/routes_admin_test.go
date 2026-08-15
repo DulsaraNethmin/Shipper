@@ -41,6 +41,11 @@ var auditedAdminMutations = map[string]admin.AuditAction{
 
 	// SHIP-147, SHIP-148. The most privileged action the console has.
 	"POST /v1/admin/administrators": admin.AuditActionAdministratorCreated,
+
+	// SHIP-160. The first audited mutation whose target is not an administrator — the entry
+	// names the job, and the same reason is written into `job_status_history` as well, because
+	// the two tables answer different questions to different readers.
+	"POST /v1/admin/jobs/{id}/unpublish": admin.AuditActionJobUnpublished,
 }
 
 // administrativeMutation reports whether this route is a state change an administrator makes.

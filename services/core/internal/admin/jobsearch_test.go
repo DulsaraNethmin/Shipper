@@ -87,10 +87,10 @@ type jobFixture struct {
 func newJobFixture(t *testing.T) jobFixture {
 	t.Helper()
 
-	creds, auth, pool, _ := adminAuth(t)
+	creds, auth, pool, clk := adminAuth(t)
 	directory := &testJobDirectory{}
 
-	services := testServices(t, creds, pool)
+	services := testServices(t, creds, pool, clk)
 	console, err := NewJobConsole(directory, testJobStatuses, pool)
 	if err != nil {
 		t.Fatalf("building the job search: %v", err)

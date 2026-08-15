@@ -84,6 +84,43 @@ func (j testJobs) MoveToDisputed(
 	}
 }
 
+// Unpublish is SHIP-160's move, as cmd/api's disputeLifecycle performs it.
+//
+// **A copy of the adapter rather than a stub answering a canned value**, and that is what makes the
+// enforcement tests worth running: the transition is a real one through the real guard against a
+// real database, so Docs/02 §2's table decides which jobs can be unpublished rather than this file
+// deciding it. A stub returning JobMoved would establish that `admin` writes an audit entry when
+// told the move worked, which is the half that was never in doubt.
+//
+// It is a copy because cmd/api's adapter is in package main, which no test can import. What keeps
+// the two honest is scripts/verify/90-admin.sh, which drives the real one against the built binary.
+func (j testJobs) Unpublish(
+	ctx context.Context,
+	r db.Runner,
+	jobID, actorID uuid.UUID,
+	reason string,
+) (JobMove, error) {
+	_, err := j.svc.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusCancelled,
+		Actor:  jobs.User(jobs.ActorAdmin, actorID),
+		Reason: reason,
+	})
+
+	switch {
+	case err == nil:
+		return JobMoved, nil
+	case errors.Is(err, jobs.ErrJobNotFound):
+		return JobNotFound, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return JobAlreadyRemoved, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted):
+		return JobNotRemovable, nil
+	default:
+		return JobMoveUnrecognised, err
+	}
+}
+
 // testParties is admin.JobParties over the job and its accepted bid, as cmd/api reads it.
 type testParties struct{}
 
@@ -129,6 +166,12 @@ type staticJobs struct {
 }
 
 func (s staticJobs) MoveToDisputed(context.Context, db.Runner, uuid.UUID, uuid.UUID, Party, string) (JobMove, error) {
+	return s.move, s.err
+}
+
+// Unpublish answers the same canned outcome. Present so the type still satisfies [Jobs]; the
+// enforcement tests use [testJobs], which performs a real transition.
+func (s staticJobs) Unpublish(context.Context, db.Runner, uuid.UUID, uuid.UUID, string) (JobMove, error) {
 	return s.move, s.err
 }
 

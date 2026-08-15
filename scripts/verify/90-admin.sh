@@ -1446,7 +1446,12 @@ print(e["actor_type"])
 print("actor-ok" if e["actor_id"] == sys.argv[2] else "actor-" + str(e["actor_id"]))
 print("target-ok" if e["target_id"] == sys.argv[3] else "target-" + str(e["target_id"]))
 print(e["target_type"])
-print(json.dumps(e["metadata"], sort_keys=True))
+# The role granted, which is the field an entry about a created administrator most needs — a
+# record that an account was made without saying what it may do is half a fact. Asserted by key
+# rather than as the whole object, because the writer also records the address and a whole-object
+# comparison would make this section fail the next time somebody adds a field to the metadata.
+print(str(e["metadata"].get("role")))
+print("object" if isinstance(e["metadata"], dict) else "not-an-object")
 PY
 trail_keys="$(sed -n '1p' "$WORKDIR/trail-entry.txt")"
 [[ "$trail_keys" == "action,actor_id,actor_type,created_at,id,metadata,reason,target_id,target_type" ]] \
@@ -1455,8 +1460,10 @@ trail_keys="$(sed -n '1p' "$WORKDIR/trail-entry.txt")"
 [[ "$(sed -n '3p' "$WORKDIR/trail-entry.txt")" == "actor-ok" ]] || fail "the entry does not name the administrator who acted"
 [[ "$(sed -n '4p' "$WORKDIR/trail-entry.txt")" == "target-ok" ]] || fail "the entry does not name the account that was created"
 [[ "$(sed -n '5p' "$WORKDIR/trail-entry.txt")" == "administrator" ]] || fail "the entry does not say what kind of thing it names"
-[[ "$(sed -n '6p' "$WORKDIR/trail-entry.txt")" == '{"role": "moderator"}' ]] \
-  || { cat "$WORKDIR/admin-trail-entry.json"; fail "the metadata is not the object that was written: $(sed -n '6p' "$WORKDIR/trail-entry.txt")"; }
+[[ "$(sed -n '6p' "$WORKDIR/trail-entry.txt")" == "moderator" ]] \
+  || { cat "$WORKDIR/admin-trail-entry.json"; fail "the metadata does not carry the role that was granted: $(sed -n '6p' "$WORKDIR/trail-entry.txt")"; }
+[[ "$(sed -n '7p' "$WORKDIR/trail-entry.txt")" == "object" ]] \
+  || { cat "$WORKDIR/admin-trail-entry.json"; fail "the metadata is not a JSON object; null is what a console renders by crashing"; }
 ok "an entry carries every column of the row, including the metadata as the object that was written — a viewer that redacted would be a second record"
 
 # --- the filters are refused rather than ignored ---------------------------------------------------
@@ -1500,5 +1507,187 @@ status="$(admin_get "/v1/admin/audit" "" trail-nocred)"
 [[ "$(cat "$WORKDIR/admin-trail-nocred.json")" != *"$trail_id"* ]] \
   || fail "a refused request returned entries anyway"
 ok "and the trail is behind the administrator credential — without one it would be a public list of who runs the platform and what they touch"
+
+admin_clear_limits
+
+# ==========================================================================================
+# SHIP-160 — unpublishing a policy-breaching job, and SHIP-161 — restricting or suspending an
+# account.
+#
+# # What only this section can show
+#
+# Two things, and the second is the one the Go suite structurally cannot reach.
+#
+# The composition root's half: `adminHandler` builds the enforcement service from the same
+# `disputeLifecycle` adapter the dispute workflow uses, and `disputeLifecycle.Unpublish` is the
+# translation between `jobs`' sentinels and `admin.JobMove`. `internal/admin`'s tests use their own
+# copy of that adapter, so a change that wired a different lifecycle, or that mistranslated
+# `ErrTransitionNotPermitted`, compiles and passes every Go test in the domain.
+#
+# **And SHIP-161's enforcement, which lives in `internal/identity`.** The *Done when* is "account
+# access is limited or disabled", and no test in `internal/admin` can show that: the domain writes a
+# column, and whether a suspended account can still sign in is a question for a different domain's
+# code, through the real HTTP surface, against the real running service. That is demonstrated here
+# or nowhere.
+#
+# # Everything is fenced on rows this run created
+#
+# `jobs`, `users` and `audit_log` are shared with every previous run and every other worktree, so
+# every assertion below is on identifiers this section made.
+
+# **Every key below is prefixed `verify-adm160-` or `verify-adm161-`, and that is not cosmetic.**
+# `dispute_draft <name>` sends `verify-adm-<name>-$$` and `admin_signin <key>` sends the key it is
+# handed, so a section reusing one string across two different bodies is answered
+# `idempotency_key_reused` by the middleware — a 409 where the check expects a 403, which reads as a
+# broken endpoint rather than as two requests sharing a key. This section paid for that once.
+
+ticket "SHIP-160  an administrator unpublishes a policy-breaching job, with a recorded reason"
+
+admin_clear_limits
+
+# A moderator, because `jobs.unpublish` is held by `moderator` and `owner` and not by `support` —
+# the split that makes Docs/04 §9's least-privilege control real rather than nominal.
+unpub_email="verify-admin-unpub-$$@example.com"
+unpub_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$unpub_email', 'Verify Moderator', '$admin_fixture_hash', 'moderator')
+   returning id;")"
+[[ -n "$unpub_id" ]] || fail "the unpublishing moderator could not be created"
+
+status="$(admin_signin "verify-adm160-signin-$$" "$unpub_email" "$admin_password" unpub-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-unpub-in.json"; fail "the moderator could not sign in ($status)"; }
+unpub_token="$(json "$WORKDIR/admin-unpub-in.json" '["token"]')"
+
+# A support administrator too, for the permission check below.
+unpub_support_email="verify-admin-unpub-sup-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$unpub_support_email', 'Verify Support', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the support administrator could not be created"
+status="$(admin_signin "verify-adm160-supsignin-$$" "$unpub_support_email" "$admin_password" unpub-sup)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-unpub-sup.json"; fail "the support administrator could not sign in ($status)"; }
+unpub_support_token="$(json "$WORKDIR/admin-unpub-sup.json" '["token"]')"
+
+# unpublish <token> <key> <job-id> <body> <name> — one attempt, answering with its status.
+unpublish() {
+  curl -s -X POST -o "$WORKDIR/unpub-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT/v1/admin/jobs/$3/unpublish"
+}
+
+unpub_reason="Listing offers to transport a live animal, which Docs 05 prohibits."
+unpub_body="{\"reason\":\"$unpub_reason\"}"
+
+# An Open job: published, nobody committed. dispute_draft creates it and one guarded move publishes.
+unpub_job="$(dispute_draft ship160job)"
+dispute_move "$unpub_job" Draft Open
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$unpub_job';")" == "Open" ]] \
+  || fail "the fixture job is not Open, so nothing below is testing what it claims"
+
+# --- the permission, before anything succeeds -----------------------------------------------------
+
+status="$(unpublish "$unpub_support_token" "verify-adm160-suptry-$$" "$unpub_job" "$unpub_body" sup)"
+[[ "$status" == "403" ]] \
+  || { cat "$WORKDIR/unpub-sup.json"; fail "a support administrator unpublished a job and got $status, want 403"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$unpub_job';")" == "Open" ]] \
+  || fail "a refused removal moved the job anyway"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from audit_log where target_id = '$unpub_job';")" == "0" ]] \
+  || fail "a refused removal wrote an audit entry, in a table nothing can correct"
+ok "a support administrator may open any job and may not remove one — two permissions on two endpoints, which is what makes least privilege real"
+
+# --- a reason that records nothing is refused -----------------------------------------------------
+
+status="$(unpublish "$unpub_token" "verify-adm160-noreason-$$" "$unpub_job" '{"reason":""}' noreason)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/unpub-noreason.json"; fail "an empty reason returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/unpub-noreason.json")" == *'"reason"'* ]] \
+  || { cat "$WORKDIR/unpub-noreason.json"; fail "the refusal does not name the field"; }
+
+status="$(unpublish "$unpub_token" "verify-adm160-short-$$" "$unpub_job" '{"reason":"spam"}' short)"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/unpub-short.json"; fail "a four-character reason returned $status, want 422"; }
+ok "an empty reason and one too short to record anything are both refused and name the field — a required field satisfied by one character is not a recorded reason"
+
+# --- the removal itself ----------------------------------------------------------------------------
+
+status="$(unpublish "$unpub_token" "verify-adm160-remove-$$" "$unpub_job" "$unpub_body" ok)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/unpub-ok.json"; fail "unpublishing returned $status, want 200"; }
+[[ "$(json "$WORKDIR/unpub-ok.json" '["status"]')" == "Cancelled" ]] \
+  || { cat "$WORKDIR/unpub-ok.json"; fail "the response does not say the job was cancelled"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$unpub_job';")" == "Cancelled" ]] \
+  || fail "the job is not Cancelled"
+ok "a published job is removed by moving it to Cancelled through the one guarded transition — there is no unpublished status and no hidden flag"
+
+# The transition went through the guard, attributed to an administrator, with the reason. A bare
+# UPDATE would have been refused by 000402, so reaching Cancelled at all is half the claim; that it
+# is recorded against an *admin* rather than the customer is the other half.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from job_status_history
+    where job_id = '$unpub_job' and to_status = 'Cancelled'
+      and actor_type = 'admin' and actor_id = '$unpub_id'
+      and reason = '$unpub_reason';")" == "1" ]] \
+  || fail "the transition is not recorded against the administrator with the reason they gave"
+ok "and the job's status history names the administrator and says why — which is what a customer's support conversation reads"
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$unpub_job' and target_type = 'job'
+      and action = 'job.unpublished' and actor_type = 'admin'
+      and actor_id = '$unpub_id' and reason = '$unpub_reason';")" == "1" ]] \
+  || fail "the removal wrote no audit entry naming the job, the administrator and the reason"
+ok "and the audit log records the same reason against the administrator — two tables, two readers, and neither has to find the other"
+
+# --- the customer is notified, and no new event arranges it ------------------------------------------
+#
+# The last clause of the *Done when*. The guarded transition emits `job.status_changed` in the same
+# transaction and `notifications.StatusRules` routes a move to Cancelled to the job's customer and
+# the awarded provider. **No `admin.job_unpublished` event was added**, which is the finding rather
+# than a shortcut: a second announcement of one state change is the failure those rules exist to
+# prevent. Fenced on this job's aggregate id rather than on a count or a timestamp, because the
+# outbox is shared with every other worktree.
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from outbox
+    where aggregate_id = '$unpub_job' and event_type = 'job.status_changed'
+      and payload->>'to' = 'Cancelled' and payload->>'actor_type' = 'admin';")" == "1" ]] \
+  || fail "the removal emitted no job.status_changed to Cancelled, so nothing tells the customer"
+ok "the removal emits job.status_changed to Cancelled — which notifications already routes to the customer, so the customer is notified without a second event about one state change"
+
+# --- a second attempt, and a job past the point ------------------------------------------------------
+
+status="$(unpublish "$unpub_token" "verify-adm160-again-$$" "$unpub_job" "$unpub_body" again)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/unpub-again.json"; fail "unpublishing an already-removed job returned $status, want 409"; }
+[[ "$(cat "$WORKDIR/unpub-again.json")" == *'admin_job_already_unpublished'* ]] \
+  || { cat "$WORKDIR/unpub-again.json"; fail "the refusal does not say the job was already removed"; }
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from audit_log where target_id = '$unpub_job';")" == "1" ]] \
+  || fail "a second attempt wrote a second entry, so the trail says the job was taken down twice"
+ok "a job somebody has already removed answers with its own code and writes nothing — the ordinary outcome of two moderators reading one queue"
+
+# An awarded job. Docs/02 §2 offers no route from Awarded to Cancelled: a provider has committed,
+# and Docs/02 §6.2 makes ending it a support case rather than a status change.
+unpub_awarded="$(dispute_draft ship160awarded)"
+dispute_move "$unpub_awarded" Draft Open
+dispute_move "$unpub_awarded" Open Awarded
+dispute_award "$unpub_awarded" "$dispute_provider_id"
+
+status="$(unpublish "$unpub_token" "verify-adm160-awarded-$$" "$unpub_awarded" "$unpub_body" awarded)"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/unpub-awarded.json"; fail "unpublishing an awarded job returned $status, want 409"; }
+[[ "$(cat "$WORKDIR/unpub-awarded.json")" == *'admin_job_not_unpublishable'* ]] \
+  || { cat "$WORKDIR/unpub-awarded.json"; fail "the refusal does not carry the code a console branches on"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$unpub_awarded';")" == "Awarded" ]] \
+  || fail "a refused removal moved an awarded job"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from audit_log where target_id = '$unpub_awarded';")" == "0" ]] \
+  || fail "a refused removal wrote an audit entry"
+ok "an awarded job cannot be unpublished — Docs/02 §2 has no such row, and the administrator's path is a dispute they then resolve"
+
+status="$(curl -s -X POST -o "$WORKDIR/unpub-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $unpub_token" -H 'Content-Type: application/json' -d "$unpub_body" \
+  "http://localhost:$VERIFY_PORT/v1/admin/jobs/$unpub_job/unpublish")"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/unpub-nokey.json"; fail "unpublishing without an Idempotency-Key returned $status, want 400"; }
+ok "and it is refused without an Idempotency-Key — a retry after a dropped connection must not write a second entry into a table nothing can tidy"
 
 admin_clear_limits

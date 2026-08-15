@@ -16,6 +16,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
@@ -57,7 +58,7 @@ func newAuditFixture(t *testing.T) auditFixture {
 
 	creds, auth, pool, clk := adminAuth(t)
 
-	handler, err := NewHandler(testServices(t, creds, pool), pool, testLogger())
+	handler, err := NewHandler(testServices(t, creds, pool, clk), pool, testLogger())
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -160,6 +161,16 @@ type adminMutation struct {
 	// action is the entry the mutation must write.
 	action AuditAction
 
+	// targetType is the kind of thing the entry names.
+	//
+	// Added at SHIP-160, which was the first audited mutation whose target is not an
+	// administrator. Before it every row here targeted [AuditTargetAdministrator] and the
+	// assertion below said so as a constant — which would have passed a job removal that
+	// recorded its target as an administrator, in the field a support search filters on.
+	//
+	// Empty means [AuditTargetAdministrator], so the three SHIP-147 rows read as they did.
+	targetType string
+
 	// run performs it, through the handler and the guard, and returns the account the entry must
 	// be attributed to and the thing it must name as its target.
 	//
@@ -175,7 +186,7 @@ type adminMutation struct {
 
 // adminMutations is every state-changing administrative action the service serves today.
 //
-// Three, matching the three mutating routes in `cmd/api/routes_golden.txt` under `/v1/admin/`. The
+// Four, matching the four mutating routes in `cmd/api/routes_golden.txt` under `/v1/admin/`. The
 // pairing between this list and the served surface is checked from the other side by
 // TestEveryMutatingAdminRouteIsAudited in cmd/api, which is the only place the route table is
 // visible.
@@ -259,6 +270,35 @@ func adminMutations() []adminMutation {
 				return owner.ID, created
 			},
 		},
+		{
+			name:       "unpublishing a job",
+			action:     AuditActionJobUnpublished,
+			targetType: AuditTargetJob,
+			run: func(t *testing.T, f auditFixture, ready func()) (uuid.UUID, uuid.UUID) {
+				t.Helper()
+
+				moderator, token := f.signedIn(t, "unpub@example.com", RoleModerator, "10.0.53.1")
+
+				customerID := newAccount(t, f.pool, "unpub-cust@example.com", "+61400530", "customer")
+				jobID := newDraft(t, f.pool, customerID)
+				moveJob(t, f.pool, jobID, jobs.User(jobs.ActorCustomer, customerID), jobs.StatusOpen)
+				ready()
+
+				req := httptest.NewRequest(http.MethodPost,
+					"/v1/admin/jobs/"+jobID.String()+"/unpublish",
+					strings.NewReader(`{"reason":"Prohibited goods; removed after review."}`))
+				req.SetPathValue("id", jobID.String())
+				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+				req.Header.Set("Content-Type", "application/json")
+
+				rec := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.UnpublishJob()).ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("unpublishing: status = %d, want 200 (%s)", rec.Code, rec.Body)
+				}
+				return moderator.ID, jobID
+			},
+		},
 	}
 }
 
@@ -336,8 +376,12 @@ func TestEveryAdminMutationWritesAnAuditEntry(t *testing.T) {
 				t.Errorf("actor_id = %v, want the administrator who acted, %s",
 					entry.ActorID, actor)
 			}
-			if entry.TargetType != AuditTargetAdministrator {
-				t.Errorf("target_type = %q, want %q", entry.TargetType, AuditTargetAdministrator)
+			wantTarget := m.targetType
+			if wantTarget == "" {
+				wantTarget = AuditTargetAdministrator
+			}
+			if entry.TargetType != wantTarget {
+				t.Errorf("target_type = %q, want %q", entry.TargetType, wantTarget)
 			}
 			if entry.TargetID != target {
 				t.Errorf("target_id = %s, want %s", entry.TargetID, target)
@@ -371,6 +415,7 @@ func TestEveryAuditActionConstantIsInTheCatalogue(t *testing.T) {
 		AuditActionAdministratorCreated,
 		AuditActionAdministratorSignedIn,
 		AuditActionAdministratorSignedOut,
+		AuditActionJobUnpublished,
 	}
 
 	if len(declared) != len(AuditActions) {
