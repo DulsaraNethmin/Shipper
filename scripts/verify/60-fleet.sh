@@ -1056,6 +1056,49 @@ status="$(fleet_get "$fleet_customer_token" "/v1/fleet/jobs/$open_job_id" "$WORK
 ok "the provider's route is not a second way to a job the customer owns"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-83a  the feed moved off the {id} slot, and the old path is gone rather than aliased"
+
+# **What only a running service can show.** cmd/api/routes_jobsegment_test.go proves the freed space
+# by attaching a four-segment literal to the real route table; what it cannot prove is that the
+# process this harness has been driving for the last two hundred checks came up at all. It did — the
+# collision was a *registration* panic, so every check above ran against a binary that would not have
+# started if the pair had been reintroduced.
+#
+# What is left to show here is the other half of the Done when: the old path is gone, not aliased.
+# A redirect would collide with a four-segment literal exactly as a 200 does, because ServeMux
+# refuses the pair before either handler is reached — so an alias is not a gentler migration, it is
+# the same defect wearing a 301.
+
+# **`/v1/jobs/open` answers 400 and that is the demonstration rather than a near miss.** The word
+# `open` now lands in `GET /v1/jobs/{id}`'s identifier slot and is refused for not being a UUID —
+# which is precisely the claim SHIP-83a makes: the slot holds an identifier again, and no literal is
+# shadowing it. A 404 here would mean something was still matching the old shape.
+status="$(fleet_get "$elig_provider_token" /v1/jobs/open "$WORKDIR/moved-feedpath.json")"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/moved-feedpath.json"; fail "GET /v1/jobs/open returned $status, want 400 — the word open should now be read as a job identifier and refused for not being one"; }
+python3 - "$WORKDIR/moved-feedpath.json" <<'FEEDPATH' || fail "the refusal is not the malformed-identifier one"
+import json, sys
+if json.load(open(sys.argv[1]))["error"]["code"] != "bad_request":
+    sys.exit("the old feed path is being served by something: %s" % open(sys.argv[1]).read())
+FEEDPATH
+
+# And the four-segment form matches nothing at all: no route, no redirect, no alias. A redirect
+# would collide with a four-segment literal exactly as a 200 does, because ServeMux refuses the pair
+# before either handler is reached — an alias is the same defect wearing a 301, not a gentler
+# migration. curl is not following redirects here, so one would show as its own status.
+status="$(fleet_get "$elig_provider_token" "/v1/jobs/open/$open_job_id" "$WORKDIR/moved-detailpath.json")"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/moved-detailpath.json"; fail "GET /v1/jobs/open/{id} returned $status, want 404 — SHIP-83a removed the old path and did not alias it"; }
+ok "the old feed path is now read as a job identifier and the old detail path matches nothing — gone rather than aliased"
+
+# And the new ones answer, which is what makes the 404s above a move rather than a deletion.
+status="$(fleet_get "$elig_provider_token" '/v1/fleet/jobs?limit=100' "$WORKDIR/moved-feed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/moved-feed.json"; fail "GET /v1/fleet/jobs returned $status, want 200"; }
+status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$open_job_id" "$WORKDIR/moved-detail.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/moved-detail.json"; fail "GET /v1/fleet/jobs/{id} returned $status, want 200"; }
+ok "the feed and the single job answer under /v1/fleet, which is where the provider's own things already live"
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-96a  GET /v1/fleet/jobs/{id} once the job has left the feed — the bid, not eligibility"
 
 # **What only the harness can show here.** internal/fleet's tests drive the handler on a mux of
