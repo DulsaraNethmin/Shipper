@@ -244,6 +244,11 @@ func (c DriverClaims) Assignment() (uuid.UUID, error) {
 type DriverToken struct {
 	Value string
 
+	// ID is the token's own `jti`, which is what SHIP-109 records against the assignment to make
+	// this the one link that opens it. It is returned rather than re-parsed out of Value, which is
+	// a thing nothing outside the verifier should be doing to a credential.
+	ID string
+
 	JobID        uuid.UUID
 	AssignmentID uuid.UUID
 
@@ -285,21 +290,49 @@ func (i *DriverTokenIssuer) TTL() time.Duration { return i.ttl }
 // later believe, and a perfectly valid signature over uuid.Nil would be a grant over a job that
 // does not exist — which a verifier has no way to tell from a grant over one that does.
 func (i *DriverTokenIssuer) Issue(jobID, assignmentID uuid.UUID) (DriverToken, error) {
+	tokenID, err := uuid.NewV7()
+	if err != nil {
+		return DriverToken{}, fmt.Errorf("delivery: generating a driver token id: %w", err)
+	}
+	return i.IssueAs(jobID, assignmentID, tokenID.String())
+}
+
+// IssueAs signs a token carrying a link identifier the caller already holds (SHIP-109).
+//
+// # It exists so that "nothing was written" can also mean "nothing was revoked"
+//
+// `driver_assignments.link_token_id` names the one link that opens an assignment, so minting a
+// fresh identifier is what ends the previous link. That is right for a reissue and wrong for the
+// path [Service.AssignDriver] takes when a provider nominates the same driver twice: the second
+// request wrote no row, moved no job and emitted no event, and a provider whose phone lost the
+// first response must not silently cut off a driver already holding the link. Re-signing the same
+// identifier hands them a working credential and leaves the driver's alone.
+//
+// The two tokens are different values — `iat` and `exp` are read from the clock — and both verify
+// and both match the column, which is the intended outcome rather than an accident: they are two
+// renderings of one grant.
+//
+// **Only [Service.ReissueDriverLink] and a new assignment mint a fresh identifier**, which is what
+// makes revocation something a provider asks for rather than something a retry causes.
+func (i *DriverTokenIssuer) IssueAs(jobID, assignmentID uuid.UUID, tokenID string) (DriverToken, error) {
 	if jobID == uuid.Nil {
 		return DriverToken{}, fmt.Errorf("delivery: a driver token needs the job it grants")
 	}
 	if assignmentID == uuid.Nil {
 		return DriverToken{}, fmt.Errorf("delivery: a driver token needs the assignment it belongs to")
 	}
+	if _, err := uuid.Parse(tokenID); err != nil {
+		// Refused rather than replaced with a fresh one, because a caller that passed something
+		// unusable meant to re-sign a specific link and would otherwise get a *different* link
+		// back — which is a revocation nobody asked for. ck_driver_assignments_link_token_id
+		// holds the same shape in the database.
+		return DriverToken{}, fmt.Errorf("delivery: %q is not a link identifier: %w",
+			tokenID, ErrMalformedDriverToken)
+	}
 
 	key, err := i.keys.key(i.keys.active)
 	if err != nil {
 		return DriverToken{}, err
-	}
-
-	tokenID, err := uuid.NewV7()
-	if err != nil {
-		return DriverToken{}, fmt.Errorf("delivery: generating a driver token id: %w", err)
 	}
 
 	// Truncated to the second, because `iat` and `exp` are counts of seconds. Without it the
@@ -313,7 +346,7 @@ func (i *DriverTokenIssuer) Issue(jobID, assignmentID uuid.UUID) (DriverToken, e
 		AssignmentID: assignmentID.String(),
 		IssuedAt:     now.Unix(),
 		ExpiresAt:    expires.Unix(),
-		TokenID:      tokenID.String(),
+		TokenID:      tokenID,
 		Issuer:       IssuerName,
 		Audience:     DriverAudience,
 	}
@@ -331,6 +364,7 @@ func (i *DriverTokenIssuer) Issue(jobID, assignmentID uuid.UUID) (DriverToken, e
 
 	return DriverToken{
 		Value:        signed,
+		ID:           tokenID,
 		JobID:        jobID,
 		AssignmentID: assignmentID,
 		ExpiresAt:    expires,

@@ -1,0 +1,46 @@
+-- SHIP-89: the index the bid-expiry sweep reads, and the reason there is no column beside it.
+--
+-- # An offer's "own terms" are the terms in the offer, and they are already stored
+--
+-- Docs/01 §4.2 gives a provider "place, update, and withdraw a bid until it is accepted or
+-- expires" and no document says what a bid expires *on*. 000502's header predicted this ticket
+-- would need "a column saying what those terms are". It does not, and the reason is worth writing
+-- down rather than leaving the absence to be read as an oversight.
+--
+-- **A live offer names the moment it commits to collecting, and once that moment has passed the
+-- offer is one nobody can act on.** Awarding it would commit a provider to collecting in the past;
+-- `Offer.validate` already refuses *placing* or *revising* one, so expiry is the identical rule
+-- read at a later instant rather than a second rule with a second source of truth. It is also the
+-- shape Docs/02 §6.3 gives the job it hangs under — "the earlier of 14 days or the pickup date
+-- passing" — with the fourteen-day half belonging to the job's publication rather than to any
+-- offer against it.
+--
+-- The alternative was `bids.expires_at`, defaulting to some fixed lifetime — "this quote is good
+-- for 48 hours". That is **product policy no document has decided**, and a column would have made
+-- the decision by defaulting: whatever value the migration chose would become the rule, unargued,
+-- in the one place nobody re-reads. `pickup_at` is a commitment the provider actually made.
+--
+-- # What this migration is, then: the predicate as an index
+--
+-- The sweep runs every few minutes over the whole table, and `bids` grows with every offer the
+-- marketplace has ever carried. Without this it is a sequential scan per pass forever.
+--
+-- Partial on `status = 'Submitted'`, which is the same trade `idx_jobs_open_expiry` (000406) makes
+-- and for the same reason: the sweep reads the live market rather than every offer ever placed,
+-- and the index stays roughly the size of the negotiations currently in flight. `Submitted` is the
+-- whole of "live" here by construction rather than by convention — 000502's
+-- `ck_bids_superseded_is_not_live` makes the live offer and the head of its chain the same row —
+-- so there is no live offer this index misses.
+--
+-- Ordered by `pickup_at`, so the claim's `ORDER BY pickup_at` is the index's own order and the
+-- longest-overdue offer is swept first. That matters after an outage for the reason
+-- `ExpiryClaim`'s ordering does in `jobs`: the offers that have been misleading a customer longest
+-- stop doing so first.
+--
+-- Rows with a NULL `pickup_at` are in the index and are excluded by the claim rather than by the
+-- predicate. Nothing this platform writes past 'Draft' leaves it NULL — and `ck_bids_offer_has_timing`
+-- is still not written (000501, 000502), so the column *is* nullable and the claim says so.
+CREATE INDEX idx_bids_live_expiry ON bids (pickup_at) WHERE status = 'Submitted';
+
+COMMENT ON COLUMN bids.pickup_at IS
+    'When the offer commits to collecting. Also the offer''s own expiry: a Submitted offer whose pickup_at has passed is swept to Expired by cmd/worker''s bid-expiry task (SHIP-89), because an offer to collect in the past is one nobody can accept.';

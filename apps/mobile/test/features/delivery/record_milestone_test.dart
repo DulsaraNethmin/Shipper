@@ -13,11 +13,13 @@ import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/core/queue/queued_operation.dart';
 import 'package:shipper/features/delivery/milestone.dart';
+import 'package:shipper/features/delivery/proof_capture_screen.dart';
 import 'package:shipper/features/delivery/record_milestone_controller.dart';
 
 import '../../core/queue/queue_fixture.dart';
 import '../../core/sync/sync_fixture.dart';
 import 'delivery_app.dart';
+import 'proof_fixture.dart';
 
 /// The platform is not reachable. What a driver in a pickup bay has.
 ScriptedSender get offline => ScriptedSender(thereafter: const ApiUnreachable());
@@ -225,19 +227,39 @@ void main() {
   });
 
   group('Delivered', () {
-    testWidgets('is named and not offered, because proof does not exist yet', (tester) async {
+    testWidgets('is offered through the camera and not as a plain button (SHIP-130)',
+        (tester) async {
+      // It was named and not offered at all until SHIP-130, because this device could capture
+      // neither a photograph nor an exception. What changed is where the button goes: `delivered`
+      // is still not one of `Milestone.offered`, and the button beside it is a route to the capture
+      // screen rather than a fourth recording.
       final harness = SyncHarness.create();
 
-      await openDelivery(tester, harness: harness, jobId: job);
+      // A camera, because the screen this pushes opens one — and under `testWidgets`' fake clock a
+      // platform-channel reply never arrives, so the real plugin's future never completes and the
+      // capture screen would sit on its opening spinner. `proof_fixture.dart` says it once.
+      await openDelivery(tester, harness: harness, jobId: job, overrides: withoutACamera());
 
-      expect(find.byKey(const Key('milestone-record-delivered')), findsNothing);
       expect(find.byKey(const Key('milestone-delivered-needs-proof')), findsOneWidget);
+      expect(find.byKey(const Key('milestone-record-delivered')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('milestone-record-delivered')));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byType(ProofCaptureScreen),
+        findsOneWidget,
+        reason: 'the camera, not a queued milestone — SHIP-118 refuses `delivered` without proof, '
+            'so a plain recording could only ever end up quarantined',
+      );
+      expect(await harness.queue.count(), 0);
     });
 
-    test('the controller refuses it even if a button ever appeared', () {
-      // Belt and braces beside the screen. Every `delivered` is answered
-      // `delivery_proof_required` until SHIP-118, so queueing one puts work the driver believes
-      // they recorded into a quarantine only a person can clear.
+    test('the controller refuses a plain one, however it were reached', () {
+      // Belt and braces beside the screen, and still true after SHIP-130: what makes `delivered`
+      // sendable is the *proof* operation, which carries an object key. A plain recording is
+      // answered `delivery_proof_required` (SHIP-118) and would sit in a quarantine only a person
+      // can clear.
       expect(Milestone.offered, isNot(contains(Milestone.delivered)));
       expect(Milestone.delivered.needsProof, isTrue);
     });

@@ -3,7 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:go_router/go_router.dart';
+
 import 'package:shipper/core/errors/api_failure.dart';
+import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/jobs/job.dart';
 import 'package:shipper/features/jobs/job_actions.dart';
 import 'package:shipper/features/jobs/job_detail_controller.dart';
@@ -185,7 +188,16 @@ class JobDetailScreen extends ConsumerWidget {
 
       _Section(
         title: 'Progress',
-        child: _Timeline(job),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _Timeline(job),
+            const SizedBox(height: 12),
+            _CompareOffers(jobId: jobId),
+            const SizedBox(height: 12),
+            _TrackThisDelivery(jobId: jobId),
+          ],
+        ),
       ),
 
       _Section(
@@ -360,6 +372,81 @@ class _TimelineStep extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// The way to the delivery itself (SHIP-133).
+///
+/// ## It is offered on every job, whatever the status, and that is deliberate
+///
+/// The obvious refinement is to hide it until the job is awarded. It is not taken, for the reason
+/// `app_router.dart` gives about role-aware redirects: a rule on the device about when a screen is
+/// worth showing is a copy of `Docs/02` §2's table living where nobody maintains it, and this one
+/// would be wrong in both directions the first time the table changed.
+///
+/// **The platform makes it safe to offer.** `Service.partyTo` asks whether the caller is the job's
+/// customer before it asks anything about status, so the delivery shelf answers a draft's owner with
+/// an empty assignment and an empty milestone list rather than a refusal — and the tracking screen's
+/// empty state is written for exactly that. A customer who taps this on a job published five minutes
+/// ago is told nothing has been recorded yet, which is true and is what they wanted to know.
+///
+/// `Routes` is `core/routing`, so naming a location in `features/delivery` from `features/jobs` is
+/// not a feature importing a feature: the constant is `core`'s and the screen behind it is supplied
+/// by the router (`Docs/07` §2).
+class _TrackThisDelivery extends StatelessWidget {
+  const _TrackThisDelivery({required this.jobId});
+
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: OutlinedButton.icon(
+        key: const Key('track-delivery'),
+        // `push` rather than `go`, so the back gesture returns to the job where it was rather than
+        // rebuilding it — which would re-read the job to show what the customer just left.
+        onPressed: () => context.push(Routes.trackingFor(jobId)),
+        icon: const Icon(Icons.local_shipping_outlined),
+        label: const Text('Track this delivery'),
+      ),
+    );
+  }
+}
+
+/// The way in to the offers on this job (SHIP-102).
+///
+/// ## Offered on every job, whatever the status, for [_TrackThisDelivery]'s reason
+///
+/// The obvious refinement is to hide it until an offer exists. It is not taken: a rule on the device
+/// about when a screen is worth showing is a copy of the platform's own answer living where nobody
+/// maintains it, and this one would need to know how many offers a job has before it could draw the
+/// button that finds out.
+///
+/// **The platform makes it safe to offer.** `GET /v1/jobs/{id}/bids/received` answers a job's owner
+/// with an empty page rather than a refusal — a job published five minutes ago has no offers and
+/// nothing is wrong — and `CompareOffersScreen` is written for exactly that state.
+///
+/// **It shows no count**, deliberately. A number here would have to come from a read this screen
+/// does not make, and one that was fetched and then went stale would tell a customer there were
+/// three offers on a job that has five. The offers screen counts them, having read them.
+class _CompareOffers extends StatelessWidget {
+  const _CompareOffers({required this.jobId});
+
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: OutlinedButton.icon(
+        key: const Key('compare-offers'),
+        // `push` rather than `go`, so the back gesture returns to the job where it was.
+        onPressed: () => context.push(Routes.jobOffersFor(jobId)),
+        icon: const Icon(Icons.compare_arrows),
+        label: const Text('Compare offers'),
       ),
     );
   }

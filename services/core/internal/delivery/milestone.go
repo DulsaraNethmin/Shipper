@@ -162,7 +162,40 @@ type Recording struct {
 
 	Proof     VerifiedProof
 	Exception ProofExceptionReason
+
+	// RecipientName and DeliveryNote are Docs/01 §4.4's other two required facts about a
+	// delivered job, and they arrive with the claim for the reason [VerifiedProof] does
+	// (SHIP-123).
+	//
+	// **Required on 'Delivered' and refused on every other milestone**, which is
+	// `ck_milestones_delivery_details` in Go — see [Recording.problems]. The second half is the
+	// one that is easy to leave out and is worth as much: a recipient name attached to a
+	// `picked_up` would be recording a handover that did not happen.
+	//
+	// **Neither has an exception path, and that is deliberate.** Docs/01 §4.4 gives three reasons
+	// a *photograph* can be impossible — a camera, a recipient who objects, an unlit place — and
+	// gives none for a name or a note, because a driver can always type what they see. "Left with
+	// reception" is a delivery note and "unattended" is a recipient. What that paragraph does not
+	// contemplate is a delivery with no recipient at all; Docs/11 §9 records it as a question for
+	// operations rather than answering it here.
+	//
+	// DeliveryNote is not [Recording.Reason]. Reason is the optional note any milestone may carry
+	// — Docs/02 §5's "the gate was locked and I am returning at four" — and a row may carry both,
+	// meaning different things. Docs/11 §4 refused the reuse before this ticket existed.
+	RecipientName string
+	DeliveryNote  string
 }
+
+// maxRecipientName and maxDeliveryNote bound the two fields a delivered milestone carries.
+//
+// The same call [maxMilestoneReason] makes: a bound against a runaway text field rather than a
+// judgement about what may be said. Both are paired with `ck_milestones_delivery_details`, which
+// carries the identical numbers — Docs/10 §3.4's rule that a limit the database enforces and a
+// validator states must be one limit.
+const (
+	maxRecipientName = 120
+	maxDeliveryNote  = 500
+)
 
 // hasEvidence reports whether this recording carries a photograph or a reasoned exception.
 //
@@ -174,6 +207,8 @@ func (rec Recording) hasEvidence() bool { return rec.Proof.present() || rec.Exce
 // normalise trims what the client sent into what the columns should hold.
 func (rec Recording) normalise() Recording {
 	rec.Reason = collapse(rec.Reason)
+	rec.RecipientName = collapse(rec.RecipientName)
+	rec.DeliveryNote = collapse(rec.DeliveryNote)
 	return rec
 }
 
@@ -204,6 +239,34 @@ func (rec Recording) problems() validate.Errors {
 
 	if rec.Reason != "" {
 		e.Length("reason", rec.Reason, 1, maxMilestoneReason)
+	}
+
+	// Docs/01 §4.4's field set for a delivered job, in both directions (SHIP-123).
+	//
+	// Checked here as well as by `ck_milestones_delivery_details`, for the reason Docs/10 §4.6
+	// gives about validation generally and SHIP-118 gives about its own rule: a constraint name in
+	// a 500 explains nothing, and this is the layer a client can act on. The database is the layer
+	// that does not depend on which function did the writing.
+	//
+	// The refusal on a non-delivered milestone names the field the client sent rather than the
+	// milestone, because that is the thing to remove.
+	if rec.Milestone == MilestoneDelivered {
+		if e.Required("recipient_name", rec.RecipientName) {
+			e.Length("recipient_name", rec.RecipientName, 1, maxRecipientName)
+		}
+		if e.Required("delivery_note", rec.DeliveryNote) {
+			e.Length("delivery_note", rec.DeliveryNote, 1, maxDeliveryNote)
+		}
+	} else {
+		if rec.RecipientName != "" {
+			e.Add("recipient_name", validate.CodeNotAllowed,
+				"Only a delivered milestone names who received the goods.")
+		}
+		if rec.DeliveryNote != "" {
+			e.Add("delivery_note", validate.CodeNotAllowed,
+				"Only a delivered milestone carries a delivery note. Use reason for a note on any "+
+					"other milestone.")
+		}
 	}
 
 	// The evidence, checked here as well as at the wire (SHIP-116).
@@ -266,8 +329,58 @@ type Record struct {
 	Reason string
 	Key    string
 
+	// RecipientName and DeliveryNote are set on a 'Delivered' row and empty on every other
+	// (SHIP-123). `ck_milestones_delivery_details` permits no other combination, so a reader that
+	// checks one has checked both.
+	RecipientName string
+	DeliveryNote  string
+
 	ActorRecordedAt  time.Time
 	ServerRecordedAt time.Time
+}
+
+// Recorder is who is recording a milestone: which kind of actor, and which row identifies them
+// (SHIP-120a).
+//
+// # It exists because a driver is not a provider, and both rows a milestone writes have to say so
+//
+// SHIP-111 had one caller and passed a bare `providerID` through the domain and out to [Jobs].
+// SHIP-120a adds a second entry point on a credential that names no account at all, and the pair
+// `(actor_type, actor_id)` is what 000601 and 000401 both use to say which — a `users` row for a
+// provider, a `driver_assignments` row for a driver, because a driver has none. Passing an
+// assignment identifier through a parameter named `providerID` would have compiled and written a
+// history row claiming a provider did it.
+//
+// So this is the vocabulary both tables already speak, carried as one value rather than as two
+// arguments that can be swapped. It is the whole of what the [Jobs] port gained.
+//
+// # Only two of the four [ActorType] values can appear here
+//
+// [ActorProvider] and [ActorDriver] are the two that can present a credential. [ActorAdmin] is
+// SHIP-113's and owes a reason with it; [ActorSystem] is the automatic presentation change
+// Docs/02 §2 permits, which a worker will write rather than a request. Neither is constructed
+// anywhere yet, and cmd/api's adapter refuses an actor it has no mapping for rather than
+// defaulting to one — see routes_delivery.go.
+type Recorder struct {
+	Type ActorType
+
+	// ID is the row that identifies the actor: a `users` row for a provider, a
+	// `driver_assignments` row for a driver.
+	ID uuid.UUID
+}
+
+// valid reports whether this recorder names an actor that could have made a request.
+//
+// [ActorSystem] is deliberately not valid here even though the column accepts it: nothing
+// unattended records a milestone today, and the zero [Recorder] — which is what a caller that
+// forgot to build one holds — must not be mistaken for the platform acting on its own.
+func (rec Recorder) valid() bool {
+	switch rec.Type {
+	case ActorProvider, ActorDriver:
+		return rec.ID != uuid.Nil
+	default:
+		return false
+	}
 }
 
 // Outcome is what the platform did with a recording (SHIP-112).
@@ -314,6 +427,27 @@ const (
 	// OutcomeAlreadyRecorded means this idempotency key had already recorded this milestone and
 	// nothing was written. The record returned is the one the first attempt wrote.
 	OutcomeAlreadyRecorded
+
+	// OutcomeOverruled means the row was written and the job was deliberately not moved, because
+	// the job had left the delivery altogether — cancelled, disputed or completed while this
+	// milestone was still on a phone with no signal (SHIP-113, Docs/02 §3.1).
+	//
+	// # It is not [OutcomeAbsorbed], and the difference is what happened to the delivery
+	//
+	// Absorption is a milestone the job has already been past: the work it describes was done, and
+	// the platform recorded that it happened in sequence. This is a milestone the job will now
+	// never be at, because something ended or froze the delivery while the driver was out of
+	// contact. Both retain the row and move nothing, and both are true records — but only one of
+	// them is a driver whose work is about to come as a surprise to them, and Docs/02 §3.1 asks
+	// for exactly that to be surfaced rather than swallowed.
+	//
+	// **Retaining the row is the whole ticket.** Before SHIP-113 the transaction rolled back and
+	// took the milestone with it, and any photograph attached to it. `milestones` is append-only
+	// for this case specifically: 000601's own comment says the append-only trigger is "what 'the
+	// attempt is retained' means in Docs/02 §3.1 — a milestone that lost to an administrative
+	// action is still a true record of what somebody recorded, and tidying it away would destroy
+	// the evidence SHIP-113 has to show the driver".
+	OutcomeOverruled
 )
 
 func (o Outcome) String() string {
@@ -324,6 +458,8 @@ func (o Outcome) String() string {
 		return "absorbed"
 	case OutcomeAlreadyRecorded:
 		return "already recorded"
+	case OutcomeOverruled:
+		return "overruled"
 	default:
 		return "unrecognised"
 	}

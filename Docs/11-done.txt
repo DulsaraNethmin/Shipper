@@ -5,12 +5,12 @@
 # *Done when* line in Docs/09 is demonstrable.
 #
 # Docs/11 §4 lists the partly-finished tickets, and they are NOT all absent from this list.
-# Every ticket §4 names is here. SHIP-149 is its only live row, and it is here as well as there
-# because it landed and is named by a commit subject, while one clause of its *Done when* — the
-# Go write helper — belongs to work that does not exist yet. SHIP-65 was the other such entry
-# until SHIP-67 closed it, and SHIP-134 until its publisher landed, which is how this shape is
-# meant to end. Do not "tidy" any of them out: `make status` exits 1 when git shows a ticket this
-# file does not declare, so removing one breaks the build rather than making it more honest.
+# Every ticket §4 names is here. SHIP-151 is the newest of them: it landed, it is named by a
+# commit subject, and one clause of its *Done when* — the search by name — has no column in the
+# schema to search. SHIP-149 was such a row until SHIP-150 built its write helper, SHIP-65 until
+# SHIP-67 closed it, and SHIP-134 until its publisher landed, which is how this shape is meant to
+# end. Do not "tidy" any of them out: `make status` exits 1 when git shows a ticket this file
+# does not declare, so removing one breaks the build rather than making it more honest.
 # Docs/11 §10 carries the full reasoning.
 #
 # This paragraph was itself duplicated and self-contradictory until the wave-4 reconciliation —
@@ -39,7 +39,27 @@
 #
 # merge=union resolves line by line. The list used to be grouped several tickets to a line, and
 # two tracks appending to the same line would still have conflicted — the union would have had
-# nothing to keep both of. Order does not matter: the reader sorts.
+# nothing to keep both of.
+#
+# # And the order does matter, which is a correction (SHIP-15t)
+#
+# This paragraph used to end "Order does not matter: the reader sorts." That is true of
+# `make status`, which sorts before it counts, and false of every human reading the file — and it
+# is the sentence that let the same defect happen twice. A union appends in *merge* order while
+# this list is written in *build* order, so a wave's merge lands its tickets wherever the merge
+# put them. `23618e5` is titled "restore the sorted position a union broke" and moved SHIP-15g
+# back from below the M7 group; wave 8 then put SHIP-120 and SHIP-120a between SHIP-112 and
+# SHIP-114 the same way, and nothing caught it, because counting rows cannot see where they sit.
+#
+# **`make status` now checks the order** and fails on a third occurrence. The check is in
+# `scripts/delivery-status.sh`; note that `sort -c` is the wrong instrument, exactly as it is for
+# routes_golden.txt — the order here is by ticket number with letter suffixes
+# (SHIP-120, SHIP-120a, SHIP-121), which is not the lexicographic order of the lines.
+#
+# Track X sorts before M0, as it does in Docs/09.
+
+# Track X — External dependencies
+X-6
 
 # M0 — Foundation
 SHIP-1
@@ -65,6 +85,7 @@ SHIP-15g
 SHIP-15i
 SHIP-15m
 SHIP-15p
+SHIP-15r
 SHIP-16
 SHIP-17
 SHIP-17a
@@ -108,6 +129,7 @@ SHIP-55
 
 # M2 — Jobs
 SHIP-56
+SHIP-56a
 SHIP-57
 SHIP-57a
 SHIP-59a
@@ -122,6 +144,7 @@ SHIP-67a
 SHIP-68
 SHIP-69
 SHIP-70
+SHIP-70a
 SHIP-71
 SHIP-76
 SHIP-77
@@ -138,40 +161,75 @@ SHIP-85
 SHIP-86
 SHIP-87
 SHIP-88
+SHIP-89
+SHIP-90
 SHIP-91
 SHIP-92
 SHIP-93
 SHIP-94
 SHIP-95
+SHIP-96
 SHIP-98
 SHIP-99
 SHIP-100
+SHIP-101
+SHIP-101a
+SHIP-102
+SHIP-102a
 
 # M4 — Delivery execution
 SHIP-105
 SHIP-106
 SHIP-107
 SHIP-108
+SHIP-109
 SHIP-110
 SHIP-111
 SHIP-112
-SHIP-120
+SHIP-113
 SHIP-114
 SHIP-115
+SHIP-115a
 SHIP-116
+SHIP-117
 SHIP-118
+SHIP-119
+SHIP-120
+SHIP-120a
+SHIP-121
+SHIP-122
+SHIP-123
 SHIP-124
 SHIP-125
 SHIP-126
+SHIP-127
+SHIP-128
 SHIP-129
+SHIP-130
+SHIP-131
+SHIP-133
 
 # M5 — Notifications
 SHIP-134
 SHIP-135
+SHIP-136
+SHIP-137
+SHIP-138
+SHIP-139
+SHIP-140
 
 # M6 — Admin
+SHIP-147
+SHIP-148
 SHIP-149
+SHIP-150
+SHIP-151
+SHIP-152
+SHIP-160
+SHIP-161
+SHIP-162
 SHIP-163
+SHIP-165
 
 # M7 — Hardening
 SHIP-167

@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 )
@@ -37,7 +38,8 @@ type postgresStore struct{}
 // unassigned_at has no COALESCE because PostgreSQL's NULL has no representation in time.Time, and
 // because the distinction it carries is the whole of [Assignment.Live].
 const assignmentColumns = `
-	id, job_id, driver_name, driver_mobile, unassigned_at, created_at, updated_at`
+	id, job_id, driver_name, driver_mobile, unassigned_at,
+	link_token_id, link_issued_at, link_issue_count, created_at, updated_at`
 
 // scanAssignment reads one row of [assignmentColumns].
 //
@@ -51,8 +53,8 @@ func scanAssignment(row pgx.Row) (Assignment, error) {
 	)
 
 	if err := row.Scan(
-		&a.ID, &a.JobID, &a.DriverName, &a.DriverMobile,
-		&unassignedAt, &a.CreatedAt, &a.UpdatedAt,
+		&a.ID, &a.JobID, &a.DriverName, &a.DriverMobile, &unassignedAt,
+		&a.LinkTokenID, &a.LinkIssuedAt, &a.LinkIssueCount, &a.CreatedAt, &a.UpdatedAt,
 	); err != nil {
 		return Assignment{}, err
 	}
@@ -120,26 +122,30 @@ func (postgresStore) liveAssignment(ctx context.Context, r db.Runner, jobID uuid
 // it, which is not a rule this file has to remember: there is no statement below that could.
 const milestoneColumns = `
 	id, job_id, milestone, actor_type, actor_id, reason, idempotency_key,
-	actor_recorded_at, server_recorded_at`
+	recipient_name, delivery_note, actor_recorded_at, server_recorded_at`
 
 // scanMilestone reads one row of [milestoneColumns].
 func scanMilestone(row pgx.Row) (Record, error) {
 	var (
-		rec     Record
-		actorID *uuid.UUID
-		reason  *string
-		key     *string
+		rec       Record
+		actorID   *uuid.UUID
+		reason    *string
+		key       *string
+		recipient *string
+		note      *string
 	)
 
 	if err := row.Scan(
 		&rec.ID, &rec.JobID, &rec.Milestone, &rec.Actor, &actorID, &reason, &key,
-		&rec.ActorRecordedAt, &rec.ServerRecordedAt,
+		&recipient, &note, &rec.ActorRecordedAt, &rec.ServerRecordedAt,
 	); err != nil {
 		return Record{}, err
 	}
 
-	// Three nullable columns, and each null means something the zero value says just as well:
-	// nobody (the platform acting alone), no reason given, and no request behind the row.
+	// Five nullable columns, and each null means something the zero value says just as well:
+	// nobody (the platform acting alone), no reason given, no request behind the row, and — on
+	// every milestone that is not 'Delivered' — no recipient and no note, which
+	// `ck_milestones_delivery_details` makes the only permitted state there (SHIP-123).
 	if actorID != nil {
 		rec.ActorID = *actorID
 	}
@@ -148,6 +154,12 @@ func scanMilestone(row pgx.Row) (Record, error) {
 	}
 	if key != nil {
 		rec.Key = *key
+	}
+	if recipient != nil {
+		rec.RecipientName = *recipient
+	}
+	if note != nil {
+		rec.DeliveryNote = *note
 	}
 	return rec, nil
 }
@@ -178,14 +190,16 @@ func scanMilestone(row pgx.Row) (Record, error) {
 func (postgresStore) insertMilestone(ctx context.Context, r db.Runner, rec Record) (Record, bool, error) {
 	const q = `
 		INSERT INTO milestones
-			(id, job_id, milestone, actor_type, actor_id, reason, idempotency_key, actor_recorded_at)
-		VALUES ($1, $2, $3, $4, $5, nullif($6, ''), nullif($7, ''), $8)
+			(id, job_id, milestone, actor_type, actor_id, reason, idempotency_key,
+			 recipient_name, delivery_note, actor_recorded_at)
+		VALUES ($1, $2, $3, $4, $5, nullif($6, ''), nullif($7, ''),
+		        nullif($8, ''), nullif($9, ''), $10)
 		ON CONFLICT (job_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING ` + milestoneColumns
 
 	created, err := scanMilestone(r.QueryRow(ctx, q,
 		rec.ID, rec.JobID, string(rec.Milestone), string(rec.Actor), rec.ActorID,
-		rec.Reason, rec.Key, rec.ActorRecordedAt))
+		rec.Reason, rec.Key, rec.RecipientName, rec.DeliveryNote, rec.ActorRecordedAt))
 	switch {
 	case errors.Is(err, db.ErrNoRows):
 		return Record{}, false, nil
@@ -194,6 +208,43 @@ func (postgresStore) insertMilestone(ctx context.Context, r db.Runner, rec Recor
 			rec.Milestone, rec.JobID, err)
 	}
 	return created, true, nil
+}
+
+// deliveredAt is when the delivery was recorded as delivered, on the actor's clock (SHIP-123).
+//
+// # Why this exists at all, when the job's status already says so
+//
+// It says so to a *client with a session*. A driver has neither, and `GET /v1/driver/jobs/{id}`
+// deliberately serves no job status — that vocabulary is `jobs`' and a copy in this domain would be
+// a second list to keep in step. So the portal has no way to know the delivery is finished after a
+// reload, and "the portal becomes read-only after" is half of SHIP-123's *Done when*.
+//
+// What this answers is a fact about **this domain's own table**: is there a 'Delivered' milestone on
+// this job. That is not the status vocabulary borrowed by another name — a milestone can be recorded
+// without the job moving (SHIP-112), and this reports the recording rather than the transition,
+// which is the correct thing for a page whose job is to stop offering the button that records it.
+//
+// **The earliest, not the latest.** A delivery can be recorded delivered more than once — a repeat is
+// `JobAlreadyInStatus`, recorded and moving nothing — and what a driver is shown is when the delivery
+// was completed, not when somebody last pressed the button.
+//
+// One statement, no lock: `milestones` is append-only, so a row that is there stays there.
+func (postgresStore) deliveredAt(ctx context.Context, r db.Runner, jobID uuid.UUID) (time.Time, bool, error) {
+	const q = `
+		SELECT actor_recorded_at FROM milestones
+		 WHERE job_id = $1 AND milestone = 'Delivered'
+		 ORDER BY actor_recorded_at, id
+		 LIMIT 1`
+
+	var at time.Time
+	err := r.QueryRow(ctx, q, jobID).Scan(&at)
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return time.Time{}, false, nil
+	case err != nil:
+		return time.Time{}, false, fmt.Errorf("delivery: reading whether %s has been delivered: %w", jobID, err)
+	}
+	return at, true, nil
 }
 
 // milestoneRecordedBy is what a key already recorded on a job, if anything.
@@ -280,10 +331,16 @@ func scanProof(row pgx.Row) (Proof, error) {
 //
 // A [Proof] built for an exception carries an empty object key and a zero length, and 000604's
 // ck_proofs_photograph_or_exception counts NULLs rather than reading empty strings — which is the
-// right way round: `''` is a perfectly good object key as far as `text` is concerned, and a CHECK
-// written against it would be a second spelling of "absent" for the database to disagree with the
-// domain about. The cast on the length is what stops PostgreSQL inferring `nullif($6, 0)` as
-// something other than bigint.
+// right way round: an empty string is a perfectly good object key as far as `text` is concerned, and
+// a CHECK written against it would be a second spelling of "absent" for the database to disagree
+// with the domain about. The cast on the length is what stops PostgreSQL inferring `nullif($6, 0)`
+// as something other than bigint.
+//
+// The empty string is spelled out in words rather than as a pair of quotes deliberately: gofmt
+// rewrites a bare doubled apostrophe inside a doc comment into a typographic closing quote, which
+// puts the file on `gofmt -l` permanently and then reformats it into a character
+// `make lint-spelling` has an opinion about. This comment was one of the two that kept `gofmt` out
+// of `CHECKS` until SHIP-15t.
 //
 // # ON CONFLICT on the object key, for the reason [postgresStore.insertMilestone] gives
 //
@@ -402,4 +459,195 @@ func (postgresStore) accountPhone(ctx context.Context, r db.Runner, userID uuid.
 		return "", fmt.Errorf("delivery: reading the mobile on %s: %w", userID, err)
 	}
 	return phone, nil
+}
+
+// milestonesOn is a page of one job's milestones, newest by the actor's clock first (SHIP-115a).
+//
+// # Ordered by the actor's clock, which is the same call [postgresStore.proofOn] makes
+//
+// `idx_milestones_job` is `(job_id, actor_recorded_at DESC)` and 000601 says why: that is the
+// sequence the customer is shown (Docs/02 §3.1). An offline batch that syncs together shares one
+// arrival time while carrying four different recorded times, so ordering by arrival would show a
+// delivery that ran backwards.
+//
+// **The identifier breaks the tie and it is not decoration.** Milestones are UUIDv7, so `id`
+// descends with creation time, and a page boundary that fell inside a group sharing one
+// `actor_recorded_at` would otherwise repeat or skip a row — which is the failure keyset pagination
+// exists to avoid, arriving by a different route. That is also why the cursor carries both.
+//
+// One row more than asked for is fetched, so `has_more` is a fact rather than a guess: a client is
+// never told there is another page that turns out to be empty.
+//
+// **This does not check who is asking.** [Service.MilestonesFor] does, before calling it, which is
+// the division [postgresStore.proofOn] states and the reason this method is unexported.
+func (postgresStore) milestonesOn(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+	after milestoneCursor,
+	limit int,
+) ([]Record, bool, error) {
+	const q = `
+		SELECT ` + milestoneColumns + `
+		FROM milestones
+		WHERE job_id = $1
+		  AND ($2::timestamptz IS NULL
+		       OR (actor_recorded_at, id) < ($2::timestamptz, $3::uuid))
+		ORDER BY actor_recorded_at DESC, id DESC
+		LIMIT $4`
+
+	var (
+		at *time.Time
+		id *uuid.UUID
+	)
+	if after.set {
+		at, id = &after.recordedAt, &after.id
+	}
+
+	rows, err := r.Query(ctx, q, jobID, at, id, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("delivery: reading the milestones on %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	var records []Record
+	for rows.Next() {
+		rec, err := scanMilestone(rows)
+		if err != nil {
+			return nil, false, fmt.Errorf("delivery: reading a milestone row on %s: %w", jobID, err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("delivery: reading the milestones on %s: %w", jobID, err)
+	}
+
+	if len(records) > limit {
+		return records[:limit], true, nil
+	}
+	return records, false, nil
+}
+
+// linkIssued records that this assignment has been handed a new link, and makes it the only one
+// that opens it (SHIP-109).
+//
+// # One statement for both paths, and that is the design rather than a saving
+//
+// Every way a caller is handed a driver link goes through [Service.granted] and therefore through
+// here: the assignment that mints the first one, the repeated nomination that mints another, and
+// SHIP-109's explicit reissue. A second statement that initialised the column on one path and
+// updated it on another is the arrangement in which the two drift — and the drift is invisible,
+// because both rows are well formed and only the *older* link's holder notices.
+//
+// `link_issue_count` starts at 0 in the schema and is incremented here, so an assignment's count is
+// 1 with no special case anywhere.
+//
+// **Scoped to the live assignment.** A stood-down row keeps whatever identifier it had; reviving a
+// link on it would revive a driver 000600's trigger refuses to revive.
+//
+// The row is returned rather than assumed, because the caller hands the updated assignment straight
+// back to a response and a stale `link_issue_count` beside a brand-new token would be a support
+// answer that is wrong by one.
+func (postgresStore) linkIssued(
+	ctx context.Context,
+	r db.Runner,
+	assignmentID uuid.UUID,
+	tokenID string,
+) (Assignment, error) {
+	const q = `
+		UPDATE driver_assignments
+		SET link_token_id    = $2,
+		    link_issued_at   = now(),
+		    link_issue_count = link_issue_count + 1
+		WHERE id = $1 AND unassigned_at IS NULL
+		RETURNING ` + assignmentColumns
+
+	a, err := scanAssignment(r.QueryRow(ctx, q, assignmentID, tokenID))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		// The assignment was stood down between being read and being handed a link. Reported
+		// rather than absorbed: the caller is about to return a token, and a token for an
+		// assignment that is no longer live is a link that opens nothing.
+		return Assignment{}, fmt.Errorf("delivery: %s is not a live assignment: %w",
+			assignmentID, ErrDriverLinkSuperseded)
+	case err != nil:
+		return Assignment{}, fmt.Errorf("delivery: recording the link on %s: %w", assignmentID, err)
+	}
+	return a, nil
+}
+
+// unsyncedMilestones reads the delivery exception queue on the unsynced ground (SHIP-128).
+//
+// # The gap is computed once, in SQL, and both the predicate and the result read it
+//
+// `server_recorded_at - actor_recorded_at` appears twice in the statement and is one expression:
+// selecting on one figure and returning another is how a queue comes to hold a row that does not
+// satisfy its own rule. `$1` is [UnsyncedAlertThreshold], passed rather than written, so
+// Docs/02 §3.1's twenty-four hours lives in one place in Go and a test can move it without waiting.
+//
+// # `>=` rather than `>`, and the interval comparison is the reason it is safe
+//
+// A row exactly on the threshold is over it: Docs/02 §3.1 says "24 hours — operations alert", and a
+// strict inequality would leave the boundary case in nobody's rung. PostgreSQL compares intervals
+// exactly, so this is a real boundary rather than a floating-point one.
+//
+// # It joins `jobs` for the status and nothing else
+//
+// A queue is triage, and a stale record on a completed job is a different morning's work from one on
+// a job still in transit. The join is to `jobs` rather than to `job_status_history` because the
+// current status is the only fact needed and the row already has it — reconstructing it from history
+// would be a second answer to a question the column answers.
+//
+// No index is added for this. The predicate is over a computed difference, so a partial index would
+// have to be an expression index on exactly this expression, and the queue is read by a moderator
+// rather than by a sweep on a ticker — a sequential scan over `milestones` costs nothing at pilot
+// scale and buys nothing to prepay. **The trigger for adding one is named rather than left to
+// judgement: the first caller that reads this on a schedule rather than on a person's request.**
+func (postgresStore) unsyncedMilestones(
+	ctx context.Context,
+	r db.Runner,
+	threshold time.Duration,
+	limit int,
+) ([]UnsyncedEntry, error) {
+	const q = `
+		SELECT m.id, m.job_id, m.milestone, m.actor_type,
+		       m.server_recorded_at - m.actor_recorded_at,
+		       m.actor_recorded_at, m.server_recorded_at, j.status
+		FROM milestones m
+		JOIN jobs j ON j.id = m.job_id
+		WHERE m.server_recorded_at - m.actor_recorded_at >= $1
+		ORDER BY m.server_recorded_at, m.id
+		LIMIT $2`
+
+	rows, err := r.Query(ctx, q, threshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("delivery: reading the unsynced-milestone queue: %w", err)
+	}
+	defer rows.Close()
+
+	var out []UnsyncedEntry
+	for rows.Next() {
+		var (
+			entry UnsyncedEntry
+			gap   pgtype.Interval
+		)
+		if err := rows.Scan(&entry.MilestoneID, &entry.JobID, &entry.Milestone, &entry.Actor,
+			&gap, &entry.ActorRecordedAt, &entry.ServerRecordedAt, &entry.JobStatus); err != nil {
+			return nil, fmt.Errorf("delivery: scanning the unsynced-milestone queue: %w", err)
+		}
+
+		// An interval is months, days and microseconds, and only the last two can appear
+		// here: the difference between two timestamptz values never carries a month, because
+		// PostgreSQL has no month to attribute it to. Days are kept separate from
+		// microseconds all the same, since a delivery unsynced for a week is exactly the row
+		// this queue exists to surface and dropping the field would report it as zero.
+		entry.UnsyncedFor = time.Duration(gap.Days)*24*time.Hour +
+			time.Duration(gap.Microseconds)*time.Microsecond
+
+		out = append(out, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("delivery: reading the unsynced-milestone queue: %w", err)
+	}
+	return out, nil
 }

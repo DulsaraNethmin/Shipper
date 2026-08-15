@@ -62,10 +62,43 @@ export interface Delivery {
   driver_name: string;
   assigned_at: string;
   link_expires_at: string;
+
+  /**
+   * When this delivery was recorded as delivered, on the actor's clock (SHIP-123).
+   *
+   * **Absent until it has been**, which is the whole of how this page becomes read-only after a
+   * reload. Component state does not survive one, and a driver on one bar of signal reloads; holding
+   * it in `sessionStorage` would be the page inventing a fact about the delivery rather than reading
+   * one. So the platform answers it, which is where `Docs/07` §3 puts every question of this shape.
+   *
+   * **It is not the job's status.** That vocabulary belongs to `jobs` and a driver's link cannot
+   * reach it. What this reports is a fact about the delivery's own record — that a `delivered`
+   * milestone exists — and the two are genuinely different questions, because a milestone can be
+   * recorded without the job moving.
+   *
+   * Optional in this interface and **not** checked by `isDelivery`, deliberately: it is the one
+   * field of the six whose absence is an ordinary state rather than a broken contract.
+   */
+  delivered_at?: string;
 }
 
-/** The ways this page fails to show a delivery. */
-export type Refusal = "expired" | "invalid" | "closed" | "unavailable" | "unexpected";
+/**
+ * The ways this page fails to show a delivery, or fails to record one.
+ *
+ * The first five are the read's and are SHIP-120's. The last three arrive with SHIP-121 and can only
+ * come from a write: they are the platform saying that a perfectly well-formed request contradicts
+ * something about *this delivery*, which a read has no way to do.
+ */
+export type Refusal =
+  | "expired"
+  | "invalid"
+  | "closed"
+  | "unavailable"
+  | "unexpected"
+  | "too_early"
+  | "needs_evidence"
+  | "rejected"
+  | "upload_failed";
 
 /** What one attempt at opening a link produced. */
 export type Outcome =
@@ -106,11 +139,63 @@ export const REFUSALS: Record<Refusal, { title: string; body: string }> = {
     title: "Something went wrong at our end",
     body: "Try again in a moment. If it keeps happening, tell the transport provider who sent you the link.",
   },
+  too_early: {
+    title: "Not yet",
+    body:
+      "The delivery has not reached that point. Record the step before it first — and if you have " +
+      "already done that step, record it now and this one will go through.",
+  },
+  needs_evidence: {
+    title: "A delivery needs a photograph",
+    body:
+      "Take a photograph of the goods where you left them, or say why there is no photograph. " +
+      "Either finishes the job.",
+  },
+  upload_failed: {
+    title: "The photograph did not upload",
+    body:
+      "It did not reach us — check your signal and take it again. If it keeps failing, say why " +
+      "there is no photograph instead; that finishes the job too.",
+  },
+  rejected: {
+    title: "That could not be recorded",
+    body:
+      "Something in that update was not accepted. Try again, and if it keeps happening tell the " +
+      "transport provider who sent you the link.",
+  },
 };
 
-/** The path this portal fetches a delivery from. Relative, and the only one in the application. */
+/**
+ * Whether the platform has answered, as opposed to not having been reached.
+ *
+ * This is what `lib/keys.ts` means by settled and it is the whole of the decision about a driver's
+ * idempotency key: an answer ends the action, so the next tap mints a new key; no answer leaves the
+ * action in flight, so the next tap reuses the one already sent. Getting it backwards in either
+ * direction is a real defect on a phone — reuse where a fresh key was needed silently records
+ * nothing, and a fresh key where reuse was needed silently records twice.
+ *
+ * `unavailable` and `unexpected` are the two that are not answers. `unavailable` is the phone: no
+ * signal, a `429`, or a `503` from a service that says to try again. `unexpected` covers a `5xx`
+ * and anything this application could not parse, which is the platform not having said anything
+ * usable — and a retry under the same key is exactly what the mechanism is for.
+ */
+export function isSettled(refusal: Refusal): boolean {
+  return refusal !== "unavailable" && refusal !== "unexpected" && refusal !== "upload_failed";
+}
+
+/** The path this portal fetches a delivery from. Relative, and one of three in the application. */
 export function deliveryPath(jobId: string): string {
   return `/api/driver/jobs/${encodeURIComponent(jobId)}`;
+}
+
+/** The path this portal records a milestone at. Relative, under the delivery it names. */
+export function milestonePath(jobId: string): string {
+  return `${deliveryPath(jobId)}/milestones`;
+}
+
+/** The path this portal asks for somewhere to put a photograph. Relative, under the same delivery. */
+export function proofUploadPath(jobId: string): string {
+  return `${deliveryPath(jobId)}/proof-uploads`;
 }
 
 /**
@@ -128,6 +213,49 @@ export function refusalFor(status: number, code: string | null): Refusal {
   if (status === 404) return "closed";
   if (status === 429 || status === 503) return "unavailable";
   return "unexpected";
+}
+
+/**
+ * The refusal a platform answer to a *write* maps to (SHIP-121).
+ *
+ * Everything the read can be told, plus the three a write can. It delegates rather than repeating,
+ * so a change to what a `401` means changes it in one place for both.
+ *
+ * # `delivery_milestone_not_permitted` means "too early" and never "too late"
+ *
+ * That is SHIP-112's narrowing and it is the difference between a message worth reading and one that
+ * is wrong. A milestone the delivery has already passed is **absorbed** — recorded as history, the
+ * job left where it stands, answered `201` — so it never reaches here. What does reach here is a
+ * milestone the delivery has not got to yet, and the identical request succeeds once it has. So the
+ * copy says to keep going rather than to give up, which is the true thing.
+ *
+ * # A `409` on the key is the driver's own retry racing itself
+ *
+ * `idempotency_key_reused` means this key has already recorded something different, and
+ * `idempotency_in_progress` means the first attempt is still running. Both are `unavailable`: the
+ * honest instruction in each case is to wait a moment and try again, and neither is something the
+ * driver did wrong. Treating them as unsettled is also correct for `lib/keys.ts` — in progress
+ * genuinely is in progress.
+ */
+export function recordRefusalFor(status: number, code: string | null): Refusal {
+  if (status === 409) {
+    switch (code) {
+      case "delivery_milestone_not_permitted":
+        return "too_early";
+      case "delivery_proof_required":
+        return "needs_evidence";
+      case "idempotency_key_reused":
+      case "idempotency_in_progress":
+        return "unavailable";
+      default:
+        // Every other 409 this route can answer is about the evidence: a photograph that never
+        // arrived, one the platform will not accept, one already standing behind another
+        // milestone. All three are "capture it again", which is what needs_evidence says.
+        return "needs_evidence";
+    }
+  }
+  if (status === 422) return "rejected";
+  return refusalFor(status, code);
 }
 
 /**
@@ -198,4 +326,312 @@ export async function openDelivery(
   }
 
   return { kind: "refused", refusal: refusalFor(response.status, codeFrom(body)) };
+}
+
+/**
+ * What the platform answers when a milestone is recorded (SHIP-121).
+ *
+ * The fields `POST /v1/driver/jobs/{id}/milestones` serves, and the page shows two of them. **The
+ * job's status is deliberately not among them** and never will be: `internal/delivery` keeps that
+ * vocabulary in `jobs`, and a copy here would be a second list to keep in step. So this page never
+ * learns what status the delivery is in — it learns what it recorded, which is the only thing the
+ * driver did.
+ *
+ * `recorded_at` is the **actor's** clock and `accepted_at` is the platform's. They are ninety
+ * minutes apart when a phone has been out of signal, and the first is the one a driver is shown.
+ */
+export interface Recorded {
+  id: string;
+  job_id: string;
+  milestone: string;
+  recorded_by: string;
+  recorded_at: string;
+  accepted_at: string;
+}
+
+/** What one attempt at recording a milestone produced. */
+export type RecordOutcome =
+  | { kind: "recorded"; recorded: Recorded }
+  | { kind: "refused"; refusal: Refusal };
+
+/**
+ * The evidence attached to a recording: a photograph the platform issued a key for, or a reason
+ * there is none (`Docs/01` §4.4).
+ *
+ * Exactly one, never both and never neither, which is the shape `internal/delivery`'s
+ * `proofRequest` refuses any other version of. A `Delivered` needs one; the other three take none.
+ */
+export type Evidence = { object_key: string } | { exception_reason: string };
+
+/**
+ * Who took the goods and what was left where — `Docs/01` §4.4's other two required facts about a
+ * delivered job (SHIP-123).
+ *
+ * Required together and only on `delivered`, which is why they travel as one value rather than two
+ * optional arguments: a caller holding one and not the other is a caller the platform will refuse,
+ * and the type says so before the request goes out.
+ *
+ * **Neither has an exception path**, unlike the photograph. `Docs/01` §4.4 gives three reasons a
+ * photograph can be impossible and none for a name or a note, because a driver can always write what
+ * they see.
+ */
+export interface Completion {
+  recipientName: string;
+  deliveryNote: string;
+}
+
+/** Whether a parsed body is a recorded milestone. Checked rather than asserted, as the read is. */
+function isRecorded(value: unknown): value is Recorded {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.job_id === "string" &&
+    typeof candidate.milestone === "string" &&
+    typeof candidate.recorded_by === "string" &&
+    typeof candidate.recorded_at === "string" &&
+    typeof candidate.accepted_at === "string"
+  );
+}
+
+/**
+ * Record one milestone on one delivery (SHIP-121).
+ *
+ * # The job identifier is the caller's and is never derived from the token
+ *
+ * The same statement `openDelivery` makes, and it matters more here because this writes.
+ * `lib/link.ts` has the full argument; the short form is that SHIP-108 put the one-job check in the
+ * platform's auth class, comparing the job in the path against the job in the grant — so a client
+ * that built the path out of the grant would leave that check comparing the token with itself, and
+ * it would pass for ever on any link however widely forwarded. `lib/one-job.test.ts` records the
+ * requests this function actually issues, for exactly that reason.
+ *
+ * # `recorded_at` is sent, and it is the driver's phone rather than the platform's clock
+ *
+ * `Docs/02` §3.1 and `Docs/01` §4.4 both make the recorded time the time the driver acted, not the
+ * time the request arrived — "milestone updates must succeed without a network connection… the
+ * recorded time is the time the driver acted". This page has no offline queue (that is the Flutter
+ * client's, SHIP-124), but the same request can sit in a browser's retry for minutes in a yard, and
+ * stamping the tap is free and correct. The platform stores it beside, never instead of, its own
+ * arrival time and deliberately does not bound it against now.
+ *
+ * # The key comes in as an argument and is not minted here
+ *
+ * `lib/keys.ts` owns that decision — one value per action, reused for every retry of that action,
+ * discarded when the action settles — and it needs to know whether the attempt settled, which is
+ * something only the caller learns. Minting one here would make every retry a new action.
+ */
+export async function recordMilestone(
+  jobId: string,
+  token: string,
+  milestone: string,
+  key: string,
+  options: {
+    evidence?: Evidence;
+    completion?: Completion;
+    recordedAt?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<RecordOutcome> {
+  const body: Record<string, unknown> = {
+    milestone,
+    recorded_at: options.recordedAt ?? new Date().toISOString(),
+  };
+  if (options.evidence !== undefined) body.proof = options.evidence;
+
+  // Sent only when the caller has them, which in practice means only on `delivered`. The platform
+  // refuses either field on any other milestone, so a page that attached them everywhere would turn
+  // every pickup into a `422` — and the refusal is right: a recipient name on a pickup is a handover
+  // that did not happen.
+  if (options.completion !== undefined) {
+    body.recipient_name = options.completion.recipientName;
+    body.delivery_note = options.completion.deliveryNote;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(milestonePath(jobId), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`, // spelling:ok — RFC 9110
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": key,
+      },
+      body: JSON.stringify(body),
+      cache: "no-store",
+      signal: options.signal,
+    });
+  } catch {
+    // No answer at all, which on this surface is a driver in a shed. The action has **not**
+    // settled, so the caller keeps the key and the next tap is the same action retrying.
+    return { kind: "refused", refusal: "unavailable" };
+  }
+
+  let parsed: unknown = null;
+  try {
+    parsed = await response.json();
+  } catch {
+    parsed = null;
+  }
+
+  if (response.ok) {
+    // `201` is a fresh recording and `200` is this key's own earlier one coming back, which is the
+    // retry path working. Both are the same outcome to a driver: it is recorded, once.
+    return isRecorded(parsed)
+      ? { kind: "recorded", recorded: parsed }
+      : { kind: "refused", refusal: "unexpected" };
+  }
+
+  return { kind: "refused", refusal: recordRefusalFor(response.status, codeFrom(parsed)) };
+}
+
+/**
+ * Somewhere to put one photograph, as `POST /v1/driver/jobs/{id}/proof-uploads` answers it
+ * (SHIP-122).
+ *
+ * **`upload_url` is a credential** — the whole of the authorisation to write that object, until
+ * `expires_at`, unrevocable. It is used once and never stored: nothing in this application writes it
+ * to `sessionStorage`, and the route handler that carries it sets `cache-control: no-store`.
+ *
+ * `content_type` may come back spelled differently from what was sent — the platform lower-cases and
+ * trims it before signing — so what goes on the PUT is what came back here and never what the file
+ * reported.
+ */
+export interface Upload {
+  object_key: string;
+  upload_url: string;
+  method: string;
+  content_type: string;
+  content_length: number;
+  expires_at: string;
+}
+
+/** What one attempt at obtaining a place to upload produced. */
+export type UploadOutcome =
+  | { kind: "somewhere"; upload: Upload }
+  | { kind: "refused"; refusal: Refusal };
+
+function isUpload(value: unknown): value is Upload {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.object_key === "string" &&
+    typeof candidate.upload_url === "string" &&
+    typeof candidate.method === "string" &&
+    typeof candidate.content_type === "string" &&
+    typeof candidate.content_length === "number" &&
+    typeof candidate.expires_at === "string"
+  );
+}
+
+/**
+ * Ask the platform for somewhere to put one photograph (SHIP-122).
+ *
+ * # The key is fresh for this attempt and is never one held anywhere
+ *
+ * `lib/keys.ts`'s `freshKey` rather than `keyFor`, and it is the opposite call from the milestone.
+ * Reusing a stored key makes SHIP-15's middleware replay the stored response, which hands back the
+ * *same* URL with its expiry already running down — correct for a milestone, useless for an upload,
+ * and dead until Redis evicts it. A driver retrying after a failed upload needs a new slot.
+ *
+ * # The job identifier is the caller's, exactly as it is everywhere else in this file
+ *
+ * `lib/link.ts` has the argument; the short form is that SHIP-108's one-job check compares the job
+ * in the path with the job in the grant, and a client that built the path out of the grant would
+ * leave that check comparing the token with itself. The key the platform mints is scoped to the job
+ * *it* resolves from the token, so a mismatch here is refused rather than silently signed.
+ */
+export async function requestUpload(
+  jobId: string,
+  token: string,
+  what: { contentType: string; contentLength: number },
+  key: string,
+  signal?: AbortSignal,
+): Promise<UploadOutcome> {
+  let response: Response;
+  try {
+    response = await fetch(proofUploadPath(jobId), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`, // spelling:ok — RFC 9110
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": key,
+      },
+      body: JSON.stringify({
+        content_type: what.contentType,
+        content_length: what.contentLength,
+      }),
+      cache: "no-store",
+      signal,
+    });
+  } catch {
+    return { kind: "refused", refusal: "unavailable" };
+  }
+
+  let parsed: unknown = null;
+  try {
+    parsed = await response.json();
+  } catch {
+    parsed = null;
+  }
+
+  if (response.ok) {
+    return isUpload(parsed)
+      ? { kind: "somewhere", upload: parsed }
+      : { kind: "refused", refusal: "unexpected" };
+  }
+
+  return { kind: "refused", refusal: recordRefusalFor(response.status, codeFrom(parsed)) };
+}
+
+/**
+ * PUT one photograph to the store, which is the one request this application makes that does not go
+ * to its own origin (SHIP-122).
+ *
+ * # **The driver's token is not sent here, and that is the point of the whole arrangement**
+ *
+ * `upload_url` carries its own authorisation in its query string — that is what a pre-signed URL is.
+ * Attaching the link credential would send it to a host this application does not control, on a
+ * request that has no use for it, and `Docs/06` §5.2's whole reason for putting the bytes outside the
+ * platform is that the store and the API are separate trust domains. `lib/surface.test.ts` asserts
+ * that this function names no credential, and `lib/upload.test.ts` asserts it against the request
+ * that actually goes out.
+ *
+ * # `Content-Length` is deliberately not set, and it is still signed
+ *
+ * It is a forbidden header name in the Fetch specification: a browser refuses to let a page set it
+ * and computes it from the body. That is fine and is why the platform asks for the *exact* size —
+ * the value it signed is the size of the file, the browser sends that size because it is sending
+ * that file, and a mismatch is refused by the store rather than negotiated. Setting it here would
+ * be silently dropped, which is worse than not trying.
+ *
+ * `Content-Type` **is** set, from what the platform answered with rather than from what the file
+ * reports: the platform normalises the media type before signing it, so `IMAGE/JPEG` from a handset
+ * has already become `image/jpeg` by the time it is in the signature.
+ *
+ * # A refusal here is not an error contract
+ *
+ * The store is not this API and answers in its own vocabulary — a `403 SignatureDoesNotMatch` is XML.
+ * So nothing is parsed: what the caller needs to know is whether the bytes arrived, and the honest
+ * answer to anything else is "take it again".
+ */
+export async function putPhotograph(
+  upload: Upload,
+  photograph: Blob,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const stored = await fetch(upload.upload_url, {
+      method: upload.method,
+      headers: { "Content-Type": upload.content_type },
+      body: photograph,
+      cache: "no-store",
+      signal,
+    });
+    return stored.ok;
+  } catch {
+    return false;
+  }
 }

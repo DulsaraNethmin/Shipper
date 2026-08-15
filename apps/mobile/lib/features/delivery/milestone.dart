@@ -88,6 +88,9 @@ enum Milestone {
   /// SHIP-124's queue and is read back by this one. The screen renders the raw value rather than
   /// dropping the row, because a queued operation that is not displayed is the silent drop
   /// `Docs/07` §4 forbids, arriving one layer above the queue.
+  ///
+  /// **A milestone this app cannot record is not a milestone it cannot be shown**, which is why
+  /// [milestoneLabel] exists beside this rather than a fifth value being added here. See below.
   static Milestone? byWire(String wire) {
     for (final milestone in values) {
       if (milestone.wire == wire) return milestone;
@@ -95,3 +98,32 @@ enum Milestone {
     return null;
   }
 }
+
+/// What to call the milestone [wire] names, whether or not this app can record it (SHIP-133).
+///
+/// ## Why this is a function beside [Milestone] rather than a fifth value inside it
+///
+/// [Milestone] is deliberately four: it is *the milestones this app records*, and
+/// `driver_assigned` is not one — it has an endpoint of its own and the milestone endpoint refuses
+/// it with a `422` pointing there. Adding it to the enumeration would put it in
+/// [Milestone.offered] unless a second flag were added to take it out again, which is a button a
+/// driver would eventually be shown for an act this app cannot perform.
+///
+/// **Reading is the other half, and it arrived with the customer's tracking view.**
+/// `GET /v1/jobs/{id}/delivery/milestones` serves *every* milestone anybody recorded, and its
+/// enumeration is all five. A customer looking at their own delivery must not be shown
+/// `driver_assigned` in its wire spelling.
+///
+/// So the four labels are **derived** from the enumeration and cannot drift from it, and the fifth
+/// is named once, here. An unrecognised value is returned unaltered rather than dropped or reported
+/// as a fault: `Docs/07` §6 is built on old builds living on devices indefinitely, and a sixth
+/// milestone is a row this build should still show a person.
+String milestoneLabel(String wire) => Milestone.byWire(wire)?.label ?? _readOnlyLabels[wire] ?? wire;
+
+/// The milestones this app can be shown and cannot record.
+///
+/// `Docs/02` §1's own name, as `CLAUDE.md` requires: a customer reading "Driver assigned" here and
+/// support reading it in an audit entry have to be reading about the same thing.
+const _readOnlyLabels = <String, String>{
+  'driver_assigned': 'Driver assigned',
+};

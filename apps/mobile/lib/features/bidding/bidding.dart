@@ -1,16 +1,19 @@
 /// Bidding — bids, counter-offers, negotiation, award (`Docs/07` §2).
 ///
-/// ## What is here (SHIP-100)
+/// ## What is here (SHIP-100, SHIP-101, SHIP-102)
 ///
-/// `Docs/01` §4.2's first verb, and only the first: a provider offers to carry a job, for a price
-/// and against two commitments about timing, over `POST /v1/jobs/{id}/bids` (SHIP-84).
+/// `Docs/01` §4.2's first verb, and what became of it: a provider offers to carry a job, for a price
+/// and against two commitments about timing, over `POST /v1/jobs/{id}/bids` (SHIP-84) — and reads
+/// back every offer in every negotiation they are in over `GET /v1/fleet/bids` (SHIP-101a).
 ///
 /// - `bid.dart` — the `Bid` schema from `contracts/paths/bidding.yaml`, and `BidPlacement`, which
 ///   is an offer on its way *to* the platform.
 /// - `bid_status.dart` — the eight bid states of `Docs/02` §4, in their wire form.
-/// - `bidding_repository.dart` — the one endpoint a screen calls, and what is deliberately absent.
+/// - `bidding_repository.dart` — the two endpoints a screen calls, and what is deliberately absent.
 /// - `place_bid_controller.dart` — one offer, one idempotency key, and no queue.
 /// - `place_bid_panel.dart` — the form, the platform's answer, and the offer it recorded.
+/// - `my_bids_controller.dart` — the provider's own offers, and the two ways to group them.
+/// - `my_bids_screen.dart` — the list, grouped by status, with no field a budget could be in.
 ///
 /// ## Deliberately **not** offline-capable, and now enforced rather than stated
 ///
@@ -47,6 +50,32 @@
 ///
 /// Revising, withdrawing, countering and reading a negotiation's history are **served and
 /// deliberately not modelled**. An endpoint no screen calls is dead code that nothing holds to the
-/// contract; each arrives with the screen that needs it — the provider's own bid list for the first
-/// two, and the negotiation screens for the rest.
+/// contract; each arrives with the screen that needs it, and the negotiation screens (SHIP-103) are
+/// where the last three belong. SHIP-101 deliberately did **not** take revise and withdraw with it:
+/// both are writes that end or change a commitment somebody else is relying on, and both want a
+/// confirmation flow rather than a button on a list.
+///
+/// ## The customer's half arrived at SHIP-102a, and its privacy rule is a different one
+///
+/// This paragraph used to say the customer's half "cannot be built", because no endpoint served it.
+/// `GET /v1/jobs/{id}/bids/received` now does — at five segments, because `GET /v1/jobs/{id}/bids`
+/// cannot be registered beside `GET /v1/jobs/open/{id}`.
+///
+/// - `received_offer.dart` — the `ReceivedOffer`, `ProviderSummary` and `VehicleSummary` schemas.
+/// - `compare_offers_controller.dart` — one list per job, and sorting that is the client's.
+/// - `compare_offers_screen.dart` — the cards, side by side, with no word a budget could hide in.
+///
+/// **The rule on that side is not `Bid`'s rule and does not inherit from it.** `Bid`'s guarantee is
+/// structural — there is no job in the shape, so there is no budget to withhold. `ReceivedOffer`
+/// crosses *providers*, so what one provider could learn about another through it is the question,
+/// and the platform answers it by refusing a provider the byte-identical `404` a stranger gets
+/// rather than by leaving anything out of the shape.
+///
+/// **And the third clause of `Docs/01` §4.3 needs a guard neither of the two above can be.** A
+/// screen saying "the customer has set a maximum" carries no field and no value: it passes a closed
+/// key set over the model and a source scan over the file. `compare_offers_test.dart` asserts on the
+/// **words rendered**, which is what wave 9's finding cost to learn.
+///
+/// What is still not here: awarding (SHIP-104) and the negotiation screens (SHIP-103), which is
+/// where revise, withdraw and counter belong.
 library;

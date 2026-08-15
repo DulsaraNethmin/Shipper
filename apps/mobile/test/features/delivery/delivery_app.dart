@@ -7,6 +7,11 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+// `Override` is the type of a provider override and is exported from `misc.dart` rather than from
+// the package's main library in Riverpod 3. Named here because these helpers pass a list of them
+// through, which is what lets a test override on the **root** scope instead of wrapping a screen in
+// a second `ProviderScope` — the arrangement `main.dart` explains is not a test of the app at all.
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/app.dart';
 import 'package:shipper/core/auth/user_role.dart';
@@ -24,11 +29,17 @@ import '../identity/signup_app.dart';
 /// sends the provider one. Pushing the screen directly would skip the router's guard, which is
 /// exactly where a missing entry in `_signedInPatterns` would show up, and a route that lands on
 /// the home shell instead looks from the outside like a link that does nothing.
+/// [nudgeClock] is what SHIP-127 measures `enqueued_at` against, and it defaults to the handset's
+/// own — so a test that is not about the four-hour nudge never sees one, however old the fixture's
+/// fixed date has become. A test that *is* about it hands over a clock running ahead of the queue's,
+/// which is what "recorded before breakfast, still unsent at lunchtime" looks like from inside.
 Future<void> openDelivery(
   WidgetTester tester, {
   required SyncHarness harness,
   required String jobId,
   UserRole role = UserRole.provider,
+  DateTime Function()? nudgeClock,
+  List<Override> overrides = const <Override>[],
 }) async {
   // A phone-shaped surface rather than the 800×600 default, and a tall one: three large buttons
   // and a log of what was recorded should scroll rather than be reported as overflowing.
@@ -38,7 +49,14 @@ Future<void> openDelivery(
 
   final identity = FakeIdentityRepository()..tokens = aTokenPair(role: role);
 
-  await tester.pumpWidget(signupApp(identity, worker: harness.worker));
+  await tester.pumpWidget(
+    signupApp(
+      identity,
+      worker: harness.worker,
+      clock: nudgeClock ?? harness.now,
+      extra: overrides,
+    ),
+  );
   await tester.pumpAndSettle();
 
   await signInThrough(tester);

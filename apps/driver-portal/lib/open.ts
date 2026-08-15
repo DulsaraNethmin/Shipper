@@ -1,4 +1,16 @@
-import { openDelivery, type Delivery, type Refusal } from "./delivery.ts";
+import {
+  isSettled,
+  openDelivery,
+  putPhotograph,
+  recordMilestone,
+  requestUpload,
+  type Completion,
+  type Delivery,
+  type Evidence,
+  type RecordOutcome,
+  type Refusal,
+} from "./delivery.ts";
+import { freshKey, keyFor, settle } from "./keys.ts";
 import { isJobId, recallToken, rememberToken, tokenFromFragment } from "./link.ts";
 
 /**
@@ -69,4 +81,130 @@ export async function openLink(jobId: string, signal: AbortSignal): Promise<Open
   if (token === null) return { kind: "missing" };
 
   return openDelivery(jobId, token, signal);
+}
+
+/** What one tap on a milestone button produced, before the page decides how to draw it. */
+export type Told = RecordOutcome | { kind: "missing" };
+
+/**
+ * Record one milestone, from the address bar through to an answer (SHIP-121).
+ *
+ * The write counterpart of [openLink], and it is here for the same two reasons: a `.tsx` file
+ * cannot be imported by `node --test`, and everything with a decision in it belongs where a test
+ * can reach it. What is left in the component is state and markup.
+ *
+ * # The idempotency key's whole lifecycle is these four lines and it is the reason this is not
+ * inside the component
+ *
+ * `lib/keys.ts` mints one per action and holds it across a reload; this function is the only place
+ * that decides an action is **over**. The rule is one line — settle on an answer, keep on silence —
+ * and it is testable here and untestable in JSX. Getting it wrong in either direction is a defect a
+ * driver meets and nobody else does: settling on a network failure records the milestone twice when
+ * they tap again, and never settling makes `Docs/02` §5's second pickup attempt come back as the
+ * first one with nothing written.
+ *
+ * The scope is the job and the milestone together, so two recordings in flight at once — a driver
+ * tapping `Picked up` while `En route to pickup` is still retrying in a tunnel — cannot take each
+ * other's key or each other's answer.
+ *
+ * # The job identifier is the caller's, exactly as it is on the read
+ *
+ * `jobId` arrives from the URL path and is handed on unchanged. It is never derived from the token,
+ * and the token is never parsed here — `lib/link.ts` records why at length, and
+ * `lib/one-job.test.ts` asserts it against the requests this function actually issues, on the write
+ * as well as on the read.
+ */
+export async function recordStep(
+  jobId: string,
+  milestone: string,
+  options: { evidence?: Evidence; completion?: Completion; signal?: AbortSignal } = {},
+): Promise<Told> {
+  if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
+
+  const token = tokenForThisView(jobId);
+  if (token === null) return { kind: "missing" };
+
+  const scope = `${jobId}.${milestone}`;
+  const outcome = await recordMilestone(jobId, token, milestone, keyFor(scope), {
+    evidence: options.evidence,
+    completion: options.completion,
+    signal: options.signal,
+  });
+
+  if (outcome.kind === "recorded" || isSettled(outcome.refusal)) settle(scope);
+  return outcome;
+}
+
+/**
+ * Capture one photograph and record the milestone it stands behind (SHIP-122).
+ *
+ * Three requests, in an order that cannot be rearranged, and the middle one does not go to this
+ * origin:
+ *
+ *  1. **Ask for somewhere to put it.** `POST /v1/driver/jobs/{id}/proof-uploads`, through this
+ *     origin's own route handler, on the driver's link. Answers with a short-lived pre-signed URL
+ *     and the `object_key` that names what will be there.
+ *  2. **PUT the bytes to the store.** Straight to the URL, with **no credential attached** — the URL
+ *     is the credential — and with this service in neither direction (`Docs/06` §5.2). The platform
+ *     never sees the photograph.
+ *  3. **Record the milestone against the key.** `POST /v1/driver/jobs/{id}/milestones` with
+ *     `proof.object_key`. This is where the object *becomes* evidence: until it does, it is bytes
+ *     with a name, and `internal/delivery` asks the store what is actually there before it writes
+ *     the row — the platform never takes a client's word for an upload it did not observe.
+ *
+ * # Why the ordering is not negotiable
+ *
+ * Recording before uploading answers `409 delivery_proof_not_uploaded`, which is the platform
+ * refusing to hold a record that asserts a photograph exists when nothing has looked. `Docs/01` §4.4
+ * makes proof "the only evidence that the job happened as claimed", so a row that might point at
+ * nothing is not evidence — and a dispute is where that would be discovered.
+ *
+ * # A failed upload leaves nothing behind, and the driver has two ways forward
+ *
+ * Step 1 wrote nothing durable — SHIP-114 argues at length that issuing a URL reserves no object and
+ * records no row — so a failure at step 2 leaves at most one unreferenced object key nobody will
+ * ever use, which ages out. The driver taps again and gets a **new** URL and a **new** key, because
+ * the presign uses `freshKey`. Or they take the exception path, which finishes the job with a reason
+ * in place of the photograph and is exactly what `Docs/01` §4.4 built it for.
+ *
+ * # The milestone's key is held and the presign's is not
+ *
+ * Step 3 goes through [recordStep], so it takes the held per-action key and settles it on an answer.
+ * Step 1 mints a fresh one every time. That asymmetry is the contract read correctly rather than an
+ * inconsistency — `lib/keys.ts` has the argument.
+ */
+export async function capturePhotograph(
+  jobId: string,
+  milestone: string,
+  photograph: Blob,
+  options: { completion?: Completion; signal?: AbortSignal } = {},
+): Promise<Told> {
+  if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
+
+  const token = tokenForThisView(jobId);
+  if (token === null) return { kind: "missing" };
+
+  // The type and the size come from the file the camera produced, and the platform signs both. A
+  // handset that reports no media type at all — some Android WebViews, on a file picked rather than
+  // captured — is refused by the platform naming `content_type`, which the page renders as
+  // `rejected` and offers the exception path beside. Guessing one here would be this application
+  // inventing a fact about bytes it has not looked at.
+  const asked = await requestUpload(
+    jobId,
+    token,
+    { contentType: photograph.type, contentLength: photograph.size },
+    freshKey(),
+    options.signal,
+  );
+  if (asked.kind === "refused") return asked;
+
+  if (!(await putPhotograph(asked.upload, photograph, options.signal))) {
+    return { kind: "refused", refusal: "upload_failed" };
+  }
+
+  return recordStep(jobId, milestone, {
+    evidence: { object_key: asked.upload.object_key },
+    completion: options.completion,
+    signal: options.signal,
+  });
 }

@@ -59,12 +59,12 @@ const maxProofContentType = 128
 // of object are private evidence under the same access rules.
 const proofKeyPrefix = "proof"
 
-// UploadPolicy is what the platform will issue an upload URL for, from configuration.
+// UploadPolicy is what the platform will issue a pre-signed URL for, from configuration.
 //
 // # Every field is server-side, and Docs/06 §5.3 is why
 //
 // "Anything expected to change under operational pressure lives server-side… Flutter has no
-// over-the-air update path for Dart code." All three of these move: a size limit is raised the
+// over-the-air update path for Dart code." All of these move: a size limit is raised the
 // first time a handset's camera outgrows it, a type list gained HEIC without an app release
 // anywhere, and a lifetime is tightened after an incident. A limit compiled into the client is a
 // limit that needs a store review to change, and the concrete cost of getting it wrong is stated in
@@ -83,8 +83,22 @@ type UploadPolicy struct {
 	// browsers execute — cannot arrive by being an image.
 	AcceptedContentTypes []string
 
-	// URLTTL is how long an issued URL works for.
-	URLTTL time.Duration
+	// UploadTTL is how long an issued upload URL works for.
+	//
+	// It was URLTTL and served both directions until SHIP-15r. The rename is what makes the split
+	// below reviewable: a field called URLTTL beside a DownloadTTL reads as though one of them is
+	// the general case, and the compiler cannot tell you which sites meant which.
+	UploadTTL time.Duration
+
+	// DownloadTTL is how long an issued download URL works for, and it is separate because the two
+	// requirements are different and only one of them is generous (SHIP-15r).
+	//
+	// An upload link has to outlast a phone finishing a slow PUT on a bad connection. A download
+	// link has to outlast an image rendering. Serving both from one number made every read link
+	// live for as long as an upload needed — and a read link is an unrevocable link to a
+	// photograph of somebody's front door, which is the exposure internal/config's Storage section
+	// spends a paragraph on.
+	DownloadTTL time.Duration
 }
 
 // valid reports whether this policy can issue anything at all.
@@ -92,8 +106,14 @@ type UploadPolicy struct {
 // Checked at construction rather than per request: a service built with a zero policy would refuse
 // every upload with a validation error naming the client's own perfectly good request, which is the
 // worst place for a configuration failure to surface.
+//
+// Both lifetimes are required. A zero DownloadTTL would sign a download URL that has already
+// expired, which is a broken image in a customer's tracking view rather than an error anybody sees
+// — the quietest of the failures available here, and the reason it is refused at construction
+// alongside the rest.
 func (p UploadPolicy) valid() bool {
-	return p.MaxBytes > 0 && len(p.AcceptedContentTypes) > 0 && p.URLTTL > 0
+	return p.MaxBytes > 0 && len(p.AcceptedContentTypes) > 0 &&
+		p.UploadTTL > 0 && p.DownloadTTL > 0
 }
 
 // UploadRequest is what a client says it is about to upload.
@@ -249,13 +269,80 @@ func (s *Service) PresignProofUpload(
 			jobID, awarded, providerID, ErrNotAwardedProvider)
 	}
 
+	return s.presign(ctx, jobID, request)
+}
+
+// PresignDriverProofUpload issues one short-lived URL the assigned driver may upload one photograph
+// to (SHIP-122).
+//
+// # It takes a grant and no job identifier, which is the whole signature
+//
+// The same shape [Service.RecordDriverMilestone] and [Service.AssignmentFor] take, and it matters
+// most here because what comes back is a **credential to write into the evidence bucket**. A
+// [DriverGrant] is produced by [DriverTokenVerifier.Verify] and by nothing else, and the middleware
+// that produces one has already compared the job in the request path with the job inside the token.
+// So a handler cannot widen the scope by passing the wrong identifier: it has none to pass, and the
+// key this mints can therefore only ever name the job the link opens.
+//
+// Wave 7 recorded a mutation that survived a full suite — a driver surface deriving the job it acted
+// on from its own credential rather than from what was asked for — and the shape that makes it
+// unwritable is not a test, it is a signature with nothing to get wrong in it.
+//
+// # What it checks that [Service.PresignProofUpload] does not, and what it deliberately drops
+//
+// The provider's path asks `bidding` who was awarded the job. A driver has no account to compare
+// against an award, so the question is asked of a row instead: is the assignment this grant names
+// still the live one on this job. That is the same read SHIP-108 makes before showing a driver
+// anything, and it is what makes a stood-down driver's link stop minting upload URLs at the moment
+// the row changes rather than when the token expires seven days later.
+//
+// The accepted bid is **not** re-checked, for the reason [Service.RecordDriverMilestone] gives: an
+// assignment can only exist on a job that reached 'Driver assigned', which only the awarded provider
+// can ask for, so a live assignment is a stronger statement about this job than the award is.
+//
+// # The refusals, in this order, and the order is every other write in this domain's
+//
+//  1. a request the platform will not sign — no content type, an unaccepted one, no length, or one
+//     over [UploadPolicy.MaxBytes] — is `validation_failed` with the field named;
+//  2. a link whose assignment is no longer live is [ErrDriverLinkSuperseded], one 404.
+//
+// Validation runs first and discloses nothing: a client is told about its own body.
+//
+// r is a reader rather than a transaction. One statement, no write, nothing to keep consistent with
+// anything else — the same call [Service.PresignProofUpload] makes.
+func (s *Service) PresignDriverProofUpload(
+	ctx context.Context,
+	r db.Runner,
+	grant DriverGrant,
+	req UploadRequest,
+) (Upload, error) {
+	request := req.normalise()
+	problems := request.problems(s.proof.policy)
+	if err := problems.Err(); err != nil {
+		return Upload{}, err
+	}
+
+	if _, err := s.AssignmentFor(ctx, r, grant); err != nil {
+		return Upload{}, err
+	}
+
+	return s.presign(ctx, grant.JobID, request)
+}
+
+// presign is the minting itself, after whoever is asking has been established.
+//
+// One function rather than a copy per entry point, which is the same call [Service.record] makes one
+// layer up: the key's shape, the freshness argument and the signer's failure mode are the ticket,
+// and a second copy is a second place for a driver's key to be built differently from a provider's —
+// which [keyBelongsToJob] would then refuse on the milestone that tried to use it.
+func (s *Service) presign(ctx context.Context, jobID uuid.UUID, request UploadRequest) (Upload, error) {
 	key, err := proofObjectKey(jobID)
 	if err != nil {
 		return Upload{}, err
 	}
 
 	url, expiresAt, err := s.proof.uploads.PresignUpload(
-		ctx, key, request.ContentType, request.ContentLength, s.proof.policy.URLTTL)
+		ctx, key, request.ContentType, request.ContentLength, s.proof.policy.UploadTTL)
 	if err != nil {
 		// A failure of the signer rather than of the request: the domain has already checked
 		// everything a client could get wrong, so this is a configuration or a wiring fault and
@@ -431,6 +518,61 @@ func (s *Service) VerifyProof(
 			jobID, awarded, providerID, ErrNotAwardedProvider)
 	}
 
+	return s.stored(ctx, jobID, key)
+}
+
+// VerifyDriverProof is [Service.VerifyProof] asked by the driver holding the job's link (SHIP-122).
+//
+// # The same two questions, and only the second one has a different answer
+//
+// "Does this key name an object the platform issued for this job" is identical, because a key is a
+// key: [keyBelongsToJob] compares it against the job in the grant, from the string alone, with no
+// lookup. "May this caller attach it" is where the two paths part — the provider's is the accepted
+// bid, and a driver's is a live assignment, because a driver has no account to compare against an
+// award. That is the same split [Service.RecordDriverMilestone] makes and it is made here again
+// rather than deferred to it, because the store is asked before the transaction opens and the
+// authorisation has to happen on this side of that boundary.
+//
+// **It takes a grant and no job identifier**, for the reason [Service.PresignDriverProofUpload]
+// gives: the job cannot be got wrong because there is nothing to get wrong. The consequence is worth
+// stating — a driver holding two links cannot attach the photograph from one delivery to the other,
+// and the refusal is [ErrProofNotForThisJob] rather than anything that discloses the other job.
+//
+// The check is deliberately made twice, here and again in [Service.RecordDriverMilestone] through
+// [Service.AssignmentFor], for the reason [Service.VerifyProof] gives at greater length: skipping it
+// here would let a stood-down link-holder learn whether an object exists, and skipping it there
+// would make this function's return value load-bearing for authorisation.
+func (s *Service) VerifyDriverProof(
+	ctx context.Context,
+	r db.Runner,
+	grant DriverGrant,
+	objectKey string,
+) (VerifiedProof, error) {
+	key := strings.TrimSpace(objectKey)
+	if !keyBelongsToJob(key, grant.JobID) {
+		return VerifiedProof{}, fmt.Errorf("delivery: %q is not an object key %s issued: %w",
+			key, grant.JobID, ErrProofNotForThisJob)
+	}
+
+	if _, err := s.AssignmentFor(ctx, r, grant); err != nil {
+		return VerifiedProof{}, err
+	}
+
+	return s.stored(ctx, grant.JobID, key)
+}
+
+// stored is what the store holds under key, judged against [UploadPolicy].
+//
+// One function rather than a copy per entry point, and the reason is [UploadPolicy] rather than
+// tidiness: what makes a photograph acceptable evidence is a decision about evidence, and a driver's
+// and a provider's have to be the same decision. Two copies would be two places for a size limit to
+// be raised, and the one that was not raised would refuse a delivery on a handset whose camera had
+// outgrown it — which is `Docs/01` §4.4's operational failure with an extra step.
+//
+// It authorises nobody. Both callers have already decided that this caller may attach this key to
+// this job, which is why this takes a job identifier rather than a grant or a provider: by the time
+// it runs there is no question of *whose* it is left to ask.
+func (s *Service) stored(ctx context.Context, jobID uuid.UUID, key string) (VerifiedProof, error) {
 	contentType, contentLength, etag, found, err := s.proof.objects.Stored(ctx, key)
 	if err != nil {
 		// A failure of the store rather than an answer from it — see [ProofObjects.Stored]. It
@@ -541,58 +683,17 @@ func keyBelongsToJob(key string, jobID uuid.UUID) bool {
 // Docs/02 §6.1 at all; **nothing here presumes either answer**, and SHIP-119 can branch on the row
 // in whichever direction operations settles it.
 
-// ProofExceptionReason is why a recorded milestone carries no photograph (SHIP-116).
+// The three proof exception reasons are generated (SHIP-56a).
 //
-// # A closed list, and Docs/01 §4.4 wrote it
+// contracts/statuses.yaml is the source and proofexception_gen.go beside this file is the Go form:
+// ProofExceptionReason, its constants, ProofExceptionReasons, Valid, String, Wire and
+// ProofExceptionReasonFromWire. Docs/01 §4.4's three clauses moved into the specification with the
+// values they justify, which is where they can reach a driver's phone and a driver's browser as
+// well as this package.
 //
-// The three below are that paragraph's own three, and there is deliberately no `other`. A reason
-// nobody can group is a moderation queue nobody can triage (Docs/04 §5), and a driver's own words
-// are not lost by leaving them out: `milestones.reason` is optional, 500 characters, and one row
-// away — "the recipient asked me not to photograph their door" goes there, beside a selected
-// reason rather than instead of one.
-//
-// The values are lower snake case and the stored form is the wire form, which is [ActorType]'s
-// arrangement rather than [Milestone]'s. Milestones store Docs/02 §1's exact strings because a
-// document fixes them (Docs/10 §3.4); no document fixes these, so a second spelling would be a
-// translation table with nothing on the other side of it.
-//
-// Paired with ck_proofs_exception_reason by TestProofExceptionConstraintMatchesTheGoConstants, in
-// both directions, which is what Docs/10 §3.4 asks of every enumeration.
-type ProofExceptionReason string
-
-const (
-	// ExceptionRecipientObjected is Docs/01 §4.4's first: "the recipient objects to being
-	// photographed".
-	ExceptionRecipientObjected ProofExceptionReason = "recipient_objected"
-
-	// ExceptionCameraUnavailable is its second: "the camera permission is denied or the hardware
-	// is unavailable".
-	//
-	// **This is the one SHIP-131 exists for** — "a denied permission offers the exception path
-	// instead of a dead end" — and it is why that ticket depends on this one.
-	ExceptionCameraUnavailable ProofExceptionReason = "camera_unavailable"
-
-	// ExceptionLocationUnsafe is its third: "the delivery point is unlit or unsafe to
-	// photograph".
-	ExceptionLocationUnsafe ProofExceptionReason = "location_unsafe"
-)
-
-// ProofExceptionReasons is every reason a photograph may be missing.
-//
-// Ordered as Docs/01 §4.4 lists them, which is also the order a client should offer them in: the
-// first is the one a driver meets most often and the third is the one they meet in the dark.
-var ProofExceptionReasons = []ProofExceptionReason{
-	ExceptionRecipientObjected,
-	ExceptionCameraUnavailable,
-	ExceptionLocationUnsafe,
-}
-
-// Valid reports whether r is one of the three.
-func (r ProofExceptionReason) Valid() bool {
-	return slices.Contains(ProofExceptionReasons, r)
-}
-
-func (r ProofExceptionReason) String() string { return string(r) }
+// The stored form is the wire form here, unlike the job and bid statuses. Nothing about that
+// changed: it is written out per value in the specification, both columns the same, rather than
+// being a case the generator knows about.
 
 // proofExceptionWire is every accepted reason, for the message a client is refused with.
 //
@@ -815,11 +916,11 @@ func (s *Service) ProofFor(
 	r db.Runner,
 	readerID, jobID uuid.UUID,
 ) ([]ProofLink, error) {
-	mayRead, err := s.mayReadProof(ctx, r, readerID, jobID)
+	party, err := s.partyTo(ctx, r, readerID, jobID)
 	if err != nil {
 		return nil, err
 	}
-	if !mayRead {
+	if party == PartyNone {
 		return nil, fmt.Errorf("delivery: %s may not read the proof on %s: %w",
 			readerID, jobID, ErrJobNotFound)
 	}
@@ -840,41 +941,11 @@ func (s *Service) ProofFor(
 			continue
 		}
 
-		url, expiresAt, err := s.proof.objects.PresignDownload(ctx, p.ObjectKey, s.proof.policy.URLTTL)
+		url, expiresAt, err := s.proof.objects.PresignDownload(ctx, p.ObjectKey, s.proof.policy.DownloadTTL)
 		if err != nil {
 			return nil, fmt.Errorf("delivery: signing a download for %s on %s: %w", p.ObjectKey, jobID, err)
 		}
 		links = append(links, ProofLink{Proof: p, URL: url, ExpiresAt: expiresAt})
 	}
 	return links, nil
-}
-
-// mayReadProof answers whether this account is one of the two parties to the delivery.
-//
-// The customer is asked first and the awarded provider second, which is an ordering rather than a
-// preference: the two are never the same account today — `ck_users_role` fixes the role at
-// registration and SHIP-45's trigger keeps it fixed — and cmd/api's jobPartiesLookup records the
-// same ordering for the same reason.
-//
-// Both questions are asked of ports rather than of a role claim on the token. Being the customer on
-// the job and the provider on its accepted bid are facts; `role: provider` is an assertion the
-// platform issued about an account and says nothing about *this* delivery.
-func (s *Service) mayReadProof(
-	ctx context.Context,
-	r db.Runner,
-	readerID, jobID uuid.UUID,
-) (bool, error) {
-	isCustomer, err := s.owners.IsCustomer(ctx, r, jobID, readerID)
-	if err != nil {
-		return false, err
-	}
-	if isCustomer {
-		return true, nil
-	}
-
-	awarded, isAwarded, err := s.awards.AwardedProvider(ctx, r, jobID)
-	if err != nil {
-		return false, err
-	}
-	return isAwarded && awarded == readerID, nil
 }

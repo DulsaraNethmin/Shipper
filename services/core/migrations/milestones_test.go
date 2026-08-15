@@ -211,9 +211,17 @@ func TestMilestoneRecordsBothClocksIndependently(t *testing.T) {
 
 		for milestone, at := range claimed {
 			id, _ := uuid.NewV7()
+			// The recipient and the note travel with the delivered row and with no other, which
+			// is `ck_milestones_delivery_details` (SHIP-123) — required on 'Delivered' and refused
+			// elsewhere. A sync worker draining a queue supplies them the same way, because what
+			// it is draining is what the driver typed at the door.
 			if _, err := tx.Exec(t.Context(), `
-				INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
-				VALUES ($1, $2, $3, 'driver', $4, $5)`,
+				INSERT INTO milestones
+					(id, job_id, milestone, actor_type, actor_id, actor_recorded_at,
+					 recipient_name, delivery_note)
+				VALUES ($1, $2, $3, 'driver', $4, $5,
+				        CASE WHEN $3 = 'Delivered' THEN 'R. Chen' END,
+				        CASE WHEN $3 = 'Delivered' THEN 'Left with reception' END)`,
 				id, batchJob, milestone, driver, at); err != nil {
 				t.Fatalf("recording %s: %v", milestone, err)
 			}

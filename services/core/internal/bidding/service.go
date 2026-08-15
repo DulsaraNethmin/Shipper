@@ -68,11 +68,15 @@ const (
 // the database is not abstracted, and the partial unique indexes this file is built against are
 // PostgreSQL's.
 type Service struct {
-	eligibility Eligibility
-	negotiation Negotiation
-	awarding    Awarding
-	store       postgresStore
-	clock       clock.Clock
+	events       EventSink
+	eligibility  Eligibility
+	negotiation  Negotiation
+	awarding     Awarding
+	presentation Presentation
+	vehicles     Vehicles
+	directory    Directory
+	store        postgresStore
+	clock        clock.Clock
 }
 
 // NewService wires the domain to what it cannot decide for itself.
@@ -84,8 +88,39 @@ type Service struct {
 //
 // The clock is injected (Docs/10 §6.3) because two of the three timing rules compare against "now",
 // and a test that had to wait for wall-clock time to pass would either be slow or be flaky.
-func NewService(eligibility Eligibility, negotiation Negotiation, awarding Awarding, c clock.Clock) *Service {
-	return &Service{eligibility: eligibility, negotiation: negotiation, awarding: awarding, clock: c}
+//
+// # The sink is required and this panics without it (SHIP-136)
+//
+// The same call jobs.NewService and delivery.NewService make, and in the same spirit as
+// httpx.RegisterCode: this is called once from the composition root, a missing collaborator is a
+// programming mistake rather than a runtime condition, and the alternative is a service that starts
+// and then loses every domain event it should have emitted. Nothing downstream would report it —
+// the bid is written, the award is correct, and the only symptom is a notification nobody receives.
+func NewService(
+	sink EventSink,
+	eligibility Eligibility,
+	negotiation Negotiation,
+	awarding Awarding,
+	presentation Presentation,
+	vehicles Vehicles,
+	directory Directory,
+	c clock.Clock,
+) *Service {
+	if sink == nil {
+		panic("bidding: NewService needs an EventSink; an offer, a counter or an award that " +
+			"emits no event is a state change nothing downstream will ever hear about " +
+			"(Docs/01 §4.5, Docs/10 §6.1)")
+	}
+	return &Service{
+		events:       sink,
+		eligibility:  eligibility,
+		negotiation:  negotiation,
+		awarding:     awarding,
+		presentation: presentation,
+		vehicles:     vehicles,
+		directory:    directory,
+		clock:        c,
+	}
 }
 
 // PlaceBid records one provider's offer against one job (SHIP-84).
@@ -97,7 +132,7 @@ func NewService(eligibility Eligibility, negotiation Negotiation, awarding Award
 // against one version of the world: a job can be cancelled, expire, or be awarded between two
 // statements, and a bid written against a stale "yes" is a bid nobody checked.
 //
-// # The order of the four steps is the design, and each one is in front of the next for a reason
+// # The order of the five steps is the design, and each one is in front of the next for a reason
 //
 //  1. **The retry is answered before anything else.** A request carrying a key that already placed
 //     an offer is answered from that row without consulting eligibility at all — because by the time
@@ -106,22 +141,33 @@ func NewService(eligibility Eligibility, negotiation Negotiation, awarding Award
 //     happened to my request", and the answer to that does not change when the world does.
 //  2. **Eligibility, which is fleet's and not this domain's.** See [Eligibility]. A job this
 //     provider may not bid on is indistinguishable from one that does not exist.
-//  3. **The insert, written as though the middleware were not there.** ON CONFLICT DO NOTHING
+//  3. **The job, held and moved to Negotiating if this offer is the first** (SHIP-90). See below.
+//  4. **The insert, written as though the middleware were not there.** ON CONFLICT DO NOTHING
 //     against uq_bids_idempotency absorbs the concurrent duplicate that step 1 cannot see — two
 //     requests carrying one key, arriving together, both finding nothing.
-//  4. **A second live offer is the database's refusal, not a check.** There is no SELECT asking
+//  5. **A second live offer is the database's refusal, not a check.** There is no SELECT asking
 //     whether this provider has already bid. uq_bids_one_submitted_per_provider_per_job raises, and
 //     the raise is translated to [ErrAlreadyBid]. A check-then-insert would be correct in a
 //     single-threaded reading and wrong under two taps on one phone.
 //
-// # What this does not do: it does not move the job
+// # It moves the job, and that is SHIP-90's half of this method
 //
-// Docs/02 §2 has `Open → Negotiating` on "first bid or counter-offer submitted", and that is
-// **SHIP-90's** ticket, which depends on SHIP-87 and SHIP-57. It is deliberately not done here.
-// Negotiating is a presentation status — Docs/02 §1 says so in as many words — and moving the job
-// would change nothing about what may happen to it, since a Negotiating job "remains open to
-// eligible bids". Doing it early would also make every bid a status transition, with a
-// job_status_history row and a lock on the job, for a change nobody reads yet.
+// Docs/02 §2 has `Open → Negotiating` on "first bid or counter-offer submitted", and a placement
+// is the only thing that can be first — a counter answers a live offer, which is one this method
+// wrote. So the move is here and nowhere else; [Presentation] argues that at length.
+//
+// **It happens between eligibility and the insert, which is a position rather than an ordering
+// detail.** Docs/11 §3's SHIP-88 entry records that everything in this domain apart from the award
+// locks only its own `bids` rows, so that `jobs` → `bids` runs in one direction; this takes a
+// `jobs` lock, and taking it before the insert is what keeps that true. It also closes a window
+// SHIP-95 named: the eligibility answer is read without a lock, so a job awarded in between used
+// to be able to acquire a fresh offer. Under the lock, Docs/02 §2 answers
+// [JobPresentationClosed] for a job no bid may be placed on, and this refuses it with the same 404
+// an ineligible provider gets.
+//
+// **A retry never reaches it**, because step 1 returns first. A request that already placed its
+// offer already moved the job, and asking again would be asking the world a question a retry is
+// not entitled to (see step 1).
 func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID uuid.UUID, o Offer) (Bid, bool, error) {
 	if providerID == uuid.Nil {
 		return Bid{}, false, fmt.Errorf("bidding: an offer names no provider: %w", ErrJobNotOffered)
@@ -146,7 +192,8 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 		return existing, false, nil
 	}
 
-	// 2. Eligibility, which is fleet's answer and not this domain's.
+	// 2. Eligibility, which is fleet's answer and not this domain's. Read without a lock; step 3
+	//    is what holds the job still for the rest of the transaction.
 	permitted, err := s.eligibility.EligibleFor(ctx, r, providerID, jobID)
 	if err != nil {
 		return Bid{}, false, fmt.Errorf("bidding: deciding whether %s may bid on %s: %w", providerID, jobID, err)
@@ -155,12 +202,24 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 		return Bid{}, false, ErrJobNotOffered
 	}
 
+	// 2a. The vehicle, if one was named — the caller's own and in service (SHIP-102a). In the same
+	//     transaction and for the same reason step 2 is: a vehicle deactivated between two
+	//     statements would otherwise be committed to on an offer nobody checked.
+	if err := s.vehicleUsable(ctx, r, providerID, offer.VehicleID); err != nil {
+		return Bid{}, false, err
+	}
+
+	// 3. The job, held and moved to Negotiating if this is the first offer on it (SHIP-90).
+	if err := s.enterNegotiation(ctx, r, jobID); err != nil {
+		return Bid{}, false, err
+	}
+
 	id, err := uuid.NewV7()
 	if err != nil {
 		return Bid{}, false, fmt.Errorf("bidding: generating a bid id: %w", err)
 	}
 
-	// 3 and 4. The insert, and the two indexes that answer for it.
+	// 4 and 5. The insert, and the two indexes that answer for it.
 	bid, created, err := s.store.insertBid(ctx, r, Bid{
 		ID:          id,
 		JobID:       jobID,
@@ -171,12 +230,19 @@ func (s *Service) PlaceBid(ctx context.Context, r db.Runner, providerID, jobID u
 		PickupAt:    offer.PickupAt,
 		DeliverBy:   offer.DeliverBy,
 		Message:     offer.Message,
+		VehicleID:   offer.VehicleID,
 		Key:         offer.Key,
 	})
 	switch {
 	case err != nil:
 		return Bid{}, false, err
 	case created:
+		// The event, in the transaction that wrote the row (SHIP-136). Only on the branch that
+		// actually created something: a retry answered from the record below has already emitted
+		// once, and a second event would tell a customer twice about one offer.
+		if err := s.emitOffer(ctx, r, EventBidPlaced, bid, bid.CreatedAt); err != nil {
+			return Bid{}, false, err
+		}
 		return bid, true, nil
 	}
 
@@ -271,7 +337,28 @@ func (s *Service) ReviseBid(
 		return Bid{}, ErrJobNotOffered
 	}
 
-	return s.store.reviseOffer(ctx, r, bid.ID, offer)
+	// The vehicle, and **only when the revision moves it** (SHIP-102a). A provider re-pricing an
+	// offer made with a truck they have since taken out of service is not naming that truck again,
+	// and refusing them would be the platform enforcing a rule against a row it already holds —
+	// the same asymmetry [Vehicles.Usable] states between writing the column and reading it.
+	if offer.VehicleID != bid.VehicleID {
+		if err := s.vehicleUsable(ctx, r, providerID, offer.VehicleID); err != nil {
+			return Bid{}, err
+		}
+	}
+
+	revised, err := s.store.reviseOffer(ctx, r, bid.ID, offer)
+	if err != nil {
+		return Bid{}, err
+	}
+
+	// The event, in the transaction that wrote the change (SHIP-136). `updated_at` rather than
+	// `created_at`, because a revision is the second thing to happen to a row that already existed —
+	// and the two events then carry the two instants a consumer would reconcile the row against.
+	if err := s.emitOffer(ctx, r, EventBidRevised, revised, revised.UpdatedAt); err != nil {
+		return Bid{}, err
+	}
+	return revised, nil
 }
 
 // WithdrawBid takes a provider's own offer back before it is accepted (SHIP-86).
@@ -303,13 +390,20 @@ func (s *Service) ReviseBid(
 // answers. SHIP-81's filter governs what a provider may *offer*; it has no business governing what
 // they may stop offering.
 //
-// # It does not move the job
+// # It returns the job to Open when it took the last live offer with it (SHIP-90)
 //
-// Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", and
-// nothing reaches Negotiating until **SHIP-90**, which owns that presentation status in both
-// directions. Job status is never a settable field in any case (Docs/02 §2, CLAUDE.md): a move passes
-// one guarded function and leaves a `job_status_history` row in the same transaction, and inventing
-// half of that here would be inventing the half without the record.
+// Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected",
+// and a withdrawal is the middle one. The condition is a fact about `bids`, so this domain is the
+// only thing that can know when it holds — and the status is still `jobs`', written through the one
+// guarded function inside this transaction (see [Presentation]).
+//
+// **Only when nothing live is left.** A job with two offers, one of them withdrawn, is still a
+// negotiation. [postgresStore.liveOffers] is the count, taken after the write and inside the same
+// transaction, so it cannot see a state the withdrawal has not reached.
+//
+// **A withdrawal that wrote nothing moves nothing**, which is the early return above: withdrawing
+// an already-withdrawn offer is the caller asking for an outcome that holds, and the job's standing
+// was settled when the offer actually closed.
 func (s *Service) WithdrawBid(
 	ctx context.Context,
 	r db.Runner,
@@ -324,13 +418,97 @@ func (s *Service) WithdrawBid(
 		return Bid{}, err
 	}
 	if bid.Status == StatusWithdrawn {
+		// Already withdrawn, and nothing is written — so nothing is emitted either. The event
+		// belongs to the transition and this request made none: an offer withdrawn twice is one
+		// withdrawal, which is exactly the guarantee the header above calls stronger than a key.
 		return bid, nil
 	}
 	if err := changeable(bid); err != nil {
 		return Bid{}, err
 	}
 
-	return s.store.withdrawBid(ctx, r, bid.ID)
+	withdrawn, err := s.store.withdrawBid(ctx, r, bid.ID)
+	if err != nil {
+		return Bid{}, err
+	}
+	if err := s.emitClosed(ctx, r, EventBidWithdrawn, withdrawn); err != nil {
+		return Bid{}, err
+	}
+
+	// The job, last (SHIP-90). After the event rather than before it, because the event is about
+	// the offer and is true the moment the row moved, while this is about what the offer leaving
+	// did to the job — and `jobs` emits its own transition event from inside the same transaction.
+	if err := s.leaveNegotiationIfEmpty(ctx, r, withdrawn.JobID); err != nil {
+		return Bid{}, err
+	}
+	return withdrawn, nil
+}
+
+// enterNegotiation moves the job to Negotiating if this is the first offer on it (SHIP-90).
+//
+// One place rather than a switch at the call site, so that "what an unrecognised answer means" is
+// decided once. [JobPresentationClosed] is the only refusal: a job Docs/02 §2 will not move to
+// Negotiating from is one that is neither Open nor already Negotiating, which is a job no offer may
+// be placed on — answered with [ErrJobNotOffered], the 404 an ineligible provider gets, so that a
+// provider cannot tell "somebody else won this" from "there is no such job".
+//
+// A nil port is a programming mistake rather than a runtime condition, and it is reported as an
+// error rather than skipped: a placement that silently declined to move the job would leave Docs/02
+// §2's first row unenforced in whichever binary forgot to wire it.
+func (s *Service) enterNegotiation(ctx context.Context, r db.Runner, jobID uuid.UUID) error {
+	if s.presentation == nil {
+		return fmt.Errorf("bidding: placing an offer on %s: no Presentation port is wired", jobID)
+	}
+
+	switch moved, err := s.presentation.EnterNegotiation(ctx, r, jobID); {
+	case err != nil:
+		return fmt.Errorf("bidding: moving %s to Negotiating: %w", jobID, err)
+	case moved == JobPresentationMoved, moved == JobPresentationAlreadyThere:
+		return nil
+	case moved == JobPresentationClosed:
+		return fmt.Errorf("bidding: %s cannot take an offer: %w", jobID, ErrJobNotOffered)
+	default:
+		// JobPresentationUnrecognised, or JobPresentationHeld from a method that does not skip.
+		// Reported rather than read as permission: the zero value is first in the enumeration
+		// precisely so that a half-written adapter cannot look like a job that moved.
+		return fmt.Errorf("bidding: moving %s to Negotiating answered %q", jobID, moved)
+	}
+}
+
+// leaveNegotiationIfEmpty returns the job to Open when the offer that just closed was the last live
+// one (SHIP-90).
+//
+// The count and the move are one act inside the caller's transaction: a count taken outside it
+// could be answered by a state the caller has not committed, and a move made without the count
+// would reopen a job that still has offers standing.
+//
+// **Every answer but an error is success**, including [JobPresentationHeld] and
+// [JobPresentationClosed]. Held is the ordinary contended case and [Presentation] argues why it is
+// skipped rather than waited on; Closed means the job has gone somewhere this move has no opinion
+// about — awarded, cancelled, expired — which is a job that has left the negotiation by a route
+// that is not this one's business. Neither is a reason to fail a withdrawal that has already been
+// recorded.
+func (s *Service) leaveNegotiationIfEmpty(ctx context.Context, r db.Runner, jobID uuid.UUID) error {
+	if s.presentation == nil {
+		return fmt.Errorf("bidding: closing an offer on %s: no Presentation port is wired", jobID)
+	}
+
+	live, err := s.store.liveOffers(ctx, r, jobID)
+	if err != nil {
+		return err
+	}
+	if live > 0 {
+		return nil
+	}
+
+	switch moved, err := s.presentation.LeaveNegotiation(ctx, r, jobID); {
+	case err != nil:
+		return fmt.Errorf("bidding: returning %s to Open: %w", jobID, err)
+	case moved == JobPresentationUnrecognised:
+		return fmt.Errorf("bidding: returning %s to Open answered %q", jobID, moved)
+	default:
+		return nil
+	}
 }
 
 // CounterOffer answers the other party's offer with different terms (SHIP-87, SHIP-88).
@@ -481,7 +659,19 @@ func (s *Service) CounterOffer(
 		PickupAt:    offer.PickupAt,
 		DeliverBy:   offer.DeliverBy,
 		Message:     offer.Message,
-		Key:         c.Key,
+
+		// Inherited from the offer this counter displaces, through [Revision.applyTo], and never
+		// named by the caller: [Counter] has no vehicle field (SHIP-102a). The vehicle is the
+		// provider's commitment, so a customer countering on price carries it forward rather than
+		// dropping it, and a provider changing which truck does so by revising their own offer.
+		//
+		// **It is deliberately not re-checked against `fleet` here.** It was checked when it was
+		// written, and a vehicle deactivated since is one an offer already stands on — 000504's
+		// `ON DELETE RESTRICT` and [Vehicles.Usable]'s doc comment are the same sentence. Asking
+		// again would let a customer's counter fail because of something the *provider* did.
+		VehicleID: offer.VehicleID,
+
+		Key: c.Key,
 	})
 	if err != nil {
 		return Bid{}, false, err
@@ -497,6 +687,15 @@ func (s *Service) CounterOffer(
 	}
 
 	if _, err := s.store.linkSuccessor(ctx, r, answered.bid.ID, counter.ID); err != nil {
+		return Bid{}, false, err
+	}
+
+	// The event, last, in the transaction all three statements share (SHIP-136). After the link
+	// rather than before it, because the payload names the offer this counter displaced and that
+	// fact is only true of the database once `superseded_by` is written — an event emitted between
+	// the insert and the link would describe a chain that had not been made yet, and would still be
+	// on the topic if the link then failed.
+	if err := s.emitCountered(ctx, r, counter, answered.bid.ID); err != nil {
 		return Bid{}, false, err
 	}
 	return counter, true, nil
@@ -656,6 +855,30 @@ func (s *Service) AwardBid(
 		// statements ago. Reported rather than papered over, because continuing would move the job
 		// to 'Awarded' with nothing accepted — a job two parties believe is committed and no row
 		// says who to.
+		//
+		// # The opaque 500 this becomes is the intended answer, and Docs/11 §9 asked for a ruling
+		//
+		// §9 carried this as "an unmapped `internal_error` sits on a reachable award path", with two
+		// ways out: a sentinel with a mapped code, or a comment saying the 500 is intended and why.
+		// **It is intended, and this is the why.**
+		//
+		// A code exists so a client can *branch* on it (Docs/10 §4.4), and there is nothing for a
+		// client to do differently here. Every state this could describe is one two guards already
+		// answer legibly: an offer that stopped being live is [ErrBidClosed], an offer that was
+		// already accepted is this method's own retry branch, and a job that moved on is
+		// [ErrJobNotAwardable]. Reaching this line means the row was read as `Submitted` under a
+		// lock this transaction still holds and then did not match on the same conditions — which
+		// is not a state the platform has, so a code naming it would be a code describing a defect.
+		// SHIP-95 established that the liveness rule is kept **twice**, here and at the locking
+		// re-read; this is the second guard reporting that the first was wrong about the world.
+		//
+		// A 500 is therefore the honest answer: the client retries, and `httpx.WriteError` logs the
+		// cause against the request id (SHIP-15i) so the defect is findable. What a mapped code
+		// would buy is a client branch on a condition that should never occur, which is the shape
+		// that makes a real defect look handled.
+		//
+		// The same reading covers [postgresStore.supersedeHead]'s and [Awarding.MoveToAwarded]'s
+		// equivalents in this file, for the same reason and by the same argument.
 		return Bid{}, fmt.Errorf("bidding: %s was live when it was locked and is not now", bid.ID)
 	}
 
@@ -664,7 +887,8 @@ func (s *Service) AwardBid(
 	//    predicate and needs no exclusion — and a sweep moved in front of it would close the row the
 	//    statement above is about to name, which is a failure a test can see rather than one only a
 	//    race can.
-	if err := s.store.rejectCompeting(ctx, r, jobID); err != nil {
+	rejected, err := s.store.rejectCompeting(ctx, r, jobID)
+	if err != nil {
 		return Bid{}, err
 	}
 
@@ -673,6 +897,26 @@ func (s *Service) AwardBid(
 	case err != nil:
 		return Bid{}, fmt.Errorf("bidding: moving %s to Awarded: %w", jobID, err)
 	case move == JobAwarded:
+		// 6. The events, after the five steps and inside the same transaction (SHIP-136).
+		//
+		// **Emitted here rather than beside each statement, so that the lock ordering above stays
+		// readable as the five steps it is.** An `INSERT INTO outbox` takes no lock on `bids` or
+		// `jobs`, so this position is free — and it is the only position where every event is true:
+		// an award is not an award until the job has moved, and emitting at step 3 would put an
+		// acceptance on the topic that step 5 could still roll back.
+		//
+		// The winner first, then each offer the sweep closed. The order is a courtesy rather than a
+		// guarantee — the aggregate is the bid, so these land on different partitions and Kafka
+		// promises nothing between them (catalogue.go) — and it costs nothing to write them in the
+		// order somebody reading the outbox table would expect.
+		if err := s.emitAccepted(ctx, r, accepted, customerID); err != nil {
+			return Bid{}, err
+		}
+		for _, closed := range rejected {
+			if err := s.emitClosed(ctx, r, EventBidRejected, closed); err != nil {
+				return Bid{}, err
+			}
+		}
 		return accepted, nil
 	default:
 		// Unreachable: the job has been held FOR UPDATE since before the bid was read, and it was
@@ -719,12 +963,13 @@ func acceptable(b Bid) error {
 //
 // # Who may read it, and the two rules that are not the same rule
 //
-// **Both parties to the negotiation, and nobody else.** The provider it is with, and the customer who
-// owns the job — the two Docs/02 §4 names, less the administrator, whose view is SHIP-96's along with
-// the rest of the visibility rules. A *competing* provider is refused with the 404 a bid that does not
-// exist gets, which is Docs/01 §4.3's second line: another provider's price, timing and counters are
-// private, and this endpoint is the one place a competitor could otherwise read a whole negotiation
-// at once.
+// **The three readers Docs/02 §4 names, and nobody else** — the provider the negotiation is with,
+// the customer who owns the job, and an administrator (SHIP-96). visibility.go holds that list and
+// argues each of the three; the administrator has no route until SHIP-147 supplies an admin session,
+// and that is recorded there rather than left as an absence. A *competing* provider is refused with
+// the 404 a bid that does not exist gets, which is Docs/01 §4.3's second line: another provider's
+// price, timing and counters are private, and this endpoint is the one place a competitor could
+// otherwise read a whole negotiation at once.
 //
 // **The customer's budget is not in this shape**, because no shape in this package carries anything
 // of the job. What *is* here and is new is an amount the customer chose — their counter — reaching a
@@ -741,26 +986,50 @@ func acceptable(b Bid) error {
 //
 // No transaction and no lock. This is a read, and a chain that changed under it would produce an
 // older row beside a newer one rather than an inconsistent one.
+// It returns the audience the platform decided the caller is, so that a caller cannot be served by
+// one rule and reported under another — and so that SHIP-102's comparison screen and SHIP-101's
+// provider list, which are two screens over these rows, can be told apart by the platform rather
+// than guessed at by the client.
 func (s *Service) Chain(
 	ctx context.Context,
 	r db.Runner,
-	callerID, jobID, bidID uuid.UUID,
-) ([]Bid, bool, error) {
-	answered, err := s.reachableBid(ctx, r, callerID, jobID, bidID, false)
+	viewer Viewer,
+	jobID, bidID uuid.UUID,
+) ([]Bid, Audience, bool, error) {
+	if bidID == uuid.Nil || jobID == uuid.Nil || viewer.ID == uuid.Nil {
+		return nil, AudienceNone, false, fmt.Errorf("bidding: %s on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	bid, err := s.store.readBid(ctx, r, bidID)
 	if err != nil {
-		return nil, false, err
+		return nil, AudienceNone, false, err
+	}
+	if bid.JobID != jobID {
+		// The job in the path is compared for [Service.reachableBid]'s reason: a bid is addressed
+		// under its own job, so a client pairing a real bid with the wrong one is naming something
+		// that does not exist.
+		return nil, AudienceNone, false, fmt.Errorf("bidding: %s is not on %s: %w", bidID, jobID, ErrBidNotFound)
+	}
+
+	audience, err := s.audienceFor(ctx, r, viewer, bid)
+	if err != nil {
+		return nil, AudienceNone, false, err
+	}
+	if !audience.permitted() {
+		return nil, AudienceNone, false, fmt.Errorf(
+			"bidding: %s is none of Docs/02 §4's readers of %s: %w", viewer.ID, bidID, ErrNotBidOwner)
 	}
 
 	// One more than the cap, so that "there are more" is read off the query rather than off a second
 	// count that could disagree with it.
-	offers, err := s.store.chain(ctx, r, answered.bid.JobID, answered.bid.ProviderID, maxChainLength+1)
+	offers, err := s.store.chain(ctx, r, bid.JobID, bid.ProviderID, maxChainLength+1)
 	if err != nil {
-		return nil, false, err
+		return nil, AudienceNone, false, err
 	}
 	if len(offers) > maxChainLength {
-		return offers[:maxChainLength], true, nil
+		return offers[:maxChainLength], audience, true, nil
 	}
-	return offers, false, nil
+	return offers, audience, false, nil
 }
 
 // reached is a bid the caller may act on, and which side of the negotiation they are.
@@ -986,6 +1255,48 @@ func changeable(b Bid) error {
 // making an offer the customer is free to decline, and Docs/01 §4.3's answer to bids that miss is
 // better job detail rather than a platform that refuses them. Migration 000501 records the same
 // split from the schema's side.
+// vehicleUsable refuses an offer that names a vehicle the caller may not offer (SHIP-102a).
+//
+// # It answers 422 naming the field rather than a 404 or a 403
+//
+// `vehicle_id` is a value in the request body, and Docs/10 §4.6's division puts a body field whose
+// value the platform will not accept in the validation contract — the client marks the field and
+// the provider picks another truck from a list they already have. A 404 would be answering a
+// question about the *job*, which is not what is wrong, and a 403 would be an authorisation answer
+// to what is really a bad reference.
+//
+// **[validate.CodeNotAllowed] rather than [validate.CodeInvalid]**, because the value is a
+// well-formed identifier that this caller may not use. The three refusals it covers — no such
+// vehicle, another provider's, and out of service — are one message for [Vehicles.Usable]'s reason:
+// telling them apart would let a provider enumerate a competitor's fleet one identifier at a time.
+//
+// A zero vehicle is no vehicle and asks nothing. That is the ordinary case for every client written
+// before 000504 and it must not reach the port, which would otherwise be asked whether a provider
+// may use [uuid.Nil].
+func (s *Service) vehicleUsable(ctx context.Context, r db.Runner, providerID, vehicleID uuid.UUID) error {
+	if vehicleID == uuid.Nil {
+		return nil
+	}
+	if s.vehicles == nil {
+		// Wiring rather than a refusal, and reported as one. A service built without the port cannot
+		// answer the question, and treating silence as permission would store a commitment to a
+		// vehicle nobody checked — the failure JobAwardUnrecognised is ordered first to prevent.
+		return fmt.Errorf("bidding: no vehicle port is wired, so %s cannot be checked", vehicleID)
+	}
+
+	usable, err := s.vehicles.Usable(ctx, r, providerID, vehicleID)
+	if err != nil {
+		return fmt.Errorf("bidding: deciding whether %s may offer %s: %w", providerID, vehicleID, err)
+	}
+	if !usable {
+		var e validate.Errors
+		e.Add("vehicle_id", validate.CodeNotAllowed,
+			"Choose a vehicle from your own fleet that is in service.")
+		return e.Err()
+	}
+	return nil
+}
+
 func (o Offer) validate(now time.Time) error {
 	var e validate.Errors
 

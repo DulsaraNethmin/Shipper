@@ -78,7 +78,7 @@ func storedEvidence(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) (
 //
 // One request, one milestone, one `proofs` row — and the row holds a reason and no object. That the
 // object columns are NULL rather than empty is the half worth reading twice: 000604 counts NULLs, so
-// a row that stored `''` would satisfy the CHECK by looking like a photograph.
+// a row that stored an empty string would satisfy the CHECK by looking like a photograph.
 func TestAReasonedExceptionIsRecordedInPlaceOfAPhotograph(t *testing.T) {
 	pool := pgtest.DB(t)
 
@@ -565,7 +565,7 @@ func TestADeliveryIsRecordedWithAPhotograph(t *testing.T) {
 	objects.holding(key, aPhotograph())
 
 	record, outcome, err := recordWithProof(t, pool, svc, provider, jobID,
-		Recording{Milestone: MilestoneDelivered, Key: theKey}, key)
+		Recording{Milestone: MilestoneDelivered, Key: theKey, RecipientName: "R. Chen", DeliveryNote: "Left with reception"}, key)
 	if err != nil {
 		t.Fatalf("recording a photographed delivery: %v", err)
 	}
@@ -600,7 +600,7 @@ func TestADeliveryIsRecordedWithAReasonedException(t *testing.T) {
 	svc := serviceReadingProofFrom(newRecordingObjects())
 
 	_, outcome, err := recordWithException(t, pool, svc, provider, jobID,
-		Recording{Milestone: MilestoneDelivered, Key: theExceptionKey}, ExceptionRecipientObjected)
+		Recording{Milestone: MilestoneDelivered, Key: theExceptionKey, RecipientName: "R. Chen", DeliveryNote: "Left with reception"}, ExceptionRecipientObjected)
 	if err != nil {
 		t.Fatalf("recording a delivery evidenced by a reasoned exception: %v", err)
 	}
@@ -650,8 +650,9 @@ func TestTheDeliveredRuleIsAlsoTheDatabases(t *testing.T) {
 	defer func() { _ = tx.Rollback(t.Context()) }()
 
 	if _, err := tx.Exec(t.Context(), `
-		INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
-		VALUES ($1, $2, 'Delivered', 'provider', $3, now())`,
+		INSERT INTO milestones
+			(id, job_id, milestone, actor_type, actor_id, actor_recorded_at, recipient_name, delivery_note)
+		VALUES ($1, $2, 'Delivered', 'provider', $3, now(), 'R. Chen', 'Left with reception')`,
 		uuid.Must(uuid.NewV7()), jobID, provider); err != nil {
 		t.Fatalf("the insert itself must succeed — the trigger is deferred so that evidence can "+
 			"be written second: %v", err)
@@ -674,7 +675,12 @@ func TestADeliveryWithNothingBehindItIsRefusedAtTheWire(t *testing.T) {
 
 	router := newTestRouterFor(t, pool, serviceReadingProofFrom(newRecordingObjects()))
 
-	rec := recordAs(t, router, provider, jobID, theKey, `{"milestone": "delivered"}`)
+	// The two fields Docs/01 §4.4 also requires are supplied, because this test is about the
+	// *evidence* rule and not about the field set (SHIP-123). Without them the refusal would be a
+	// `422` naming `recipient_name` — validation runs before the evidence rule, which is the order
+	// every write in this domain uses — and the test would pass for a reason it is not about.
+	rec := recordAs(t, router, provider, jobID, theKey,
+		`{"milestone": "delivered", "recipient_name": "R. Chen", "delivery_note": "Left with reception"}`)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("a delivery with nothing behind it answered %d, want 409 (%s)", rec.Code, rec.Body)
 	}
@@ -692,7 +698,9 @@ func TestADeliveryWithNothingBehindItIsRefusedAtTheWire(t *testing.T) {
 	// The same request with a reason in it is accepted, so the refusal above is not the endpoint
 	// being broken for `delivered` in general.
 	rec = recordAs(t, router, provider, jobID, theExceptionKey,
-		`{"milestone": "delivered", "proof": {"exception_reason": "location_unsafe"}}`)
+		`{"milestone": "delivered", "recipient_name": "R. Chen", `+
+			`"delivery_note": "Left with reception", `+
+			`"proof": {"exception_reason": "location_unsafe"}}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("a delivery with a reasoned exception answered %d, want 201 (%s)", rec.Code, rec.Body)
 	}

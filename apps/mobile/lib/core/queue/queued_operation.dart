@@ -19,7 +19,7 @@ library;
 /// Features may read this because it is in `core/`; `Docs/07` §2 forbids features importing one
 /// another, not importing core.
 final class OperationKind {
-  const OperationKind._(this.name, this.bodyVersion);
+  const OperationKind._(this.name, this.bodyVersion, {this.attachmentContentType});
 
   /// What is written into the row, and what a row written by another build is matched against.
   final String name;
@@ -36,6 +36,17 @@ final class OperationKind {
   /// the same obligation a schema change already carries.
   final int bodyVersion;
 
+  /// The media type of the file at [QueuedOperation.attachmentPath], or `null` for a kind that
+  /// never carries one (SHIP-130).
+  ///
+  /// **It is declared by the kind rather than sniffed from the file**, and the reason is on the
+  /// platform: `POST /v1/jobs/{id}/proof-uploads` **signs the content type into the URL**, so the
+  /// `Content-Type` on the PUT has to match what was declared byte for byte or the object store
+  /// refuses the upload with a signature error and no explanation. One value, in one place, read by
+  /// the sender that declares it and by the compressor that produces it — and a test holds the two
+  /// together, because a compressor quietly emitting PNG would fail only on a real handset.
+  final String? attachmentContentType;
+
   /// A delivery milestone the driver or provider recorded (`Docs/01` §4.4, `Docs/02` §3.1).
   ///
   /// The one `Docs/07` §4 names first, and the reason the queue exists: pickup bays, warehouses
@@ -49,7 +60,7 @@ final class OperationKind {
   /// proof images "upload on reconnection, **not** as part of the milestone request". The image
   /// itself never enters the row; [QueuedOperation.attachmentPath] points at the compressed file
   /// SHIP-130 wrote.
-  static const proof = OperationKind._('delivery.proof', 1);
+  static const proof = OperationKind._('delivery.proof', 1, attachmentContentType: 'image/jpeg');
 
   /// Every kind this build understands.
   static const all = <OperationKind>[milestone, proof];

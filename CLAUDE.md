@@ -136,6 +136,31 @@ A ticket is done when **all** of these hold:
 
 Meeting all six makes the branch **ready to merge**, not merged. Hand it to the repository owner.
 
+### Every finished piece of work ends with a handoff
+
+**When a ticket, a track or a wave finishes, write the handoff before saying it is done.** Two
+artefacts, both for a reader who has none of the context that produced the work:
+
+1. **What is ready to merge** — every branch, its tip commit, the tickets on it, the gate results
+   *as re-run rather than as reported*, and **the order to merge them in, measured** with
+   `git merge-tree --write-tree --name-only <base> <branch>` rather than predicted.
+2. **A handoff prompt for the next phase**, written to `~/.claude/plans/` and given to the owner in
+   full, so the next session can start from a cleared context. It carries the verified state with
+   every figure measured on a named commit, what is blocked and on whom, the traps accumulated so
+   far, and the decisions still outstanding.
+
+**This exists because context does not survive the session and the repository has repeatedly paid
+for that.** The same commit-count error has been made four times, each by a session that copied a
+figure instead of measuring it; the "17 call sites" figure travelled through two dispatch briefs from
+a stale comment; and three separate lanes specified one endpoint that none of them built. A handoff
+that states where the figures came from is what stops the next session inheriting the last one's
+mistakes.
+
+**A handoff is not a summary of what happened.** It is the input the next piece of work runs on:
+state, blockers, traps, decisions. Say what was measured and on which commit, what was taken on
+report and not verified, and what was left undone and why — a gap named in a handoff costs an hour,
+and the same gap discovered later costs the wave.
+
 ### What Claude does and does not do
 
 | Action | Who |
@@ -181,6 +206,7 @@ Each concurrent piece of work gets its own git worktree, never the primary tree.
 | Ports | `HTTP_PORT` and `VERIFY_PORT` per worktree, likewise |
 | Compose | One shared stack. `COMPOSE_PROJECT_NAME` is pinned in the `Makefile` so worktrees do not each start their own and fight over 5432, 6379 and 29092 |
 | **Kafka** | **There is no isolation, and there is no equivalent to add.** One broker, one `shipper.job`, and **every worktree publishes into the same topics** — the shared stack is safe for PostgreSQL only because each tree gets its own database on the cluster, and a topic has no such split. So **on a Kafka topic a fence must be an id, not a timestamp**: a concurrent run in another worktree is not ordered against this one, and a `published_at > $fence` window contains that run's events as readily as your own. Wave 5 lost a run proving it — a count over a topic failed on a tree where nothing was wrong, and the count was right about what it saw |
+| **`make verify`** | **Not concurrency-safe, and the fix is a lock rather than a setting. Only one worktree may run it at a time.** This is the Kafka row's consequence rather than a second finding: `scripts/verify/80-notifications.sh` *deletes and recreates* `shipper.job`, and the SHIP-135 section deletes `shipper.delivery` twice more, so with two harnesses live one tree's delete lands in the middle of another's run. That is deterministic, not flaky. **Two failure modes come out of it and they need different answers.** *Another tree deletes your topic*: your events are gone before you read them, a **subset** check fails reporting your own ids as missing, and **a run-start offset fence does not help** — the offsets it captured no longer exist. *Another tree publishes into your topic*: messages you did not write are on it, an **equality** check fails, and **no fence can fix this at all** — fencing narrows where you start reading, not what else arrives, so the assertion itself has to change. Wave 9 proved both **by id rather than by timing**: one lane saw five extra ids on `shipper.job` for which `select id from outbox where id in (…)` against its own database returned zero rows, with `ps` showing two other `verify-foundation.sh` processes live; another saw a `job.status_changed` carrying section 80's own marker reason for an aggregate that did not exist in its own database, while its own event id was nowhere on the topic. Note also that `80-notifications.sh`'s header justifies its deletion as *"safe today only because no other section asserts on a topic it did not create"* — **a justification scoped to sections, which does not survive a second worktree.** **The rule: serialise the runs.** Take a machine-wide lock around `make verify` — an atomic `mkdir` is enough — and release it when the run exits, so a second tree blocks rather than interleaves |
 | **Object storage** | **`STORAGE_BUCKET` in `deploy/.env`, one per worktree — and this is the one shared service that genuinely can be split, which is why the row exists rather than repeating the Kafka one.** A bucket is a namespace the store makes on demand, so five trees get five buckets on one MinIO and never see each other's objects; a topic is created from the event catalogue, shared by every tree, and has no per-tree equivalent. `make up` creates whatever `STORAGE_BUCKET` names, so a tree that sets the line has isolation from its next `make up` and needs nothing else. **Unlike `TEST_TEMPLATE_DB` it is not derived from the directory**, so a tree that leaves it alone shares `shipper-dev` with every other tree that did — which is safe for keyed reads and writes and is not safe for a count or a listing. Set it, or fence on an id |
 | **`git stash`** | **Never.** The stash is shared across worktrees through one `.git`, and this repository already carries the scar — `CLAUDE.md` was committed with `Stashed changes` conflict markers in it |
 | Shared files | Do not edit from a domain branch: `cmd/api/routes.go`, `internal/boundaries/boundaries.go`, `internal/httpx/**`, `go.mod`, the root `Makefile`, migrations in the shared block, `scripts/verify-foundation.sh`, `CLAUDE.md`, `Docs/**`. A domain's own `scripts/verify/<n>-<domain>.sh` is not shared — that is what the split is for. See `Docs/10` §9.2 |
@@ -190,6 +216,25 @@ Because history is not squashed, `git log --oneline` shows every individual comm
 ```
 git log --first-parent develop
 ```
+
+### Reverting a mutation
+
+Breaking a mechanism deliberately to confirm a test fails is how this repository establishes that a guard is real rather than believed — every `Docs/11` §3 entry that claims one carries the mutation and its outcome. The applying is easy. **Undoing it is where two lanes in wave 7 destroyed an hour of uncommitted work each, in the same way.**
+
+**Never revert a mutation with `git checkout <file>`.** It is the first command anybody reaches for and it is wrong on an unstaged tree: it restores the file *from the index*, which discards every uncommitted change in that file — the mutation and the work sitting beside it, indistinguishably. The mutation is deliberate and reversible; the hour of work next to it is neither.
+
+The recipe:
+
+1. **Copy the file aside before applying anything** — `cp path/to/file /tmp/snap/`, or tar-snapshot the tree if the mutation touches several. **Write the checksums to a `SHASUMS` file beside the copy in the same command**, not to the terminal.
+2. Apply the mutation, run the test, read the failure.
+3. **Restore from the copy, not from git** — `cp /tmp/snap/file path/to/file`.
+4. **Confirm with `git diff` *and* `shasum -c /tmp/snap/SHASUMS`.**
+
+**Step 4 is not for the person who applied the mutation. It is for whoever arrives afterwards, and that is the whole reason the recipe works.** The session that applies a mutation knows what it did; the one that finds the tree does not, and there is no guarantee they are the same session. Wave 7 lost two hours to this and wave 9 nearly lost a third — a lane died mid-restore, and the only thing that let the next session establish which files were mutated, which were restored, and which were untouched work was the `SHASUMS` manifest it had written before it started. A checksum held in a dead session's scrollback is not a checksum.
+
+**The `git diff` half is the mechanism and the checksum is the proof.** After a destructive `git checkout` the file matches the index exactly, so `git diff` reports nothing — which reads as success and is in fact the signature of the failure. Only a checksum against the copy you took distinguishes "restored" from "reverted to the last commit", and only a checksum *on disk* is still there when the session that took it is not.
+
+The same argument bans `git stash` here twice over: the worktree table above rules it out because the stash is shared through one `.git`, and it is the wrong instrument for this regardless.
 
 ### Never commit
 

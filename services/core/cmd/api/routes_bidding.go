@@ -10,6 +10,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/bidding"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/fleet"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 )
@@ -83,6 +84,24 @@ import (
 // claims `provider` is still recognised as the customer of their own job, which is what CLAUDE.md
 // means by no authorisation decision on the device.
 //
+// # The provider's own bids are under `/v1/fleet`, which is the one route here not under a job
+//
+// SHIP-101a, and it is the shape this file predicted at SHIP-84: "SHIP-101's provider list is a
+// different resource — the caller's own bids across every job — rather than a filter on this one".
+// `/v1/fleet` is where a provider's own things already live — their vehicles, their service area,
+// their profile — and a provider asking what they have bid on is asking about their operation rather
+// than about any one job.
+//
+// **It also sidesteps `net/http`'s routing constraint rather than working around it.** A
+// four-segment `GET /v1/jobs/{id}/<literal>` panics the mux at registration while
+// `GET /v1/jobs/open/{id}` exists, so a provider list under the job tree would have had to take a
+// fifth segment or a different verb. This resource does not belong there anyway, which is the
+// happier of the two reasons.
+//
+// `RequireUser` and not a role, for the fifth time. The list is scoped to the caller's own id in the
+// `WHERE` clause, so a customer's answer is an empty page by construction rather than by permission —
+// there is no parameter that widens it and nothing to refuse.
+//
 // # And the history is a `GET` under the same offer
 //
 // SHIP-88's "full chain remains readable". It is deliberately **not** `GET /v1/jobs/{id}/bids`, which
@@ -146,6 +165,86 @@ func init() {
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).History() },
 		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/fleet/bids",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).Mine() },
+		},
+		Route{
+			Method: http.MethodGet,
+
+			// **`/jobs/{id}/bids` was the intended pattern, it is what Docs/09's SHIP-102a row
+			// names, and it cannot be served.** Three comments in this file reserved it for
+			// SHIP-102 from SHIP-84 onwards. The reservation was made before SHIP-83 declared
+			// `GET /jobs/open/{id}`, and the two cannot coexist: `open` is a literal in the
+			// `{id}` position, so both patterns match `/v1/jobs/open/bids` with neither more
+			// specific, and Go's ServeMux panics at registration rather than choosing. Measured
+			// on this branch against Go's own mux, five ways:
+			//
+			//	GET /jobs/open/{id} + GET  /jobs/{id}/bids                   PANIC
+			//	GET /jobs/open/{id} + GET  /jobs/{id}/offers                 PANIC — renaming does not help
+			//	GET /jobs/open/{id} + GET  /jobs/{id}/bids + /jobs/open/bids PANIC — the overlap cannot be resolved
+			//	GET /jobs/open/{id} + POST /jobs/{id}/bids                   ok    — why the POST exists and no GET did
+			//	GET /jobs/open/{id} + GET  /jobs/{id}/bids/received          ok    — five segments do not overlap four
+			//
+			// The third line is the one worth recording, because it is the escape hatch
+			// somebody will reach for: registering the intersection does **not** teach the mux
+			// which pattern wins. Go has no such rule.
+			//
+			// # Two honest options, and this takes the first
+			//
+			// **Insert a segment**, which is SHIP-115's precedent — `/jobs/{id}/delivery/detail`,
+			// `/delivery/milestones` and `/delivery/proof` are all shaped by this same
+			// collision, and that file's note ends by recording it "for whoever owns
+			// `/jobs/open/{id}`". **Or move `/jobs/open/{id}`**, which is the structural fix: it
+			// frees the whole `GET /v1/jobs/{id}/<literal>` space, which is otherwise closed to
+			// every future ticket, and this branch is unusually well placed to take it because
+			// it also owns `apps/mobile` and could move the client in the same change.
+			//
+			// **It takes the first, and the reason is ownership rather than modelling.** Moving
+			// the route is a breaking change to a served endpoint that SHIP-101 and SHIP-133
+			// already consume, and carrying it through means editing `contracts/paths/fleet.yaml`,
+			// `internal/fleet/http_test.go` and `scripts/verify/`'s fleet section — three files
+			// this branch does not own, in a wave with five concurrent trees. This file and
+			// routes_fleet.go were granted; the rest of the move was not. A four-line change
+			// spread across another lane's files is how a route gets dropped in a merge, which
+			// is the failure routes_golden.txt exists to catch and not one to invite.
+			//
+			// routes_fleet.go's own argument at its line 45 also still stands on the merits —
+			// the resource is a job and `/v1/jobs/open` is the collection offered to the calling
+			// provider — so the move is not obviously right, only obviously cheaper for
+			// everything that comes after it. **Docs/11 §3 records it as an open recommendation
+			// with the cost measured**, and Docs/09's SHIP-102a row names a path this service
+			// does not serve until somebody corrects it.
+			//
+			// # Why `received` rather than a shelf like delivery's
+			//
+			// Delivery took `/delivery/<thing>` because it had three reads to place and expected
+			// more. This has one, and the collection it names is already `bids` — so a shelf
+			// would read `/jobs/{id}/bids/bids`. `received` says which side of the negotiation
+			// is asking, which is the whole difference between this endpoint and
+			// `GET /v1/fleet/bids`: one is the offers a customer has received, the other is the
+			// offers a provider has made.
+			//
+			// It cannot collide with a future `GET /jobs/{id}/bids/{bid_id}` either. A literal
+			// is strictly more specific than a wildcard in the same position, so Go prefers this
+			// and registers both — measured, not assumed.
+			Pattern: "/jobs/{id}/bids/received",
+			Group:   GroupV1,
+
+			// RequireUser, and the role is not enforced here for the reason every route in this
+			// file gives. **The access control is the job's ownership, decided in the domain**:
+			// `bidding.Service.Offers` asks `jobs` whether this account is the job's customer
+			// before it reads a single `bids` row, and a provider — including one bidding on
+			// this very job — gets the byte-identical 404 a stranger and a non-existent job get.
+			// That is a clause of SHIP-102a's *Done when* rather than a consequence, and it is
+			// the one endpoint in this domain where a competing provider could otherwise read
+			// every rival's price on a job in one request.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).Received() },
+		},
 	)
 }
 
@@ -185,9 +284,13 @@ func init() {
 // about each other.
 func biddingHandler(d Deps) *bidding.Handler {
 	svc := bidding.NewService(
+		events.NewOutbox(),
 		fleet.NewService(d.Clock),
 		negotiatedJobs{jobs: newJobService(d)},
 		awardableJobs{jobs: newJobService(d)},
+		presentedJobs{jobs: newJobService(d)},
+		offerableVehicles{fleet: fleet.NewService(d.Clock)},
+		offerorDirectory{},
 		d.Clock,
 	)
 
@@ -385,14 +488,363 @@ func (a awardableJobs) MoveToAwarded(
 	}
 }
 
-// Compile-time proof that the three adapters satisfy the ports bidding declared.
+// presentedJobs implements bidding.Presentation, which is Docs/02 §1's Negotiating status (SHIP-90).
+//
+// The fourth seam this file joins, and the third that needed a type. It is `awardableJobs` in
+// shape — a lock, a reading of Docs/02 §2's table, and the guarded transition — with one difference
+// that is the whole of the ticket's concurrency story: see [presentedJobs.LeaveNegotiation].
+//
+// **The actor is the platform in both directions.** Docs/02 §1 calls Negotiating "a useful
+// presentation status" in as many words, and these moves are the platform's reading of a condition
+// in `bids` rather than an act anybody performed: a provider placing an offer asked for their offer
+// to exist, not for the job to move, and `job_status_history` records who acted rather than who
+// caused. `jobs.System()` is the same actor SHIP-68's expiry sweep records, and each move carries a
+// reason for the same reason that one does — it is read by support and shown in the customer's
+// status timeline.
+type presentedJobs struct {
+	jobs *jobs.Service
+}
+
+// The two reasons, in the shape jobs.ExpiryReason has: fixed strings rather than formatted ones, so
+// that support can search for them and a customer's timeline reads the same on every job.
+const (
+	negotiationOpenedReason = "An offer was made on the job (Docs/02 §2)."
+	negotiationEndedReason  = "The last live offer on the job was withdrawn or expired (Docs/02 §2)."
+)
+
+// EnterNegotiation runs `Open → Negotiating`, taking the job row for the rest of the transaction.
+//
+// An ordinary blocking lock, because `bidding` calls it before it has touched a `bids` row — which
+// is what keeps Docs/11 §3's `jobs` → `bids` ordering in one direction. `jobs.Service.Transition`
+// takes the lock itself, so there is no separate statement here.
+//
+// The translation is of errors into outcomes, exactly as `jobLifecycle.move` and
+// `awardableJobs.MoveToAwarded` do it: everything `jobs` treats as a refusal becomes an outcome
+// with a nil error, and everything else stays an error because a failing database is not an answer.
+func (p presentedJobs) EnterNegotiation(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (bidding.JobPresentation, error) {
+	return p.move(p.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusNegotiating,
+		Actor:  jobs.System(),
+		Reason: negotiationOpenedReason,
+	}))
+}
+
+// LeaveNegotiation runs `Negotiating → Open`, and **does not wait for the job row**.
+//
+// `FOR UPDATE SKIP LOCKED` first, and the transition only if it was obtained. `bidding` calls this
+// once the offer has closed, which is after a `bids` row is locked — and in the expiry sweep the
+// bid was locked by the *claim*, before the domain was reached at all. A blocking lock would be
+// `bids` → `jobs` against the award's `jobs` → `bids`, and the first deadlock would be between a
+// sweep and an award. A lock attempt that cannot wait cannot deadlock.
+//
+// **Skipping is also the right answer rather than merely the safe one.** Whatever holds the row is
+// making a real change — an award, a cancellation, an expiry, a publication, an extension — and a
+// presentation change must not overwrite or delay it. bidding.Presentation carries the cost that
+// follows: under contention a job can sit at Negotiating with no live offer until the next thing
+// happens to it.
+//
+// The status is read under the lock as well, so that a job somebody moved between the caller's
+// count and this statement is answered rather than transitioned. That read costs nothing — the row
+// is already in hand — and it is what makes [bidding.JobPresentationClosed] a real answer here
+// rather than a translation of a refusal.
+func (p presentedJobs) LeaveNegotiation(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) (bidding.JobPresentation, error) {
+	const q = `SELECT status FROM jobs WHERE id = $1 FOR UPDATE SKIP LOCKED`
+
+	var status jobs.Status
+	switch err := r.QueryRow(ctx, q, jobID).Scan(&status); {
+	case errors.Is(err, db.ErrNoRows):
+		// Either there is no such job or somebody is holding it. `SKIP LOCKED` cannot tell the
+		// two apart in one statement, and a second statement to find out would be a read whose
+		// only product is the knowledge that a row exists — which is the disclosure every port
+		// in this file declines to make. Held is the answer that says "no change was
+		// attempted", which is true of both.
+		return bidding.JobPresentationHeld, nil
+	case err != nil:
+		return bidding.JobPresentationUnrecognised,
+			fmt.Errorf("cmd/api: holding %s to leave Negotiating: %w", jobID, err)
+	}
+
+	if !jobs.Permitted(status, jobs.StatusOpen) {
+		// Docs/02 §2's table rather than a comparison against 'Negotiating' written here. The
+		// row that matters is `Negotiating → Open`; `Awarded / Driver assigned → Open` is also
+		// in the table and is SHIP-116's provider cancellation, which reaches this transition
+		// through its own path and never through a closing offer.
+		if status == jobs.StatusOpen {
+			return bidding.JobPresentationAlreadyThere, nil
+		}
+		return bidding.JobPresentationClosed, nil
+	}
+
+	return p.move(p.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     jobs.StatusOpen,
+		Actor:  jobs.System(),
+		Reason: negotiationEndedReason,
+	}))
+}
+
+// move is the translation, in one place, so that a third presentation row added later cannot treat
+// `jobs.ErrAlreadyInStatus` differently from these two.
+func (presentedJobs) move(_ jobs.Job, err error) (bidding.JobPresentation, error) {
+	switch {
+	case err == nil:
+		return bidding.JobPresentationMoved, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return bidding.JobPresentationAlreadyThere, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted), errors.Is(err, jobs.ErrJobNotFound):
+		// One outcome for both, which is the collapse every port here makes: a job that cannot
+		// take this move and a job that does not exist are one answer, and telling them apart
+		// would disclose that somebody else's job exists.
+		return bidding.JobPresentationClosed, nil
+	default:
+		return bidding.JobPresentationUnrecognised, err
+	}
+}
+
+// Compile-time proof that the four adapters satisfy the ports bidding declared.
 //
 // This is the only place in the build where that can be established — `bidding` names neither `fleet`
 // nor `jobs`, and neither names `bidding`, so nothing else links them. If any of them ever part
 // company, these lines are what say so, at compile time and in the file whose job it is to know about
 // all three.
 var (
-	_ bidding.Eligibility = (*fleet.Service)(nil)
-	_ bidding.Negotiation = negotiatedJobs{}
-	_ bidding.Awarding    = awardableJobs{}
+	_ bidding.Eligibility  = (*fleet.Service)(nil)
+	_ bidding.Negotiation  = negotiatedJobs{}
+	_ bidding.Awarding     = awardableJobs{}
+	_ bidding.Presentation = presentedJobs{}
+	_ bidding.Vehicles     = offerableVehicles{}
+	_ bidding.Directory    = offerorDirectory{}
 )
+
+// offerableVehicles implements bidding.Vehicles over the provider's own fleet (SHIP-102a).
+//
+// The port migration 000501 named and declined to write — "validating it needs a second `fleet`
+// fact … and therefore a second port" — joined here, which is the only place `bidding` and `fleet`
+// may meet. It needs a type where eligibility did not, and the reason is the reverse of the usual
+// one: eligibility answers a bool already, and this has to *narrow* a `fleet.Vehicle` and two
+// sentinels down to one.
+//
+// **`fleet.Service.Vehicle` is scoped by provider, which is what makes the collapse safe.** A
+// vehicle belonging to another provider raises the same `ErrVehicleNotFound` a vehicle that does not
+// exist raises, so this adapter never learns the difference and could not disclose it if it wanted
+// to. `contracts/paths/fleet.yaml` makes the same collapse on `GET /v1/fleet/vehicles/{id}` and says
+// why: which vehicles a competitor runs is commercial information they never published.
+type offerableVehicles struct {
+	fleet *fleet.Service
+}
+
+// Usable reports whether this provider may offer this vehicle, right now.
+//
+// Three refusals to one `false`: no such vehicle, another provider's, and one out of service.
+// Anything else stays an error, because a failing database is not an answer — the reading every
+// adapter in this file takes.
+func (v offerableVehicles) Usable(
+	ctx context.Context,
+	r db.Runner,
+	providerID, vehicleID uuid.UUID,
+) (bool, error) {
+	vehicle, err := v.fleet.Vehicle(ctx, r, providerID, vehicleID)
+	switch {
+	case errors.Is(err, fleet.ErrVehicleNotFound), errors.Is(err, fleet.ErrNotVehicleOwner):
+		// **Both sentinels, and the pair is why this is a `switch` rather than one comparison.**
+		// `fleet` keeps them apart in Go deliberately — "a test asserting 'the stranger was
+		// refused' should fail if the vehicle silently stopped existing instead" — and
+		// indistinguishable on the wire, which is the collapse this adapter is making. Matching
+		// only the first would answer 500 for a competitor's vehicle: a refusal turned into an
+		// outage by an omission the compiler cannot see.
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("cmd/api: reading %s's vehicle %s: %w", providerID, vehicleID, err)
+	}
+
+	// In service as well as owned. Docs/01 §4.2 makes deactivation the act that stops a vehicle
+	// carrying new work, and an offer is new work. `fleet.Vehicle.Active` is that domain's own
+	// reading of `deactivated_at` rather than a second comparison written here.
+	return vehicle.Active(), nil
+}
+
+// offerorDirectory implements bidding.Directory for the customer's comparison screen (SHIP-102a).
+//
+// # Why these two statements are here and not in a domain
+//
+// `users` is `identity`'s table and `vehicles` is `fleet`'s. `bidding` may import neither, and
+// reading them from `bidding/postgres.go` would be the import's effect without the import's
+// visibility — a second place that knows what `deactivated_at` and `email_verified_at` mean, in a
+// file whose header says it is the `bids` table in SQL. This is `acceptedBids`' arrangement pointing
+// a third way, and it is the argument bidding/ports.go makes about locking a `jobs` row.
+//
+// **`fleet.Service.Vehicle` is deliberately not used here even though `offerableVehicles` uses it.**
+// That method reads one vehicle scoped by its owner, which is the right shape for authorising one
+// write and the wrong shape for rendering a page: a page of a hundred offers would be a hundred
+// round trips. `fleet` has no batch read and adding one is an edit to a package this branch does not
+// own, so the statement is here — where a cross-domain read is allowed to be visible — and the
+// wave's handover records `fleet.Service.VehiclesByID` as the method that would replace it.
+//
+// # Two statements for the whole page, whatever is on it
+//
+// One over `users` and one over `vehicles`, each with an `= ANY($1)` over the identifiers the page
+// named. That is the point of [bidding.Directory] taking a map rather than answering one offer at a
+// time.
+//
+// # Nothing it selects could carry a budget, and nothing it selects is a declaration
+//
+// `users` is read for two verification timestamps, the account's standing and its creation date;
+// `vehicles` for the type, make, model and the four capacity columns. `provider_service_areas` and
+// `provider_specialties` are not read at all — SHIP-102a's *Done when* forbids both, and the way to
+// be sure of that is not to have a statement that could return them. `jobs` is not read either, so
+// there is no budget in reach of this file.
+type offerorDirectory struct{}
+
+// Describe reads the providers and vehicles one page of offers named.
+//
+// An offer whose provider or vehicle has no row is simply absent from the maps, which
+// [bidding.Service.Offers] renders with what it has. A page of offers must not fail because one of
+// them names something unreadable — and with `ON DELETE RESTRICT` on both references (000300,
+// 000504) the case is very nearly unreachable anyway.
+func (offerorDirectory) Describe(
+	ctx context.Context,
+	r db.Runner,
+	offers map[uuid.UUID]bidding.Offeror,
+) (map[uuid.UUID]bidding.OfferorDetail, error) {
+	providerIDs := make([]uuid.UUID, 0, len(offers))
+	vehicleIDs := make([]uuid.UUID, 0, len(offers))
+	seenProvider := make(map[uuid.UUID]bool, len(offers))
+	seenVehicle := make(map[uuid.UUID]bool, len(offers))
+
+	for _, offeror := range offers {
+		if !seenProvider[offeror.ProviderID] {
+			seenProvider[offeror.ProviderID] = true
+			providerIDs = append(providerIDs, offeror.ProviderID)
+		}
+		if offeror.VehicleID != uuid.Nil && !seenVehicle[offeror.VehicleID] {
+			seenVehicle[offeror.VehicleID] = true
+			vehicleIDs = append(vehicleIDs, offeror.VehicleID)
+		}
+	}
+
+	providers, err := describeProviders(ctx, r, providerIDs)
+	if err != nil {
+		return nil, err
+	}
+	vehicles, err := describeVehicles(ctx, r, vehicleIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	described := make(map[uuid.UUID]bidding.OfferorDetail, len(offers))
+	for bidID, offeror := range offers {
+		detail := bidding.OfferorDetail{Provider: providers[offeror.ProviderID]}
+		if vehicle, found := vehicles[offeror.VehicleID]; found {
+			detail.Vehicle, detail.HasVehicle = vehicle, true
+		}
+		described[bidID] = detail
+	}
+	return described, nil
+}
+
+// describeProviders is the closed customer-facing summary of each provider, from `users`.
+//
+// **The verification predicate is `fleet`'s, copied deliberately rather than abstracted.**
+// `fleet/eligibility.go`'s second filter is `u.status = 'active' AND u.email_verified_at IS NOT NULL
+// AND u.phone_verified_at IS NOT NULL`, and 000002's own comment says the five states of Docs/04 §4
+// will live in `profiles` when that domain is written. Two copies of one predicate is one more than
+// this repository wants, and the alternative today is worse: a port into `fleet` for a fact `fleet`
+// derives from `identity`'s table, to answer a question neither domain asked. Docs/11 §3 records
+// SHIP-153…SHIP-159 as what collapses both copies into `profiles`.
+func describeProviders(
+	ctx context.Context,
+	r db.Runner,
+	ids []uuid.UUID,
+) (map[uuid.UUID]bidding.ProviderSummary, error) {
+	summaries := make(map[uuid.UUID]bidding.ProviderSummary, len(ids))
+	if len(ids) == 0 {
+		return summaries, nil
+	}
+
+	const q = `
+		SELECT id,
+		       (status = 'active'
+		            AND email_verified_at IS NOT NULL
+		            AND phone_verified_at IS NOT NULL) AS verified,
+		       created_at
+		FROM users
+		WHERE id = ANY($1)`
+
+	rows, err := r.Query(ctx, q, ids)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: describing %d providers: %w", len(ids), err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var summary bidding.ProviderSummary
+		if err := rows.Scan(&summary.ID, &summary.Verified, &summary.MemberSince); err != nil {
+			return nil, fmt.Errorf("cmd/api: describing one of %d providers: %w", len(ids), err)
+		}
+		summaries[summary.ID] = summary
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: describing %d providers: %w", len(ids), err)
+	}
+	return summaries, nil
+}
+
+// describeVehicles is the customer-facing description of each vehicle, from `vehicles`.
+//
+// **`registration` is not selected**, which is the same reason it is not a field on
+// bidding.VehicleSummary: a plate identifies a vehicle in the physical world and a comparison screen
+// is choosing between offers rather than meeting a driver. Not selecting it is stronger than not
+// rendering it.
+//
+// **`deactivated_at` is not read either, and that is deliberate rather than an omission.** An offer
+// made with a vehicle that has since left service still stands on it — 000504's `ON DELETE RESTRICT`
+// and bidding.Vehicles' doc comment are the same sentence — so a customer comparing last week's
+// offers has to see the vehicle they were made with. The check that a vehicle is in service belongs
+// where the offer is *written*, which is `offerableVehicles` above.
+func describeVehicles(
+	ctx context.Context,
+	r db.Runner,
+	ids []uuid.UUID,
+) (map[uuid.UUID]bidding.VehicleSummary, error) {
+	summaries := make(map[uuid.UUID]bidding.VehicleSummary, len(ids))
+	if len(ids) == 0 {
+		return summaries, nil
+	}
+
+	const q = `
+		SELECT id, vehicle_type, COALESCE(make, ''), COALESCE(model, ''),
+		       COALESCE(max_weight_kg, 0), COALESCE(load_length_cm, 0),
+		       COALESCE(load_width_cm, 0), COALESCE(load_height_cm, 0)
+		FROM vehicles
+		WHERE id = ANY($1)`
+
+	rows, err := r.Query(ctx, q, ids)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: describing %d vehicles: %w", len(ids), err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var summary bidding.VehicleSummary
+		if err := rows.Scan(
+			&summary.ID, &summary.Type, &summary.Make, &summary.Model,
+			&summary.MaxWeightKg, &summary.LengthCm, &summary.WidthCm, &summary.HeightCm,
+		); err != nil {
+			return nil, fmt.Errorf("cmd/api: describing one of %d vehicles: %w", len(ids), err)
+		}
+		summaries[summary.ID] = summary
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: describing %d vehicles: %w", len(ids), err)
+	}
+	return summaries, nil
+}

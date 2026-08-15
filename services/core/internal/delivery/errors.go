@@ -183,10 +183,14 @@ var (
 	// it would discard the driver's record; a premature one succeeds unchanged as soon as the
 	// delivery reaches that point, so refusing it costs a retry.
 	//
-	// A job cancelled or disputed before it ever reached the milestone is refused here too, and
-	// **that is SHIP-113's case** rather than this one's: "a queued update that contradicts an
-	// administrative action loses… the attempt is retained in history". Retaining it is that
-	// ticket's change.
+	// **SHIP-113 took a second half away from this sentinel, and it is the half that used to
+	// lose a record.** A job cancelled, disputed or completed before the milestone ever reached
+	// it was refused here too — and the transaction rolled back, so the driver's row went with
+	// it, and the photograph attached to it. Docs/02 §3.1's fourth bullet had always said
+	// otherwise: "a queued update that contradicts an administrative action loses… the attempt
+	// is retained in history". That case is now [JobLostTheDelivery] and [OutcomeOverruled], and
+	// what remains under this sentinel is the premature milestone alone — the one a retry fixes
+	// on its own, which is why refusing it costs nothing.
 	ErrMilestoneNotPermitted = errors.New("delivery: this milestone cannot be recorded from the job's current status")
 
 	// ErrMilestoneVanished means the unique index refused a duplicate and no row exists for the
@@ -197,6 +201,16 @@ var (
 	// is here so that an impossible state becomes a 500 with a cause in the log rather than a
 	// reply that invents an answer.
 	ErrMilestoneVanished = errors.New("delivery: a milestone was refused as a duplicate of a row that is not there")
+
+	// ErrUnknownRecorder means a milestone was being written for an actor this domain cannot
+	// attribute it to (SHIP-120a).
+	//
+	// A defect here rather than anything a caller did: every entry point builds the [Recorder]
+	// itself, from a credential the guard has already verified, so a zero or unmapped one means a
+	// path was added without deciding whose row `actor_id` names. It is refused in front of the
+	// insert because the alternative is ck_milestones_actor_type answering with a constraint name
+	// and a 500, three frames further in and after a row has been attempted.
+	ErrUnknownRecorder = errors.New("delivery: a milestone was recorded for an actor this domain cannot attribute")
 
 	// ErrInvalidKeyset means the driver token signing material cannot be used to sign anything
 	// (SHIP-107).

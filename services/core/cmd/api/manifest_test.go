@@ -108,7 +108,7 @@ func TestTheRouterBuildsWithoutADatabaseOrACache(t *testing.T) {
 	deps := testDeps()
 	deps.Pool, deps.Redis = nil, nil
 
-	router := newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard())
+	router := newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard())
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -125,6 +125,11 @@ func TestTheRouterBuildsWithoutADatabaseOrACache(t *testing.T) {
 // security consequence rather than a routing detail — which is the point of keeping the list
 // here, short, and in the same file as the test that enforces it.
 var publicMutatingRoutes = map[string]bool{
+	// SHIP-147. An endpoint that hands out an administrator credential cannot require one.
+	// Rate limited per account and per address, like every other entry here, and the two
+	// figures are internal/admin's rather than internal/identity's — see credentials.go.
+	"POST /v1/admin/sessions": true,
+
 	"POST /v1/auth/register":      true, // SHIP-30
 	"POST /v1/auth/login":         true, // SHIP-41
 	"POST /v1/auth/refresh":       true, // SHIP-42

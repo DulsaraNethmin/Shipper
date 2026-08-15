@@ -1,8 +1,8 @@
 import { isJobId } from "@/lib/link";
+import { isJSON, passThrough, platform, refuse, unreachable } from "@/lib/upstream";
 
 /**
- * The portal's one outbound call, forwarded to `GET /v1/driver/jobs/{id}` and to nothing else
- * (SHIP-120).
+ * The delivery read, forwarded to `GET /v1/driver/jobs/{id}` and to nothing else (SHIP-120).
  *
  * # Why this exists at all, given there is no BFF tier
  *
@@ -37,6 +37,15 @@ import { isJobId } from "@/lib/link";
  * refused unless it is a job identifier. `..%2f..%2fjobs` does not construct a URL here; it
  * produces a `400` and no outbound request.
  *
+ * **SHIP-121 and SHIP-122 add two more route files rather than widening this one**, and each is the
+ * same shape: one method, one upstream template, one hole, refused unless it is a job identifier.
+ * The property this file claims — "can only ever reach one endpoint" — is a property of *each*
+ * file, so it survives the portal growing from one outbound call to three. What would have
+ * destroyed it is the tidy-up nobody should make: a shared `forward(path, …)` in `lib/`, which is
+ * the `rewrites()` entry again with more steps. `lib/upstream.ts` deliberately holds no path and
+ * makes no request, and `lib/surface.test.ts` fails if a file that mentions `/v1/` carries more
+ * than one template.
+ *
  * That refusal is **not an authorisation decision**. It does not decide who may see what — it
  * declines to build a URL other than the one this route exists for. Whether the caller may open
  * that job is the platform's answer, and it is the only answer forwarded below.
@@ -49,30 +58,6 @@ import { isJobId } from "@/lib/link";
  * the only thing in the path. Nothing else is forwarded: no cookies, no query string, no client
  * headers beyond the credential and the media type.
  */
-
-/**
- * Where the platform is, read per request rather than inlined at build time.
- *
- * The default is the port `make run` serves on in a primary tree. A worktree serving elsewhere, or
- * any deployment at all, sets `SHIPPER_API_BASE_URL` — see this application's README.
- */
-function platform(): string {
-  return (process.env.SHIPPER_API_BASE_URL ?? "http://localhost:8080").replace(/\/+$/, "");
-}
-
-/**
- * A refusal in the platform's own error contract, so the browser has one parser rather than two.
- *
- * There is no `request_id`, and its absence is the honest signal: this refusal was made here and
- * no request reached the platform, so there is no identifier for anybody to look up.
- */
-function refuse(status: number, code: string, message: string): Response {
-  return Response.json({ error: { code, message } }, {
-    status,
-    headers: { "cache-control": "no-store" },
-  });
-}
-
 export async function GET(
   request: Request,
   context: { params: Promise<{ jobId: string }> },
@@ -95,19 +80,10 @@ export async function GET(
       cache: "no-store",
     });
   } catch {
-    return refuse(503, "service_unavailable", "The delivery service is not answering. Try again in a moment.");
+    return unreachable();
   }
 
-  // Only a JSON answer is passed through. Anything else came from something between here and the
-  // platform — a load balancer's HTML error page is the usual one — and forwarding it under a JSON
-  // content type would hand the browser a body it cannot parse and a status it would act on.
-  const contentType = upstream.headers.get("content-type") ?? "";
-  if (!contentType.toLowerCase().startsWith("application/json")) {
-    return refuse(503, "service_unavailable", "The delivery service is not answering. Try again in a moment.");
-  }
+  if (!isJSON(upstream)) return unreachable();
 
-  return new Response(await upstream.text(), {
-    status: upstream.status,
-    headers: { "content-type": "application/json", "cache-control": "no-store" },
-  });
+  return passThrough(upstream);
 }

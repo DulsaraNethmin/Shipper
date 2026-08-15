@@ -3,6 +3,7 @@ package delivery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -51,38 +52,52 @@ func (j testJobs) MoveToDriverAssigned(ctx context.Context, r db.Runner, jobID, 
 	})
 }
 
-func (j testJobs) MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
-	return j.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusEnRouteToPickup,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: at,
-	})
+func (j testJobs) MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, at time.Time) (JobMove, error) {
+	return j.moveBy(ctx, r, jobID, jobs.StatusEnRouteToPickup, by, at)
 }
 
-func (j testJobs) MoveToPickedUp(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
-	return j.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusPickedUp,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: at,
-	})
+func (j testJobs) MoveToPickedUp(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, at time.Time) (JobMove, error) {
+	return j.moveBy(ctx, r, jobID, jobs.StatusPickedUp, by, at)
 }
 
-func (j testJobs) MoveToInTransit(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
-	return j.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusInTransit,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: at,
-	})
+func (j testJobs) MoveToInTransit(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, at time.Time) (JobMove, error) {
+	return j.moveBy(ctx, r, jobID, jobs.StatusInTransit, by, at)
 }
 
-func (j testJobs) MoveToDelivered(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, at time.Time) (JobMove, error) {
+func (j testJobs) MoveToDelivered(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, at time.Time) (JobMove, error) {
+	return j.moveBy(ctx, r, jobID, jobs.StatusDelivered, by, at)
+}
+
+// moveBy is cmd/api/routes_delivery.go's actor translation, copied here for the reason this file's
+// header gives about the rest of the adapter (SHIP-120a).
+//
+// An actor with no mapping is an error rather than a default, exactly as the production copy makes
+// it. That is the half worth duplicating faithfully: defaulting to the provider would let a driver's
+// milestone write a history row saying a provider moved the job, and both copies would agree about
+// it.
+func (j testJobs) moveBy(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+	to jobs.Status,
+	by Recorder,
+	at time.Time,
+) (JobMove, error) {
+	var kind jobs.ActorType
+	switch by.Type {
+	case ActorProvider:
+		kind = jobs.ActorProvider
+	case ActorDriver:
+		kind = jobs.ActorDriver
+	default:
+		return JobMoveUnrecognised, fmt.Errorf(
+			"delivery: %q is not an actor this adapter can attribute a transition to", by.Type)
+	}
+
 	return j.move(ctx, r, jobs.Move{
 		JobID:      jobID,
-		To:         jobs.StatusDelivered,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		To:         to,
+		Actor:      jobs.User(kind, by.ID),
 		RecordedAt: at,
 	})
 }
@@ -123,7 +138,23 @@ func (j testJobs) refusal(ctx context.Context, r db.Runner, m jobs.Move) (JobMov
 			return JobAlreadyPast, nil
 		}
 	}
+
+	// SHIP-113, and the order matters: a job that reached 'Delivered' and was then disputed
+	// satisfies both tests, and it is the first of them. The production copy says the same.
+	if len(history) > 0 && testOutOfTheDelivery(history[len(history)-1].To) {
+		return JobLostTheDelivery, nil
+	}
 	return JobNotAssignable, nil
+}
+
+// testOutOfTheDelivery is cmd/api's outOfTheDelivery — the statuses Docs/02 §2 gives a job no way
+// back into a delivery from (SHIP-113).
+//
+// The third copy of the same three statuses, and the one that would drift silently, so
+// TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays derives the set from jobs.Permitted and
+// holds this function to it.
+func testOutOfTheDelivery(s jobs.Status) bool {
+	return s == jobs.StatusCancelled || s == jobs.StatusCompleted || s == jobs.StatusDisputed
 }
 
 // testAwards is delivery.Awards over the accepted bid, as cmd/api reads it.
@@ -156,19 +187,19 @@ func (s staticJobs) MoveToDriverAssigned(context.Context, db.Runner, uuid.UUID, 
 	return s.move, s.err
 }
 
-func (s staticJobs) MoveToEnRouteToPickup(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+func (s staticJobs) MoveToEnRouteToPickup(context.Context, db.Runner, uuid.UUID, Recorder, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 
-func (s staticJobs) MoveToPickedUp(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+func (s staticJobs) MoveToPickedUp(context.Context, db.Runner, uuid.UUID, Recorder, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 
-func (s staticJobs) MoveToInTransit(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+func (s staticJobs) MoveToInTransit(context.Context, db.Runner, uuid.UUID, Recorder, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 
-func (s staticJobs) MoveToDelivered(context.Context, db.Runner, uuid.UUID, uuid.UUID, time.Time) (JobMove, error) {
+func (s staticJobs) MoveToDelivered(context.Context, db.Runner, uuid.UUID, Recorder, time.Time) (JobMove, error) {
 	return s.move, s.err
 }
 
@@ -192,8 +223,9 @@ func newTestService() *Service {
 // to rediscover four times. SHIP-114's upload signer and policy arrive the same way, and SHIP-115's
 // object reader and ownership lookup after them.
 func newTestServiceWith(lifecycle Jobs) *Service {
-	return NewService(lifecycle, testAwards{}, testJobOwners(), testDriverIssuer(testClock()),
-		&recordingUploads{}, newRecordingObjects(), testUploadPolicy(), testClock())
+	return NewService(events.NewOutbox(), lifecycle, testAwards{}, testJobOwners(),
+		testDriverIssuer(testClock()), &recordingUploads{}, newRecordingObjects(),
+		testUploadPolicy(), testClock())
 }
 
 // testJobOwners is delivery.JobOwners over jobs.Service.Job, as cmd/api reads it.
@@ -784,6 +816,7 @@ func TestAJobPastDriverAssignedIsRefused(t *testing.T) {
 
 // collaborators is everything [NewService] insists on, for the test below.
 type collaborators struct {
+	sink    EventSink
 	jobs    Jobs
 	awards  Awards
 	owners  JobOwners
@@ -803,6 +836,7 @@ type collaborators struct {
 // that is known to work makes each case a statement about one field.
 func workingCollaborators() collaborators {
 	return collaborators{
+		sink:    events.NewOutbox(),
 		jobs:    staticJobs{move: JobMoved},
 		awards:  testAwards{},
 		owners:  testJobOwners(),
@@ -823,17 +857,20 @@ func workingCollaborators() collaborators {
 // at all (SHIP-114), without an object reader the platform can only take the client's word that a
 // photograph exists (SHIP-115), and without a clock a milestone recorded with no actor-supplied
 // time has nothing to be stamped from. A service that started without any of them would fail
-// silently, in production, at the first request.
+// silently, in production, at the first request. **Without an event sink (SHIP-136) it would fail
+// most silently of all**: every row is written and every response is correct, and the only symptom
+// is a notification nobody receives.
 func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 	// The base itself must build, or every case below would "pass" for the wrong reason.
 	base := workingCollaborators()
-	NewService(base.jobs, base.awards, base.owners, base.tokens,
+	NewService(base.sink, base.jobs, base.awards, base.owners, base.tokens,
 		base.uploads, base.objects, base.policy, base.clk)
 
 	for _, tc := range []struct {
 		name   string
 		remove func(*collaborators)
 	}{
+		{"no event sink", func(c *collaborators) { c.sink = nil }},
 		{"no job lifecycle", func(c *collaborators) { c.jobs = nil }},
 		{"no award lookup", func(c *collaborators) { c.awards = nil }},
 		{"no job ownership lookup", func(c *collaborators) { c.owners = nil }},
@@ -842,7 +879,8 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 		{"no way to read an object back", func(c *collaborators) { c.objects = nil }},
 		{"no size limit", func(c *collaborators) { c.policy.MaxBytes = 0 }},
 		{"no accepted content types", func(c *collaborators) { c.policy.AcceptedContentTypes = nil }},
-		{"no URL lifetime", func(c *collaborators) { c.policy.URLTTL = 0 }},
+		{"no upload lifetime", func(c *collaborators) { c.policy.UploadTTL = 0 }},
+		{"no download lifetime", func(c *collaborators) { c.policy.DownloadTTL = 0 }},
 		{"no clock", func(c *collaborators) { c.clk = nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -854,7 +892,8 @@ func TestNewServiceRefusesAMissingCollaborator(t *testing.T) {
 
 			c := workingCollaborators()
 			tc.remove(&c)
-			NewService(c.jobs, c.awards, c.owners, c.tokens, c.uploads, c.objects, c.policy, c.clk)
+			NewService(c.sink, c.jobs, c.awards, c.owners, c.tokens, c.uploads, c.objects,
+				c.policy, c.clk)
 		})
 	}
 }

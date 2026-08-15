@@ -161,7 +161,19 @@ func TestEveryEventIsPublishable(t *testing.T) {
 // emitted from code that forgot to register it, which fails at the first emission rather than at
 // build time.
 func TestEveryEventTypeTheServiceNamesIsRegistered(t *testing.T) {
-	want := []string{"job.status_changed", "job.expiry_warned", "job.expiry_extended"}
+	want := []string{
+		"job.status_changed", "job.expiry_warned", "job.expiry_extended",
+
+		// SHIP-136, and `bid.expired` from SHIP-89. That one was deliberately absent for a
+		// wave: bidding.StatusExpired was declared and nothing wrote it, and a schema
+		// registered for an event nothing emits puts a line in the golden file describing a
+		// payload no code marshals — which reads as covered when it is not. The scheduled
+		// sweep is the writer, and the schema landed in the same commit as the first row.
+		"bid.placed", "bid.revised", "bid.withdrawn",
+		"bid.countered", "bid.accepted", "bid.rejected", "bid.expired",
+
+		"delivery.driver_assigned", "delivery.milestone_recorded", "delivery.proof_recorded",
+	}
 	sort.Strings(want)
 
 	got := make([]string, 0, len(events.Catalogue()))

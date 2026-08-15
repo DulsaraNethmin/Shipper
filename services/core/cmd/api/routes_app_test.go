@@ -33,7 +33,7 @@ func withApp(deps Deps, app config.App) Deps {
 func routerWithApp(t *testing.T, app config.App) http.Handler {
 	t.Helper()
 	return newRouter(withApp(testDeps(), app), idempotency.NewMemoryStore(),
-		testAuthenticator(), testDriverGuard())
+		testAuthenticator(), testDriverGuard(), testAdminGuard())
 }
 
 // TestTheAppFixtureOverwritesNothingButApp is the guard on that shape rather than on any value in

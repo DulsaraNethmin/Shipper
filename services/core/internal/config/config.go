@@ -60,6 +60,7 @@ type Config struct {
 	Delivery    Delivery
 	Email       Email
 	SMS         SMS
+	Push        Push
 	Geocoding   Geocoding
 	Pagination  Pagination
 	Storage     Storage
@@ -136,7 +137,7 @@ type Storage struct {
 	// deployment against AWS sets it false.
 	UsePathStyle bool
 
-	// PresignTTL is how long an issued pre-signed URL works for.
+	// PresignTTL is how long an issued **upload** URL works for.
 	//
 	// Short, and bounded at load, for the reason the driver token is: **nothing can revoke one
 	// once it is signed.** The URL is the whole of the authorisation — Docs/06 §5.2 puts the
@@ -145,6 +146,26 @@ type Storage struct {
 	// phone on a poor connection to finish an upload it has already started, which is the only
 	// thing it has to outlast.
 	PresignTTL time.Duration
+
+	// DownloadTTL is how long an issued **download** URL works for, and it is a separate number
+	// because the two directions have nothing in common but the mechanism (SHIP-15r).
+	//
+	// SHIP-114 signed uploads with PresignTTL; SHIP-115 added the downloads and reused it, and both
+	// tickets recorded the request rather than parking a flag, because a field here is a
+	// shared-surface edit a domain branch may not make. This is that field.
+	//
+	// **Only one of the two requirements is generous.** An upload link has to outlast a phone
+	// finishing a slow PUT on a bad connection — minutes of a transfer that has already started. A
+	// download link has to outlast an image rendering, which is seconds. One number serving both
+	// therefore errs long in the direction that costs something: every read link is a live,
+	// unrevocable link to a photograph of somebody's front door, and it stayed live for as long as
+	// an *upload* needed.
+	//
+	// Five minutes rather than one, so that a customer's tracking view can sit open, a phone can
+	// change network mid-fetch, and a moderator can open several photographs from one listing
+	// without the first expiring underneath them. Bounded by the same [maxPresignTTL], for the
+	// same reason: nothing revokes either kind once it is signed.
+	DownloadTTL time.Duration
 
 	// MaxUploadBytes is the largest object the platform will issue an upload URL for.
 	//
@@ -341,9 +362,39 @@ type SMS struct {
 	Sender string
 }
 
+// Push configures the Firebase Cloud Messaging adapter (SHIP-139), consumed by cmd/notifier.
+//
+// The same shape as [Email] and [SMS] and chosen the same way — from Env, not from here. It matters
+// for the same reason SMS does and more sharply: a message reaches a real handset, and unlike an
+// email there is no address to inspect afterwards to work out whose.
+//
+// # Why there is a credential rather than a key file
+//
+// FCM's HTTP v1 API takes a short-lived OAuth access token, and Google's way of obtaining one is to
+// exchange a service-account JSON key for it. **Nothing in this repository performs that exchange**:
+// it needs golang.org/x/oauth2/google, which is a module and therefore a go.mod change SHIP-139's
+// branch could not make. See internal/platform/push/doc.go.
+//
+// So this holds the bearer credential itself, and whatever mints it is outside this service today.
+// A service-account key is on CLAUDE.md's never-commit list and this variable is not where one
+// would go: it is a token, it expires, and it belongs in the CI secret store like every other
+// credential (Docs/06 §5.2).
+type Push struct {
+	// ProjectID is the Firebase project. Empty means the no-op implementation, whatever the
+	// environment — which is the state of every deployment today, because no project exists.
+	ProjectID string
+
+	// BaseURL overrides Google's, for a test or a proxy. Empty means push.DefaultBaseURL.
+	BaseURL string
+
+	// Credential is presented to FCM as a bearer token and is never logged.
+	Credential string
+}
+
 // Argon2 is the password hashing cost.
 //
-// It mirrors identity.Argon2Profile, which is the type the domain takes. Two shapes rather than
+// It mirrors passwords.Argon2Profile, which is the type the hasher takes — internal/identity's
+// until SHIP-15r moved the hashing to infrastructure. Two shapes rather than
 // one shared type on purpose: internal/config does not import a domain, the domain does not
 // import configuration, and the two meet in cmd/api — which is the rule that keeps every domain
 // independently buildable (Docs/06 §4.1).
@@ -653,6 +704,11 @@ func Load() (*Config, error) {
 			ProviderAPIKey:  l.str("SMS_PROVIDER_API_KEY", ""),
 			Sender:          l.str("SMS_SENDER", "Shipper"),
 		},
+		Push: Push{
+			ProjectID:  l.str("PUSH_PROJECT_ID", ""),
+			BaseURL:    l.str("PUSH_BASE_URL", ""),
+			Credential: l.str("PUSH_CREDENTIAL", ""),
+		},
 		Geocoding: Geocoding{
 			ProviderBaseURL: l.str("GEOCODING_BASE_URL", ""),
 			ProviderAPIKey:  l.str("GEOCODING_API_KEY", ""),
@@ -675,6 +731,7 @@ func Load() (*Config, error) {
 			SecretAccessKey: l.str("STORAGE_SECRET_ACCESS_KEY", developmentStorageSecretAccessKey),
 			UsePathStyle:    l.boolean("STORAGE_USE_PATH_STYLE", true),
 			PresignTTL:      l.duration("STORAGE_PRESIGN_TTL", 15*time.Minute),
+			DownloadTTL:     l.duration("STORAGE_DOWNLOAD_TTL", 5*time.Minute),
 			MaxUploadBytes: int64(l.boundedInt("STORAGE_MAX_UPLOAD_BYTES",
 				defaultMaxUploadBytes, smallestMaxUploadBytes, largestMaxUploadBytes)),
 			AcceptedContentTypes: l.csv("STORAGE_ACCEPTED_CONTENT_TYPES",
@@ -737,6 +794,11 @@ func (c Config) LogValue() slog.Value {
 		slog.String("email_sender", c.Email.Sender),
 		slog.Bool("sms_provider_configured", c.SMS.ProviderBaseURL != ""),
 		slog.String("sms_sender", c.SMS.Sender),
+		// The project, which is not secret and is the value somebody needs when a push has
+		// not arrived — a wrong one is a 404 per message, which SHIP-139 reads as the token
+		// being dead. Never the credential.
+		slog.String("push_project", c.Push.ProjectID),
+		slog.Bool("push_credential_configured", c.Push.Credential != ""),
 		// The bucket and the endpoint, never the credential. The bucket is the one worth
 		// insisting on: it is per-worktree in development, and a process writing into the
 		// wrong one succeeds at everything and puts the objects where nobody looks.
@@ -745,6 +807,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("storage_region", c.Storage.Region),
 		slog.Bool("storage_path_style", c.Storage.UsePathStyle),
 		slog.Duration("storage_presign_ttl", c.Storage.PresignTTL),
+		slog.Duration("storage_download_ttl", c.Storage.DownloadTTL),
 		slog.Int64("storage_max_upload_bytes", c.Storage.MaxUploadBytes),
 	)
 }
@@ -1113,10 +1176,32 @@ func (l *loader) validate(cfg *Config) {
 	// See [maxPresignTTL]: a pre-signed URL is the whole of the authorisation and nothing
 	// revokes one, so an over-long window is a standing grant to a photograph of somebody's
 	// front door for whoever the link reaches.
+	//
+	// Both directions are bounded, and the download is checked separately rather than by taking
+	// the larger of the two: they are independent settings and a deployment that raised only the
+	// read window would otherwise pass unnoticed (SHIP-15r).
 	if cfg.Storage.PresignTTL > maxPresignTTL {
 		l.errf("STORAGE_PRESIGN_TTL (%s) is longer than %s; a pre-signed URL cannot be revoked "+
 			"once it is signed, so the window is the whole of the exposure",
 			cfg.Storage.PresignTTL, maxPresignTTL)
+	}
+	if cfg.Storage.DownloadTTL > maxPresignTTL {
+		l.errf("STORAGE_DOWNLOAD_TTL (%s) is longer than %s; a pre-signed URL cannot be revoked "+
+			"once it is signed, and a read link is a live link to a photograph",
+			cfg.Storage.DownloadTTL, maxPresignTTL)
+	}
+
+	// Zero is refused for both, and it is a real mistake rather than a hypothetical one: an
+	// unparseable duration is reported by [loader.duration] and a *deliberate* `0s` is not, so
+	// without this the first symptom is a startup panic from delivery's handler — a configuration
+	// fault reported as a wiring one, at the point furthest from the line that caused it.
+	if cfg.Storage.PresignTTL <= 0 {
+		l.errf("STORAGE_PRESIGN_TTL (%s) must be positive; nothing could be uploaded",
+			cfg.Storage.PresignTTL)
+	}
+	if cfg.Storage.DownloadTTL <= 0 {
+		l.errf("STORAGE_DOWNLOAD_TTL (%s) must be positive; no proof could be read back",
+			cfg.Storage.DownloadTTL)
 	}
 
 	// A credential with nowhere to go is the shape of a half-finished configuration, and the

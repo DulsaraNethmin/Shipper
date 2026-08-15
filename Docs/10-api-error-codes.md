@@ -48,8 +48,16 @@ them where the call is made, beside the thing the user was trying to do.
 
 | Code | Meaning |
 |---|---|
+| `admin_account_disabled` | This administrator account has been disabled. Ask whoever administers the platform to restore it; signing in again will not help. |
+| `admin_credentials_invalid` | That email address and password do not match an administrator account. Deliberately one code for both halves, so this endpoint cannot be used to find out which addresses are administrators. |
 | `admin_dispute_already_open` | This job already has a dispute waiting on an outcome. Open it rather than raising another — one job is disputed once at a time. |
+| `admin_email_taken` | An administrator account already exists with that email address. |
+| `admin_job_already_unpublished` | This job has already been unpublished. Reload it to see who removed it and why. |
 | `admin_job_not_disputable` | A dispute can only be raised on a job that has been awarded and has not yet been completed or cancelled. Reload the job to see its current status. |
+| `admin_job_not_unpublishable` | A job can only be unpublished before it is awarded. Once a provider has committed, ending it is a dispute an administrator resolves — reload the job to see its current status. |
+| `admin_permission_denied` | This administrator account does not have permission to do that. Ask whoever administers the platform if you need it. |
+| `admin_session_expired` | The administrator session has ended, through inactivity or by reaching its maximum length. Sign in again. |
+| `admin_user_standing_unchanged` | This account already has that standing. Reload it — another administrator may have changed it already, and the audit trail will say who. |
 | `bidding_already_bid` | You already have a live offer on this job. Revise or withdraw it rather than placing a second. |
 | `bidding_bid_accepted` | That offer has been accepted. An accepted bid can be neither revised nor withdrawn. |
 | `bidding_bid_closed` | That offer is no longer live, so it can be neither changed nor answered. |
@@ -77,3 +85,4 @@ them where the call is made, beside the thing the user was trying to do.
 | `jobs_not_a_draft` | The job has been published and can no longer be edited as a draft. Reload it to see its current status. |
 | `jobs_not_cancellable` | The job can no longer be cancelled. Once a provider has been awarded the work, ending the job is a support matter rather than a state change. Reload it to see its current status. |
 | `jobs_not_extendable` | The job's expiry cannot be extended. Either it is not being offered to providers any more, or its pickup date is what is ending it — and no amount of extra listing time keeps a job alive past the date its goods were to be collected. |
+| `notifications_no_device_session` | That credential does not name a device session, so there is nothing to register a push token against. Sign in again. |

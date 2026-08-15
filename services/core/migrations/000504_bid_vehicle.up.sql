@@ -1,0 +1,72 @@
+-- SHIP-102a: the vehicle an offer is made with — the seam 000500 and 000501 both deferred.
+--
+-- # This is the trigger those two migrations named, arriving
+--
+-- 000500 handed "the vehicle or vehicles a bid is offered on" to SHIP-84. SHIP-84 declined it in
+-- 000501, under the ticket `???`, and gave three reasons: it is not in that ticket's *Done when*
+-- ("price and timing"), Docs/01 §4.3 wants it for the **customer's** comparison, and validating it
+-- needs a second `fleet` fact — that the vehicle is the caller's and in service — "and therefore a
+-- second port, which is more design than a three-point ticket should be taking on somebody else's
+-- behalf".
+--
+-- SHIP-102a is that somebody. Its *Done when* is "each element carrying the offer's price and
+-- timing, a closed customer-facing provider summary **and the vehicle it is offered with**", so the
+-- read cannot be written without the column, and the second port is now being taken on its own
+-- behalf rather than guessed at on another ticket's.
+--
+-- # One column and not a join table, and Docs/01 §4.2's "one or more" is why that needs arguing
+--
+-- 000500 read "add, edit, deactivate, and select one or more vehicles" literally and said a literal
+-- reading "is a join table rather than a column". Taken here as a column anyway, for three reasons
+-- in the order they weighed:
+--
+--   1. **Docs/01 §4.3 is the sentence this column exists to serve, and it is singular.** "Allow a
+--      customer to compare price, timing, provider profile, **vehicle**, and declared capability."
+--      §4.2's sentence is about the fleet *verbs* a provider has — a provider selects among the one
+--      or more vehicles they run — and says nothing about how many attach to one offer.
+--   2. **Comparability, which is 000501's own first argument for two instants over two windows.**
+--      "Two instants sort; four numbers do not, and a customer comparing five bids would be reading
+--      twenty timestamps." A set of vehicles per offer is that failure again: five offers of three
+--      trucks each is fifteen vehicles on a comparison screen, and no ordering over them.
+--   3. **It is the reversible direction**, which is 000501's third. Widening one column into a join
+--      table later is additive — the table is created, the column is backfilled into it and dropped.
+--      Narrowing a populated join table into one column is a data migration over offers people have
+--      already made, with no honest answer for which of three vehicles the commitment was.
+--
+-- # Nullable, and that is a statement about existing offers rather than a weakened rule
+--
+-- Every offer already placed was placed without one, and there is no vehicle to backfill them with:
+-- a provider may run several, and choosing one on their behalf would be the platform inventing a
+-- commitment nobody made. `NOT NULL` would therefore have to invent one or refuse to migrate.
+--
+-- It stays nullable afterwards for the same reason stated forwards: `POST /v1/jobs/{id}/bids`
+-- accepts `vehicle_id` and does not require it, so that SHIP-84's served request schema keeps
+-- working for every client written against it (Docs/10 §4.2 — a field added to a request is
+-- optional or it is a new endpoint). The customer's screen renders "no vehicle stated", which is
+-- the truth about that offer.
+--
+-- # ON DELETE RESTRICT, which is the same answer 000500 gave for the job
+--
+-- Docs/10 §3.3 and 000300's own header: nothing deletes a vehicle, because it is named by the bid
+-- that won a job and by the delivery that followed. This constraint is that sentence made true from
+-- the other end — the row a bid names cannot go away underneath it. A vehicle leaves service through
+-- `deactivated_at`, and an offer already made with it keeps naming it, which is what a customer
+-- comparing offers from last week has to see.
+--
+-- **There is deliberately no CHECK that the vehicle belongs to the bidding provider.** It is a
+-- cross-row invariant over two tables, which is a trigger rather than a constraint, and 000300 and
+-- 000500 both take the same line about the provider's role: what cannot be true is a constraint,
+-- what a rule decides is enforced where the rule lives. `bidding.Service` asks `fleet` through
+-- [bidding.Vehicles] in the transaction that writes the row, which is the one place that can also
+-- answer "and is it in service".
+--
+-- # No index
+--
+-- Nothing queries by it. The read this column exists for selects a page of `bids` by `job_id` and
+-- then describes the vehicles that page named, so the column is only ever projected. A foreign key
+-- does not need one to be checked in this direction, and an index nothing reads is a write cost per
+-- offer for nobody.
+ALTER TABLE bids ADD COLUMN vehicle_id uuid REFERENCES vehicles (id) ON DELETE RESTRICT;
+
+COMMENT ON COLUMN bids.vehicle_id IS
+    'The vehicle the offer is made with, or NULL when the provider named none. Docs/01 §4.3''s "compare price, timing, provider profile, vehicle, and declared capability" is the only reader (SHIP-102a). Validated against fleet at placement — the caller''s own, and in service — rather than by a constraint, because that is a fact about another table.';

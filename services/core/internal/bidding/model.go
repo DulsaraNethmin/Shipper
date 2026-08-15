@@ -7,93 +7,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// Status is one of the eight bid states in Docs/02 §4.
+// The eight bid statuses are generated (SHIP-56a).
 //
-// The values are the document's own strings, because Docs/10 §3.4 requires it and the reason is
-// that three languages hold a copy of this list. Go, Dart and TypeScript can each be diffed
-// against Docs/02 rather than against one another, and a value that has drifted is visible
-// without holding two files side by side. SHIP-56a generates the other two; this is the Go copy
-// until it does.
+// contracts/statuses.yaml is the source and status_gen.go beside this file is the Go form:
+// Status, its constants, Statuses, Valid, String, Wire and StatusFromWire. Docs/10 §8.2 named
+// that arrangement before there was a generator, and the argument for why nothing writes
+// 'Countered' — which used to sit here and, in almost the same words, in the Dart client — is
+// now in the specification and rendered into all three languages from it.
 //
-// These eight happen to be single words in sentence case, unlike the twelve job statuses, so
-// storing them unaltered looks like it costs nothing. It is the same rule all the same — the
-// document is the source, and the moment somebody lower-cases one of them here the pairing test
-// against ck_bids_status is what says so.
-//
-// The wire form is deliberately not here. Docs/10 §4.7 puts enum values on the wire in lower
-// snake case, and [jobs.Status.Wire] arrived only when SHIP-61 became the first endpoint that had
-// to serialise one. SHIP-80 adds no endpoint, so adding the mapping now would be adding an
-// untested transformation with no caller.
-//
-// SHIP-84 is that endpoint, and [Status.Wire] is below.
-type Status string
-
-const (
-	// StatusDraft is an offer the provider is composing and nobody else can see.
-	StatusDraft Status = "Draft"
-
-	// StatusSubmitted is a live offer awaiting the other party.
-	StatusSubmitted Status = "Submitted"
-
-	// StatusCountered is an offer that has been answered with a different price or timing.
-	//
-	// **Nothing writes it, and SHIP-87 decided that deliberately rather than by omission.** Docs/02
-	// §4 lists it beside 'Superseded' and describes the two in almost the same words — one offer
-	// "answered with a different price or timing", the other "displaced by a counter from either
-	// party" — which are the same event seen from the two ends. A platform that wrote both would be
-	// writing two statuses for one transition and would then have to say which of them a client
-	// branches on.
-	//
-	// 'Superseded' is the one written, for a reason outside this file: [CodeBidClosed] and the
-	// `BidNoLongerYours` response in contracts/paths/bidding.yaml have both enumerated "rejected,
-	// expired, superseded" as the closed statuses since SHIP-85, and neither names 'Countered'. The
-	// published vocabulary had already made the choice; this constant is what records that it was
-	// noticed rather than overlooked.
-	//
-	// It stays in `ck_bids_status` because Docs/02 §4 has it and Docs/10 §3.4 pairs the list with
-	// the constraint in both directions. The trigger for writing it: a ticket that needs to
-	// distinguish "displaced because the other party answered" from some other way of being
-	// displaced. There is no other way today. Docs/11 §3 reports the overlap in Docs/02 §4.
-	StatusCountered Status = "Countered"
-
-	// StatusAccepted is the awarded offer. At most one bid per job may hold it, and that is a
-	// database guarantee rather than an application one — see uq_bids_one_accepted_per_job in
-	// migration 000500.
-	StatusAccepted Status = "Accepted"
-
-	// StatusRejected is an offer the customer declined, including every competing bid closed by
-	// an award (SHIP-93).
-	StatusRejected Status = "Rejected"
-
-	// StatusWithdrawn is an offer the provider took back before it was accepted.
-	StatusWithdrawn Status = "Withdrawn"
-
-	// StatusExpired is an offer that ran out on its own terms (SHIP-89).
-	StatusExpired Status = "Expired"
-
-	// StatusSuperseded is an offer displaced by a counter from either party. The row remains,
-	// because Docs/02 §4 keeps the whole chain readable to the customer, the bidding provider
-	// and administrators.
-	StatusSuperseded Status = "Superseded"
-)
-
-// Statuses is every status, in the order Docs/02 §4 lists them.
-//
-// Ordered rather than a set because that order is the document's, and because it is what
-// TestEveryBidStatusConstraintMatchesTheGoConstants compares against ck_bids_status. Docs/10
-// §3.4 requires that pairing for every enumeration: the constraint is read out of pg_constraint
-// and held to this list, which is what stops the twelve job statuses and the eight bid statuses
-// drifting when they are built on separate branches.
-var Statuses = []Status{
-	StatusDraft,
-	StatusSubmitted,
-	StatusCountered,
-	StatusAccepted,
-	StatusRejected,
-	StatusWithdrawn,
-	StatusExpired,
-	StatusSuperseded,
-}
+// **live below stayed hand-written**, and the line is the same one the job transition table is on:
+// it is a decision rather than a vocabulary. Docs/07 §3 puts every such decision on the platform,
+// so no client wants a copy and the reason for generating disappears. Party is likewise still here
+// — it names a kind of person rather than a lifecycle state, which is not what SHIP-56a is scoped
+// to.
 
 // live reports whether an offer is still open for either party to act on (SHIP-85, SHIP-86,
 // SHIP-87).
@@ -165,38 +91,6 @@ func (p Party) String() string { return string(p) }
 // pair of strings happens to satisfy it, and a third party added by some later ticket must not have
 // to remember that the conversion was skipped here.
 func (p Party) Wire() string { return string(p) }
-
-// Valid reports whether s is one of the eight.
-func (s Status) Valid() bool {
-	for _, known := range Statuses {
-		if s == known {
-			return true
-		}
-	}
-	return false
-}
-
-func (s Status) String() string { return string(s) }
-
-// Wire is the status as it appears in a response body (SHIP-84).
-//
-// Docs/10 §4.7 puts enum values on the wire in lower snake case. All eight of these are single words
-// already, so the transformation is only a case fold today — and it is written as the same
-// transformation [jobs.Status.Wire] applies, including the space replacement, because a ninth status
-// with a space in it must not have to remember to be handled here.
-//
-// **Derived rather than tabulated**, which is the part that matters. An eight-entry table beside the
-// eight constants is a second list that can disagree with the first — exactly the drift Docs/10 §3.4
-// pairs every enumeration with a test to prevent. A transformation cannot disagree with its input.
-// TestTheWireFormsAreStableAndDistinct still writes all eight out, because these strings are
-// published: a client already branching on `submitted` cannot have it renamed underneath it.
-//
-// There is no `StatusFromWire`. Nothing a client sends names a bid status: status is not a settable
-// field, and there is no `?status=` filter on this domain's one endpoint. The inverse arrives with
-// the ticket that needs it.
-func (s Status) Wire() string {
-	return strings.ReplaceAll(strings.ToLower(string(s)), " ", "_")
-}
 
 // Bid is one offer against one job.
 //
@@ -278,6 +172,24 @@ type Bid struct {
 	// item after price and timing; empty when none was given.
 	Message string
 
+	// VehicleID is the vehicle the offer is made with, or [uuid.Nil] when the provider named none
+	// (SHIP-102a).
+	//
+	// **The seam 000500 and 000501 both deferred, arriving with the ticket they named as its
+	// trigger.** Docs/01 §4.3 wants it for the customer's comparison — "price, timing, provider
+	// profile, vehicle, and declared capability" — and 000504 argues one column against a join
+	// table.
+	//
+	// [uuid.Nil] rather than a pointer, for [Bid.SupersededBy]'s reason: "no vehicle stated" is a
+	// total answer rather than a missing one, and a nil pointer would add a third state no read of
+	// this table can produce.
+	//
+	// **This is an identifier and nothing else, which is what keeps `fleet` out of this package.**
+	// The make, model, type and capacity a customer compares are read by the *edge*, through
+	// [Directory], and never stored here — a copy of a vehicle inside `bidding` would be a second
+	// place for it to disagree with the fleet the provider actually runs.
+	VehicleID uuid.UUID
+
 	// Key is the idempotency key the offer was placed under.
 	//
 	// Held on the model because it is the row's own identity for a retry, not merely how one request
@@ -305,6 +217,20 @@ type Offer struct {
 	PickupAt    time.Time
 	DeliverBy   time.Time
 	Message     string
+
+	// VehicleID is the vehicle the offer is made with, and [uuid.Nil] means none was named
+	// (SHIP-102a).
+	//
+	// **Optional, and that is a compatibility decision rather than a weak rule.** SHIP-84's request
+	// schema has been served since wave 5 and every client written against it omits this field;
+	// Docs/10 §4.2's rule is that a field added to a request is optional or it is a new endpoint.
+	// A provider who names none makes an offer whose vehicle the customer's screen shows as
+	// unstated, which is the truth about it.
+	//
+	// **Nothing in [Offer.validate] looks at it**, because everything worth checking about it is a
+	// fact in another domain's table — that it is the caller's own, and in service. [Vehicles] is
+	// the port that asks, and [Service.PlaceBid] asks inside the transaction that writes the row.
+	VehicleID uuid.UUID
 
 	// Key is the caller's idempotency key, which becomes the row's. Required: see
 	// [ErrNoIdempotencyKey].
@@ -351,6 +277,18 @@ type Revision struct {
 	// same treatment a placement gives a blank message: `nullif` puts NULL in the column, so ""
 	// and "not given" cannot part company.
 	Message *string
+
+	// VehicleID is the vehicle the offer is made with (SHIP-102a). Present and [uuid.Nil] clears
+	// it, which is the treatment [Revision.Message] gets and for the same reason: a provider who
+	// named a truck and then decided not to commit to one has to be able to say so, and without an
+	// explicit empty value "no longer stated" would be inexpressible.
+	//
+	// **A revision is the only way the vehicle on a negotiation ever changes.** A counter-offer
+	// inherits it — [Counter] has no such field, so [Counter.terms] leaves this nil and
+	// [Revision.applyTo] carries the superseded row's forward. That is deliberate: the vehicle is
+	// the *provider's* commitment, and a customer countering on price must not silently drop the
+	// truck out of the negotiation the customer is comparing.
+	VehicleID *uuid.UUID
 }
 
 // IsEmpty reports whether the caller named no field at all.
@@ -359,7 +297,8 @@ type Revision struct {
 // naming no field: it is almost always a client defect, and answering `200` with the unchanged bid
 // would hide it behind a success.
 func (r Revision) IsEmpty() bool {
-	return r.AmountCents == nil && r.PickupAt == nil && r.DeliverBy == nil && r.Message == nil
+	return r.AmountCents == nil && r.PickupAt == nil && r.DeliverBy == nil &&
+		r.Message == nil && r.VehicleID == nil
 }
 
 // applyTo is the offer that would stand if this revision were accepted.
@@ -386,8 +325,12 @@ func (r Revision) applyTo(b Bid) Offer {
 		PickupAt:    b.PickupAt,
 		DeliverBy:   b.DeliverBy,
 		Message:     b.Message,
+		VehicleID:   b.VehicleID,
 	}
 
+	if r.VehicleID != nil {
+		o.VehicleID = *r.VehicleID
+	}
 	if r.AmountCents != nil {
 		o.AmountCents = *r.AmountCents
 	}

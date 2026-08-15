@@ -1,25 +1,80 @@
-// SHIP-29: password storage.
+// Package passwords stores a password so that nothing can read it back (SHIP-29).
 //
 // argon2id, with the cost parameters stored alongside the hash in a PHC string, exactly as
 // Docs/10 §5 specifies. Nothing reversible is stored anywhere: the column holds a derived key
 // and the salt that produced it, and there is no code path in this package that turns either
 // back into a password.
 //
-// The blank line below keeps this a file note rather than a second package comment; the
-// package's own documentation is in doc.go.
+// # Why it is infrastructure and not part of internal/identity
+//
+// It was internal/identity's until SHIP-15r, and it moved because a second domain needs it.
+// SHIP-147 gives an administrator a password, `internal/admin` may not import `internal/identity`
+// — domains do not import each other, enforced by `make lint-imports` and by a test — and the two
+// remaining options were this package or a second argon2id implementation inside `admin`.
+//
+// **Hashing parameters are a security control, and two implementations that agree by comment are
+// what Docs/10 §3.4 exists to refuse.** The concrete failure is not exotic: one copy is raised to
+// m=128 MiB and the other is not, both still verify every hash they are given because the
+// parameters travel in the PHC string, and nothing anywhere reports that half the platform's
+// passwords are stored at the old cost. A single implementation makes that impossible rather than
+// unlikely.
+//
+// **It imports neither a domain nor an adapter, and it must not** (SHIP-15c). Nothing here knows
+// what a user is, what a role is, or where a hash is stored — it takes a string and returns a
+// string. That is what makes it safe for every domain to sit on.
+//
+// # What did not move with it
+//
+// [Hasher.SpendEquivalentWork] is here and is the exception worth naming: it is a disclosure
+// control rather than a hashing primitive, and it belongs beside the derivation whose cost it
+// reproduces. Its *consumer* is `internal/identity`'s sign-in path, and the end-to-end proof —
+// that an unknown address costs what a wrong password costs — stays there, in
+// TestSignInSpendsTheSameWorkWhetherOrNotTheAccountExists, because that is where the disclosure
+// would actually happen.
 
-package identity
+package passwords
 
 import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
+)
+
+// The sentinel errors this package raises.
+//
+// **They moved here from internal/identity's errors.go rather than being re-created**, and that
+// distinction is the whole of why error identity survived the move: `identity` binds its three
+// exported names to these values, so `errors.Is` answers the same question whichever name a caller
+// reaches for, because there is one value behind both. A fresh `errors.New` on either side plus a
+// translation somewhere in between would be two values agreeing by convention, and the first path
+// that forgot to translate would report a malformed stored hash as an unmapped 500 — the exact
+// failure the distinction between "wrong password" and "unreadable hash" exists to prevent.
+var (
+	// ErrEmptyPassword is returned rather than hashing the empty string, which would otherwise
+	// produce a perfectly valid hash that any empty submission then matches. Length and strength
+	// rules belong to whoever accepts the password; this is only the floor below which hashing is
+	// meaningless.
+	ErrEmptyPassword = errors.New("passwords: the password is empty")
+
+	// ErrMalformedHash means the stored PHC string could not be read: a truncated column, a hash
+	// written by something else, or a value someone has edited.
+	//
+	// It is deliberately distinct from "the password did not match". A wrong password is an
+	// ordinary event; an unreadable hash is a data defect, and answering "wrong password" to it
+	// would hide the defect behind a sign-in failure the owner cannot explain.
+	ErrMalformedHash = errors.New("passwords: the stored password hash is malformed")
+
+	// ErrInvalidProfile means the cost parameters are outside the range this package will run —
+	// either configured that way, or read out of a hash that has been tampered with. See
+	// argon2Bounds for why the range exists.
+	ErrInvalidProfile = errors.New("passwords: the argon2id profile is out of range")
 )
 
 // The PHC string format, as written by every argon2 implementation that speaks it:
@@ -95,57 +150,57 @@ func (p Argon2Profile) Validate() error {
 	switch {
 	case p.MemoryKiB < b.minMemoryKiB || p.MemoryKiB > b.maxMemoryKiB:
 		return fmt.Errorf("%w: m=%d is outside %d..%d KiB",
-			ErrInvalidArgon2Profile, p.MemoryKiB, b.minMemoryKiB, b.maxMemoryKiB)
+			ErrInvalidProfile, p.MemoryKiB, b.minMemoryKiB, b.maxMemoryKiB)
 	case p.Iterations < b.minIterations || p.Iterations > b.maxIterations:
 		return fmt.Errorf("%w: t=%d is outside %d..%d",
-			ErrInvalidArgon2Profile, p.Iterations, b.minIterations, b.maxIterations)
+			ErrInvalidProfile, p.Iterations, b.minIterations, b.maxIterations)
 	case p.Parallelism < b.minParallelism:
 		return fmt.Errorf("%w: p=%d, and argon2 needs at least %d lane",
-			ErrInvalidArgon2Profile, p.Parallelism, b.minParallelism)
+			ErrInvalidProfile, p.Parallelism, b.minParallelism)
 	// There is no separate ceiling on the lane count: this is the real rule. argon2 divides
 	// the memory between the lanes and rounds down, so below eight kibibytes a lane the
 	// rounding reaches zero and the library's behaviour stops being defined.
 	case p.MemoryKiB < 8*uint32(p.Parallelism):
 		return fmt.Errorf("%w: m=%d leaves less than 8 KiB for each of p=%d lanes",
-			ErrInvalidArgon2Profile, p.MemoryKiB, p.Parallelism)
+			ErrInvalidProfile, p.MemoryKiB, p.Parallelism)
 	}
 	return nil
 }
 
-// PasswordHasher hashes passwords at one profile and verifies hashes made at any profile.
+// Hasher hashes passwords at one profile and verifies hashes made at any profile.
 //
 // The asymmetry is the point. Hash uses the profile it was built with; Verify uses the
 // parameters recorded in the hash it is given, so raising the profile does not invalidate a
 // single stored password. NeedsRehash is how the upgrade then happens: at the owner's next
 // sign-in, with no migration and no reset (Docs/10 §5).
-type PasswordHasher struct {
+type Hasher struct {
 	profile Argon2Profile
 }
 
-// NewPasswordHasher returns a hasher at the given profile, or an error if the profile is
+// NewHasher returns a hasher at the given profile, or an error if the profile is
 // outside the range this package will run.
-func NewPasswordHasher(profile Argon2Profile) (*PasswordHasher, error) {
+func NewHasher(profile Argon2Profile) (*Hasher, error) {
 	if err := profile.Validate(); err != nil {
 		return nil, err
 	}
-	return &PasswordHasher{profile: profile}, nil
+	return &Hasher{profile: profile}, nil
 }
 
 // Profile is the profile new hashes are written at.
-func (h *PasswordHasher) Profile() Argon2Profile { return h.profile }
+func (h *Hasher) Profile() Argon2Profile { return h.profile }
 
 // Hash derives a key from the password and returns the PHC string to store.
 //
 // The salt is sixteen fresh bytes from crypto/rand every time, so two accounts with the same
 // password have nothing in common on disk and a precomputed table is worth nothing.
-func (h *PasswordHasher) Hash(plaintext string) (string, error) {
+func (h *Hasher) Hash(plaintext string) (string, error) {
 	if plaintext == "" {
 		return "", ErrEmptyPassword
 	}
 
 	salt := make([]byte, saltLength)
 	if _, err := rand.Read(salt); err != nil {
-		return "", fmt.Errorf("identity: reading a salt: %w", err)
+		return "", fmt.Errorf("passwords: reading a salt: %w", err)
 	}
 
 	key := argon2.IDKey([]byte(plaintext), salt,
@@ -163,7 +218,7 @@ func (h *PasswordHasher) Hash(plaintext string) (string, error) {
 //
 // A wrong password returns (false, nil). An unreadable hash returns an error, because those are
 // different problems with different answers.
-func (h *PasswordHasher) Verify(encoded, plaintext string) (bool, error) {
+func (h *Hasher) Verify(encoded, plaintext string) (bool, error) {
 	stored, err := parsePHC(encoded)
 	if err != nil {
 		return false, err
@@ -178,7 +233,7 @@ func (h *PasswordHasher) Verify(encoded, plaintext string) (bool, error) {
 	return subtle.ConstantTimeCompare(derived, stored.key) == 1, nil
 }
 
-// decoySalt is the salt [PasswordHasher.SpendEquivalentWork] derives against.
+// decoySalt is the salt [Hasher.SpendEquivalentWork] derives against.
 //
 // Fixed, and in the source deliberately: it salts nothing, because nothing here is stored or
 // compared. A fresh random salt would suggest the derived key mattered, and the next reader would
@@ -190,19 +245,25 @@ var decoySalt = []byte("shipper-decoy-salt")[:saltLength]
 //
 // # Why this exists
 //
-// [CodeCredentialsInvalid] gives one answer to "no such address" and to "wrong password", so that
-// sign-in cannot be used to find out which addresses have accounts. Without this, the *response
-// time* would answer anyway and rather more cheaply than the status code refuses to: argon2id at
-// m=64 MiB takes tens of milliseconds, and a lookup that misses takes none of them. A caller
-// timing two requests reads the difference off a wall clock.
+// `internal/identity`'s CodeCredentialsInvalid gives one answer to "no such address" and to "wrong
+// password", so that sign-in cannot be used to find out which addresses have accounts. That is the
+// consumer this exists for, and it is named rather than linked because this package may not import
+// a domain. Without this, the *response time* would answer anyway and rather more cheaply than the
+// status code refuses to: argon2id at m=64 MiB takes tens of milliseconds, and a lookup that misses
+// takes none of them. A caller timing two requests reads the difference off a wall clock.
 //
-// It is one argon2id derivation at this hasher's profile, which is the cost [PasswordHasher.Verify]
+// **This is a disclosure control, not a performance detail**, which is why it moved with the
+// derivation rather than staying beside its caller: what it has to equal is the cost of
+// [Hasher.Verify], and the only place that cost is decided is here. SHIP-147 gets it for free —
+// an administrator sign-in has exactly the same enumeration problem.
+//
+// It is one argon2id derivation at this hasher's profile, which is the cost [Hasher.Verify]
 // is made of. The PHC parse Verify also does is microseconds against that and is not reproduced —
 // what is being equalised is the cost that dominates, not every instruction.
 //
 // The result is deliberately unused, and runtime.KeepAlive is what says so to a reader: without
 // it the call reads like something left behind by a deletion.
-func (h *PasswordHasher) SpendEquivalentWork(plaintext string) {
+func (h *Hasher) SpendEquivalentWork(plaintext string) {
 	key := argon2.IDKey([]byte(plaintext), decoySalt,
 		h.profile.Iterations, h.profile.MemoryKiB, h.profile.Parallelism, keyLength)
 	runtime.KeepAlive(key)
@@ -214,7 +275,7 @@ func (h *PasswordHasher) SpendEquivalentWork(plaintext string) {
 // The caller for this is the sign-in path (SHIP-41): it has the plaintext in hand exactly once,
 // which is the only moment a stronger hash can be written without asking anyone to reset
 // anything.
-func (h *PasswordHasher) NeedsRehash(encoded string) (bool, error) {
+func (h *Hasher) NeedsRehash(encoded string) (bool, error) {
 	stored, err := parsePHC(encoded)
 	if err != nil {
 		return false, err
@@ -247,12 +308,12 @@ func parsePHC(encoded string) (storedHash, error) {
 	fields := strings.Split(encoded, "$")
 	if len(fields) != 6 || fields[0] != "" {
 		return storedHash{}, fmt.Errorf(
-			"%w: expected $argon2id$v=…$m=…,t=…,p=…$salt$key", ErrMalformedPasswordHash)
+			"%w: expected $argon2id$v=…$m=…,t=…,p=…$salt$key", ErrMalformedHash)
 	}
 
 	if fields[1] != phcVariant {
 		return storedHash{}, fmt.Errorf("%w: variant is %q, not %s",
-			ErrMalformedPasswordHash, fields[1], phcVariant)
+			ErrMalformedHash, fields[1], phcVariant)
 	}
 
 	version, err := keyedUint(fields[2], "v")
@@ -261,13 +322,13 @@ func parsePHC(encoded string) (storedHash, error) {
 	}
 	if version != argon2.Version {
 		return storedHash{}, fmt.Errorf("%w: version is %d, not %d",
-			ErrMalformedPasswordHash, version, argon2.Version)
+			ErrMalformedHash, version, argon2.Version)
 	}
 
 	costs := strings.Split(fields[3], ",")
 	if len(costs) != 3 {
 		return storedHash{}, fmt.Errorf("%w: expected m, t and p, got %q",
-			ErrMalformedPasswordHash, fields[3])
+			ErrMalformedHash, fields[3])
 	}
 	memory, err := keyedUint(costs[0], "m")
 	if err != nil {
@@ -288,7 +349,7 @@ func parsePHC(encoded string) (storedHash, error) {
 		iterations > uint64(argon2Bounds.maxIterations) ||
 		parallelism > 255 {
 		return storedHash{}, fmt.Errorf("%w: m=%d, t=%d, p=%d exceeds what this package will run",
-			ErrInvalidArgon2Profile, memory, iterations, parallelism)
+			ErrInvalidProfile, memory, iterations, parallelism)
 	}
 
 	profile := Argon2Profile{
@@ -302,20 +363,20 @@ func parsePHC(encoded string) (storedHash, error) {
 
 	salt, err := base64.RawStdEncoding.DecodeString(fields[4])
 	if err != nil {
-		return storedHash{}, fmt.Errorf("%w: the salt is not raw base64", ErrMalformedPasswordHash)
+		return storedHash{}, fmt.Errorf("%w: the salt is not raw base64", ErrMalformedHash)
 	}
 	if len(salt) < argon2Bounds.minSaltLength || len(salt) > argon2Bounds.maxSaltLength {
 		return storedHash{}, fmt.Errorf("%w: the salt is %d bytes, outside %d..%d",
-			ErrMalformedPasswordHash, len(salt), argon2Bounds.minSaltLength, argon2Bounds.maxSaltLength)
+			ErrMalformedHash, len(salt), argon2Bounds.minSaltLength, argon2Bounds.maxSaltLength)
 	}
 
 	key, err := base64.RawStdEncoding.DecodeString(fields[5])
 	if err != nil {
-		return storedHash{}, fmt.Errorf("%w: the key is not raw base64", ErrMalformedPasswordHash)
+		return storedHash{}, fmt.Errorf("%w: the key is not raw base64", ErrMalformedHash)
 	}
 	if len(key) < argon2Bounds.minKeyLength || len(key) > argon2Bounds.maxKeyLength {
 		return storedHash{}, fmt.Errorf("%w: the key is %d bytes, outside %d..%d",
-			ErrMalformedPasswordHash, len(key), argon2Bounds.minKeyLength, argon2Bounds.maxKeyLength)
+			ErrMalformedHash, len(key), argon2Bounds.minKeyLength, argon2Bounds.maxKeyLength)
 	}
 
 	return storedHash{profile: profile, salt: salt, key: key}, nil
@@ -328,11 +389,11 @@ func parsePHC(encoded string) (storedHash, error) {
 func keyedUint(field, name string) (uint64, error) {
 	value, ok := strings.CutPrefix(field, name+"=")
 	if !ok {
-		return 0, fmt.Errorf("%w: expected %s=…, got %q", ErrMalformedPasswordHash, name, field)
+		return 0, fmt.Errorf("%w: expected %s=…, got %q", ErrMalformedHash, name, field)
 	}
 	n, err := strconv.ParseUint(value, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %s=%q is not a number", ErrMalformedPasswordHash, name, value)
+		return 0, fmt.Errorf("%w: %s=%q is not a number", ErrMalformedHash, name, value)
 	}
 	return n, nil
 }

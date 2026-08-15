@@ -86,7 +86,7 @@ func refusingGuard(ran *int) Guard {
 // a route that answers 401 forever, which is indistinguishable from an expired credential to every
 // client — the weaker failure, and the one guardsFor exists to avoid.
 func TestWithNoDriverGuardTheClassIsAbsentAndTheRouteRefusesToStart(t *testing.T) {
-	g := guardsFor(nil)
+	g := guardsFor(nil, nil)
 
 	if _, enforced := g[RequireDriverToken]; enforced {
 		t.Fatal("RequireDriverToken is mapped to something with no verifier behind it.\n" +
@@ -113,7 +113,7 @@ func TestWithNoDriverGuardTheClassIsAbsentAndTheRouteRefusesToStart(t *testing.T
 // the guard runs in front of the handler, and its refusal is the response.
 func TestASuppliedDriverGuardServesAndGuardsTheRoute(t *testing.T) {
 	ran := 0
-	g := guardsFor(refusingGuard(&ran))
+	g := guardsFor(refusingGuard(&ran), nil)
 
 	if _, enforced := g[RequireDriverToken]; !enforced {
 		t.Fatal("a supplied driver guard did not reach the map, so the class stays unserved")
@@ -152,7 +152,7 @@ func TestRequireUserIsEnforcedWithOrWithoutADriverGuard(t *testing.T) {
 		"a driver guard":  refusingGuard(new(int)),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, enforced := guardsFor(driver)[RequireUser]; !enforced {
+			if _, enforced := guardsFor(driver, nil)[RequireUser]; !enforced {
 				t.Error("RequireUser is unenforced, so every route declaring it panics at startup")
 			}
 		})
@@ -173,7 +173,7 @@ func TestTheClassIsServedExactlyWhenTheConstructorSuppliesAGuard(t *testing.T) {
 		t.Fatalf("building the driver-token guard: %v", err)
 	}
 
-	_, enforced := guardsFor(driverToken)[RequireDriverToken]
+	_, enforced := guardsFor(driverToken, nil)[RequireDriverToken]
 	if enforced != (driverToken != nil) {
 		t.Errorf("newDriverTokenGuard returned a guard: %t, but the class is enforced: %t.\n"+
 			"These must agree — a class enforced with no verifier behind it is a route that "+

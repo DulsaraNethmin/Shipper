@@ -51,6 +51,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
 )
 
@@ -112,8 +113,21 @@ type bidRequest struct {
 	PickupAt  string `json:"pickup_at"`
 	DeliverBy string `json:"deliver_by"`
 
-	// Message is the conditions accompanying the offer, and the only optional field.
+	// Message is the conditions accompanying the offer, and one of two optional fields.
 	Message string `json:"message"`
+
+	// VehicleID is the vehicle the offer is made with, as a string parsed by hand below (SHIP-102a).
+	//
+	// A string rather than a uuid.UUID for the reason the two timestamps are strings: encoding/json
+	// reports an unparseable UUID as an ordinary error with no type of its own, so httpx.DecodeJSON
+	// could only answer "the request body is not valid JSON" — which is untrue and unactionable when
+	// the body is good JSON containing "my-van". Parsing here produces a field error naming the
+	// field (Docs/10 §4.6).
+	//
+	// **Optional, which is Docs/10 §4.2 rather than a soft rule**: this field arrived at SHIP-102a,
+	// long after `POST /v1/jobs/{id}/bids` was being served, and a field added to a request is
+	// optional or it is a new endpoint.
+	VehicleID string `json:"vehicle_id"`
 }
 
 // offer turns the request into the domain's command, reporting anything it could not parse.
@@ -129,6 +143,7 @@ func (b bidRequest) offer(key string, now time.Time) (Offer, error) {
 		PickupAt:    instant("pickup_at", b.PickupAt, &e),
 		DeliverBy:   instant("deliver_by", b.DeliverBy, &e),
 		Message:     b.Message,
+		VehicleID:   reference("vehicle_id", b.VehicleID, &e),
 		Key:         key,
 	}
 
@@ -179,6 +194,30 @@ func instant(field, value string, e *validate.Errors) time.Time {
 		return time.Time{}
 	}
 	return t.UTC()
+}
+
+// reference parses a UUID from a request body, reporting a field error rather than a decode error.
+//
+// Named for what it is rather than for its type: every UUID in a request body here refers to a row
+// in another table, and `identifier` is already the name http_test.go gives the regular expression
+// that finds one in a response.
+//
+// The [instant] of identifiers, and for the same reason: encoding/json cannot say which field a bad
+// value was in, and "the request body is not valid JSON" is untrue of a body that is.
+//
+// An empty or absent value is [uuid.Nil], which every caller reads as "not given". That is the
+// ordinary case for `vehicle_id`, so it must not be a complaint.
+func reference(field, value string, e *validate.Errors) uuid.UUID {
+	if strings.TrimSpace(value) == "" {
+		return uuid.Nil
+	}
+
+	id, err := uuid.Parse(value)
+	if err != nil {
+		e.Add(field, validate.CodeInvalid, "Enter an identifier from your own fleet.")
+		return uuid.Nil
+	}
+	return id
 }
 
 // bidResponse is an offer as the provider who made it sees it.
@@ -388,6 +427,17 @@ type reviseRequest struct {
 	// provider takes a condition back — the alternative would be a second field meaning "and now
 	// remove the note", for a value the column already expresses as NULL.
 	Message *string `json:"message"`
+
+	// VehicleID is the vehicle the offer is made with (SHIP-102a). **Present and blank clears it**,
+	// which is [reviseRequest.Message]'s treatment applied to an identifier — a provider who named
+	// a truck and then decided not to commit to one has to be able to say so.
+	//
+	// Blank rather than `null`, and that is a constraint of the decoder rather than a preference.
+	// `encoding/json` sets a pointer to nil for the JSON literal `null`, so a `*string` cannot tell
+	// "absent" from "null" and a `**string` cannot either — the outer pointer is what null nils.
+	// `fleet.VehicleFields` reached the same place and states the same rule: omitted or null leaves
+	// it alone, an empty value clears it.
+	VehicleID *string `json:"vehicle_id"`
 }
 
 // revision turns the request into the domain's command, reporting anything it could not parse.
@@ -405,6 +455,12 @@ func (b reviseRequest) revision() (Revision, error) {
 	var e validate.Errors
 
 	rev := Revision{AmountCents: b.AmountCents, Message: b.Message}
+	if b.VehicleID != nil {
+		// Blank is [uuid.Nil], which the store writes as NULL — [reference] returns it for an empty
+		// value rather than complaining, because "no vehicle" is the ordinary answer here.
+		id := reference("vehicle_id", *b.VehicleID, &e)
+		rev.VehicleID = &id
+	}
 	if b.PickupAt != nil {
 		at := instant("pickup_at", *b.PickupAt, &e)
 		rev.PickupAt = &at
@@ -819,7 +875,13 @@ func (h *Handler) Award() http.Handler {
 // Read-only, so no `Idempotency-Key`: the middleware lets safe methods through untouched, and a key
 // on a request that changes nothing would be a key stored for no reason.
 //
-// # Two callers, and the one this file has to be most careful about
+// # Two callers here, three in the domain, and the one this file has to be most careful about
+//
+// SHIP-96 enumerates Docs/02 §4's three readers in `visibility.go` — the bidding provider, the
+// customer, and an administrator. **Two of the three can reach this handler**, because the route is
+// `RequireUser` and no administrator session exists until SHIP-147; the third is reachable from the
+// domain and is exercised by test. That is recorded rather than papered over, and the one line a
+// later administrator endpoint changes is the [Viewer] built below.
 //
 // The customer sees the provider's prices, which Docs/01 §4.3 explicitly wants — "allow a customer to
 // compare price, timing, provider profile". The provider sees the customer's *counters*, which is new
@@ -846,7 +908,13 @@ func (h *Handler) History() http.Handler {
 			return err
 		}
 
-		offers, truncated, err := h.svc.Chain(r.Context(), pool, callerID, jobID, bidID)
+		// Administrator is false and cannot be anything else on this route: it declares
+		// RequireUser, and `authctx.Subject` cannot carry an administrator at all — Docs/06 §5.2
+		// and SHIP-147 make admin sign-in a separate system that a user token cannot reach.
+		// **The line SHIP-152's administrator endpoint changes is this one**, and nothing in the
+		// domain moves with it (SHIP-96).
+		offers, _, truncated, err := h.svc.Chain(
+			r.Context(), pool, Viewer{ID: callerID}, jobID, bidID)
 		if err != nil {
 			return apiError(err)
 		}
@@ -854,6 +922,159 @@ func (h *Handler) History() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, chainFrom(offers, truncated))
 		return nil
 	})
+}
+
+// Mine handles GET /v1/fleet/bids (SHIP-101a).
+//
+// SHIP-101a's *Done when*: "a provider lists every bid they have placed, grouped by status,
+// paginated, and sees no other provider's; the response carries no customer budget in any form."
+//
+// # Why it is under /v1/fleet and not under /v1/jobs
+//
+// **The resource is the caller's own bids across every job**, which is not a collection under any
+// one job. routes_bidding.go reserved `/v1/jobs/{id}/bids` for SHIP-102's customer comparison at
+// SHIP-84 and has said since then that a provider's list "is a different resource — the caller's own
+// bids across every job — rather than a filter on this one".
+//
+// `/v1/fleet` is where a provider's own things already live: their vehicles, their declared service
+// area, their profile. A provider asking "what have I bid on" is asking about their operation rather
+// than about a job, and the URL says so. It also sidesteps `net/http`'s routing constraint entirely
+// rather than taking another shelf under `/v1/jobs/` — `GET /v1/jobs/open/{id}` already exists, so a
+// four-segment `GET /v1/jobs/{id}/<literal>` panics the mux at registration.
+//
+// # Every response key is one this API already promises a provider
+//
+// The element type is the same [bidResponse] the four write endpoints and the history answer with,
+// which is what keeps the closed key set one list rather than two. Nothing of the job travels in it
+// beyond the identifier, so Docs/01 §4.3 is structurally true here rather than remembered — there is
+// no budget field to omit because there is no job in the shape.
+//
+// Read-only, so no `Idempotency-Key`: the middleware lets safe methods through untouched.
+//
+// **A customer calling it gets an empty page rather than a refusal**, and that is deliberate. There
+// is no role check here for the reason `fleet`'s own list endpoints have none: the query is scoped to
+// the caller's own id, so a customer's answer is empty by construction rather than by permission, and
+// a 403 would make the client special-case a screen it never shows. Docs/11 §9 carries the wider
+// question about `fleet`'s missing role checks; this endpoint discloses nothing either way.
+func (h *Handler) Mine() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		providerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		query, err := bidQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		page, err := h.svc.Bids(r.Context(), pool, providerID, query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		bids := make([]bidResponse, 0, len(page.Bids))
+		for _, bid := range page.Bids {
+			bids = append(bids, bidFrom(bid))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(bids, encodeBidCursor(page.Next)))
+		return nil
+	})
+}
+
+// bidQueryFrom reads `?status=`, `?limit=` and `?cursor=`, which is every parameter this list has.
+//
+// Every failure is bad_request rather than validation_failed, which is httpx's own division: a query
+// parameter is part of how the request was addressed rather than data a person typed into a form, and
+// `?cursor=` in particular is a token the client was handed rather than a value it composed.
+//
+// An unknown parameter is passed over rather than refused, unlike an unknown *body* field. Docs/07
+// §6's strictness is about bodies: a URL picks up parameters from link trackers and proxies that no
+// client typed. What matters is the other direction — neither parameter this endpoint reads can
+// widen the scope, and the provider is not one of them.
+func bidQueryFrom(r *http.Request) (BidQuery, error) {
+	values := r.URL.Query()
+
+	var query BidQuery
+
+	if wanted := strings.TrimSpace(values.Get("status")); wanted != "" {
+		status, known := StatusFromWire(wanted)
+		if !known {
+			// The valid values are not listed in the message. There are eight, the contract
+			// publishes them, and a message that enumerated them would be a fourth copy of the
+			// list to keep in step (Docs/10 §3.4).
+			return BidQuery{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+				"%q is not a bid status.", wanted)
+		}
+		query.Status = status
+	}
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return BidQuery{}, err
+	}
+	query.Limit = limit
+
+	if query.After, err = decodeBidCursor(values.Get("cursor")); err != nil {
+		return BidQuery{}, err
+	}
+	return query, nil
+}
+
+// bidCursorFields is how many parts a bid cursor has: the created_at it is positioned at, and the id
+// that breaks ties on it.
+const bidCursorFields = 2
+
+// encodeBidCursor renders a position for a client to hand back, in the encoding
+// `internal/pagination` owns. The zero cursor is the empty string, which is also what "no cursor"
+// looks like on the way in.
+func encodeBidCursor(c BidCursor) string {
+	if c.IsZero() {
+		return ""
+	}
+	return pagination.Cursor{
+		c.CreatedAt.UTC().Format(time.RFC3339Nano),
+		c.ID.String(),
+	}.Encode()
+}
+
+// decodeBidCursor reads one back.
+//
+// pagination.Decode establishes the shape — this version, this many fields — and this establishes the
+// meaning. Only the domain knows that its ordering key is a timestamp and a UUID, and a cursor whose
+// fields decode but do not parse has to be refused here rather than reaching the query as a zero
+// time, which would silently answer with the first page.
+//
+// **Nanoseconds, not the millisecond precision responses render.** A cursor is compared against
+// created_at rather than displayed, and a rendering that rounded would put the boundary in the wrong
+// place — repeating an offer at every page edge, or dropping one.
+func decodeBidCursor(raw string) (BidCursor, error) {
+	fields, err := pagination.Decode(raw, bidCursorFields)
+	if err != nil || fields == nil {
+		return BidCursor{}, err
+	}
+
+	at, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		return BidCursor{}, invalidBidCursor(err)
+	}
+	id, err := uuid.Parse(fields[1])
+	if err != nil {
+		return BidCursor{}, invalidBidCursor(err)
+	}
+	return BidCursor{CreatedAt: at, ID: id}, nil
+}
+
+func invalidBidCursor(cause error) error {
+	return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+		"The cursor is not one this endpoint issued. Ask for the first page without one.").
+		WithCause(cause)
 }
 
 // pathIDs reads both identifiers a bid is addressed by.
@@ -1068,4 +1289,197 @@ func apiError(err error) error {
 	default:
 		return err
 	}
+}
+
+// offerResponse is one offer as the customer who owns the job sees it (SHIP-102a).
+//
+// # It embeds [bidResponse] rather than restating it, and that is what keeps the closed set one list
+//
+// Go flattens an embedded struct into the enclosing JSON object, so every key the four write
+// endpoints and the history already promise appears here under the same name, produced by the same
+// [bidFrom]. The alternative — a second flat struct with eleven copied tags — is a second place for
+// the offer's shape to be corrected, and the correction that reached only one of them would give a
+// customer and a provider two different words for one field.
+//
+// **The closed key set is therefore [bidResponse]'s keys plus exactly two.** Both additions are
+// objects rather than flattened fields, so `provider` and `vehicle` each have their own closed set
+// declared in ports.go, and TestTheOfferResponseCarriesNothingItMayNot walks all three depths.
+//
+// # What is not here, stated as the four things the *Done when* forbids
+//
+// **No budget in any form** — no amount, no band, no flag, and no sentence. There is no field for one
+// because [bidResponse] carries nothing of the job beyond its identifier and neither summary below
+// carries a job at all. **No service area and no specialties**, which is the whole of `fleet.Profile`
+// and therefore the whole of what "provider profile" can mean today. **No other jobs**, which no
+// query in this domain could reach: [Service.Offers] selects one `job_id`.
+//
+// The fourth is not a field at all and is the one wave 9 found surviving in a form nothing caught: a
+// *sentence* that says a budget exists — "the customer has set a maximum" — passes a closed key set
+// and a source-parsing scan alike, because it is neither a field nor the word "budget". Nothing on
+// this side of the wire can produce one, and the guard for it is on the screen: SHIP-102's
+// customer_offers_test.dart asserts on words as well as on values.
+type offerResponse struct {
+	bidResponse
+
+	// Provider is the closed customer-facing summary of who made this offer.
+	//
+	// Always present, and never a provider's declaration. `fleet.Profile` has exactly two fields —
+	// the service area and the specialties — and SHIP-102a's *Done when* forbids both, so what a
+	// customer may know about a provider today is what `users` can answer. Docs/11 §3 records the
+	// gap and names SHIP-153…SHIP-159 as what closes it.
+	Provider providerSummaryResponse `json:"provider"`
+
+	// Vehicle is the vehicle the offer is made with, omitted when it names none.
+	//
+	// Omitted rather than null, which is the treatment [bidResponse.Message] and
+	// [bidResponse.SupersededBy] both get: a client can tell "no vehicle stated" from a vehicle
+	// whose fields happen to be empty without a second flag. Every offer placed before 000504 is in
+	// this case, and so is every offer from a client that does not yet send the field.
+	Vehicle *vehicleSummaryResponse `json:"vehicle,omitempty"`
+}
+
+// providerSummaryResponse is [ProviderSummary] on the wire.
+type providerSummaryResponse struct {
+	ID string `json:"id"`
+
+	// Verified is the platform's automated verification: email and phone confirmed, on an account in
+	// good standing. The same predicate `fleet`'s eligibility filter reads, rather than a second one.
+	Verified bool `json:"verified"`
+
+	// MemberSince is when the provider's account was created, rendered day-first by the client
+	// rather than here — every instant in this API is RFC 3339 in UTC (Docs/10 §4.1).
+	MemberSince string `json:"member_since"`
+}
+
+// vehicleSummaryResponse is [VehicleSummary] on the wire.
+//
+// **The registration is absent and its absence is the point.** See [VehicleSummary].
+type vehicleSummaryResponse struct {
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	Make  string `json:"make,omitempty"`
+	Model string `json:"model,omitempty"`
+
+	// Capacity is Docs/01 §4.3's "declared capability", nested rather than flattened so that the
+	// four numbers read as one statement about the vehicle — which is `fleet.Capacity`'s own reason
+	// for being a struct.
+	Capacity capacityResponse `json:"capacity"`
+}
+
+// capacityResponse is what the vehicle can carry, as declared.
+//
+// Zeroes are sent rather than omitted. A provider who stated no maximum weight has a vehicle whose
+// capacity is unstated, and a client showing "not stated" needs the key to be there to say so —
+// `omitempty` would make an unstated capacity indistinguishable from a field this API had dropped.
+type capacityResponse struct {
+	MaxWeightKg float64 `json:"max_weight_kg"`
+	LengthCm    int     `json:"length_cm"`
+	WidthCm     int     `json:"width_cm"`
+	HeightCm    int     `json:"height_cm"`
+}
+
+// offerFrom renders one described offer.
+func offerFrom(o ReceivedOffer) offerResponse {
+	response := offerResponse{
+		bidResponse: bidFrom(o.Bid),
+		Provider: providerSummaryResponse{
+			ID:          o.Provider.ID.String(),
+			Verified:    o.Provider.Verified,
+			MemberSince: timestamp(o.Provider.MemberSince),
+		},
+	}
+	if o.HasVehicle {
+		response.Vehicle = &vehicleSummaryResponse{
+			ID:    o.Vehicle.ID.String(),
+			Type:  o.Vehicle.Type,
+			Make:  o.Vehicle.Make,
+			Model: o.Vehicle.Model,
+			Capacity: capacityResponse{
+				MaxWeightKg: o.Vehicle.MaxWeightKg,
+				LengthCm:    o.Vehicle.LengthCm,
+				WidthCm:     o.Vehicle.WidthCm,
+				HeightCm:    o.Vehicle.HeightCm,
+			},
+		}
+	}
+	return response
+}
+
+// Received handles GET /v1/jobs/{id}/bids/received (SHIP-102a).
+//
+// SHIP-102a's *Done when*: "the owning customer lists every live offer on one of their jobs in the
+// Docs 10 §4.5 collection envelope with cursor pagination, each element carrying the offer's price
+// and timing, a closed customer-facing provider summary and the vehicle it is offered with; a
+// provider gets what a stranger gets; the response carries no budget in any form, and no provider's
+// service area, specialties or other jobs."
+//
+// # The path says `/bids/received` and the *Done when* says `/bids`, and that is a finding rather
+// than a slip
+//
+// `GET /v1/jobs/{id}/bids` **cannot be registered**. `GET /v1/jobs/open/{id}` (SHIP-83) puts a
+// literal where the `{id}` wildcard goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>`
+// both match `/v1/jobs/open/bids` with neither more specific, and Go's `ServeMux` panics at
+// registration — the process does not start. Renaming the literal does not help; `/offers` collides
+// identically. `POST /v1/jobs/{id}/bids` is unaffected only because the other route is a `GET`.
+//
+// SHIP-115 met this first and resolved it by taking a shelf under the job, which is why
+// `GET /jobs/{id}/delivery/detail`, `/delivery/milestones` and `/delivery/proof` are shaped the way
+// they are; that note ends by recording the collision "for whoever owns `/jobs/open/{id}`". This
+// endpoint follows the precedent rather than overturning it, and cmd/api/routes_bidding.go's
+// declaration carries the full argument for which of the two options was taken and what the other
+// one would cost.
+//
+// # Read-only, so no `Idempotency-Key`
+//
+// The middleware lets safe methods through untouched, exactly as it does for
+// `GET /v1/jobs/{id}/bids/{bid_id}/history` and `GET /v1/fleet/bids`.
+//
+// # A provider calling it gets a 404 and so does a stranger
+//
+// A clause of the *Done when* rather than a consequence, and the ownership check in
+// [Service.Offers] is the whole of it — there is no branch anywhere that asks whether the caller is
+// a provider, which is what makes "not the customer", "no such job" and "somebody else's job" one
+// answer by construction rather than by three code paths agreeing. This differs from
+// `GET /v1/fleet/bids`, where a customer gets an *empty page* rather than a refusal: that endpoint
+// is scoped by the caller's own id and discloses nothing either way, and this one takes a job
+// identifier from the client and would otherwise disclose that it exists.
+func (h *Handler) Received() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		customerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		query, err := bidQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		page, err := h.svc.Offers(r.Context(), pool, customerID, jobID, OfferQuery{
+			Status: query.Status,
+			Limit:  query.Limit,
+			After:  query.After,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		offers := make([]offerResponse, 0, len(page.Offers))
+		for _, offer := range page.Offers {
+			offers = append(offers, offerFrom(offer))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(offers, encodeBidCursor(page.Next)))
+		return nil
+	})
 }

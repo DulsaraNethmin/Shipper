@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/fleet"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/validate"
@@ -694,9 +695,13 @@ func TestAnOfferWithNoMessageStoresNULLRatherThanEmpty(t *testing.T) {
 func TestAnEligibilityFailureIsNotARefusal(t *testing.T) {
 	m := newMarket(t)
 	m.svc = NewService(
+		events.NewOutbox(),
 		refusing{err: errors.New("the filter could not run")},
 		newTestNegotiation(m.svc.clock),
 		newTestAwarding(m.svc.clock),
+		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -734,43 +739,226 @@ func TestABidNamingNoJobOrNoProviderIsRefused(t *testing.T) {
 
 // --- the invariant this domain exists to protect ------------------------------------------------
 
-// TestPlacingABidNeverMovesTheJob is the ticket next door, asserted here so that it stays next door.
+// TestTheFirstOfferMovesTheJobToNegotiating is SHIP-90's *Done when*, first half.
 //
-// Docs/02 §2 has `Open → Negotiating` on "first bid or counter-offer submitted", and that is
-// **SHIP-90's**, which depends on SHIP-87 and SHIP-57. Moving the job here would also be a status
-// change, and every status change in this platform leaves a job_status_history row written by one
-// guarded function (Docs/02 §2, CLAUDE.md).
+// Docs/02 §2: `Open → Negotiating` on "first bid or counter-offer submitted". This was the opposite
+// assertion until SHIP-90 — the ticket next door, asserted here so that it stayed next door — and
+// it is now the positive form, in both directions: the job moved, **and** the move left a
+// job_status_history row, because every status change in this platform passes one guarded function
+// and 000402 refuses one that did not (Docs/02 §2, CLAUDE.md). The second half is what would catch
+// a move made through some other path.
 //
-// So the assertion is in both directions: the job is where it was, and nothing was written to its
-// history. The second half is what would catch a move made through some other path.
-func TestPlacingABidNeverMovesTheJob(t *testing.T) {
+// The actor is the platform. Docs/02 §1 calls Negotiating "a useful presentation status", and a
+// provider placing an offer asked for their offer to exist rather than for the job to move.
+func TestTheFirstOfferMovesTheJobToNegotiating(t *testing.T) {
 	m := newMarket(t)
 
-	var before int
-	if err := m.pool.QueryRow(t.Context(),
-		`SELECT count(*) FROM job_status_history WHERE job_id = $1`, m.job).Scan(&before); err != nil {
-		t.Fatalf("counting history: %v", err)
-	}
-
-	if _, _, err := m.place(t, m.provider, m.job, offer("key-nomove")); err != nil {
+	if _, _, err := m.place(t, m.provider, m.job, offer("key-negotiating")); err != nil {
 		t.Fatalf("PlaceBid() = %v", err)
 	}
 
-	var (
-		status string
-		after  int
-	)
-	if err := m.pool.QueryRow(t.Context(),
-		`SELECT j.status, (SELECT count(*) FROM job_status_history WHERE job_id = j.id)
-		   FROM jobs j WHERE j.id = $1`, m.job).Scan(&status, &after); err != nil {
-		t.Fatalf("reading the job: %v", err)
+	status, changes := m.jobStatus(t, m.job)
+	if status != "Negotiating" {
+		t.Errorf("the job is %q after the first offer, want Negotiating", status)
+	}
+	if changes != 2 {
+		t.Errorf("the job has %d transitions, want two: its publication and this move", changes)
 	}
 
-	if status != "Open" {
-		t.Errorf("the job is %q after a bid, want Open — Open → Negotiating is SHIP-90's", status)
+	var actor, reason string
+	if err := m.pool.QueryRow(t.Context(), `
+		SELECT actor_type, COALESCE(reason, '') FROM job_status_history
+		 WHERE job_id = $1 AND to_status = 'Negotiating'`, m.job).Scan(&actor, &reason); err != nil {
+		t.Fatalf("reading the recorded move: %v", err)
 	}
-	if after != before {
-		t.Errorf("placing a bid wrote %d job_status_history rows", after-before)
+	if actor != "system" {
+		t.Errorf("the move was recorded against %q, want the platform", actor)
+	}
+	if reason == "" {
+		t.Error("the move carries no reason, so a customer's timeline cannot say why it happened")
+	}
+}
+
+// TestASecondOfferLeavesTheJobWhereItIs is the other half of "first", and it is what stops the
+// move being made once per bid.
+//
+// A job already at Negotiating cannot move there again — Docs/02 §2 has no `Negotiating →
+// Negotiating` row and [Service.Transition] refuses one — so the second offer must find that
+// unremarkable rather than fail. **Without a rival this is not testable**: one provider has one
+// live offer per job.
+func TestASecondOfferLeavesTheJobWhereItIs(t *testing.T) {
+	m := newMarket(t)
+
+	if _, _, err := m.place(t, m.provider, m.job, offer("key-first-of-two")); err != nil {
+		t.Fatalf("the first offer: %v", err)
+	}
+	_, changes := m.jobStatus(t, m.job)
+
+	rival := m.rival(t, 9021)
+	if _, _, err := m.place(t, rival, m.job, offer("key-second-of-two")); err != nil {
+		t.Fatalf("the second offer: %v", err)
+	}
+
+	status, after := m.jobStatus(t, m.job)
+	if status != "Negotiating" {
+		t.Errorf("the job is %q after a second offer, want Negotiating", status)
+	}
+	if after != changes {
+		t.Errorf("the second offer wrote %d further transitions, want none", after-changes)
+	}
+}
+
+// TestANegotiatingJobStillTakesBids is the half of SHIP-90's *Done when* that is the whole ticket.
+//
+// "A job with active offers presents as Negotiating **without closing to new bids**." Docs/02 §1
+// says it outright — "the job remains available for eligible bids unless the customer closes it or
+// awards a bid" — and `fleet.biddableStatuses` has held both statuses since SHIP-81 against exactly
+// this day. This is that pair meeting for the first time: the job is moved by the platform, and the
+// next provider is still eligible for it through the real filter.
+func TestANegotiatingJobStillTakesBids(t *testing.T) {
+	m := newMarket(t)
+
+	if _, _, err := m.place(t, m.provider, m.job, offer("key-still-open-1")); err != nil {
+		t.Fatalf("the first offer: %v", err)
+	}
+	if status, _ := m.jobStatus(t, m.job); status != "Negotiating" {
+		t.Fatalf("the job is %q, so this test is not about a Negotiating job", status)
+	}
+
+	rival := m.rival(t, 9022)
+	second, created, err := m.place(t, rival, m.job, offer("key-still-open-2"))
+	if err != nil {
+		t.Fatalf("bidding on a Negotiating job: %v", err)
+	}
+	if !created {
+		t.Fatal("the second offer was answered as a retry")
+	}
+	if got := m.row(t, second.ID).status; got != string(StatusSubmitted) {
+		t.Errorf("the second offer is %s, want Submitted", got)
+	}
+
+	// And the customer can still award it, which is the other thing "not closing" has to mean.
+	if _, err := m.award(t, m.customer, m.job, second.ID); err != nil {
+		t.Errorf("awarding an offer placed on a Negotiating job: %v", err)
+	}
+}
+
+// TestTheLastOfferLeavingReturnsTheJobToOpen is SHIP-90's second direction.
+//
+// Docs/02 §2: `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected". The
+// third cause never reaches this path — an award closes the others and moves the job to Awarded —
+// so the two that do are a withdrawal and an expiry, and both are exercised: this one here, the
+// expiry in expiry_test.go.
+func TestTheLastOfferLeavingReturnsTheJobToOpen(t *testing.T) {
+	m := newMarket(t)
+
+	bid, _, err := m.place(t, m.provider, m.job, offer("key-back-to-open"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, err := m.withdraw(t, m.provider, m.job, bid.ID); err != nil {
+		t.Fatalf("withdrawing: %v", err)
+	}
+
+	status, changes := m.jobStatus(t, m.job)
+	if status != "Open" {
+		t.Errorf("the job is %q after its only offer was withdrawn, want Open", status)
+	}
+	if changes != 3 {
+		t.Errorf("the job has %d transitions, want three: publication, Negotiating, and back", changes)
+	}
+}
+
+// TestAJobWithAnotherLiveOfferStaysNegotiating is what stops the return being made per withdrawal.
+//
+// "**All** active bids expire, are withdrawn, or are rejected" is the condition, and a job with two
+// offers loses one and is still a negotiation. The count is taken inside the withdrawal's own
+// transaction, so it cannot see a state the write has not reached.
+func TestAJobWithAnotherLiveOfferStaysNegotiating(t *testing.T) {
+	m := newMarket(t)
+
+	mine, _, err := m.place(t, m.provider, m.job, offer("key-two-left-1"))
+	if err != nil {
+		t.Fatalf("the first offer: %v", err)
+	}
+	rival := m.rival(t, 9023)
+	if _, _, err := m.place(t, rival, m.job, offer("key-two-left-2")); err != nil {
+		t.Fatalf("the second offer: %v", err)
+	}
+
+	if _, err := m.withdraw(t, m.provider, m.job, mine.ID); err != nil {
+		t.Fatalf("withdrawing: %v", err)
+	}
+
+	if status, _ := m.jobStatus(t, m.job); status != "Negotiating" {
+		t.Errorf("the job is %q with a live offer still on it, want Negotiating", status)
+	}
+}
+
+// TestTheLivePredicateIsOneRule holds [Status.live] and [postgresStore.liveOffers] together.
+//
+// The rule "an offer is still open for either party to act on" is now written twice — once in Go,
+// where three verbs gate on it, and once in SQL, where it decides whether a job leaves Negotiating.
+// Docs/10 §3.4 wants every such pair held by a test, and the failure if they drift is silent in both
+// directions: a count that treated a closed status as live would strand a job at Negotiating with
+// nothing in it, and one that treated `Submitted` as closed would reopen a job somebody is still
+// negotiating on.
+//
+// Driven over all eight statuses rather than the two that occur, so that a status this platform
+// starts writing later is covered the day it is written.
+func TestTheLivePredicateIsOneRule(t *testing.T) {
+	m := newMarket(t)
+
+	bid, _, err := m.place(t, m.provider, m.job, offer("key-live-predicate"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+
+	for _, status := range Statuses {
+		m.setStatus(t, bid.ID, status)
+
+		var live int
+		if err := db.InTx(t.Context(), m.pool, func(ctx context.Context, r db.Runner) error {
+			var err error
+			live, err = m.svc.store.liveOffers(ctx, r, m.job)
+			return err
+		}); err != nil {
+			t.Fatalf("counting the live offers: %v", err)
+		}
+
+		want := 0
+		if status.live() {
+			want = 1
+		}
+		if live != want {
+			t.Errorf("%s: the SQL predicate counts %d live offers and Status.live says %t",
+				status, live, status.live())
+		}
+	}
+}
+
+// TestWithdrawingAnAlreadyWithdrawnOfferMovesNothing is the early return seen from the job.
+//
+// A withdrawal that wrote nothing has nothing to report about the job either: the standing was
+// settled when the offer actually closed. Without this, a repeated withdrawal on a job somebody had
+// meanwhile republished would move it again.
+func TestWithdrawingAnAlreadyWithdrawnOfferMovesNothing(t *testing.T) {
+	m := newMarket(t)
+
+	bid, _, err := m.place(t, m.provider, m.job, offer("key-double-withdraw"))
+	if err != nil {
+		t.Fatalf("placing: %v", err)
+	}
+	if _, err := m.withdraw(t, m.provider, m.job, bid.ID); err != nil {
+		t.Fatalf("withdrawing: %v", err)
+	}
+	_, changes := m.jobStatus(t, m.job)
+
+	if _, err := m.withdraw(t, m.provider, m.job, bid.ID); err != nil {
+		t.Fatalf("withdrawing again: %v", err)
+	}
+	if _, after := m.jobStatus(t, m.job); after != changes {
+		t.Errorf("a repeated withdrawal wrote %d further transitions, want none", after-changes)
 	}
 }
 
@@ -1251,10 +1439,10 @@ func TestARevisionNeedsTheProviderToStillBeEligible(t *testing.T) {
 			exec(t, m.pool, `UPDATE users SET phone_verified_at = NULL WHERE id = $1`, m.provider)
 		},
 		"the job was cancelled": func(t *testing.T, m market) {
-			transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+			m.moveJob(t, "Cancelled")
 		},
 		"the job was awarded to somebody else": func(t *testing.T, m market) {
-			transition(t, m.pool, m.job, m.customer, "Open", "Awarded")
+			m.moveJob(t, "Awarded")
 		},
 	}
 
@@ -1498,7 +1686,7 @@ func TestAWithdrawalNeedsNoEligibility(t *testing.T) {
 			declare(t, m.pool, m.provider, "NSW")
 		},
 		"the job was cancelled underneath the offer": func(t *testing.T, m market) {
-			transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+			m.moveJob(t, "Cancelled")
 		},
 	}
 
@@ -1528,53 +1716,35 @@ func TestAWithdrawalNeedsNoEligibility(t *testing.T) {
 
 // --- what neither verb does ------------------------------------------------------------------------
 
-// TestNeitherRevisingNorWithdrawingMovesTheJob is SHIP-90's ticket, asserted here so that it stays
-// SHIP-90's.
+// TestARevisionMovesNothing is the half of SHIP-90 that stayed as it was.
 //
-// Docs/02 §2 has `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", and
-// it is tempting to read a withdrawal as the trigger for it. Nothing reaches Negotiating until SHIP-90,
-// which owns that presentation status in both directions — and job status is never a settable field in
-// any case: a move passes one guarded function and leaves a `job_status_history` row in the same
-// transaction (Docs/02 §2, CLAUDE.md). Doing half of that here would be doing the half without the
-// record.
+// Docs/02 §2's two presentation rows are about offers **arriving** and offers **leaving**. A
+// revision does neither: it is the same live offer at a different number, and the job's standing
+// cannot have changed because the set of live offers did not. Asserted as a history count rather
+// than as a status, because a move made and then reversed would leave the status right and the
+// record wrong.
 //
-// Both halves are asserted, as SHIP-84's twin does: the job is where it was, and its history is
-// unchanged. The second is what would catch a move made through some other path.
-func TestNeitherRevisingNorWithdrawingMovesTheJob(t *testing.T) {
+// The withdrawal that used to share this test is now TestTheLastOfferLeavingReturnsTheJobToOpen,
+// which asserts the opposite — and the pair is worth keeping apart for exactly that reason.
+func TestARevisionMovesNothing(t *testing.T) {
 	m := newMarket(t)
 
 	placed, _, err := m.place(t, m.provider, m.job, offer("key-nomove-revision"))
 	if err != nil {
 		t.Fatalf("placing the offer: %v", err)
 	}
-
-	var before int
-	if err := m.pool.QueryRow(t.Context(),
-		`SELECT count(*) FROM job_status_history WHERE job_id = $1`, m.job).Scan(&before); err != nil {
-		t.Fatalf("counting history: %v", err)
-	}
+	status, before := m.jobStatus(t, m.job)
 
 	if _, err := m.revise(t, m.provider, m.job, placed.ID, Revision{AmountCents: ptr(int64(41000))}); err != nil {
 		t.Fatalf("revising: %v", err)
 	}
-	if _, err := m.withdraw(t, m.provider, m.job, placed.ID); err != nil {
-		t.Fatalf("withdrawing: %v", err)
-	}
 
-	var (
-		status string
-		after  int
-	)
-	if err := m.pool.QueryRow(t.Context(),
-		`SELECT j.status, (SELECT count(*) FROM job_status_history WHERE job_id = j.id)
-		   FROM jobs j WHERE j.id = $1`, m.job).Scan(&status, &after); err != nil {
-		t.Fatalf("reading the job: %v", err)
+	after, changes := m.jobStatus(t, m.job)
+	if after != status {
+		t.Errorf("the job is %q after a revision, want %q", after, status)
 	}
-	if status != "Open" {
-		t.Errorf("the job is %q, want Open — Negotiating in either direction is SHIP-90's", status)
-	}
-	if after != before {
-		t.Errorf("revising and withdrawing wrote %d job_status_history rows", after-before)
+	if changes != before {
+		t.Errorf("revising wrote %d job_status_history rows", changes-before)
 	}
 }
 
@@ -1983,7 +2153,7 @@ func TestACustomerCannotCounterOnAJobThatCanNoLongerBeAwarded(t *testing.T) {
 		t.Fatalf("placing: %v", err)
 	}
 
-	transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+	m.moveJob(t, "Cancelled")
 
 	if _, _, err := m.counter(t, m.customer, m.job, placed.ID,
 		counterOf(40000, "key-job-over-counter")); !errors.Is(err, ErrNegotiationOver) {
@@ -2039,9 +2209,13 @@ func TestANegotiationFailureIsNotARefusal(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		brokenNegotiation{err: errors.New("the job service could not run")},
 		newTestAwarding(m.svc.clock),
+		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -2080,47 +2254,41 @@ func TestCounteringRefusesAConnectionPool(t *testing.T) {
 	}
 }
 
-// TestCounteringNeverMovesTheJob keeps SHIP-90's ticket intact.
+// TestACounterMovesNothing, because the offer it answers already did (SHIP-90).
 //
-// Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted", which reads like
-// an instruction to this ticket more than it did to SHIP-84 — a counter is literally the second half
-// of that sentence. It is still SHIP-90's, which depends on this ticket and owns the presentation
-// status in both directions.
+// Docs/02 §2 has `Open → Negotiating` on "first bid or **counter-offer** submitted", and the second
+// half of that sentence reads like an instruction to [Service.CounterOffer]. It is not one, and the
+// reason is "first": **a counter answers a live offer, and a live offer is one a placement wrote**,
+// so the job has already moved by the time any counter can exist. A second call would take a `jobs`
+// lock after this method has locked a `bids` row, which is the ordering Docs/11 §3 forbids.
 //
-// The history count is the half that matters: job status is never a settable field, so a move made
-// through some other path would still leave a `job_status_history` row, and asserting the status
-// alone would miss a move made and then reversed.
-func TestCounteringNeverMovesTheJob(t *testing.T) {
+// A counter also does not *leave* the negotiation: it supersedes one live offer and inserts
+// another, so the count [postgresStore.liveOffers] takes is unchanged either side of it.
+//
+// The history count is the half that matters: a move made through some other path would still leave
+// a `job_status_history` row, and asserting the status alone would miss a move made and reversed.
+func TestACounterMovesNothing(t *testing.T) {
 	m := newMarket(t)
-
-	var before int
-	if err := m.pool.QueryRow(t.Context(),
-		`SELECT count(*) FROM job_status_history WHERE job_id = $1`, m.job).Scan(&before); err != nil {
-		t.Fatalf("counting the history: %v", err)
-	}
 
 	placed, _, err := m.place(t, m.provider, m.job, offer("key-counter-nomove"))
 	if err != nil {
 		t.Fatalf("placing: %v", err)
 	}
+	status, before := m.jobStatus(t, m.job)
+	if status != "Negotiating" {
+		t.Fatalf("the placement left the job at %q, so this test is not about a counter", status)
+	}
+
 	if _, _, err := m.counter(t, m.customer, m.job, placed.ID, counterOf(40000, "key-counter-nomove-c")); err != nil {
 		t.Fatalf("countering: %v", err)
 	}
 
-	var (
-		status string
-		after  int
-	)
-	if err := m.pool.QueryRow(t.Context(),
-		`SELECT j.status, (SELECT count(*) FROM job_status_history WHERE job_id = j.id)
-		   FROM jobs j WHERE j.id = $1`, m.job).Scan(&status, &after); err != nil {
-		t.Fatalf("reading the job: %v", err)
+	after, changes := m.jobStatus(t, m.job)
+	if after != "Negotiating" {
+		t.Errorf("the job is %q after a counter, want Negotiating", after)
 	}
-	if status != "Open" {
-		t.Errorf("the job is %q after a counter, want Open — Negotiating is SHIP-90's", status)
-	}
-	if after != before {
-		t.Errorf("a counter wrote %d job_status_history rows", after-before)
+	if changes != before {
+		t.Errorf("a counter wrote %d job_status_history rows", changes-before)
 	}
 }
 
@@ -2632,7 +2800,7 @@ func TestTheChainStaysReadableAfterTheJobIsOver(t *testing.T) {
 		t.Fatalf("countering: %v", err)
 	}
 
-	transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+	m.moveJob(t, "Cancelled")
 
 	for who, caller := range map[string]uuid.UUID{"the customer": m.customer, "the provider": m.provider} {
 		offers, _, err := m.chain(t, caller, m.job, countered.ID)
@@ -2735,8 +2903,9 @@ func TestAwardingAcceptsTheBidAndMovesTheJob(t *testing.T) {
 	}
 
 	before, changes := m.jobStatus(t, m.job)
-	if before != "Open" || changes != 1 {
-		t.Fatalf("the fixture job is %s with %d transitions, want Open with 1", before, changes)
+	if before != "Negotiating" || changes != 2 {
+		t.Fatalf("the fixture job is %s with %d transitions, want Negotiating with 2 — its "+
+			"publication and the move the offer above made (SHIP-90)", before, changes)
 	}
 
 	accepted, err := m.award(t, m.customer, m.job, placed.ID)
@@ -2758,9 +2927,10 @@ func TestAwardingAcceptsTheBidAndMovesTheJob(t *testing.T) {
 	if after != "Awarded" {
 		t.Errorf("the job is %s, want Awarded", after)
 	}
-	if changes != 2 {
-		t.Errorf("the job has %d recorded transitions, want 2 — an award that moved the status "+
-			"without leaving a history row would have gone round 000402's guard", changes)
+	if changes != 3 {
+		t.Errorf("the job has %d recorded transitions, want 3 — publication, Negotiating and the "+
+			"award. An award that moved the status without leaving a history row would have gone "+
+			"round 000402's guard", changes)
 	}
 }
 
@@ -2800,8 +2970,9 @@ func TestOnlyTheJobsCustomerCanAward(t *testing.T) {
 	if stored := m.row(t, placed.ID); stored.status != string(StatusSubmitted) {
 		t.Errorf("the bid is %s after three refused awards, want Submitted", stored.status)
 	}
-	if status, _ := m.jobStatus(t, m.job); status != "Open" {
-		t.Errorf("the job is %s after three refused awards, want Open", status)
+	if status, _ := m.jobStatus(t, m.job); status != "Negotiating" {
+		t.Errorf("the job is %s after three refused awards, want Negotiating — where the offer "+
+			"left it", status)
 	}
 }
 
@@ -2835,8 +3006,8 @@ func TestOnlyALiveProvidersOfferCanBeAwarded(t *testing.T) {
 			if stored := m.row(t, placed.ID); stored.status != string(status) {
 				t.Errorf("the refused award moved the bid to %s", stored.status)
 			}
-			if job, changes := m.jobStatus(t, m.job); job != "Open" || changes != 1 {
-				t.Errorf("the job is %s with %d transitions, want Open with 1", job, changes)
+			if job, changes := m.jobStatus(t, m.job); job != "Negotiating" || changes != 2 {
+				t.Errorf("the job is %s with %d transitions, want Negotiating with 2", job, changes)
 			}
 		})
 	}
@@ -2866,7 +3037,7 @@ func TestACustomersOwnCounterCannotBeAwarded(t *testing.T) {
 	if _, err := m.award(t, m.customer, m.job, theirs.ID); !errors.Is(err, ErrNotAProvidersOffer) {
 		t.Fatalf("awarding the customer's own counter: %v, want ErrNotAProvidersOffer", err)
 	}
-	if status, _ := m.jobStatus(t, m.job); status != "Open" {
+	if status, _ := m.jobStatus(t, m.job); status != "Negotiating" {
 		t.Errorf("the refused award moved the job to %s", status)
 	}
 
@@ -2946,8 +3117,9 @@ func TestAwardingTheSameBidTwiceIsTheSameOutcome(t *testing.T) {
 		t.Errorf("the repeated award wrote to the row: updated_at moved from %s to %s",
 			written.updatedAt, again.updatedAt)
 	}
-	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 2 {
-		t.Errorf("the job is %s with %d transitions, want Awarded with 2", status, changes)
+	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 3 {
+		t.Errorf("the job is %s with %d transitions, want Awarded with 3 — publication, "+
+			"Negotiating, and the award", status, changes)
 	}
 }
 
@@ -3039,7 +3211,7 @@ func TestTheIndexRefusesASecondAcceptedBid(t *testing.T) {
 	if stored := m.row(t, mine.ID); stored.status != string(StatusSubmitted) {
 		t.Errorf("the refused award left the bid at %s", stored.status)
 	}
-	if status, _ := m.jobStatus(t, m.job); status != "Open" {
+	if status, _ := m.jobStatus(t, m.job); status != "Negotiating" {
 		t.Errorf("the refused award moved the job to %s", status)
 	}
 }
@@ -3059,7 +3231,7 @@ func TestAJobThatHasMovedOnCannotBeAwarded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("placing: %v", err)
 	}
-	transition(t, m.pool, m.job, m.customer, "Open", "Cancelled")
+	m.moveJob(t, "Cancelled")
 
 	if _, err := m.award(t, m.customer, m.job, placed.ID); !errors.Is(err, ErrJobNotAwardable) {
 		t.Fatalf("awarding a cancelled job: %v, want ErrJobNotAwardable", err)
@@ -3132,9 +3304,13 @@ func TestAnAwardingFailureIsNotARefusal(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lockErr: errors.New("the job service could not run")},
+		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -3166,9 +3342,13 @@ func TestAnUnrecognisedAwardAnswerIsRefused(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardUnrecognised},
+		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -3200,9 +3380,13 @@ func TestAFailedTransitionRollsTheAcceptBackWithIt(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},
+		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -3214,8 +3398,9 @@ func TestAFailedTransitionRollsTheAcceptBackWithIt(t *testing.T) {
 		t.Errorf("the bid is %s, want Submitted — the accept committed without the transition, "+
 			"which leaves a provider holding work the job says nobody was given", stored.status)
 	}
-	if status, changes := m.jobStatus(t, m.job); status != "Open" || changes != 1 {
-		t.Errorf("the job is %s with %d transitions, want Open with 1", status, changes)
+	if status, changes := m.jobStatus(t, m.job); status != "Negotiating" || changes != 2 {
+		t.Errorf("the job is %s with %d transitions, want Negotiating with 2 — the rollback took "+
+			"the award's transition with it and left the offer's alone", status, changes)
 	}
 }
 
@@ -3299,8 +3484,9 @@ func TestAnAwardClosesEveryCompetingOffer(t *testing.T) {
 	if live != 0 || accepted != 1 {
 		t.Errorf("the awarded job holds %d live offers and %d accepted, want 0 and 1", live, accepted)
 	}
-	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 2 {
-		t.Errorf("the job is %s with %d transitions, want Awarded with 2", status, changes)
+	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 3 {
+		t.Errorf("the job is %s with %d transitions, want Awarded with 3 — publication, "+
+			"Negotiating, and the award", status, changes)
 	}
 }
 
@@ -3350,8 +3536,9 @@ func TestTheSweepReachesNoOtherJob(t *testing.T) {
 			t.Errorf("%s is %s, want Submitted — the sweep left its own job", name, other[bid])
 		}
 	}
-	if status, _ := m.jobStatus(t, elsewhere); status != "Open" {
-		t.Errorf("the other job is %s, want Open", status)
+	if status, _ := m.jobStatus(t, elsewhere); status != "Negotiating" {
+		t.Errorf("the other job is %s, want Negotiating — its own offers moved it there and the "+
+			"award on this one reached neither", status)
 	}
 }
 
@@ -3509,9 +3696,13 @@ func TestAFailedTransitionRollsTheSweepBackToo(t *testing.T) {
 	}
 
 	m.svc = NewService(
+		events.NewOutbox(),
 		fleet.NewService(m.svc.clock),
 		newTestNegotiation(m.svc.clock),
 		brokenAwarding{lock: JobAwardable, move: JobAwardNotPermitted},
+		newTestPresentation(m.svc.clock),
+		newTestVehicles(m.svc.clock),
+		newTestDirectory(),
 		m.svc.clock,
 	)
 
@@ -3527,8 +3718,9 @@ func TestAFailedTransitionRollsTheSweepBackToo(t *testing.T) {
 		t.Errorf("the sweep survived the rollback: the competing offer is %s — a job still Open "+
 			"with its offers closed is a market emptied by a request that failed", after[loser.ID])
 	}
-	if status, changes := m.jobStatus(t, m.job); status != "Open" || changes != 1 {
-		t.Errorf("the job is %s with %d transitions, want Open with 1", status, changes)
+	if status, changes := m.jobStatus(t, m.job); status != "Negotiating" || changes != 2 {
+		t.Errorf("the job is %s with %d transitions, want Negotiating with 2 — the rollback took "+
+			"the award's transition with it and left the offer's alone", status, changes)
 	}
 }
 
@@ -3582,8 +3774,9 @@ func TestARetriedAwardDoesNotSweepAgain(t *testing.T) {
 		t.Errorf("the retry ran the sweep a second time: the closed offer's updated_at moved from "+
 			"%s to %s, and no caller ever named that row", wroteLoser.updatedAt, now.updatedAt)
 	}
-	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 2 {
-		t.Errorf("the job is %s with %d transitions, want Awarded with 2", status, changes)
+	if status, changes := m.jobStatus(t, m.job); status != "Awarded" || changes != 3 {
+		t.Errorf("the job is %s with %d transitions, want Awarded with 3 — publication, "+
+			"Negotiating, and the award", status, changes)
 	}
 }
 
@@ -3636,7 +3829,7 @@ func TestARetryIsAnsweredAfterTheJobHasMovedOnAgain(t *testing.T) {
 	if _, err := m.award(t, m.customer, m.job, loser.ID); !errors.Is(err, ErrJobNotAwardable) {
 		t.Errorf("awarding a different offer on a job under way: %v, want ErrJobNotAwardable", err)
 	}
-	if status, changes := m.jobStatus(t, m.job); status != "En route to pickup" || changes != 3 {
-		t.Errorf("the job is %s with %d transitions, want En route to pickup with 3", status, changes)
+	if status, changes := m.jobStatus(t, m.job); status != "En route to pickup" || changes != 4 {
+		t.Errorf("the job is %s with %d transitions, want En route to pickup with 4", status, changes)
 	}
 }

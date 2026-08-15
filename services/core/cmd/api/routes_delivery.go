@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,6 +58,28 @@ func init() {
 		},
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/driver/link",
+			Group:   GroupV1,
+
+			// SHIP-109: another link for the driver already on the job, ending the previous one.
+			//
+			// RequireUser, and the same pairing as the route above: it mints a driver token and
+			// does not accept one. **A driver cannot reissue their own link**, which is the whole
+			// point of a credential the provider controls — a forwarded link that reached the
+			// wrong person could otherwise be used to keep itself alive.
+			//
+			// # Why this is not a method on /jobs/{id}/driver
+			//
+			// PUT there would say a second call replaces the driver, and it deliberately does
+			// not: 000600 makes an assignment's identity immutable because `milestones.actor_id`
+			// names it, and replacing a driver is ending one row and inserting another. This
+			// replaces the *link* and leaves the driver, the row and every milestone recorded
+			// against it exactly where they are.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).ReissueDriverLink() },
+		},
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/jobs/{id}/milestones",
 			Group:   GroupV1,
 
@@ -78,13 +101,14 @@ func init() {
 			// driver's. The caller is the awarded provider, checked against the accepted
 			// bid.
 			//
-			// **SHIP-122 needs the driver's version of this and it is not here**, which is a
-			// gap recorded in Docs/11 §3 rather than a decision. A driver-token route is
-			// served with the idempotency scope `anonymous` — the scope is computed
-			// group-wide, outside the middleware, while a guard runs per route inside it —
-			// and this response carries a URL that can write into the evidence bucket. That
-			// is the SHIP-44 shape the whole service was fixed for, and it stays shut until
-			// SHIP-121 settles the scope.
+			// **The driver's version of this is now the last route in this file**
+			// (SHIP-122). This comment used to say it was "a gap recorded in Docs/11 §3
+			// rather than a decision", held shut because a driver-token route is served
+			// with the idempotency scope `anonymous` and this response carries a URL that
+			// can write into the evidence bucket. SHIP-120a settled the scope and SHIP-122
+			// wrote down what a replay of that stored credential actually reaches — see
+			// [delivery.Handler.PresignDriverProofUpload], which is the paragraph to read
+			// before touching either route.
 			//
 			// # A pre-signed URL is minted here and spent nowhere in this service
 			//
@@ -135,6 +159,45 @@ func init() {
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).ProofOnJob() },
 		},
 		Route{
+			Method: http.MethodGet,
+
+			// **Five segments, and four would stop the process** (SHIP-115a). This is the shelf
+			// the route above opened, extended by the ticket `Docs/09` wrote for it — and the
+			// row in that document names both paths in full rather than describing a shelf,
+			// precisely because building either as `GET /jobs/{id}/delivery` is not a failing
+			// test but a ServeMux panic at registration: `make run` dies at startup.
+			//
+			// # Two operations rather than one composite
+			//
+			// The alternative was one `GET /jobs/{id}/delivery` answering both, which the
+			// segment constraint forbids anyway — but it would also have been wrong on its own
+			// terms. The assignment is a single resource and the milestones are a collection
+			// that pages; putting a paging collection inside a resource means a client asking
+			// for the second page re-fetches the resource, and the envelope of Docs/10 §4.5 has
+			// nowhere to sit.
+			Pattern: "/jobs/{id}/delivery/detail",
+			Group:   GroupV1,
+
+			// RequireUser, and the class is not the access control here either: the handler
+			// asks the database which of the two parties the caller is, and being neither
+			// answers exactly what a missing job answers.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DeliveryDetail() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs/{id}/delivery/milestones",
+			Group:   GroupV1,
+
+			// The second half of SHIP-115a, and the one that has no other source. **A milestone
+			// that moved nothing appears here and nowhere else**: a repeated pickup attempt
+			// (Docs/02 §5) and SHIP-112's absorbed late milestone each write a `milestones` row
+			// and no `job_status_history` row, so a timeline derived from the job's status —
+			// which is what SHIP-77 has to do today (Docs/11 §9) — cannot show either.
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).MilestonesOnJob() },
+		},
+		Route{
 			Method:  http.MethodGet,
 			Pattern: "/driver/jobs/{id}",
 			Group:   GroupV1,
@@ -165,6 +228,75 @@ func init() {
 			Auth:    RequireDriverToken,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DriverJob() },
 		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/driver/jobs/{id}/milestones",
+			Group:   GroupV1,
+
+			// **The first write in the service served on a credential that names no account**
+			// (SHIP-120a), and the route three separate lanes of wave 7 each specified and none
+			// built — every one of them correctly finding it belonged to another lane's ticket
+			// (Docs/11 §9). A gap three independent readings arrive at is a specification.
+			//
+			// # Why a second route rather than a second auth class on POST /jobs/{id}/milestones
+			//
+			// That one is RequireUser and always will be. Serving both classes on one path would
+			// put two credential systems on one URL, where presenting the wrong one reads as a
+			// permissions problem rather than as the wrong door — and the manifest allows one
+			// class per method in any case. So the driver's route sits under `/driver` beside the
+			// read, and the two entry points meet in `internal/delivery`'s service rather than in
+			// a guard that has been taught to accept either credential.
+			//
+			// # The idempotency scope, which Docs/11 §9 has held open since SHIP-15m for this route
+			//
+			// `anonymous`, and **nothing declared here can change it**: the scope is computed
+			// group-wide outside the middleware while this class is enforced per route inside it.
+			// The decision is argued in [delivery.Handler.RecordDriverMilestone] and it is §9's
+			// second option — the platform's "once per key" guarantee is
+			// `uq_milestones_idempotency (job_id, idempotency_key)`, which 000602 scoped to the
+			// job in advance and named this exact case while doing it.
+			//
+			// **Unlike POST /jobs/{id}/proof-uploads, this response carries no credential**, which
+			// is the whole reason this route can be served today and the driver's upload cannot: a
+			// replay hands back a milestone that both parties to the delivery may read anyway,
+			// not a URL that writes into the evidence bucket.
+			Auth:    RequireDriverToken,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordDriverMilestone() },
+		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/driver/jobs/{id}/proof-uploads",
+			Group:   GroupV1,
+
+			// **The route this file recorded as a gap for a wave** (SHIP-122), and the one
+			// that makes a driver able to photograph a delivery at all. Until it existed,
+			// `internal/delivery` refused an `object_key` on the driver's milestone route by
+			// name — there was no route by which a driver could obtain one — so SHIP-117's
+			// moderation queue was the *only* path to a driver-recorded 'Delivered' rather
+			// than one of two.
+			//
+			// # Why a fourth segment is safe here and would not be under /jobs
+			//
+			// `GET /jobs/open/{id}` puts a literal in the `{id}` position, so it and any
+			// three-segment `GET /jobs/{id}/<literal>` both match `/jobs/open/<literal>`
+			// with neither more specific, and Go's ServeMux **panics at registration**. That
+			// collision is confined to the `/jobs` tree and to `GET`: `/driver/...` is a
+			// different tree with no literal in its identifier slot, and this is a POST in
+			// any case — which is the same reason `POST /jobs/{id}/proof-uploads` above is
+			// unaffected.
+			//
+			// # The scope question this route had to answer before it could be served
+			//
+			// A driver token produces no `authctx.Subject`, so the idempotency key lands in
+			// `idem:v1:anonymous:<key>` — and unlike the milestone route beside it, **this
+			// response body is a credential**. [delivery.Handler.PresignDriverProofUpload]
+			// carries the whole analysis: what a replay requires, what it can and cannot
+			// then do, and the `internal/httpx` change that would close it properly, which
+			// is a prep ticket's rather than a domain branch's. Read it before adding a
+			// second driver-token route whose response carries anything issued.
+			Auth:    RequireDriverToken,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).PresignDriverProofUpload() },
+		},
 	)
 }
 
@@ -189,6 +321,7 @@ func deliveryHandler(d Deps) *delivery.Handler {
 	store := proofUploads(d)
 
 	svc := delivery.NewService(
+		events.NewOutbox(),
 		jobLifecycle{jobs: newJobService(d)},
 		acceptedBids{},
 		jobCustomers{jobs: newJobService(d)},
@@ -198,7 +331,8 @@ func deliveryHandler(d Deps) *delivery.Handler {
 		delivery.UploadPolicy{
 			MaxBytes:             d.Config.Storage.MaxUploadBytes,
 			AcceptedContentTypes: d.Config.Storage.AcceptedContentTypes,
-			URLTTL:               d.Config.Storage.PresignTTL,
+			UploadTTL:            d.Config.Storage.PresignTTL,
+			DownloadTTL:          d.Config.Storage.DownloadTTL,
 		},
 		d.Clock,
 	)
@@ -220,12 +354,16 @@ func deliveryHandler(d Deps) *delivery.Handler {
 // assertion at the foot of this file — which is, as with the two ports above, the only place in the
 // build where that can be established at all.
 //
-// # Three of the nine configured values are read here and the other three in the policy above
+// # Six of the ten configured values are read here and the other four in the policy above
 //
 // The split is not arbitrary: everything below describes the *store* — where it is, what it is
 // called, how to authenticate to it — and everything in [delivery.UploadPolicy] describes what the
-// platform will allow into it. The first is the adapter's business and the second is the domain's,
-// which is Docs/06 §4.1's division written as two structs.
+// platform will allow into it, and for how long. The first is the adapter's business and the second
+// is the domain's, which is Docs/06 §4.1's division written as two structs.
+//
+// The tenth arrived at SHIP-15r: STORAGE_DOWNLOAD_TTL, which is the policy's rather than the
+// adapter's for the same reason the upload lifetime is — how long a link to a photograph stays live
+// is a decision about evidence, and the signer will sign whatever window it is handed.
 //
 // It panics for the reason driverTokenIssuer does: it runs during attach, from a Handler closure
 // with nowhere to put an error, and every failure it can report is a configuration fault that will
@@ -345,43 +483,31 @@ func (l jobLifecycle) MoveToDriverAssigned(
 func (l jobLifecycle) MoveToEnRouteToPickup(
 	ctx context.Context,
 	r db.Runner,
-	jobID, providerID uuid.UUID,
+	jobID uuid.UUID,
+	by delivery.Recorder,
 	recordedAt time.Time,
 ) (delivery.JobMove, error) {
-	return l.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusEnRouteToPickup,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: recordedAt,
-	})
+	return l.moveBy(ctx, r, jobID, jobs.StatusEnRouteToPickup, by, recordedAt)
 }
 
 func (l jobLifecycle) MoveToPickedUp(
 	ctx context.Context,
 	r db.Runner,
-	jobID, providerID uuid.UUID,
+	jobID uuid.UUID,
+	by delivery.Recorder,
 	recordedAt time.Time,
 ) (delivery.JobMove, error) {
-	return l.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusPickedUp,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: recordedAt,
-	})
+	return l.moveBy(ctx, r, jobID, jobs.StatusPickedUp, by, recordedAt)
 }
 
 func (l jobLifecycle) MoveToInTransit(
 	ctx context.Context,
 	r db.Runner,
-	jobID, providerID uuid.UUID,
+	jobID uuid.UUID,
+	by delivery.Recorder,
 	recordedAt time.Time,
 ) (delivery.JobMove, error) {
-	return l.move(ctx, r, jobs.Move{
-		JobID:      jobID,
-		To:         jobs.StatusInTransit,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
-		RecordedAt: recordedAt,
-	})
+	return l.moveBy(ctx, r, jobID, jobs.StatusInTransit, by, recordedAt)
 }
 
 // MoveToDelivered is `In transit → Delivered` (SHIP-118).
@@ -393,13 +519,59 @@ func (l jobLifecycle) MoveToInTransit(
 func (l jobLifecycle) MoveToDelivered(
 	ctx context.Context,
 	r db.Runner,
-	jobID, providerID uuid.UUID,
+	jobID uuid.UUID,
+	by delivery.Recorder,
 	recordedAt time.Time,
 ) (delivery.JobMove, error) {
+	return l.moveBy(ctx, r, jobID, jobs.StatusDelivered, by, recordedAt)
+}
+
+// moveBy is the four methods above with their one difference — the target status — as an argument,
+// and the actor translation in one place (SHIP-120a).
+//
+// # This is the second vocabulary this file translates, and it is translated exactly once
+//
+// The first is the milestone-to-status mapping the four methods are: `delivery` names milestones,
+// this names statuses, and Docs/02 §2's table is visible from neither side alone. The second is
+// who acted. A [delivery.Recorder] carries `(actor_type, actor_id)` in the delivery domain's own
+// vocabulary; `jobs.Actor` carries the same pair in its own, and 000401 and 000601 already agree
+// about what each value means — a `users` row for a provider, a `driver_assignments` row for a
+// driver, because a driver has no account.
+//
+// **An actor this function has no mapping for is an error rather than a default**, which is the
+// same call [jobLifecycle.move] makes about an unrecognised outcome. Defaulting to the provider
+// would compile, pass every test written today, and write `job_status_history` rows saying a
+// provider moved a job their driver moved — a false attribution that nothing downstream could
+// detect, because the row would be perfectly well formed.
+//
+// [delivery.ActorSystem] and [delivery.ActorAdmin] fall into that refusal today and deliberately:
+// the platform's automatic `Picked up → In transit` (Docs/02 §2) will be a worker rather than a
+// request, and an administrator's move owes an audit reason that `jobs.Move.validate` requires and
+// this signature has nowhere to carry. Both are a method here when somebody writes the ticket.
+func (l jobLifecycle) moveBy(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+	to jobs.Status,
+	by delivery.Recorder,
+	recordedAt time.Time,
+) (delivery.JobMove, error) {
+	var kind jobs.ActorType
+	switch by.Type {
+	case delivery.ActorProvider:
+		kind = jobs.ActorProvider
+	case delivery.ActorDriver:
+		kind = jobs.ActorDriver
+	default:
+		return delivery.JobMoveUnrecognised, fmt.Errorf(
+			"cmd/api: moving %s to %s: %q is not an actor this adapter can attribute a transition to",
+			jobID, to, by.Type)
+	}
+
 	return l.move(ctx, r, jobs.Move{
 		JobID:      jobID,
-		To:         jobs.StatusDelivered,
-		Actor:      jobs.User(jobs.ActorProvider, providerID),
+		To:         to,
+		Actor:      jobs.User(kind, by.ID),
 		RecordedAt: recordedAt,
 	})
 }
@@ -437,8 +609,8 @@ func (l jobLifecycle) move(ctx context.Context, r db.Runner, m jobs.Move) (deliv
 	}
 }
 
-// refusal tells a job that has already been past this status from one that has not reached it
-// (SHIP-112).
+// refusal sorts one refusal of Docs/02 §2's table into the three things it can mean (SHIP-112,
+// SHIP-113).
 //
 // # It reads history rather than reasoning about the table
 //
@@ -446,8 +618,22 @@ func (l jobLifecycle) move(ctx context.Context, r db.Runner, m jobs.Move) (deliv
 // any permitted sequence?" — and that answer would be wrong in a way nobody would notice for a while.
 // A job cancelled or disputed at Awarded can no longer reach 'Picked up' either, and it has not moved
 // *past* the pickup; it has lost the delivery to something else. Docs/02 §3.1 keeps those two apart
-// and gives them different handling — the second is the administrative-conflict bullet, which is
-// SHIP-113 — so the test is the recorded fact, not the reachable set.
+// and gives them different handling, so the test for "already past" is the recorded fact and not the
+// reachable set.
+//
+// # The three answers, in the order they are asked
+//
+//  1. `job_status_history` holds a transition **into** the target — the job has been there, the
+//     milestone is late, and SHIP-112 absorbs it;
+//  2. the job's current status is one Docs/02 §2 offers no way back into a delivery from — it lost
+//     the delivery while the phone was offline, and SHIP-113 retains the attempt;
+//  3. neither — the delivery has simply not got there yet, and the milestone is premature.
+//
+// **The order is load-bearing and (1) must stay first.** A job that reached 'Delivered' and was then
+// disputed satisfies both of the first two for a queued 'Picked up': it has been past the pickup
+// *and* it is now in a status with no way back. It is the first of those — the work was done and
+// recorded in sequence — and answering it as an administrative conflict would tell the driver their
+// pickup had lost to something when it had not.
 //
 // # Why the composition root and not the domain
 //
@@ -474,7 +660,48 @@ func (l jobLifecycle) refusal(ctx context.Context, r db.Runner, m jobs.Move) (de
 			return delivery.JobAlreadyPast, nil
 		}
 	}
+
+	// jobs.Service.History is oldest first, so the last row's target is where the job stands.
+	// A job with no history at all is a Draft, which cannot have an accepted bid and so cannot
+	// have reached this function; it falls through to the premature answer rather than being
+	// asserted about.
+	if len(history) > 0 && outOfTheDelivery(history[len(history)-1].To) {
+		return delivery.JobLostTheDelivery, nil
+	}
 	return delivery.JobNotAssignable, nil
+}
+
+// outOfTheDeliveryStatuses are the statuses Docs/02 §2 gives a job no way back into a delivery
+// from (SHIP-113).
+//
+// # Named rather than computed, and then held to the computation
+//
+// The set could be derived at each call by searching Docs/02 §2's graph for a milestone status
+// still reachable, and that search is exactly what
+// TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays runs — against jobs.Permitted, over all
+// twelve statuses, deriving this list and failing if it differs. So the drift a hand-written list
+// invites is checked rather than trusted, and the call site still reads as three named statuses
+// somebody decided on rather than as a graph search whose result nobody can see.
+//
+// **Naming them is also what keeps SHIP-112's behaviour untouched**, which is the risk this ticket
+// carried. A plain "can the job still reach the target?" test would have swept in a job at
+// 'In transit' with a queued 'Driver assigned' — a status the delivery legitimately skipped, which
+// Docs/02 §2 says is skippable — and reported a premature-and-unreachable milestone as an
+// administrative conflict. These three are the statuses where something *ended or froze the
+// delivery*, which is the only thing Docs/02 §3.1's fourth bullet is about.
+//
+// The three are also why the answer cannot change under a retry: Cancelled and Completed are
+// terminal, and Disputed leads only to those two.
+var outOfTheDeliveryStatuses = []jobs.Status{
+	jobs.StatusCancelled,
+	jobs.StatusCompleted,
+	jobs.StatusDisputed,
+}
+
+// outOfTheDelivery reports whether a job standing in this status has lost the delivery rather than
+// merely not reached the milestone yet.
+func outOfTheDelivery(s jobs.Status) bool {
+	return slices.Contains(outOfTheDeliveryStatuses, s)
 }
 
 // acceptedBids implements delivery.Awards by reading the job's accepted bid.

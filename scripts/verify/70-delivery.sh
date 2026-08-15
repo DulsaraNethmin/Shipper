@@ -26,6 +26,13 @@
 # The tokens are minted by the runner and every one of them claims `role: customer`. That is the
 # right thing to exercise: this endpoint decides from the accepted bid, not from a claim in a token.
 # It also means nothing here signs in, so SHIP-47's per-address bucket is untouched by this file.
+#
+# # The last section reads the outbox, and nothing here reads Kafka or starts the worker
+#
+# SHIP-136 gave this domain its events. That section is fenced on the **job identifiers this file
+# created** — which are the aggregate ids of a delivery event — rather than counted over the table,
+# because this database persists between runs. Its rows are left unpublished on purpose, for
+# 80-notifications.sh to drain.
 
 # --- the accounts and the awarded job these checks run against ---------------------------------
 
@@ -579,7 +586,11 @@ status="$(milestone_request "$delivery_provider_token" "$milestone_key-transit" 
   || fail "the job did not follow its milestones"
 ok "the delivery runs through its milestones, each one a named move on the port rather than a status the domain chose"
 
-status="$(milestone_request "$delivery_provider_token" "$milestone_key-delivered" '{"milestone":"delivered"}' delivered)"
+# The two fields Docs/01 §4.4 also requires are supplied (SHIP-123), because this check is about
+# the *evidence* rule. Without them the refusal would be a 422 naming recipient_name — validation
+# runs before the evidence rule — and the check would pass for a reason it is not about.
+status="$(milestone_request "$delivery_provider_token" "$milestone_key-delivered" \
+  '{"milestone":"delivered","recipient_name":"R. Chen","delivery_note":"Left with reception"}' delivered)"
 [[ "$status" == "409" ]] || { cat "$WORKDIR/ms-delivered.json"; fail "delivered returned $status, want 409"; }
 [[ "$(json "$WORKDIR/ms-delivered.json" '["error"]["code"]')" == "delivery_proof_required" ]] \
   || { cat "$WORKDIR/ms-delivered.json"; fail "expected code=delivery_proof_required"; }
@@ -672,6 +683,238 @@ status="$(curl -s -X POST -o "$WORKDIR/ms-early.json" -w '%{http_code}' \
 ok "a milestone the delivery has not reached yet is still refused and still rolls back whole — retrying it succeeds, which is what makes the refusal cost a retry rather than a record"
 
 # ---------------------------------------------------------------------------------------
+ticket "SHIP-113  a queued update contradicting an administrative action loses and is retained"
+
+# Docs/02 §3.1's fourth bullet, run against the running binary:
+#
+#   A queued update that contradicts an administrative action loses. If a driver records
+#   "Delivered" offline while an administrator cancels the job, the cancellation stands, the
+#   attempt is retained in history, and the app must show the driver what happened rather than
+#   silently discarding their work.
+#
+# # Why this belongs here and not only in Go, which is the SHIP-112 argument again
+#
+# The three-way split of one refusal is `jobLifecycle.refusal` in cmd/api/routes_delivery.go, and
+# internal/delivery's tests drive a *copy* of it because cmd/api has no database in a Go test. The
+# production adapter — including `outOfTheDelivery`, which is what decides retention — is exercised
+# here or nowhere.
+#
+# # The fixture goes through Disputed because Docs/02 §2 offers no other way out
+#
+# There is no `Awarded → Cancelled` row, and none from any delivery status: once the goods are in
+# somebody's vehicle the route out is a dispute and an administrator resolving it (§6.2). So an
+# administrator ending a live delivery is two guarded moves, both made as `admin` with the reason
+# ck_job_status_history_admin_reason requires — which is what makes the action distinguishable in the
+# record afterwards, and is what the app reconciles against.
+
+# delivery_admin_move <job-id> <from> <to> <reason> — a guarded transition made by an administrator.
+#
+# Deliberately not delivery_move with a different argument: an administrator owes a reason, the
+# constraint enforces it, and a fixture that routed round that would demonstrate this ticket against
+# a move no administrator could actually make.
+delivery_admin_move() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -v job="$1" -v from_status="$2" -v to_status="$3" -v why="$4" \
+    >/dev/null <<'SQL'
+BEGIN;
+INSERT INTO job_status_history
+    (id, job_id, from_status, to_status, actor_type, actor_id, reason, actor_recorded_at)
+VALUES (gen_random_uuid(), :'job', :'from_status', :'to_status', 'admin',
+        gen_random_uuid(), :'why', now());
+SELECT set_config('shipper.job_status_transition',
+                  (SELECT id::text FROM job_status_history
+                    WHERE job_id = :'job' AND to_status = :'to_status'), true);
+UPDATE jobs SET status = :'to_status' WHERE id = :'job';
+COMMIT;
+SQL
+}
+
+# A live delivery: the driver is in transit and about to lose signal.
+conflict_job="$(delivery_awarded_job conflict)"
+delivery_move "$conflict_job" Awarded 'En route to pickup'
+delivery_move "$conflict_job" 'En route to pickup' 'Picked up'
+delivery_move "$conflict_job" 'Picked up' 'In transit'
+
+# While they are out of contact, an administrator disputes the job and resolves it as cancelled.
+delivery_admin_move "$conflict_job" 'In transit' Disputed "Customer reported the goods never arrived."
+delivery_admin_move "$conflict_job" Disputed Cancelled "Resolved as a failed delivery."
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$conflict_job';")" == "Cancelled" ]] \
+  || fail "the fixture did not reach Cancelled; the rest of this section would prove nothing"
+
+# The phone reconnects and syncs the delivery it recorded three hours ago. Before SHIP-113 this
+# answered 409 and rolled back, taking the driver's row and their recorded exception with it.
+status="$(curl -s -X POST -o "$WORKDIR/ms-conflict.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-conflict" \
+  -H 'Content-Type: application/json' \
+  -d '{"milestone":"delivered","recorded_at":"2026-08-12T06:40:11Z","recipient_name":"R. Chen","delivery_note":"Left with reception","proof":{"exception_reason":"recipient_objected"}}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$conflict_job/milestones")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-conflict.json"; fail "the queued delivery returned $status, want 201 — Docs/02 §3.1 requires the attempt retained, not discarded"; }
+conflict_milestone_id="$(json "$WORKDIR/ms-conflict.json" '["id"]')"
+[[ "$conflict_milestone_id" =~ ^[0-9a-f-]{36}$ ]] || fail "the retained attempt came back with no id"
+ok "a milestone recorded offline into a job an administrator cancelled is accepted rather than refused"
+
+# **The attempt is retained in history** — the row, read from the table, carrying the driver's own
+# clock and Docs/01 §4.4's delivery details. This is the half a rollback took silently.
+conflict_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select milestone || ' @ ' || to_char(actor_recorded_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+        || ' for ' || recipient_name || ' / ' || delivery_note
+     from milestones where id = '$conflict_milestone_id';")"
+[[ "$conflict_row" == "Delivered @ 2026-08-12 06:40:11 for R. Chen / Left with reception" ]] \
+  || fail "the retained attempt is stored as '$conflict_row'"
+ok "the row is there afterwards with the actor's clock uncorrected — 'the attempt is retained in history', literally"
+
+# And the evidence with it. A reasoned exception is the driver's account of why there is no
+# photograph, written before the move is attempted, so a rollback discarded that too.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from proofs where milestone_id = '$conflict_milestone_id';")" == "1" ]] \
+  || fail "the retained attempt lost the reason recorded with it"
+ok "and the evidence recorded with it survives — the driver's work is kept, not merely the fact they tried"
+
+# **The cancellation stands.** Nothing re-opens the job, moves it, or annotates it.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$conflict_job';")" == "Cancelled" ]] \
+  || fail "the retained milestone moved the job; the administrative action must win"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$conflict_job' and to_status = 'Delivered';")" == "0" ]] \
+  || fail "the retained milestone wrote a job_status_history row for a move that did not happen"
+ok "the cancellation stands and no transition was recorded — the update lost, and losing is what it did"
+
+# The last recorded transition is still the administrator's, with their reason on it. That reason is
+# what a client reconciling against the job resource shows the driver (SHIP-132), and it is why the
+# milestone response carries no field of its own.
+conflict_last="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select to_status || ' by ' || actor_type || ': ' || reason from job_status_history
+    where job_id = '$conflict_job' order by server_recorded_at desc, id desc limit 1;")"
+[[ "$conflict_last" == "Cancelled by admin: Resolved as a failed delivery." ]] \
+  || fail "the job's latest transition is '$conflict_last', want the administrator's cancellation"
+ok "and the administrator's own reason is what the job still records, for the app to reconcile against"
+
+# The retry, because retention must not have opened a second way past uq_milestones_idempotency.
+redis-cli -u "$REDIS_URL" del "idem:v1:user:$delivery_provider_id:$milestone_key-conflict" >/dev/null
+status="$(curl -s -X POST -o "$WORKDIR/ms-conflict-again.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-conflict" \
+  -H 'Content-Type: application/json' \
+  -d '{"milestone":"delivered","recorded_at":"2026-08-12T06:40:11Z","recipient_name":"R. Chen","delivery_note":"Left with reception","proof":{"exception_reason":"recipient_objected"}}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$conflict_job/milestones")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/ms-conflict-again.json"; fail "the retry returned $status, want 200"; }
+[[ "$(json "$WORKDIR/ms-conflict-again.json" '["id"]')" == "$conflict_milestone_id" ]] \
+  || fail "the retry answered with a different milestone"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$conflict_job';")" == "1" ]] \
+  || fail "the retry of a retained milestone wrote a second row"
+ok "retried with its cached response deleted it is answered from the row it already wrote — once per key, retained or not"
+
+# --- and the case that must NOT have become a retention -----------------------------------------
+#
+# A job **still on its delivery** refuses a premature milestone exactly as it did before this ticket,
+# and rolls it back whole. That is the boundary SHIP-113 had to not cross: retention is for a job
+# that has *left* the delivery, and widening it to every unreachable move would keep updates a retry
+# would have recorded properly a few minutes later.
+#
+# The other half of the boundary — that a status the delivery legitimately *skipped* is not treated
+# as an administrative conflict — cannot be driven from here at all. 'Driver assigned' is the only
+# skippable status, and `Recording.problems` refuses it at validation with a 422 long before any of
+# this is reached, because a driver is put on a job through its own endpoint. cmd/api's
+# TestTheOutOfDeliveryStatusesAreWhatTheTransitionTableSays is where that half is held, against
+# Docs/02 §2 directly.
+still_on_delivery_job="$(delivery_awarded_job still-on-delivery)"
+delivery_move "$still_on_delivery_job" Awarded 'En route to pickup'
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-still.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-still" \
+  -H 'Content-Type: application/json' -d '{"milestone":"in_transit"}' \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$still_on_delivery_job/milestones")"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/ms-still.json"; fail "a premature milestone on a live delivery returned $status, want 409"; }
+[[ "$(json "$WORKDIR/ms-still.json" '["error"]["code"]')" == "delivery_milestone_not_permitted" ]] \
+  || { cat "$WORKDIR/ms-still.json"; fail "expected code=delivery_milestone_not_permitted"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$still_on_delivery_job';")" == "0" ]] \
+  || fail "a job still on its delivery retained a refused milestone; SHIP-112's refusal has been widened by accident"
+ok "a job still on its delivery still refuses and still rolls back — only a job that has left one retains"
+
+unset conflict_job conflict_milestone_id conflict_row conflict_last still_on_delivery_job
+unset -f delivery_admin_move
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-128  an update unsynced for a day raises an operations alert when it lands"
+
+# Docs/02 §3.1's ladder has three rungs and this is the last: "24 hours — operations alert. The job
+# is treated as at risk and enters the delivery-exception queue (04 §5)." SHIP-126 built the first
+# rung and SHIP-127 the second, both on the handset, both measuring `enqueued_at` — a column the
+# platform has never seen.
+#
+# # What the platform measures instead, and 000601 named it before this ticket existed
+#
+# `server_recorded_at - actor_recorded_at`. The two clocks SHIP-110 kept apart *are* how long the
+# update was unsynced, and 000601 says so: `server_recorded_at` is "what makes an unsynced-milestone
+# threshold (Docs/02 §6.5) measurable". No column is added and no flag is written — the rows are the
+# queue, which is the reading `admin.ExceptionQueue` takes of its own.
+#
+# # This section demonstrates the alert; the queue is Go's to demonstrate
+#
+# `delivery.UnsyncedMilestones` has no HTTP surface until SHIP-157 builds the screen, so it is
+# covered against a real database in internal/delivery. What only a running process can show is the
+# alert itself, and `$WORKDIR/server.log` is where this harness already reads the service's structured
+# output.
+#
+# **Both instants come from the platform's own clock**, computed here and sent as `recorded_at`, so
+# there is no calendar literal for the real date to overtake — the trap wave 9 closed on the 72-hour
+# ticket, and a threshold section is the shape most likely to fall into it.
+unsynced_job="$(delivery_awarded_job unsynced)"
+delivery_move "$unsynced_job" Awarded 'En route to pickup'
+
+# Twenty-five hours behind: a driver who recorded the pickup yesterday morning in a place with no
+# coverage, and whose phone has only now found some.
+unsynced_at="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-unsynced.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-unsynced" \
+  -H 'Content-Type: application/json' \
+  -d "{\"milestone\":\"picked_up\",\"recorded_at\":\"$unsynced_at\"}" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$unsynced_job/milestones")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-unsynced.json"; fail "a day-old update returned $status, want 201 — a stale update is still a recording"; }
+unsynced_milestone_id="$(json "$WORKDIR/ms-unsynced.json" '["id"]')"
+ok "an update recorded a day ago is accepted when it finally lands — being late is not being wrong"
+
+# The gap, from the row rather than from what the endpoint said about itself. `>= interval '24 hours'`
+# is the queue's own predicate, so this asserts the row would be selected by it.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select server_recorded_at - actor_recorded_at >= interval '24 hours'
+     from milestones where id = '$unsynced_milestone_id';")" == "t" ]] \
+  || fail "the stored gap is $("$PSQL" "$DATABASE_URL" -tAc "select server_recorded_at - actor_recorded_at from milestones where id = '$unsynced_milestone_id';"), want at least 24 hours"
+ok "the two clocks are a day apart on the stored row — the gap is measured, not asserted by the client"
+
+# The alert. At WARN, naming the job and the gap, so a log search can find it and order by it.
+unsynced_line="$(grep -F "\"milestone_id\":\"$unsynced_milestone_id\"" "$WORKDIR/server.log" \
+  | grep -F 'more than a day after it was recorded' | tail -1)"
+[[ -n "$unsynced_line" ]] \
+  || { grep -F "$unsynced_milestone_id" "$WORKDIR/server.log" | tail -5; fail "no operations alert was logged for an update a day out of sync"; }
+[[ "$unsynced_line" == *'"level":"WARN"'* ]] \
+  || fail "the unsynced alert is not at WARN: $unsynced_line"
+[[ "$unsynced_line" == *"\"job_id\":\"$unsynced_job\""* && "$unsynced_line" == *'"unsynced_for"'* ]] \
+  || fail "the alert does not name the job and the gap: $unsynced_line"
+ok "it raises an operations alert at WARN, naming the job and how far behind the record ran"
+
+# And the rung is a threshold rather than "any gap at all". An update inside the four-hour rung is
+# the handset's business (SHIP-127) and must not page anybody.
+nudge_job="$(delivery_awarded_job unsynced-nudge)"
+delivery_move "$nudge_job" Awarded 'En route to pickup'
+nudge_at="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+status="$(curl -s -X POST -o "$WORKDIR/ms-nudge.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_provider_token" -H "Idempotency-Key: $milestone_key-nudge" \
+  -H 'Content-Type: application/json' \
+  -d "{\"milestone\":\"picked_up\",\"recorded_at\":\"$nudge_at\"}" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$nudge_job/milestones")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/ms-nudge.json"; fail "a three-hour-old update returned $status, want 201"; }
+nudge_milestone_id="$(json "$WORKDIR/ms-nudge.json" '["id"]')"
+
+grep -F "\"milestone_id\":\"$nudge_milestone_id\"" "$WORKDIR/server.log" \
+  | grep -qF 'more than a day after it was recorded' \
+  && fail "an update three hours behind raised the twenty-four-hour alert; the rung is a threshold"
+ok "and an update inside the four-hour rung raises nothing here — that one is the handset's (SHIP-127)"
+
+unset unsynced_job unsynced_at unsynced_milestone_id unsynced_line nudge_job nudge_at nudge_milestone_id
+
+# ---------------------------------------------------------------------------------------
 ticket "SHIP-108  a driver token grants exactly one job and cannot be exchanged for a user session"
 
 # # What only this section can show
@@ -722,6 +965,10 @@ json_keys() { python3 -c 'import json,sys; print(",".join(sorted(json.load(open(
 # The response held to a closed set of keys rather than searched for the field it must not carry,
 # which is SHIP-83's argument: a search for driver_mobile catches driver_mobile and misses `phone`.
 driver_response_keys="$(json_keys "$WORKDIR/driver-own.json")"
+# **Five keys on an undelivered job, and `delivered_at` is deliberately not among them** (SHIP-123).
+# It is omitempty, so a delivery in progress answers with exactly the five SHIP-108 closed this set
+# at — which is what keeps the closed set meaningful after a sixth field was added to the shape. The
+# SHIP-123 section below asserts the other side: delivered, and the sixth key appears.
 [[ "$driver_response_keys" == "assigned_at,assignment_id,driver_name,job_id,link_expires_at" ]] \
   || fail "the driver's view carries '$driver_response_keys', want exactly assigned_at,assignment_id,driver_name,job_id,link_expires_at"
 ok "and answers with five fields and no sixth — no mobile number, and no delivery detail, which is SHIP-120's"
@@ -809,6 +1056,330 @@ status="$(open_delivery "$driver_wrong_key" "$delivery_job" wrong-key)"
 [[ "$(json "$WORKDIR/driver-wrong-key.json" '["error"]["code"]')" == "unauthenticated" ]] \
   || { cat "$WORKDIR/driver-wrong-key.json"; fail "expected code=unauthenticated"; }
 ok "and one signed with the mobile session's key is refused too — separate key material, checked by the service that is running"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-120a  a driver records a milestone on the job their link grants, and on no other"
+
+# # What only this section can show
+#
+# internal/delivery drives the handler over a real database on a mux of its own, and cmd/api drives
+# the route through the real middleware chain with no database behind it. Neither package can have
+# both at once — cmd/api has no pool in a Go test, and internal/delivery cannot import package main —
+# so **the running binary is the only place where a real link, the real guard, the real composition
+# root and a real row all meet**. That is also where the attribution is decided: the adapter that
+# turns a delivery.Recorder into a jobs.Actor lives in cmd/api/routes_delivery.go and is exercised
+# here or nowhere.
+#
+# # A fixture of its own, deliberately
+#
+# The jobs above have been driven through several milestones already, and this ticket is about who
+# is allowed to record one rather than about where a delivery has got to. Two fresh awarded jobs,
+# each with its own driver, keep the two questions apart — and give the "and on no other" check a
+# second real delivery to be refused on rather than a job identifier nobody assigned.
+
+drv_job="$(delivery_awarded_job drvms)"
+status="$(delivery_request "$delivery_provider_token" "verify-drvms-assign-$$" \
+  "/v1/jobs/$drv_job/driver" '{"driver_name":"Nina Alvares","driver_mobile":"+61417000101"}' \
+  "$WORKDIR/drvms-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvms-assign.json"; fail "assigning the driver returned $status, want 201"; }
+drv_token="$(json "$WORKDIR/drvms-assign.json" '["driver_token"]')"
+drv_assignment="$(json "$WORKDIR/drvms-assign.json" '["id"]')"
+
+drv_other_job="$(delivery_awarded_job drvms-other)"
+status="$(delivery_request "$delivery_provider_token" "verify-drvms-other-assign-$$" \
+  "/v1/jobs/$drv_other_job/driver" '{"driver_name":"Owen Blake","driver_mobile":"+61417000102"}' \
+  "$WORKDIR/drvms-other-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvms-other-assign.json"; fail "assigning the second driver returned $status, want 201"; }
+
+# drv_record <token> <job-id> <key> <body> <name> — one driver milestone, answering with the status.
+#
+# The credential and the job are separate arguments for the reason open_delivery's are: every check
+# below is a pairing of the two, and a helper that built the path out of the token could not express
+# the pairing this ticket exists to refuse.
+drv_record() {
+  curl -s -X POST -o "$WORKDIR/drvms-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $3" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$2/milestones"
+}
+
+# --- the recording itself, and what the two tables say about who made it -----------------------
+
+drv_acted_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=90)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+status="$(drv_record "$drv_token" "$drv_job" "verify-drvms-first-$$" \
+  "{\"milestone\":\"en_route_to_pickup\",\"recorded_at\":\"$drv_acted_at\"}" first)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvms-first.json"; fail "the driver's own link recorded nothing: $status, want 201"; }
+[[ "$(json "$WORKDIR/drvms-first.json" '["job_id"]')" == "$drv_job" ]] \
+  || fail "the milestone landed on $(json "$WORKDIR/drvms-first.json" '["job_id"]'), want $drv_job"
+[[ "$(json "$WORKDIR/drvms-first.json" '["recorded_by"]')" == "driver" ]] \
+  || fail "recorded_by is $(json "$WORKDIR/drvms-first.json" '["recorded_by"]'), want driver"
+ok "a driver holding a job-scoped link records a milestone on that job — the first write in the service served on a credential that names no account"
+
+drv_milestone_id="$(json "$WORKDIR/drvms-first.json" '["id"]')"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select actor_type || '/' || actor_id from milestones where id = '$drv_milestone_id';")" \
+   == "driver/$drv_assignment" ]] \
+  || fail "the milestone row is not attributed to the driver_assignments row the link names"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select actor_type || '/' || actor_id from job_status_history
+     where job_id = '$drv_job' and to_status = 'En route to pickup';")" == "driver/$drv_assignment" ]] \
+  || fail "the transition the driver's milestone caused is attributed to somebody other than the driver"
+ok "and both rows say a driver did it, naming the assignment rather than an account — 000401's convention, through cmd/api's own adapter"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$drv_job';")" == "En route to pickup" ]] \
+  || fail "the job did not move, so the driver's milestone reached no guarded transition"
+[[ "$(json "$WORKDIR/drvms-first.json" '["recorded_at"]')" != "$(json "$WORKDIR/drvms-first.json" '["accepted_at"]')" ]] \
+  || fail "the two clocks are the same value; the driver acted ninety minutes before the platform heard about it"
+ok "the job moves through the same guard, and the two clocks stay ninety minutes apart — Docs/02 §3.1 on the credential it was written for"
+
+# --- exactly one job, which is the half of the *Done when* the invariant rests on ---------------
+
+status="$(drv_record "$drv_token" "$drv_other_job" "verify-drvms-wrong-$$" \
+  '{"milestone":"en_route_to_pickup"}' wrong)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/drvms-wrong.json"; fail "a link for $drv_job recorded on $drv_other_job: $status, want 404"; }
+[[ "$(json "$WORKDIR/drvms-wrong.json" '["error"]["code"]')" == "not_found" ]] \
+  || { cat "$WORKDIR/drvms-wrong.json"; fail "expected code=not_found; a 403 would confirm the other delivery exists"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$drv_other_job';")" == "0" ]] \
+  || fail "the refused request wrote a milestone onto the other job"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$drv_other_job';")" == "Driver assigned" ]] \
+  || fail "the other job moved, so something acted on it"
+ok "the same link presented on another delivery gets exactly what a missing job gets, and writes nothing"
+
+# --- neither token system opens the other's milestone route -------------------------------------
+
+status="$(drv_record "$delivery_provider_token" "$drv_job" "verify-drvms-session-$$" \
+  '{"milestone":"picked_up"}' as-session)"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/drvms-as-session.json"; fail "a mobile session recorded on the driver's route: $status, want 401"; }
+[[ "$(json "$WORKDIR/drvms-as-session.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || { cat "$WORKDIR/drvms-as-session.json"; fail "expected code=unauthenticated"; }
+
+status="$(delivery_request "$drv_token" "verify-drvms-onuser-$$" \
+  "/v1/jobs/$drv_job/milestones" '{"milestone":"picked_up"}' "$WORKDIR/drvms-on-user-route.json")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/drvms-on-user-route.json"; fail "a driver link recorded on the user route: $status, want 401"; }
+ok "a mobile access token is refused on the driver's route and the driver's link is refused on POST /v1/jobs/{id}/milestones — both directions, one binary"
+
+# --- the key, which is why this endpoint exists on a phone with a bad connection -----------------
+
+status="$(curl -s -X POST -o "$WORKDIR/drvms-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $drv_token" -H 'Content-Type: application/json' \
+  -d '{"milestone":"picked_up"}' \
+  "http://localhost:$VERIFY_PORT/v1/driver/jobs/$drv_job/milestones")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/drvms-nokey.json"; fail "the driver's write was accepted with no idempotency key: $status"; }
+[[ "$(json "$WORKDIR/drvms-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || { cat "$WORKDIR/drvms-nokey.json"; fail "expected code=idempotency_key_required"; }
+ok "a driver's write with no Idempotency-Key is refused before it reaches a handler"
+
+status="$(drv_record "$drv_token" "$drv_job" "verify-drvms-first-$$" \
+  "{\"milestone\":\"en_route_to_pickup\",\"recorded_at\":\"$drv_acted_at\"}" retry)"
+[[ "$status" == "201" || "$status" == "200" ]] || { cat "$WORKDIR/drvms-retry.json"; fail "the retry returned $status"; }
+[[ "$(json "$WORKDIR/drvms-retry.json" '["id"]')" == "$drv_milestone_id" ]] \
+  || fail "the retry answered with a different milestone, so a driver's reconnection recorded a second one"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from milestones where job_id = '$drv_job' and idempotency_key = 'verify-drvms-first-$$';")" == "1" ]] \
+  || fail "the key recorded more than one milestone"
+ok "and a retry under the same key answers with the milestone the first attempt recorded, once — the driver on a mobile browser this rule exists for"
+
+# --- the evidence line this ticket draws --------------------------------------------------------
+
+# **The line this ticket drew moved at SHIP-122 rather than disappearing.** SHIP-120a refused every
+# `object_key` from a driver, because no route issued one; the driver's upload exists now, so what is
+# refused is the narrower and better-founded thing — a key the platform did not issue, which is a
+# `409` after the store has been asked rather than a field error before it. The section below drives
+# the whole photographed path; this is the refusal that guards it.
+status="$(drv_record "$drv_token" "$drv_job" "verify-drvms-key-$$" \
+  "{\"milestone\":\"picked_up\",\"proof\":{\"object_key\":\"proof/$drv_job/019bd7a1-2c44-7f10-9a2c-3d4e5f607182\"}}" objkey)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/drvms-objkey.json"; fail "a photograph that never arrived was accepted: $status, want 409"; }
+[[ "$(json "$WORKDIR/drvms-objkey.json" '["error"]["code"]')" == "delivery_proof_not_uploaded" ]] \
+  || { cat "$WORKDIR/drvms-objkey.json"; fail "expected code=delivery_proof_not_uploaded"; }
+
+status="$(drv_record "$drv_token" "$drv_job" "verify-drvms-exception-$$" \
+  '{"milestone":"picked_up","proof":{"exception_reason":"camera_unavailable"}}' exception)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvms-exception.json"; fail "a driver could not record a reasoned exception: $status"; }
+ok "a driver may say why there is no photograph, and a key naming an object that never arrived is refused rather than believed — the platform never takes an upload on trust"
+
+# --- the event, fenced on this section's own job ------------------------------------------------
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$drv_job'
+       and event_type = 'delivery.milestone_recorded' and payload->>'actor_type' = 'driver';")" -ge 1 ]] \
+  || fail "the driver's milestone emitted no delivery.milestone_recorded naming a driver"
+ok "and the driver's recording emits the domain's own event, saying a driver made it"
+
+unset drv_acted_at
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-109  a provider reissues a driver's link and the previous one stops working"
+
+# # What only this section can show
+#
+# internal/delivery holds both tokens and presents each in turn, which is the assertion that matters
+# and it is made there against a real database. What is left for the binary is the wiring: that the
+# route is served, that it is the *provider's* route rather than the driver's, and that the link the
+# response carries is one the running service will actually accept.
+#
+# # The half of the *Done when* that cannot be met, and it is not a shortcut
+#
+# "Provider **or admin** can reissue a link." There is no administrator: ck_users_role refuses the
+# role, admin sign-in is a separate system, and RequireAdmin is unmapped until SHIP-147 — a route
+# declaring it would stop the process at startup rather than be served open. Nothing below is
+# narrowed to hide that; Docs/11 §3 records it, and the service method is already the one a second
+# route would call.
+
+drv_link_job="$(delivery_awarded_job reissue)"
+status="$(delivery_request "$delivery_provider_token" "verify-reissue-assign-$$" \
+  "/v1/jobs/$drv_link_job/driver" '{"driver_name":"Priya Raman","driver_mobile":"+61417000201"}' \
+  "$WORKDIR/reissue-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/reissue-assign.json"; fail "assigning the driver returned $status, want 201"; }
+drv_link_first="$(json "$WORKDIR/reissue-assign.json" '["driver_token"]')"
+drv_link_assignment="$(json "$WORKDIR/reissue-assign.json" '["id"]')"
+
+status="$(open_delivery "$drv_link_first" "$drv_link_job" reissue-before)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/driver-reissue-before.json"; fail "the original link did not open the delivery: $status"; }
+ok "the link the assignment minted opens the delivery, which is the baseline the refusal below is measured against"
+
+# --- the reissue itself ------------------------------------------------------------------------
+
+status="$(delivery_request "$delivery_provider_token" "verify-reissue-$$" \
+  "/v1/jobs/$drv_link_job/driver/link" '{}' "$WORKDIR/reissue.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/reissue.json"; fail "reissuing returned $status, want 200"; }
+drv_link_second="$(json "$WORKDIR/reissue.json" '["driver_token"]')"
+[[ "$drv_link_second" != "$drv_link_first" ]] || fail "the reissue handed back the same token, so nothing was invalidated"
+[[ "$(json "$WORKDIR/reissue.json" '["assignment_id"]')" == "$drv_link_assignment" ]] \
+  || fail "the reissue changed the assignment; it replaces the link and not the driver"
+[[ "$(json "$WORKDIR/reissue.json" '["issue_count"]')" == "2" ]] \
+  || fail "issue_count is $(json "$WORKDIR/reissue.json" '["issue_count"]'), want 2"
+ok "a provider is handed a second link for the same driver, on the same assignment, and the count says which"
+
+status="$(open_delivery "$drv_link_first" "$drv_link_job" reissue-old)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/driver-reissue-old.json"; fail "the previous link still opens the delivery: $status, want 404"; }
+[[ "$(json "$WORKDIR/driver-reissue-old.json" '["error"]["code"]')" == "not_found" ]] \
+  || { cat "$WORKDIR/driver-reissue-old.json"; fail "expected code=not_found — telling a holder their link used to work says something about a delivery they are no longer on"; }
+status="$(open_delivery "$drv_link_second" "$drv_link_job" reissue-new)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/driver-reissue-new.json"; fail "the new link does not open the delivery: $status"; }
+ok "and the previous one gets exactly what a job that does not exist gets, while the new one opens the delivery — revocation as a read against the row, with no denylist to grow"
+
+status="$(drv_record "$drv_link_first" "$drv_link_job" "verify-reissue-write-$$" \
+  '{"milestone":"en_route_to_pickup"}' reissue-write)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/drvms-reissue-write.json"; fail "a superseded link recorded a milestone: $status, want 404"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$drv_link_job';")" == "0" ]] \
+  || fail "the superseded link wrote a milestone"
+ok "the dead link writes nothing either — one check serves the read and the write, because both go through the assignment"
+
+# --- who may ask -------------------------------------------------------------------------------
+
+status="$(delivery_request "$delivery_other_token" "verify-reissue-other-$$" \
+  "/v1/jobs/$drv_link_job/driver/link" '{}' "$WORKDIR/reissue-other.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/reissue-other.json"; fail "another provider reissued the link: $status, want 404"; }
+
+status="$(delivery_request "$drv_link_second" "verify-reissue-bydriver-$$" \
+  "/v1/jobs/$drv_link_job/driver/link" '{}' "$WORKDIR/reissue-bydriver.json")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/reissue-bydriver.json"; fail "a driver reissued their own link: $status, want 401"; }
+ok "a competitor gets what a missing job gets, and the driver cannot reissue their own link at all — which is the point of a credential the provider controls"
+
+status="$(open_delivery "$drv_link_second" "$drv_link_job" reissue-survived)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/driver-reissue-survived.json"; fail "a refused reissue invalidated the live link anyway: $status"; }
+ok "and neither refusal touched the live link, so a refused request wrote nothing"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-115a  both parties read the driver assignment and every recorded milestone"
+
+# # What only this section can show
+#
+# The domain's tests drive both handlers over a real database with a subject injected directly. What
+# they cannot show is the shelf **served**: that two five-segment GETs are registered beside
+# /delivery/proof without the router refusing the set at startup, and that RequireUser is what stands
+# in front of them. `make run` dying at startup is the failure this shape exists to avoid, and only a
+# running binary can demonstrate that it does not.
+#
+# It reads the job the SHIP-120a section drove, which already carries a driver, a milestone that
+# moved the job and one recorded with a reasoned exception — so the list below has something to be a
+# list of.
+
+# read_shelf <token> <job-id> <leaf> <name> — one authenticated read on the shelf.
+read_shelf() {
+  curl -s -o "$WORKDIR/shelf-$4.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/jobs/$2/delivery/$3"
+}
+
+status="$(read_shelf "$delivery_provider_token" "$drv_job" detail provider-detail)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/shelf-provider-detail.json"; fail "the provider could not read the delivery detail: $status"; }
+[[ "$(json "$WORKDIR/shelf-provider-detail.json" '["driver_assigned"]')" == "True" ]] \
+  || { cat "$WORKDIR/shelf-provider-detail.json"; fail "driver_assigned is not true on a job with a live driver"; }
+[[ "$(json "$WORKDIR/shelf-provider-detail.json" '["driver_name"]')" == "Nina Alvares" ]] \
+  || fail "driver_name is $(json "$WORKDIR/shelf-provider-detail.json" '["driver_name"]')"
+
+status="$(read_shelf "$delivery_customer_token" "$drv_job" detail customer-detail)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/shelf-customer-detail.json"; fail "the customer could not read the delivery detail: $status"; }
+[[ "$(json "$WORKDIR/shelf-customer-detail.json" '["assignment_id"]')" \
+   == "$(json "$WORKDIR/shelf-provider-detail.json" '["assignment_id"]')" ]] \
+  || fail "the two parties are looking at different assignments"
+ok "both parties to the job read the driver assignment from a five-segment path served beside /delivery/proof"
+
+# The mobile, held as a closed set of keys rather than searched for: a search for driver_mobile
+# catches driver_mobile and misses `mobile` or `phone` (SHIP-83's argument, and wave 6's lesson).
+[[ "$(json_keys "$WORKDIR/shelf-provider-detail.json")" == "assigned_at,assignment_id,driver_assigned,driver_mobile,driver_name,job_id" ]] \
+  || fail "the provider's view carries '$(json_keys "$WORKDIR/shelf-provider-detail.json")'"
+[[ "$(json_keys "$WORKDIR/shelf-customer-detail.json")" == "assigned_at,assignment_id,driver_assigned,driver_name,job_id" ]] \
+  || fail "the customer's view carries '$(json_keys "$WORKDIR/shelf-customer-detail.json")', and the driver's number should not be among them"
+ok "and the driver's number reaches the provider who typed it and not the customer — Docs/01 §4 on a person with no account and no way to consent"
+
+# --- the timeline, including what a status history cannot show -----------------------------------
+
+# A milestone that moves nothing, which is the case this operation exists for: the driver reaches
+# the pickup, finds nobody there, and records the same milestone again (Docs/02 §5). It writes a row
+# and leaves the job where it stands, so it appears in no timeline derived from the job's status.
+status="$(drv_record "$drv_token" "$drv_job" "verify-shelf-repeat-$$" \
+  '{"milestone":"picked_up"}' shelf-repeat)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvms-shelf-repeat.json"; fail "the repeated milestone returned $status, want 201"; }
+
+status="$(read_shelf "$delivery_customer_token" "$drv_job" milestones customer-milestones)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/shelf-customer-milestones.json"; fail "the customer could not read the milestones: $status"; }
+shelf_rows="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["data"]))' "$WORKDIR/shelf-customer-milestones.json")"
+shelf_stored="$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$drv_job';")"
+[[ "$shelf_rows" == "$shelf_stored" ]] \
+  || fail "the list returned $shelf_rows milestones and the table holds $shelf_stored"
+# The transitions a *milestone* could have caused, rather than every transition the job has ever
+# made — the fixture drove it through Draft, Open and Awarded before any of this, and counting those
+# would make the comparison below pass for the wrong reason.
+shelf_moves="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$drv_job'
+     and to_status in ('En route to pickup','Picked up','In transit','Delivered');")"
+(( shelf_rows > shelf_moves )) \
+  || fail "the list has $shelf_rows rows and the job has $shelf_moves transitions; this section is not exercising a milestone that moved nothing"
+ok "every recorded milestone is on the list, including the ones that moved nothing — which appear here and in no timeline derived from the job's status"
+
+[[ "$(json "$WORKDIR/shelf-customer-milestones.json" '["has_more"]')" == "False" ]] \
+  || fail "has_more is true on a collection smaller than a page"
+[[ "$(json "$WORKDIR/shelf-customer-milestones.json" '["data"][0]["recorded_by"]')" == "driver" ]] \
+  || fail "the newest milestone does not say who recorded it"
+ok "in the collection envelope, newest by the actor's clock first, each row saying who recorded it"
+
+# --- a stranger gets exactly what a missing job gets ---------------------------------------------
+
+# Compared with the request id removed, because "exactly what a missing job gets" is a statement
+# about what somebody probing can tell apart — a difference in the message is one they can act on.
+shelf_refusal() {
+  python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))["error"]; print(e["code"], "/", e["message"])' "$1"
+}
+
+shelf_missing_job="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+for shelf_leaf in detail milestones; do
+  status="$(read_shelf "$delivery_other_token" "$drv_job" "$shelf_leaf" "stranger-$shelf_leaf")"
+  [[ "$status" == "404" ]] || { cat "$WORKDIR/shelf-stranger-$shelf_leaf.json"; fail "a stranger read /delivery/$shelf_leaf: $status, want 404"; }
+
+  status="$(read_shelf "$delivery_customer_token" "$shelf_missing_job" "$shelf_leaf" "missing-$shelf_leaf")"
+  [[ "$status" == "404" ]] || { cat "$WORKDIR/shelf-missing-$shelf_leaf.json"; fail "a job that does not exist answered $status on /delivery/$shelf_leaf"; }
+
+  [[ "$(shelf_refusal "$WORKDIR/shelf-stranger-$shelf_leaf.json")" \
+     == "$(shelf_refusal "$WORKDIR/shelf-missing-$shelf_leaf.json")" ]] \
+    || fail "a stranger and a missing job are distinguishable on /delivery/$shelf_leaf"
+done
+ok "a stranger gets exactly what a missing job gets on both paths, down to the message — a 403 would confirm that somebody else's delivery exists"
+
+unset shelf_rows shelf_stored shelf_moves shelf_missing_job shelf_leaf
+unset -f read_shelf shelf_refusal drv_record
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-114  a client receives a short-lived pre-signed URL and uploads directly"
@@ -1111,6 +1682,31 @@ proof115_unsigned="$(curl -s -o /dev/null -w '%{http_code}' "$STORAGE_ENDPOINT/$
   || fail "the same object answered $proof115_unsigned unsigned, want 403 — a proof photograph identifies an address and a recipient"
 ok "and the same object is refused without a signature: the only way to a photograph is a URL issued after an authorisation check"
 
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-15r  a download URL is signed for a shorter window than an upload URL"
+
+# The two lifetimes were one number until SHIP-15r, and the reason they are two is demonstrated here
+# rather than in a unit test: what is being shown is that the *service* asks for different windows in
+# the two directions, over the wire, against a real signer.
+#
+# Neither number is typed. internal/config owns both, and a check that hard-coded five minutes and
+# fifteen would keep passing after somebody stopped reading them — the same reasoning as SHIP-114's
+# upload window above, whose measured figure this compares against.
+proof115_download_window="$(python3 -c '
+import sys, urllib.parse
+query = urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[1]).query)
+print(int(query["X-Amz-Expires"][0]))
+' "$proof115_download")"
+
+(( proof115_download_window > 0 && proof115_download_window <= 3600 )) \
+  || fail "the download is signed to last $proof115_download_window seconds; internal/config caps both lifetimes at an hour because nothing revokes either"
+ok "the download URL carries its own signed window — $proof115_download_window seconds"
+
+(( proof115_download_window < proof_expires_seconds )) \
+  || fail "the download is signed for $proof115_download_window seconds against an upload's $proof_expires_seconds; a read link is a live link to a photograph and must not inherit the window a slow PUT needs"
+ok "and it is shorter than the upload's $proof_expires_seconds seconds — the two directions no longer share one lifetime"
+
+
 status="$(read_proof "$delivery_provider_token" "$proof_job" provider)"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/p115-read-provider.json"; fail "the awarded provider reading proof answered $status"; }
 [[ "$(json "$WORKDIR/p115-read-provider.json" '["data"][0]["object_key"]')" == "$proof115_key" ]] \
@@ -1283,7 +1879,7 @@ delivery_move "$deliv_job" "Picked up" "In transit"
 # --- neither, which is the refusal the invariant is ---------------------------------------------
 
 status="$(record_milestone_on "$deliv_job" "verify-p118-neither-$$" \
-  '{"milestone":"delivered"}' deliv-neither)"
+  '{"milestone":"delivered","recipient_name":"R. Chen","delivery_note":"Left with reception"}' deliv-neither)"
 [[ "$status" == "409" ]] \
   || { cat "$WORKDIR/p115-deliv-neither.json"; fail "a delivery with nothing behind it answered $status, want 409"; }
 [[ "$(json "$WORKDIR/p115-deliv-neither.json" '["error"]["code"]')" == "delivery_proof_required" ]] \
@@ -1299,8 +1895,10 @@ ok "a delivery recorded with neither a photograph nor a reason is refused, the j
 # ever be written second.
 if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
 BEGIN;
-INSERT INTO milestones (id, job_id, milestone, actor_type, actor_id, actor_recorded_at)
-VALUES (gen_random_uuid(), '$deliv_job', 'Delivered', 'provider', '$delivery_provider_id', now());
+INSERT INTO milestones
+    (id, job_id, milestone, actor_type, actor_id, actor_recorded_at, recipient_name, delivery_note)
+VALUES (gen_random_uuid(), '$deliv_job', 'Delivered', 'provider', '$delivery_provider_id', now(),
+        'R. Chen', 'Left with reception');
 COMMIT;
 SQL
 then
@@ -1313,7 +1911,7 @@ ok "and the same row is refused in raw SQL at COMMIT — the rule holds for a wr
 # --- a reasoned exception, which is the whole of Docs/01 §4.4's second path ---------------------
 
 status="$(record_milestone_on "$deliv_job" "verify-p118-exc-$$" \
-  '{"milestone":"delivered","reason":"handed over at the loading dock","proof":{"exception_reason":"location_unsafe"}}' \
+  '{"milestone":"delivered","reason":"handed over at the loading dock","recipient_name":"R. Chen","delivery_note":"Left with reception","proof":{"exception_reason":"location_unsafe"}}' \
   deliv-exc)"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/p115-deliv-exc.json"; fail "a delivery evidenced by a reasoned exception answered $status, want 201"; }
@@ -1343,7 +1941,7 @@ deliv_key="$(proof_url_for "$deliv_photo_job" deliv "$WORKDIR/p118-url.json")"
 upload_to "$WORKDIR/p118-url.json" "$WORKDIR/p115-proof.bin"
 
 status="$(record_milestone_on "$deliv_photo_job" "verify-p118-photo-$$" \
-  "{\"milestone\":\"delivered\",\"proof\":{\"object_key\":\"$deliv_key\"}}" deliv-photo)"
+  "{\"milestone\":\"delivered\",\"recipient_name\":\"R. Chen\",\"delivery_note\":\"Left with reception\",\"proof\":{\"object_key\":\"$deliv_key\"}}" deliv-photo)"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/p115-deliv-photo.json"; fail "a photographed delivery answered $status, want 201"; }
 [[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$deliv_photo_job';")" == "Delivered" ]] \
@@ -1355,3 +1953,524 @@ ok "and a delivery evidenced by a photograph is accepted the same way — both h
    mc rm --force "local/'"$STORAGE_BUCKET/$deliv_key"'" >/dev/null 2>&1 || true' \
   || fail "could not remove the object this section uploaded"
 ok "the object this section uploaded was removed from $STORAGE_BUCKET"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-136  every delivery state change emits its event from the domain, into the outbox"
+
+# Docs/01 §4.5's "delivery status changes", read to include everything Docs/01 §4.4 asks an actor to
+# record — which is more than the job's status carries.
+#
+# # What is demonstrated here and what is demonstrated by tests
+#
+# internal/delivery/events_test.go holds the payloads, the retry and absorption paths, the ordering of
+# the milestone event and the evidence event, and the rolled-back transaction that emits nothing.
+# cmd/api/events_domain_test.go holds the half of the *Done when* that is about where the emit lives.
+#
+# **What only this can show is that every assignment, milestone and piece of evidence recorded through
+# the served binary above left its event behind** — through cmd/api's own wiring rather than a
+# fixture's. 80-notifications.sh takes them the rest of the way onto `shipper.delivery`.
+#
+# # The fence, and why it is by job identifier
+#
+# The aggregate id of a delivery event is the **job**, so this section's jobs are its own fence: each
+# is created by `delivery_awarded_job` in this run and named nowhere else. A count over
+# `aggregate_type = 'delivery'` would include every previous `make verify` on this database, which
+# persists between runs.
+#
+# Nothing here reads Kafka and nothing here starts the worker: these rows are deliberately left
+# unpublished.
+
+# delivery_events_on <job> <event_type> — how many of one event type a job produced.
+delivery_events_on() {
+  "$PSQL" "$DATABASE_URL" -tAc \
+    "select count(*) from outbox
+      where aggregate_type = 'delivery' and aggregate_id = '$1' and event_type = '$2';"
+}
+
+# The assignment. `$delivery_job` had a driver put on it by the first section of this file.
+[[ "$(delivery_events_on "$delivery_job" delivery.driver_assigned)" -ge 1 ]] \
+  || fail "assigning a driver through the endpoint emitted no delivery.driver_assigned"
+ok "putting a driver on a job emits its event, alongside the job's own transition"
+
+# **And the driver's name and mobile are not on it.** Docs/01 §5.1: an event travels through the
+# outbox onto a topic with seven days of retention and into every consumer there will ever be. The
+# assignment above nominated "Sam Patel" on +61412345678, so this is a real assertion.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$delivery_job'
+       and (payload::text ilike '%Patel%' or payload::text like '%41234567%');")" == "0" ]] \
+  || fail "an assignment event carries the driver's name or number — Docs/01 §5.1 keeps both off the wire"
+ok "and it carries neither the driver's name nor their number, which a consumer reads from the row"
+
+# The milestone. `$milestone_job` had several recorded against it, including one the job had already
+# moved past — which writes a row, moves nothing, and therefore emits **no** job.status_changed.
+# Before this ticket that recording was invisible to everything downstream.
+[[ "$(delivery_events_on "$milestone_job" delivery.milestone_recorded)" -ge 1 ]] \
+  || fail "recording a milestone through the endpoint emitted no delivery.milestone_recorded"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$milestone_job'
+       and event_type = 'delivery.milestone_recorded' and (payload->>'job_moved')::boolean is false;")" -ge 1 ]] \
+  || fail "no milestone event reports job_moved false, and this file recorded one the job had moved past"
+ok "a milestone emits its event whether or not the job moved, and says which — the case job.status_changed cannot report"
+
+# One event per row, which is what the milestone table is the authority on. A count that disagreed
+# would mean either a recording that emitted twice or one that emitted not at all.
+[[ "$(delivery_events_on "$milestone_job" delivery.milestone_recorded)" \
+   == "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$milestone_job';")" ]] \
+  || fail "the milestone events and the milestone rows on $milestone_job do not agree"
+ok "and there is exactly one event per recorded milestone — a retry answered from the record emits nothing"
+
+# The evidence, both kinds. `$deliv_job` was delivered on a reasoned exception and
+# `$deliv_photo_job` on a photograph, both through the endpoint.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select payload->>'exception_reason' from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$deliv_job'
+       and event_type = 'delivery.proof_recorded' and (payload->>'is_exception')::boolean;")" == "location_unsafe" ]] \
+  || fail "the exception-completed delivery emitted no proof event naming its reason"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$deliv_photo_job'
+       and event_type = 'delivery.proof_recorded' and (payload->>'is_exception')::boolean is false;")" -ge 1 ]] \
+  || fail "the photographed delivery emitted no proof event"
+ok "a photograph and a reasoned exception each emit the same event, told apart by is_exception — Docs/04 §5's queue reads the second"
+
+# **And the object key is not on it.** Where the bytes are is a storage locator, and who may look at
+# them is decided by GET /v1/jobs/{id}/delivery/proof after an authorisation check — which is not a
+# decision a consumer of a topic is in a position to make.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$deliv_photo_job'
+       and payload::text like '%$deliv_key%';")" == "0" ]] \
+  || fail "a proof event carries the object key; a signed URL is issued after an authorisation check, not from a topic"
+ok "and no proof event carries the object key — the photograph is reached through the endpoint that checks who is asking"
+
+# The order, which on this aggregate is a guarantee rather than a preference: both events are about
+# the job, so both key onto one partition and Kafka keeps their order. Evidence naming a milestone a
+# consumer has not seen yet is what this avoids.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select event_type from outbox
+     where aggregate_type = 'delivery' and aggregate_id = '$deliv_photo_job'
+       and event_type in ('delivery.milestone_recorded','delivery.proof_recorded')
+     order by id desc limit 1;")" == "delivery.proof_recorded" ]] \
+  || fail "the evidence event was written before the milestone it stands behind"
+ok "the evidence follows the claim it stands behind, in the outbox and therefore on the partition"
+
+unset deliv_key
+unset -f delivery_events_on
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-121  every milestone the driver portal offers is one the platform accepts"
+
+# # What only this section can show, and it is the risk this ticket actually carries
+#
+# SHIP-121 draws buttons over `POST /v1/driver/jobs/{id}/milestones`, which SHIP-120a built and the
+# section above already exercises. So there is no new endpoint here and this file is not testing one.
+#
+# **What is new is a hand-written list.** `apps/driver-portal/lib/milestones.ts` names four wire
+# forms, and it names them by hand: `contracts/statuses.yaml` generates three enumerations into that
+# application and milestones are deliberately not among them — `internal/delivery/milestone.go`
+# declares its own five and says SHIP-56a "has no opinion about this one". A fourth enumeration
+# would have meant editing a shared file mid-wave and rewriting a domain's hand-written type, so
+# `Docs/11` §9 carries the generator as a recommendation with a trigger and the list is written out
+# meanwhile.
+#
+# A hand-written list of another system's vocabulary is exactly the thing that drifts, and the drift
+# is silent in the worst place: a driver taps a button in a yard and gets a `422` naming a field.
+# **So the list is read out of the TypeScript source and every value in it is recorded against the
+# running service**, which no Go test and no `node --test` can do — the first has no portal and the
+# second has no platform.
+#
+# The fifth milestone is checked from the other end. `driver_assigned` is refused by name, and a
+# portal that offered it would have a button that could never work.
+
+ms_portal_source="$ROOT/apps/driver-portal/lib/milestones.ts"
+[[ -f "$ms_portal_source" ]] || fail "the driver portal's milestone list is not where this check expects it: $ms_portal_source"
+
+# The wire forms the portal offers, in the order it offers them. `sed` rather than a JSON parse
+# because the file is TypeScript; the shape is one `wire: "..."` per milestone and nothing else in
+# the file matches it.
+ms_portal_wire="$(sed -n 's/^ *wire: "\([a-z_]*\)",$/\1/p' "$ms_portal_source")"
+[[ "$(printf '%s\n' "$ms_portal_wire" | grep -c .)" == "4" ]] \
+  || { printf '%s\n' "$ms_portal_wire"; fail "the portal offers $(printf '%s\n' "$ms_portal_wire" | grep -c .) milestones, want 4"; }
+ok "the driver portal offers four milestones, read out of lib/milestones.ts rather than retyped here"
+
+# ms_record <token> <job-id> <key> <body> <name> — one driver milestone, answering with the status.
+#
+# A helper of this section's own rather than SHIP-120a's `drv_record`, which is `unset -f` above.
+# The credential and the job stay separate arguments for the reason that one's were: every check
+# here is a pairing of the two, and a helper that built the path out of the token could not express
+# the pairing the driver routes exist to refuse.
+ms_record() {
+  curl -s -X POST -o "$WORKDIR/portalms-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $3" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$2/milestones"
+}
+
+ms_job="$(delivery_awarded_job portalms)"
+status="$(delivery_request "$delivery_provider_token" "verify-portalms-assign-$$" \
+  "/v1/jobs/$ms_job/driver" '{"driver_name":"Tam Ngo","driver_mobile":"+61417000121"}' \
+  "$WORKDIR/portalms-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/portalms-assign.json"; fail "assigning the portal driver returned $status, want 201"; }
+ms_token="$(json "$WORKDIR/portalms-assign.json" '["driver_token"]')"
+
+# Each in turn, in the order the buttons read in, on the driver's own credential — which is what the
+# browser holds. `delivered` carries a reasoned exception because that is the whole of what a driver
+# can attach today: there is no route by which one can obtain an object key until SHIP-122, and
+# `internal/delivery` refuses an `object_key` on this route by name. `Docs/01` §4.4 makes the
+# exception path part of the same feature, and the portal's completion step offers exactly these.
+ms_step=0
+while read -r ms_wire; do
+  [[ -n "$ms_wire" ]] || continue
+  ms_step=$((ms_step + 1))
+
+  ms_body="{\"milestone\":\"$ms_wire\"}"
+  if [[ "$ms_wire" == "delivered" ]]; then
+    ms_body="{\"milestone\":\"delivered\",\"recipient_name\":\"R. Chen\",\"delivery_note\":\"Left with reception\",\"proof\":{\"exception_reason\":\"recipient_objected\"}}"
+  fi
+
+  status="$(ms_record "$ms_token" "$ms_job" "verify-portalms-$ms_step-$$" "$ms_body" "$ms_step")"
+  [[ "$status" == "201" ]] \
+    || { cat "$WORKDIR/portalms-$ms_step.json"; fail "the portal offers $ms_wire and the platform answered $status"; }
+  [[ "$(json "$WORKDIR/portalms-$ms_step.json" '["milestone"]')" == "$ms_wire" ]] \
+    || fail "recording $ms_wire came back as $(json "$WORKDIR/portalms-$ms_step.json" '["milestone"]')"
+done <<< "$ms_portal_wire"
+ok "every one of them records on the driver's own link, in the order the buttons read in — the four the portal draws are the four the service accepts"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$ms_job';")" == "Delivered" ]] \
+  || fail "the four milestones did not take the job to Delivered"
+ok "and a driver takes a delivery from assignment to Delivered through the portal's four buttons and nothing else"
+
+# The fifth, refused by name. A portal that offered it would have a button that could never work.
+status="$(ms_record "$ms_token" "$ms_job" "verify-portalms-fifth-$$" \
+  '{"milestone":"driver_assigned"}' fifth)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/portalms-fifth.json"; fail "driver_assigned was accepted as a milestone: $status"; }
+[[ "$(json "$WORKDIR/portalms-fifth.json" '["error"]["details"][0]["field"]')" == "milestone" ]] \
+  || { cat "$WORKDIR/portalms-fifth.json"; fail "the refusal does not name the milestone field"; }
+[[ "$(grep -c 'driver_assigned' "$ms_portal_source")" == "1" ]] \
+  || fail "lib/milestones.ts names driver_assigned more than once; it should appear only in the comment saying it is absent"
+ok "the fifth milestone is refused by name and the portal does not offer it — a driver is put on a job through its own endpoint"
+
+unset ms_portal_source ms_portal_wire ms_job ms_token ms_step ms_wire ms_body
+unset -f ms_record
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-122  a driver photographs a delivery, uploads it themselves, and records it as proof"
+
+# # What only this section can show, and it is the whole point of the ticket
+#
+# Until this route existed there was **no way for a driver to photograph a delivery at all**, because
+# there was no way for one to obtain an object key: `POST /v1/jobs/{id}/proof-uploads` is
+# `RequireUser`, and `internal/delivery` refused an `object_key` on the driver's milestone route by
+# name. So a driver could reach 'Delivered' only through a reasoned exception — which means SHIP-117's
+# moderation queue was the *only* path for a driver-recorded delivery rather than one of two.
+#
+# internal/delivery drives both new functions against a real database with a stubbed store, and
+# cmd/api holds the route's auth class. **What neither can reach is the store**: the domain's tests
+# stub the signer, so no Go test in this repository fails when a signature stops binding what it
+# should. This section is where the bytes actually leave a client, land in MinIO under the key the
+# API named, and come back out again.
+#
+# # The fixture is a fresh delivery, driven to 'In transit' on the driver's own link
+#
+# Not one of the jobs above: this is about a delivery a driver carried end to end, and the four
+# recordings are the sequence a portal produces.
+
+drvpx_job="$(delivery_awarded_job drvpx)"
+status="$(delivery_request "$delivery_provider_token" "verify-drvpx-assign-$$" \
+  "/v1/jobs/$drvpx_job/driver" '{"driver_name":"Priya Raman","driver_mobile":"+61417000122"}' \
+  "$WORKDIR/drvpx-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvpx-assign.json"; fail "assigning the driver returned $status, want 201"; }
+drvpx_token="$(json "$WORKDIR/drvpx-assign.json" '["driver_token"]')"
+drvpx_assignment="$(json "$WORKDIR/drvpx-assign.json" '["id"]')"
+
+drvpx_other_job="$(delivery_awarded_job drvpx-other)"
+status="$(delivery_request "$delivery_provider_token" "verify-drvpx-other-assign-$$" \
+  "/v1/jobs/$drvpx_other_job/driver" '{"driver_name":"Owen Blake","driver_mobile":"+61417000123"}' \
+  "$WORKDIR/drvpx-other-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/drvpx-other-assign.json"; fail "assigning the second driver returned $status"; }
+drvpx_other_token="$(json "$WORKDIR/drvpx-other-assign.json" '["driver_token"]')"
+
+# drvpx_post <token> <job> <suffix> <key> <body> <name> — one driver request under /driver/jobs/{id}.
+#
+# The credential, the job and the suffix are separate arguments for the reason every other driver
+# helper in this file keeps them apart: a helper that built the path out of the token could not
+# express the pairing these routes exist to refuse.
+drvpx_post() {
+  curl -s -X POST -o "$WORKDIR/drvpx-$6.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $4" \
+    -H 'Content-Type: application/json' -d "$5" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$2/$3"
+}
+
+# --- the URL, minted on the driver's own credential ---------------------------------------------
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-url-$$" \
+  '{"content_type":"image/jpeg","content_length":48}' url)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/drvpx-url.json"; fail "the driver's presign answered $status, want 200"; }
+
+drvpx_key="$(json "$WORKDIR/drvpx-url.json" '["object_key"]')"
+drvpx_url="$(json "$WORKDIR/drvpx-url.json" '["upload_url"]')"
+[[ "$(json "$WORKDIR/drvpx-url.json" '["method"]')" == "PUT" ]] || fail "the response does not describe a PUT"
+[[ "$drvpx_key" == proof/$drvpx_job/* ]] \
+  || fail "object_key is $drvpx_key, want it prefixed by proof/$drvpx_job/ — a key naming another job could never be recorded"
+ok "a driver holding a job-scoped link is issued an upload URL and a key under their own delivery — the route that did not exist for the whole of wave 8"
+
+# --- the bytes, which leave a client and never touch this service -------------------------------
+
+printf '%s' 'not a photograph, but exactly forty-eight bytes.' > "$WORKDIR/drvpx-proof.bin"
+put_status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H 'Content-Type: image/jpeg' --data-binary "@$WORKDIR/drvpx-proof.bin" "$drvpx_url")"
+[[ "$put_status" == "200" ]] \
+  || fail "the driver's pre-signed PUT answered $put_status — a browser could not upload directly, which is the whole of SHIP-122"
+
+drvpx_stored="$("${COMPOSE[@]}" exec -T minio sh -c \
+  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; \
+   mc cat "local/'"$STORAGE_BUCKET/$drvpx_key"'"' 2>/dev/null)"
+[[ "$drvpx_stored" == "not a photograph, but exactly forty-eight bytes." ]] \
+  || fail "the driver's object in $STORAGE_BUCKET reads back as '$drvpx_stored'"
+ok "and the browser PUTs it straight to $STORAGE_BUCKET with that URL and nothing else — the platform is in neither direction"
+
+# --- the record, which is what turns bytes into evidence -----------------------------------------
+
+for drvpx_step in en_route_to_pickup picked_up in_transit; do
+  status="$(drvpx_post "$drvpx_token" "$drvpx_job" milestones "verify-drvpx-$drvpx_step-$$" \
+    "{\"milestone\":\"$drvpx_step\"}" "$drvpx_step")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/drvpx-$drvpx_step.json"; fail "recording $drvpx_step answered $status"; }
+done
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" milestones "verify-drvpx-delivered-$$" \
+  "{\"milestone\":\"delivered\",\"recipient_name\":\"R. Chen\",\"delivery_note\":\"Left with reception\",\"proof\":{\"object_key\":\"$drvpx_key\"}}" delivered)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/drvpx-delivered.json"; fail "a driver could not record a photographed delivery: $status"; }
+drvpx_milestone="$(json "$WORKDIR/drvpx-delivered.json" '["id"]')"
+[[ "$(json "$WORKDIR/drvpx-delivered.json" '["recorded_by"]')" == "driver" ]] \
+  || fail "the photographed delivery is not attributed to the driver"
+ok "a driver records Delivered against the photograph they uploaded — the ordinary path, reachable by the person actually at the door"
+
+drvpx_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (p.job_id = '$drvpx_job') || ' ' || (p.milestone_id = '$drvpx_milestone')
+        || ' ' || p.content_type || ' ' || p.content_length
+        || ' ' || (p.exception_reason is null) || ' ' || (length(p.etag) > 0)
+     from proofs p where p.object_key = '$drvpx_key';")"
+[[ "$drvpx_row" == "true true image/jpeg 48 true true" ]] \
+  || fail "the driver's proof row is '$drvpx_row', want 'true true image/jpeg 48 true true'"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select actor_type || '/' || actor_id from milestones where id = '$drvpx_milestone';")" \
+   == "driver/$drvpx_assignment" ]] \
+  || fail "the delivered milestone is not attributed to the driver_assignments row the link names"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$drvpx_job';")" == "Delivered" ]] \
+  || fail "the job did not reach Delivered"
+ok "and the row holds a photograph rather than an exception, with the type, size and tag the store reported — a driver-recorded delivery that Docs/04 §5's queue has no reason to hold"
+
+# --- the two ways to get a key wrong --------------------------------------------------------------
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_other_job" proof-uploads "verify-drvpx-wrong-$$" \
+  '{"content_type":"image/jpeg","content_length":48}' wrong)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/drvpx-wrong.json"; fail "a link for $drvpx_job minted a URL on $drvpx_other_job: $status"; }
+[[ "$(json "$WORKDIR/drvpx-wrong.json" '["error"]["code"]')" == "not_found" ]] \
+  || fail "expected code=not_found; a 403 would confirm the other delivery exists"
+
+drvpx_elsewhere="$(drvpx_post "$drvpx_other_token" "$drvpx_other_job" proof-uploads \
+  "verify-drvpx-elsewhere-$$" '{"content_type":"image/jpeg","content_length":48}' elsewhere)"
+[[ "$drvpx_elsewhere" == "200" ]] || { cat "$WORKDIR/drvpx-elsewhere.json"; fail "the second driver's presign answered $drvpx_elsewhere"; }
+drvpx_elsewhere_key="$(json "$WORKDIR/drvpx-elsewhere.json" '["object_key"]')"
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" milestones "verify-drvpx-cross-$$" \
+  "{\"milestone\":\"picked_up\",\"proof\":{\"object_key\":\"$drvpx_elsewhere_key\"}}" cross)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/drvpx-cross.json"; fail "another delivery's key was accepted: $status, want 422"; }
+[[ "$(json "$WORKDIR/drvpx-cross.json" '["error"]["details"][0]["field"]')" == "proof.object_key" ]] \
+  || { cat "$WORKDIR/drvpx-cross.json"; fail "the refusal does not name proof.object_key"; }
+ok "a link mints no URL on another delivery and cannot attach one issued for another delivery — the grant scopes both halves"
+
+# --- the credential systems stay apart on the new route -------------------------------------------
+
+status="$(delivery_request "$delivery_provider_token" "verify-drvpx-session-$$" \
+  "/v1/driver/jobs/$drvpx_job/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' \
+  "$WORKDIR/drvpx-session.json")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/drvpx-session.json"; fail "a mobile session minted a driver upload URL: $status, want 401"; }
+
+status="$(delivery_request "$drvpx_token" "verify-drvpx-onuser-$$" \
+  "/v1/jobs/$drvpx_job/proof-uploads" '{"content_type":"image/jpeg","content_length":48}' \
+  "$WORKDIR/drvpx-on-user-route.json")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/drvpx-on-user-route.json"; fail "a driver link minted a provider upload URL: $status, want 401"; }
+ok "a mobile access token is refused on the driver's upload route and the driver's link is refused on the provider's — both directions, one binary"
+
+# --- the key, and what a retry gets ---------------------------------------------------------------
+
+status="$(curl -s -X POST -o "$WORKDIR/drvpx-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $drvpx_token" -H 'Content-Type: application/json' \
+  -d '{"content_type":"image/jpeg","content_length":48}' \
+  "http://localhost:$VERIFY_PORT/v1/driver/jobs/$drvpx_job/proof-uploads")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/drvpx-nokey.json"; fail "the driver's presign was accepted with no idempotency key: $status"; }
+[[ "$(json "$WORKDIR/drvpx-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || { cat "$WORKDIR/drvpx-nokey.json"; fail "expected code=idempotency_key_required"; }
+
+# **A repeat under the same key replays the stored URL rather than minting a new slot**, which is
+# correct and is exactly why the driver portal sends a fresh key per attempt: one intent buys one
+# upload slot, and a retry must not extend a credential's life. A driver whose upload failed needs a
+# new slot, so their browser mints a new key — see apps/driver-portal/lib/keys.ts.
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-url-$$" \
+  '{"content_type":"image/jpeg","content_length":48}' url-again)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/drvpx-url-again.json"; fail "the replay answered $status"; }
+[[ "$(json "$WORKDIR/drvpx-url-again.json" '["object_key"]')" == "$drvpx_key" ]] \
+  || fail "the same key minted a second object key; one intent buys one upload slot"
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-fresh-$$" \
+  '{"content_type":"image/jpeg","content_length":48}' fresh)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/drvpx-fresh.json"; fail "the fresh-key presign answered $status"; }
+[[ "$(json "$WORKDIR/drvpx-fresh.json" '["object_key"]')" != "$drvpx_key" ]] \
+  || fail "a fresh key was issued the same object key; a URL issued today could then overwrite an object that already holds proof"
+ok "a driver's presign needs a key, replays under a repeated one, and mints a fresh object key under a new one — which is why the portal sends a new key per attempt"
+
+# --- what the platform will not sign for a driver either -------------------------------------------
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-svg-$$" \
+  '{"content_type":"image/svg+xml","content_length":48}' svg)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/drvpx-svg.json"; fail "a driver was signed a URL for image/svg+xml: $status"; }
+[[ "$(json "$WORKDIR/drvpx-svg.json" '["error"]["details"][0]["field"]')" == "content_type" ]] \
+  || fail "the refusal does not name content_type"
+
+status="$(drvpx_post "$drvpx_token" "$drvpx_job" proof-uploads "verify-drvpx-huge-$$" \
+  '{"content_type":"image/jpeg","content_length":99999999}' huge)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/drvpx-huge.json"; fail "a driver was signed a URL over the size limit: $status"; }
+[[ "$(json "$WORKDIR/drvpx-huge.json" '["error"]["details"][0]["field"]')" == "content_length" ]] \
+  || fail "the refusal does not name content_length"
+ok "the same policy applies to a driver's upload as to a provider's — one limit, enforced where the URL is signed rather than where the buttons are"
+
+unset drvpx_job drvpx_token drvpx_assignment drvpx_other_job drvpx_other_token drvpx_key drvpx_url
+unset drvpx_stored drvpx_step drvpx_milestone drvpx_row drvpx_elsewhere drvpx_elsewhere_key
+unset -f drvpx_post
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-123  a delivered job records who took it and what was done with it, and the link goes read-only"
+
+# # What this closes, and it had been named in a migration since SHIP-118
+#
+# Docs/01 §4.4 requires four things of a delivered job: recipient name, delivery timestamp, delivery
+# note, and photo proof. Three were reachable before this ticket. `000605`'s own comment named
+# SHIP-123 as the one that would close the other two — "no column holds either yet" — and Docs/11 §4
+# has carried the gap as documentation ahead of code ever since.
+#
+# # What only this section can show
+#
+# internal/delivery drives both layers of the rule against a real database: the domain's field errors
+# and `ck_milestones_delivery_details` in raw SQL. **What only the running binary can show is that
+# the fields survive the wire in both directions** — sent on a driver's link and read back out of the
+# platform's own response — and that `GET /v1/driver/jobs/{id}` grew the one field a portal needs to
+# become read-only without growing any of the ones SHIP-108 kept off it.
+
+comp_job="$(delivery_awarded_job comp)"
+status="$(delivery_request "$delivery_provider_token" "verify-comp-assign-$$" \
+  "/v1/jobs/$comp_job/driver" '{"driver_name":"Mei Lin","driver_mobile":"+61417000124"}' \
+  "$WORKDIR/comp-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/comp-assign.json"; fail "assigning the driver returned $status, want 201"; }
+comp_token="$(json "$WORKDIR/comp-assign.json" '["driver_token"]')"
+
+# comp_post <suffix> <key> <body> <name> — one driver request on this section's own delivery.
+comp_post() {
+  curl -s -X POST -o "$WORKDIR/comp-$4.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $comp_token" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$3" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$comp_job/$1"
+}
+
+# comp_read <name> — what the driver's link opens, right now.
+comp_read() {
+  curl -s -o "$WORKDIR/comp-read-$1.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $comp_token" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$comp_job"
+}
+
+for comp_step in en_route_to_pickup picked_up in_transit; do
+  status="$(comp_post milestones "verify-comp-$comp_step-$$" "{\"milestone\":\"$comp_step\"}" "$comp_step")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/comp-$comp_step.json"; fail "recording $comp_step answered $status"; }
+done
+
+# --- the field set, refused one field at a time -------------------------------------------------
+
+status="$(comp_post milestones "verify-comp-noname-$$" \
+  '{"milestone":"delivered","delivery_note":"Left with reception","proof":{"exception_reason":"recipient_objected"}}' noname)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/comp-noname.json"; fail "a delivery with no recipient answered $status, want 422"; }
+[[ "$(json "$WORKDIR/comp-noname.json" '["error"]["details"][0]["field"]')" == "recipient_name" ]] \
+  || { cat "$WORKDIR/comp-noname.json"; fail "the refusal does not name recipient_name"; }
+
+status="$(comp_post milestones "verify-comp-nonote-$$" \
+  '{"milestone":"delivered","recipient_name":"R. Chen","proof":{"exception_reason":"recipient_objected"}}' nonote)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/comp-nonote.json"; fail "a delivery with no note answered $status, want 422"; }
+[[ "$(json "$WORKDIR/comp-nonote.json" '["error"]["details"][0]["field"]')" == "delivery_note" ]] \
+  || { cat "$WORKDIR/comp-nonote.json"; fail "the refusal does not name delivery_note"; }
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$comp_job';")" == "In transit" ]] \
+  || fail "a job reached Delivered without Docs/01 §4.4's field set"
+ok "a delivery is refused without the recipient or the note, each named as the field it is, and the job does not move"
+
+# The other half of the rule: the two fields belong to a delivered milestone and to no other.
+status="$(comp_post milestones "verify-comp-onpickup-$$" \
+  '{"milestone":"picked_up","recipient_name":"R. Chen","delivery_note":"Left with reception"}' onpickup)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/comp-onpickup.json"; fail "a pickup carrying a recipient answered $status, want 422"; }
+[[ "$(json "$WORKDIR/comp-onpickup.json" '["error"]["details"][0]["field"]')" == "recipient_name" ]] \
+  || { cat "$WORKDIR/comp-onpickup.json"; fail "the refusal does not name recipient_name"; }
+ok "and neither field may be attached to any other milestone — a recipient name on a pickup is a handover that did not happen"
+
+# --- before: the link opens a delivery that is not finished --------------------------------------
+
+status="$(comp_read before)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/comp-read-before.json"; fail "the driver's read answered $status"; }
+comp_before_keys="$(json_keys "$WORKDIR/comp-read-before.json")"
+[[ "$comp_before_keys" == "assigned_at,assignment_id,driver_name,job_id,link_expires_at" ]] \
+  || fail "an undelivered job answers with '$comp_before_keys'; delivered_at is omitempty and must be absent until there is one"
+ok "a delivery in progress carries no delivered_at, so SHIP-108's closed set of five is unchanged for every job that is still running"
+
+# --- the delivery itself, on the driver's own link ------------------------------------------------
+
+status="$(comp_post milestones "verify-comp-delivered-$$" \
+  '{"milestone":"delivered","recipient_name":"R. Chen","delivery_note":"Left with reception, signed for","proof":{"exception_reason":"recipient_objected"}}' delivered)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/comp-delivered.json"; fail "the completed delivery answered $status, want 201"; }
+comp_milestone="$(json "$WORKDIR/comp-delivered.json" '["id"]')"
+
+[[ "$(json "$WORKDIR/comp-delivered.json" '["recipient_name"]')" == "R. Chen" ]] \
+  || fail "the response does not carry the recipient back"
+[[ "$(json "$WORKDIR/comp-delivered.json" '["delivery_note"]')" == "Left with reception, signed for" ]] \
+  || fail "the response does not carry the delivery note back"
+
+comp_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select recipient_name || '|' || delivery_note from milestones where id = '$comp_milestone';")"
+[[ "$comp_row" == "R. Chen|Left with reception, signed for" ]] \
+  || fail "the row holds '$comp_row'"
+ok "a driver completes the delivery with the recipient and the note, and both are in the row and in the response — Docs/01 §4.4's field set, closed end to end"
+
+# Both parties read them on the delivery shelf, which is where a customer's tracking view gets them.
+status="$(curl -s -o "$WORKDIR/comp-shelf.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_customer_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$comp_job/delivery/milestones")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/comp-shelf.json"; fail "the customer's milestone read answered $status"; }
+grep -q '"recipient_name":"R. Chen"' "$WORKDIR/comp-shelf.json" \
+  || { cat "$WORKDIR/comp-shelf.json"; fail "the customer cannot see who took the delivery"; }
+ok "and the customer reads both on /delivery/milestones — Docs/01 §4.4's acceptance measure is theirs, not only the driver's"
+
+# --- after: the link still opens, and says the delivery is finished --------------------------------
+
+status="$(comp_read after)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/comp-read-after.json"; fail "the link stopped opening once the delivery finished: $status"; }
+comp_after_keys="$(json_keys "$WORKDIR/comp-read-after.json")"
+[[ "$comp_after_keys" == "assigned_at,assignment_id,delivered_at,driver_name,job_id,link_expires_at" ]] \
+  || fail "a delivered job answers with '$comp_after_keys', want the five plus delivered_at"
+[[ "$(json "$WORKDIR/comp-read-after.json" '["delivered_at"]')" == *Z ]] \
+  || fail "delivered_at is not UTC"
+ok "the link still opens afterwards and now reports delivered_at — which is what makes the portal read-only across a reload, from the platform rather than from the page's memory"
+
+# **And it is presentation rather than authorisation**, which is the half a field like this invites
+# somebody to get wrong. The platform refuses a further milestone because Docs/02 §2 has no row out
+# of Delivered, not because a client was told to stop asking.
+status="$(comp_post milestones "verify-comp-again-$$" '{"milestone":"in_transit"}' again)"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/comp-again.json"; fail "a late milestone after delivery answered $status, want 201 — SHIP-112 absorbs it"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$comp_job';")" == "Delivered" ]] \
+  || fail "an absorbed milestone moved a delivered job backwards"
+ok "a milestone recorded after delivery is still absorbed by the platform rather than refused by the page — delivered_at hides controls and decides nothing"
+
+unset comp_job comp_token comp_step comp_milestone comp_row comp_before_keys comp_after_keys
+unset -f comp_post comp_read

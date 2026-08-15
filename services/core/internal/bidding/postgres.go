@@ -49,12 +49,20 @@ type postgresStore struct{}
 // terms or SHIP-92's award record must not arrive in this package's shapes with somebody else's
 // schema change; naming them makes admitting one a deliberate edit here. 000502's two columns were
 // admitted that way, which is what this comment predicted.
+//
+// `vehicle_id` (000504) is the third exception and it is coalesced rather than scanned into a
+// pointer, because [Bid.VehicleID] is [uuid.Nil] when no vehicle was named — the same total answer
+// `superseded_by` is *not* given, and the difference is worth noting rather than looking like an
+// inconsistency: `superseded_by` is read into a pointer above and flattened by [scanBid], which is
+// the same result reached the other way round. Coalescing here is possible only because
+// `uuid.Nil` is a value PostgreSQL can produce; both columns are [uuid.Nil] on the Go side.
 const bidColumns = `
 	id, job_id, provider_id, offered_by, status,
 	COALESCE((amount * 100)::bigint, 0),
 	pickup_at, deliver_by,
 	COALESCE(message, ''), COALESCE(idempotency_key, ''),
 	superseded_by,
+	COALESCE(vehicle_id, '00000000-0000-0000-0000-000000000000'::uuid),
 	created_at, updated_at`
 
 // scanBid reads one row of [bidColumns].
@@ -76,6 +84,7 @@ func scanBid(row pgx.Row) (Bid, error) {
 		&pickupAt, &deliverBy,
 		&bid.Message, &bid.Key,
 		&supersededBy,
+		&bid.VehicleID,
 		&bid.CreatedAt, &bid.UpdatedAt,
 	); err != nil {
 		return Bid{}, err
@@ -143,18 +152,24 @@ func scanBid(row pgx.Row) (Bid, error) {
 // nothing, reported as though it had. The arbiter has to name the index exactly, so this clause and
 // 000502's `CREATE UNIQUE INDEX` move together or neither works.
 func (postgresStore) insertBid(ctx context.Context, r db.Runner, b Bid) (Bid, bool, error) {
+	// `nullif($11, uuid nil)` is the vehicle (000504), written the way `message` and
+	// `idempotency_key` are: this domain says "not given" with a zero value and the column says it
+	// with NULL, and converting in the statement keeps the two from parting company. A literal
+	// rather than a Go constant because it is one half of a pair whose other half is in
+	// [bidColumns]' COALESCE, and both are SQL.
 	const q = `
 		INSERT INTO bids
 			(id, job_id, provider_id, offered_by, status, amount, pickup_at, deliver_by, message,
-			 idempotency_key)
-		VALUES ($1, $2, $3, $4, $5, ($6::bigint)::numeric / 100, $7, $8, nullif($9, ''), nullif($10, ''))
+			 idempotency_key, vehicle_id)
+		VALUES ($1, $2, $3, $4, $5, ($6::bigint)::numeric / 100, $7, $8, nullif($9, ''), nullif($10, ''),
+			nullif($11, '00000000-0000-0000-0000-000000000000'::uuid))
 		ON CONFLICT (job_id, provider_id, offered_by, idempotency_key)
 			WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING ` + bidColumns
 
 	created, err := scanBid(r.QueryRow(ctx, q,
 		b.ID, b.JobID, b.ProviderID, string(b.OfferedBy), string(b.Status),
-		b.AmountCents, b.PickupAt, b.DeliverBy, b.Message, b.Key))
+		b.AmountCents, b.PickupAt, b.DeliverBy, b.Message, b.Key, b.VehicleID))
 	switch {
 	case errors.Is(err, db.ErrNoRows):
 		return Bid{}, false, nil
@@ -302,11 +317,13 @@ func (postgresStore) reviseOffer(ctx context.Context, r db.Runner, id uuid.UUID,
 		SET amount     = ($2::bigint)::numeric / 100,
 		    pickup_at  = $3,
 		    deliver_by = $4,
-		    message    = nullif($5, '')
+		    message    = nullif($5, ''),
+		    vehicle_id = nullif($6, '00000000-0000-0000-0000-000000000000'::uuid)
 		WHERE id = $1
 		RETURNING ` + bidColumns
 
-	bid, err := scanBid(r.QueryRow(ctx, q, id, o.AmountCents, o.PickupAt, o.DeliverBy, o.Message))
+	bid, err := scanBid(r.QueryRow(ctx, q,
+		id, o.AmountCents, o.PickupAt, o.DeliverBy, o.Message, o.VehicleID))
 	if err != nil {
 		return Bid{}, fmt.Errorf("bidding: revising bid %s: %w", id, err)
 	}
@@ -344,6 +361,52 @@ func (postgresStore) withdrawBid(ctx context.Context, r db.Runner, id uuid.UUID)
 		return Bid{}, fmt.Errorf("bidding: withdrawing bid %s: %w", id, err)
 	}
 	return bid, nil
+}
+
+// expireBid moves an offer past its own collection time to Expired (SHIP-89).
+//
+// # It is a compare-and-set, and the deadline is inside the `WHERE` rather than in the caller
+//
+// `status = 'Submitted' AND pickup_at IS NOT NULL AND pickup_at <= $3` is the claim's predicate
+// written a second time, which is deliberate and is the one redundancy in this file that has a
+// mutation behind it. `cmd/worker` chooses *which* rows to sweep; this refuses to expire a row
+// that is not due whichever query found it. Delete the deadline from
+// [ExpiryClaim] and this statement matches nothing, so the pass reports a row it could not expire
+// rather than quietly killing every live offer on the marketplace.
+//
+// `superseded_by IS NULL` is redundant against `ck_bids_superseded_is_not_live` — a displaced row
+// cannot be 'Submitted' — and is written for [postgresStore.acceptBid]'s reason: a displaced offer
+// should *match nothing* rather than raise a constraint violation that aborts the pass's
+// transaction and releases every other claimed row with it.
+//
+// The status is a parameter rather than a literal so the value comes from [StatusExpired] — Docs/02
+// §4's own string, held to `ck_bids_status` by TestEveryBidStatusConstraintMatchesTheGoConstants —
+// rather than from a second spelling of it in SQL. `updated_at` is left to `bids_set_updated_at`
+// (000500), which is what makes "this pass moved it" observable.
+func (postgresStore) expireBid(
+	ctx context.Context,
+	r db.Runner,
+	id uuid.UUID,
+	now time.Time,
+) (Bid, bool, error) {
+	const q = `
+		UPDATE bids
+		SET status = $2
+		WHERE id = $1
+		  AND status = $4
+		  AND superseded_by IS NULL
+		  AND pickup_at IS NOT NULL
+		  AND pickup_at <= $3
+		RETURNING ` + bidColumns
+
+	bid, err := scanBid(r.QueryRow(ctx, q, id, string(StatusExpired), now, string(StatusSubmitted)))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Bid{}, false, nil
+	case err != nil:
+		return Bid{}, false, fmt.Errorf("bidding: expiring bid %s: %w", id, err)
+	}
+	return bid, true, nil
 }
 
 // supersedeHead moves the offer being answered out of the live predicate (SHIP-87).
@@ -473,23 +536,69 @@ func (postgresStore) acceptBid(ctx context.Context, r db.Runner, id uuid.UUID) (
 // **The one position in the recorded lock ordering a single-threaded suite can hold is then held by a
 // test rather than by review**, which is the thing SHIP-92's mutation run found it was not.
 //
-// # It reports no count, and "no rows" is not a refusal here
+// # It returns the rows it closed, and "no rows" is not a refusal here
 //
 // Unlike [postgresStore.supersedeHead] and [postgresStore.acceptBid], whose `WHERE` clauses *are* the
 // check and which therefore report whether they matched, this one has nothing to compare and set. A
 // job awarded on its only offer sweeps nothing, and that is an ordinary award rather than a lost
-// update. `updated_at` is left to `bids_set_updated_at` (000500), which is what lets a test tell a
-// swept row from an untouched one even when the status it would write is the status already there.
-func (postgresStore) rejectCompeting(ctx context.Context, r db.Runner, jobID uuid.UUID) error {
+// update — an empty slice, not an error. `updated_at` is left to `bids_set_updated_at` (000500),
+// which is what lets a test tell a swept row from an untouched one even when the status it would
+// write is the status already there.
+//
+// **SHIP-136 is why it returns the rows rather than nothing.** Each closed offer is a different
+// provider to tell, so the award emits one `bid.rejected` per row — and the rows have to come from
+// the statement that closed them. A second `SELECT` afterwards would read whatever is `Rejected`
+// *now*, including offers closed by some earlier award or by whatever ticket eventually lets a
+// customer decline one by hand, and would attribute every one of them to this transaction.
+// `RETURNING` names exactly what this `UPDATE` moved and nothing else.
+func (postgresStore) rejectCompeting(ctx context.Context, r db.Runner, jobID uuid.UUID) ([]Bid, error) {
 	const q = `
 		UPDATE bids
 		SET status = $2
-		WHERE job_id = $1 AND status = $3`
+		WHERE job_id = $1 AND status = $3
+		RETURNING ` + bidColumns
 
-	if _, err := r.Exec(ctx, q, jobID, string(StatusRejected), string(StatusSubmitted)); err != nil {
-		return fmt.Errorf("bidding: closing the competing offers on %s: %w", jobID, err)
+	rows, err := r.Query(ctx, q, jobID, string(StatusRejected), string(StatusSubmitted))
+	if err != nil {
+		return nil, fmt.Errorf("bidding: closing the competing offers on %s: %w", jobID, err)
 	}
-	return nil
+	defer rows.Close()
+
+	var closed []Bid
+	for rows.Next() {
+		bid, err := scanBid(rows)
+		if err != nil {
+			return nil, fmt.Errorf("bidding: reading a closed offer on %s: %w", jobID, err)
+		}
+		closed = append(closed, bid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bidding: closing the competing offers on %s: %w", jobID, err)
+	}
+	return closed, nil
+}
+
+// liveOffers is how many offers on a job are still open for either party to act on (SHIP-90).
+//
+// **The predicate is [Status.live]'s, written in SQL**, and the two have to agree: Docs/02 §2 has
+// `Negotiating → Open` on "all active bids expire, are withdrawn, or are rejected", so a count that
+// treated some closed status as live would leave a job at Negotiating with nothing in it, and one
+// that treated a live status as closed would reopen a job somebody is still negotiating on.
+// `status = 'Submitted'` is the whole of it for the reason [postgresStore.rejectCompeting] gives:
+// `ck_bids_superseded_is_not_live` makes the live offer and the head of its chain the same row, so
+// this predicate misses no live offer. TestTheLivePredicateIsOneRule holds the pair together.
+//
+// A count rather than an existence check, because the caller acts on "none" and the number is what
+// a failure message can report. No lock: the caller has already written the row that changed the
+// answer, inside this transaction, so what this reads is that transaction's own view.
+func (postgresStore) liveOffers(ctx context.Context, r db.Runner, jobID uuid.UUID) (int, error) {
+	const q = `SELECT count(*) FROM bids WHERE job_id = $1 AND status = $2`
+
+	var live int
+	if err := r.QueryRow(ctx, q, jobID, string(StatusSubmitted)).Scan(&live); err != nil {
+		return 0, fmt.Errorf("bidding: counting the live offers on %s: %w", jobID, err)
+	}
+	return live, nil
 }
 
 // linkSuccessor records which offer displaced this one, completing the chain (SHIP-88).
@@ -572,4 +681,151 @@ func (postgresStore) chain(
 		return nil, fmt.Errorf("bidding: reading the chain on %s: %w", jobID, err)
 	}
 	return offers, nil
+}
+
+// bidsFor is one page of a provider's own negotiations, newest first (SHIP-101a).
+//
+// # The scope is one column and there is no parameter that widens it
+//
+// `provider_id = $1`, taken from the authenticated subject. Another provider's offer is not refused
+// by this query — it is never selected, which is the strongest available form of Docs/01 §4.3's
+// second privacy rule and the same construction `fleet`'s vehicle list uses. **The `WHERE` clause is
+// the whole of the rule here**, unlike the addressed reads above where ownership is judged in Go:
+// there is no identifier a caller supplied to tell "somebody else's" from "nobody's" about, so there
+// is nothing for a comparison in Go to be more precise about.
+//
+// `idx_bids_provider` is `(provider_id, created_at DESC)` from 000500, which is this predicate and
+// this order exactly.
+//
+// # The keyset, and why the tuple comparison rather than two clauses
+//
+// `(created_at, id) < ($3, $4)` is a row-value comparison, which PostgreSQL can answer straight off
+// the index. Written as `created_at < $3 OR (created_at = $3 AND id < $4)` it is the same rows and a
+// worse plan, and it is the form somebody eventually gets wrong by dropping the parenthesis.
+//
+// Descending on both, because the list is newest first: a cursor names the last row of the previous
+// page and the next page is everything **before** it.
+//
+// # The status filter is optional and is applied in SQL rather than after the page is cut
+//
+// A filter applied in Go would page over the unfiltered set and hand back short pages — the failure
+// that makes `has_more` a lie. `$2` is the empty string when no status was asked for, and the clause
+// is written so that PostgreSQL sees a constant-false disjunct rather than a second query.
+func (postgresStore) bidsFor(
+	ctx context.Context,
+	r db.Runner,
+	providerID uuid.UUID,
+	status Status,
+	after BidCursor,
+	limit int,
+) ([]Bid, error) {
+	const q = `
+		SELECT ` + bidColumns + `
+		FROM bids
+		WHERE provider_id = $1
+		  AND ($2 = '' OR status = $2)
+		  AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4))
+		ORDER BY created_at DESC, id DESC
+		LIMIT $5`
+
+	var (
+		at *time.Time
+		id *uuid.UUID
+	)
+	if !after.IsZero() {
+		at, id = &after.CreatedAt, &after.ID
+	}
+
+	rows, err := r.Query(ctx, q, providerID, string(status), at, id, limit)
+	if err != nil {
+		return nil, fmt.Errorf("bidding: reading %s's bids: %w", providerID, err)
+	}
+	defer rows.Close()
+
+	bids := make([]Bid, 0, limit)
+	for rows.Next() {
+		bid, err := scanBid(rows)
+		if err != nil {
+			return nil, fmt.Errorf("bidding: reading one of %s's bids: %w", providerID, err)
+		}
+		bids = append(bids, bid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bidding: reading %s's bids: %w", providerID, err)
+	}
+	return bids, nil
+}
+
+// offersOn is one page of the offers on a job, newest first (SHIP-102a).
+//
+// # The scope is one column and ownership is settled before this runs
+//
+// `job_id = $1`, and unlike [postgresStore.bidsFor] the `WHERE` clause is *not* the whole of the
+// rule. A job identifier is something a caller supplied, so this query would happily answer about
+// somebody else's job — [Service.Offers] asks [Negotiation.CustomerOf] first and refuses before
+// reaching here. That is the same division [postgresStore.readBid] takes and the opposite of the
+// provider's own list, where there is no identifier for a comparison in Go to be more precise about.
+//
+// **Never call this without that check.** It is the one statement in this file that selects every
+// provider's price on one job in a single row set, which is exactly what Docs/01 §4.3's second
+// privacy rule exists to keep away from a competing provider.
+//
+// # The status filter is required rather than optional, which is the other difference
+//
+// [postgresStore.bidsFor] treats the empty string as "every status". Here [Service.Offers] has
+// already substituted 'Submitted' for it, so `$2` is always a real status and the clause is a plain
+// equality. Written this way rather than with the empty-string disjunct `bidsFor` uses, because there
+// is no caller that wants every status at once: a comparison screen reads the live offers and a
+// history screen names the one it wants.
+//
+// (The disjunct is not quoted here on purpose. `gofmt` rewrites a pair of single quotes inside a doc
+// comment into a typographic quote, which puts the file on `gofmt -l` permanently — a trap this
+// repository has paid for before.)
+//
+// `idx_bids_job` is `(job_id, created_at DESC)` from 000500, which is this predicate and this order
+// exactly. The keyset is the row-value comparison [postgresStore.bidsFor] documents, for the same
+// reason and with the same descending order on both fields.
+func (postgresStore) offersOn(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+	status Status,
+	after BidCursor,
+	limit int,
+) ([]Bid, error) {
+	const q = `
+		SELECT ` + bidColumns + `
+		FROM bids
+		WHERE job_id = $1
+		  AND status = $2
+		  AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4))
+		ORDER BY created_at DESC, id DESC
+		LIMIT $5`
+
+	var (
+		at *time.Time
+		id *uuid.UUID
+	)
+	if !after.IsZero() {
+		at, id = &after.CreatedAt, &after.ID
+	}
+
+	rows, err := r.Query(ctx, q, jobID, string(status), at, id, limit)
+	if err != nil {
+		return nil, fmt.Errorf("bidding: reading the offers on %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	bids := make([]Bid, 0, limit)
+	for rows.Next() {
+		bid, err := scanBid(rows)
+		if err != nil {
+			return nil, fmt.Errorf("bidding: reading one of the offers on %s: %w", jobID, err)
+		}
+		bids = append(bids, bid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("bidding: reading the offers on %s: %w", jobID, err)
+	}
+	return bids, nil
 }

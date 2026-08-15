@@ -435,16 +435,27 @@ ExtendJob:
 
       ## Extending is not a status change
 
-      The job is `open` before and `open` after. Nothing is written to its status history, and
-      Docs/02 §2 has no transition for it; only `expires_at` moves. The warning is re-armed with
-      it, so the customer is told again forty-eight hours before the new deadline (SHIP-69).
+      The job is in the same status before and after — `open` or `negotiating`. Nothing is
+      written to its status history, and Docs/02 §2 has no transition for it; only `expires_at`
+      moves. The warning is re-armed with it, so the customer is told again forty-eight hours
+      before the new deadline (SHIP-69).
+
+      ## A job with live offers can be extended too (SHIP-70a)
+
+      `negotiating` is a presentation of a job that is still being offered — Docs/02 §1 says the
+      job "remains available for eligible bids" — and since SHIP-70a it expires on its own
+      deadline rather than waiting for its last offer to lapse. Docs/02 §6.3 is one mechanism in
+      two sentences: the customer is warned, **and can extend in one action**. So the warning
+      sweep and this endpoint read the same set of statuses, and a customer warned about a job
+      somebody has actually bid on can keep it alive.
 
       ## When it cannot be extended
 
       Two conditions answer `409` with `jobs_not_extendable`, and they share a code because the
       client's response to both is the same — reload and offer what is actually available:
 
-      - the job is not `open`, so no deadline is ending it;
+      - the job is not being offered — anything but `open` or `negotiating` — so no deadline is
+        ending it;
       - the job's **pickup date** is what ends it rather than the listing period. Docs/02 §6.3
         makes the pickup date the operative rule: "a job whose pickup window has gone is dead
         regardless of how recently it was posted", and extra listing time in front of providers
@@ -822,9 +833,11 @@ Job:
         pickup window ending (Docs/02 §6.3, SHIP-68). **Omitted while the job is a draft** —
         the clock starts at publication, and a draft may be saved and returned to indefinitely.
 
-        A job that reaches this instant while still `open` is moved to `cancelled` by the
+        A job that reaches this instant while still being offered — `open` or `negotiating`,
+        Docs/02 §2's expiry row names both since SHIP-70a — is moved to `cancelled` by the
         platform, with the transition recorded like any other. The customer is warned forty-eight
-        hours ahead (SHIP-69) and can extend it in one call (SHIP-70).
+        hours ahead (SHIP-69) and can extend it in one call (SHIP-70). A job with live offers
+        expires on its own deadline rather than waiting for its last offer to lapse.
       example: '2026-08-25T03:30:00.000Z'
     created_at:
       type: string

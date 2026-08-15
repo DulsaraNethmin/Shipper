@@ -43,7 +43,7 @@ ok "role is constrained to customer and provider"
 ticket "SHIP-29  passwords are stored as argon2id, and nothing reversible is stored"
 
 pushd "$ROOT/services/core" >/dev/null
-if ! password_log="$(go test ./internal/identity/ -run TestPassword -count=1 -v 2>&1)"; then
+if ! password_log="$(go test ./internal/passwords/ -run TestPassword -count=1 -v 2>&1)"; then
   echo "$password_log"
   popd >/dev/null
   fail "the password tests do not pass"
@@ -64,15 +64,21 @@ costs="$(cut -d'$' -f4 <<<"$sample")"
 [[ "$costs" =~ ^m=[0-9]+,t=[0-9]+,p=[0-9]+$ ]] || fail "the costs are not in the hash: $costs"
 ok "the costs travel with the hash — $costs — so raising the profile needs no migration"
 
-# Reversibility is a property of the schema as much as of the code: one credential column, and
-# it holds a derived key.
+# Reversibility is a property of the schema as much as of the code: every credential column in the
+# database holds a derived key, and the list of them is short enough to write out.
+#
+# **SHIP-147 added the second entry**, and the list is still exact rather than a pattern. Two
+# credential columns is a fact worth stating deliberately — `users` and `admin_users` are separate
+# account systems (CLAUDE.md's third separation) and each stores its own argon2id PHC string through
+# `internal/passwords`. Loosening this to "every match ends in _hash" would let a third one appear
+# without anybody deciding it should, which is the whole reason this check is a literal.
 credential_column="$("$PSQL" "$DATABASE_URL" -tAc \
   "select coalesce(string_agg(table_name || '.' || column_name, ', ' order by table_name), 'none')
      from information_schema.columns
     where table_schema = 'public'
       and column_name ~ '(password|secret|passphrase)'")"
-[[ "$credential_column" == "users.password_hash" ]] \
-  || fail "expected users.password_hash and nothing else, found: $credential_column"
+[[ "$credential_column" == "admin_users.password_hash, users.password_hash" ]] \
+  || fail "expected admin_users.password_hash and users.password_hash and nothing else, found: $credential_column"
 ok "the schema holds exactly one credential column, users.password_hash"
 
 # ---------------------------------------------------------------------------------------

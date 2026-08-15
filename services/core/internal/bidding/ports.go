@@ -2,11 +2,30 @@ package bidding
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 )
+
+// EventSink is where this domain's events go (SHIP-136).
+//
+// Declared here rather than taken as *events.Outbox for the reason jobs.EventSink is: Docs/06 §4.1
+// makes the consuming domain the one that names the interface. The concrete writer is
+// infrastructure and this domain may import it either way — what the interface buys is that a test
+// can watch what was emitted without a table, and that the publisher can change the writer without
+// touching a domain.
+//
+// Emit takes the same db.Runner the state change is using, and that is the entire point of the
+// outbox: an event written in a different transaction from the change it describes can commit when
+// the change does not (Docs/06 §4.0, Docs/10 §6.1). It matters more here than anywhere else in the
+// platform, because the transaction it has to join is the award — five statements across two
+// domains, and the one thing two parties are then committed to.
+type EventSink interface {
+	Emit(ctx context.Context, r db.Runner, e events.Event) error
+}
 
 // What this domain needs of other domains, declared by the consumer (Docs/06 §4.1, Docs/10 §2.3).
 //
@@ -205,6 +224,139 @@ func (a JobAward) String() string {
 	}
 }
 
+// JobPresentation is what Docs/02 §2 said about a presentation move, in terms this domain can act
+// on (SHIP-90).
+//
+// An outcome rather than a bool, for [JobAward]'s reason and one of its own. The award's port both
+// asks and acts, and so does this one — but here the interesting distinction is not "may this
+// happen": it is **which of three things happened**, and only one of the three is a refusal a
+// caller should act on. A bool would have collapsed "the job is already Negotiating", which is the
+// ordinary case on every bid after the first, into the same answer as "this job cannot take a bid
+// at all", which has to become a 404.
+type JobPresentation int
+
+const (
+	// JobPresentationUnrecognised is the zero value and is never a valid answer.
+	//
+	// First on purpose, exactly as [JobAwardUnrecognised] is: a stub, a half-written adapter or a
+	// switch with a missing case returns this, and the caller refuses it rather than reading
+	// silence as "the job moved".
+	JobPresentationUnrecognised JobPresentation = iota
+
+	// JobPresentationMoved means the transition ran and is recorded.
+	JobPresentationMoved
+
+	// JobPresentationAlreadyThere means the job is already in the status asked for.
+	//
+	// **The ordinary answer, not an edge case**, and the reason this is an enumeration. Every bid
+	// after the first on one job meets it, and so does every withdrawal on a job that was never
+	// moved. Nothing is wrong and nothing is written.
+	JobPresentationAlreadyThere
+
+	// JobPresentationClosed means Docs/02 §2 has no such move from where the job stands, or there
+	// is no such job.
+	//
+	// **One value for both**, which is the collapse every port in this file makes: telling them
+	// apart would take a second query whose only product is the knowledge that somebody else's job
+	// exists.
+	JobPresentationClosed
+
+	// JobPresentationHeld means another transaction holds the job row, so no presentation change
+	// was attempted. Only [Presentation.LeaveNegotiation] answers it.
+	//
+	// See that method for why it does not wait.
+	JobPresentationHeld
+)
+
+func (p JobPresentation) String() string {
+	switch p {
+	case JobPresentationMoved:
+		return "moved"
+	case JobPresentationAlreadyThere:
+		return "already there"
+	case JobPresentationClosed:
+		return "closed"
+	case JobPresentationHeld:
+		return "held elsewhere"
+	default:
+		return "unrecognised"
+	}
+}
+
+// Presentation is Docs/02 §1's Negotiating status, which is this domain's to move (SHIP-90).
+//
+// Docs/02 §2 has two rows nothing could reach until now: `Open → Negotiating` on "first bid or
+// counter-offer submitted", and `Negotiating → Open` on "all active bids expire, are withdrawn, or
+// are rejected". Both conditions are facts about `bids`, so this domain is the only one that can
+// know when they hold — and neither is a status this domain may write, because a job's status
+// passes one guarded function in `jobs` (Docs/02 §2, CLAUDE.md). So it asks, in the transaction
+// that made the condition true.
+//
+// **Deliberately not "move this job to any status I name"**, which is [Awarding]'s rule and the
+// same rule: a port shaped that way would be Docs/02 §2's table acquiring a second opinion through
+// the back door. The two methods name the two rows.
+//
+// # Only a placement enters, and that is not an omission
+//
+// Docs/02 §2 says "first bid **or counter-offer** submitted", and [Service.CounterOffer] does not
+// call [Presentation.EnterNegotiation]. It cannot need to: a counter answers a *live* offer, a
+// live offer is one [Service.PlaceBid] wrote, and that placement is what moved the job. **A
+// counter can never be the first thing to happen in a negotiation**, which is what "first" is
+// doing in that sentence.
+//
+// # The two methods take the job row differently, and that is the whole of the lock ordering
+//
+// Docs/11 §3's SHIP-88 entry records the ordering this domain keeps: `jobs` → `bids`, in one
+// direction, with nothing coming back. [Presentation.EnterNegotiation] is called before any bid
+// row is touched, so it takes an ordinary blocking lock and the ordering holds.
+// [Presentation.LeaveNegotiation] cannot: it is called once the offer has closed, which is after
+// the bid is locked — and in the expiry sweep the bid was locked by the *claim*, before this
+// domain was reached at all. A blocking lock there would close the cycle, and the first deadlock
+// would be between a sweep and an award.
+type Presentation interface {
+	// EnterNegotiation runs Docs/02 §2's `Open → Negotiating` through the one guarded function,
+	// inside the caller's transaction, as the platform.
+	//
+	// **The platform, and not the provider who bid.** Docs/02 §1 calls Negotiating "a useful
+	// presentation status" in as many words, and this move is the platform's reading of a
+	// condition rather than an act anybody performed: a provider placing an offer asked for their
+	// offer to exist, not for the job to move, and `job_status_history` records who acted.
+	//
+	// It takes an ordinary blocking `FOR UPDATE`, because it runs before this domain has touched
+	// a `bids` row. **That is a strengthening rather than a cost**: the eligibility answer a
+	// placement is authorised by is read without a lock, so a job awarded in the window between
+	// the two used to acquire a fresh offer. Holding the row and reading Docs/02 §2 under it
+	// closes that window — [JobPresentationClosed] is a job no bid may be placed on, and
+	// [Service.PlaceBid] refuses it with the 404 an ineligible provider gets.
+	EnterNegotiation(ctx context.Context, r db.Runner, jobID uuid.UUID) (JobPresentation, error)
+
+	// LeaveNegotiation runs Docs/02 §2's `Negotiating → Open` through the one guarded function,
+	// inside the caller's transaction, as the platform.
+	//
+	// Called only once the caller has established that no live offer remains on the job.
+	//
+	// # It does not wait for the job row, and answers [JobPresentationHeld] rather than blocking
+	//
+	// The implementation takes the row `FOR UPDATE SKIP LOCKED` before running the transition, so
+	// a job somebody else is holding is skipped rather than queued behind. Two reasons, and the
+	// first is structural:
+	//
+	//   - **The caller already holds `bids` rows.** A blocking lock here would be `bids` → `jobs`,
+	//     against the `jobs` → `bids` an award takes, and the cycle would deadlock a sweep against
+	//     an award. A lock attempt that cannot wait cannot deadlock.
+	//   - **Whatever holds the row is making a real change, and it supersedes a presentational
+	//     one.** The transactions that hold a `jobs` row are an award, a cancellation, an expiry,
+	//     a publication and an extension. In the first three the job is leaving Negotiating for
+	//     somewhere this move has no opinion about; in the others the next bid or withdrawal moves
+	//     it correctly. Docs/02 §1's own sentence is the licence: this is presentation, and a
+	//     presentation change must never block a real one.
+	//
+	// The cost is stated rather than hidden: under contention a job can sit at Negotiating with no
+	// live offer until the next thing happens to it. It remains awardable-by-nobody and biddable
+	// by everybody, which is what Negotiating means anyway.
+	LeaveNegotiation(ctx context.Context, r db.Runner, jobID uuid.UUID) (JobPresentation, error)
+}
+
 // Awarding is the job lifecycle, as far as the award reaches into it (SHIP-92).
 //
 // Deliberately not "move this job to any status I name". A port shaped that way would be Docs/02
@@ -260,4 +412,181 @@ type Awarding interface {
 	// before the bid was touched — and it is still reported as an outcome rather than assumed away,
 	// because the alternative is [Service.AwardBid] treating "the job did not move" as success.
 	MoveToAwarded(ctx context.Context, r db.Runner, jobID, customerID uuid.UUID) (JobAward, error)
+}
+
+// Vehicles is the one fact this domain needs about a vehicle before it will store an offer made
+// with one (SHIP-102a).
+//
+// # This is the port migration 000501 named and declined to write
+//
+// That file deferred `bids.vehicle_id` under the ticket `???` and gave the reason in as many words:
+// "Validating it needs a second `fleet` fact — that the vehicle is the caller's and in service — and
+// therefore a second port, which is more design than a three-point ticket should be taking on
+// somebody else's behalf." This is that port, taken by the ticket the column exists for.
+//
+// # A bool, for [Eligibility]'s reason and a privacy one of its own
+//
+// A caller deciding whether to *permit* something wants a boolean rather than a row. Returning a
+// `fleet.Vehicle` would put a copy of another domain's shape inside this package, and this domain
+// has no use for one: nothing it writes reads a field of the vehicle, and the make and model a
+// customer compares are read at the edge through [Directory] rather than stored here.
+//
+// It also collapses the two refusals a placement is allowed to make, exactly as
+// [Eligibility.EligibleFor] collapses "no such job" and "not for you": a vehicle that does not
+// exist, one belonging to another provider, and one out of service are one answer. Telling them
+// apart would let a provider enumerate a competitor's fleet one identifier at a time, which is the
+// disclosure `contracts/paths/fleet.yaml` already refuses on `GET /v1/fleet/vehicles/{id}`.
+type Vehicles interface {
+	// Usable reports whether this provider may offer this vehicle, right now.
+	//
+	// It takes the caller's [db.Runner] so the answer is read inside the transaction that writes the
+	// offer, for [Eligibility.EligibleFor]'s reason: a vehicle can be deactivated between two
+	// statements, and an offer authorised by a check made in a different transaction is an offer
+	// nobody checked.
+	//
+	// **In service as well as owned.** Docs/01 §4.2 makes deactivation the act that stops a vehicle
+	// carrying new work, and an offer is new work. A vehicle deactivated *after* the offer was made
+	// keeps standing on it — 000504's `ON DELETE RESTRICT` is the same sentence from the schema's
+	// side — which is why this is asked when the column is written and never when it is read.
+	//
+	// A non-nil error is a failure of the mechanism rather than a refusal.
+	Usable(ctx context.Context, r db.Runner, providerID, vehicleID uuid.UUID) (bool, error)
+}
+
+// ProviderSummary is what a customer comparing offers may know about the provider who made one
+// (SHIP-102a).
+//
+// # A closed set declared here, which is what makes Docs/01 §4.3 structural rather than remembered
+//
+// The invariant SHIP-102a's *Done when* states from the other end — "no provider's service area,
+// specialties or other jobs" — is held by this struct having no field for any of them. The adapter
+// in `cmd/api` reads whatever it likes and can only hand back this, so a field cannot travel by
+// being forgotten about; adding one is an edit here, in a type whose doc comment says why each
+// field is allowed.
+//
+// **It is deliberately thin, and the thinness is a finding rather than an omission.** `internal/
+// profiles` — which Docs/06 §3 gives "profile detail" and the five verification states of Docs/04
+// §4 — is `doc.go` and nothing else at wave 10, and the only provider profile that exists is
+// `fleet.Profile`, whose two fields are precisely the two this response may not carry. So there is
+// no trading name, no rating and no completed-job count to show, and this carries the two facts the
+// database can actually answer. Docs/11 §3 records what SHIP-153…SHIP-159 will add.
+type ProviderSummary struct {
+	// ID is the provider the negotiation is with.
+	//
+	// The customer already holds it — every offer in the page names one — and it is carried anyway
+	// because it is what a client hands back to any later provider-facing endpoint.
+	ID uuid.UUID
+
+	// Verified is whether this account has cleared the platform's automated verification: email and
+	// phone confirmed, on an account in good standing.
+	//
+	// **The same predicate `fleet`'s eligibility filter reads**, rather than a second definition —
+	// 000002's own comment says provider verification will live in `profiles` and this is the
+	// automated row of it that exists today. A customer choosing between offers is choosing between
+	// strangers, and Docs/01 §1 makes "verified transport providers" the product's promise; a
+	// comparison screen that could not show it would be hiding the one thing the promise is about.
+	Verified bool
+
+	// MemberSince is when the provider's account was created.
+	//
+	// Not a rating and not a job count — neither exists, and "other jobs" is a thing this response
+	// may not carry at all. How long somebody has been on the platform is a fact about the account
+	// rather than about their work, and it is the only durability signal available.
+	MemberSince time.Time
+}
+
+// VehicleSummary is what a customer comparing offers may know about the vehicle one is made with
+// (SHIP-102a).
+//
+// Docs/01 §4.3's "vehicle, and declared capability", which is why the capacity is here in full: it
+// is the half of the sentence a customer with a two-seater sofa is actually reading.
+//
+// **The registration is deliberately absent.** A plate identifies a vehicle in the physical world
+// and nothing on a comparison screen needs one — the customer is choosing between offers, not
+// meeting a driver, and the awarded provider's vehicle reaches them again through `delivery` once
+// there is something to meet. `contracts/paths/fleet.yaml` already treats a competitor's fleet as
+// commercial information; a losing bidder's plate is the same fact with a customer in the middle.
+type VehicleSummary struct {
+	ID uuid.UUID
+
+	// Type is `fleet`'s vehicle type, carried as the string that domain publishes rather than as a
+	// second enumeration. This package has no opinion about the list and must not acquire one:
+	// `contracts/statuses.yaml` generates the eight bid statuses because they are this domain's,
+	// and vehicle types are not.
+	Type string
+
+	Make  string
+	Model string
+
+	// MaxWeightKg and the three dimensions are Docs/01 §4.3's "declared capability".
+	//
+	// Carried as they are declared, including the zeroes. A provider who stated no maximum weight
+	// has a vehicle whose capacity is unstated rather than nil, which is `fleet.Capacity`'s own
+	// reading of the same columns, and a client renders the difference.
+	MaxWeightKg float64
+	LengthCm    int
+	WidthCm     int
+	HeightCm    int
+}
+
+// Offeror names one negotiation's provider and, when the offer states one, the vehicle it is made
+// with (SHIP-102a).
+type Offeror struct {
+	ProviderID uuid.UUID
+
+	// VehicleID is [uuid.Nil] when the offer named no vehicle, and [Directory.Describe] answers with
+	// a zero [OfferorDetail.Vehicle] for it.
+	VehicleID uuid.UUID
+}
+
+// OfferorDetail is one offer's provider and vehicle, described for the customer comparing it.
+type OfferorDetail struct {
+	Provider ProviderSummary
+
+	// Vehicle is the vehicle the offer is made with, and HasVehicle says whether there is one.
+	//
+	// A flag rather than a nil pointer, for the reason [Bid.SupersededBy] is [uuid.Nil] rather than
+	// a pointer: an offer either states a vehicle or does not, and a pointer would add a third state
+	// — "not looked up" — that a client would have to tell apart from "none stated" and could not.
+	Vehicle    VehicleSummary
+	HasVehicle bool
+}
+
+// Directory is how the customer's comparison reaches the two things about an offer that are not in
+// `bids` (SHIP-102a).
+//
+// # Why it is a port and not a join
+//
+// `provider_profiles`, `vehicles` and `users` are other domains' tables. Reading them from
+// `bidding/postgres.go` would be the import's effect without the import's visibility — a second
+// place that knows what `vehicles.deactivated_at` means, in a file whose header says it is the
+// `bids` table in SQL. The composition root is where a dependency between two domains is allowed to
+// be visible, which is the argument [Awarding] makes about locking a `jobs` row and
+// `cmd/api/routes_delivery.go`'s `acceptedBids` makes pointing the other way.
+//
+// # One call for the whole page, which is the difference between this and a lookup
+//
+// The alternative shape — describe one provider, describe one vehicle — reads two rows per offer,
+// so a page of a hundred offers costs two hundred round trips to render one screen. This takes the
+// page and answers the page. It is also what lets the adapter answer with one statement per table
+// however many offers there are.
+//
+// # It reads and never decides
+//
+// Nothing here is an authorisation answer. Whether this caller may see this page is settled before
+// [Directory.Describe] is reached — [Service.Offers] asks [Negotiation.CustomerOf] first — so an
+// implementation of this port cannot widen what a caller sees, only describe what they were already
+// permitted to read.
+type Directory interface {
+	// Describe returns a detail for each offer, keyed by the bid identifier it was asked under.
+	//
+	// **Keyed by bid rather than by provider**, because a page reached with `?status=` can carry
+	// several rows of one negotiation — a superseded offer and the counter that displaced it — and
+	// they may name different vehicles. A map keyed on the provider would silently answer one row
+	// with another's vehicle.
+	//
+	// An offer whose provider or vehicle has no row is absent from the result rather than an error,
+	// and [Service.Offers] renders it with what it has. A page of offers is not the place to fail
+	// because one of them names something unreadable.
+	Describe(ctx context.Context, r db.Runner, offers map[uuid.UUID]Offeror) (map[uuid.UUID]OfferorDetail, error)
 }

@@ -3,7 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:go_router/go_router.dart';
+
 import 'package:shipper/core/auth/provider_only.dart';
+import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/delivery/milestone.dart';
 import 'package:shipper/features/delivery/record_milestone_controller.dart';
 import 'package:shipper/shared/formatting/dates.dart';
@@ -40,14 +43,17 @@ import 'package:shipper/shared/formatting/dates.dart';
 /// would be enforcing a sequence the platform does not have, on the device `Docs/07` §3 says may
 /// not decide anything.
 ///
-/// ## Delivered is not offered, and the reason is on the platform
+/// ## Delivered is offered, and only through the camera (SHIP-130)
 ///
 /// `CLAUDE.md`'s invariant: delivered requires photo proof or a recorded exception reason, never
-/// neither. `POST /v1/jobs/{id}/milestones` refuses every `delivered` with
-/// `delivery_proof_required` until SHIP-118, and this device can capture neither a photograph
-/// (SHIP-130) nor an exception (SHIP-131). A fourth button would queue an operation whose only
-/// possible outcome is a quarantined row — work the driver believes they recorded, waiting for a
-/// person. So the screen names the milestone and says what it is waiting for instead.
+/// neither, and `POST /v1/jobs/{id}/milestones` enforces it (SHIP-118). So `delivered` is not one of
+/// the buttons above — a plain one would queue an operation whose only possible outcome is a
+/// quarantined row — and is instead a route to `ProofCaptureScreen`, which photographs the delivery,
+/// compresses it, and queues the milestone **with** its proof.
+///
+/// The half that is still missing is the reasoned exception (SHIP-116 on the platform, SHIP-131
+/// here): a driver whose camera is refused reaches an honest explanation and not yet a way through.
+/// That is named on the capture screen rather than hidden.
 class DeliveryScreen extends ConsumerWidget {
   const DeliveryScreen({required this.jobId, super.key});
 
@@ -108,7 +114,9 @@ class _Recording extends ConsumerWidget {
         ],
 
         const SizedBox(height: 8),
-        const _DeliveredWaitsForProof(),
+        _DeliveredNeedsAPhotograph(
+          onPhotograph: () => context.push(Routes.deliveryProofFor(jobId)),
+        ),
         const SizedBox(height: 24),
 
         Text('What you have recorded', style: theme.textTheme.titleMedium),
@@ -235,9 +243,11 @@ class _EntryTile extends StatelessWidget {
       };
 }
 
-/// Why there is no Delivered button. See the note on [DeliveryScreen].
-class _DeliveredWaitsForProof extends StatelessWidget {
-  const _DeliveredWaitsForProof();
+/// Delivered, which is the camera rather than a plain button. See the note on [DeliveryScreen].
+class _DeliveredNeedsAPhotograph extends StatelessWidget {
+  const _DeliveredNeedsAPhotograph({required this.onPhotograph});
+
+  final VoidCallback onPhotograph;
 
   @override
   Widget build(BuildContext context) {
@@ -262,9 +272,15 @@ class _DeliveredWaitsForProof extends StatelessWidget {
                 Text('Delivered', style: theme.textTheme.titleSmall),
                 const SizedBox(height: 2),
                 Text(
-                  'Marking a delivery complete needs a photograph or a written reason there is '
-                  'none. This version of Shipper cannot take one yet.',
+                  'Marking a delivery complete needs a photograph of the goods with the '
+                  'recipient. Shipper keeps it on this phone and sends it when there is signal.',
                   style: theme.textTheme.bodySmall,
+                ),
+                const SizedBox(height: 8),
+                FilledButton.tonal(
+                  key: const Key('milestone-record-delivered'),
+                  onPressed: onPhotograph,
+                  child: const Text('Photograph the delivery'),
                 ),
               ],
             ),

@@ -176,6 +176,30 @@ paths:
     $ref: './paths/service.yaml#/Health'
   /v1/:
     $ref: './paths/service.yaml#/APIRoot'
+  /v1/admin/administrators:
+    $ref: './paths/admin.yaml#/AdminAdministrators'
+  /v1/admin/audit:
+    $ref: './paths/admin.yaml#/AdminAudit'
+  /v1/admin/jobs:
+    $ref: './paths/admin.yaml#/AdminJobs'
+  /v1/admin/jobs/{id}:
+    $ref: './paths/admin.yaml#/AdminJob'
+  /v1/admin/jobs/{id}/unpublish:
+    $ref: './paths/admin.yaml#/AdminJobUnpublish'
+  /v1/admin/me:
+    $ref: './paths/admin.yaml#/AdminMe'
+  /v1/admin/moderation/exceptions:
+    $ref: './paths/admin.yaml#/AdminExceptionQueue'
+  /v1/admin/notes:
+    $ref: './paths/admin.yaml#/AdminNotes'
+  /v1/admin/sessions:
+    $ref: './paths/admin.yaml#/AdminSessions'
+  /v1/admin/sessions/current:
+    $ref: './paths/admin.yaml#/AdminCurrentSession'
+  /v1/admin/users:
+    $ref: './paths/admin.yaml#/AdminUsers'
+  /v1/admin/users/{id}/standing:
+    $ref: './paths/admin.yaml#/AdminUserStanding'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
   /v1/auth/login:
@@ -200,6 +224,12 @@ paths:
     $ref: './paths/identity.yaml#/VerifyPhone'
   /v1/driver/jobs/{id}:
     $ref: './paths/delivery.yaml#/DriverJob'
+  /v1/driver/jobs/{id}/milestones:
+    $ref: './paths/delivery.yaml#/DriverMilestones'
+  /v1/driver/jobs/{id}/proof-uploads:
+    $ref: './paths/delivery.yaml#/DriverProofUploads'
+  /v1/fleet/bids:
+    $ref: './paths/bidding.yaml#/FleetBids'
   /v1/fleet/profile:
     $ref: './paths/fleet.yaml#/Profile'
   /v1/fleet/vehicles:
@@ -222,6 +252,8 @@ paths:
     $ref: './paths/bidding.yaml#/AwardJob'
   /v1/jobs/{id}/bids:
     $ref: './paths/bidding.yaml#/Bids'
+  /v1/jobs/{id}/bids/received:
+    $ref: './paths/bidding.yaml#/ReceivedBids'
   /v1/jobs/{id}/bids/{bid_id}:
     $ref: './paths/bidding.yaml#/BidByID'
   /v1/jobs/{id}/bids/{bid_id}/counter:
@@ -232,18 +264,28 @@ paths:
     $ref: './paths/bidding.yaml#/WithdrawBid'
   /v1/jobs/{id}/cancel:
     $ref: './paths/jobs.yaml#/CancelJob'
+  /v1/jobs/{id}/delivery/detail:
+    $ref: './paths/delivery.yaml#/DeliveryDetail'
+  /v1/jobs/{id}/delivery/milestones:
+    $ref: './paths/delivery.yaml#/DeliveryMilestones'
   /v1/jobs/{id}/delivery/proof:
     $ref: './paths/delivery.yaml#/ProofOnJob'
   /v1/jobs/{id}/disputes:
     $ref: './paths/admin.yaml#/Disputes'
   /v1/jobs/{id}/driver:
     $ref: './paths/delivery.yaml#/AssignDriver'
+  /v1/jobs/{id}/driver/link:
+    $ref: './paths/delivery.yaml#/DriverLink'
   /v1/jobs/{id}/extend:
     $ref: './paths/jobs.yaml#/ExtendJob'
   /v1/jobs/{id}/milestones:
     $ref: './paths/delivery.yaml#/Milestones'
   /v1/jobs/{id}/proof-uploads:
     $ref: './paths/delivery.yaml#/ProofUploads'
+  /v1/notifications/device-tokens:
+    $ref: './paths/notifications.yaml#/DeviceTokens'
+  /v1/notifications/device-tokens/current:
+    $ref: './paths/notifications.yaml#/CurrentDeviceToken'
 
 components:
   schemas:
@@ -274,6 +316,29 @@ components:
         **The driver portal's token is a different system and is never accepted here.** It
         carries its own audience and its own key material, and neither can be exchanged for the
         other (`Docs/10` §5).
+
+    BearerAdminSession:
+      type: http
+      scheme: bearer
+      description: |
+        The administrator console session (SHIP-147). **Not a JWT** — an opaque random value,
+        stored hashed against `admin_sessions` and read back on every request.
+
+        That shape is a deliberate departure from the other two, and it buys two things a signed
+        token cannot: an administrator can be signed out and stop being able to act *at once*, and
+        a role change takes effect on the next request rather than at the next expiry (`Docs/04`
+        §9's least-privilege requirement, and SHIP-148's permissions).
+
+        It is obtained from `POST /v1/admin/sessions` and ended by
+        `DELETE /v1/admin/sessions/current`. There is no refresh: the session slides while the
+        console is in use and stops after thirty minutes idle or twelve hours in total, whichever
+        comes first.
+
+        **It is a third credential system, and it cannot be exchanged with either of the others.**
+        A mobile access token on an operation secured with this answers `401`; this on an operation
+        secured with `BearerAccessToken` answers `401` as well. Neither verifier will look at the
+        other's credential — one parses a signed JWT and the other looks up a digest — so the
+        separation is a property of the construction rather than a rule somebody follows.
 
     BearerDriverToken:
       type: http

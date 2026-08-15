@@ -7,7 +7,26 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 )
+
+// EventSink is where this domain's events go (SHIP-136).
+//
+// Declared here rather than taken as *events.Outbox for the reason jobs.EventSink is: Docs/06 §4.1
+// makes the consuming domain the one that names the interface. The concrete writer is
+// infrastructure and this domain may import it either way — what the interface buys is that a test
+// can watch what was emitted without a table, and that the publisher can change the writer without
+// touching a domain.
+//
+// Emit takes the same db.Runner the state change is using, and that is the entire point of the
+// outbox: an event written in a different transaction from the change it describes can commit when
+// the change does not (Docs/06 §4.0, Docs/10 §6.1). This domain's transactions are the ones where
+// that is hardest to see, because SHIP-112's absorption *commits* a milestone whose move was
+// refused — so an event written outside the transaction would be right about the milestone and
+// wrong about the job on precisely the path where the two disagree.
+type EventSink interface {
+	Emit(ctx context.Context, r db.Runner, e events.Event) error
+}
 
 // What this domain needs of other domains, declared by the consumer (Docs/06 §4.1, Docs/10 §2.3).
 //
@@ -243,8 +262,8 @@ const (
 	// is Docs/02 §3.1's own phrasing — "a queued update that arrives after a later transition has
 	// already been recorded". It is deliberately not a reachability search over Docs/02 §2's table:
 	// a job cancelled or disputed before it ever reached the status has not passed the milestone,
-	// it has lost to something else, and that is SHIP-113's "queued update contradicting an
-	// administrative action" rather than this.
+	// it has lost to something else, and that is [JobLostTheDelivery] since SHIP-113 rather than
+	// this.
 	//
 	// # An implementation that never returns this is not a compile error, and there is no
 	// mechanism that could make it one
@@ -254,6 +273,43 @@ const (
 	// by tests that record a late milestone against a real database, and by
 	// scripts/verify/70-delivery.sh against the running binary.
 	JobAlreadyPast
+
+	// JobLostTheDelivery means the job has left the delivery sequence altogether and can never
+	// reach the status this move names — it was cancelled, disputed or completed while the
+	// milestone was still sitting on somebody's phone (SHIP-113).
+	//
+	// # It is the third refusal, and Docs/02 §3.1 gives it the third handling
+	//
+	// [JobAlreadyPast] is *late* and is absorbed; [JobNotAssignable] is *premature* and is
+	// refused. This is neither. The job has not moved past the milestone and it has not yet
+	// arrived at it — **it lost the delivery to something else**, which is §3.1's fourth bullet:
+	// "a queued update that contradicts an administrative action loses. If a driver records
+	// 'Delivered' offline while an administrator cancels the job, the cancellation stands, the
+	// attempt is retained in history, and the app must show the driver what happened rather than
+	// silently discarding their work."
+	//
+	// So the milestone is **retained**, as an absorbed one is, and the job is **not moved**, as a
+	// refused one is not. Before SHIP-113 this fell into [JobNotAssignable] and the transaction
+	// was rolled back — which discarded the driver's record, and the photograph attached to it,
+	// for work that had genuinely been done. SHIP-112 put it there deliberately and named this
+	// ticket in three places rather than folding it in and finishing half of this one by accident.
+	//
+	// # "Can never reach it" is monotone, which is what makes the answer stable under a retry
+	//
+	// The statuses this covers are the ones Docs/02 §2 offers no path back to a delivery from:
+	// `Cancelled` and `Completed` are terminal, and `Disputed` leads only to those two. So a job
+	// that has lost a delivery cannot stop having lost it. That is the property [JobAlreadyPast]
+	// does not have — its question has a different answer at a different moment, which is why
+	// [Service.alreadyRecorded] refuses to re-ask it — and it is what makes this outcome safe to
+	// report the same way twice.
+	//
+	// # An implementation that never returns this degrades to the pre-SHIP-113 refusal
+	//
+	// The same shape [JobAlreadyPast] has, and it is not a compile error either. Both adapters —
+	// cmd/api/routes_delivery.go and the copy in this package's tests — are held to it by tests
+	// that cancel a job and then record against it, and by scripts/verify/70-delivery.sh against
+	// the running binary.
+	JobLostTheDelivery
 )
 
 func (m JobMove) String() string {
@@ -268,6 +324,8 @@ func (m JobMove) String() string {
 		return "not assignable"
 	case JobAlreadyPast:
 		return "already past that status"
+	case JobLostTheDelivery:
+		return "no longer on this delivery"
 	default:
 		return "unrecognised"
 	}
@@ -303,6 +361,23 @@ func (m JobMove) String() string {
 // was pointing in; telling them apart is a second question about the same job, asked of the same
 // domain, in the same transaction. It is asked in the composition root because that is the only
 // place a `jobs.Status` may be named at all.
+//
+// # The four milestone moves take a [Recorder] and not a provider identifier (SHIP-120a)
+//
+// They took `providerID uuid.UUID` while the awarded provider was the only caller who could reach
+// them. `POST /v1/driver/jobs/{id}/milestones` is the second, on a credential that names no account
+// at all — a driver *is* a `driver_assignments` row (000600) — and the transition it causes has to
+// be attributed to that row with `actor_type = 'driver'`, exactly as 000401 declared and 000601
+// follows.
+//
+// **Widening the parameter rather than adding four more methods is the decision**, and it is the
+// narrower of the two: eight methods would let an implementation attribute the driver's move
+// differently from the provider's, which is the kind of drift that compiles, passes its own test,
+// and only shows up in a support query months later asking who moved a job. One parameter carrying
+// the pair the database already stores cannot.
+//
+// [MoveToDriverAssigned] keeps its `providerID`, because only a provider assigns a driver — a
+// driver holding a link cannot put themselves on a job they are already on.
 type Jobs interface {
 	// MoveToDriverAssigned runs the guarded transition on behalf of the provider, inside the
 	// caller's transaction. providerID is the actor recorded against it.
@@ -317,10 +392,10 @@ type Jobs interface {
 	// Two `from` statuses and one method, because the caller is not choosing between them:
 	// a provider driving the job themselves sets off from Awarded without nominating anybody,
 	// and the guard is what knows that both are permitted.
-	MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+	MoveToEnRouteToPickup(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, recordedAt time.Time) (JobMove, error)
 
 	// MoveToPickedUp is `En route to pickup → Picked up`.
-	MoveToPickedUp(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+	MoveToPickedUp(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, recordedAt time.Time) (JobMove, error)
 
 	// MoveToInTransit is `Picked up → In transit`.
 	//
@@ -329,7 +404,7 @@ type Jobs interface {
 	// something does it will be a task in cmd/worker rather than a request, so this method stays
 	// the actor's path and is not widened to carry an actor type it would only ever be given one
 	// value of.
-	MoveToInTransit(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+	MoveToInTransit(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, recordedAt time.Time) (JobMove, error)
 
 	// MoveToDelivered is `In transit → Delivered` (SHIP-118).
 	//
@@ -352,5 +427,5 @@ type Jobs interface {
 	// exception recorded" — is deliberately not `jobs`' to check. The transition table says which
 	// moves exist; what a delivery must carry is this domain's, and asking `jobs` to know about
 	// `proofs` would be the import the lint refuses.
-	MoveToDelivered(ctx context.Context, r db.Runner, jobID, providerID uuid.UUID, recordedAt time.Time) (JobMove, error)
+	MoveToDelivered(ctx context.Context, r db.Runner, jobID uuid.UUID, by Recorder, recordedAt time.Time) (JobMove, error)
 }

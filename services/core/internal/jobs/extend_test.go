@@ -186,11 +186,12 @@ func TestExtendRefusesAJobItsPickupDateIsEnding(t *testing.T) {
 	}
 }
 
-// TestExtendRefusesAJobThatIsNotOpen leans on the fact that only an Open job expires.
+// TestExtendRefusesAJobThatIsNotOpen leans on the fact that only a job being offered expires.
 //
-// ExpiryClaim filters on Open and Docs/02 §2's one "job expires unclaimed" row is
-// `Open → Cancelled`, so extending anything else moves a column nothing reads — and tells the
-// customer their job was saved when it was never at risk.
+// ExpiryClaim filters on [LiveStatuses] and Docs/02 §2's "job expires unclaimed" row is
+// `Open / Negotiating → Cancelled`, so extending anything else moves a column nothing reads — and
+// tells the customer their job was saved when it was never at risk. None of the three fixtures
+// below is in that set, which is what SHIP-70a's widening had to leave true.
 func TestExtendRefusesAJobThatIsNotOpen(t *testing.T) {
 	pool := pgtest.DB(t)
 	service := newTestService(&recordingSink{})
@@ -214,6 +215,48 @@ func TestExtendRefusesAJobThatIsNotOpen(t *testing.T) {
 		if _, err := extend(t, pool, service, customer, job); !errors.Is(err, ErrJobNotExtendable) {
 			t.Errorf("extending %s = %v, want ErrJobNotExtendable", name, err)
 		}
+	}
+}
+
+// TestExtendKeepsANegotiatingJobAlive is the other half of SHIP-70a, and it is the half that would
+// otherwise have been left broken by the first.
+//
+// Docs/02 §6.3 is one mechanism in two sentences: "the customer is warned 48 hours before expiry
+// **and can extend in one action**". The moment the warning sweep can reach a Negotiating job — as
+// SHIP-70a makes it — an extend endpoint still filtering on Open alone answers 422 to the one
+// customer the warning was for, on the one kind of job somebody has actually bid on.
+//
+// The deadline is asserted to have *moved*, not merely to have been accepted, because refusing
+// quietly and accepting quietly look identical from a status code.
+func TestExtendKeepsANegotiatingJobAlive(t *testing.T) {
+	pool := pgtest.DB(t)
+	service := newTestService(&recordingSink{})
+
+	customer := newCustomer(t, pool, "extend-negotiating@example.com", "+61400000704")
+	job := newDraft(t, pool, customer)
+	publish(t, pool, job, customer)
+	move(t, pool, job, StatusNegotiating, User(ActorCustomer, customer))
+
+	before := deadlineOf(t, pool, job)
+	if before == nil {
+		t.Fatal("the Negotiating job has no deadline to extend")
+	}
+
+	// Pulled back inside the warning window, which is the state a customer acts from.
+	setDeadline(t, pool, job, testInstant.Add(24*time.Hour))
+
+	extended, err := extend(t, pool, service, customer, job)
+	if err != nil {
+		t.Fatalf("extending a job somebody has bid on = %v, want it kept alive", err)
+	}
+	if extended.Status != StatusNegotiating {
+		t.Errorf("the extended job is %s, want Negotiating — an extension is not a transition",
+			extended.Status)
+	}
+
+	after := deadlineOf(t, pool, job)
+	if after == nil || !after.After(testInstant.Add(24*time.Hour)) {
+		t.Errorf("the deadline is %v after extending, want it moved past the window it was in", after)
 	}
 }
 
