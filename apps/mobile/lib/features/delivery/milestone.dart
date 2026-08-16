@@ -20,6 +20,19 @@
 /// collected" about a screen that says `Picked up` is a support call made out of a wording choice.
 library;
 
+/// How long a driver's own note about a milestone may be (SHIP-131a).
+///
+/// `MilestoneRecording.reason` in `contracts/paths/delivery.yaml` is `maxLength: 500`, and
+/// `internal/delivery`'s `maxMilestoneReason` is the same number. It is compiled in rather than read
+/// from `GET /v1/app/policy` because it is a contract bound rather than an operational dial: the
+/// column is `varchar(500)` and moving it is a migration, so a device that learned a larger number
+/// over the air would be told `validation_failed` about text it had already let a driver type.
+///
+/// The field on the screen is capped at it, which is the honest place to stop a driver: a note
+/// truncated on the device is one they watched stop growing, and one truncated on the platform is
+/// one they wrote and lost.
+const milestoneNoteMaxLength = 500;
+
 /// One of the four milestones a provider can record from the app.
 enum Milestone {
   /// The driver has set off towards the collection address.

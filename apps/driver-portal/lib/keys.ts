@@ -60,13 +60,20 @@ function storageKey(scope: string): string {
  * A key of this browser's own, from a CSPRNG.
  *
  * `crypto.randomUUID` rather than anything derived from the clock or from a counter, and the reason
- * is not tidiness. Idempotency keys on a driver-token route are scoped `anonymous` — a driver token
+ * is not tidiness. It was load-bearing until SHIP-147b and it is defence in depth now, which is a
+ * demotion rather than a reason to weaken it.
+ *
+ * **Until SHIP-147b, keys on a driver-token route were scoped `anonymous`** — a driver token
  * produces no `authctx.Subject` and the scope is computed group-wide, outside the middleware — so
- * `idem:v1:anonymous:<key>` is a namespace shared with every other anonymous caller, and a stored
- * response is reachable by anybody who can reproduce the key **and** the exact request. 122 bits
- * from a CSPRNG is what makes the first of those two unreachable. `internal/delivery/http.go` argues
- * the platform's half; this is the client's, and SHIP-122's upload — whose stored response carries a
- * credential — is why it is written here rather than assumed.
+ * `idem:v1:anonymous:<key>` was a namespace shared with every other anonymous caller, and a stored
+ * response was reachable by anybody who could reproduce the key **and** the exact request. 122 bits
+ * from a CSPRNG is what made the first of those two unreachable, and SHIP-122's upload — whose
+ * stored response carries a credential — is why it was written down here rather than assumed.
+ *
+ * `httpx.SubjectScope` now answers `credential:<salted digest of the bearer token>` for a credential
+ * that produces no subject, so this browser's keys land in a namespace only the holder of this exact
+ * link can compute. The shared namespace is gone; an unguessable key is still the right thing to
+ * mint, because nothing here should depend on a platform-side scope decision staying as it is.
  *
  * The fallback is for a browser with no `crypto.randomUUID`, which on a driver's handset means an
  * old Android WebView. It is deliberately still random rather than sequential: `Math.random` is not

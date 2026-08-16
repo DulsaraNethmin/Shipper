@@ -420,6 +420,19 @@ function isRecorded(value: unknown): value is Recorded {
  * `lib/keys.ts` owns that decision — one value per action, reused for every retry of that action,
  * discarded when the action settles — and it needs to know whether the attempt settled, which is
  * something only the caller learns. Minting one here would make every retry a new action.
+ *
+ * # `note` is the driver's own words, and this is the line that puts them on the wire (SHIP-131a)
+ *
+ * `MilestoneRecording.reason` has been in the published contract since SHIP-111 and the platform has
+ * always stored it. **No client ever sent it** — this function took `evidence`, `completion` and
+ * `recordedAt` and no note — while the customer's tracking view rendered `reason` whenever it was
+ * there. So the customer-facing surface could display a field nothing in the product could write,
+ * and closing that gap is the whole of SHIP-131a.
+ *
+ * An empty note sends **no key at all** rather than an empty string. `httpx.DecodeJSON` would accept
+ * `"reason": ""` and the domain would judge it as a supplied value; a customer's view branches on
+ * the field being present, so an empty one is a blank line under their latest update rather than
+ * nothing.
  */
 export async function recordMilestone(
   jobId: string,
@@ -429,6 +442,7 @@ export async function recordMilestone(
   options: {
     evidence?: Evidence;
     completion?: Completion;
+    note?: string;
     recordedAt?: string;
     signal?: AbortSignal;
   } = {},
@@ -438,6 +452,13 @@ export async function recordMilestone(
     recorded_at: options.recordedAt ?? new Date().toISOString(),
   };
   if (options.evidence !== undefined) body.proof = options.evidence;
+
+  // Trimmed before it is judged, for the reason the completion form trims its two: the platform
+  // collapses whitespace and then bounds what is left, so a note of spaces is a note nobody wrote.
+  // It goes on **every** milestone, not only `delivered` — a locked gate at the pickup is exactly
+  // the thing `reason` exists for, and the platform accepts it on all five.
+  const note = options.note?.trim() ?? "";
+  if (note !== "") body.reason = note;
 
   // Sent only when the caller has them, which in practice means only on `delivered`. The platform
   // refuses either field on any other milestone, so a page that attached them everywhere would turn

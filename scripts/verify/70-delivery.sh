@@ -931,10 +931,13 @@ ticket "SHIP-108  a driver token grants exactly one job and cannot be exchanged 
 # $delivery_second_job, and $delivery_forged is that first token repointed at the second job with
 # its signature left alone.
 #
-# The route is a GET, so nothing here needs an Idempotency-Key — and that is not an accident.
-# Docs/11 §9 records that a driver-token request scopes its idempotency key to `anonymous`, because
-# the scope is computed group-wide outside the middleware while a guard runs per route inside it. A
-# read does not meet that; SHIP-121's milestone controls will.
+# The route is a GET, so nothing here needs an Idempotency-Key — and that is not an accident. The
+# scope a driver-token request gets is computed group-wide outside the middleware while a guard runs
+# per route inside it, so no route can declare its own; a read does not meet that question at all,
+# and SHIP-121's milestone controls did. **What that scope is has changed since this was written**:
+# it was `anonymous`, and SHIP-147b made `httpx.SubjectScope` answer `credential:<salted digest>` for
+# any bearer credential that produces no subject. Docs/11 §9's entry still says the old thing;
+# `httpx.SubjectScope` is the authority.
 
 # open_delivery <token> <job-id> <name> — one driver-portal read, answering with the status code.
 #
@@ -2618,3 +2621,187 @@ ok "a session is refused on the driver's read and a driver link is refused on th
 
 unset dml_job dml_other dml_token dml_step dml_shape dml_nowhere_status
 unset -f dml_keys dml_post dml_list
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-131a  a driver's own words on a milestone reach the platform and are read back"
+
+# # The field the platform has always accepted and no client has ever sent
+#
+# `MilestoneRecording.reason` is in the published contract — optional, 500 characters, "what a person
+# should know about this milestone that the milestone itself does not say" — and internal/delivery
+# has bounded and stored it since SHIP-111. Measured across both client trees before this ticket: the
+# driver portal's `recordMilestone` took `evidence`, `completion` and `recordedAt` and no note; the
+# Flutter client sent `reason` on a job cancellation and on no milestone; and the Flutter tracking
+# view *read one back and rendered it*. So the customer-facing surface could display a note nothing
+# in the product could write.
+#
+# # What only this section can show
+#
+# internal/delivery's own tests drive the bound and the column against a real database, and the two
+# client suites assert on the request body each one *builds*. Neither can show the field surviving
+# the wire, and that is the whole of the gap this ticket closed: a note that reaches the request body
+# and is dropped by a decoder, a column or a response type looks identical from either side. **Here
+# the note is sent by a real driver link and by a real provider session, against the running binary,
+# and read back on the endpoint the customer's tracking view actually calls.**
+#
+# Both writing routes are exercised because they are two entry points rather than one behind a
+# widened guard (SHIP-120a): `POST /v1/driver/jobs/{id}/milestones` is the portal's on a job-scoped
+# link, `POST /v1/jobs/{id}/milestones` is the Flutter client's on a session, and neither token can
+# be exchanged for the other. A note that arrived on one and not the other would be a client-visible
+# difference between two screens the *Done when* names in the same sentence.
+
+note_job="$(delivery_awarded_job note)"
+status="$(delivery_request "$delivery_provider_token" "verify-note-assign-$$" \
+  "/v1/jobs/$note_job/driver" '{"driver_name":"Sam Okafor","driver_mobile":"+61417000131"}' \
+  "$WORKDIR/note-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-assign.json"; fail "assigning the driver returned $status, want 201"; }
+note_token="$(json "$WORKDIR/note-assign.json" '["driver_token"]')"
+
+# note_drv <key> <body> <name> — the driver portal's write, on the job-scoped link.
+note_drv() {
+  curl -s -X POST -o "$WORKDIR/note-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $note_token" -H "Idempotency-Key: $1" \
+    -H 'Content-Type: application/json' -d "$2" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$note_job/milestones"
+}
+
+# note_prv <key> <body> <name> — the Flutter client's write, on the provider's own session.
+note_prv() {
+  delivery_request "$delivery_provider_token" "$1" "/v1/jobs/$note_job/milestones" "$2" \
+    "$WORKDIR/note-$3.json"
+}
+
+# note_shelf <token> <name> — the parties' milestone read, which is what the customer's tracking
+# view calls.
+note_shelf() {
+  curl -s -o "$WORKDIR/note-shelf-$2.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/jobs/$note_job/delivery/milestones"
+}
+
+# note_reason_of <file> <milestone-id> — the `reason` the response carries for one milestone, or the
+# literal `absent` when the field is not there at all. The distinction is the ticket's "optional"
+# clause: `omitempty` means an unnoted milestone carries no key, and a client that rendered an empty
+# string would draw a blank line under the customer's latest update.
+note_reason_of() {
+  python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))["data"]
+row = next(r for r in rows if r["id"] == sys.argv[2])
+print(row["reason"] if "reason" in row else "absent")
+' "$1" "$2"
+}
+
+# --- the driver portal, on the link -------------------------------------------------------------
+
+status="$(note_drv "verify-note-drv-$$" \
+  '{"milestone":"en_route_to_pickup","reason":"Nobody at the gate, returning at four"}' drv)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-drv.json"; fail "a driver's note answered $status, want 201"; }
+note_drv_id="$(json "$WORKDIR/note-drv.json" '["id"]')"
+[[ "$(json "$WORKDIR/note-drv.json" '["reason"]')" == "Nobody at the gate, returning at four" ]] \
+  || { cat "$WORKDIR/note-drv.json"; fail "the driver's own response does not carry the note back"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select reason from milestones where id = '$note_drv_id';")" \
+   == "Nobody at the gate, returning at four" ]] \
+  || fail "the row does not hold the note the driver typed"
+ok "a note typed on the driver portal is stored against the milestone and returned on the driver's own credential"
+
+# --- the Flutter milestone screen, on the provider's session ------------------------------------
+
+status="$(note_prv "verify-note-prv-$$" \
+  '{"milestone":"picked_up","reason":"Loaded from bay 4, pallet wrapped"}' prv)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-prv.json"; fail "a provider's note answered $status, want 201"; }
+note_prv_id="$(json "$WORKDIR/note-prv.json" '["id"]')"
+[[ "$(json "$WORKDIR/note-prv.json" '["reason"]')" == "Loaded from bay 4, pallet wrapped" ]] \
+  || { cat "$WORKDIR/note-prv.json"; fail "the provider's response does not carry the note back"; }
+ok "and the same field on the provider's own route — two entry points to one service, neither taught to accept the other's credential"
+
+# --- it stays optional, and an unnoted milestone carries no key at all --------------------------
+
+status="$(note_prv "verify-note-none-$$" '{"milestone":"in_transit"}' none)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-none.json"; fail "a milestone with no note answered $status, want 201"; }
+note_none_id="$(json "$WORKDIR/note-none.json" '["id"]')"
+[[ "$(json "$WORKDIR/note-none.json" '.get("reason", "absent")')" == "absent" ]] \
+  || { cat "$WORKDIR/note-none.json"; fail "a milestone with no note came back carrying a reason field"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select coalesce(reason, 'null') from milestones where id = '$note_none_id';")" == "null" ]] \
+  || fail "a milestone with no note wrote something into the column"
+ok "a milestone recorded without a note is unchanged — no column value, and no key in the response for a client to render blank"
+
+# --- the exception path: beside the selected reason, never instead of one ------------------------
+#
+# Docs/01 §4.4's list is closed so Docs/04 §5's delivery-exception queue can group it, and
+# ck_proofs_exception_reason pairs with that. What a closed list cannot carry is which of the three
+# it was and why, which is the sentence that turns a queue entry into a decision. Both, one request.
+
+status="$(note_drv "verify-note-exc-$$" \
+  '{"milestone":"delivered","recipient_name":"R. Chen","delivery_note":"Left with reception",
+    "reason":"The recipient asked me not to photograph their door.",
+    "proof":{"exception_reason":"recipient_objected"}}' exc)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/note-exc.json"; fail "a reasoned exception carrying a note answered $status, want 201"; }
+note_exc_id="$(json "$WORKDIR/note-exc.json" '["id"]')"
+
+note_pair="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select m.reason || '|' || p.exception_reason
+     from milestones m join proofs p on p.milestone_id = m.id
+    where m.id = '$note_exc_id';")"
+[[ "$note_pair" == "The recipient asked me not to photograph their door.|recipient_objected" ]] \
+  || fail "the exception holds '$note_pair' — the note and the selection are not both there"
+ok "on the exception path the driver's words sit beside the chosen reason in two tables, rather than in place of it"
+
+# --- read back on the customer's tracking view ---------------------------------------------------
+#
+# `GET /v1/jobs/{id}/delivery/milestones` is the endpoint `CustomerTrackingScreen` calls and the one
+# whose `reason` it has rendered since SHIP-133 — against, until now, a field no client ever wrote.
+
+status="$(note_shelf "$delivery_customer_token" customer)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-shelf-customer.json"; fail "the customer's milestone read answered $status"; }
+[[ "$(note_reason_of "$WORKDIR/note-shelf-customer.json" "$note_drv_id")" \
+   == "Nobody at the gate, returning at four" ]] \
+  || { cat "$WORKDIR/note-shelf-customer.json"; fail "the customer cannot read the driver's note"; }
+[[ "$(note_reason_of "$WORKDIR/note-shelf-customer.json" "$note_prv_id")" \
+   == "Loaded from bay 4, pallet wrapped" ]] \
+  || fail "the customer cannot read the provider's note"
+[[ "$(note_reason_of "$WORKDIR/note-shelf-customer.json" "$note_exc_id")" \
+   == "The recipient asked me not to photograph their door." ]] \
+  || fail "the customer cannot read the note recorded beside the exception"
+[[ "$(note_reason_of "$WORKDIR/note-shelf-customer.json" "$note_none_id")" == "absent" ]] \
+  || fail "an unnoted milestone carries a reason key on the customer's read"
+ok "the customer reads every note back on the endpoint their tracking view calls, and reads no key at all for the milestone that carried none"
+
+status="$(note_shelf "$delivery_provider_token" provider)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-shelf-provider.json"; fail "the provider's milestone read answered $status"; }
+[[ "$(note_reason_of "$WORKDIR/note-shelf-provider.json" "$note_drv_id")" \
+   == "Nobody at the gate, returning at four" ]] \
+  || fail "the awarded provider cannot read the note their own driver typed"
+ok "and the awarded provider reads what their driver wrote — the note is a fact about the delivery, not a message to one party"
+
+# The driver's own narrow read carries it too (SHIP-121a), which is what lets the portal show a
+# reload what it recorded. It still carries neither recipient_name nor delivery_note.
+status="$(curl -s -o "$WORKDIR/note-drv-list.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $note_token" \
+  "http://localhost:$VERIFY_PORT/v1/driver/jobs/$note_job/milestones")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/note-drv-list.json"; fail "the driver's milestone read answered $status"; }
+[[ "$(note_reason_of "$WORKDIR/note-drv-list.json" "$note_exc_id")" \
+   == "The recipient asked me not to photograph their door." ]] \
+  || { cat "$WORKDIR/note-drv-list.json"; fail "a driver cannot read back the words they typed"; }
+if grep -q 'recipient_name\|delivery_note' "$WORKDIR/note-drv-list.json"; then
+  cat "$WORKDIR/note-drv-list.json"
+  fail "the driver's read grew a third party's details alongside the note"
+fi
+ok "a driver reads their own words back on their narrow read, which still discloses neither the recipient nor the delivery note"
+
+# --- the bound, which is the contract's and not a client's ---------------------------------------
+
+note_before="$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$note_job';")"
+status="$(note_prv "verify-note-long-$$" \
+  "{\"milestone\":\"in_transit\",\"reason\":\"$(printf 'a%.0s' {1..501})\"}" long)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/note-long.json"; fail "a 501-character note answered $status, want 422"; }
+[[ "$(json "$WORKDIR/note-long.json" '["error"]["details"][0]["field"]')" == "reason" ]] \
+  || { cat "$WORKDIR/note-long.json"; fail "the refusal does not name reason"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from milestones where job_id = '$note_job';")" \
+   == "$note_before" ]] \
+  || fail "a refused note wrote a milestone anyway"
+ok "a note past the contract's 500 characters is refused by name and writes nothing — the bound both clients cap their field at"
+
+unset note_job note_token note_drv_id note_prv_id note_none_id note_exc_id note_pair note_before
+unset -f note_drv note_prv note_shelf note_reason_of

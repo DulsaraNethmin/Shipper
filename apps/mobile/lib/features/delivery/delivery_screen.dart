@@ -51,9 +51,19 @@ import 'package:shipper/shared/formatting/dates.dart';
 /// quarantined row — and is instead a route to `ProofCaptureScreen`, which photographs the delivery,
 /// compresses it, and queues the milestone **with** its proof.
 ///
-/// The half that is still missing is the reasoned exception (SHIP-116 on the platform, SHIP-131
-/// here): a driver whose camera is refused reaches an honest explanation and not yet a way through.
-/// That is named on the capture screen rather than hidden.
+/// The other half of that rule is the reasoned exception, and it is on the same screen: SHIP-131
+/// gave a driver whose camera is refused a way through rather than an honest dead end, and the
+/// panel that offers it is `ProofCaptureScreen`'s.
+///
+/// ## The driver's own words go on the request, not only on the screen (SHIP-131a)
+///
+/// `MilestoneRecording.reason` has been in the published contract since SHIP-111 — optional, 500
+/// characters, "what a person should know about this milestone that the milestone itself does not
+/// say" — the platform has always stored it, and the **customer's tracking view has always rendered
+/// it**. What did not exist was anywhere to type one: measured across both client trees, no client
+/// sent the field at all, so a customer-facing surface could display a note nothing in the product
+/// could write. The field above the buttons closes that, and it stays optional in the strong sense —
+/// an empty one puts no key in the body.
 class DeliveryScreen extends ConsumerWidget {
   const DeliveryScreen({required this.jobId, super.key});
 
@@ -71,13 +81,50 @@ class DeliveryScreen extends ConsumerWidget {
   }
 }
 
-class _Recording extends ConsumerWidget {
+class _Recording extends ConsumerStatefulWidget {
   const _Recording({required this.jobId});
 
   final String jobId;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_Recording> createState() => _RecordingState();
+}
+
+class _RecordingState extends ConsumerState<_Recording> {
+  /// The driver's own words for the **next** milestone they record (SHIP-131a).
+  ///
+  /// Held by the screen rather than by the controller, and cleared the moment a recording commits.
+  /// Both halves of that matter. A note belongs to one milestone — `MilestoneRecording.reason` is
+  /// "what a person should know about *this* milestone" — so carrying it forward would attach a
+  /// driver's sentence about a locked gate to the pickup that followed it, on the customer's
+  /// timeline, with nothing on this screen to say it had happened.
+  ///
+  /// It sits **above** the buttons because the note is typed before the tap: a field under three
+  /// large targets is one a driver fills in after they have already recorded the thing it was about.
+  final _note = TextEditingController();
+
+  @override
+  void dispose() {
+    _note.dispose();
+    super.dispose();
+  }
+
+  Future<void> _record(Milestone milestone) async {
+    final recorded =
+        await ref.read(recordMilestoneProvider(widget.jobId).notifier).record(
+              milestone,
+              note: _note.text,
+            );
+
+    // Cleared only when the row committed. A refusal leaves the words on screen, because the driver
+    // is about to tap again and retyping a sentence they already wrote is the worst thing this
+    // screen could ask of somebody standing in the rain.
+    if (recorded && mounted) _note.clear();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final jobId = widget.jobId;
     final theme = Theme.of(context);
     final state = ref.watch(recordMilestoneProvider(jobId));
     final controller = ref.read(recordMilestoneProvider(jobId).notifier);
@@ -105,10 +152,13 @@ class _Recording extends ConsumerWidget {
           const SizedBox(height: 16),
         ],
 
+        _Note(controller: _note),
+        const SizedBox(height: 16),
+
         for (final milestone in Milestone.offered) ...[
           _RecordButton(
             milestone: milestone,
-            onRecord: () => unawaited(controller.record(milestone)),
+            onRecord: () => unawaited(_record(milestone)),
           ),
           const SizedBox(height: 12),
         ],
@@ -130,6 +180,48 @@ class _Recording extends ConsumerWidget {
         else
           for (final entry in state.entries) _EntryTile(entry: entry),
       ],
+    );
+  }
+}
+
+/// The driver's own words about whatever they record next (SHIP-131a).
+///
+/// **Optional, and said so in the label rather than only in the code.** `MilestoneRecording.reason`
+/// has always been optional and no client has ever sent one, so the field a customer's tracking view
+/// renders has until now been one nothing in the product could write. A driver who leaves this empty
+/// records exactly what they recorded before: the body carries no `reason` key at all.
+///
+/// **It says who reads it**, because that changes what a person writes. "Shipper keeps this with the
+/// delivery and the customer can see it" is the difference between a note meant for the customer and
+/// a note meant for the provider's own records, and a driver who does not know which is writing
+/// neither.
+///
+/// Capped at [milestoneNoteMaxLength] with no counter under it: the bound is the contract's, and a
+/// character count under a field a driver will almost always leave blank is noise on a screen whose
+/// whole job is three large buttons.
+class _Note extends StatelessWidget {
+  const _Note({required this.controller});
+
+  final TextEditingController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      key: const Key('milestone-note'),
+      controller: controller,
+      maxLength: milestoneNoteMaxLength,
+      maxLines: 2,
+      minLines: 1,
+      textCapitalization: TextCapitalization.sentences,
+      keyboardType: TextInputType.multiline,
+      decoration: const InputDecoration(
+        labelText: 'Anything to add? (optional)',
+        helperText: 'Kept with the delivery. The customer can see it.',
+        // The bound is the contract's and the field stops growing at it; a running count under a
+        // box most drivers will leave empty is clutter.
+        counterText: '',
+        border: OutlineInputBorder(),
+      ),
     );
   }
 }

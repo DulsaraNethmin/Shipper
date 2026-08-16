@@ -767,6 +767,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-153** | M6 | `GET /v1/admin/verifications` — Docs/04 §5's **first** moderation queue, and the read half of what ends the state SHIP-81a left the marketplace in. Oldest first, cursor paged on `(created_at, provider_id)`, and `state` is a **required** parameter rather than one defaulting to `Pending`: every provider has a record from registration, so an unfiltered request is the whole supply side wearing a queue's name, and a default would make the same URL mean two things depending on whether a console remembered to send one. The query lives in `internal/profiles`, which owns the tables; `internal/admin` declares a port and `cmd/api` supplies the adapter, so **no package imports another** — *see below* |
 | **SHIP-154** | M6 | `POST /v1/admin/verifications/{id}/decision` — the **only** route in the API that moves a verification state, and the act `profiles.Service.Decide` was exported and left unrouted for a whole wave. All five of Docs/04 §4's outcomes on one endpoint, any following any other, with a reason required in every direction including a reinstatement. **Four writes in one transaction** — the decision row, the transaction-local setting the trigger reads, the state change and the `audit_log` entry — so a provider's eligibility cannot move with nobody accountable for moving it. The evidence trail and the audit trail are two tables for two readers and carry the same reason deliberately, which is SHIP-160's arrangement. The mutation taking the entry out of the transaction is reported below with its verdict — *see below* |
 | **SHIP-103** | M3 | The negotiation screen — **one screen for two people**, over the four endpoints that each serve both sides and work out which from the credential. It reads the whole chain and the conversation, and writes a counter-offer and a message; `BidCounter` is a **difference rather than an offer**, so a counter on price alone leaves the timing on the table, and an empty `message` is sent rather than omitted because that is how conditions are cleared. A counter **re-reads the chain instead of patching it** — the response is the new head alone and the platform also superseded the row it answered — and the read count is what the test asserts, because a client that wrote both facts renders identically. **The budget guard is closed-world over three rendered surfaces** in the provider's view with the counter form open — `Text`, `EditableText` and the **semantics tree a screen reader is read from** — and every string on them must be recorded copy, a written-down value shape, or a party's own words, so a sentence nobody recorded fails whatever it says and wherever it is carried. A ban-list was tried first and **lost to a paraphrase**; a `Text`-only collector then **lost to a `semanticsLabel:`**, which leaves the visible screen byte-identical and changes only what is spoken. **No other client screen has a test that reads a semantics label at all** — measured, and carried to §9 What it does not build: revising and withdrawing your own offer, both still served and both still wanting a confirmation flow — *see below* |
+| **SHIP-131a** | M4 | The driver's own words on a milestone. **No platform change at all** — `MilestoneRecording.reason` has been published, bounded and stored since SHIP-111, and the customer's tracking view has rendered it since SHIP-133, against a field **no client had ever sent**. Three controls, one per screen the row names: the Flutter milestone screen, the Flutter proof-exception panel and the driver portal. On the exception path it sits **beside** the selected reason rather than instead of one — a note alone still records nothing, because a closed list is what `Docs/04` §5's queue can group and the sentence is which of the three it was. **Optional in the strong sense**: an empty or whitespace-only note puts no `reason` key in the body, because a customer's view branches on the field being *present*. The mutation aimed at exactly the defect the ticket closes — drop the note from the portal's request body, leave the field on screen — was killed by `lib/completion.test.ts`, which asserts on the body the platform received — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14490,6 +14491,70 @@ called.
 nothing else. The harness demonstrates platform acceptance criteria end to end and has nothing to say
 about a Flutter screen, so running it would have consumed the machine-wide mutex for a result that
 could not differ. `make flutter-check` and `make check` are the gates this ticket answers to.
+
+### SHIP-131a — the field the platform had always accepted and no client had ever sent
+
+**No Go file changed, and checking that was the first thing the ticket did.** `MilestoneRecording.reason` is in the published contract at `contracts/paths/delivery.yaml:518` — optional, `maxLength: 500`, "what a person should know about this milestone that the milestone itself does not say" — `internal/delivery` has collapsed, bounded at `maxMilestoneReason = 500` and stored it since SHIP-111, both writing routes decode it, both reading shelves serve it with `omitempty`, and the domain event carries it. `contracts/**` is untouched as well. The whole of this ticket is three controls and three request bodies.
+
+**What made it worth a ticket is the asymmetry, which had been live since SHIP-133.** `tracking_screen.dart` renders `latest.reason` and `delivery_tracking.dart` declares `String? reason`, so the **customer's tracking view has been displaying a field no client in the product could write.** Measured across both trees before the change: the driver portal's `recordMilestone` took `evidence`, `completion` and `recordedAt` and no note; the Flutter client sent `reason` on a job *cancellation* and on no milestone. A read path with no write path is not a gap somebody notices from either side alone — each half is correct — which is why it survived three waves of being declined.
+
+#### Where the three controls went, and why each one is where it is
+
+| Screen | Control | What it puts on the wire |
+|---|---|---|
+| Flutter milestone screen (`delivery_screen.dart`) | `Key('milestone-note')`, **above** the three buttons | `reason` on `POST /v1/jobs/{id}/milestones` |
+| Flutter proof-exception panel (`proof_capture_screen.dart`) | `Key('proof-exception-note')`, **under the three reasons, above the record button** | `reason` beside `proof.exception_reason`, one body |
+| Driver portal (`delivery-link.tsx`) | `Note`, above the milestone buttons, moving **into** the completion form when it opens | `reason` on `POST /v1/driver/jobs/{id}/milestones` |
+
+Each position is the same argument in three places: **a note is typed before the act, and every one of these controls sits above something that records immediately.** The portal's exception reasons are buttons that fire on the tap; the Flutter panel's record button is the commitment; a milestone button is one tap. A field underneath any of them is one a driver fills in after the thing it was about has already gone.
+
+The portal's field **moves** rather than being drawn twice, holding one piece of state: above the buttons ordinarily, inside `Completion` while the completion form is open, so that on the exception path it sits with the three reasons rather than four buttons away. A driver who types "nobody at reception" and then taps `Delivered` finds the words still there.
+
+#### "Beside the selected reason rather than instead of one" is enforced, not just laid out
+
+`Docs/01` §4.4's list is closed and stays closed, for `Docs/04` §5's reason: a reason nobody can group is a moderation queue nobody can triage, and `ck_proofs_exception_reason` is what pairs with that. The note is the sentence that says *which* of the three it actually was — "the recipient asked me not to photograph their door" is a decision a moderator can make and `recipient_objected` alone is a row they have to ring somebody about.
+
+So the clause is asserted rather than described. On the Flutter panel the record button is **still disabled with a note typed and nothing selected**, which is the one place a driver could otherwise substitute prose for a selection, and `proof_exception_test.dart` asserts exactly that before it asserts the body. `scripts/verify/70-delivery.sh` asserts the pair at the far end, in two tables: `select m.reason || '|' || p.exception_reason from milestones m join proofs p on p.milestone_id = m.id`.
+
+#### Optional in the strong sense: an empty note puts no key in the body
+
+Empty or whitespace-only sends **no `reason` field at all**, in all three clients — trimmed first, because the platform collapses whitespace and then bounds what is left, so a note of spaces is refused as too short. `"reason": ""` would be worse than a refusal: the customer's view branches on the field being *present*, so an empty string is a blank line under their latest update rather than nothing. The existing "carries nothing else" test, which pins the body's key set to `{milestone, recorded_at}`, is unchanged and still passes — a driver who ignores the box records exactly what they recorded before it existed.
+
+#### The mutation, and the layer that killed it
+
+**Applied:** the note dropped from the driver portal's outgoing request body while the input field stayed on the form — the driver types it, the screen shows it, and it never reaches the wire. That is precisely the defect this ticket exists to close, so a survivor would have meant the tests asserted on the widget rather than on what was sent.
+
+**Killed**, by three tests in `apps/driver-portal/lib/completion.test.ts` — `a note typed on the portal arrives as reason`, `a note goes beside the exception reason and never in place of it`, and `a note reaches the recording and not the request for somewhere to put a photograph`. **The layer is `lib/delivery.ts`'s wire-body assembly**, and the assertions are on the body the stand-in platform *received* after two real hops (the portal's own Next route handler is in the chain), never on component state — which is what makes them able to see this at all. 57 of 60 passed; the fourth note test, `a note of nothing but spaces is not sent at all`, **correctly stayed green**, because a mutation that removes an already-absent field changes nothing about that case. Restored from a copy taken before the mutation was applied, confirmed with `git diff` **and** `shasum -a 256 -c` against a fourteen-file manifest written beside the copy in the same command.
+
+**What the mutation also establishes is which gate cannot see it.** `make verify` drives the platform with `curl` and the platform was never broken, so the new section passes with the portal mutated. The client half is held by the two client suites and by nothing else, which is the ordinary arrangement here and is worth stating rather than assuming: a ticket whose whole content is "the client sends a field the platform already accepts" has its only real guard in `web-test` and `flutter-test`.
+
+#### What the verify section adds that neither client suite can
+
+`scripts/verify/70-delivery.sh` gained a section that sends the note **on both writing routes against the running binary** — the driver's job-scoped link and the provider's session, which are two entry points rather than one behind a widened guard (SHIP-120a) — and reads it back on `GET /v1/jobs/{id}/delivery/milestones`, which is the endpoint `CustomerTrackingScreen` actually calls. A note that reaches a request body and is dropped by a decoder, a column or a response type looks identical from either client's side. It also pins the two ends the clients cap themselves at: a 501-character note is refused naming `reason` and writes nothing, and a milestone recorded with no note comes back with **no key at all** rather than an empty one.
+
+The driver's own narrow read (`GET /v1/driver/jobs/{id}/milestones`, SHIP-121a) carries the note too — which is what lets the portal show a reload what it recorded — and is checked to still disclose neither `recipient_name` nor `delivery_note`.
+
+### SHIP-147b's follow-through — ten comments that outlived the `anonymous` driver scope
+
+**SHIP-147b closed a hole and left the explanation of the hole in place at ten sites**, which is the ordinary way a security comment goes wrong: the argument is long, correct when written, and stops being true through a change in a file it does not name. `httpx.SubjectScope` now answers `credential:<salted digest of the bearer token>` for any bearer credential that produced no subject, and a driver token is exactly that — so a driver's idempotency keys no longer land in `idem:v1:anonymous:<key>`, and every present-tense sentence saying they do was false on `4fd7fd5`.
+
+**The measurement is the finding.** It was scouted as three or four sites in `services/core/cmd/api/routes_delivery.go` and `scripts/verify/70-delivery.sh`. Measured with `grep -rn anonymous` across the delivery surface it is **fourteen occurrences at ten claim sites across five files**:
+
+| File | Sites |
+|---|---|
+| `services/core/internal/delivery/http.go` | 4 — `RecordDriverMilestone`, `PresignDriverProofUpload` (two paragraphs), `DriverJob`, `DriverMilestones` |
+| `services/core/cmd/api/routes_delivery.go` | 3 — the provider presign's history, the driver milestone route, the driver presign route |
+| `apps/driver-portal/lib/keys.ts` | 1 — why a key is minted from a CSPRNG |
+| `apps/driver-portal/lib/record.test.ts` | 1 — the same argument, as a test's rationale |
+| `scripts/verify/70-delivery.sh` | 1 — SHIP-108's section header |
+
+One further occurrence, `internal/delivery/http.go`'s note that the sign-in endpoints are anonymous-scoped, **is still accurate and was left alone** — a caller who presents nothing is still `anonymous`, and `make verify` asserts that in the SHIP-147b section.
+
+**All ten were corrected, and none of the analysis was deleted.** Each keeps its argument and gains the sentence that says what changed, because the *mechanism* those paragraphs are really about has not changed at all: `httpx.Idempotent` wraps the whole `/v1` group and the auth class is applied per route inside it, so on a repeated key the middleware still replays the stored response **before** `RequireDriverToken` runs. That is what makes `PresignDriverProofUpload`'s bounds — a replay cannot make the object evidence, cannot read it, cannot write anything else, and cannot overwrite undetectably — worth keeping for whoever adds the next driver-token route whose response carries something issued. What is gone is the exposure they were written against.
+
+**Two of the corrected sites were wrong about something other than the scope**, found while reading them: `routes_delivery.go`'s driver-milestone comment said the response carrying no credential "is the whole reason this route can be served today and **the driver's upload cannot**", which SHIP-122 falsified a wave earlier by serving it.
+
+**`Docs/11` §9 still carries the old claim in two entries, and this pass deliberately did not touch it** — §9 belongs to the reconciliation lane, and §3's SHIP-147b row already records that it "closes the driver half of §9 as a side effect", so the repository's own account is not what was stale. The comments now point at `httpx.SubjectScope` as the authority rather than at a section number, which is the change that stops this recurring.
 
 ## 4. Partly done — do not treat these as finished
 

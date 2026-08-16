@@ -212,13 +212,16 @@ test("the key reaches the platform as the browser minted it", async () => {
 });
 
 /**
- * The keys are unguessable, and on this route that is load-bearing rather than hygiene.
+ * The keys are unguessable, which was load-bearing on this route and is defence in depth now.
  *
- * A driver-token request scopes its idempotency key to `anonymous` — the scope is computed
- * group-wide, outside the middleware, and a driver token deliberately produces no subject — so
- * `idem:v1:anonymous:<key>` is a namespace shared with every other anonymous caller. What stops a
- * stored response being read by somebody else is that reproducing it needs the exact request *and*
- * the exact key, and the key is 122 bits from a CSPRNG. `lib/keys.ts` argues it; this asserts it.
+ * **Until SHIP-147b a driver-token request scoped its idempotency key to `anonymous`** — the scope
+ * is computed group-wide, outside the middleware, and a driver token deliberately produces no
+ * subject — so `idem:v1:anonymous:<key>` was a namespace shared with every other anonymous caller,
+ * and what stopped a stored response being read by somebody else was that reproducing it needs the
+ * exact request *and* the exact key. `httpx.SubjectScope` now answers `credential:<salted digest of
+ * the bearer token>` for a credential that produces no subject, so the namespace is this link's
+ * alone. The key is still 122 bits from a CSPRNG and still asserted here: `lib/keys.ts` argues why
+ * a client should not lean on a platform-side scope decision staying as it is.
  */
 test("a minted key is a random identifier and not a counter", async () => {
   const browser = session(["recorded", "recorded", "recorded"]);
