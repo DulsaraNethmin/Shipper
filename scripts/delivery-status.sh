@@ -245,6 +245,56 @@ fi
 # 14" is a list, and bold or struck-through markers are stripped. Only the first cell of a row
 # counts — a ticket named in the "What" column is a cross-reference, not an entry.
 
+# --- is every §3 table row still under a header? ------------------------------------------
+#
+# The completeness check below reads every line in §3 that begins with a pipe and asks whether
+# the first cell names a ticket. **It has no idea how many tables there are**, and that blindness
+# was demonstrated by mutation rather than reasoned about: a blank line inserted into the
+# "Elsewhere" summary table splits one table in two, every row below the gap still renders and is
+# still counted, and `make status` exits 0 with both ticks green. Deleting a row from the same
+# table fails by name. So the guard was real for what it checks and blind to the shape of what it
+# reads — and a merge resolution that leaves a blank line behind is exactly how the split happens.
+#
+# The fix needs no hand-maintained number and no list of which tables are summary tables, both of
+# which would be a second thing to keep current. **Every run of table rows must begin with its
+# header and the `|---|` line under it.** Appending a row to an existing table keeps the run
+# contiguous, which is what four concurrent lanes do to §3 every wave; splitting one does not.
+#
+# Fenced blocks are skipped, so a Markdown table quoted inside ``` is not held to it. A fence
+# also ends a run: a table interrupted by one is as broken as a table interrupted by a blank line.
+
+orphaned="$(awk '
+    function flush() {
+        if (rows == 0) return
+        if (rows < 2 || separator !~ /^\|[ :|-]*-[ :|-]*$/)
+            printf "line %d: %s\n", start, substr(header, 1, 72)
+        rows = 0; separator = ""
+    }
+    /^## 3\. Done/ { in3 = 1; next }
+    /^## / && in3  { flush(); exit }
+    !in3           { next }
+    /^[ \t]*```/   { flush(); fenced = !fenced; next }
+    fenced         { next }
+    /^\|/ {
+        if (rows == 0) { start = NR; header = $0 }
+        rows++
+        if (rows == 2) separator = $0
+        next
+    }
+                   { flush() }
+    END            { flush() }
+' "$TRACKER")"
+
+if [[ -n "$orphaned" ]]; then
+    printf '\n  %s§3 of %s has table rows that are not under a header%s\n' "$yellow" "$TRACKER" "$off"
+    printf '    %s\n' "$orphaned"
+    printf '    %sa blank line inside a summary table splits it in two: the rows below still render,\n' "$dim"
+    printf '    are still counted here, and nothing else in this script can see it. Close the gap\n'
+    printf '    rather than adding a second header, and check the merge that opened it did not also\n'
+    printf '    drop a row.%s\n\n' "$off"
+    exit 1
+fi
+
 section3_ids="$(awk -F'|' '
     /^## 3\. Done/ { in3 = 1; next }
     /^## / && in3  { exit }
