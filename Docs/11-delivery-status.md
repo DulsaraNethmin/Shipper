@@ -16093,25 +16093,34 @@ assertion about concurrency that is argued rather than run is the thing this ent
 That is the workaround and it is written into `CLAUDE.md` as a rule rather than as a path, because
 the path is per-session and the rule is not.
 
-**A driver's pre-signed upload URL is stored under `idem:v1:anonymous:<key>`, and the mechanism that
-would close it properly is an `internal/httpx` change (SHIP-122).**
+**~~A driver's pre-signed upload URL is stored under `idem:v1:anonymous:<key>`.~~ Closed at SHIP-147b
+— see §3, and re-measured here rather than taken from that ticket's own write-up.**
 
-`httpx.Idempotent` wraps the whole `/v1` group while an auth class is applied per route **inside** it,
-so on a repeated key the middleware replays the stored response *before* `RequireDriverToken` runs.
-On `POST /v1/driver/jobs/{id}/milestones` that is accepted, and §6's reasoning covers it: the stored
-body is a milestone both parties to the delivery may read anyway. **On
-`POST /v1/driver/jobs/{id}/proof-uploads` the stored body is a credential**, which is why
-`routes_delivery.go` held that route shut for a wave.
+`httpx.SubjectScope` on `4fd7fd5` answers three things and not two: `user:<id>` from a verified
+`authctx.Subject`, `credential:<sha256(salt‖credential)>` for **any bearer credential that produces
+no subject**, and `anonymous` only when nothing was presented. A driver's job-scoped token is
+presented as a `Bearer` credential in the standard credential header — `internal/delivery/driverauth.go` reads it from there
+and nothing else — so **it takes the middle branch, and every driver-token route now has a namespace
+per credential.** `POST /v1/driver/jobs/{id}/proof-uploads`, whose stored body is a pre-signed URL
+and therefore a credential, is no longer stored where another caller could compute the key.
 
-SHIP-122 shipped it with the exposure written out in the handler rather than left implicit — what a
-replay requires (the job identifier, the photograph's exact byte length, and a key the portal mints
-with `crypto.randomUUID`), and the four things it still cannot do: make the object evidence, read it,
-write anything of another size or type, or overwrite recorded proof undetectably. **That is a bounded
-position and not a closed one.** The close is §9's *first* option from the SHIP-15m entry below — a
-second group-wide resolver beside `ResolveSubject` that a driver grant can populate, with
-`SubjectScope` widened to read either — and it is a shared-surface change no domain branch may make.
-**A prep ticket owns it, and the trigger is named: the second driver-token route whose response
-carries anything the platform issued.**
+**It was closed as a side effect and by a mechanism this entry had ruled out, which is the part worth
+keeping.** This entry named the close as *"a second group-wide resolver beside `ResolveSubject` that
+a driver grant can populate, with `SubjectScope` widened to read either"*, and said a prep ticket
+owned it. **SHIP-147b built that resolver, passed `make check`, and broke a nine-month-old verify
+check** — `DELETE /v1/admin/sessions/current` revokes the credential it was called with, so a
+retry's resolution fails and the replayed 204 is filed under a scope nothing can recompute. Scoping
+on a *salted digest of the presented credential* instead needs no resolver, no database read and no
+context, is stable across revocation and expiry, and closed the driver case without naming it.
+**An entry that prescribes the mechanism as well as the outcome can be wrong about the mechanism and
+right about the outcome** — this one was, and it also meant a ticket aimed at administrators closed a
+driver hole nobody had scheduled.
+
+**What is left is bounded and is not this entry.** A replay still requires reproducing the exact
+request — the job identifier, the photograph's byte length and the key — *and* now presenting the
+same driver token, which is the grant itself. A holder of that token can already reach the route
+directly. **Two in-repo comments still describe this as open** and are named in §7's findings;
+correcting them belongs to whoever next touches those files.
 
 **The object store needs CORS for the driver portal's direct upload, and nothing in this repository
 can test it (SHIP-122).** The browser PUTs the photograph straight to the store, which is
@@ -16167,20 +16176,27 @@ which nothing is blocked on today because the column accepts whatever the driver
 
 **One more, found at SHIP-15m while building the `RequireDriverToken` seam.**
 
-**A driver-token request will scope its idempotency key to `anonymous`, and nothing a guard does can
-change that.** `httpx.SubjectScope` keys on the `authctx.Subject`, a driver token deliberately
-produces none (§3), and the scope is computed group-wide **outside** `Idempotent` — while an auth
-guard runs per route, inside it. So the ordering that makes SHIP-44's fix work is the same ordering
-that puts the driver's scope out of a guard's reach, whatever the guard puts on the context.
+**~~A driver-token request will scope its idempotency key to `anonymous`, and nothing a guard does
+can change that.~~ Closed at SHIP-147b — see the entry above, and §3.** The premise was exactly
+right and the conclusion did not survive it. The premise: `SubjectScope` is computed group-wide
+**outside** `Idempotent` while an auth guard runs per route **inside** it, so the ordering that makes
+SHIP-44's fix work puts the driver's scope out of a guard's reach whatever the guard writes to the
+context. **That is still true.** What was wrong was reading it as "therefore `anonymous`": the scope
+function does not need the guard's *output*, it needs the guard's *input*, and the credential is on
+the request before any guard runs. `SubjectScope` reads the bearer credential off that header itself when no
+subject resolved, and a driver token lands in `credential:<digest>`.
 
-**This is the posture §6 already accepts for public routes, not a new hole**: `replayOrRefuse`
-fingerprints method, path and body, so reading somebody else's stored response means reproducing
-their exact request — which on `POST /v1/jobs/{id}/milestones` means already holding the job
-identifier. It is defensible, and it is worth deciding rather than inheriting, because the driver
-half of M4 is entirely idempotent writes from a phone with a bad connection. **The two shapes
-available**: a second group-wide resolver beside `ResolveSubject` that a driver grant can also
-populate, with `SubjectScope` widened to read either; or an explicit decision that a job-scoped
-grant scopes on the job identifier already in the path, which costs nothing and is weaker.
+**The lesson is about the shape of the argument rather than about idempotency.** This entry reasoned
+from middleware ordering to an impossibility, and middleware ordering constrains what a *guard* can
+contribute, not what a function positioned earlier can read for itself. **An impossibility argued
+from ordering should be checked against what is already on the request.** Both this entry and the one
+above named the same fix — a second resolver — and the answer needed no resolver at all.
+
+**The original reasoning is kept below**, because the disclosure posture it describes for genuinely
+anonymous routes is unchanged and is still what §6 relies on: `replayOrRefuse` fingerprints method,
+path and body, so reading somebody else's stored response means reproducing their exact request.
+**The two shapes it offered** — a second group-wide resolver, or scoping a job-scoped grant on the
+job identifier in the path — are recorded as the options that were on the table and were not taken.
 
 **~~Decide with SHIP-112.~~ Wrong ticket, corrected in this pass.** SHIP-112 landed and no driver
 retries anything through it: `POST /v1/jobs/{id}/milestones` is **`RequireUser`** in
@@ -16932,21 +16948,75 @@ envelope `GET /v1/fleet/bids` already uses. **Recorded now rather than when a cl
 because that is the entire argument this section makes about itself and SHIP-101 and SHIP-102 are the
 worked examples of the alternative.
 
-**`scripts/delivery-status.sh` cannot see that §3's summary table is one table, and a blank line in a
-merge resolution is invisible to every guard there is.** Demonstrated by mutation at this pass rather
-than argued — §11 has the run and its two verdicts. The check counts lines beginning with `|` and asks
-whether every done ticket appears in a first cell, so **a table split in half passes and a row deleted
-fails**, which is exactly the line between what it can and cannot see. **§3's summary tables are two
-and only two on `5a3b8d7`**, both contiguous, so this is a latent hazard rather than a live defect.
+**~~`scripts/delivery-status.sh` cannot see that §3's summary table is one table.~~ Taken by this
+pass, in the form this entry proposed.** Demonstrated by mutation a wave ago rather than argued: the
+check counts lines beginning with `|` and asks whether every done ticket appears in a first cell, so
+**a table split in half passed and a row deleted failed**, which is exactly the line between what it
+could and could not see.
 
-**What would catch it is small and belongs to a prep ticket, and the reason it is not taken here is
-worth stating.** The check already walks §3's lines in order; counting header separators (`|---|`)
-inside the section and failing when the count exceeds the expected number of summary tables would do
-it. **That number is currently two and is a thing somebody would have to maintain**, which is the
-shape this file spends a lot of words regretting — a hand-maintained scalar in an instrument. The
-better form is probably to require every `|` line in §3's summary region to be contiguous with its
-header, which needs no number at all. **Owner: whoever writes the next prep**, and it is cheaper than
-the wave 11 spent finding the last instance by eye.
+**The entry offered two shapes and the one it preferred is the one that was built.** Counting
+`|---|` separators against an expected number of summary tables was rejected here for the reason the
+entry itself gave — that number would be a hand-maintained scalar inside an instrument, which is the
+shape this file spends a lot of words regretting. **What `make status` now requires is that every run
+of table rows in §3 begins with its header and the separator under it**, which needs no number, no
+list of which tables are summary tables, and nothing kept current. Appending a row to an existing
+table keeps a run contiguous; splitting one does not.
+
+**The entry's own figure was already stale when it was written, which is the small lesson.** It said
+*"§3's summary tables are two and only two"*. Measured on `4fd7fd5`, §3 holds **78** contiguous runs
+of table rows — two summary tables at 28 and 151 rows and 76 smaller tables inside prose
+subsections — and **all 78 are well formed.** A fix that had assumed two would have failed every
+lane's gate. §11 has this pass's mutation, its control, and the four plausible lane appends it was
+checked against.
+
+---
+
+**The five below were found at the wave-12 reconciliation, and none of them was owned by a ticket
+when it was written.** Two are corrections to things this file already said, which is what a
+re-read is for.
+
+**Two in-repo comments still describe the driver-token idempotency scope as open, and both are
+wrong on `4fd7fd5`.** `scripts/verify/70-delivery.sh:935` says *"Docs/11 §9 records that a
+driver-token request scopes its idempotency key to `anonymous`"*, and
+`services/core/cmd/api/routes_delivery.go` says it at `:107`, `:253` and `:326` — the last of those
+being the route comment that held `proof-uploads` shut for a wave. **SHIP-147b closed it** and §9's
+two entries above are corrected; these four sites are not, because they are a domain's files rather
+than this pass's. **Both are the same failure as the entries they cite** — a claim about behaviour
+restated in a second place, where nothing re-reads it — and the cheap form is a citation rather than
+a copy: name §9 and the ticket, do not restate the mechanism.
+
+**A reason that counts occurrences of its own subject invalidates itself by being written.**
+SHIP-182's strike said `git grep -E 'pg_dump|pg_restore'` returns *"exactly one match, and it is
+this section's own row"*; it returns two, the second being the sentence making the claim, and it was
+already two on the tree that sentence was written against. **The general form: a grep count over a
+repository that contains the document making the claim is not stable under publication.** Count what
+the grep finds *outside* the document, or state the command and let the next reader run it. §2 chose
+the second answer for the commit count and §3 chose the first for the check count; this class needs
+one of them picked deliberately rather than a bare number.
+
+**§3 names SHIP-140 among the tickets blocked on the Firebase project and §4 does not, and §4 is
+right.** SHIP-140's *Done when* is *"tokens bind to a device session and clear on sign-out"*, which
+is demonstrated whatever string a device registers; the ticket that needs a real credential is
+SHIP-143, and it is already declared reduced. §5 carries the correction. **The §3 paragraph is a
+lane's to fix**, and it is recorded here because a category with one extra member in it is the kind
+of error that survives every gate.
+
+**The report-mechanism row is now wanted by three surfaces rather than two, and one of them
+arrived.** SHIP-97 landed, so `job_messages` exists and *"reported jobs or messages"* has messages to
+report. The entry above about `display_name` asked that whoever writes the row size it for a job, a
+message once SHIP-97 lands, and a provider's declared name. **The middle one has landed and the row
+still does not exist**, which makes this the fourth consecutive pass to carry it. It is `Docs/04`
+§5's and §6's territory — what is reportable, by whom, with what outcome and against what policy —
+and **an owner decision rather than a row a reconciliation pass may invent.**
+
+**`make status` grew a structural guard and the other two ordered files have none of the same
+kind.** The §3 check now refuses a table whose rows are not under a header. `Docs/11-done.txt` has
+its build-order guard, and `routes_golden.txt` has `TestRouteTableMatchesGolden` — but nothing checks
+that `routes_golden.txt` is *sorted*, which is the property a `merge=union` resolution breaks and
+which `CLAUDE.md` asks a person to confirm by eye before running the `-update` that would otherwise
+bless a loss. **Sorting is checkable and the ordering is known** — by path, column 2, `LC_ALL=C` —
+so this is a small guard nobody has written. Recorded rather than taken: `cmd/api` is a shared
+surface and this pass may not edit it.
 
 ## 10. The done list, in a form a script can read
 
@@ -16955,11 +17025,16 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is now in the list**, and its six live rows — **SHIP-158, SHIP-77, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
-not a contradiction to be tidied away. That sentence named SHIP-149, SHIP-77 and SHIP-118 two passes
-ago and SHIP-77 and SHIP-151 one pass ago, and **it has now been wrong at three consecutive
-reconciliations** — as has §4's own. Neither is checked by anything, both are maintained by hand, and
-both name a set rather than a count, which is the only reason a reader notices at all.
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is in the list**, and its six live rows — **SHIP-158, SHIP-77, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
+not a contradiction to be tidied away. **This sentence was wrong at three consecutive
+reconciliations and it is right at this one, because it was re-read rather than restated**: §4's
+non-struck first cells were listed off the tree and each of the six checked against
+`Docs/11-done.txt` by name. It named SHIP-149, SHIP-77 and SHIP-118 three passes ago and SHIP-77 and
+SHIP-151 two passes ago, each time correctly at the moment of writing and wrongly by the next merge.
+**The reason the pattern is worth keeping rather than the sentence**: neither this nor §4's parallel
+sentence is checked by anything, both are maintained by hand, and both name a *set* rather than a
+count — which is the only reason a reader ever notices, and is also why wave 11's version stayed
+plausible while every name in it had changed.
 
 **A ticket can be both**, and this is the shape: it landed, it is named by a commit subject, and one
 clause of what it was supposed to deliver belongs to a ticket that does not exist yet. SHIP-149
@@ -17010,8 +17085,25 @@ Update it in the same change that finishes a ticket. A tracker maintained afterw
 
 `make status` compares three things: the backlog, the list in §10, and the tickets named by commit subjects. It fails when §10 claims something git has never seen, and warns when git has seen something §10 does not mention. It reads subjects only, so a commit finishing two tickets while naming one under-reports — which is why §10 is authoritative and the git side is a check on it rather than the source.
 
-**It cannot see table structure, and that was demonstrated at the wave-11 reconciliation rather than reasoned about.** The §3 completeness check counts lines beginning with `|` and asks whether every done ticket appears in a first cell. **It has no idea how many tables there are.** Mutated on this tree: a **blank line inserted into §3's "Elsewhere" summary table**, immediately above the SHIP-134 row, splits one 142-row table into two — and `make status` **exits 0 with both ticks green**. Mutated a second time on top of it, **deleting SHIP-166's summary row** made the same run exit 1 naming `SHIP-166`. So the guard is real for what it checks and blind to the shape of what it reads, and the two mutations together say exactly where the line is. Both were reverted from a copy taken before either was applied, confirmed with `git diff` **and** a checksum against that copy.
+**It could not see table structure until this pass, and both the blindness and its fix were demonstrated by mutation rather than reasoned about.** The §3 completeness check counts lines beginning with `|` and asks whether every done ticket appears in a first cell; it has no idea how many tables there are, so **a blank line inside a summary table splits it in two, every row below the gap is still counted, and the two halves still render as two adjacent tables in most viewers.** A merge resolution that leaves a blank line behind produces exactly that, and nothing reported it.
 
-**This matters because the failure has happened.** A merge can split a summary table by leaving a blank line in a resolution, the tables still render as two adjacent tables in most viewers, every guard stays green, and it is found only by somebody reading. **§3's summary tables on `5a3b8d7` are two and only two** — `M0 — Foundation` at 28 rows and `Elsewhere` at 142, each contiguous, checked before this was written — so nothing is wrong today. §9 has what would catch it if it happened.
+**The fix requires every run of table rows in §3 to begin with its header and the separator under it.** No hand-maintained number, no list of which tables are summary tables — the alternative §9 offered was to count `|---|` separators against an expected total, and that total would have been a scalar inside an instrument, which is the shape this file spends a lot of words regretting.
+
+**Mutated on this tree, and the same mutation was run against both guards so the comparison is on one file rather than across two trees.** A blank line inserted at line 641, splitting §3's 151-row "Elsewhere" table into runs of 81 and 70:
+
+| Guard | Verdict |
+|---|---|
+| The pre-fix script, on the mutated tree | **exit 0, both ticks green** — survived |
+| The fixed script, on the same mutated tree | **exit 1**, naming `line 642: \| **SHIP-110** \| M4 \| …` |
+| The fixed script, with SHIP-166's summary row deleted instead | **exit 1**, naming `SHIP-166` — the control still holds |
+| The fixed script, on the unmutated tree | exit 0 |
+
+**The control is the half that matters.** A structural guard that caught the split and stopped catching a deleted row would have traded one blindness for another, and only running the old mutation again says which happened.
+
+**Four plausible lane appends were checked before the guard was committed, because four lanes were appending to §3 while it was written.** A row added to the "Elsewhere" table, a whole new subsection with its own table, a Markdown table quoted inside a fence, and a fenced block whose lines merely begin with a pipe — all four exit 0. Fenced blocks are skipped, and a fence also ends a run, so a table interrupted by one is as broken as a table interrupted by a blank line.
+
+**The shape of §3 was measured before the guard was written rather than assumed, and the number the last pass left behind was wrong.** §9 recorded *"§3's summary tables are two and only two"*; on `4fd7fd5` §3 holds **78 contiguous runs of table rows** — the two summary tables at 28 and 151 rows, and 76 smaller tables inside prose subsections — and **every one of the 78 is well formed.** A guard built on the figure in the previous sentence would have failed every lane's gate in the wave it was written in.
+
+**Every mutation was reverted from a copy taken before any of them was applied**, with the checksums written to a `SHASUMS` file beside the copy in the same command, and confirmed afterwards with `git diff` **and** `shasum -a 256 -c`. `git checkout <file>` was not used: on an unstaged tree it restores from the index, which reads as success and is the signature of having destroyed the work sitting beside the mutation.
 
 **It also checks that the done list is in *build* order, and `sort -c` is wrong for that job in both directions — measured at the wave-10 reconciliation and re-measured here.** The guard was mutated on this tree by inserting `SHIP-12` between `SHIP-119` and `SHIP-120`, which is the shape a `merge=union` resolution produces. **`LC_ALL=C sort -c` accepts that window**, because `SHIP-119` < `SHIP-12` < `SHIP-120` byte for byte, so the defect is invisible to it; the build-order guard rejected it with exit 1 and named the line — *"line 202: SHIP-12 follows SHIP-119"* when re-run at the wave-11 reconciliation, *"line 197"* when first run at wave 10, the difference being the rows added since. **And `LC_ALL=C sort -c` rejects the *correct* file**, at line 2 — re-confirmed here, and the reason is not the one this paragraph gave for a wave. It is **the comment header**, which sorts after nothing; Track X sorting first in build order while `X` sorts after `S` in bytes is a *second*, independent reason the whole-file check is meaningless, and it bites on the ticket rows rather than at line 2. An instrument that passes the defect and fails the healthy file is not a weaker check than the guard; it answers a different question. The comparison has to be on the parsed triple — track, number, letter suffix — which is what `scripts/delivery-status.sh` writes out longhand, and why it is written out longhand.
