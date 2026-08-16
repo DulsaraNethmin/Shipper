@@ -124,6 +124,95 @@ void main() {
     });
   });
 
+  // SHIP-131a. `MilestoneRecording.reason` has been in the published contract since SHIP-111, the
+  // platform has always stored it, and the **customer's tracking view has always rendered it** — and
+  // no client ever sent one. So every assertion here is on the body that left the device, never on
+  // what the text field holds: a note the driver can see and the platform never receives is exactly
+  // the defect this ticket exists to close, and a widget-level assertion would pass through it.
+  group('the driver’s own words on a milestone', () {
+    testWidgets('reach the platform as `reason`', (tester) async {
+      final harness = SyncHarness.create();
+
+      await openDelivery(tester, harness: harness, jobId: job);
+      await tester.enterText(
+        find.byKey(const Key('milestone-note')),
+        'Nobody at the gate, returning at four',
+      );
+      await tester.pumpAndSettle();
+      await recordMilestone(tester, harness, 'en_route_to_pickup');
+
+      final body = harness.sender.sent.single.body;
+      expect(body['reason'], 'Nobody at the gate, returning at four');
+      expect(body['milestone'], 'en_route_to_pickup');
+      expect(body.keys.toSet(), <String>{'milestone', 'recorded_at', 'reason'});
+    });
+
+    testWidgets('are optional, and an empty field sends no key at all', (tester) async {
+      final harness = SyncHarness.create();
+
+      await openDelivery(tester, harness: harness, jobId: job);
+
+      // Whitespace rather than nothing: the platform trims and then bounds what is left, so a note
+      // of spaces is refused as too short after the collapse. Sending `"reason": ""` would be worse
+      // than a refusal — the customer's view branches on the field being *present*, so it would put
+      // a blank line under their latest update.
+      await tester.enterText(find.byKey(const Key('milestone-note')), '   ');
+      await tester.pumpAndSettle();
+      await recordMilestone(tester, harness, 'picked_up');
+
+      expect(harness.sender.sent.single.body.containsKey('reason'), isFalse);
+    });
+
+    testWidgets('belong to one milestone and are not carried on to the next', (tester) async {
+      // A note is "what a person should know about **this** milestone". Carrying it forward would
+      // attach a driver's sentence about a locked gate to the pickup that followed it, on the
+      // customer's timeline, with nothing on the screen to say it had happened.
+      final harness = SyncHarness.create();
+
+      await openDelivery(tester, harness: harness, jobId: job);
+      await tester.enterText(find.byKey(const Key('milestone-note')), 'Locked yard, waited 20 min');
+      await tester.pumpAndSettle();
+      await recordMilestone(tester, harness, 'en_route_to_pickup');
+      await recordMilestone(tester, harness, 'picked_up');
+
+      expect(harness.sender.sent, hasLength(2));
+      expect(harness.sender.sent[0].body['reason'], 'Locked yard, waited 20 min');
+      expect(
+        harness.sender.sent[1].body.containsKey('reason'),
+        isFalse,
+        reason: 'the second recording inherited the first one’s note',
+      );
+    });
+
+    testWidgets('are kept when the device would not store the recording', (tester) async {
+      // The one case where clearing would be wrong, and it is a real one rather than a defensive
+      // branch: a queue that mints the same key twice refuses the second row *before* anything
+      // commits. A driver about to tap again should not have to retype a sentence they have already
+      // written while standing in the rain.
+      final harness = SyncHarness.create(sender: offline, mintKey: () => 'one-key-for-everything');
+
+      await openDelivery(tester, harness: harness, jobId: job);
+
+      await tester.enterText(find.byKey(const Key('milestone-note')), 'Locked yard, waited 20 min');
+      await tester.pumpAndSettle();
+      await recordMilestone(tester, harness, 'en_route_to_pickup');
+
+      await tester.enterText(find.byKey(const Key('milestone-note')), 'Gate open now');
+      await tester.pumpAndSettle();
+      await recordMilestone(tester, harness, 'picked_up');
+
+      // The observed side effect: one row, not two. The second recording never committed.
+      expect((await harness.queue.snapshot()).total, 1);
+      expect(find.byKey(const Key('milestone-refused')), findsOneWidget);
+
+      expect(
+        tester.widget<TextField>(find.byKey(const Key('milestone-note'))).controller?.text,
+        'Gate open now',
+        reason: 'a refused recording threw away the driver’s words',
+      );
+    });
+  });
+
   group('pending and recorded are told apart on the same screen', () {
     testWidgets('by different words, on two milestones recorded minutes apart', (tester) async {
       // The first recording is accepted; the second meets an outage. This is the ordinary shape of

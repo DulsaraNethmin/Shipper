@@ -208,7 +208,19 @@ class RecordMilestoneController extends Notifier<DeliveryState> {
   /// reused unchanged by every attempt for the life of the row (SHIP-124, SHIP-125). Nothing here
   /// touches it, which is what makes a retry after a day in a valley a retry rather than a second
   /// milestone on the customer's timeline.
-  Future<bool> record(Milestone milestone) async {
+  ///
+  /// ## [note] is the driver's own words, and it is optional in the strong sense (SHIP-131a)
+  ///
+  /// `MilestoneRecording.reason` — "what a person should know about this milestone that the
+  /// milestone itself does not say". An empty one puts **no key** in the body rather than an empty
+  /// string: `httpx.DecodeJSON` would accept `"reason": ""` and the domain would then judge it as a
+  /// supplied value, and a customer's tracking view renders `reason` whenever it is present. An
+  /// absent field says nothing; an empty one says something and says it blank.
+  ///
+  /// Trimmed here rather than at the screen, because the platform trims before it judges — a note of
+  /// spaces is a note nobody wrote, and sending one would put an empty line under a customer's
+  /// latest update.
+  Future<bool> record(Milestone milestone, {String note = ''}) async {
     // Belt and braces beside the screen, which offers no button for it. The platform refuses every
     // `delivered` with `delivery_proof_required`, so queueing one would put work the driver
     // believes they recorded into a quarantine that only a person can clear.
@@ -216,6 +228,7 @@ class RecordMilestoneController extends Notifier<DeliveryState> {
 
     final at = DateTime.now();
     final bornAt = _reads;
+    final words = note.trim();
 
     try {
       final operation = await _worker.record(
@@ -233,6 +246,7 @@ class RecordMilestoneController extends Notifier<DeliveryState> {
           // is hours after the delivery event it describes, and `Docs/02` §3.1's two clocks would
           // be one.
           'recorded_at': rfc3339(at),
+          if (words.isNotEmpty) 'reason': words,
         },
         recordedAt: at,
       );

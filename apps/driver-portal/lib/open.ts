@@ -117,7 +117,12 @@ export type Told = RecordOutcome | { kind: "missing" };
 export async function recordStep(
   jobId: string,
   milestone: string,
-  options: { evidence?: Evidence; completion?: Completion; signal?: AbortSignal } = {},
+  options: {
+    evidence?: Evidence;
+    completion?: Completion;
+    note?: string;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<Told> {
   if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
 
@@ -128,6 +133,10 @@ export async function recordStep(
   const outcome = await recordMilestone(jobId, token, milestone, keyFor(scope), {
     evidence: options.evidence,
     completion: options.completion,
+    // The driver's own words (SHIP-131a). Carried through rather than folded into the key's scope:
+    // a note is part of *what* is recorded and not part of *which action* it is, so editing one
+    // between two taps of the same button must not mint a second key and record the milestone twice.
+    note: options.note,
     signal: options.signal,
   });
 
@@ -177,7 +186,7 @@ export async function capturePhotograph(
   jobId: string,
   milestone: string,
   photograph: Blob,
-  options: { completion?: Completion; signal?: AbortSignal } = {},
+  options: { completion?: Completion; note?: string; signal?: AbortSignal } = {},
 ): Promise<Told> {
   if (!isJobId(jobId)) return { kind: "refused", refusal: "invalid" };
 
@@ -202,9 +211,13 @@ export async function capturePhotograph(
     return { kind: "refused", refusal: "upload_failed" };
   }
 
+  // The note goes on step 3 and never on step 1. The presign's whole subject is a media type and a
+  // length, and a driver's sentence about the delivery on it would be personal data on a request
+  // that has no business carrying any.
   return recordStep(jobId, milestone, {
     evidence: { object_key: asked.upload.object_key },
     completion: options.completion,
+    note: options.note,
     signal: options.signal,
   });
 }

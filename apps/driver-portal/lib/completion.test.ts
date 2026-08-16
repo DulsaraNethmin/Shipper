@@ -17,6 +17,14 @@ import { capturePhotograph, recordStep } from "./open.ts";
  * What is asserted here is the client's half: that both fields reach the platform on a `delivered`
  * and on nothing else, through both paths to it — the photograph and the reasoned exception — and
  * that `delivered_at` is read back so the page can stop offering the controls.
+ *
+ * **The last group is SHIP-131a's**, and it is here because this file already runs both paths to a
+ * finished delivery with the platform's request bodies captured. `MilestoneRecording.reason` is a
+ * third field, unrelated to the two above — the optional note **any** milestone may carry, which the
+ * platform has accepted since SHIP-111 and no client has ever sent, while the customer's tracking
+ * view rendered it. Every assertion is on the body that reached the platform, never on the form,
+ * because a note the driver can see and the platform never receives is the defect the ticket exists
+ * to close and a form-level assertion would pass straight through it.
  */
 
 register("./alias-hooks.mts", import.meta.url);
@@ -195,6 +203,77 @@ test("an ordinary milestone carries neither field", async () => {
   assert.equal(bodies.length, 1);
   assert.equal("recipient_name" in bodies[0], false);
   assert.equal("delivery_note" in bodies[0], false);
+  assert.deepEqual(Object.keys(bodies[0]).sort(), ["milestone", "recorded_at"]);
+});
+
+/**
+ * **SHIP-131a's central assertion, and the one the mutation is aimed at.** A note typed on the
+ * portal has to arrive as `MilestoneRecording.reason`. Asserted on the body the platform received,
+ * so a build that renders the field and drops it from the request fails here.
+ */
+test("a note typed on the portal arrives as `reason`", async () => {
+  const { outcome, bodies } = await inTheBrowser(() =>
+    recordStep(JOB, "picked_up", { note: "Nobody at the gate, returning at four" }));
+
+  assert.equal(outcome.kind, "recorded");
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].reason, "Nobody at the gate, returning at four");
+  assert.deepEqual(Object.keys(bodies[0]).sort(), ["milestone", "reason", "recorded_at"]);
+});
+
+/**
+ * On the exception path it sits **beside** the selected reason rather than instead of one.
+ *
+ * `Docs/01` §4.4's list is closed so that `Docs/04` §5's delivery-exception queue can group it, and
+ * `ck_proofs_exception_reason` pairs with that. The note is what says which of the three it actually
+ * was — "the recipient asked me not to photograph their door" is the sentence that turns a queue
+ * entry into a decision. Both fields, one body.
+ */
+test("a note goes beside the exception reason and never in place of it", async () => {
+  const { outcome, bodies } = await inTheBrowser(() =>
+    recordStep(JOB, "delivered", {
+      evidence: { exception_reason: "recipient_objected" },
+      completion: FINISHED,
+      note: "The recipient asked me not to photograph their door.",
+    }));
+
+  assert.equal(outcome.kind, "recorded");
+  assert.equal(bodies.length, 1);
+  assert.deepEqual(bodies[0].proof, { exception_reason: "recipient_objected" });
+  assert.equal(bodies[0].reason, "The recipient asked me not to photograph their door.");
+});
+
+/** And on the photographed path — on the recording, never on the presign. */
+test("a note reaches the recording and not the request for somewhere to put a photograph", async () => {
+  const photograph = new Blob([new Uint8Array(1874)], { type: "image/jpeg" });
+  const { outcome, bodies } = await inTheBrowser(() =>
+    capturePhotograph(JOB, "delivered", photograph, {
+      completion: FINISHED,
+      note: "Left inside the roller door, out of the rain.",
+    }));
+
+  assert.equal(outcome.kind, "recorded");
+  assert.equal(bodies.length, 2, "the presign and the recording");
+
+  // The presign's whole subject is a media type and a length. A driver's sentence about the
+  // delivery on it would be personal data on a request that has no business carrying any.
+  assert.deepEqual(Object.keys(bodies[0]).sort(), ["content_length", "content_type"]);
+  assert.equal(bodies[1].reason, "Left inside the roller door, out of the rain.");
+});
+
+/**
+ * Optional in the strong sense: an empty note sends **no key**, not an empty string.
+ *
+ * Whitespace rather than nothing, because that is the case a form actually produces. The platform
+ * collapses whitespace and then bounds what is left, so `"reason": "  "` is refused as too short —
+ * and `"reason": ""` would be worse than a refusal, because the customer's tracking view branches on
+ * the field being *present* and would draw a blank line under their latest update.
+ */
+test("a note of nothing but spaces is not sent at all", async () => {
+  const { bodies } = await inTheBrowser(() => recordStep(JOB, "in_transit", { note: "   " }));
+
+  assert.equal(bodies.length, 1);
+  assert.equal("reason" in bodies[0], false);
   assert.deepEqual(Object.keys(bodies[0]).sort(), ["milestone", "recorded_at"]);
 });
 

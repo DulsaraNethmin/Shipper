@@ -219,8 +219,24 @@ class CaptureProofController extends Notifier<ProofCaptureState> {
   /// unchanged (SHIP-124, SHIP-125), which is what makes a retry after a day in a valley a retry
   /// rather than a second `Delivered` on the customer's timeline.
   ///
+  /// ## [note] goes beside the selected reason and never instead of one (SHIP-131a)
+  ///
+  /// `proof.exception_reason` is a **selection from a closed list of three**, which is what makes it
+  /// enforceable — `ck_proofs_exception_reason` pairs with it — and what makes `Docs/04` §5's
+  /// delivery-exception queue triageable at all. A free-text box in its place would be a queue
+  /// nobody can group.
+  ///
+  /// What a closed list cannot carry is *which* of the three it was and why, and "the recipient
+  /// asked me not to photograph their door" is the sentence that turns a queue entry into a
+  /// decision. So the note is `MilestoneRecording.reason`, a second field on the same request, and
+  /// this method still refuses to queue anything without a selection. **Both go in one body**: the
+  /// milestone, the reason, and the proof object beside each other.
+  ///
+  /// Empty means no key at all, for the reason `record_milestone_controller.dart` sets out on its
+  /// own `record`: an absent field says nothing, and an empty one says something and says it blank.
+  ///
   /// Returns once the row is **committed**, which is when the screen may confirm it.
-  Future<bool> queueException(ProofExceptionReason reason) async {
+  Future<bool> queueException(ProofExceptionReason reason, {String note = ''}) async {
     if (state.isBusy) return false;
 
     // `unknown` is this client's own value for a reason a later build wrote — see
@@ -231,6 +247,7 @@ class CaptureProofController extends Notifier<ProofCaptureState> {
     if (reason == ProofExceptionReason.unknown) return false;
 
     final at = DateTime.now();
+    final words = note.trim();
 
     try {
       await ref.read(syncWorkerProvider).record(
@@ -244,6 +261,7 @@ class CaptureProofController extends Notifier<ProofCaptureState> {
               // `record_milestone_controller.dart` sets out at length: omitting it would have the
               // platform stamp a delivery that happened in a valley with the time it arrived.
               'recorded_at': rfc3339(at),
+              if (words.isNotEmpty) 'reason': words,
               'proof': <String, dynamic>{'exception_reason': reason.wireName},
             },
             recordedAt: at,

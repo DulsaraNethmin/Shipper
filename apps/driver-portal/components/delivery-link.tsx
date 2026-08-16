@@ -287,6 +287,16 @@ function Detail({ jobId, delivery }: { jobId: string; delivery: Delivery }) {
 function Progress({ jobId, onDelivered }: { jobId: string; onDelivered: (at: string) => void }) {
   const [steps, setSteps] = useState<Record<string, StepState>>({});
   const [completing, setCompleting] = useState(false);
+
+  // The driver's own words for the **next** milestone they record (SHIP-131a), and cleared the
+  // moment one commits. A note belongs to one milestone — `reason` is "what a person should know
+  // about *this* milestone" — so carrying it forward would attach a sentence about a locked gate to
+  // the pickup that followed it, on the customer's timeline, with nothing on this page saying so.
+  //
+  // It is held here rather than in `Note` so that it survives the completion form opening: a driver
+  // who types "nobody at reception" and then taps `Delivered` finds the words still there, beside
+  // the three reasons.
+  const [note, setNote] = useState("");
   const live = useRef(true);
 
   useEffect(() => {
@@ -310,6 +320,10 @@ function Progress({ jobId, onDelivered }: { jobId: string; onDelivered: (at: str
         setSteps((held) => ({ ...held, [wire]: stepFrom(told) }));
         if (told.kind === "recorded") {
           setCompleting(false);
+          // Cleared only when the platform took it. A refusal leaves the words in the box, because
+          // the driver is about to tap again and retyping a sentence they already wrote is the worst
+          // thing this page could ask of somebody standing at a roller door.
+          setNote("");
           // The page goes read-only on the milestone the platform *recorded*, and on its recorded
           // time rather than the local clock — a retry answered from an earlier attempt comes back
           // with that attempt's time, which is the honest one to show.
@@ -328,14 +342,14 @@ function Progress({ jobId, onDelivered }: { jobId: string; onDelivered: (at: str
 
   const record = useCallback(
     (wire: string, evidence?: Evidence, completion?: Finished) =>
-      settle(wire, recordStep(jobId, wire, { evidence, completion })),
-    [jobId, settle],
+      settle(wire, recordStep(jobId, wire, { evidence, completion, note })),
+    [jobId, note, settle],
   );
 
   const capture = useCallback(
     (wire: string, photograph: Blob, completion: Finished) =>
-      settle(wire, capturePhotograph(jobId, wire, photograph, { completion })),
-    [jobId, settle],
+      settle(wire, capturePhotograph(jobId, wire, photograph, { completion, note })),
+    [jobId, note, settle],
   );
 
   return (
@@ -348,6 +362,14 @@ function Progress({ jobId, onDelivered }: { jobId: string; onDelivered: (at: str
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
+        {/*
+          Above the buttons, because the note is typed before the tap: a field under four large
+          targets is one a driver fills in after they have already recorded the thing it was about.
+          It moves into the completion form when that opens, so it sits beside the three reasons on
+          the path `Docs/04` §5 needs it on most.
+        */}
+        {completing ? null : <Note value={note} onChange={setNote} disabled={false} />}
+
         {MILESTONES.map((milestone) => (
           <Step
             key={milestone.wire}
@@ -362,6 +384,8 @@ function Progress({ jobId, onDelivered }: { jobId: string; onDelivered: (at: str
         {completing ? (
           <Completion
             recording={at("delivered").kind === "recording"}
+            note={note}
+            onNote={setNote}
             onPhotograph={(photograph, finished) => capture("delivered", photograph, finished)}
             onException={(reason, finished) =>
               record("delivered", { exception_reason: reason }, finished)
@@ -371,6 +395,59 @@ function Progress({ jobId, onDelivered }: { jobId: string; onDelivered: (at: str
         ) : null}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * The driver's own words about whatever they record next (SHIP-131a).
+ *
+ * # The field the platform has always accepted and no client ever sent
+ *
+ * `MilestoneRecording.reason` — optional, 500 characters, "what a person should know about this
+ * milestone that the milestone itself does not say" — has been in the published contract since
+ * SHIP-111 and `internal/delivery` has stored it since. This page's `recordMilestone` took
+ * `evidence`, `completion` and `recordedAt` and no note, and the Flutter client sent `reason` on a
+ * job cancellation and on no milestone; meanwhile the **customer's tracking view rendered it**. So a
+ * customer-facing surface could display a note that nothing in the product could write.
+ *
+ * # It says who reads it, because that changes what a person writes
+ *
+ * "The customer can see it" is the difference between a note meant for the customer and a note meant
+ * for the transport provider's own records, and a driver who does not know which is writing neither.
+ *
+ * # Optional in the strong sense
+ *
+ * Leaving it empty sends no `reason` key at all — `lib/delivery.ts` trims and then omits — so a
+ * driver who ignores this box records exactly what they recorded before it existed.
+ *
+ * `maxLength` is the contract's 500 rather than a layout choice: the column is `varchar(500)` and
+ * the platform answers `validation_failed` past it, which is a poor way to learn about a sentence
+ * you have already written.
+ */
+function Note({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  disabled: boolean;
+}) {
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-sm font-medium">Anything to add? (optional)</span>
+      <textarea
+        className="border-border bg-background focus-visible:border-ring focus-visible:ring-ring/50 min-h-16 w-full rounded-lg border px-3 py-2 text-base outline-none focus-visible:ring-3"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        maxLength={500}
+        placeholder="Nobody at the gate, returning at four"
+        disabled={disabled}
+      />
+      <span className="text-muted-foreground text-xs">
+        Kept with the delivery. The customer can see it.
+      </span>
+    </label>
   );
 }
 
@@ -459,6 +536,15 @@ function Step({
  * reasons a photograph can be impossible and none for a name or a note, because a driver can always
  * write what they see: "unattended" is a recipient and "left at the front door" is a note.
  *
+ * # The third field is a third thing, and conflating it with the second is the mistake to avoid
+ *
+ * `delivery_note` — "What did you do with it?" — is `Docs/01` §4.4's required fact about a
+ * **delivered** job, refused on any other milestone and required on that one. `reason` (SHIP-131a)
+ * is the optional note **any** milestone may carry, and `internal/delivery`'s own comment says in as
+ * many words that the two are not the same field. They read alike on a form and they are not: one is
+ * where the goods went, the other is anything a person should know that the milestone itself does
+ * not say. Both are here because a driver finishing a delivery may have something to say about both.
+ *
  * # The camera is a file input and not a media stream
  *
  * `capture="environment"` on `<input type="file" accept="image/*">` asks the handset to open the rear
@@ -475,11 +561,15 @@ function Step({
  */
 function Completion({
   recording,
+  note,
+  onNote,
   onPhotograph,
   onException,
   onCancel,
 }: {
   recording: boolean;
+  note: string;
+  onNote: (value: string) => void;
   onPhotograph: (photograph: Blob, finished: Finished) => void;
   onException: (reason: string, finished: Finished) => void;
   onCancel: () => void;
@@ -531,6 +621,18 @@ function Completion({
           disabled={recording}
         />
       </label>
+
+      {/*
+        Third, and above both evidence paths, because tapping either of them records immediately —
+        the photograph fires on the picker's `change` and a reason button is the commitment. A note
+        under them would be one a driver typed after the delivery had already gone.
+
+        On the exception path this is what `Docs/04` §5 needs: the three reasons are a closed list so
+        that the delivery-exception queue can group them, and this is the sentence that says which of
+        the three it actually was. It goes beside the selection and never instead of it — the reason
+        buttons still record `proof.exception_reason` whether or not a word is typed here.
+      */}
+      <Note value={note} onChange={onNote} disabled={recording} />
 
       <input
         ref={camera}

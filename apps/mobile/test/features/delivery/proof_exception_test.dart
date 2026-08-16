@@ -233,6 +233,90 @@ void main() {
     expect(camera.started, isTrue, reason: 'the preview was never given away');
   });
 
+  // SHIP-131a. The closed list stays closed — `Docs/04` §5 needs a reason it can group — and the
+  // driver's own words go **beside** the selection on the same request. The assertions are on the
+  // queued body rather than on the field, because a note the driver can see and the platform never
+  // receives is the whole defect this ticket exists to close.
+  testWidgets('a note is recorded beside the selected reason, not instead of one', (tester) async {
+    final camera = FakeProofCamera(problem: ProofCameraProblem.refused);
+    final harness = stuckQueue();
+
+    await openDelivery(
+      tester,
+      harness: harness,
+      jobId: job,
+      overrides: withDevice(camera, store()),
+    );
+
+    await tester.tap(find.byKey(const Key('milestone-record-delivered')));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.byKey(const Key('proof-exception-note')),
+      'The recipient asked me not to photograph their door.',
+    );
+    await tester.pumpAndSettle();
+
+    // **A note alone records nothing.** The button is still disabled, which is the "beside rather
+    // than instead of" clause said in the one place a driver could otherwise get round it.
+    expect(
+      tester.widget<FilledButton>(find.byKey(const Key('proof-exception-record'))).onPressed,
+      isNull,
+      reason: 'typing a sentence substituted for choosing one of the three',
+    );
+
+    await tester.tap(find.byKey(const Key('proof-exception-recipient_objected')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('proof-exception-record')));
+    await tester.pumpAndSettle();
+    await harness.worker.drained;
+    await tester.pumpAndSettle();
+
+    final queued = (await harness.queue.snapshot()).pending.single;
+
+    // Both, in one body. The selection is what a queue can group and a CHECK constraint can hold;
+    // the sentence is which of the three it actually was.
+    expect(queued.body['proof'], <String, dynamic>{'exception_reason': 'recipient_objected'});
+    expect(queued.body['reason'], 'The recipient asked me not to photograph their door.');
+    expect(
+      queued.body.keys.toSet(),
+      <String>{'milestone', 'recorded_at', 'reason', 'proof'},
+    );
+  });
+
+  testWidgets('a reason with no note is recorded exactly as it was before the field existed',
+      (tester) async {
+    final camera = FakeProofCamera(problem: ProofCameraProblem.refused);
+    final harness = stuckQueue();
+
+    await openDelivery(
+      tester,
+      harness: harness,
+      jobId: job,
+      overrides: withDevice(camera, store()),
+    );
+
+    await tester.tap(find.byKey(const Key('milestone-record-delivered')));
+    await tester.pumpAndSettle();
+
+    // Spaces rather than nothing: the platform collapses whitespace and then bounds what is left,
+    // so a note of spaces is a note nobody wrote — and `"reason": ""` would put a blank line under
+    // the customer's latest update, because their view branches on the field being present.
+    await tester.enterText(find.byKey(const Key('proof-exception-note')), '  ');
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('proof-exception-camera_unavailable')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('proof-exception-record')));
+    await tester.pumpAndSettle();
+    await harness.worker.drained;
+    await tester.pumpAndSettle();
+
+    final queued = (await harness.queue.snapshot()).pending.single;
+    expect(queued.body.containsKey('reason'), isFalse);
+    expect(queued.body['proof'], <String, dynamic>{'exception_reason': 'camera_unavailable'});
+  });
+
   testWidgets('a refused camera offers no way back to a shutter that does not exist',
       (tester) async {
     final camera = FakeProofCamera(problem: ProofCameraProblem.unavailable);

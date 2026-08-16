@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shipper/core/auth/provider_only.dart';
 import 'package:shipper/core/permissions/permission_copy.dart';
 import 'package:shipper/features/delivery/capture_proof_controller.dart';
+import 'package:shipper/features/delivery/milestone.dart';
 import 'package:shipper/features/delivery/proof_camera.dart';
 import 'package:shipper/features/delivery/proof_exception_reason.dart';
 
@@ -75,6 +76,14 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
   /// The reason selected and not yet recorded. See the note on the class about the two taps.
   ProofExceptionReason? _chosen;
 
+  /// The driver's own words, beside the reason rather than instead of it (SHIP-131a).
+  ///
+  /// `Docs/01` §4.4's list is closed and stays closed — `Docs/04` §5 wants a reason it can group —
+  /// and this is the sentence that says which of the three it actually was. "The recipient asked me
+  /// not to photograph their door" is what turns a delivery-exception queue entry into a decision,
+  /// and until this field there was nowhere to type it.
+  final _note = TextEditingController();
+
   @override
   void initState() {
     super.initState();
@@ -83,6 +92,7 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
 
   @override
   void dispose() {
+    _note.dispose();
     unawaited(_camera?.stop());
     super.dispose();
   }
@@ -159,7 +169,9 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
     await _camera?.stop();
     if (mounted) setState(() => _camera = null);
 
-    await ref.read(captureProofProvider(widget.jobId).notifier).queueException(reason);
+    await ref
+        .read(captureProofProvider(widget.jobId).notifier)
+        .queueException(reason, note: _note.text);
   }
 
   @override
@@ -184,6 +196,7 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
               // whose recipient objected is not being told their camera will not open.
               blocked: blocked,
               chosen: _chosen,
+              note: _note,
               failure: state.message,
               onChoose: (reason) => setState(() => _chosen = reason),
               onRecord: _record,
@@ -277,15 +290,22 @@ class _CameraOrOpening extends StatelessWidget {
 /// table as the photographs — and a driver who reads this as a failure will keep trying the camera
 /// at a door somebody is waiting behind.
 ///
-/// There is deliberately **no free-text option**. `Docs/01` §4.4 wrote the list closed and `Docs/04`
-/// §5 gives the reason: a reason nobody can group is a moderation queue nobody can triage. A
-/// driver's own words are not lost — the milestone's `reason` field is optional, 500 characters and
-/// one row away, and goes beside a selection rather than instead of one. That field has no control
-/// on this screen yet, which is worth knowing and is not this ticket.
+/// There is deliberately **no free-text option in place of the list**. `Docs/01` §4.4 wrote the list
+/// closed and `Docs/04` §5 gives the reason: a reason nobody can group is a moderation queue nobody
+/// can triage. **The driver's own words go beside the selection and never instead of it**
+/// (SHIP-131a) — the milestone's `reason` field, optional and 500 characters, on the same request as
+/// the chosen `exception_reason`. The record button is still disabled until one of the three is
+/// selected, and a note alone records nothing.
+///
+/// That is what makes the pair useful rather than redundant. The selection is what a queue can group
+/// and a `CHECK` constraint can hold; the sentence is which of the three it actually was. "The
+/// recipient asked me not to photograph their door" is a decision a moderator can make, and
+/// `recipient_objected` on its own is a row they have to ring somebody about.
 class _Reason extends StatelessWidget {
   const _Reason({
     required this.blocked,
     required this.chosen,
+    required this.note,
     required this.failure,
     required this.onChoose,
     required this.onRecord,
@@ -296,6 +316,11 @@ class _Reason extends StatelessWidget {
   final bool blocked;
 
   final ProofExceptionReason? chosen;
+
+  /// The driver's own words. Held by the screen so it survives the panel being rebuilt on every
+  /// selection — a note typed and then lost by choosing a second reason is a note typed once.
+  final TextEditingController note;
+
   final String? failure;
   final void Function(ProofExceptionReason) onChoose;
   final Future<void> Function() onRecord;
@@ -358,6 +383,26 @@ class _Reason extends StatelessWidget {
             ],
           ),
         ),
+        const SizedBox(height: 16),
+        // Under the three and above the button that commits them: the driver chooses, then says
+        // what the choice does not cover, then records. A field above the list would be answering a
+        // question nobody had asked yet.
+        TextField(
+          key: const Key('proof-exception-note'),
+          controller: note,
+          maxLength: milestoneNoteMaxLength,
+          maxLines: 3,
+          minLines: 1,
+          textCapitalization: TextCapitalization.sentences,
+          keyboardType: TextInputType.multiline,
+          decoration: const InputDecoration(
+            labelText: 'Anything to add? (optional)',
+            helperText: 'Kept with the delivery. The customer can see it.',
+            counterText: '',
+            border: OutlineInputBorder(),
+          ),
+        ),
+
         if (failure != null) ...[
           const SizedBox(height: 8),
           Text(
