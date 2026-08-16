@@ -529,13 +529,20 @@ func (h *Handler) RecordMilestone() http.Handler {
 // reach 'Delivered', because a reasoned exception was the only evidence a driver could produce.
 // Docs/11 §3 carries it.
 //
-// # The idempotency key is scoped `anonymous`, and the guarantee is not Redis's anyway
+// # The idempotency key is scoped to the credential, and the guarantee is not Redis's anyway
 //
-// Docs/11 §9 has held this decision open since SHIP-15m for the first driver-authenticated write,
-// which is this one. `httpx.SubjectScope` keys on the `authctx.Subject`; a driver token deliberately
-// produces none, and the scope is computed group-wide outside the middleware while a guard runs per
-// route inside it — so **nothing this route can do changes it**, and the only shape that would is a
-// second resolver in `internal/httpx`, which no domain branch may edit.
+// **SHIP-147b changed the first half of this and left the second half exactly as it was.** Docs/11
+// §9 held the decision open from SHIP-15m for the first driver-authenticated write, which is this
+// one, and the answer at the time was `anonymous`: `httpx.SubjectScope` keyed on the
+// `authctx.Subject`, a driver token deliberately produces none, and the scope is computed group-wide
+// outside the middleware while a guard runs per route inside it — so nothing this route could
+// declare changed it. **`SubjectScope` now answers `credential:<salted digest>` for any bearer
+// credential that produced no subject**, so a driver's keys land in a namespace only that link's
+// holder can compute. Read that function rather than this sentence; it is the authority and this
+// comment is downstream of it.
+//
+// What has not changed is that the scope is still not this route's to declare, and that the cache is
+// not what makes a repeat correct.
 //
 // **The decision is the second of the two §9 offered: a job-scoped grant scopes on the job
 // identifier already in the path, and it costs nothing because the platform already does it.**
@@ -888,14 +895,24 @@ func (h *Handler) PresignProofUpload() http.Handler {
 // 200 rather than 201, for the reason [Handler.PresignProofUpload] gives: nothing was created. The
 // platform holds no record of this URL, wrote no row and reserved no object.
 //
-// # The idempotency key on this route is `anonymous`-scoped, and this is the paragraph to read
-// before changing anything here
+// # SHIP-147b closed the question this route was held shut over, and the analysis below is kept
 //
-// `httpx.Idempotent` wraps the whole `/v1` group and the auth class is applied **per route, inside
-// it** — so on a repeated key the middleware replays the stored response *before* RequireDriverToken
-// runs. On [Handler.RecordDriverMilestone] that is argued as acceptable because the stored body is a
-// milestone both parties to the delivery may read anyway. **Here the stored body is a credential**,
-// which is a different question and is why routes_delivery.go held this route shut for a wave.
+// **The claim this paragraph used to make is no longer true.** It read "the idempotency key on this
+// route is `anonymous`-scoped, and this is the paragraph to read before changing anything here",
+// and every line of the reasoning under it was about what a *stranger* could reach in a shared
+// namespace. `httpx.SubjectScope` now answers `credential:<salted digest of the bearer token>` for
+// any credential that produced no subject, so **this route's stored responses sit in a namespace
+// only the holder of that exact driver link can compute** — and somebody holding the link can
+// simply make the request. The exposure the bounds below were written against is gone.
+//
+// The mechanism they were written against has not changed and is why they are kept rather than
+// deleted: `httpx.Idempotent` wraps the whole `/v1` group and the auth class is applied **per route,
+// inside it**, so on a repeated key the middleware still replays the stored response *before*
+// RequireDriverToken runs. On [Handler.RecordDriverMilestone] that is argued as acceptable because
+// the stored body is a milestone both parties to the delivery may read anyway. **Here the stored
+// body is a credential**, which is a different question, is why routes_delivery.go held this route
+// shut for a wave, and is what makes the bounds below worth keeping for whoever adds the next
+// driver-token route whose response carries something issued.
 //
 // What is reachable, stated precisely rather than waved at. To be handed this response somebody must
 // send an *identical* request: `replayOrRefuse` fingerprints method, path and body, and a mismatch is
@@ -918,12 +935,15 @@ func (h *Handler) PresignProofUpload() http.Handler {
 //   - **An overwrite of a recorded photograph is detectable.** 000603 stores the store's entity tag
 //     at the moment the object became proof, which is what that column exists for.
 //
-// **This is the posture Docs/11 §6 already accepts for every anonymous-scoped route** — "reading
-// another caller's stored response requires sending their exact request" — and what is new is that
-// the body is a credential rather than a fact. It is recorded in Docs/11 §9 with the mechanism that
-// closes it properly: §9's *first* option, a second group-wide resolver beside `ResolveSubject` that
-// a driver grant can populate, with `SubjectScope` widened to read either. That is an
-// `internal/httpx` change and therefore a prep ticket's, not a domain branch's.
+// That was the posture Docs/11 §6 accepts for every anonymous-scoped route — "reading another
+// caller's stored response requires sending their exact request" — with the wrinkle that the body is
+// a credential rather than a fact. **SHIP-147b removed the wrinkle**, and not by the mechanism §9
+// named: §9's first option was a second group-wide resolver beside `ResolveSubject` that a driver
+// grant could populate, and that shape was built, passed `make check` and broke on
+// `DELETE /v1/admin/sessions/current`, which revokes the credential it was called with. What shipped
+// instead scopes on a salted digest of the credential itself — stable across revocation, no
+// resolver, no database read — and closed the driver half as a side effect. Docs/11 §3's SHIP-147b
+// entry carries it.
 //
 // # There is no job identifier in this function, deliberately
 //
@@ -1235,9 +1255,10 @@ func driverJobFrom(a Assignment, grant DriverGrant, deliveredAt time.Time) drive
 //
 // SHIP-108 is a middleware ticket: it needs one route declaring RequireDriverToken so that "grants
 // exactly one job" and "cannot be exchanged for a user session" can be shown over HTTP rather than
-// only in Go. A read is the right size for that — it needs no idempotency scope (Docs/11 §9 records
-// that a driver-token request scopes its key to `anonymous`, which bites a write and not a read) —
-// and the delivery detail behind it belongs to SHIP-120.
+// only in Go. A read is the right size for that — it needs no idempotency scope at all, so the
+// question that held the first driver *write* open never arose here — and the delivery detail behind
+// it belongs to SHIP-120. (That question is settled in any case: SHIP-147b gives a driver token its
+// own `credential:<digest>` scope. `httpx.SubjectScope` is the authority.)
 //
 // # Why the job is in the path when the token already names it
 //
@@ -1835,7 +1856,8 @@ func driverMilestoneFrom(rec Record) driverMilestoneResponse {
 //
 // A GET changes nothing and the middleware lets safe methods through untouched. The scope question
 // that [Handler.RecordDriverMilestone] had to settle — a driver token produces no `authctx.Subject`,
-// so a key lands in `idem:v1:anonymous:<key>` — does not arise for a read.
+// so what namespace does its key land in — does not arise for a read. SHIP-147b answered it for the
+// writes: `credential:<salted digest>`, from `httpx.SubjectScope`.
 //
 // The same collection envelope and the same cursor as `GET /v1/jobs/{id}/delivery/milestones`, so a
 // client that has implemented one has implemented both.

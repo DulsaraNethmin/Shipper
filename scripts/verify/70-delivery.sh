@@ -931,10 +931,13 @@ ticket "SHIP-108  a driver token grants exactly one job and cannot be exchanged 
 # $delivery_second_job, and $delivery_forged is that first token repointed at the second job with
 # its signature left alone.
 #
-# The route is a GET, so nothing here needs an Idempotency-Key — and that is not an accident.
-# Docs/11 §9 records that a driver-token request scopes its idempotency key to `anonymous`, because
-# the scope is computed group-wide outside the middleware while a guard runs per route inside it. A
-# read does not meet that; SHIP-121's milestone controls will.
+# The route is a GET, so nothing here needs an Idempotency-Key — and that is not an accident. The
+# scope a driver-token request gets is computed group-wide outside the middleware while a guard runs
+# per route inside it, so no route can declare its own; a read does not meet that question at all,
+# and SHIP-121's milestone controls did. **What that scope is has changed since this was written**:
+# it was `anonymous`, and SHIP-147b made `httpx.SubjectScope` answer `credential:<salted digest>` for
+# any bearer credential that produces no subject. Docs/11 §9's entry still says the old thing;
+# `httpx.SubjectScope` is the authority.
 
 # open_delivery <token> <job-id> <name> — one driver-portal read, answering with the status code.
 #

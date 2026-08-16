@@ -14179,6 +14179,28 @@ Empty or whitespace-only sends **no `reason` field at all**, in all three client
 
 The driver's own narrow read (`GET /v1/driver/jobs/{id}/milestones`, SHIP-121a) carries the note too — which is what lets the portal show a reload what it recorded — and is checked to still disclose neither `recipient_name` nor `delivery_note`.
 
+### SHIP-147b's follow-through — ten comments that outlived the `anonymous` driver scope
+
+**SHIP-147b closed a hole and left the explanation of the hole in place at ten sites**, which is the ordinary way a security comment goes wrong: the argument is long, correct when written, and stops being true through a change in a file it does not name. `httpx.SubjectScope` now answers `credential:<salted digest of the bearer token>` for any bearer credential that produced no subject, and a driver token is exactly that — so a driver's idempotency keys no longer land in `idem:v1:anonymous:<key>`, and every present-tense sentence saying they do was false on `4fd7fd5`.
+
+**The measurement is the finding.** It was scouted as three or four sites in `services/core/cmd/api/routes_delivery.go` and `scripts/verify/70-delivery.sh`. Measured with `grep -rn anonymous` across the delivery surface it is **fourteen occurrences at ten claim sites across five files**:
+
+| File | Sites |
+|---|---|
+| `services/core/internal/delivery/http.go` | 4 — `RecordDriverMilestone`, `PresignDriverProofUpload` (two paragraphs), `DriverJob`, `DriverMilestones` |
+| `services/core/cmd/api/routes_delivery.go` | 3 — the provider presign's history, the driver milestone route, the driver presign route |
+| `apps/driver-portal/lib/keys.ts` | 1 — why a key is minted from a CSPRNG |
+| `apps/driver-portal/lib/record.test.ts` | 1 — the same argument, as a test's rationale |
+| `scripts/verify/70-delivery.sh` | 1 — SHIP-108's section header |
+
+One further occurrence, `internal/delivery/http.go`'s note that the sign-in endpoints are anonymous-scoped, **is still accurate and was left alone** — a caller who presents nothing is still `anonymous`, and `make verify` asserts that in the SHIP-147b section.
+
+**All ten were corrected, and none of the analysis was deleted.** Each keeps its argument and gains the sentence that says what changed, because the *mechanism* those paragraphs are really about has not changed at all: `httpx.Idempotent` wraps the whole `/v1` group and the auth class is applied per route inside it, so on a repeated key the middleware still replays the stored response **before** `RequireDriverToken` runs. That is what makes `PresignDriverProofUpload`'s bounds — a replay cannot make the object evidence, cannot read it, cannot write anything else, and cannot overwrite undetectably — worth keeping for whoever adds the next driver-token route whose response carries something issued. What is gone is the exposure they were written against.
+
+**Two of the corrected sites were wrong about something other than the scope**, found while reading them: `routes_delivery.go`'s driver-milestone comment said the response carrying no credential "is the whole reason this route can be served today and **the driver's upload cannot**", which SHIP-122 falsified a wave earlier by serving it.
+
+**`Docs/11` §9 still carries the old claim in two entries, and this pass deliberately did not touch it** — §9 belongs to the reconciliation lane, and §3's SHIP-147b row already records that it "closes the driver half of §9 as a side effect", so the repository's own account is not what was stale. The comments now point at `httpx.SubjectScope` as the authority rather than at a section number, which is the change that stops this recurring.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

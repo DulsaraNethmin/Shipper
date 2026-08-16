@@ -103,12 +103,16 @@ func init() {
 			//
 			// **The driver's version of this is now the last route in this file**
 			// (SHIP-122). This comment used to say it was "a gap recorded in Docs/11 §3
-			// rather than a decision", held shut because a driver-token route is served
-			// with the idempotency scope `anonymous` and this response carries a URL that
-			// can write into the evidence bucket. SHIP-120a settled the scope and SHIP-122
-			// wrote down what a replay of that stored credential actually reaches — see
-			// [delivery.Handler.PresignDriverProofUpload], which is the paragraph to read
-			// before touching either route.
+			// rather than a decision", held shut because a driver-token route was then
+			// served with the idempotency scope `anonymous` and this response carries a
+			// URL that can write into the evidence bucket. SHIP-120a settled the scope at
+			// `anonymous` and SHIP-122 wrote down what a replay of that stored credential
+			// actually reaches; **SHIP-147b then moved it off `anonymous` altogether** —
+			// `httpx.SubjectScope` answers `credential:<salted digest>` for a bearer
+			// credential that produces no subject, so a driver's stored responses sit
+			// where only that link's holder can reach them. See
+			// [delivery.Handler.PresignDriverProofUpload], which is still the paragraph to
+			// read before touching either route.
 			//
 			// # A pre-signed URL is minted here and spent nowhere in this service
 			//
@@ -248,19 +252,28 @@ func init() {
 			// read, and the two entry points meet in `internal/delivery`'s service rather than in
 			// a guard that has been taught to accept either credential.
 			//
-			// # The idempotency scope, which Docs/11 §9 has held open since SHIP-15m for this route
+			// # The idempotency scope, which Docs/11 §9 held open from SHIP-15m for this route
 			//
-			// `anonymous`, and **nothing declared here can change it**: the scope is computed
-			// group-wide outside the middleware while this class is enforced per route inside it.
-			// The decision is argued in [delivery.Handler.RecordDriverMilestone] and it is §9's
-			// second option — the platform's "once per key" guarantee is
-			// `uq_milestones_idempotency (job_id, idempotency_key)`, which 000602 scoped to the
-			// job in advance and named this exact case while doing it.
+			// **Nothing declared here can change it** — the scope is computed group-wide outside
+			// the middleware while this class is enforced per route inside it — and what it
+			// computes is no longer `anonymous`. SHIP-147b made `httpx.SubjectScope` answer
+			// `credential:<salted digest of the bearer token>` for any credential that produces no
+			// subject, which a driver token deliberately does, so this route's keys land in a
+			// namespace only that link's holder can compute. **Read `httpx.SubjectScope`, not this
+			// comment**: it is the authority and this is downstream of it.
+			//
+			// The scope was `anonymous` when SHIP-120a shipped, and the decision that made that
+			// acceptable is unaffected and still the load-bearing one — §9's second option, argued
+			// in [delivery.Handler.RecordDriverMilestone]: the platform's "once per key" guarantee
+			// is `uq_milestones_idempotency (job_id, idempotency_key)`, which 000602 scoped to the
+			// job in advance and named this exact case while doing it. A btree survives an
+			// eviction and a flush; a cache scope does not have to be the thing that is correct.
 			//
 			// **Unlike POST /jobs/{id}/proof-uploads, this response carries no credential**, which
-			// is the whole reason this route can be served today and the driver's upload cannot: a
-			// replay hands back a milestone that both parties to the delivery may read anyway,
-			// not a URL that writes into the evidence bucket.
+			// is why this route could be served a wave before the driver's upload was: a replay
+			// hands back a milestone that both parties to the delivery may read anyway, not a URL
+			// that writes into the evidence bucket. SHIP-122 then served that one too, and
+			// SHIP-147b removed what the asymmetry was about.
 			Auth:    RequireDriverToken,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordDriverMilestone() },
 		},
@@ -320,15 +333,20 @@ func init() {
 			// unaffected. SHIP-83a moved the feed to `/v1/fleet/jobs/{id}` and the `/jobs`
 			// tree is now clear as well; nothing here depended on that either way.
 			//
-			// # The scope question this route had to answer before it could be served
+			// # The scope question this route had to answer before it could be served,
+			// and which SHIP-147b has since closed
 			//
-			// A driver token produces no `authctx.Subject`, so the idempotency key lands in
-			// `idem:v1:anonymous:<key>` — and unlike the milestone route beside it, **this
-			// response body is a credential**. [delivery.Handler.PresignDriverProofUpload]
-			// carries the whole analysis: what a replay requires, what it can and cannot
-			// then do, and the `internal/httpx` change that would close it properly, which
-			// is a prep ticket's rather than a domain branch's. Read it before adding a
-			// second driver-token route whose response carries anything issued.
+			// A driver token produces no `authctx.Subject`, and while that meant the
+			// idempotency key landed in `idem:v1:anonymous:<key>` this route was the one
+			// that mattered: unlike the milestone route beside it, **this response body is
+			// a credential**. `httpx.SubjectScope` now answers `credential:<salted digest
+			// of the bearer token>` instead, so a replay is reachable only by somebody
+			// already holding this exact link — who can simply ask again.
+			// [delivery.Handler.PresignDriverProofUpload] carries the whole analysis and
+			// keeps it: what a replay requires, and what it can and cannot then do. **Read
+			// it before adding a second driver-token route whose response carries anything
+			// issued** — the middleware still replays before the guard runs, which is the
+			// mechanism the analysis is really about.
 			Auth:    RequireDriverToken,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).PresignDriverProofUpload() },
 		},
