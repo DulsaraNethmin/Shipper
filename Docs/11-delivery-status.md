@@ -13150,9 +13150,9 @@ provider spends the longest on.
 SHIP-80's own migration tests". **The measurement on this tree is wider.** With the constraint
 applied and nothing else changed, `make test` failed in **five packages** — `internal/admin`,
 `internal/bidding`, `internal/delivery`, `internal/fleet` and `cmd/notifier` — plus `migrations`,
-and two `scripts/verify` sections would have followed.
+and three `scripts/verify` sections would have followed.
 
-The blast is loud and the repair is small: **ten fixture sites**, every one of them a single
+The blast is loud and the repair is small: **twelve fixture sites**, every one of them a single
 `INSERT INTO bids` arranging a world rather than testing one. `internal/delivery` alone carries
 about a hundred and fifty failures behind **one** helper. The sites are
 
@@ -13164,6 +13164,7 @@ about a hundred and fifty failures behind **one** helper. The sites are
 | `internal/admin/service_test.go` | 2 | `acceptBid`, and a losing bid for the stranger checks |
 | `internal/fleet/providerjob_test.go` | 1 | SHIP-96a's every-status loop, which includes `Draft` |
 | `cmd/notifier/parties_test.go` | 2 | the accepted and losing bids party resolution reads |
+| `scripts/verify/60-fleet.sh` | 2 | SHIP-96a's awarded job, and the rival provider's bid on another job |
 | `scripts/verify/70-delivery.sh` | 1 | `delivery_award` |
 | `scripts/verify/90-admin.sh` | 1 | `dispute_award` |
 
@@ -13173,8 +13174,16 @@ with a condition in it, and the condition is the point: that helper is the one c
 `Draft`, and the two constraints are twins with one predicate, so filling the timing in
 unconditionally would have stopped it exercising the one status allowed to be incomplete.
 
-**Eight of those ten sites are outside this branch's stated ownership**, and that is recorded here
-rather than glossed: five domain packages and two verify sections belong to other lanes. The edits
+**Two of the twelve were found by `make verify` and not by `make test`, after the branch was already
+committed** — `60-fleet.sh`'s pair. That is the trap worth carrying forward rather than the count:
+`make check` passing says nothing about a shell fixture, because the Go tests and the harness keep
+separate fixtures, so a constraint that lands green under `make check` can still stop the harness at
+the first section that writes SQL. **A new `CHECK` on a table needs a sweep of `scripts/verify/*.sh`
+in the same pass as the Go fixtures**, and the harness stops at the first failure, so one section
+fixed is not evidence the rest are clean.
+
+**Ten of those twelve sites are outside this branch's stated ownership**, and that is recorded here
+rather than glossed: five domain packages and three verify sections belong to other lanes. The edits
 are additive fixture lines in `_test.go` files and two shell fixtures, and no production code in
 another domain changes — but a merge conflict here is a real possibility and this is the row that
 says where to look.
