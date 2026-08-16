@@ -708,7 +708,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-147a** | M6 | The platform's password cost, under its own name. `Config.Identity.Argon2` and `IDENTITY_ARGON2_*` became `Config.Passwords.Argon2` and `PASSWORDS_ARGON2_*` — one setting, read by identity's hasher, by admin's, and by identity's phone one-time codes. **Declined in three consecutive prep passes and it cost nothing to take**: five files. "No second knob" is a **guard rather than a claim** — a reflective walk of the `Config` tree and a source scan of `cmd/api` — and the release note naming the rename is in `deploy/.env.example` beside the variables, because no release-notes artefact exists to put it in — *see below* |
 | **SHIP-78a** | M3 | Every one of `internal/fleet`'s eight service methods refuses a caller who is not a provider, with the sentinel `Add` and `Declare` already returned. **Docs/11 §9's oldest ownerless finding**, open since wave 5, and it was never a disclosure — each of the six that did not check scopes to the caller's own identifier, so a customer got an empty list or a 404 and never another provider's vehicle. What it was is a surface declining to *refuse*. `Service.Profile` reversed its own recorded position to take it — *see below* |
 | **SHIP-81a** | M3 | `Docs/04` §4's five outcomes exist as a record: `provider_verifications` and its append-only decision trail (`000200` — migration block 200–299's first table, owned by `internal/profiles`), `GET /v1/provider/verification`, and the eligibility predicate reading that record instead of its automated stand-in. **The guarded function is in the database rather than in Go** — `provider_verification_decide()` records the decision with its actor and reason, names it to a trigger through a transaction-local setting, then moves the state — so the domain, a `make verify` fixture and a psql prompt are the same caller; the jobs precedent puts the protocol in Go and this file already records what the hand-written copy of it cost. **Every provider has a row from registration and the existing ones are backfilled `Pending`**, which is the ticket rather than a detail: Pending is a state a provider is *in*, so SHIP-153 has somebody to list — and **every provider on the platform stops being eligible to bid** until somebody decides otherwise. `internal/fleet` imports nothing from `internal/profiles`; the seam is one `EXISTS` clause — *see below* |
-| **SHIP-103** | M3 | The negotiation screen — **one screen for two people**, over the four endpoints that each serve both sides and work out which from the credential. It reads the whole chain and the conversation, and writes a counter-offer and a message; `BidCounter` is a **difference rather than an offer**, so a counter on price alone leaves the timing on the table, and an empty `message` is sent rather than omitted because that is how conditions are cleared. A counter **re-reads the chain instead of patching it** — the response is the new head alone and the platform also superseded the row it answered — and the read count is what the test asserts, because a client that wrote both facts renders identically. **The budget guard is word-level over rendered output** in the provider's view with the counter form open, and it was mutation-tested with a sentence carrying no field, no value and no digit. What it does not build: revising and withdrawing your own offer, both still served and both still wanting a confirmation flow — *see below* |
+| **SHIP-103** | M3 | The negotiation screen — **one screen for two people**, over the four endpoints that each serve both sides and work out which from the credential. It reads the whole chain and the conversation, and writes a counter-offer and a message; `BidCounter` is a **difference rather than an offer**, so a counter on price alone leaves the timing on the table, and an empty `message` is sent rather than omitted because that is how conditions are cleared. A counter **re-reads the chain instead of patching it** — the response is the new head alone and the platform also superseded the row it answered — and the read count is what the test asserts, because a client that wrote both facts renders identically. **The budget guard is closed-world over rendered output** in the provider's view with the counter form open — every string must be recorded copy, a written-down value shape, or a party's own words, so a sentence nobody recorded fails whatever it says. A ban-list was tried first and **lost to a paraphrase**, which is the fourth wave running that a guard of that shape has lost What it does not build: revising and withdrawing your own offer, both still served and both still wanting a confirmation flow — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14182,33 +14182,68 @@ supplied" indicator — is a *sentence*, and a sentence carries no field, no val
 and wave 11 each proved that a closed key set, a source scan, a value search and an AST walk all pass
 one.
 
-So `negotiation_test.dart` collects every rendered `Text` in the **provider's** view, with the counter
-form open, and refuses fourteen phrases. It asserts four things are on screen first — both offers'
-amounts, a message body and the form's own heading — because wave 11 recorded thirteen Dart tests that
-passed while asserting over empty lists.
+The guard is over the **provider's** view with the counter form open, and it is in two halves. It
+asserts five things are on screen first — both offers' amounts, both parties' words and the form's own
+heading — because wave 11 recorded thirteen Dart tests that passed while asserting over empty lists.
 
-**Mutation, applied and reverted by `CLAUDE.md`'s recipe.** A `Text` was added to the counter form,
-rendered to both parties and therefore to the provider, reading *"The customer has set a maximum."* —
-no field, no value, no digit. Result: **killed, and by exactly one assertion** — the word-level scan
-over rendered output, failing on the phrase `maximum`. Everything else passed: `flutter analyze`, the
+**Mutation 1 — the phrase wave 10 isolated.** A `Text` was added to the counter form reading *"The
+customer has set a maximum."*: no field, no value, no digit. **Killed**, by the word-level scan over
+rendered output, on the phrase `maximum`. Everything structural passed it — `flutter analyze`, the
 closed key set over `Bid`, `Message` and `ReceivedOffer`, `budget_stays_on_the_customer_side_test.dart`'s
-source scan for `budget_cents|budgetCents`, `compare_offers_test.dart`'s own word scan, and the other
-nineteen tests in `negotiation_test.dart`.
+source scan for `budget_cents|budgetCents`, and `compare_offers_test.dart`'s own word scan.
 
-**What that establishes, and what it does not.** The guard is word-level over rendered output, which is
-the shape the failure has — and none of the structural guards caught it at all, so this is not a
-structural check that happened to match the phrasing. What it is **not** is a guard against every
-sentence: a phrase the list does not carry survives, which is why the list holds shapes as well as
-nouns — `has set a`, `within their`, `over their`, `can afford`, `room to move`. That is the honest
-limit of the technique, and it is the same limit `compare_offers_test.dart` has.
+**Mutation 2 is the one that matters, and it survived.** The wave's orchestrator ran a paraphrase at
+the same location — *"The customer cannot go higher than this."* — naming none of the fourteen banned
+phrases. **All 1030 tests passed.** It then established that the fixture was not the reason, by
+swapping only the wording at that identical location to mutation 1's and watching the ban-list fail:
+the location was reachable, the guard was live, and the paraphrase simply walked past it.
 
-**One thing about the recipe itself, worth passing on.** Step 4 is *confirm with `git diff` **and**
-`shasum -a 256 -c`*, and here `git diff` was **structurally incapable of saying anything**: the mutated
-file is new on this branch, so it is untracked, so `git diff` reports nothing whether the file was
-restored or not. The checksum against the copy taken beforehand was the only evidence. That is the
-exact failure mode the recipe was written for — "after a destructive checkout the file matches the
-index, so `git diff` reports nothing, which reads as success" — arriving by a route the recipe does not
-name. **On a branch that adds files, the checksum is not the second half of step 4. It is all of it.**
+**That is not a phrase the list forgot. It is the shape of a ban-list, and this is the fourth wave to
+meet it.** Wave 10 beat a closed key set with a sentence; wave 11 beat a word search with the same
+sentence; wave 13 beat a phrase list with a synonym. Each time the instance was patched and the shape
+was kept. **A ban-list is open-world and the thing it guards is unbounded**, so it loses to a
+thesaurus, always, and widening it only moves the loss further out.
+
+**So the guard was inverted to closed-world**, which is the same principle as the closed key set
+already used over the models, moved from the type to the rendered output. Every string the provider's
+screen renders must be one of three things: copy `negotiation_test.dart` records **by hand**, a value
+whose *shape* is written down and anchored at both ends, or one of the exact strings the fixture's own
+parties typed. **Anything else fails, whatever it says.** Adding provider-visible copy is now a
+decision somebody recorded rather than something that happened.
+
+Three details make it hold rather than look like it holds. The recorded set is **hand-written and not
+derived from the source**, because deriving it would admit whatever the source said — the exact
+property under guard. It covers **`EditableText` as well as `Text`**, because the counter form seeds
+the price and the conditions from the live offer and a populated, provider-visible box that no `Text`
+finder sees would otherwise sit outside the guard. And a **second test runs it backwards**: every
+recorded string must still appear in the negotiation's source, so a reworded line has to be
+re-recorded rather than inherited, and an entry that matches nothing cannot sit there as a slot.
+
+**Re-mutated after the change, all three by the recipe.** Mutation 2 verbatim: **killed**, by the
+closed-world assertion alone, naming the string. Mutation 1 as the control at the same location:
+**killed twice**, by the ban-list and by the closed-world assertion. And a third, against the second
+test — one recorded refusal sentence reworded in `negotiation_controller.dart`, which no fixture in
+that group renders: **killed**, by the staleness check alone, naming the stale entry. The ban-list was
+kept beside the closed-world check because it is a fast, legible failure for the obvious case and
+costs nothing.
+
+**What is deliberately left fail-closed rather than allowed.** The stale-read banner interpolates
+`ApiFailure.userMessage` — for an `ApiErrorResponse` that is **the platform's own free text**, which no
+closed key set covers because a `message` is prose by definition. No fixture in this group renders it,
+so no shape admits it, and a test that renders one will fail until somebody decides what that means.
+That is the honest position: it is a real hole in *what a provider can be shown*, it is not this
+screen's to close, and it is now recorded rather than silently permitted. §9 is where it belongs if
+anybody wants it owned.
+
+**One thing about the mutation-revert recipe itself, worth passing on.** Step 4 is *confirm with `git
+diff` **and** `shasum -a 256 -c`*, and on the first round `git diff` was **structurally incapable of
+saying anything**: the mutated file was new on the branch, so untracked, so `git diff` reported nothing
+whether it had been restored or not. The checksum against the copy was the only evidence. That is the
+exact failure the recipe exists for — "after a destructive checkout the file matches the index, so
+`git diff` reports nothing, which reads as success" — arriving by a route it does not name. **On a
+branch that adds files, the checksum is not the second half of step 4; it is all of it.** After the
+first commit the same files are tracked and `git diff` works normally, which is why rounds two and
+three could confirm both ways.
 
 **One limit is recorded rather than hidden.** `Message.body` is what a party typed, stored unaltered —
 "the platform contributes no prose to it at all" — so a customer who writes their own limit into a

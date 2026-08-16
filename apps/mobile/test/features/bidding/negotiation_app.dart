@@ -131,10 +131,28 @@ Future<void> openNegotiationAsCustomer(
 /// **The instrument the budget guard needs and no structural check can be.** A closed key set holds
 /// a *model*; this holds the *pixels*. A screen composing "the customer has set a maximum" out of no
 /// field and no value passes every guard that looks at fields or values, and fails only here.
-String renderedText(WidgetTester tester) => tester
-    .widgetList<Text>(find.byType(Text))
-    .map((text) => (text.data ?? '').toLowerCase())
-    .join('\n');
+///
+/// This is the *open-world* half of that guard — a ban-list, fast to read and fast to fail. See
+/// [renderedStrings] for the half that does not need to anticipate the wording.
+String renderedText(WidgetTester tester) =>
+    renderedStrings(tester).map((data) => data.toLowerCase()).join('\n');
+
+/// Every string this screen actually puts in front of somebody, one entry per widget.
+///
+/// **Both kinds of rendered text, because a disclosure does not care which widget carries it.**
+/// `Text` covers headings, labels, helper text, buttons and message bodies; `EditableText` covers
+/// what a field is *seeded with*, which is rendered just as visibly and which no `Text` finder sees.
+/// The counter form seeds the price and the conditions from the offer being answered, so leaving
+/// `EditableText` out would leave a populated, provider-visible box outside the guard.
+///
+/// Empty strings are dropped: an empty composer is not a sentence.
+List<String> renderedStrings(WidgetTester tester) {
+  final texts = tester.widgetList<Text>(find.byType(Text)).map((text) => text.data ?? '');
+  final editable =
+      tester.widgetList<EditableText>(find.byType(EditableText)).map((f) => f.controller.text);
+
+  return <String>[...texts, ...editable].where((data) => data.trim().isNotEmpty).toList();
+}
 
 /// A phone-shaped surface, and a tall one: a negotiation is a chain, a conversation and two forms.
 void _phone(WidgetTester tester) {

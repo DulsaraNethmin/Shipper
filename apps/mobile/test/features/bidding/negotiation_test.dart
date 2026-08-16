@@ -45,6 +45,7 @@
 // provider's view**.
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -773,5 +774,237 @@ void main() {
         reason: 'what a party wrote is theirs, and the platform stores it unaltered',
       );
     });
+
+    testWidgets('every string on the provider’s screen is one somebody recorded', (tester) async {
+      // **The closed-world half, and the reason it exists is that the ban-list above lost.**
+      //
+      // The orchestrator ran a sharper mutation than the one this file was written against:
+      // `The customer cannot go higher than this.` — a paraphrase, in the provider's counter form,
+      // naming none of the fourteen phrases. All 1030 tests passed. It then proved the fixture was
+      // not the reason, by swapping only the wording at the same location to the known phrase and
+      // watching the ban-list fail. So the location was reachable, the guard was live, and the
+      // paraphrase simply walked past it.
+      //
+      // **That is not a phrase the list forgot. It is the shape of a ban-list.** Wave 10 beat a
+      // closed key set with a sentence; wave 11 beat a word search with the same sentence; a phrase
+      // list is the next rung and it loses to a thesaurus. Every wave so far has patched the
+      // instance and kept the shape.
+      //
+      // So this inverts it. Every string the provider's screen renders must be one of three things:
+      // copy this file records by hand, a value whose *shape* is written down, or the exact words a
+      // party typed into this fixture. **Anything else fails, whatever it says** — which makes
+      // adding provider-visible copy a decision somebody recorded rather than something that
+      // happened, exactly as `budget_stays_on_the_customer_side_test.dart` does for model keys. It
+      // is the same principle moved from the type to the pixels, and it is the only form that does
+      // not have to anticipate the wording.
+      //
+      // The state rendered is the richest one the provider can reach: both parties' offers with
+      // conditions on each, the counter form open and seeded from the live head, and a conversation
+      // with a message from each side.
+      const providerAsked = 'Is there a lift, or is it stairs to the second floor?';
+      const customerAnswered = 'There is a lift, but it is out until Thursday.';
+      const providerConditions = 'Tail lift required.';
+      const customerConditions = 'Happy at this price if you can make it Thursday.';
+
+      final bidding = FakeBiddingRepository()
+        ..chains = <List<Bid>>[
+          <Bid>[
+            aBid(
+              id: openingOffer,
+              jobId: _job,
+              amountCents: 52000,
+              offeredBy: BidParty.provider,
+              status: BidStatus.superseded,
+              supersededBy: 'offer-2',
+              message: providerConditions,
+            ),
+            aBid(
+              id: 'offer-2',
+              jobId: _job,
+              amountCents: 40000,
+              offeredBy: BidParty.customer,
+              message: customerConditions,
+            ),
+          ],
+        ]
+        ..messagePages = <ApiPage<Message>>[
+          conversation(<Message>[
+            aMessage(id: 'm1', sentBy: BidParty.provider, body: providerAsked),
+            aMessage(id: 'm2', sentBy: BidParty.customer, body: customerAnswered),
+          ]),
+        ];
+
+      await openNegotiationAsProvider(tester, bidding);
+      await tester.tap(find.byKey(const Key('negotiation-counter-open')));
+      await tester.pumpAndSettle();
+
+      // **Exactly the words this fixture wrote, not free text generally.** The carve-out below is
+      // for what a party typed — a customer who names their own limit in a message has disclosed it
+      // themselves — and admitting arbitrary strings under that heading would hand the guard back
+      // its hole. These four values and no others.
+      const partyWords = <String>{
+        providerAsked,
+        customerAnswered,
+        providerConditions,
+        customerConditions,
+      };
+
+      final rendered = renderedStrings(tester);
+
+      // **Not vacuous**, and checked before anything is concluded from an absence: wave 11 recorded
+      // thirteen Dart tests that passed while asserting over empty lists.
+      expect(rendered, contains(r'$520.00'));
+      expect(rendered, contains(r'$400.00'));
+      expect(rendered, contains(providerAsked));
+      expect(rendered, contains(customerAnswered));
+      expect(rendered, contains('Answer with different terms'));
+
+      final unrecorded = rendered
+          .where((data) => !_providerCopy.contains(data))
+          .where((data) => !partyWords.contains(data))
+          .where((data) => !_computed.any((shape) => shape.hasMatch(data)))
+          .toSet();
+
+      expect(
+        unrecorded,
+        isEmpty,
+        reason: '\n\nThe negotiation screen renders a string to a **provider** that nothing in this '
+            'file records:\n\n'
+            '  ${unrecorded.map((s) => '“$s”').join('\n  ')}\n\n'
+            'This assertion is closed-world on purpose. Docs/01 §4.3 forbids the customer’s\n'
+            'maximum as an amount, as a band, **and as a “budget supplied” indicator** — and the\n'
+            'third form is a sentence, which carries no field, no value and no digit. A list of\n'
+            'banned phrases loses to a paraphrase; this one loses to nothing, because it fails on\n'
+            'anything it was not told about.\n\n'
+            'If the string above is legitimate copy, add it to `_providerCopy` — that is the\n'
+            'decision being recorded, and it is a decision about what a provider may be told. If\n'
+            'it is a value the screen computes, add its **shape** to `_computed`, tightly enough\n'
+            'that prose cannot match it. If it is something a party typed, it belongs in this\n'
+            'test’s `partyWords`, which is the fixture’s own four strings and not a licence.\n\n'
+            'If it relates an offer to what the customer can spend, in any wording at all, it is a\n'
+            'product decision about Docs/01 §4.3 and belongs in the document before it belongs in\n'
+            'a widget.\n',
+      );
+    });
+
+    test('every recorded string is still copy the negotiation actually carries', () {
+      // **The other direction, and the reason `budget_stays_on_the_customer_side_test.dart` has its
+      // own version of it**: an allow-list that outlives its copy quietly permits a sentence
+      // somebody could reintroduce under a wording that was retired for a reason. A reworded line
+      // has to be re-recorded rather than inherited.
+      //
+      // Adjacent Dart string literals are joined before searching, because the source wraps a long
+      // sentence across two quoted parts and the rendered string has no such seam.
+      final source = <String>[
+        'lib/features/bidding/negotiation_screen.dart',
+        'lib/features/bidding/negotiation_controller.dart',
+        'lib/features/bidding/instant_field.dart',
+      ].map((path) => File(path).readAsStringSync()).join('\n').replaceAll(RegExp(r"'\s*\n\s*'"), '');
+
+      final stale = _providerCopy.where((copy) => !source.contains(copy)).toList();
+
+      expect(
+        stale,
+        isEmpty,
+        reason: '\n\nThese strings are recorded as copy a provider may be shown and no longer '
+            'appear in the negotiation’s source:\n\n'
+            '  ${stale.map((s) => '“$s”').join('\n  ')}\n\n'
+            'Delete them, or correct them to what the screen now says. A recorded string that\n'
+            'matches nothing is a slot the closed-world assertion above would wave through.\n',
+      );
+    });
   });
 }
+
+/// Every sentence, label and word the negotiation is allowed to put in front of a **provider**.
+///
+/// **Hand-written, and that is the whole mechanism.** Deriving this from the source would admit
+/// whatever the source said, which is the property being guarded against — the point is that a new
+/// provider-visible string fails until a person decides it may be shown. The companion test above
+/// keeps it from drifting the other way.
+///
+/// It deliberately includes the **refusal** copy, which lives in `negotiation_controller.dart`:
+/// explaining why the platform said no is the most plausible place anybody would write "they cannot
+/// go higher than that", and it is the copy least likely to be read by a reviewer looking at a
+/// screen.
+///
+/// What is **not** here, and is therefore fail-closed rather than allowed: the stale-read banner,
+/// which interpolates `ApiFailure.userMessage` — the platform's own free text. No fixture in this
+/// group renders it, so no shape admits it, and a test that renders one will fail until somebody
+/// decides what that means. See `Docs/11` §3.
+const _providerCopy = <String>{
+  // The screen itself.
+  'Negotiation',
+  'Offers',
+  'Messages',
+  'No offers have been read yet.',
+  'No price on this offer',
+  'Offer',
+  'Yours',
+  'Theirs',
+  'On the table',
+  'There is no offer on the table. Nothing further can be proposed here, and you can still send a message.',
+  'It is your turn. Answer with different terms, or send a message.',
+  'Your terms are with the other party. They can accept them, answer them, or write back.',
+  'Show later messages',
+  'No messages yet. Counter-offers say what the terms are; this is where the questions go.',
+  'Write to the other party',
+  'Questions a price cannot answer — access, timing, what is being moved.',
+  'Close',
+  'Try again',
+
+  // The counter form.
+  'Counter this offer',
+  'Answer with different terms',
+  'Anything you leave as it is stays as it is. Changing nothing at all is agreement, which is a different thing from a counter-offer.',
+  'This counter-offer changes nothing. Propose a different price, a different time or different conditions — or award the delivery if you agree with it.',
+  'Your price',
+  r'$',
+  'Australian dollars, for the whole job. Clear the box to leave the price as it is.',
+  'Collecting at',
+  'Delivered by',
+  'Keeping the time on the table',
+  'Conditions (optional)',
+  'Clear the box to remove the conditions on the offer.',
+  'Send counter-offer',
+  'Cancel',
+  'Counter-offers are sent straight away and are not held on your phone.',
+
+  // `instant_field.dart`.
+  'Choose',
+  'Change',
+
+  // The refusals, from `negotiation_controller.dart`.
+  'That offer is now yours to wait on rather than to answer — the other party has already replied. Reload the negotiation to see where it stands.',
+  'This delivery has been awarded. The terms are settled, and you can still send a message to arrange the details.',
+  'This negotiation is closed. The offer has been answered, withdrawn or has expired, so there is nothing left to counter.',
+  'That did not go through. Send the counter-offer again.',
+  'This negotiation could not be found. Open it again from the offer.',
+  'This conversation could not be found. Open it again from the offer.',
+  'That did not go through. Send the message again.',
+};
+
+/// A day-first instant as `dayFirstDateTime` renders one — `20 Aug 2026, 4:30 am`.
+///
+/// Written as a **shape rather than a value**, because the alternative is building the expectation
+/// out of the formatter the screen uses, which is the mistake `rules_test.go` made: a `want`
+/// computed from the subject agrees with a mutation by construction.
+const _instant = r'\d{1,2} [A-Z][a-z]{2} \d{4}, \d{1,2}:\d{2} [ap]m';
+
+/// The shapes of the values the screen computes rather than writes.
+///
+/// **Anchored at both ends, every one of them.** An unanchored pattern is a hole: a mutant that
+/// appended a sentence to a price line would still match `\$[\d,]+\.\d{2}` somewhere inside itself.
+final _computed = <RegExp>[
+  // A price, as `audFromCents` renders it.
+  RegExp(r'^\$-?[\d,]+\.\d{2}$'),
+
+  // The same price seeded into the counter form's own box, which has no currency symbol.
+  RegExp(r'^\d+\.\d{2}$'),
+
+  // One offer's two commitments, either of which may be absent.
+  RegExp('^Collect (?:$_instant|not stated) · deliver by (?:$_instant|not stated)\$'),
+
+  // Who wrote a message and when.
+  RegExp('^(?:You|Them) · $_instant\$'),
+];
