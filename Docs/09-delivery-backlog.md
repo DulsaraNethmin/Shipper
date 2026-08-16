@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**230 tickets, 711 points.**
+**231 tickets, 714 points.**
 
 ## How to read this
 
@@ -26,7 +26,9 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 
 **Dependencies point backwards, with exactly ten forward edges across nine tickets — do not write a parser that assumes otherwise, and count edges rather than rows.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, `SHIP-15m` depends on `SHIP-44` **and** `SHIP-135` — two edges from one row, which is why this sentence says which unit it is counting — `SHIP-30a` depends on `SHIP-151`, `SHIP-65a` depends on `SHIP-83a`, `SHIP-70a` depends on `SHIP-90`, `SHIP-78a` depends on `SHIP-79`, `SHIP-81b` depends on `SHIP-114`, and `SHIP-134a` depends on `SHIP-135`. All of them exist because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Compute startability from the dependency column itself, never from ticket order.
 
-**One of the ten now points at work that is not done, which is new and is why this paragraph was rewritten rather than renumbered.** Until the wave-10 reconciliation every forward edge named a target long since finished, so a parser that got the direction wrong still computed the right answer and the risk was purely theoretical. `SHIP-65a → SHIP-83a` ends that: `SHIP-83a` is open, `SHIP-65a` is therefore genuinely not startable, and a tool treating forward edges as decorative would now report it as ready. It is the first row in this file whose startability actually depends on reading the column.
+**The count is ten edges and it is unchanged by the wave-11 reconciliation, which added two.** `SHIP-144 → X-10` and `SHIP-145 → X-10` are both *backward*: Track X sorts first in build order, as it does in the milestone table above, so a dependency on an X row is never a forward edge whatever it gates. Re-derived by parsing the column rather than counted by eye, on `5a3b8d7` and again after the row was added.
+
+**Every one of the ten points at finished work again, and that is a state this paragraph has now been through in both directions.** The wave-10 reconciliation recorded the first exception in the file's history — `SHIP-65a → SHIP-83a`, where the target was open, so `SHIP-65a` was genuinely not startable and a tool treating forward edges as decorative would have reported it as ready. **SHIP-83a landed in wave 11**, so that edge is satisfied and SHIP-65a is startable; the warning is kept rather than deleted because the condition recurs the next time a lettered row is written ahead of its blocker. **Compute startability from the dependency column itself, never from ticket order, and never from whether this paragraph currently names an exception.**
 
 **This figure is hand-maintained and has been checked by a parser rather than counted by eye.** Both totals above and the milestone table below are the same kind of number — the rows are the truth, `scripts/delivery-status.sh` reads them, and nothing reads this sentence. Whoever adds a lettered row recounts all three in the same change.
 
@@ -38,7 +40,7 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
-| **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 9 | 26 |
+| **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 10 | 29 |
 | **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 38 | 106 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 28 | 84 |
@@ -47,14 +49,14 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 20 | 58 |
-| | | **230** | **711** |
+| | | **231** | **714** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
 ## Track X — External dependencies
 
 **Goal:** Unblock everything that depends on a third party. None of this is code; all of it is slow.  
-**Size:** 9 tickets, 26 points
+**Size:** 10 tickets, 29 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -67,6 +69,13 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | X-7 | Publish privacy policy at a public URL | 5 | Policy live at a stable URL reachable without authentication | X-4 |
 | X-8 | Draft customer terms of use and provider agreement | 5 | Both documents approved by the legal adviser | X-4 |
 | X-9 | Finalise the prohibited-goods list | 3 | Category list approved and ready to load as reference data | X-4 |
+| X-10 | Create the Firebase project and issue its push credentials | 3 | A Firebase project exists; a service-account key is in the CI secret store and in no commit; `google-services.json` and `GoogleService-Info.plist` are available to the mobile build; and a push sent with the platform's own credential arrives on a real handset | — |
+
+**X-10 was written at the wave-11 reconciliation, eleven waves after the work behind it started, and the reason it stayed invisible is worth more than the row.** `Docs/11` §5 lists only work blocked on a Track-X ticket, and **this was blocked on nothing** — there was no row to be blocked on. So SHIP-139 built the Firebase adapter against a fake FCM server, SHIP-143 shipped a `PushTokenSource` seam with a test asserting the absence, both said in their own write-ups that no project exists, and neither could do anything about it. **A prerequisite the backlog assumed and never wrote down is invisible to every instrument here**: `make status` counts rows, `make verify` exercises endpoints, and neither can report a thing that is missing from the plan itself. It is the same shape as the SHIP-153 gap the wave-10 reconciliation found, and the same answer — write the row.
+
+**It depends on nothing and can be done this week, which is the operationally important half.** Creating the project, downloading the two client configuration files and issuing a service-account key need no third-party approval and no enrolment. **The one part that does wait is the iOS leg**: FCM reaches an iPhone through APNs, which needs an authentication key from the Apple Developer Program, so that half arrives with X-2. Split the ticket if the Android leg is wanted sooner; do not let the iOS half hold the project.
+
+**Four rows take the dependency and a fifth deliberately does not.** SHIP-144 and SHIP-145 are open and take it in the column below, which is what makes them stop reading as startable. SHIP-139 and SHIP-143 are **done in reduced form** and carry the gap in `Docs/11` §4 instead, with X-10 as the named owner — a done ticket with an unmet dependency in this column would misreport the graph, and §4 is the instrument for a shipped ticket whose *Done when* is partly met. **SHIP-140 takes neither**, and that is measured rather than assumed: its *Done when* is "tokens bind to a device session and clear on sign-out", a push token is an opaque string to the platform, and `make verify` demonstrates the whole of it today.
 
 ## M0 — Foundation
 
@@ -208,6 +217,8 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 **It is written in M2 rather than beside the screen, because the gap is a read and not a rendering** — the same call `Docs/11` §6 makes for SHIP-101a, SHIP-115a, SHIP-120a, SHIP-96a and SHIP-102a. What changes in `apps/mobile` is that `jobTimeline` takes the history and the steps gain their real times; nothing else about the screen moves.
 
 **Its dependency on SHIP-83a is a forward edge and is a hard one rather than a placement convention.** `GET /v1/jobs/{id}/history` is a four-segment `GET` under `/v1/jobs/{id}/`, and while `GET /v1/jobs/open/{id}` exists both patterns match `/v1/jobs/open/history` with neither more specific — Go's `ServeMux` panics at registration and the process does not start. **Registering the intersection does not help.** The alternatives are all worse than waiting: a five-segment path, or a `POST` for a read. This row is therefore the fifth ticket to be shaped by that clash, and unlike the four before it — SHIP-115, SHIP-115a, SHIP-101a and SHIP-102a, each of which took a workaround — it declares the blocker instead. That is what SHIP-83a's "cheapest before there is a deployment" argument buys.
+
+**The blocker cleared in wave 11 and this paragraph is now history, deliberately kept.** SHIP-83a moved the feed to `GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}` and **proved the freed slot by registering a probe route** rather than asserting it, so `GET /v1/jobs/{id}/history` is registrable today and SHIP-65a is startable. It is kept because it is the worked example of a row that declared a blocker instead of taking a workaround, and it is the only one of the five that did.
 
 ## M3 — Bidding and award
 
@@ -367,11 +378,13 @@ Five segments or more are safe, because the literal route has only three after `
 | SHIP-141 | Push content redaction rules | 2 | No address, goods description, or full customer name appears in a notification body | SHIP-139 |
 | SHIP-142 | Notification preferences per user | 3 | A user can mute non-essential categories; essential events cannot be muted | SHIP-137 |
 | SHIP-143 | Flutter push registration | 3 | Token registers after sign-in and de-registers on sign-out | SHIP-140, SHIP-50 |
-| SHIP-144 | Flutter permission prompt at the right moment | 2 | Notification permission is requested contextually, never on first launch | SHIP-143 |
-| SHIP-145 | Flutter deep link routing | 5 | Tapping a notification opens the exact job, bid, or dispute it concerns | SHIP-143 |
+| SHIP-144 | Flutter permission prompt at the right moment | 2 | Notification permission is requested contextually, never on first launch | SHIP-143, X-10 |
+| SHIP-145 | Flutter deep link routing | 5 | Tapping a notification opens the exact job, bid, or dispute it concerns | SHIP-143, X-10 |
 | SHIP-146 | Flutter notification inbox | 3 | In-app list of recent notifications with read state | SHIP-145 |
 
 **SHIP-134a is an assertion-design ticket rather than a harness one, and that distinction is why it is a row rather than a lane's passing fix.** `80-notifications.sh` compares `consumed_sorted` against `outbox_sorted` — set **equality** over `shipper.job`. One broker serves every worktree on the machine, so a concurrent run's events land inside that set and the check fails on a tree where nothing is wrong; wave 9 saw it twice, identified by id in both cases. **No fence closes it.** Fencing narrows where a consumer starts reading and says nothing about what else arrives, so the equality has to become subset-plus-completeness over ids this run created — and somebody has to decide what completeness means once "everything on the topic" stops being the answer. That is a change to what a guard asserts, which is exactly the thing a lane must not weaken in passing.
+
+**SHIP-144 and SHIP-145 depend on X-10, and until the wave-11 reconciliation they were the two rows on this table that read as startable and were not buildable.** Both need a push token, a token needs `firebase_messaging`, and `firebase_messaging` needs `firebase_core`, a `google-services.json` and a `GoogleService-Info.plist` — none of which exists, because **no row in this file asked anybody to create the Firebase project** until X-10 was written. SHIP-143 shipped its half against a `PushTokenSource` seam with **a test asserting the absence**, which is the honest form and is not a substitute for the thing. `Docs/11` §4 carries what SHIP-139 and SHIP-143 owe the same row; SHIP-140 owes it nothing, because a device token is an opaque string to this platform and its *Done when* is demonstrated end to end today.
 
 **The deletion is the other half and is the reason a fence alone is not enough either.** The section deletes and recreates `shipper.job` on every run, and its own header says that is "safe today only because no other section asserts on a topic it did not create" — a justification scoped to *sections*, which does not survive a second worktree. A delete destroys the offsets a run-start fence captured, so the neighbouring run's subset check fails reporting its own ids as missing. Once the comparison is scoped to this run's ids the deletion has nothing left to buy, which is why the row asks for both in one change. `CLAUDE.md`'s worktree table carries the operational rule meanwhile: serialise `make verify` across trees.
 
