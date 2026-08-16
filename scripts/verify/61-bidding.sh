@@ -2980,6 +2980,13 @@ for token in ("data", "next_cursor", "has_more", "id", "sent_by", "body", "creat
               "provider", "customer"):
     allowed.update(words(token))
 
+# The envelope's own literals. `words` runs over the raw text rather than over values, so the
+# rendered form of a JSON boolean or null is a bare word to it — `has_more` is always present and
+# is `false` on a page with nothing after it. These are syntax rather than prose the platform
+# introduced, and the check keeps its whole point: an added *sentence* is still left over.
+for token in ("true", "false", "null"):
+    allowed.update(words(token))
+
 for row in page["data"]:
     allowed.update(words(row["body"]))       # what a party actually typed
     allowed.update(words(row["id"]))         # the identifier, by its own rendered form
@@ -3007,7 +3014,7 @@ ok "every word a party reads is one of them typed it, a key of the closed set, a
 
 status="$(bid_post "$bid_customer_token" "verify-msg-1-$$" "$msg_path" \
   '{"body":"Is there parking at the pickup end?"}' msg-retry)"
-[[ "$status" == "200" ]] || { cat "$WORKDIR/bid-msg-retry.json"; fail "a retry under the original key returned $status, want 200"; }
+[[ "$status" == "201" ]] || { cat "$WORKDIR/bid-msg-retry.json"; fail "the cached retry returned $status, want the stored 201"; }
 replayed_from_redis msg-retry || fail "the retry was not answered by the middleware, so this is not the cached case"
 
 # And once the cache has forgotten it, the row answers — which is the guarantee Redis cannot give.

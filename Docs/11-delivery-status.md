@@ -13355,6 +13355,21 @@ is something the platform introduced. **The check does not need to recognise a d
 needs to notice a word nobody put there.** `scripts/verify/61-bidding.sh` runs the same shape over the
 wire, against a job whose budget is asserted present first so the check is not vacuous.
 
+**The wire copy needed one thing the Go test did not, and only a harness run could have said so.**
+`words` runs over the *rendered* text, so a JSON boolean is a bare word to it. The Go test marshals
+`[]messageResponse` — the rows alone — while the endpoint returns them inside `Docs/10` §4.5's
+envelope, so `has_more` exists on the wire and in no Go fixture. The allow-list held `has_more` as a
+*key* and nothing accounted for its *value*, and `false` was left over. **The two halves of one
+check were not reading the same document**, which is the general form worth remembering: a Go test
+that renders a fragment and a verify check that renders the whole response are not the same
+assertion, and only the second sees the envelope. `true`, `false` and `null` are now allowed as
+syntax, which costs the check nothing — an added *sentence* is still left over.
+
+It went unseen because **`make check` cannot reach a shell check and `make verify` never got there**:
+the run was stopping in `60-fleet.sh`, the file before this one, on the fixture named in SHIP-87a's
+account above. One failure was hiding the other, which is the argument for sweeping past the first
+red rather than fixing it and declaring the gate clean.
+
 One thing this deliberately does *not* claim: **a party's own words are their own to choose.** A
 customer who types their budget into a message has disclosed it themselves. The invariant is about
 what the platform exposes, and the platform exposes nothing.
@@ -13371,6 +13386,15 @@ It matters more here than for a bid. **The other party has already read the mess
 which sending was the mistake**, which is also why the insert is `DO NOTHING` rather than `DO UPDATE`:
 a retry carrying different words is a *new* message, and silently replacing the delivered one would
 rewrite what somebody had already seen.
+
+**The two halves answer with different statuses, and the verify check first asserted the wrong one.**
+A retry the middleware replays returns the **stored 201** — `httpx`'s `replay` writes `resp.Status`
+verbatim, so a cached creation stays a creation — while a retry the *column* answers returns **200**,
+because `SendMessage`'s `ON CONFLICT DO NOTHING` declines, the row is read back and `created` is
+false. The check expected 200 from both. This file's own SHIP-87 placement checks (`r1`/`r2`/`r3`)
+had the pattern right — 201, the stored 201, then 200 from the row — so the correction was to match
+the shape already three checks old rather than to invent one. Recorded because **a replayed status
+is the original status**, and a reader who assumes a retry is always 200 will write this bug again.
 
 #### What was declined, on the record
 
