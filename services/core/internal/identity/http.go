@@ -584,6 +584,74 @@ func (h *Handler) RevokeDevice() http.Handler {
 	})
 }
 
+// deletionRequestResponse is what a person is told when they ask to be deleted (SHIP-169).
+//
+// `completes_by` is the whole point of the response. Docs/05 §3.1 requires the platform to tell the
+// person when deletion will complete, and this is that sentence in machine-readable form — read
+// back from the stored row, never computed while rendering. See the note at the top of deletion.go.
+//
+// The account is not echoed. A client that has just asked to be deleted does not need its own email
+// address handed back, and a response naming the contact details of an account under a deletion
+// request is one more copy of them to end up in a log.
+type deletionRequestResponse struct {
+	ID string `json:"id"`
+
+	// State is `requested` for every response this endpoint can currently produce. It is here
+	// rather than implied, because SHIP-170 adds `deferred` and a client that had assumed one
+	// value would render a deferral as an ordinary request.
+	State string `json:"state"`
+
+	RequestedAt string `json:"requested_at"`
+	CompletesBy string `json:"completes_by"`
+}
+
+func deletionRequestFrom(req DeletionRequest) deletionRequestResponse {
+	return deletionRequestResponse{
+		ID:          req.ID.String(),
+		State:       req.State.String(),
+		RequestedAt: timestamp(req.RequestedAt),
+		CompletesBy: timestamp(req.CompleteBy),
+	}
+}
+
+// RequestAccountDeletion handles POST /v1/account/deletion (SHIP-169).
+//
+// # Why there is no request body
+//
+// Which account is being deleted is decided by the token, exactly as sign-out is. A body naming an
+// account would be an endpoint that could delete somebody else's, and no confirmation field belongs
+// here either: Docs/05 §3.1 puts the confirmation in the app, and a `"confirm": true` on the wire
+// is a checkbox the platform cannot see anybody tick.
+//
+// # 202 the first time, 200 afterwards
+//
+// 202 Accepted is the honest status for the first request: the platform has accepted it and will
+// act within thirty days, which is precisely what 202 means and what 201 does not. A repeat gets
+// 200 with the same body — the request that already exists, carrying the date it has carried since
+// it was made. A client can tell "I have just asked" from "I asked before" without either being an
+// error, and neither answer moves the completion date.
+func (h *Handler) RequestAccountDeletion() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		who, err := callerFrom(r)
+		if err != nil {
+			return err
+		}
+
+		request, created, err := h.svc.RequestDeletion(r.Context(), who.UserID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		status := http.StatusOK
+		if created {
+			status = http.StatusAccepted
+		}
+
+		httpx.WriteJSON(w, status, deletionRequestFrom(request))
+		return nil
+	})
+}
+
 // timestamp renders an instant the way every response in this domain renders one.
 //
 // One function rather than a format string repeated per struct: two copies is how a field ends up

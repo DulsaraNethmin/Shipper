@@ -118,6 +118,25 @@ func init() {
 			Auth:    Public,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Refresh() },
 		},
+		Route{
+			// Account deletion (SHIP-169), and the first route this domain serves that is
+			// not under /auth.
+			//
+			// The prefix is a claim about what the resource is. Everything under /auth is
+			// how a caller obtains, holds or ends a *credential*; asking to be deleted is
+			// an act on the account itself, which outlives every session it ever had. It
+			// is also where SHIP-170's deferral and SHIP-173's screen will read from, and
+			// a person cancelling a deletion is not signing anything out.
+			//
+			// RequireUser, and it may be: SHIP-44 supplies the idempotency middleware's
+			// scope, so a key on this route lands in idem:v1:user:<id>:<key> rather than
+			// the anonymous namespace CLAUDE.md's hard gate names.
+			Method:  http.MethodPost,
+			Pattern: "/account/deletion",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return identityHandler(d).RequestAccountDeletion() },
+		},
 	)
 }
 

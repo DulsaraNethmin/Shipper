@@ -1501,3 +1501,160 @@ status="$(post_json "verify-throttle-cleared-$$" /v1/auth/login \
   "$WORKDIR/throttle-cleared.json")"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/throttle-cleared.json"; fail "sign-in is still refused after the address buckets were cleared ($status)"; }
 ok "the per-address buckets are cleared, so a later section is not throttled by this one ($cleared removed)"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-169  a signed-in person can request deletion and is told when it completes"
+
+# Deliberately after SHIP-47, and deliberately doing no *failed* sign-ins.
+#
+# The section above ends by emptying `rl:v1:signin:address:*`, because every request in this run
+# arrives from 127.0.0.1 and a later track that got a 429 would look like a broken endpoint rather
+# than like this file's leftovers. That clean-up has to stay the last thing the file does to those
+# keys. Nothing here spends from them — SHIP-47 charges the bucket on a *refused* credential only
+# (`Allow` on admission, `Spend` on failure), and every sign-in below uses the right password — and
+# the last check in this section proves that rather than asserting it.
+
+deletion_email="deletion-$$@example.com"
+status="$(post_json "verify-deletion-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Harness\",\"email\":\"$deletion_email\",\"phone\":\"04920$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
+  "$WORKDIR/deletion-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/deletion-register.json"; fail "could not register the deletion account ($status)"; }
+deletion_user="$(json "$WORKDIR/deletion-register.json" '["id"]')"
+
+status="$(post_json "verify-deletion-login-$$" /v1/auth/login \
+  "{\"email\":\"$deletion_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Deletion\"}" \
+  "$WORKDIR/deletion-login.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/deletion-login.json"; fail "could not sign the deletion account in ($status)"; }
+deletion_access="$(json "$WORKDIR/deletion-login.json" '["access_token"]')"
+
+# Unreachable without a credential, or the account being deleted would not have to be the
+# caller's own. The Idempotency-Key is sent because the middleware checks it further out than the
+# auth class is enforced — without one this would be a 400 about the key and prove nothing.
+status="$(curl -s -X POST -o "$WORKDIR/deletion-anon.json" -D "$WORKDIR/deletion-anon.headers" \
+  -w '%{http_code}' -H "Idempotency-Key: verify-deletion-anon-$$" \
+  "http://localhost:$VERIFY_PORT/v1/account/deletion")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/deletion-anon.json"; fail "deletion answered $status to a caller with no credential, want 401"; }
+grep -qi '^WWW-Authenticate: Bearer' "$WORKDIR/deletion-anon.headers" \
+  || fail "no WWW-Authenticate challenge on the 401"
+[[ "$(json "$WORKDIR/deletion-anon.json" '["error"]["code"]')" == "unauthenticated" ]] \
+  || fail "expected code=unauthenticated"
+ok "requesting deletion is unreachable without a credential"
+
+# It is a state change like every other, so it carries a key (SHIP-15).
+status="$(curl -s -X POST -o "$WORKDIR/deletion-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $deletion_access" \
+  "http://localhost:$VERIFY_PORT/v1/account/deletion")"
+[[ "$status" == "400" ]] || fail "requesting deletion without an Idempotency-Key returned $status"
+[[ "$(json "$WORKDIR/deletion-nokey.json" '["error"]["code"]')" == "idempotency_key_required" ]] \
+  || fail "expected code=idempotency_key_required"
+ok "requesting deletion needs an Idempotency-Key"
+
+# The criterion itself.
+status="$(post_auth "verify-deletion-first-$$" "$deletion_access" /v1/account/deletion \
+  "$WORKDIR/deletion-first.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/deletion-first.json"; fail "POST /v1/account/deletion returned $status, want 202"; }
+ok "a signed-in person can request deletion, answered 202 Accepted"
+
+deletion_id="$(json "$WORKDIR/deletion-first.json" '["id"]')"
+deletion_state="$(json "$WORKDIR/deletion-first.json" '["state"]')"
+deletion_requested="$(json "$WORKDIR/deletion-first.json" '["requested_at"]')"
+deletion_completes="$(json "$WORKDIR/deletion-first.json" '["completes_by"]')"
+
+[[ "$deletion_state" == "requested" && -n "$deletion_completes" ]] \
+  || fail "the response says state='$deletion_state' completes_by='$deletion_completes'"
+
+# Thirty days, which is the figure Docs/05 §3.1 commits to and the one the person is told.
+window_days="$(python3 - "$deletion_requested" "$deletion_completes" <<'PYTHON'
+import sys
+from datetime import datetime
+
+requested, completes = (datetime.fromisoformat(a.replace("Z", "+00:00")) for a in sys.argv[1:3])
+print((completes - requested).total_seconds() / 86400)
+PYTHON
+)"
+[[ "$window_days" == "30.0" ]] \
+  || fail "the completion date is $window_days days after the request, want the 30 Docs/05 §3.1 commits to"
+ok "and receives a completion date — $deletion_completes, thirty days out"
+
+# The row, not the answer. A completion date computed while rendering the response satisfies
+# everything above and writes nothing, so this is the check that separates a promise from a
+# plausible sentence.
+read -r stored_state stored_completes stored_window <<<"$("$PSQL" "$DATABASE_URL" -tAc \
+  "select state,
+          to_char(complete_by at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+          (extract(epoch from (complete_by - requested_at)) / 86400)::int
+     from account_deletion_requests where id = '$deletion_id';" | tr '|' ' ')"
+[[ "$stored_state" == "requested" ]] || fail "the stored state is '$stored_state', want requested"
+[[ "$stored_completes" == "$deletion_completes" ]] \
+  || fail "the row holds $stored_completes and the person was told $deletion_completes"
+[[ "$stored_window" == "30" ]] \
+  || fail "the stored window is $stored_window days, want 30"
+ok "the date is recorded in the row, and it is the same date the person was told"
+
+# A retry of the same request — the dropped-connection case the middleware exists for.
+status="$(post_auth "verify-deletion-first-$$" "$deletion_access" /v1/account/deletion \
+  "$WORKDIR/deletion-replay.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/deletion-replay.json"; fail "the replay returned $status, want the stored 202"; }
+cmp -s "$WORKDIR/deletion-first.json" "$WORKDIR/deletion-replay.json" \
+  || fail "the replay is not the stored response (a success body carries no request_id, so these are comparable byte for byte)"
+ok "a retry on the same key replays the original response, byte for byte"
+
+# A second, honest request — a different key, so nothing is replayed and the handler runs again.
+# This is where a recomputed completion date shows itself: the two calls are seconds apart, and a
+# date derived from now() differs between them in the milliseconds.
+status="$(post_auth "verify-deletion-second-$$" "$deletion_access" /v1/account/deletion \
+  "$WORKDIR/deletion-second.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/deletion-second.json"; fail "asking again returned $status, want 200 — a repeat is not an error and is not a second request"; }
+[[ "$(json "$WORKDIR/deletion-second.json" '["id"]')" == "$deletion_id" ]] \
+  || fail "asking again named a different request"
+[[ "$(json "$WORKDIR/deletion-second.json" '["completes_by"]')" == "$deletion_completes" ]] \
+  || fail "the completion date moved between two requests; it is being computed at read time rather than read from the row"
+ok "asking again answers 200 with the same request and the same date, unmoved"
+
+# Two rows would be two promises about one account, and whichever the execution read would be the
+# one that counted. The count is what separates one request answered twice from two requests.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from account_deletion_requests where user_id = '$deletion_user';")" == "1" ]] \
+  || fail "the account holds more than one deletion request after asking twice"
+ok "one row after two requests and a replay — uq_account_deletion_requests_open holds"
+
+# Another account's request is its own, on both sides.
+deletion_other_email="deletion-two-$$@example.com"
+status="$(post_json "verify-deletion-other-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Harness\",\"email\":\"$deletion_other_email\",\"phone\":\"04921$$\",\"password\":\"$login_password\",\"role\":\"provider\"}" \
+  "$WORKDIR/deletion-other-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/deletion-other-register.json"; fail "could not register the second deletion account ($status)"; }
+deletion_other_user="$(json "$WORKDIR/deletion-other-register.json" '["id"]')"
+
+status="$(post_json "verify-deletion-other-login-$$" /v1/auth/login \
+  "{\"email\":\"$deletion_other_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Deletion Two\"}" \
+  "$WORKDIR/deletion-other-login.json")"
+[[ "$status" == "200" ]] || fail "could not sign the second deletion account in ($status)"
+
+status="$(post_auth "verify-deletion-other-$$" "$(json "$WORKDIR/deletion-other-login.json" '["access_token"]')" \
+  /v1/account/deletion "$WORKDIR/deletion-other.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/deletion-other.json"; fail "the second account could not request deletion ($status)"; }
+[[ "$(json "$WORKDIR/deletion-other.json" '["id"]')" != "$deletion_id" ]] \
+  || fail "the second account was handed the first account's deletion request"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from account_deletion_requests where user_id = '$deletion_other_user';")" == "1" ]] \
+  || fail "the second account does not hold exactly one request of its own"
+ok "another account's request is its own, and neither account can see the other's"
+
+# The scope boundary, stated as a check rather than as a comment. SHIP-170 defers a request made
+# during an active job and SHIP-171 executes one; both add a state, and neither exists yet. If a
+# later branch widens the constraint, this line is what makes that a decision somebody took.
+deletion_states="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'ck_account_deletion_requests_state';" \
+  | grep -oE "'[a-z_]+'::text" | tr -d "'" | sed 's/::text//' | sort | tr '\n' ',' | sed 's/,$//')"
+[[ "$deletion_states" == "requested" ]] \
+  || fail "the deletion states are '$deletion_states', want only 'requested' — SHIP-170 and SHIP-171 are not built"
+ok "'requested' is the only state — the deferral is SHIP-170's and the execution SHIP-171's"
+
+# Nothing here charged a sign-in bucket, so SHIP-47's clean-up above is still the last word on
+# them. Asserted rather than assumed: the whole file's rate-limit hygiene depends on it, and a
+# later track's 429 would read as its own endpoint being broken.
+[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | wc -l | tr -d ' ')" == "0" ]] \
+  || fail "this section left per-address sign-in buckets behind, which a later track would be throttled by"
+ok "no per-address sign-in bucket was spent here, so SHIP-47's clean-up still holds at the end of the file"

@@ -704,3 +704,79 @@ func TestRefreshRefusesAnUnknownField(t *testing.T) {
 		t.Errorf("code = %q, want %q", got, httpx.CodeBadRequest)
 	}
 }
+
+// TestAccountDeletionRefusesACallerWithNoCredential (SHIP-169).
+//
+// The first route this domain serves outside /v1/auth, and the property that has to hold before
+// anything else about it matters: asking for an account to be deleted is unreachable without a
+// credential, so the account being deleted is always the caller's own. The Idempotency-Key is sent
+// deliberately — the middleware checks it further out than the auth class is enforced, so a request
+// missing both is refused for the key and never reaches the guard.
+func TestAccountDeletionRefusesACallerWithNoCredential(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/account/deletion", nil)
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("POST /v1/account/deletion is not served")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Error("no WWW-Authenticate challenge on a 401, which RFC 9110 requires")
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnauthenticated) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeUnauthenticated)
+	}
+}
+
+// TestAccountDeletionRequiresAnIdempotencyKey.
+//
+// A deletion request is a state change and carries a key like every other one. What the key buys
+// here is narrower than usual and worth naming: the database already refuses a second open request
+// (uq_account_deletion_requests_open), so a retry cannot produce two rows either way — the key is
+// what makes the *answer* to a retry the same bytes as the answer to the original, rather than the
+// 200-instead-of-202 a re-execution would produce.
+func TestAccountDeletionRequiresAnIdempotencyKey(t *testing.T) {
+	token, _, _ := testAccessToken(t, identity.RoleCustomer)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/account/deletion", nil)
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	identityRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeIdempotencyKeyRequired) {
+		t.Errorf("code = %q, want %q", got, httpx.CodeIdempotencyKeyRequired)
+	}
+}
+
+// TestAccountDeletionWithACredentialButNoDatabaseIsUnavailable. The credential got the caller past
+// the guard, which is the half this proves: a 401 here would mean the route is unreachable rather
+// than that the database is away.
+func TestAccountDeletionWithACredentialButNoDatabaseIsUnavailable(t *testing.T) {
+	deps := testDeps()
+	deps.Pool = nil
+
+	token, _, _ := testAccessToken(t, identity.RoleCustomer)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/account/deletion", nil)
+	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
+	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
+	}
+	if got := errorCode(t, rec); got != string(httpx.CodeUnavailable) {
+		t.Errorf("code = %q, want %q — 500 tells the client to give up", got, httpx.CodeUnavailable)
+	}
+}
