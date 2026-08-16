@@ -17018,6 +17018,100 @@ bless a loss. **Sorting is checkable and the ordering is known** — by path, co
 so this is a small guard nobody has written. Recorded rather than taken: `cmd/api` is a shared
 surface and this pass may not edit it.
 
+---
+
+**The five below were surfaced by wave 13's lanes and none of them is owned by a ticket.** Three came
+out of an assigned mutation, which is what mutations are for. **Where a claim is about a file this
+branch cannot see, it says so** — a lane's branch is not merged here, and restating an unread
+measurement as though it had been taken is the failure this file spends most of its words on.
+
+**Four administrative actions write their audit entry on the transaction by convention, and nothing
+in the repository would notice if one stopped.** Lane A's assigned mutation — moving `Auditor.Record`
+off the decision's transaction and onto its own connection — **survived** `internal/admin`,
+`cmd/api`, `internal/profiles`, `migrations` and all sixteen verify sections. A closed it for its own
+action with a test that pins a `MaxConns = 1` pool, so a second connection deadlocks rather than
+succeeding quietly. Measured here on `4fd7fd5`: `Auditor.Record` is called with a transaction at
+exactly **five** sites — `enforcement.go:240` (`Unpublish`), `:338` (`SetStanding`), `notes.go:248`
+(`Notes.Add`), and `suspension.go:248` and `:338` (`Suspensions.Request` and `.Approve`) — **and the
+only `MaxConns` in any test in this repository is `internal/bidding/race_test.go:524`**, which is
+SHIP-95's race harness and has nothing to do with audit. So all five are correct today and not one of
+them is held to it. **One test each, on Lane A's pattern.**
+
+**Why the tests that look like they cover it do not, which is the reusable half.**
+`TestAPrivilegedActionIsRefusedWhenItsAuditEntryCannotBeWritten` builds an `Enforcement` with
+`auditor: nil` and asserts the job stays `Open` — but **a nil auditor fails whichever runner it is
+handed**, so what it proves is that the error is *checked* and the transaction rolls back, not that
+the write was *in* the transaction. `TestAMutationThatFailsLeavesNoAuditEntry` refuses at the
+permission check, before anything is written at all. **"The error is checked" and "the write is on
+this connection" are different properties, and only the second needs a pool that cannot lend a second
+connection.** That generalises past audit to every "X and Y commit together or neither happens" claim
+in this repository. **§3's SHIP-150 entry already records the neighbouring half of it and the two
+belong together**: a mutation swallowing `Auditor.Record`'s error survived a test that made the
+INSERT fail with a **trigger**, because PostgreSQL aborts the whole transaction as soon as a
+statement raises, so the error reaches the caller whether or not the code checks it. That entry
+distinguishes *the rollback* from *the check*. This one adds the third property neither test holds —
+**which connection the write went out on** — and it is the only one of the three a `MaxConns = 1`
+pool can see.
+
+**The budget-privacy guard has been one channel behind for four consecutive waves, and the sequence
+is the finding rather than any rung of it.** Wave 10: a closed key set over the provider-facing models
+missed a **sentence** — no field, no value, no digit. Wave 11: a word search missed the same sentence.
+Wave 13: a twelve-phrase ban-list over rendered text missed a **synonym**, *"The customer cannot go
+higher than this."*, which passed 1030 tests. Wave 13 again: a closed-world assertion over rendered
+`Text` and `EditableText` missed a **`Semantics` label** carrying that identical sentence, which
+passed all 22 tests and which VoiceOver and TalkBack read aloud to the provider. **Measured here:
+`grep -rlE 'SemanticsNode|semanticsLabel|Semantics\('` over `apps/mobile/test/` returns nothing — no
+test in this repository reads a semantics label.**
+
+**The recommendation is not a fifth patch.** Each wave has closed the instance in front of it and left
+the shape untouched: **a ban-list is open-world and cannot be completed, and a closed-world guard is
+only ever as wide as its collector.** What nobody has done is **enumerate the channels by which a
+string can reach a provider** — rendered text, a semantics label, a tooltip, a hint, a `SnackBar`, a
+route argument, an error body, a push notification, an analytics event — and hold the collector to
+that list rather than to whatever the current screen happens to render. A lane extending its own
+collector to a third surface covers its own screen; **every other provider-facing screen stays as wide
+as the collector written for it.** This wants an owner and a decision about scope rather than another
+ticket-sized patch, and it is the one item in this section that touches a `CLAUDE.md` invariant.
+
+**A rendered banner interpolates the platform's own free text, and no closed key set can cover
+prose.** Measured here: `ApiErrorResponse.userMessage` returns `message` — the error contract's
+human-readable string, written by the platform — and it is interpolated straight into rendered
+widgets at `features/bidding/compare_offers_screen.dart:797` and `:829` (the customer's comparison
+screen and its stale-read banner) and at `features/bidding/place_bid_panel.dart:402`, **which is
+provider-facing**. Lane B reports the same shape on the negotiation screen it is building; that file
+is on its branch and is not readable from here, so it is recorded as reported rather than as
+measured. **B left its own fixture fail-closed rather than admitting a shape for it** — no fixture in
+that group renders one, so a test that does will fail until somebody decides what such a message may
+say in front of a provider. **That is the right call and it is not a screen's decision to make**: it
+is the same undecided thing as the channel enumeration above, arriving from the platform's end
+instead of the client's.
+
+**The mutation-revert recipe has a second route to a silent `git diff`, and it does not name it.**
+`CLAUDE.md` step 4 explains that after a destructive `git checkout` the file matches the index, so
+`git diff` reports nothing and the silence is the signature of the failure. **The second route: when
+the mutated file is new on the branch it is untracked, so `git diff` reports nothing whether it was
+restored or not.** Found by Lane B. Same silence, different cause, and **in that case the checksum is
+not corroboration but the entire proof** — which is the argument for the `SHASUMS` file being
+mandatory rather than good practice.
+
+**A third failure of the same family belongs beside it: a mutation that silently does not apply.**
+`perl -0pi -e` with `\Q…\E` still interpolates `$1`, so a substitution matched nothing, the file was
+unchanged, and the suite came back green — **a false survival that would have been reported as a
+finding** had the file not been printed afterwards. **The rule that follows covers all three:
+checksum or print the file *after mutating*, not only after restoring.** A mutation carries two
+assertions — that it applied, and that something died — and this repository has only ever written
+down the second.
+
+**`make verify` cannot see a client-only ticket's defect, and that is a whole ticket class.** Found by
+Lane C on SHIP-131a: the harness drives the platform with `curl`, and for that ticket the platform was
+never broken — the field it adds is already accepted, bounded and served. **The new verify section
+passes with the driver portal mutated to drop the field entirely.** The only instruments that can fail
+are `web-test` and `flutter-test`. Worth stating plainly, because `make verify` is this repository's
+strongest instrument and several waves of write-ups treat a green harness as the verdict: **for a
+ticket whose change lives entirely in a client, a green `make verify` is not evidence of anything.**
+Nothing is wrong with the harness and there is nothing in it to fix; what is missing is the sentence
+in a dispatch naming which gate is load-bearing for which ticket.
+
 ## 10. The done list, in a form a script can read
 
 **The list is `Docs/11-done.txt`**, one ticket per line. It is still authoritative and it is
