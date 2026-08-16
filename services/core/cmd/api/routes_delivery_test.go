@@ -170,6 +170,103 @@ func TestTheDriverMilestoneRouteIsRefusedWithoutAnIdempotencyKey(t *testing.T) {
 	}
 }
 
+// --- SHIP-121a: the driver reads the milestones on their own delivery -----------------------------
+
+// listMilestones gets one milestone page, with whatever credential the caller names.
+//
+// A reader beside [recordMilestone] rather than a method on it: the write carries a body and an
+// idempotency key and the read carries neither, and a helper taking both and using half would
+// invite a GET to be asserted with a key it never sends.
+func listMilestones(router http.Handler, path, credential string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if credential != "" {
+		req.Header.Set(httpx.HeaderAuthorization, "Bearer "+credential)
+	}
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// partyMilestonePath is the parties' shelf, which SHIP-121a must leave closed to a driver.
+func partyMilestoneURL(job uuid.UUID) string {
+	return "/v1/jobs/" + job.String() + "/delivery/milestones"
+}
+
+// TestNeitherTokenSystemListsMilestonesOnTheOthersRoute is SHIP-121a's second and third clauses,
+// asked of the running router rather than of the source.
+//
+// The domain's own tests mount the read behind the real guard and prove what it answers for a job
+// the link does not name. What they cannot reach is the direction that matters most here: **a
+// driver's link on the parties' shelf**, `GET /v1/jobs/{id}/delivery/milestones`, which is
+// `RequireUser` and carries `recipient_name` and `delivery_note` on a delivered milestone. Adding a
+// driver read next to it is exactly the change that would tempt someone to widen that class, and
+// this is what would fail if they did.
+//
+// Both directions, because only one is the obvious one — the same bargain
+// [TestNeitherTokenSystemRecordsAMilestoneOnTheOthersRoute] strikes for the write.
+func TestNeitherTokenSystemListsMilestonesOnTheOthersRoute(t *testing.T) {
+	router := testRouter()
+	jobID := uuid.New()
+
+	access, _, _ := testAccessToken(t, identity.RoleProvider)
+	link := testDriverLink(t, jobID)
+
+	for name, tc := range map[string]struct {
+		path       string
+		credential string
+	}{
+		"a mobile session on the driver's milestone read": {
+			path: driverMilestoneURL(jobID), credential: access,
+		},
+		"a driver link on the parties' milestone shelf": {
+			path: partyMilestoneURL(jobID), credential: link,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := listMilestones(router, tc.path, tc.credential)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401 — one token system was accepted by the "+
+					"other (Docs/10 §5, CLAUDE.md)\n  body: %s", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+// TestTheDriverMilestoneReadIsServedOnTheDriversOwnLink is the assertion the refusals above are
+// worth nothing without.
+//
+// A route that refused every credential would pass every row of
+// [TestNeitherTokenSystemListsMilestonesOnTheOthersRoute]. This is what tells a scoped route apart
+// from a closed one: the link's own job gets *past* the guard and reaches a handler, which answers
+// 503 because testDeps carries no pool. Reaching a database is the signal; what it then says is the
+// domain package's half.
+func TestTheDriverMilestoneReadIsServedOnTheDriversOwnLink(t *testing.T) {
+	jobID := uuid.New()
+	rec := listMilestones(testRouter(), driverMilestoneURL(jobID), testDriverLink(t, jobID))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("the link's own job answered %d, want 503 from a handler with no database "+
+			"— anything else means the guard did not let it through (%s)", rec.Code, rec.Body)
+	}
+}
+
+// TestTheDriverMilestoneReadCarriesNoIdempotencyKey records that a GET is outside SHIP-15's rule.
+//
+// The write beside it is refused without a key ([TestTheDriverMilestoneRouteIsRefusedWithoutAnIdempotencyKey]).
+// The read must not be: the invariant is about state-changing requests, and a middleware that
+// started demanding keys on safe methods would break every client for no gain. Asserted because the
+// two routes share a path and a class and differ only by method, which is the shape a later change
+// is most likely to flatten.
+func TestTheDriverMilestoneReadCarriesNoIdempotencyKey(t *testing.T) {
+	rec := listMilestones(testRouter(), driverMilestoneURL(uuid.New()), "")
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 — an unauthenticated GET must reach the guard, not be "+
+			"turned back for a missing idempotency key (%s)", rec.Code, rec.Body)
+	}
+}
+
 // TestEveryDriverTokenRouteNamesItsJobInThePath is the check that has no other home.
 //
 // delivery.RequireDriverToken reads `{id}` and compares it with the job inside the token, and

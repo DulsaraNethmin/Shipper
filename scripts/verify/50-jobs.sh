@@ -1230,21 +1230,37 @@ diff -q "$WORKDIR/jobs-history-owner.json" "$WORKDIR/jobs-history-provider.json"
   || fail "the two parties see different histories; SHIP-65a serves both the same rows"
 ok "both parties read the same rows — there is no per-reader field, so there is none to get wrong"
 
-# The disclosure rule, and it is stronger than "both are 404". A body that differs at all — a
-# different message, a different code, a different length — tells a stranger holding an identifier
-# that somebody else's job exists.
+# The disclosure rule, and it is stronger than "both are 404". A body that differs in what it *says*
+# — a different message, a different code — tells a stranger holding an identifier that somebody
+# else's job exists.
+#
+# The comparison is over `(code, message)` and deliberately not `diff` over the whole body, which is
+# the shape every other refusal check in this file already uses. `Docs/10` §4.6 puts the request id
+# **inside** the error object, so two refusals are never byte-identical and never can be: the field
+# is unique per request by design. A `diff` here fails on a service that is behaving perfectly, and
+# says "distinguishable" about the one field a stranger learns nothing from.
+jobs_same_refusal() {
+  python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$1" "$2"
+}
+
 missing_job="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 absent_status="$(jobs_get "$jobs_customer_token" "/v1/jobs/$missing_job/history" history-absent)"
 [[ "$absent_status" == "404" ]] || { cat "$WORKDIR/jobs-history-absent.json"; fail "a job that does not exist returned $absent_status, want 404"; }
 
 status="$(jobs_get "$jobs_other_token" "$history_path" history-stranger)"
 [[ "$status" == "$absent_status" ]] || { cat "$WORKDIR/jobs-history-stranger.json"; fail "another customer got $status and a missing job gets $absent_status"; }
-diff -q "$WORKDIR/jobs-history-stranger.json" "$WORKDIR/jobs-history-absent.json" >/dev/null \
+jobs_same_refusal "$WORKDIR/jobs-history-stranger.json" "$WORKDIR/jobs-history-absent.json" \
   || { printf '  stranger: '; cat "$WORKDIR/jobs-history-stranger.json"; printf '\n  missing:  '; cat "$WORKDIR/jobs-history-absent.json"; \
        fail "a stranger's refusal is distinguishable from a job that does not exist"; }
-diff -q "$WORKDIR/jobs-history-nobid.json" "$WORKDIR/jobs-history-absent.json" >/dev/null \
+jobs_same_refusal "$WORKDIR/jobs-history-nobid.json" "$WORKDIR/jobs-history-absent.json" \
   || fail "a provider who has not bid gets a refusal distinguishable from a job that does not exist"
-ok "anybody else gets exactly what a missing job gets, byte for byte — a 403 would confirm the job exists"
+unset -f jobs_same_refusal
+ok "anybody else gets exactly what a missing job gets — same code, same message; a 403 would confirm the job exists"
 
 # The budget, on the response a **provider** was served, and checked in four ways because three of
 # them are individually defeatable. Waves 10 and 11 each isolated a sentence carrying no field, no

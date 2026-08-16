@@ -420,7 +420,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **802 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **856 checks across 15 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -639,6 +639,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
 | **SHIP-65a** | M2 | `GET /v1/jobs/{id}/history` — **the first four-segment `GET /v1/jobs/{id}/<literal>` the service has ever served**, and the endpoint SHIP-83a existed to make registrable. It supplies the endpoint that has kept SHIP-77 in §4 longer than any other ticket — `job_status_history` has recorded the actor, the reason and both clocks since SHIP-57a and nothing exposed it — **without closing that row, which now needs the screen to render what exists**. Two parties — the owning customer, and **a provider holding a bid at any status**, decided from rows rather than from a role claim — and everybody else gets a refusal proved **byte-identical** to a missing job. The actor is served as its *kind* and never as an identifier. The budget guard is **word-level over rendered output**, because `reason` is free text a provider reads — *see below* |
+| **SHIP-121a** | M4 | `GET /v1/driver/jobs/{id}/milestones` — **the fourth route on the driver's surface and the first read it has that pages**, so the portal's controls survive a reload instead of starting at rest on every page view. The response is a **type of its own rather than a redaction step**: `DriverMilestone` is `Milestone` without `recipient_name` and `delivery_note`, which are a third party's details on a credential that is a forwardable seven-day link naming no account. `Service.MilestonesForDriver` **takes the grant and no job identifier**, so a handler cannot widen the scope by passing the wrong job — wave 7's surviving mutation was exactly that shape. Both refusals are recorded against the running binary, and the one that matters is a driver link on the parties' shelf — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13209,6 +13210,84 @@ bounded by the lifecycle at under a dozen rows, the way `/v1/jobs/{id}/delivery/
 there being at most one photograph per milestone. `delivery`'s milestone list is the contrast worth
 keeping in view: 000601 deliberately has no uniqueness on `(job_id, milestone)`, so a repeat is
 legitimate there and that collection has no bound to stand on.
+
+### SHIP-121a — the driver's first paging read, and a shape that withholds by construction
+
+`GET /v1/driver/jobs/{id}/milestones` serves every milestone recorded on the delivery a driver's
+link opens, newest first by the actor's clock, in the same envelope and on the same cursor as
+`GET /v1/jobs/{id}/delivery/milestones`. The domain is `delivery.Service.MilestonesForDriver`
+(`internal/delivery/read.go`), the handler is `Handler.DriverMilestones`, the route is one entry in
+`cmd/api/routes_delivery.go`, and the contract fragment is `DriverMilestone` with
+`DriverMilestonePage` beside it.
+
+**Until this existed the driver surface had no milestone read at all.** It was three routes — one
+read and two writes — so a portal reopened from a link had no way to know what it had already
+recorded, and started every control at rest. Nothing was lost by that, which is why `Docs/09` makes
+this two points and a usability row rather than a correctness one: recording a milestone twice is
+safe (`Docs/02` §5) and a repeat is an ordinary recording. What a driver could not do is *tell*.
+
+#### The response is a second type, not the first with a field blanked
+
+`driverMilestoneResponse` is `milestoneResponse` without `recipient_name` and `delivery_note`. That
+is deliberately a separate struct rather than a shared one with a redaction step, which is the same
+call `jobs` made about the budget and for the same reason: **a shape that is safe only because a
+handler remembers to blank a field is safe until the day somebody renders the struct.**
+
+The two fields are a third party's details, recorded on a delivered milestone by whoever recorded it
+— which may be the provider rather than this driver. The credential here is a link: forwardable,
+valid for seven days, naming no account, held by whoever the provider sent it to. `Docs/01` §4 asks
+the platform to minimise exposure of personal data, and those two fields are the only things on a
+milestone that could breach it. **The driver's surface is narrow and the narrowness is the security
+property.**
+
+The guard is asserted as a **closed key set** in both the Go test and the verify section, rather than
+as a search for the two names — SHIP-83's argument, which is that a search for `recipient_name`
+catches `recipient_name` and misses `recipient` or `signed_by`. A field added to the driver's shape
+has to be added to the assertion too, which is the point of writing it that way.
+
+**Both halves of the disclosure claim are checked, and the second is what stops the first being
+vacuous.** `scripts/verify/70-delivery.sh` establishes from the row that the delivered milestone
+*holds* both fields, then that the driver's list omits them, then that the customer's shelf still
+serves them. Without the third the check would pass equally well against a platform that had stopped
+recording the fields altogether — an omission rather than a withholding.
+
+#### The handler takes the grant and no job identifier
+
+`Service.MilestonesForDriver(ctx, r, grant, page)` takes a `DriverGrant` and no `uuid.UUID`, exactly
+as `AssignmentFor`, `RecordDriverMilestone`, `PresignDriverProofUpload`, `VerifyDriverProof` and
+`DeliveryFinishedFor` do. A `DriverGrant` is produced by `DriverTokenVerifier.Verify` and by nothing
+else, and the middleware that produces one has already compared the job in the path with the job
+inside the token. **A handler therefore cannot widen the scope by passing the wrong job, because it
+has none to pass** — and wave 7's surviving mutation was exactly that shape, a driver surface that
+derived the job it acted on from its own credential and survived a full suite while rendering
+another job's delivery with a 200. `TestTheDriverMilestoneReadTakesNoJobIdentifier` holds the
+signature with the compiler rather than with a comment.
+
+The assignment is checked before anything is read, and that check is not the token's. A token is
+stateless and cannot be recalled, so it keeps verifying after the assignment behind it has ended or
+its link has been reissued; `AssignmentFor` is what knows. `TestASupersededLinkListsNothing` records
+it — a reissued link opens the delivery and the link it replaced answers 404.
+
+#### Neither credential opens the other's read, and the direction that matters is the second one
+
+A mobile access token is refused here, and a driver's link is still refused on
+`GET /v1/jobs/{id}/delivery/milestones`. The manifest allows one auth class per method, so those are
+structural — but the pair is asserted anyway, in `cmd/api/routes_delivery_test.go` against the real
+middleware chain, because the property is about the running router rather than about the
+declaration. **The second direction is the one worth the test**: the parties' shelf is `RequireUser`
+and is where `recipient_name` and `delivery_note` live, and adding a driver read beside it is exactly
+the change that would tempt somebody to widen that class.
+
+`TestTheDriverMilestoneReadIsServedOnTheDriversOwnLink` is what keeps those refusals meaningful — a
+route that refused every credential would pass both rows. The link's own job reaches a handler and
+answers 503 because `testDeps` carries no pool, and *reaching* one is the signal.
+
+#### No idempotency key, recorded rather than assumed
+
+A GET changes nothing and SHIP-15's middleware lets safe methods through untouched. The write beside
+it is refused without a key; the read must not be, and the two routes share a path and a class and
+differ only by method — which is the shape a later change is most likely to flatten. It is asserted
+for that reason alone.
 
 ## 4. Partly done — do not treat these as finished
 

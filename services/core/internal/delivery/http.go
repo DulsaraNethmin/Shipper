@@ -1757,6 +1757,136 @@ func (h *Handler) MilestonesOnJob() http.Handler {
 	})
 }
 
+// driverMilestoneResponse is one milestone as the driver who is carrying the delivery sees it
+// (SHIP-121a).
+//
+// # A type of its own, and the two fields it does not have are the point
+//
+// It is [milestoneResponse] without `recipient_name` and `delivery_note`. A second type rather than
+// the first with a redaction step somebody has to remember, which is the same call `jobs` made about
+// the budget and for the same reason: a shape that is safe only because a handler blanks a field is
+// safe until the day somebody renders the struct.
+//
+// **The driver's surface is narrow and its narrowness is the security property.** The credential is
+// a link: forwardable, valid for seven days, naming no account, and held by whoever the provider
+// sent it to. `Docs/01` §4 asks the platform to minimise exposure of personal data, and a
+// recipient's name is a *third party's* — recorded on a delivered milestone by whoever recorded it,
+// which may be the provider rather than this driver. SHIP-121a's *Done when* asks that this response
+// disclose nothing the driver's own job view does not already carry, and those two fields are the
+// only things on a milestone that could.
+//
+// **What is here is what the portal reloads with.** `Docs/07` §3 puts every authorisation decision
+// on the platform and lets the app hide or disable; a portal that has forgotten which milestones it
+// recorded cannot even do the hiding. That is the whole of SHIP-121a: the controls start at rest on
+// every page view today, and a driver who taps a milestone twice is doing something safe
+// (`Docs/02` §5) but is not being told anything.
+//
+// `reason` is the driver's own note where they wrote one (SHIP-131a), and the actor's word for what
+// the milestone does not say by itself.
+type driverMilestoneResponse struct {
+	ID    string `json:"id"`
+	JobID string `json:"job_id"`
+
+	Milestone string `json:"milestone"`
+
+	// RecordedBy is `driver` or `provider` — the kind of actor and not who they are, exactly as
+	// [milestoneResponse.RecordedBy] is. It is what tells the portal "you recorded this" from
+	// "your provider did", which is the difference a reloaded page most needs.
+	RecordedBy string `json:"recorded_by"`
+
+	Reason string `json:"reason,omitempty"`
+
+	RecordedAt string `json:"recorded_at"`
+	AcceptedAt string `json:"accepted_at"`
+}
+
+func driverMilestoneFrom(rec Record) driverMilestoneResponse {
+	return driverMilestoneResponse{
+		ID:    rec.ID.String(),
+		JobID: rec.JobID.String(),
+
+		Milestone:  rec.Milestone.Wire(),
+		RecordedBy: string(rec.Actor),
+		Reason:     rec.Reason,
+
+		RecordedAt: timestamp(rec.ActorRecordedAt),
+		AcceptedAt: timestamp(rec.ServerRecordedAt),
+	}
+}
+
+// DriverMilestones handles GET /v1/driver/jobs/{id}/milestones (SHIP-121a).
+//
+// # The fourth route on the driver's surface, and the first read it has that pages
+//
+// Until this existed the driver surface was three routes — one read and two writes — and **no
+// milestone read at all**. So the portal's controls started at rest on every page view and a reload
+// forgot what the last one did. It costs a driver nothing they cannot recover from, which is why
+// `Docs/09` makes this two points and a usability row rather than a correctness one; it is still the
+// difference between a page that knows what it did and one that does not.
+//
+// # The handler never reads the path, and that is the mechanism rather than an omission
+//
+// The job comes from the grant, which the guard has already compared with `{id}`. There is no call
+// to [jobIDFrom] here and there must not be — [Handler.DriverJob] gives the argument in full, and
+// [Service.MilestonesForDriver] takes no job identifier at all so that a handler could not pass a
+// wrong one if it tried.
+//
+// # No idempotency key
+//
+// A GET changes nothing and the middleware lets safe methods through untouched. The scope question
+// that [Handler.RecordDriverMilestone] had to settle — a driver token produces no `authctx.Subject`,
+// so a key lands in `idem:v1:anonymous:<key>` — does not arise for a read.
+//
+// The same collection envelope and the same cursor as `GET /v1/jobs/{id}/delivery/milestones`, so a
+// client that has implemented one has implemented both.
+func (h *Handler) DriverMilestones() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, ok := driverGrantFrom(r.Context())
+		if !ok {
+			// The same call [Handler.DriverJob] makes: the route declares RequireDriverToken,
+			// so reaching here with no grant means it was declared with the wrong class — a
+			// wiring defect the caller can do nothing about.
+			return httpx.NewError(http.StatusInternalServerError, httpx.CodeInternal,
+				"Something went wrong at our end.").WithCause(errors.New(
+				"delivery: a driver route was reached with no verified grant on the context; " +
+					"its Auth class is not RequireDriverToken"))
+		}
+
+		limit, err := pagination.Limit(r.URL.Query().Get("limit"))
+		if err != nil {
+			return err
+		}
+		after, err := decodeMilestoneCursor(r.URL.Query().Get("cursor"))
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		records, hasMore, err := h.svc.MilestonesForDriver(r.Context(), pool, grant,
+			MilestonePage{After: after, Limit: limit})
+		if err != nil {
+			return apiError(err)
+		}
+
+		page := make([]driverMilestoneResponse, 0, len(records))
+		for _, rec := range records {
+			page = append(page, driverMilestoneFrom(rec))
+		}
+
+		var next string
+		if hasMore && len(records) > 0 {
+			next = encodeMilestoneCursor(records[len(records)-1])
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(page, next))
+		return nil
+	})
+}
+
 // --- reissuing a driver's link (SHIP-109) -------------------------------------------------------
 
 // driverLinkResponse is a freshly issued link, and the record of how many this assignment has had.

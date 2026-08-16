@@ -265,6 +265,39 @@ func init() {
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordDriverMilestone() },
 		},
 		Route{
+			Method:  http.MethodGet,
+			Pattern: "/driver/jobs/{id}/milestones",
+			Group:   GroupV1,
+
+			// **The fourth route on the driver's surface** (SHIP-121a), and the first read
+			// it has that pages. Until it existed the surface was three routes — one read
+			// and two writes — and no milestone read at all, so the portal's controls
+			// started at rest on every page view and a reload forgot what the last one did.
+			//
+			// # Two refusals are the *Done when* as much as the read is
+			//
+			// A mobile access token does not open this, and the driver's link still does
+			// not open `GET /jobs/{id}/delivery/milestones`. The manifest allows one auth
+			// class per method, so those are structural rather than checks somebody
+			// remembered — but the pair is asserted in routes_delivery_test.go anyway,
+			// because the property is about the running router rather than about the
+			// declaration, and wave 7 recorded a driver surface that passed a full suite
+			// while serving another job's delivery.
+			//
+			// # It shares a path prefix with the POST above and is not the same route
+			//
+			// `GET` and `POST /driver/jobs/{id}/milestones` are two entries in the manifest
+			// and one line in contracts/openapi.yaml — a `$ref` is per path, not per
+			// method. The read is the write's counterpart and deliberately not its mirror:
+			// the write's response is one milestone, this is a page of them, and the shapes
+			// differ by two fields for the reason
+			// [delivery.driverMilestoneResponse] gives.
+			//
+			// No idempotency scope question arises, because a GET carries no key.
+			Auth:    RequireDriverToken,
+			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DriverMilestones() },
+		},
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/driver/jobs/{id}/proof-uploads",
 			Group:   GroupV1,
