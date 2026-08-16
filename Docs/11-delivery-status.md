@@ -708,7 +708,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-147a** | M6 | The platform's password cost, under its own name. `Config.Identity.Argon2` and `IDENTITY_ARGON2_*` became `Config.Passwords.Argon2` and `PASSWORDS_ARGON2_*` — one setting, read by identity's hasher, by admin's, and by identity's phone one-time codes. **Declined in three consecutive prep passes and it cost nothing to take**: five files. "No second knob" is a **guard rather than a claim** — a reflective walk of the `Config` tree and a source scan of `cmd/api` — and the release note naming the rename is in `deploy/.env.example` beside the variables, because no release-notes artefact exists to put it in — *see below* |
 | **SHIP-78a** | M3 | Every one of `internal/fleet`'s eight service methods refuses a caller who is not a provider, with the sentinel `Add` and `Declare` already returned. **Docs/11 §9's oldest ownerless finding**, open since wave 5, and it was never a disclosure — each of the six that did not check scopes to the caller's own identifier, so a customer got an empty list or a 404 and never another provider's vehicle. What it was is a surface declining to *refuse*. `Service.Profile` reversed its own recorded position to take it — *see below* |
 | **SHIP-81a** | M3 | `Docs/04` §4's five outcomes exist as a record: `provider_verifications` and its append-only decision trail (`000200` — migration block 200–299's first table, owned by `internal/profiles`), `GET /v1/provider/verification`, and the eligibility predicate reading that record instead of its automated stand-in. **The guarded function is in the database rather than in Go** — `provider_verification_decide()` records the decision with its actor and reason, names it to a trigger through a transaction-local setting, then moves the state — so the domain, a `make verify` fixture and a psql prompt are the same caller; the jobs precedent puts the protocol in Go and this file already records what the hand-written copy of it cost. **Every provider has a row from registration and the existing ones are backfilled `Pending`**, which is the ticket rather than a detail: Pending is a state a provider is *in*, so SHIP-153 has somebody to list — and **every provider on the platform stops being eligible to bid** until somebody decides otherwise. `internal/fleet` imports nothing from `internal/profiles`; the seam is one `EXISTS` clause — *see below* |
-| **SHIP-103** | M3 | The negotiation screen — **one screen for two people**, over the four endpoints that each serve both sides and work out which from the credential. It reads the whole chain and the conversation, and writes a counter-offer and a message; `BidCounter` is a **difference rather than an offer**, so a counter on price alone leaves the timing on the table, and an empty `message` is sent rather than omitted because that is how conditions are cleared. A counter **re-reads the chain instead of patching it** — the response is the new head alone and the platform also superseded the row it answered — and the read count is what the test asserts, because a client that wrote both facts renders identically. **The budget guard is closed-world over rendered output** in the provider's view with the counter form open — every string must be recorded copy, a written-down value shape, or a party's own words, so a sentence nobody recorded fails whatever it says. A ban-list was tried first and **lost to a paraphrase**, which is the fourth wave running that a guard of that shape has lost What it does not build: revising and withdrawing your own offer, both still served and both still wanting a confirmation flow — *see below* |
+| **SHIP-103** | M3 | The negotiation screen — **one screen for two people**, over the four endpoints that each serve both sides and work out which from the credential. It reads the whole chain and the conversation, and writes a counter-offer and a message; `BidCounter` is a **difference rather than an offer**, so a counter on price alone leaves the timing on the table, and an empty `message` is sent rather than omitted because that is how conditions are cleared. A counter **re-reads the chain instead of patching it** — the response is the new head alone and the platform also superseded the row it answered — and the read count is what the test asserts, because a client that wrote both facts renders identically. **The budget guard is closed-world over three rendered surfaces** in the provider's view with the counter form open — `Text`, `EditableText` and the **semantics tree a screen reader is read from** — and every string on them must be recorded copy, a written-down value shape, or a party's own words, so a sentence nobody recorded fails whatever it says and wherever it is carried. A ban-list was tried first and **lost to a paraphrase**; a `Text`-only collector then **lost to a `semanticsLabel:`**, which leaves the visible screen byte-identical and changes only what is spoken. **No other client screen has a test that reads a semantics label at all** — measured, and carried to §9 What it does not build: revising and withdrawing your own offer, both still served and both still wanting a confirmation flow — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14211,21 +14211,86 @@ whose *shape* is written down and anchored at both ends, or one of the exact str
 parties typed. **Anything else fails, whatever it says.** Adding provider-visible copy is now a
 decision somebody recorded rather than something that happened.
 
-Three details make it hold rather than look like it holds. The recorded set is **hand-written and not
+Two details make it hold rather than look like it holds. The recorded set is **hand-written and not
 derived from the source**, because deriving it would admit whatever the source said — the exact
-property under guard. It covers **`EditableText` as well as `Text`**, because the counter form seeds
-the price and the conditions from the live offer and a populated, provider-visible box that no `Text`
-finder sees would otherwise sit outside the guard. And a **second test runs it backwards**: every
-recorded string must still appear in the negotiation's source, so a reworded line has to be
-re-recorded rather than inherited, and an entry that matches nothing cannot sit there as a slot.
+property under guard. And a **second test runs it backwards**: every recorded string must still appear
+in the negotiation's source, so a reworded line has to be re-recorded rather than inherited, and an
+entry that matches nothing cannot sit there as a slot.
 
-**Re-mutated after the change, all three by the recipe.** Mutation 2 verbatim: **killed**, by the
-closed-world assertion alone, naming the string. Mutation 1 as the control at the same location:
-**killed twice**, by the ban-list and by the closed-world assertion. And a third, against the second
-test — one recorded refusal sentence reworded in `negotiation_controller.dart`, which no fixture in
-that group renders: **killed**, by the staleness check alone, naming the stale entry. The ban-list was
-kept beside the closed-world check because it is a fast, legible failure for the obvious case and
-costs nothing.
+#### The third rung was a surface rather than a wording, and the collector reads three of them now
+
+**A closed-world check is only as wide as what it collects**, which is the next thing that got past
+it. The orchestrator's second mutation put the same sentence in a `Semantics(label:)` rather than a
+`Text`, and all twenty-two tests passed — not because the recorded set was too small, but because
+`renderedStrings` was reading `Text` and `EditableText` and nothing else. **A screen reader would have
+announced a disclosure that nobody looking at the screen could see**, which is worse than a visible
+one rather than better.
+
+So the collector reads **three surfaces**, each added because the set before it was got past:
+`Text` (what anybody looks at), `EditableText` (what a field is *seeded with* — the counter form
+seeds the price and conditions from the live offer, and no `Text` finder sees a populated box), and
+the **semantics tree** (what VoiceOver and TalkBack say).
+
+**The semantics half walks the tree rather than querying it**, and that distinction is the whole of
+whether it is complete: it descends from the root `SemanticsNode` through `visitChildren`, which is
+the tree the platform accessibility bridge serialises and hands to the screen reader, so what is
+collected is what is announced. `find.bySemanticsLabel` was the alternative and is a **matcher** —
+it takes a pattern and returns what matches, so it can confirm a label somebody already suspects and
+cannot enumerate the ones they do not. That is a ban-list wearing a different hat. All four announced
+properties are read rather than `label` alone, and merged nodes are split on newlines so the
+*fragments* are checked rather than one concatenation that would match nothing recorded.
+
+Two mechanical things were needed and both are worth knowing. A widget test builds **no semantics
+tree at all** without a `SemanticsHandle`, so the available quiet failure was a collector reading an
+empty tree and reporting success; the collector therefore enables semantics, pumps a frame — the tree
+is built on the *next* frame, not on the call — collects, and disposes, inside one call, so no caller
+can forget. Leaving the handle to the caller was tried first and is worse twice over: a test that
+forgets it gets exactly that silent pass, and **`addTearDown` is too late to dispose one** — the
+framework verifies no handle is outstanding *before* tear-downs run, which failed every test in the
+file with "A SemanticsHandle was active at the end of the test". Separately,
+`RendererBinding.pipelineOwner` is the one-line way to the semantics owner and is **deprecated**,
+which this repository's analyzer treats as fatal, so the root is found by descending the pipeline-owner
+tree instead.
+
+Two strings the extension surfaced are now recorded rather than exempted: `Send`, the send button's
+tooltip, which carries no visible `Text` and is spoken; and `Back`, which `MaterialLocalizations`
+supplies for the `AppBar`'s automatic back button and which no file of ours can be asked to contain.
+`Back` sits in a **named one-entry set of framework strings**, exempt from the staleness check alone
+because that check reads our source. **It is deliberately not an exemption for a category** — not
+"tooltips", not "semantics labels", not "whatever the framework contributes. A category exemption is a
+hole shaped like whatever is put inside it, and a category exemption is what let a semantics label
+through in the first place.
+
+**Re-mutated after the change, five variants, all by the recipe**, and the fourth row is the one worth
+reading:
+
+| Mutation, same location in the counter form | Result |
+|---|---|
+| `Text('The customer has set a maximum.')` | **Killed twice** — ban-list on `maximum`, and closed-world |
+| `Text('The customer cannot go higher than this.')` | **Killed** — closed-world alone |
+| `Text(…, semanticsLabel: 'The customer cannot go higher than this.')` | **Killed** — closed-world alone, via the semantics surface |
+| `Semantics(label: …, child: SizedBox(width: 1, height: 1))` | **Killed** — closed-world alone, via the semantics surface |
+| `Semantics(label: …, child: SizedBox.shrink())` | **Survives — and discloses to nobody.** See below |
+| A recorded refusal reworded in `negotiation_controller.dart` | **Killed** — staleness check alone |
+
+**The survivor is not a hole, and it was measured rather than argued.** The orchestrator's mutation
+used `SizedBox.shrink()`, and a zero-size semantics node is culled: with it applied the tree holds
+**41 nodes and the label appears nowhere in it**; changing only the child to `SizedBox(width: 1,
+height: 1)` gives **42 nodes with the label present**. So that exact line reaches neither this
+collector nor a screen reader — it is inert, not hidden. **The shape it was pointing at is real**,
+which is why the collector was extended anyway, and the sized variant and the `semanticsLabel:`
+variant both die. `semanticsLabel:` is the more dangerous of the two and is the one to remember: it
+leaves the visible screen **byte-identical** and replaces only what is spoken.
+
+**One thing this does not fix, and it is bigger than this screen.** Measured across the repository:
+`grep -rln 'SemanticsNode\|semanticsLabel\|Semantics(' apps/mobile/test/` matches **only this
+negotiation collector**. Every other screen in the client — the comparison, the feed, the job detail,
+the delivery screens — has no test that reads a semantics label at all, so the same mutation would
+survive on any of them. The wave's orchestrator is carrying that to §9 for wave 14; it is recorded
+here because this is where it was found and this is the only place it is currently closed.
+
+The ban-list was kept beside the closed-world check because it is a fast, legible failure for the
+obvious case and costs nothing.
 
 **What is deliberately left fail-closed rather than allowed.** The stale-read banner interpolates
 `ApiFailure.userMessage` — for an `ApiErrorResponse` that is **the platform's own free text**, which no

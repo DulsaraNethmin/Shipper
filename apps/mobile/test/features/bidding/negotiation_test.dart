@@ -676,7 +676,7 @@ void main() {
       await tester.tap(find.byKey(const Key('negotiation-counter-open')));
       await tester.pumpAndSettle();
 
-      final rendered = renderedText(tester);
+      final rendered = await renderedText(tester);
 
       // **Not vacuous.** The screen has to be drawing a negotiation before "it names no maximum"
       // means anything at all — which is the failure wave 11 recorded, where thirteen Dart tests
@@ -735,7 +735,7 @@ void main() {
 
       await openNegotiationAsProvider(tester, bidding);
 
-      final rendered = renderedText(tester);
+      final rendered = await renderedText(tester);
 
       expect(rendered, contains('there is no offer on the table'));
       for (final phrase in <String>['budget', 'maximum', 'ceiling', 'afford', 'has set a']) {
@@ -849,7 +849,7 @@ void main() {
         customerConditions,
       };
 
-      final rendered = renderedStrings(tester);
+      final rendered = await renderedStrings(tester);
 
       // **Not vacuous**, and checked before anything is concluded from an absence: wave 11 recorded
       // thirteen Dart tests that passed while asserting over empty lists.
@@ -861,6 +861,7 @@ void main() {
 
       final unrecorded = rendered
           .where((data) => !_providerCopy.contains(data))
+          .where((data) => !_frameworkCopy.contains(data))
           .where((data) => !partyWords.contains(data))
           .where((data) => !_computed.any((shape) => shape.hasMatch(data)))
           .toSet();
@@ -950,6 +951,9 @@ const _providerCopy = <String>{
   'No messages yet. Counter-offers say what the terms are; this is where the questions go.',
   'Write to the other party',
   'Questions a price cannot answer — access, timing, what is being moved.',
+  // The send button's tooltip. It carries no visible `Text` and is **spoken**, which is exactly the
+  // kind of string the collector was extended to reach.
+  'Send',
   'Close',
   'Try again',
 
@@ -983,6 +987,19 @@ const _providerCopy = <String>{
   'This conversation could not be found. Open it again from the offer.',
   'That did not go through. Send the message again.',
 };
+
+/// Strings **Flutter** puts on this screen, which no file of ours can be asked to contain.
+///
+/// One entry: the `AppBar`'s automatic back button takes its label and its tooltip from
+/// `MaterialLocalizations`, so it is announced to a provider and is not written anywhere in
+/// `lib/features/bidding/`.
+///
+/// **A named list of exact strings, and deliberately not an exemption for a category.** Exempting
+/// "tooltips", or "semantics labels", or "anything the framework might contribute", is precisely the
+/// move that let a semantics label through in the first place — a category exemption is a hole
+/// shaped like whatever is put inside it. This set is exempt from the staleness check below and from
+/// nothing else, because that check reads our source and cannot see Flutter's localisations.
+const _frameworkCopy = <String>{'Back'};
 
 /// A day-first instant as `dayFirstDateTime` renders one — `20 Aug 2026, 4:30 am`.
 ///
