@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/features/bidding/bid.dart';
+import 'package:shipper/features/bidding/instant_field.dart';
 import 'package:shipper/features/bidding/place_bid_controller.dart';
 import 'package:shipper/shared/design_system/failure_banner.dart';
 import 'package:shipper/shared/formatting/dates.dart';
@@ -299,7 +300,7 @@ class _BidFormState extends State<_BidForm> {
           ),
           const SizedBox(height: 16),
 
-          _InstantField(
+          InstantField(
             fieldKey: 'bid-pickup',
             label: 'Collecting at',
             value: _pickupAt,
@@ -312,7 +313,7 @@ class _BidFormState extends State<_BidForm> {
           ),
           const SizedBox(height: 16),
 
-          _InstantField(
+          InstantField(
             fieldKey: 'bid-deliver-by',
             label: 'Delivered by',
             value: _deliverBy,
@@ -412,99 +413,5 @@ class _AlreadyBid extends StatelessWidget {
         ],
       ),
     );
-  }
-}
-
-/// One instant a provider commits to, picked from a calendar and a clock.
-///
-/// A `FormField` rather than a button and a label, so that presence and the platform's own message
-/// land in the same place as every other field on the form — a required value that validated
-/// somewhere else is a required value somebody forgets.
-///
-/// **The calendar's range is what a calendar has to be drawn over, and not a rule.** It starts today
-/// because a date picker offering last Tuesday guarantees a wasted round trip, and it ends far
-/// enough out that nothing legitimate is unreachable. Whether the chosen instant is actually in the
-/// future, and whether delivery follows collection, are `internal/bidding`'s answers and arrive as
-/// field messages.
-class _InstantField extends StatelessWidget {
-  const _InstantField({
-    required this.fieldKey,
-    required this.label,
-    required this.value,
-    required this.missing,
-    required this.onChanged,
-    this.serverMessage,
-  });
-
-  final String fieldKey;
-  final String label;
-  final DateTime? value;
-
-  /// What to say when nothing has been chosen.
-  final String missing;
-
-  /// What the platform said about this field, or `null`.
-  final String? serverMessage;
-
-  final void Function(DateTime at) onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    return FormField<DateTime>(
-      initialValue: value,
-      validator: (_) => serverMessage ?? (value == null ? missing : null),
-      builder: (field) {
-        final chosen = value;
-
-        return InputDecorator(
-          decoration: InputDecoration(
-            labelText: label,
-            errorText: field.errorText,
-            border: const OutlineInputBorder(),
-          ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  chosen == null ? 'Not chosen yet' : dayFirstDateTime(chosen.toIso8601String())!,
-                  key: Key('$fieldKey-value'),
-                ),
-              ),
-              TextButton(
-                key: Key(fieldKey),
-                onPressed: () => unawaited(_choose(context, field)),
-                child: Text(chosen == null ? 'Choose' : 'Change'),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  Future<void> _choose(BuildContext context, FormFieldState<DateTime> field) async {
-    final now = DateTime.now();
-    final start = value ?? now;
-
-    final date = await showDatePicker(
-      context: context,
-      initialDate: start.isBefore(now) ? now : start,
-      firstDate: DateTime(now.year, now.month, now.day),
-      lastDate: DateTime(now.year + 5, now.month, now.day),
-    );
-    if (date == null || !context.mounted) return;
-
-    final time = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay.fromDateTime(start),
-      // Typed rather than dialled. A provider committing to "09:00" types four digits; the dial is
-      // for choosing an approximate time, and this is a commitment rather than a preference.
-      initialEntryMode: TimePickerEntryMode.input,
-    );
-    if (time == null) return;
-
-    final at = DateTime(date.year, date.month, date.day, time.hour, time.minute);
-    field.didChange(at);
-    onChanged(at);
   }
 }

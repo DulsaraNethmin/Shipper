@@ -4,6 +4,7 @@ import 'package:shipper/core/api/page.dart';
 import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
 import 'package:shipper/features/bidding/bidding_repository.dart';
+import 'package:shipper/features/bidding/message.dart';
 import 'package:shipper/features/bidding/received_offer.dart';
 
 /// An offer as the platform answers with one.
@@ -234,7 +235,196 @@ class FakeBiddingRepository implements BiddingRepository {
 
     return awarded;
   }
+
+  // --- SHIP-103: the negotiation, as both parties work it ---------------------------------------
+
+  /// Every read of a negotiation's offer chain, in order.
+  ///
+  /// **The count is the assertion that matters here**, not only the arguments. A counter-offer
+  /// re-reads the chain rather than patching the list it is holding, because the platform also
+  /// superseded the offer that was answered and this device is not entitled to decide that. A
+  /// controller that wrote both facts locally would render identically and would be maintaining a
+  /// second copy of `Docs/02` §2's state machine; only the extra read tells them apart.
+  final chainReads = <HistoryCall>[];
+
+  /// The chains [negotiationHistory] answers with, in order, one per read.
+  ///
+  /// A **list of chains** rather than one chain, so a test can say what the negotiation looked like
+  /// before a counter and after it. The last is repeated once exhausted, which is what a refresh of
+  /// a settled negotiation looks like.
+  List<List<Bid>> chains = <List<Bid>>[<Bid>[]];
+
+  /// Thrown by [negotiationHistory] instead of answering, on every call until it is cleared.
+  Object? chainFailure;
+
+  @override
+  Future<ApiPage<Bid>> negotiationHistory({
+    required String jobId,
+    required String bidId,
+  }) async {
+    final index = chainReads.length;
+    chainReads.add((jobId: jobId, bidId: bidId));
+
+    final thrown = chainFailure;
+    if (thrown != null) throw thrown;
+
+    if (chains.isEmpty) return const ApiPage<Bid>(data: <Bid>[]);
+    // `next_cursor` is always null on this endpoint and `has_more` is a truncation report rather
+    // than an invitation, so the fake answers the way the platform does: one envelope, no cursor.
+    return ApiPage<Bid>(data: chains[index < chains.length ? index : chains.length - 1]);
+  }
+
+  /// Every counter-offer, in order, with the difference it carried and the key it was sent under.
+  ///
+  /// The **difference** is what is worth recording. `BidCounter` is not an offer: anything omitted
+  /// is inherited from the offer being answered, so a form that sent back every field it was showing
+  /// would look identical on screen and would re-assert timing the other party had already agreed
+  /// to. Asserting the body is what tells "countering on price" from "re-stating the whole offer".
+  final counters = <CounterCall>[];
+
+  /// What a successful counter answers with — the new live head.
+  Bid countered = aBid(id: 'counter-1', amountCents: 40000, offeredBy: BidParty.customer);
+
+  /// Thrown by [counterOffer] instead of answering, on every call until it is cleared.
+  Object? counterFailure;
+
+  /// Held open until completed, so a test can assert what the screen shows mid-counter.
+  Completer<void>? counterGate;
+
+  /// Every idempotency key a counter carried, in order.
+  List<String> get counterKeys => counters.map((c) => c.idempotencyKey).toList(growable: false);
+
+  /// Every counter body sent, encoded the way the transport would encode it.
+  List<Map<String, dynamic>> get counterBodies =>
+      counters.map((c) => c.counter.toJson()).toList(growable: false);
+
+  @override
+  Future<Bid> counterOffer({
+    required String jobId,
+    required String bidId,
+    required BidCounter counter,
+    required String idempotencyKey,
+  }) async {
+    counters.add((jobId: jobId, bidId: bidId, counter: counter, idempotencyKey: idempotencyKey));
+
+    final held = counterGate;
+    if (held != null) await held.future;
+
+    final thrown = counterFailure;
+    if (thrown != null) throw thrown;
+
+    return countered;
+  }
+
+  /// Every read of a conversation, in order, with the cursor it asked from.
+  final messageReads = <MessagesCall>[];
+
+  /// The pages [messagesOn] answers with, in order. The last is repeated once exhausted.
+  List<ApiPage<Message>> messagePages = <ApiPage<Message>>[
+    const ApiPage<Message>(data: <Message>[]),
+  ];
+
+  /// Thrown by [messagesOn] instead of answering, on every call until it is cleared.
+  Object? messagesFailure;
+
+  @override
+  Future<ApiPage<Message>> messagesOn({
+    required String jobId,
+    required String bidId,
+    String? cursor,
+  }) async {
+    final index = messageReads.length;
+    messageReads.add((jobId: jobId, bidId: bidId, cursor: cursor));
+
+    final thrown = messagesFailure;
+    if (thrown != null) throw thrown;
+
+    if (messagePages.isEmpty) return const ApiPage<Message>(data: <Message>[]);
+    return messagePages[index < messagePages.length ? index : messagePages.length - 1];
+  }
+
+  /// Every message sent, in order, with the key it carried.
+  final sends = <SendMessageCall>[];
+
+  /// What the platform answers a send with, or `null` to echo what was sent.
+  ///
+  /// **Echoing is the realistic default and the override is the interesting case.** The contract
+  /// says the platform adds nothing and stores the body as written — so a screen that appended the
+  /// composer's text instead of the response would look right against an echoing fake. Setting this
+  /// to a message whose body differs is what separates "renders the platform's row" from "renders
+  /// what was typed", and that distinction is the whole of why a retry answered `200` with an
+  /// earlier attempt's message reconciles correctly.
+  Message? messageReply;
+
+  /// Thrown by [sendMessage] instead of answering, on every call until it is cleared.
+  Object? sendFailure;
+
+  /// Held open until completed, so a test can assert what the screen shows mid-send.
+  Completer<void>? sendGate;
+
+  /// Every idempotency key a message carried, in order.
+  List<String> get sendKeys => sends.map((c) => c.idempotencyKey).toList(growable: false);
+
+  @override
+  Future<Message> sendMessage({
+    required String jobId,
+    required String bidId,
+    required String body,
+    required String idempotencyKey,
+  }) async {
+    sends.add((jobId: jobId, bidId: bidId, body: body, idempotencyKey: idempotencyKey));
+
+    final held = sendGate;
+    if (held != null) await held.future;
+
+    final thrown = sendFailure;
+    if (thrown != null) throw thrown;
+
+    return messageReply ??
+        aMessage(id: 'sent-${sends.length}', sentBy: BidParty.customer, body: body);
+  }
 }
+
+/// A message as the platform answers with one.
+///
+/// Built from the `Message` example in `contracts/paths/bidding.yaml`, so that a field renamed in the
+/// contract shows up here rather than only on a device.
+///
+/// **There is no budget parameter and there must never be one**, exactly as [aBid] and
+/// [aReceivedOffer] have none — and the reason is sharper on this shape than on either of those.
+/// This is the only response in the bidding domain carrying free text, so it is the one place a
+/// disclosure could travel as a *sentence*: no field, no value, no digit. [body] is what a party
+/// typed, which is theirs to write and is not the platform speaking.
+Message aMessage({
+  String id = '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5',
+  BidParty sentBy = BidParty.provider,
+  String body = 'Is there a lift, or is it stairs to the second floor?',
+  String? createdAt = '2026-08-15T03:30:00.000Z',
+}) {
+  return Message(id: id, sentBy: sentBy, body: body, createdAt: createdAt);
+}
+
+/// One recorded read of a negotiation's offer chain (SHIP-103).
+typedef HistoryCall = ({String jobId, String bidId});
+
+/// One recorded counter-offer (SHIP-103).
+typedef CounterCall = ({
+  String jobId,
+  String bidId,
+  BidCounter counter,
+  String idempotencyKey,
+});
+
+/// One recorded read of a conversation (SHIP-103).
+typedef MessagesCall = ({String jobId, String bidId, String? cursor});
+
+/// One recorded message (SHIP-103).
+typedef SendMessageCall = ({
+  String jobId,
+  String bidId,
+  String body,
+  String idempotencyKey,
+});
 
 // --- SHIP-102: the customer's view of the offers on their job ---------------------------------
 

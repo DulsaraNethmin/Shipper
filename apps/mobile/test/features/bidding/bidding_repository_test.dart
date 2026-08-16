@@ -626,4 +626,379 @@ void main() {
       expect(jsonEncode(bid.toJson()), isNot(contains('8675309')));
     });
   });
+
+  group('GET /v1/jobs/{id}/bids/{bid_id}/history — one negotiation’s offers (SHIP-88)', () {
+    // Not `const`: a spread that overrides a key is a duplicate key in a constant map, and the
+    // overriding is the point — these are two rounds of one negotiation over the same offer shape.
+    final chain = <String, Object?>{
+      'data': <Object?>[
+        <String, Object?>{
+          ..._bid,
+          'id': 'offer-1',
+          'status': 'superseded',
+          'superseded_by': 'offer-2',
+        },
+        <String, Object?>{
+          ..._bid,
+          'id': 'offer-2',
+          'offered_by': 'customer',
+          'amount_cents': 40000,
+        },
+      ],
+      'next_cursor': null,
+      'has_more': false,
+    };
+
+    test('reads the chain under the offer it is addressed through', () async {
+      // Any offer in the negotiation addresses the whole of it — "the one you are holding will do,
+      // however old". A client that had to hold the live head would work until the first counter.
+      final (:repo, :adapter) = _repoReturning(chain, status: 200);
+
+      await repo.negotiationHistory(jobId: _job, bidId: 'offer-1');
+
+      expect(adapter.requests.single.method, 'GET');
+      expect(adapter.requests.single.path, '/v1/jobs/$_job/bids/offer-1/history');
+    });
+
+    test('sends no cursor, because this endpoint does not page', () async {
+      // `next_cursor` is always null here and `has_more` is a **truncation report** rather than an
+      // invitation to ask for the rest. A client that sent a cursor would be sending one this
+      // endpoint never issued, which it refuses rather than misreads.
+      final (:repo, :adapter) = _repoReturning(chain, status: 200);
+
+      await repo.negotiationHistory(jobId: _job, bidId: 'offer-1');
+
+      expect(adapter.requests.single.queryParameters, isEmpty);
+    });
+
+    test('carries no idempotency key, because a read changes nothing', () async {
+      final (:repo, :adapter) = _repoReturning(chain, status: 200);
+
+      await repo.negotiationHistory(jobId: _job, bidId: 'offer-1');
+
+      expect(adapter.requests.single.headers[ApiHeaders.idempotencyKey], isNull);
+    });
+
+    test('the whole exchange arrives, oldest first, with the head identifiable', () async {
+      final page = await _repoOnlyReturning(chain, status: 200)
+          .negotiationHistory(jobId: _job, bidId: 'offer-1');
+
+      expect(page.data.map((bid) => bid.id), <String>['offer-1', 'offer-2']);
+      expect(page.data.first.supersededBy, 'offer-2');
+      expect(
+        page.data.last.supersededBy,
+        isNull,
+        reason: 'the one entry with no superseded_by is the live head, and there is no other flag '
+            'for it',
+      );
+      expect(page.data.last.offeredBy, BidParty.customer);
+    });
+
+    test('nothing of the job travels back, the customer’s figure included', () async {
+      // The same closed-key-set guard `Bid` carries everywhere else, on the response that would
+      // otherwise hand somebody an entire negotiation at once.
+      final salted = <String, Object?>{
+        'data': <Object?>[
+          <String, Object?>{..._bid, 'budget_cents': 8675309, 'max_price': 8675309},
+        ],
+      };
+
+      final page = await _repoOnlyReturning(salted, status: 200)
+          .negotiationHistory(jobId: _job, bidId: 'offer-1');
+
+      expect(jsonEncode(page.data.single.toJson()), isNot(contains('8675309')));
+    });
+  });
+
+  group('POST /v1/jobs/{id}/bids/{bid_id}/counter — answering an offer (SHIP-87)', () {
+    test('posts under the offer being answered', () async {
+      final (:repo, :adapter) = _repoReturning(_bid);
+
+      await repo.counterOffer(
+        jobId: _job,
+        bidId: 'offer-1',
+        counter: const BidCounter(amountCents: 40000),
+        idempotencyKey: 'k',
+      );
+
+      expect(adapter.requests.single.method, 'POST');
+      expect(adapter.requests.single.path, '/v1/jobs/$_job/bids/offer-1/counter');
+    });
+
+    test('sends only what changed, because the rest is inherited', () async {
+      // "Every field is optional and anything you leave out is inherited from the offer you are
+      // answering." A client that sent back the whole offer would look identical on screen and
+      // would re-assert timing the other party had already agreed to.
+      final (:repo, :adapter) = _repoReturning(_bid);
+
+      await repo.counterOffer(
+        jobId: _job,
+        bidId: 'offer-1',
+        counter: const BidCounter(amountCents: 40000),
+        idempotencyKey: 'k',
+      );
+
+      expect(adapter.requests.single.data, <String, dynamic>{'amount_cents': 40000});
+    });
+
+    test('an empty conditions string is sent, because that is how they are cleared', () async {
+      // The one tri-state in this client: `null` leaves the conditions alone and `''` removes them.
+      // `BidPlacement.toJson` omits an empty message deliberately, and a copy of it here would
+      // silently drop the only way to clear them.
+      final (:repo, :adapter) = _repoReturning(_bid);
+
+      await repo.counterOffer(
+        jobId: _job,
+        bidId: 'offer-1',
+        counter: const BidCounter(message: ''),
+        idempotencyKey: 'k',
+      );
+
+      expect(adapter.requests.single.data, <String, dynamic>{'message': ''});
+    });
+
+    test('carries the caller’s idempotency key and never mints one', () async {
+      final (:repo, :adapter) = _repoReturning(_bid);
+
+      await repo.counterOffer(
+        jobId: _job,
+        bidId: 'offer-1',
+        counter: const BidCounter(amountCents: 40000),
+        idempotencyKey: 'the-caller-s-key',
+      );
+
+      expect(adapter.requests.single.headers[ApiHeaders.idempotencyKey], 'the-caller-s-key');
+    });
+
+    test('a closed negotiation arrives as its code, not its message', () async {
+      final wired = _repoReturning(
+        <String, Object?>{
+          'error': <String, Object?>{
+            'code': 'bidding_bid_closed',
+            'message': 'this wording is not what anything branches on',
+            'request_id': 'r1',
+          },
+        },
+        status: 409,
+      );
+
+      await expectLater(
+        wired.repo.counterOffer(
+          jobId: _job,
+          bidId: 'offer-1',
+          counter: const BidCounter(amountCents: 40000),
+          idempotencyKey: 'k',
+        ),
+        throwsA(
+          isA<ApiErrorResponse>()
+              .having((f) => f.code, 'code', 'bidding_bid_closed')
+              .having((f) => f.statusCode, 'statusCode', 409),
+        ),
+      );
+    });
+
+    test('a 422 names the fields, including ones this device did not send', () async {
+      // The platform validates the **merged** offer, so countering on price alone against an offer
+      // whose collection time has passed is refused naming `pickup_at`.
+      final wired = _repoReturning(
+        <String, Object?>{
+          'error': <String, Object?>{
+            'code': 'validation_failed',
+            'message': 'one or more fields were rejected',
+            'request_id': 'r1',
+            'details': <Object?>[
+              <String, Object?>{
+                'field': 'pickup_at',
+                'code': 'in_the_past',
+                'message': 'Collection is already in the past.',
+              },
+            ],
+          },
+        },
+        status: 422,
+      );
+
+      await expectLater(
+        wired.repo.counterOffer(
+          jobId: _job,
+          bidId: 'offer-1',
+          counter: const BidCounter(amountCents: 40000),
+          idempotencyKey: 'k',
+        ),
+        throwsA(
+          isA<ApiErrorResponse>().having(
+            (f) => f.fieldMessages,
+            'fieldMessages',
+            <String, String>{'pickup_at': 'Collection is already in the past.'},
+          ),
+        ),
+      );
+    });
+  });
+
+  group('the conversation — GET and POST …/messages (SHIP-97)', () {
+    const thread = <String, Object?>{
+      'data': <Object?>[
+        <String, Object?>{
+          'id': 'm1',
+          'sent_by': 'provider',
+          'body': 'Is there a lift, or is it stairs to the second floor?',
+          'created_at': '2026-08-15T03:30:00.000Z',
+        },
+        <String, Object?>{
+          'id': 'm2',
+          'sent_by': 'customer',
+          'body': 'There is a lift, but it is out until Thursday.',
+          'created_at': '2026-08-15T03:34:00.000Z',
+        },
+      ],
+      'next_cursor': 'MR9yZWNvcmQ',
+      'has_more': true,
+    };
+
+    const sent = <String, Object?>{
+      'id': 'm3',
+      'sent_by': 'customer',
+      'body': 'Thursday morning suits.',
+      'created_at': '2026-08-15T03:40:00.000Z',
+    };
+
+    test('reads under the offer the conversation is addressed through', () async {
+      final (:repo, :adapter) = _repoReturning(thread, status: 200);
+
+      await repo.messagesOn(jobId: _job, bidId: 'offer-1');
+
+      expect(adapter.requests.single.method, 'GET');
+      expect(adapter.requests.single.path, '/v1/jobs/$_job/bids/offer-1/messages');
+      expect(
+        adapter.requests.single.queryParameters,
+        isEmpty,
+        reason: 'no `limit`: the page size is server configuration, and a number compiled in here '
+            'could not be changed without a store release',
+      );
+    });
+
+    test('hands the cursor back exactly as it arrived', () async {
+      final (:repo, :adapter) = _repoReturning(thread, status: 200);
+
+      await repo.messagesOn(jobId: _job, bidId: 'offer-1', cursor: 'MR9yZWNvcmQ');
+
+      expect(adapter.requests.single.queryParameters, <String, dynamic>{'cursor': 'MR9yZWNvcmQ'});
+    });
+
+    test('the page arrives oldest first, with each party named', () async {
+      // Oldest first is the opposite of every other list in this domain and is deliberate: a work
+      // queue is read newest first, and a conversation is read forward or it is not a conversation.
+      final page = await _repoOnlyReturning(thread, status: 200)
+          .messagesOn(jobId: _job, bidId: 'offer-1');
+
+      expect(page.data.map((m) => m.id), <String>['m1', 'm2']);
+      expect(page.data.first.sentBy, BidParty.provider);
+      expect(page.data.last.sentBy, BidParty.customer);
+      expect(page.hasMore, isTrue);
+      expect(page.nextCursor, 'MR9yZWNvcmQ');
+    });
+
+    test('a third kind of party decodes rather than throwing', () async {
+      // `Docs/07` §6: an old build on a handset that cannot be fixed over the air must degrade
+      // rather than crash. A message from a party this build has never heard of is still a message.
+      final page = await _repoOnlyReturning(
+        <String, Object?>{
+          'data': <Object?>[
+            <String, Object?>{'id': 'm9', 'sent_by': 'administrator', 'body': 'Noted.'},
+          ],
+        },
+        status: 200,
+      ).messagesOn(jobId: _job, bidId: 'offer-1');
+
+      expect(page.data.single.sentBy, BidParty.unknown);
+      expect(page.data.single.body, 'Noted.');
+    });
+
+    test('sending posts one field and carries the caller’s key', () async {
+      // The key is stored against the message rather than merely cached, because a duplicated
+      // message is worse than most duplicated writes: the other party has already read it and
+      // cannot tell which sending was the mistake.
+      final (:repo, :adapter) = _repoReturning(sent);
+
+      await repo.sendMessage(
+        jobId: _job,
+        bidId: 'offer-1',
+        body: 'Thursday morning suits.',
+        idempotencyKey: 'the-caller-s-key',
+      );
+
+      expect(adapter.requests.single.method, 'POST');
+      expect(adapter.requests.single.path, '/v1/jobs/$_job/bids/offer-1/messages');
+      expect(adapter.requests.single.data, <String, dynamic>{'body': 'Thursday morning suits.'});
+      expect(adapter.requests.single.headers[ApiHeaders.idempotencyKey], 'the-caller-s-key');
+    });
+
+    test('a replay answered 200 is the same shape as a 201', () async {
+      // "A client that does not care which happened parses one shape." Both are asserted, because a
+      // repository that only handled `201` would throw on every retry that succeeded.
+      for (final status in <int>[201, 200]) {
+        final message = await _repoOnlyReturning(sent, status: status)
+            .sendMessage(jobId: _job, bidId: 'offer-1', body: 'x', idempotencyKey: 'k');
+
+        expect(message.id, 'm3', reason: 'status $status');
+        expect(message.body, 'Thursday morning suits.', reason: 'status $status');
+      }
+    });
+
+    test('an empty message arrives as its field, not as a generic refusal', () async {
+      final wired = _repoReturning(
+        <String, Object?>{
+          'error': <String, Object?>{
+            'code': 'validation_failed',
+            'message': 'one or more fields were rejected',
+            'request_id': 'r1',
+            'details': <Object?>[
+              <String, Object?>{
+                'field': 'body',
+                'code': 'required',
+                'message': 'Write something to send.',
+              },
+            ],
+          },
+        },
+        status: 422,
+      );
+
+      await expectLater(
+        wired.repo.sendMessage(jobId: _job, bidId: 'offer-1', body: ' ', idempotencyKey: 'k'),
+        throwsA(
+          isA<ApiErrorResponse>().having(
+            (f) => f.fieldMessages,
+            'fieldMessages',
+            <String, String>{'body': 'Write something to send.'},
+          ),
+        ),
+      );
+    });
+
+    test('a message carries nothing but a message', () async {
+      // **The one response in this domain that carries free text**, which is why its key set is
+      // closed on the client as well as on the platform: a disclosure written as a sentence needs
+      // no field name and no value, and an extra prose field is where one would travel.
+      final message = await _repoOnlyReturning(
+        <String, Object?>{
+          ...sent,
+          'job_id': _job,
+          'provider_id': 'p1',
+          'budget_cents': 8675309,
+          'note': 'the customer has set a maximum',
+        },
+        status: 201,
+      ).sendMessage(jobId: _job, bidId: 'offer-1', body: 'x', idempotencyKey: 'k');
+
+      expect(
+        message.toJson().keys.toSet(),
+        <String>{'id', 'sent_by', 'body', 'created_at'},
+        reason: 'Message gained or lost a key. Extra prose on the one free-text shape in this '
+            'domain is where a sentence could travel with an innocuous name.',
+      );
+      expect(jsonEncode(message.toJson()), isNot(contains('the customer has set a maximum')));
+    });
+  });
 }

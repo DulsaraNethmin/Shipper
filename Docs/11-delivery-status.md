@@ -766,6 +766,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-81a** | M3 | `Docs/04` §4's five outcomes exist as a record: `provider_verifications` and its append-only decision trail (`000200` — migration block 200–299's first table, owned by `internal/profiles`), `GET /v1/provider/verification`, and the eligibility predicate reading that record instead of its automated stand-in. **The guarded function is in the database rather than in Go** — `provider_verification_decide()` records the decision with its actor and reason, names it to a trigger through a transaction-local setting, then moves the state — so the domain, a `make verify` fixture and a psql prompt are the same caller; the jobs precedent puts the protocol in Go and this file already records what the hand-written copy of it cost. **Every provider has a row from registration and the existing ones are backfilled `Pending`**, which is the ticket rather than a detail: Pending is a state a provider is *in*, so SHIP-153 has somebody to list — and **every provider on the platform stops being eligible to bid** until somebody decides otherwise. `internal/fleet` imports nothing from `internal/profiles`; the seam is one `EXISTS` clause — *see below* |
 | **SHIP-153** | M6 | `GET /v1/admin/verifications` — Docs/04 §5's **first** moderation queue, and the read half of what ends the state SHIP-81a left the marketplace in. Oldest first, cursor paged on `(created_at, provider_id)`, and `state` is a **required** parameter rather than one defaulting to `Pending`: every provider has a record from registration, so an unfiltered request is the whole supply side wearing a queue's name, and a default would make the same URL mean two things depending on whether a console remembered to send one. The query lives in `internal/profiles`, which owns the tables; `internal/admin` declares a port and `cmd/api` supplies the adapter, so **no package imports another** — *see below* |
 | **SHIP-154** | M6 | `POST /v1/admin/verifications/{id}/decision` — the **only** route in the API that moves a verification state, and the act `profiles.Service.Decide` was exported and left unrouted for a whole wave. All five of Docs/04 §4's outcomes on one endpoint, any following any other, with a reason required in every direction including a reinstatement. **Four writes in one transaction** — the decision row, the transaction-local setting the trigger reads, the state change and the `audit_log` entry — so a provider's eligibility cannot move with nobody accountable for moving it. The evidence trail and the audit trail are two tables for two readers and carry the same reason deliberately, which is SHIP-160's arrangement. The mutation taking the entry out of the transaction is reported below with its verdict — *see below* |
+| **SHIP-103** | M3 | The negotiation screen — **one screen for two people**, over the four endpoints that each serve both sides and work out which from the credential. It reads the whole chain and the conversation, and writes a counter-offer and a message; `BidCounter` is a **difference rather than an offer**, so a counter on price alone leaves the timing on the table, and an empty `message` is sent rather than omitted because that is how conditions are cleared. A counter **re-reads the chain instead of patching it** — the response is the new head alone and the platform also superseded the row it answered — and the read count is what the test asserts, because a client that wrote both facts renders identically. **The budget guard is closed-world over three rendered surfaces** in the provider's view with the counter form open — `Text`, `EditableText` and the **semantics tree a screen reader is read from** — and every string on them must be recorded copy, a written-down value shape, or a party's own words, so a sentence nobody recorded fails whatever it says and wherever it is carried. A ban-list was tried first and **lost to a paraphrase**; a `Text`-only collector then **lost to a `semanticsLabel:`**, which leaves the visible screen byte-identical and changes only what is spoken. **No other client screen has a test that reads a semantics label at all** — measured, and carried to §9 What it does not build: revising and withdrawing your own offer, both still served and both still wanting a confirmation flow — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14296,6 +14297,199 @@ are not this ticket's either.
 
 Reverted from a copy taken before the mutation was applied, confirmed with `git diff` **and**
 `shasum -a 256 -c` against that copy.
+
+### What SHIP-103 built, and the two decisions it took that a reviewer should check
+
+**SHIP-103 is a client ticket whose entire server surface already existed**, which is rare enough in
+this repository to be worth saying: `routes_golden.txt` at `4fd7fd5` serves the counter, the history
+and both message routes, and the branch adds no migration, no route and no Go file. What it adds is
+`apps/mobile/lib/features/bidding/negotiation_screen.dart` and the controller, model and request type
+beneath it, plus a way in from each party's existing screen.
+
+**Decision one: one screen for both parties, where the job deliberately has two.** `jobDetail` and
+`openJobDetail` are separate screens reading separate endpoints, because the customer's job and a
+provider's view of it are different *responses* — one carries the customer's private figure and the
+other must never be able to. A negotiation is the opposite case. All four of its endpoints serve
+customer and provider alike and decide which from the credential, so two screens would be two
+renderings of one exchange, and the first thing they would disagree about is whose turn it is. What
+differs between the two views is one word — which side of the thread is "you" — taken from the
+session's role, and it decides alignment and a label and **nothing else**: a device that got the role
+wrong would draw a bubble on the wrong side and disclose nothing, because a caller who is not a party
+gets the byte-identical `404` a bid that does not exist gets.
+
+**Decision two: a counter re-reads the chain rather than patching it.** `POST …/counter` answers with
+the new head alone, and in the same transaction the platform moved the offer that was answered to
+`superseded` and pointed its `superseded_by` at the new row. This device could write both of those
+itself and render identically. It does not, for the reason `CompareOffersController.showAwarded`
+already gives: `Docs/02` §2 makes status the platform's, and a client that computes the consequences
+of a transition keeps a second copy of the state machine that is right until the day it is not.
+**The test asserts the read count**, because that is the only observable that separates the two
+implementations.
+
+Three smaller things are worth knowing. `BidCounter` is a **third** request type rather than a
+`BidPlacement` with nullable fields — a placement states an offer and a counter states a *difference*,
+so `null` means "keep what is on the table", which is precisely what a placement's fields must never
+mean. Its `message` is the **one tri-state in this client**: `null` leaves the conditions alone and
+`''` clears them, so `toJson` emits an empty string where `BidPlacement.toJson` deliberately omits one
+— a copy of that method would have silently dropped the only way to remove conditions. And
+`InstantField` moved out of `place_bid_panel.dart`, where it was private, because both forms enter a
+commitment the same way or they disagree about what a commitment is (`Docs/07` §2).
+
+#### The budget guard is word-level over rendered output, and it was mutated to prove it
+
+**A negotiation screen is the most dangerous surface in this product for `Docs/01` §4.3**, because it
+renders both parties' words beside a form for proposing a number. The third clause — no "budget
+supplied" indicator — is a *sentence*, and a sentence carries no field, no value and no digit. Wave 10
+and wave 11 each proved that a closed key set, a source scan, a value search and an AST walk all pass
+one.
+
+The guard is over the **provider's** view with the counter form open, and it is in two halves. It
+asserts five things are on screen first — both offers' amounts, both parties' words and the form's own
+heading — because wave 11 recorded thirteen Dart tests that passed while asserting over empty lists.
+
+**Mutation 1 — the phrase wave 10 isolated.** A `Text` was added to the counter form reading *"The
+customer has set a maximum."*: no field, no value, no digit. **Killed**, by the word-level scan over
+rendered output, on the phrase `maximum`. Everything structural passed it — `flutter analyze`, the
+closed key set over `Bid`, `Message` and `ReceivedOffer`, `budget_stays_on_the_customer_side_test.dart`'s
+source scan for `budget_cents|budgetCents`, and `compare_offers_test.dart`'s own word scan.
+
+**Mutation 2 is the one that matters, and it survived.** The wave's orchestrator ran a paraphrase at
+the same location — *"The customer cannot go higher than this."* — naming none of the fourteen banned
+phrases. **All 1030 tests passed.** It then established that the fixture was not the reason, by
+swapping only the wording at that identical location to mutation 1's and watching the ban-list fail:
+the location was reachable, the guard was live, and the paraphrase simply walked past it.
+
+**That is not a phrase the list forgot. It is the shape of a ban-list, and this is the fourth wave to
+meet it.** Wave 10 beat a closed key set with a sentence; wave 11 beat a word search with the same
+sentence; wave 13 beat a phrase list with a synonym. Each time the instance was patched and the shape
+was kept. **A ban-list is open-world and the thing it guards is unbounded**, so it loses to a
+thesaurus, always, and widening it only moves the loss further out.
+
+**So the guard was inverted to closed-world**, which is the same principle as the closed key set
+already used over the models, moved from the type to the rendered output. Every string the provider's
+screen renders must be one of three things: copy `negotiation_test.dart` records **by hand**, a value
+whose *shape* is written down and anchored at both ends, or one of the exact strings the fixture's own
+parties typed. **Anything else fails, whatever it says.** Adding provider-visible copy is now a
+decision somebody recorded rather than something that happened.
+
+Two details make it hold rather than look like it holds. The recorded set is **hand-written and not
+derived from the source**, because deriving it would admit whatever the source said — the exact
+property under guard. And a **second test runs it backwards**: every recorded string must still appear
+in the negotiation's source, so a reworded line has to be re-recorded rather than inherited, and an
+entry that matches nothing cannot sit there as a slot.
+
+#### The third rung was a surface rather than a wording, and the collector reads three of them now
+
+**A closed-world check is only as wide as what it collects**, which is the next thing that got past
+it. The orchestrator's second mutation put the same sentence in a `Semantics(label:)` rather than a
+`Text`, and all twenty-two tests passed — not because the recorded set was too small, but because
+`renderedStrings` was reading `Text` and `EditableText` and nothing else. **A screen reader would have
+announced a disclosure that nobody looking at the screen could see**, which is worse than a visible
+one rather than better.
+
+So the collector reads **three surfaces**, each added because the set before it was got past:
+`Text` (what anybody looks at), `EditableText` (what a field is *seeded with* — the counter form
+seeds the price and conditions from the live offer, and no `Text` finder sees a populated box), and
+the **semantics tree** (what VoiceOver and TalkBack say).
+
+**The semantics half walks the tree rather than querying it**, and that distinction is the whole of
+whether it is complete: it descends from the root `SemanticsNode` through `visitChildren`, which is
+the tree the platform accessibility bridge serialises and hands to the screen reader, so what is
+collected is what is announced. `find.bySemanticsLabel` was the alternative and is a **matcher** —
+it takes a pattern and returns what matches, so it can confirm a label somebody already suspects and
+cannot enumerate the ones they do not. That is a ban-list wearing a different hat. All four announced
+properties are read rather than `label` alone, and merged nodes are split on newlines so the
+*fragments* are checked rather than one concatenation that would match nothing recorded.
+
+Two mechanical things were needed and both are worth knowing. A widget test builds **no semantics
+tree at all** without a `SemanticsHandle`, so the available quiet failure was a collector reading an
+empty tree and reporting success; the collector therefore enables semantics, pumps a frame — the tree
+is built on the *next* frame, not on the call — collects, and disposes, inside one call, so no caller
+can forget. Leaving the handle to the caller was tried first and is worse twice over: a test that
+forgets it gets exactly that silent pass, and **`addTearDown` is too late to dispose one** — the
+framework verifies no handle is outstanding *before* tear-downs run, which failed every test in the
+file with "A SemanticsHandle was active at the end of the test". Separately,
+`RendererBinding.pipelineOwner` is the one-line way to the semantics owner and is **deprecated**,
+which this repository's analyzer treats as fatal, so the root is found by descending the pipeline-owner
+tree instead.
+
+Two strings the extension surfaced are now recorded rather than exempted: `Send`, the send button's
+tooltip, which carries no visible `Text` and is spoken; and `Back`, which `MaterialLocalizations`
+supplies for the `AppBar`'s automatic back button and which no file of ours can be asked to contain.
+`Back` sits in a **named one-entry set of framework strings**, exempt from the staleness check alone
+because that check reads our source. **It is deliberately not an exemption for a category** — not
+"tooltips", not "semantics labels", not "whatever the framework contributes. A category exemption is a
+hole shaped like whatever is put inside it, and a category exemption is what let a semantics label
+through in the first place.
+
+**Re-mutated after the change, five variants, all by the recipe**, and the fourth row is the one worth
+reading:
+
+| Mutation, same location in the counter form | Result |
+|---|---|
+| `Text('The customer has set a maximum.')` | **Killed twice** — ban-list on `maximum`, and closed-world |
+| `Text('The customer cannot go higher than this.')` | **Killed** — closed-world alone |
+| `Text(…, semanticsLabel: 'The customer cannot go higher than this.')` | **Killed** — closed-world alone, via the semantics surface |
+| `Semantics(label: …, child: SizedBox(width: 1, height: 1))` | **Killed** — closed-world alone, via the semantics surface |
+| `Semantics(label: …, child: SizedBox.shrink())` | **Survives — and discloses to nobody.** See below |
+| A recorded refusal reworded in `negotiation_controller.dart` | **Killed** — staleness check alone |
+
+**The survivor is not a hole, and it was measured rather than argued.** The orchestrator's mutation
+used `SizedBox.shrink()`, and a zero-size semantics node is culled: with it applied the tree holds
+**41 nodes and the label appears nowhere in it**; changing only the child to `SizedBox(width: 1,
+height: 1)` gives **42 nodes with the label present**. So that exact line reaches neither this
+collector nor a screen reader — it is inert, not hidden. **The shape it was pointing at is real**,
+which is why the collector was extended anyway, and the sized variant and the `semanticsLabel:`
+variant both die. `semanticsLabel:` is the more dangerous of the two and is the one to remember: it
+leaves the visible screen **byte-identical** and replaces only what is spoken.
+
+**One thing this does not fix, and it is bigger than this screen.** Measured across the repository:
+`grep -rln 'SemanticsNode\|semanticsLabel\|Semantics(' apps/mobile/test/` matches **only this
+negotiation collector**. Every other screen in the client — the comparison, the feed, the job detail,
+the delivery screens — has no test that reads a semantics label at all, so the same mutation would
+survive on any of them. The wave's orchestrator is carrying that to §9 for wave 14; it is recorded
+here because this is where it was found and this is the only place it is currently closed.
+
+The ban-list was kept beside the closed-world check because it is a fast, legible failure for the
+obvious case and costs nothing.
+
+**What is deliberately left fail-closed rather than allowed.** The stale-read banner interpolates
+`ApiFailure.userMessage` — for an `ApiErrorResponse` that is **the platform's own free text**, which no
+closed key set covers because a `message` is prose by definition. No fixture in this group renders it,
+so no shape admits it, and a test that renders one will fail until somebody decides what that means.
+That is the honest position: it is a real hole in *what a provider can be shown*, it is not this
+screen's to close, and it is now recorded rather than silently permitted. §9 is where it belongs if
+anybody wants it owned.
+
+**One thing about the mutation-revert recipe itself, worth passing on.** Step 4 is *confirm with `git
+diff` **and** `shasum -a 256 -c`*, and on the first round `git diff` was **structurally incapable of
+saying anything**: the mutated file was new on the branch, so untracked, so `git diff` reported nothing
+whether it had been restored or not. The checksum against the copy was the only evidence. That is the
+exact failure the recipe exists for — "after a destructive checkout the file matches the index, so
+`git diff` reports nothing, which reads as success" — arriving by a route it does not name. **On a
+branch that adds files, the checksum is not the second half of step 4; it is all of it.** After the
+first commit the same files are tracked and `git diff` works normally, which is why rounds two and
+three could confirm both ways.
+
+**One limit is recorded rather than hidden.** `Message.body` is what a party typed, stored unaltered —
+"the platform contributes no prose to it at all" — so a customer who writes their own limit into a
+message has disclosed it themselves, and this screen renders it. `Docs/01` §4.3 binds the platform and
+the product, not the customer's mouth. A guard that suppressed words inside party-authored text would
+censor a negotiation *and* leave the actual hole — the app's own copy — exactly where it was. A test
+states this out loud so the next reader meets it as a decision rather than as a gap.
+
+`Message` was also added to `budget_stays_on_the_customer_side_test.dart`'s closed-key-set registry.
+It is the only response in the bidding domain carrying free text, so an extra prose field on it is
+where a sentence would travel under an innocuous name; the registry now fails on one whatever it is
+called.
+
+#### `make verify` was not run, and why
+
+**The branch changes no server behaviour**: no migration, no route, no Go file, no
+`scripts/verify/*.sh`. `git diff --name-only develop...` touches `apps/mobile/**` and this file and
+nothing else. The harness demonstrates platform acceptance criteria end to end and has nothing to say
+about a Flutter screen, so running it would have consumed the machine-wide mutex for a result that
+could not differ. `make flutter-check` and `make check` are the gates this ticket answers to.
 
 ## 4. Partly done — do not treat these as finished
 

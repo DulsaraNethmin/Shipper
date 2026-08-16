@@ -9,6 +9,7 @@ import 'package:shipper/core/routing/signed_in_shell.dart';
 import 'package:shipper/core/routing/starting_screen.dart';
 import 'package:shipper/features/bidding/compare_offers_screen.dart';
 import 'package:shipper/features/bidding/my_bids_screen.dart';
+import 'package:shipper/features/bidding/negotiation_screen.dart';
 import 'package:shipper/features/bidding/place_bid_panel.dart';
 import 'package:shipper/features/delivery/delivery_screen.dart';
 import 'package:shipper/features/delivery/proof_capture_screen.dart';
@@ -139,6 +140,35 @@ abstract final class Routes {
 
   /// [jobOffers] for one job.
   static String jobOffersFor(String jobId) => '/jobs/$jobId/offers';
+
+  /// One negotiation on one job, as either party sees it (SHIP-103).
+  ///
+  /// **Two identifiers in the path, which is the first route in this app to take a second**, and
+  /// both are load-bearing. A job can hold offers from several providers at once and they are not in
+  /// one room: each pair — this customer and one provider — has its own chain and its own
+  /// conversation, and no provider can see another's. So a job identifier alone does not name a
+  /// negotiation, and a path that pretended it did would be one screen for several exchanges.
+  ///
+  /// **The bid identifier is an address rather than a subject.** The platform resolves the whole
+  /// chain from *any* offer in it — "the one you are holding will do, however old" — so this stays
+  /// valid as counters supersede one another and never has to be rewritten by the screen holding it.
+  /// That is what makes it safe as a deep-link target (`Docs/07` §5): a notification sent when the
+  /// first offer was placed still opens the right conversation four counters later.
+  ///
+  /// **One route for both parties, deliberately, where `jobDetail` and `openJobDetail` are two.**
+  /// Those two are separate because the customer's job and the provider's view of it are different
+  /// *responses* — one carries the budget and the other must never be able to. A negotiation is the
+  /// opposite case: four endpoints, each serving both sides, each working out which from the
+  /// credential. Two routes here would be two renderings of one exchange, and the first thing they
+  /// would disagree about is whose turn it is.
+  ///
+  /// It collides with nothing. `/jobs/:id` matches one segment; `/jobs/:id/delivery/proof` has the
+  /// same shape but a literal third segment that differs.
+  static const negotiation = '/jobs/:id/negotiation/:bidId';
+
+  /// [negotiation] for one offer in one job's chain.
+  static String negotiationFor(String jobId, String bidId) =>
+      '/jobs/$jobId/negotiation/$bidId';
 
   /// Recording the milestones of one delivery, as the awarded **provider** (SHIP-129).
   ///
@@ -330,6 +360,14 @@ final _signedInPatterns = <RegExp>[
   // by tapping that button for exactly this reason, and it caught the omission on the first run.
   RegExp(r'^/jobs/[^/]+/offers$'),
 
+  // One negotiation on one job (SHIP-103). A seventh pattern, same reasoning, and the **first with
+  // two identifiers in it** — a job identifier alone does not name a negotiation, because a job can
+  // hold one exchange per provider and no provider may see another's. It is pushed from both
+  // parties' screens and is a deep-link target besides (`Docs/07` §5), so forgetting this line is a
+  // button that appears to do nothing on one side and a notification that lands on the home shell
+  // on the other. `negotiation_test.dart` reaches it by tapping, on both sides, for that reason.
+  RegExp(r'^/jobs/[^/]+/negotiation/[^/]+$'),
+
   // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
   // route reachable only through an identifier looks, from the outside, like a card that does
   // nothing when it is tapped.
@@ -520,6 +558,17 @@ final routerProvider = Provider<GoRouter>((ref) {
         path: Routes.delivery,
         builder: (context, state) => DeliveryScreen(
           jobId: state.pathParameters['id'] ?? '',
+        ),
+      ),
+      // Three segments under the job, like `delivery/proof`, and declared with them rather than
+      // after `jobDetail` so that "everything more specific under /jobs comes before /jobs/:id"
+      // keeps holding. It cannot collide with `deliveryProof`: that route's third segment is the
+      // literal `delivery`, and this one's is the literal `negotiation`.
+      GoRoute(
+        path: Routes.negotiation,
+        builder: (context, state) => NegotiationScreen(
+          jobId: state.pathParameters['id'] ?? '',
+          bidId: state.pathParameters['bidId'] ?? '',
         ),
       ),
       // Two segments, like `delivery` and `open/{id}`, and declared before `jobDetail` for the same

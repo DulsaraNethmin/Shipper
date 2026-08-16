@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import 'package:shipper/core/errors/api_failure.dart';
+import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/bidding/award_controller.dart';
 import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
@@ -183,10 +185,11 @@ class _Comparison extends ConsumerWidget {
         // The row itself. A fixed height, because cards of different heights side by side stop the
         // rows lining up — which is the whole of what makes this a comparison.
         SizedBox(
-          // Raised from 360 when SHIP-104 added the action, so that the button is on the card
-          // rather than below the fold of the card's own scroll view. A primary action a customer
-          // has to scroll a card to find is one most of them will not find.
-          height: 420,
+          // Raised from 360 when SHIP-104 added the action, and again when SHIP-103 added the way
+          // into the negotiation, so that both buttons are on the card rather than below the fold of
+          // the card's own scroll view. A primary action a customer has to scroll a card to find is
+          // one most of them will not find.
+          height: 480,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -337,19 +340,61 @@ class _OfferCard extends ConsumerWidget {
               // 4. The vehicle and its declared capability.
               _Vehicle(offer),
 
-              // 5. The action, when there is one to offer (SHIP-104).
+              // 5. The way into the negotiation (SHIP-103).
+              //
+              // **Offered on every card, whatever the offer's state**, which is the same call
+              // `_CompareOffers` on the job screen makes about itself: the conversation endpoint has
+              // no status rule at all — "the moment two parties most need to arrange something is
+              // after the award" — so a rule on the device about when it is worth opening would be a
+              // copy of a decision the platform deliberately did not make.
+              const SizedBox(height: 16),
+              _NegotiateButton(offer: offer, jobId: jobId),
+
+              // 6. The action, when there is one to offer (SHIP-104).
               //
               // Below the four things being compared rather than above them, because it is what a
               // customer does *after* reading the card. `isAwardable` is presentation — the
               // platform decides — and the button is simply absent on the customer's own counter
               // and on an offer that has ended, which the rows above already say in words.
               if (offer.isAwardable && !award.awarded) ...[
-                const SizedBox(height: 16),
+                const SizedBox(height: 8),
                 _AwardButton(offer: offer, jobId: jobId, awarding: award.awarding),
               ],
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// The way from one offer into the negotiation behind it (SHIP-103).
+///
+/// **The card is the summary and the negotiation is the record.** A card shows the offer as it
+/// stands; the screen behind this shows every round it went through, both parties' words, and the
+/// two ways to answer. `Docs/01` §4.3 requires the platform to record all offers, counter-offers and
+/// withdrawals, and this is the customer's way to read that record.
+///
+/// It is addressed by **this offer's** identifier, which is enough: the platform resolves the whole
+/// chain from any offer in it, so a customer opening the negotiation from a superseded card and one
+/// opening it from the live head arrive at the same conversation.
+class _NegotiateButton extends StatelessWidget {
+  const _NegotiateButton({required this.offer, required this.jobId});
+
+  final ReceivedOffer offer;
+  final String jobId;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: double.infinity,
+      child: OutlinedButton.icon(
+        key: Key('negotiate-offer-${offer.id}'),
+        // `push` rather than `go`, so the back gesture returns to the comparison where it was
+        // rather than re-reading every page the customer had loaded.
+        onPressed: () => context.push(Routes.negotiationFor(jobId, offer.id)),
+        icon: const Icon(Icons.forum_outlined),
+        label: const Text('Message and counter'),
       ),
     );
   }

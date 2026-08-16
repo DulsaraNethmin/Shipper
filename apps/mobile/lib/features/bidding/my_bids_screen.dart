@@ -349,6 +349,25 @@ class _BidCard extends StatelessWidget {
                   Icon(Icons.chevron_right, color: theme.colorScheme.onSurfaceVariant),
                 ],
               ),
+              const SizedBox(height: 4),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: OutlinedButton.icon(
+                  key: Key('negotiate-bid-${bid.id}'),
+                  // **A second destination on the same card, and it is deliberately not the same
+                  // place.** Tapping the card opens the *job*, which stops answering the moment the
+                  // job leaves the open feed — awarded, cancelled or expired — because that read is
+                  // scoped to what a provider may bid on. The negotiation has no such rule and never
+                  // closes: `…/history` and `…/messages` both keep working after the award, which is
+                  // when two parties most need to arrange something.
+                  //
+                  // On its own row rather than beside "View the job", so the two do not compete for
+                  // width on a narrow phone and neither overflows.
+                  onPressed: () => context.push(Routes.negotiationFor(bid.jobId, bid.id)),
+                  icon: const Icon(Icons.forum_outlined),
+                  label: const Text('Message and counter'),
+                ),
+              ),
             ],
           ),
         ),

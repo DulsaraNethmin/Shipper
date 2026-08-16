@@ -76,6 +76,35 @@
 /// key set over the model and a source scan over the file. `compare_offers_test.dart` asserts on the
 /// **words rendered**, which is what wave 9's finding cost to learn.
 ///
-/// What is still not here: awarding (SHIP-104) and the negotiation screens (SHIP-103), which is
-/// where revise, withdraw and counter belong.
+/// ## The negotiation arrived at SHIP-103, and it is one screen for two people
+///
+/// `Docs/01` §4.2's "negotiate" and `Docs/02` §4's alternating chain, with the conversation that a
+/// price and two dates cannot carry.
+///
+/// - `message.dart` — the `Message` schema, and the only free text this domain receives.
+/// - `bid.dart`'s `BidCounter` — a **difference**, not an offer, which is why it is a third type
+///   rather than a nullable `BidPlacement`.
+/// - `instant_field.dart` — the calendar and clock both forms enter a commitment through. It was
+///   private to `place_bid_panel.dart` until a second caller needed it (`Docs/07` §2).
+/// - `negotiation_controller.dart` — one state over the chain and the conversation, two idempotency
+///   keys, and a counter that re-reads rather than reasons.
+/// - `negotiation_screen.dart` — the rounds, the words, the composer and the counter form.
+///
+/// **One screen for both parties, where the job has two.** `jobDetail` and `openJobDetail` are
+/// separate because the customer's job and a provider's view of it are different *responses* — one
+/// carries the customer's private figure and the other must never be able to. A negotiation is the
+/// opposite case: all four of its endpoints serve both sides and work out which from the credential,
+/// so two screens would be two renderings of one exchange, disagreeing first about whose turn it is.
+///
+/// **And it is the most dangerous surface in this product for `Docs/01` §4.3**, because it renders
+/// both parties' words beside a form for proposing a number. The third clause — no "budget supplied"
+/// indicator — is a *sentence*, which carries no field, no value and no digit, and a closed key set
+/// cannot see one. `negotiation_test.dart` therefore asserts on the **words rendered in the
+/// provider's view**. Two numbers on that screen are legitimate and must not be confused with it:
+/// the provider's own price, and the customer's counter amount, which the customer chose to put in
+/// front of them.
+///
+/// What is still not here: revising your own offer (`PATCH …/{bid_id}`) and withdrawing it
+/// (`POST …/withdraw`). Both end or change a commitment the other party is relying on, and both want
+/// a confirmation flow of their own rather than a button on a list.
 library;
