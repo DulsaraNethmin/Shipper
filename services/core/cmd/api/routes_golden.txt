@@ -52,6 +52,8 @@ GET    /v1/jobs/{id}/bids/received              user         v1
 PATCH  /v1/jobs/{id}/bids/{bid_id}              user         v1
 POST   /v1/jobs/{id}/bids/{bid_id}/counter      user         v1
 GET    /v1/jobs/{id}/bids/{bid_id}/history      user         v1
+GET    /v1/jobs/{id}/bids/{bid_id}/messages     user         v1
+POST   /v1/jobs/{id}/bids/{bid_id}/messages     user         v1
 POST   /v1/jobs/{id}/bids/{bid_id}/withdraw     user         v1
 POST   /v1/jobs/{id}/cancel                     user         v1
 GET    /v1/jobs/{id}/delivery/detail            user         v1

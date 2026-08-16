@@ -104,8 +104,9 @@ SQL
 # delivery_award <job-id> <provider-id> — the accepted bid SHIP-92 will write.
 delivery_award() {
   "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -v job="$1" -v provider="$2" >/dev/null <<'SQL'
-INSERT INTO bids (id, job_id, provider_id, status, amount)
-VALUES (gen_random_uuid(), :'job', :'provider', 'Accepted', 450.00);
+INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+VALUES (gen_random_uuid(), :'job', :'provider', 'Accepted', 450.00,
+        now() + interval '2 days', now() + interval '3 days');
 SQL
 }
 

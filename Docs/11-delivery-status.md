@@ -699,6 +699,9 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
 | **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
+| **SHIP-87a** | M3 | `ck_bids_offer_has_timing` restored (`000505`) — the constraint `000501` wrote, applied and removed because it would have bound SHIP-87's design. That design is made and it **inherits**, so every row the platform writes past `Draft` already states both instants. It is a `CHECK` rather than a validator because the validator is in front of one door and a worker, a repair script or a psql prompt is not behind it. **The cost `Docs/09` priced in was real and wider than the six tests it named** — twelve fixture sites across five packages and three verify sections wrote a closed bid with no timing, because until now nothing refused one — *see below* |
+| **SHIP-95a** | M3 | The race nothing was running: **an expiry sweep and an award contending for one `jobs` row.** `LeaveNegotiation`'s `FOR UPDATE SKIP LOCKED` was the strongest untested invariant on the board — `make check` exited 0 with it removed. It now exits 1 in two ways: the race, driven by hand and confirmed with `pg_blocking_pids` as SHIP-95 does, and a source guard over **all three copies** of the statement. With the clause gone PostgreSQL reports a real deadlock, SQLSTATE **40P01**, in about a second. **No endpoint: demonstrated by its own tests** — *see below* |
+| **SHIP-97** | M3 | Job-scoped messaging — `POST` and `GET /v1/jobs/{id}/bids/{bid_id}/messages`, `000506_job_messages`. **A conversation is the `(job, provider)` pair rather than the job**, which is `bids.provider_id`'s meaning since `000502` and is what keeps competing providers out of one room — a shared thread discloses through prose, which no closed key set can catch. It attaches to the *negotiation* and not to an offer, so it survives a counter, and **there is no status gate at all**: the moment two parties most need to arrange something is after the award. The disclosure guard is **word-level over rendered output**, inverted — every word must be accounted for. **The 'and admins' clause is declared reduced**: met in the domain, unreachable from the wire — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13156,6 +13159,359 @@ the request is withdrawn by whoever made it; recording a rejection would make th
 two outcomes to route, and would put a disagreement between colleagues into the one table that
 records what was *done*, when nothing was. `withdrawn` exists in the CHECK and has no endpoint —
 named as a later ticket's, so that a pending review is not something only an approval can clear.
+
+#### Nothing was needed from `internal/config`
+
+### SHIP-87a — the constraint `000501` wrote and took back out, and what four waves of deferral cost
+
+`000501` is unusually explicit about what it did: the obvious twin of `ck_bids_offer_has_an_amount`
+"was written, applied, and then removed", because "it binds a design SHIP-87 has not made yet". That
+was the right call at the time and it has been spent for three waves. SHIP-87 landed, SHIP-88 built
+the supersede chain on top of it, and the specific question `000501` was protecting — whether a
+customer countering on price alone restates the timing or inherits it — **was answered `inherit`**.
+So every row this platform writes past `Draft` carries both instants already, and `000505` adds the
+constraint against data that satisfies it rather than against data it has to be reconciled with.
+
+#### The argument for a `CHECK` is that a validator is in front of exactly one door
+
+`Offer.validate` refuses an offer naming neither instant, at placement and at revision. That is the
+whole of the enforcement that existed, and it covers `POST /v1/jobs/{id}/bids` and nothing else. A
+worker, a repair script, an administrative path, a future endpoint or a psql prompt writes SQL, and
+SQL does not call a validator.
+
+**The consequence was already documented in the code rather than hypothetical.**
+`internal/bidding/expiry.go`'s claim carries `pickup_at IS NOT NULL` with a comment naming this
+missing constraint as its reason: "a claim that relied on a validator holding would sweep a row it
+could not judge the moment some other writer skipped it." That predicate stays. It is now the second
+of two guards rather than the only one, which is the same relation `postgresStore.expireBid`'s
+compare-and-set has to the claim that selected the row, and both files now say so.
+
+`TestAnOfferWithNoCollectionTimeIsNotSwept` is where that reads oddly at first glance: the row it
+needs is now a row the schema refuses, so it **drops the constraint in its own cloned database**
+before writing the fixture. `pgtest` clones a database per test, so nothing outside the function
+sees it — and it is the only honest way to go on asserting the claim's half of a property that is
+now held twice.
+
+#### Both instants rather than either, because the ordering constraint cannot see a NULL
+
+`ck_bids_timing_is_ordered` (`000501`) compares `deliver_by > pickup_at` and is written to pass when
+either is NULL, since it can only compare two values it has. So a row naming a collection time and
+no delivery satisfies every other constraint on the table and is still an offer nobody can be held
+to. "Neither", "pickup only" and "delivery only" are therefore three cases in
+`TestAnOfferPastDraftNamesItsTiming` and in `scripts/verify/61-bidding.sh`, not one.
+
+The `Draft` exemption is asserted rather than assumed, for `000404`'s reason about job drafts:
+refusing an incomplete row is refusing to save what somebody has typed so far. A constraint that had
+quietly lost its `status = 'Draft' OR` would pass every case above and break the one screen a
+provider spends the longest on.
+
+#### What it actually cost, measured rather than predicted — and this is the part to read before merging
+
+`Docs/09`'s row prices in "editing another ticket's fixtures", and `000501` sized that at "six of
+SHIP-80's own migration tests". **The measurement on this tree is wider.** With the constraint
+applied and nothing else changed, `make test` failed in **five packages** — `internal/admin`,
+`internal/bidding`, `internal/delivery`, `internal/fleet` and `cmd/notifier` — plus `migrations`,
+and three `scripts/verify` sections would have followed.
+
+The blast is loud and the repair is small: **twelve fixture sites**, every one of them a single
+`INSERT INTO bids` arranging a world rather than testing one. `internal/delivery` alone carries
+about a hundred and fifty failures behind **one** helper. The sites are
+
+| File | Sites | What it was arranging |
+|---|---|---|
+| `migrations/bids_test.go` | 8 | the `newBid` helper, `ck_bids_status`, `uq_bids_one_accepted_per_job`, `ck_bids_offer_has_amount`'s three, and the two foreign keys |
+| `migrations/bid_counter_offers_test.go` | 2 | the supersede chain and the per-party idempotency key |
+| `internal/delivery/assignment_test.go` | 1 | `acceptBid` — the awarded job every delivery test starts from |
+| `internal/admin/service_test.go` | 2 | `acceptBid`, and a losing bid for the stranger checks |
+| `internal/fleet/providerjob_test.go` | 1 | SHIP-96a's every-status loop, which includes `Draft` |
+| `cmd/notifier/parties_test.go` | 2 | the accepted and losing bids party resolution reads |
+| `scripts/verify/60-fleet.sh` | 2 | SHIP-96a's awarded job, and the rival provider's bid on another job |
+| `scripts/verify/70-delivery.sh` | 1 | `delivery_award` |
+| `scripts/verify/90-admin.sh` | 1 | `dispute_award` |
+
+**The table sums to twenty and the figure above is twelve, and that is deliberate rather than a
+slip: the twelve excludes `migrations/bids_test.go`'s eight**, whose repair `Docs/09`'s row already
+names as part of the ticket ("`migrations/bids_test.go`'s fixtures are updated"). Twelve is the
+*blast radius outside what the ticket priced*, which is the number worth carrying. It is written
+down because the two figures sit in one paragraph and the next reader will otherwise correct the
+one that is right — this session nearly did.
+
+**Every one of those edits makes a fixture write the row the platform would actually have written**,
+which is why they are corrections rather than accommodations. `internal/fleet`'s is the only one
+with a condition in it, and the condition is the point: that helper is the one caller that writes a
+`Draft`, and the two constraints are twins with one predicate, so filling the timing in
+unconditionally would have stopped it exercising the one status allowed to be incomplete.
+
+**Two of the twelve were found by `make verify` and not by `make test`, after the branch was already
+committed** — `60-fleet.sh`'s pair. That is the trap worth carrying forward rather than the count:
+`make check` passing says nothing about a shell fixture, because the Go tests and the harness keep
+separate fixtures, so a constraint that lands green under `make check` can still stop the harness at
+the first section that writes SQL. **A new `CHECK` on a table needs a sweep of `scripts/verify/*.sh`
+in the same pass as the Go fixtures**, and the harness stops at the first failure, so one section
+fixed is not evidence the rest are clean.
+
+**Ten of those twelve sites are outside this branch's stated ownership**, and that is recorded here
+rather than glossed: five domain packages and three verify sections belong to other lanes. The edits
+are additive fixture lines in `_test.go` files and two shell fixtures, and no production code in
+another domain changes — but a merge conflict here is a real possibility and this is the row that
+says where to look.
+
+#### Nothing was needed from `internal/config`
+
+### SHIP-95a — the race that had never been run, and the deadlock it produces when the clause is removed
+
+`Docs/08` names four races and SHIP-95 ran all four. This is the fifth, and it is the one the other
+four cannot reach: **a sweep and an award contending for the same `jobs` row.**
+
+Docs/11 §3's SHIP-88 entry records the ordering this domain keeps — `jobs` → `bids`, one direction,
+nothing coming back — and `Presentation.LeaveNegotiation` is the single call that cannot obey it. By
+the time `bidding` reaches it the offer has closed, and in the expiry sweep the `bids` rows were
+locked by the **claim**, before the domain was entered at all. So the sweep arrives at the job
+holding bids while the award arrives at the bid holding the job. `FOR UPDATE SKIP LOCKED` is the only
+thing keeping that cycle open, and until this ticket **nothing failed when it was removed.**
+
+#### The interleaving is driven by hand and then confirmed by the server, which is SHIP-95's own shape
+
+`TestAnExpirySweepDoesNotQueueBehindAnAwardHoldingTheJob` opens a transaction the test drives, runs
+the real `ExpiryClaim` in it — the query `cmd/worker` runs, not a hand-written `SELECT`, because what
+the sweep is *holding* is the whole subject — and then starts an award in the background. The award
+takes the job row, which nothing else holds, and stops at the first offer. `pg_blocking_pids` is
+polled until PostgreSQL says so. Only then does the sweep expire what it claimed and walk on to the
+job.
+
+**The contention asserted is the award waiting on the sweep, and that is deliberate rather than
+second best.** With the clause in place the sweep never waits, so there is no second block for the
+server to report — the absence of it *is* the property. What the wait establishes is that the two
+transactions genuinely overlapped, which is the half a free-running test cannot establish about
+itself.
+
+#### The verdict, run rather than predicted
+
+| Mutation | Verdict |
+|---|---|
+| `SKIP LOCKED` removed from `internal/bidding/fixtures_test.go`'s `LeaveNegotiation` — the copy the race drives | **Caught.** `TestAnExpirySweepDoesNotQueueBehindAnAwardHoldingTheJob` fails in 1.49s with *"the award was killed to break a deadlock: … ERROR: deadlock detected (SQLSTATE 40P01)"* |
+| The same clause removed from `cmd/api/routes_bidding.go` and `cmd/worker/tasks_bidding.go` | **Caught.** `TestEveryLeaveNegotiationTakesTheJobRowWithoutWaiting` fails, naming the file |
+| Before this ticket, any of the three | **Survived.** `make check` exited 0, which is what `Docs/09`'s row is about |
+
+The deadlock is real rather than diagnosed: PostgreSQL detects the cycle after `deadlock_timeout` and
+kills a backend. **Which backend is the server's choice**, so both sides are asserted — the sweep must
+succeed and the award must be refused with `ErrBidClosed` — and `deadlocked()` matches SQLSTATE 40P01
+explicitly so that a deadlock can never be mistaken for a legible refusal. That is the trap
+`TestTheJobIsTakenBeforeTheBid` records about the award's own ordering: a suite that accepted "one of
+them failed" would accept the deadlock as correct behaviour. In the run that established this test the
+server killed the **award**, and the first draft of the assertion reported that as *"the two never
+overlapped"* — the precise opposite of what had happened. The check order was corrected so the deadlock
+is diagnosed first.
+
+#### Two tests rather than one, because a source guard and a race prove different things
+
+Neither composition root is importable from `internal/bidding` — both are `package main`, and the port
+exists precisely so this package names neither type — so the race runs against the package's own
+faithful copy. **Wave 10's finding applies and is why that is not the whole ticket**: a pairing guard is
+a text guard, and a test that reads a constant does not test the query that interpolates it. So
+`TestEveryLeaveNegotiationTakesTheJobRowWithoutWaiting` parses all three files and requires the clause
+in each `LeaveNegotiation` body, and fails loudly if a file stops declaring the method at all — a guard
+looking at the wrong file is worse than the failure it was written for. The fixture is in the list
+rather than exempt from it: it is the copy the race drives, so a silent drop there would take the race
+down with it.
+
+#### And a second race, because "skipped" and "broken" look identical
+
+`FOR UPDATE SKIP LOCKED` returning no row is indistinguishable in one statement from a job that does
+not exist — `presentedJobs.LeaveNegotiation` says so and answers `JobPresentationHeld` for both. A
+`LeaveNegotiation` that had stopped working altogether would satisfy every assertion in the contended
+test: nothing moved, and nothing was meant to.
+`TestAnExpirySweepReachesTheJobWhenNobodyIsHoldingIt` runs the identical sweep against the identical
+fixture with the row free and **requires** the move to Open.
+
+#### The cost the port documents is asserted rather than left as prose
+
+`Presentation.LeaveNegotiation` states it plainly: "under contention a job can sit at Negotiating with
+no live offer until the next thing happens to it." That is the end state of this race and it is
+checked — the job at Negotiating, two transitions and not three, and zero live offers, counted through
+`postgresStore.liveOffers` rather than a second `WHERE` written in the test. A later change that made
+the sweep wait for the row would produce a tidier job status and a deadlock.
+
+#### No endpoint, and no verify section
+
+The subject is a lock ordering between two transactions, one of which is a worker pass. `make verify`
+drives HTTP and cannot arrange the interleaving; a bash approximation of it would be the vacuous race
+this file's own harness exists to refuse. This is the case Docs/11 §3's opening paragraph describes —
+work that reaches no HTTP endpoint is demonstrated by its own tests and says so in the row.
+
+#### Nothing was needed from `internal/config`
+
+### SHIP-97 — the conversation is a pair, not a job, and the admin clause is declared rather than met
+
+*Done when*: "messages attach to a job and are visible only to its two parties and admins." One
+sentence, three clauses, and the second one settles the whole data model.
+
+#### "Its two parties" — a job before an award has one customer and several providers
+
+An Open job carries offers from a dozen providers at once. A table keyed on the job alone would put
+every one of them in one room with the customer and with each other, and **Docs/01 §4.3's second line
+— "treat provider bid price as private from competing providers" — would then be broken by prose
+rather than by a field.** A provider writing *"I can beat whoever quoted you six hundred"* discloses
+a competitor's price with no column involved, and no closed key set, no value search and no AST walk
+can catch that. The only guard is not to build the room.
+
+So a conversation is `(job_id, provider_id)`, which is exactly what a negotiation is. **`000506`
+copies `000502`'s pair verbatim** — `provider_id` names the conversation and `sent_by` names the
+writer — so `bids` and `job_messages` answer "who is this between" and "who wrote this" the same way.
+There is no `sender_id` and no `customer_id`: the first is derivable from the other two and the
+second is `jobs`' column, which this domain may not read.
+
+#### The room is shut by a guard that was mutated rather than believed
+
+A passing check is not a verdict, and this section's own check — *"a provider holding a live offer on
+the same job gets exactly what a bid that does not exist gets, in both directions"* — passes just as
+readily against a guard that is not there, because a conversation a stranger cannot reach and a
+conversation nobody thought to widen look identical from outside.
+
+| Mutation | Verdict |
+|---|---|
+| `if !audience.permitted()` replaced by `if false` in `Service.Messages` — the read guard removed, so a caller `audienceFor` resolves as `AudienceNone` reads the page anyway | **Caught**, by three tests and five assertions |
+
+`TestNobodyOutsideTheNegotiationCanReadOrWrite` fails on all three of its outsiders — a provider
+bidding on the same job, a customer with no relationship to it, and an identifier belonging to
+nobody — each reporting `reading = <nil>, want ErrNotBidOwner — one 404 for every outsider`.
+`TestTwoProvidersOnOneJobHaveTwoConversations` fails in both directions, which is the disclosure
+above stated as a test: each provider reads the other's conversation with the customer.
+
+**And `TestAnAdministratorReadsAnyConversation` fails on its own negative control**, which is the
+result worth keeping. It reads the conversation once *without* the flag before reading it with one,
+and reports `the same account without the flag = <nil>, want ErrNotBidOwner — otherwise this test
+proves nothing about the flag`. A test for a permission that never establishes the permission was
+needed is a test that passes when the permission is deleted; this one says so itself.
+
+**One assertion did not fire, and that is a fact about the code rather than a gap.** Every *writing*
+assertion in those tests still passed, because `SendMessage` does not go through `Service.Messages`
+at all — it reaches its offer through `Service.reachableBid` in `service.go`, which is SHIP-87's own
+guard and was not mutated. **Reading
+and writing are refused by two independent functions**, so no single mutation can open both, and a
+future session mutating one must not read the other's tests staying green as coverage.
+
+Restored from `/tmp/wave12b-msg-snap` with `cp`, and confirmed both ways: `git diff` empty and
+`shasum -a 256 -c` reporting `OK`.
+
+#### It attaches to the negotiation, not to an offer, which is why there is no `bid_id`
+
+`POST /v1/jobs/{id}/bids/{bid_id}/messages` names an offer and the row records none. A counter
+replaces the live offer with a new row (SHIP-88) and a withdrawn offer can be replaced by a fresh
+one, so one pair of parties can hold several chains on one job. A conversation attached to an offer
+would restart every time somebody countered — the question on the superseded row and the answer on
+its successor — and neither party could read the exchange.
+`TestTheConversationSurvivesTheOfferItWasStartedOn` reaches the same conversation through the
+original offer and through the counter that displaced it.
+
+#### There is no status gate anywhere, and that is a decision rather than an omission
+
+Nothing in `messages.go` reads a bid's status. **The moment two parties most need to arrange
+something is after the award**, when the offer that got them there is `Accepted` and every other one
+is `Rejected`; a rule that closed the conversation when the negotiation closed would shut it exactly
+then. Docs/02 §4 keeps the chain readable after a negotiation ends for the same reason, and
+`Negotiation.CustomerOf` is already documented as answering "whatever the job's status" so that a
+party keeps their access afterwards. `TestMessagingOutlivesTheOffer` runs every closed status rather
+than the awarded one, because the rule is *no* status rule and a test naming one would pass against
+an implementation that permitted that one.
+
+#### The "and admins" clause is **declared reduced**, and here is exactly what a future reader adds
+
+`Service.Messages` takes SHIP-96's `Viewer` and resolves the reader through SHIP-96's own
+`audienceFor`, so an administrator is one branch that already exists — `AudienceAdministrator`, no
+second rule, no field list. `TestAnAdministratorReadsAnyConversation` proves it at the service, and
+proves it *is* the flag doing the work by refusing the identical account with the flag off first.
+
+**It is unreachable from the wire and cannot be made reachable by this branch.** `authctx.Subject`
+carries two roles and neither is an administrator — Docs/06 §5.2 and SHIP-147 make admin sign-in a
+separate credential system a user token cannot reach — so `cmd/api` builds every `Viewer` with
+`Administrator: false` and there is nothing in this platform that could make it true. This is the
+same shape SHIP-96 recorded for the bid history and this is the second endpoint behind it.
+
+**What a future administrative reader has to add, in full:**
+
+1. an admin-authenticated route — `GET /v1/admin/jobs/{id}/bids/{bid_id}/messages` or a conversation
+   list under SHIP-152's job detail — declared in `cmd/api/routes_admin.go` with `RequireAdmin`;
+2. a handler that builds `bidding.Viewer{ID: <administrator>, Administrator: true}` and calls
+   `Service.Messages`. **That is the entire change.** No migration, no store method, no widening of
+   `messages.go`, and no second audience rule;
+3. an `audit_log` entry if the read is to be recorded, which is SHIP-150's helper and this domain's
+   business not at all.
+
+Nothing about what a row *shows* differs between the three readers — visibility.go's own point — so
+the administrative half is a mapping in `cmd/api` and never a field.
+
+#### The disclosure guard is word-level and inverted, because this is the domain's first free text
+
+Every other response here is numbers and instants, so a closed key set is a complete answer: there is
+no budget field because there is no job in the shape. **This one carries a sentence.** Wave 10
+isolated *"The customer has set a maximum."* — no field, no value, no digit — and a thirteen-test
+suite passed with it live, defeating a closed key set, a word search, a value search, an AST walk and
+a SQL column guard in turn.
+
+So `TestNothingTheCustomerTypedIsAddedToByThePlatform` **inverts the assertion**: it renders the
+response, decomposes it into words, and requires every word to have come from the closed key set, the
+party enumeration, an identifier, an instant, or the bodies the test itself typed. Anything left over
+is something the platform introduced. **The check does not need to recognise a disclosure; it only
+needs to notice a word nobody put there.** `scripts/verify/61-bidding.sh` runs the same shape over the
+wire, against a job whose budget is asserted present first so the check is not vacuous.
+
+**The wire copy needed one thing the Go test did not, and only a harness run could have said so.**
+`words` runs over the *rendered* text, so a JSON boolean is a bare word to it. The Go test marshals
+`[]messageResponse` — the rows alone — while the endpoint returns them inside `Docs/10` §4.5's
+envelope, so `has_more` exists on the wire and in no Go fixture. The allow-list held `has_more` as a
+*key* and nothing accounted for its *value*, and `false` was left over. **The two halves of one
+check were not reading the same document**, which is the general form worth remembering: a Go test
+that renders a fragment and a verify check that renders the whole response are not the same
+assertion, and only the second sees the envelope. `true`, `false` and `null` are now allowed as
+syntax, which costs the check nothing — an added *sentence* is still left over.
+
+It went unseen because **`make check` cannot reach a shell check and `make verify` never got there**:
+the run was stopping in `60-fleet.sh`, the file before this one, on the fixture named in SHIP-87a's
+account above. One failure was hiding the other, which is the argument for sweeping past the first
+red rather than fixing it and declaring the gate clean.
+
+One thing this deliberately does *not* claim: **a party's own words are their own to choose.** A
+customer who types their budget into a message has disclosed it themselves. The invariant is about
+what the platform exposes, and the platform exposes nothing.
+
+#### The retry is the column rather than the cache, and a duplicated message is worse than most
+
+`uq_job_messages_idempotency` is scoped `(job_id, provider_id, sent_by, idempotency_key)` — `000502`'s
+correction to `000501` applied from the start rather than discovered later, because two writers sit
+inside one pair. `make verify` demonstrates both halves: a retry answered by the middleware
+(`Idempotency-Replayed: true`), then the cached entry deleted and the *same* retry answered from the
+row with the header absent.
+
+It matters more here than for a bid. **The other party has already read the message and cannot tell
+which sending was the mistake**, which is also why the insert is `DO NOTHING` rather than `DO UPDATE`:
+a retry carrying different words is a *new* message, and silently replacing the delivered one would
+rewrite what somebody had already seen.
+
+**The two halves answer with different statuses, and the verify check first asserted the wrong one.**
+A retry the middleware replays returns the **stored 201** — `httpx`'s `replay` writes `resp.Status`
+verbatim, so a cached creation stays a creation — while a retry the *column* answers returns **200**,
+because `SendMessage`'s `ON CONFLICT DO NOTHING` declines, the row is read back and `created` is
+false. The check expected 200 from both. This file's own SHIP-87 placement checks (`r1`/`r2`/`r3`)
+had the pattern right — 201, the stored 201, then 200 from the row — so the correction was to match
+the shape already three checks old rather than to invent one. Recorded because **a replayed status
+is the original status**, and a reader who assumes a retry is always 200 will write this bug again.
+
+#### What was declined, on the record
+
+**No domain event.** SHIP-97's *Done when* asks for none, `Docs/01` §4.5's notification list does not
+name messaging, and SHIP-138's templates would need copy nobody has specified. Emitting an
+unschematised type would fail `cmd/api`'s own event-catalogue test, and emitting a schematised one
+nothing consumes is the coverage-shaped hole SHIP-136 refused for `bid.expired`. **The trigger is a
+notification ticket for messaging, which does not exist.**
+
+**No read receipts, no unread count, no attachments.** None is in any document; each needs a
+per-reader row rather than a column, and an attachment is an object-storage design (Docs/06 §4.1).
+`000506`'s header names all three with their triggers.
+
+**No administrator as a writer.** `ck_job_messages_sent_by` admits two values.
+`TestAnAdministratorMayReadAndNotWrite` holds it: Docs/02 §4 makes an administrator a *reader* of a
+negotiation, and a message from one would have to be attributed to a party who did not write it.
 
 #### Nothing was needed from `internal/config`
 

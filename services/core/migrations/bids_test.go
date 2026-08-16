@@ -24,10 +24,26 @@ import (
 // under a race, and both look correct in every test that does not run two transactions at once.
 // TestOneAcceptedBidPerJobHoldsUnderARace does.
 
+// offerTiming is the two instants every offer past Draft has to state (SHIP-87a).
+//
+// **Written as an interval against the database's own clock rather than as a parameter**, because
+// nothing in this file is about *when* an offer collects — the tests here are about a CHECK, an
+// index and two foreign keys. A fixture that took the timing as an argument would invite a caller to
+// think it mattered, and every call site would then carry two values nobody reads.
+//
+// The order is the one ck_bids_timing_is_ordered (000501) requires: delivery after collection.
+const offerTiming = `now() + interval '2 days', now() + interval '3 days'`
+
 // newBid inserts one live offer and returns its id.
 //
 // 'Submitted' rather than the column default, because a Draft is the one status that may have no
 // amount and every test below is about an offer somebody can act on.
+//
+// **It states its timing, and that is SHIP-87a rather than tidiness.** ck_bids_offer_has_timing
+// refuses a row past 'Draft' that names neither instant, so a fixture written before that constraint
+// existed now fails at the INSERT rather than at the assertion it was written for. 000501 predicted
+// exactly this — "it failed six of SHIP-80's own migration tests" — and the fix is the one that
+// makes the fixture write the row the platform would actually have written.
 func newBid(t *testing.T, pool *pgxpool.Pool, job, provider uuid.UUID, amount string) uuid.UUID {
 	t.Helper()
 
@@ -36,7 +52,8 @@ func newBid(t *testing.T, pool *pgxpool.Pool, job, provider uuid.UUID, amount st
 		t.Fatalf("generating an id: %v", err)
 	}
 	if _, err := pool.Exec(t.Context(),
-		`INSERT INTO bids (id, job_id, provider_id, status, amount) VALUES ($1, $2, $3, 'Submitted', $4)`,
+		`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+		 VALUES ($1, $2, $3, 'Submitted', $4, `+offerTiming+`)`,
 		id, job, provider, amount); err != nil {
 		t.Fatalf("inserting a bid by %s on %s: %v", provider, job, err)
 	}
@@ -117,9 +134,13 @@ func TestAnUnknownBidStatusIsRefused(t *testing.T) {
 	provider := newUser(t, pool, "bid-status-p@example.com", "+61400000501", "provider")
 	job := newJob(t, pool, customer)
 
+	// The timing is stated so that ck_bids_offer_has_timing (SHIP-87a) is not the constraint that
+	// refuses this row. A write violating two CHECKs is reported by whichever PostgreSQL evaluates
+	// first, and this test is about ck_bids_status alone.
 	id, _ := uuid.NewV7()
 	_, err := pool.Exec(t.Context(),
-		`INSERT INTO bids (id, job_id, provider_id, status, amount) VALUES ($1, $2, $3, $4, 500.00)`,
+		`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+		 VALUES ($1, $2, $3, $4, 500.00, `+offerTiming+`)`,
 		id, job, provider, "Won")
 	if err == nil {
 		t.Fatal("'Won' was accepted as a bid status")
@@ -173,8 +194,8 @@ func TestOneAcceptedBidPerJob(t *testing.T) {
 		// or a repair script would take this path.
 		id, _ := uuid.NewV7()
 		_, err := pool.Exec(t.Context(),
-			`INSERT INTO bids (id, job_id, provider_id, status, amount)
-			 VALUES ($1, $2, $3, 'Accepted', 400.00)`, id, job, second)
+			`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+			 VALUES ($1, $2, $3, 'Accepted', 400.00, `+offerTiming+`)`, id, job, second)
 		if err == nil {
 			t.Fatal("a second accepted bid was inserted alongside the first")
 		}
@@ -308,9 +329,13 @@ func TestAnOfferPastDraftNamesAnAmount(t *testing.T) {
 	job := newJob(t, pool, customer)
 
 	t.Run("a draft with no amount is allowed", func(t *testing.T) {
+		// The draft states its timing and no amount, so ck_bids_offer_has_timing (SHIP-87a) is not
+		// what refuses the submission below. The two constraints are twins with one predicate, and
+		// a test that left both unstated could not say which of them held.
 		id, _ := uuid.NewV7()
 		if _, err := pool.Exec(t.Context(),
-			`INSERT INTO bids (id, job_id, provider_id) VALUES ($1, $2, $3)`,
+			`INSERT INTO bids (id, job_id, provider_id, pickup_at, deliver_by)
+			 VALUES ($1, $2, $3, `+offerTiming+`)`,
 			id, job, provider); err != nil {
 			t.Fatalf("a provider could not start composing an offer: %v", err)
 		}
@@ -338,7 +363,8 @@ func TestAnOfferPastDraftNamesAnAmount(t *testing.T) {
 	t.Run("a submitted offer with no amount is refused", func(t *testing.T) {
 		id, _ := uuid.NewV7()
 		_, err := pool.Exec(t.Context(),
-			`INSERT INTO bids (id, job_id, provider_id, status) VALUES ($1, $2, $3, 'Submitted')`,
+			`INSERT INTO bids (id, job_id, provider_id, status, pickup_at, deliver_by)
+			 VALUES ($1, $2, $3, 'Submitted', `+offerTiming+`)`,
 			id, job, provider)
 		if err == nil {
 			t.Fatal("an offer with no price reached the customer")
@@ -352,8 +378,8 @@ func TestAnOfferPastDraftNamesAnAmount(t *testing.T) {
 		for _, amount := range []string{"0.00", "-1.00"} {
 			id, _ := uuid.NewV7()
 			_, err := pool.Exec(t.Context(),
-				`INSERT INTO bids (id, job_id, provider_id, status, amount)
-				 VALUES ($1, $2, $3, 'Submitted', $4)`, id, job, provider, amount)
+				`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+				 VALUES ($1, $2, $3, 'Submitted', $4, `+offerTiming+`)`, id, job, provider, amount)
 			if err == nil {
 				t.Errorf("%s was accepted as a bid amount", amount)
 				continue
@@ -380,6 +406,107 @@ func TestAnOfferPastDraftNamesAnAmount(t *testing.T) {
 	})
 }
 
+// TestAnOfferPastDraftNamesItsTiming is SHIP-87a, and it is the constraint 000501 deferred.
+//
+// **The demonstration is a direct INSERT, deliberately, and that is the whole argument for the
+// ticket.** `Offer.validate` in internal/bidding already refuses an offer naming neither instant, so
+// nothing reaching this table through `POST /v1/jobs/{id}/bids` could ever have produced one. What a
+// validator cannot cover is every *other* writer — a worker, a repair script, an admin path, a
+// migration, a future endpoint — and each of those writes SQL rather than calling the validator.
+// This test writes SQL.
+//
+// # Why both instants, and why the pair is checked in three directions rather than one
+//
+// ck_bids_timing_is_ordered (000501) compares `deliver_by > pickup_at` and is written to pass when
+// either is NULL, because it can only compare two values it has. So a row naming a collection time
+// and no delivery satisfies every other constraint on this table and is still an offer nobody can be
+// held to — which is why "neither", "pickup only" and "delivery only" are three cases here and not
+// one.
+//
+// # The Draft exemption is asserted rather than assumed
+//
+// It is the same exemption ck_bids_offer_has_an_amount carries and it exists for the same reason
+// 000404 gives about job drafts: refusing an incomplete row is refusing to save what somebody has
+// typed so far. A constraint that had quietly lost the `status = 'Draft' OR` would pass every case
+// above and break the one screen a provider spends the longest on.
+func TestAnOfferPastDraftNamesItsTiming(t *testing.T) {
+	pool := pgtest.DB(t)
+	customer := newUser(t, pool, "timing@example.com", "+61400000515", "customer")
+	provider := newUser(t, pool, "timing-p@example.com", "+61400000516", "provider")
+	job := newJob(t, pool, customer)
+
+	// Every status past Draft, rather than 'Submitted' alone. The constraint names no status but
+	// one, so a status it happened not to cover would be a status nobody checked — and 'Accepted'
+	// is the sharpest of them, where the award would otherwise commit both parties to an unstated
+	// date.
+	for _, status := range []string{
+		"Submitted", "Countered", "Accepted", "Rejected", "Withdrawn", "Expired", "Superseded",
+	} {
+		t.Run(strings.ToLower(status)+" with no timing is refused", func(t *testing.T) {
+			id, _ := uuid.NewV7()
+			_, err := pool.Exec(t.Context(),
+				`INSERT INTO bids (id, job_id, provider_id, status, amount)
+				 VALUES ($1, $2, $3, $4, 450.00)`, id, job, provider, status)
+			if err == nil {
+				t.Fatalf("a %s offer stating neither of its instants reached the table", status)
+			}
+			if !strings.Contains(err.Error(), "ck_bids_offer_has_timing") {
+				t.Errorf("expected ck_bids_offer_has_timing to refuse it, got: %v", err)
+			}
+		})
+	}
+
+	t.Run("half the timing is refused as well", func(t *testing.T) {
+		for _, half := range []struct {
+			name    string
+			columns string
+			values  string
+		}{
+			{"pickup only", "pickup_at", "now() + interval '2 days'"},
+			{"delivery only", "deliver_by", "now() + interval '3 days'"},
+		} {
+			t.Run(half.name, func(t *testing.T) {
+				id, _ := uuid.NewV7()
+				_, err := pool.Exec(t.Context(),
+					`INSERT INTO bids (id, job_id, provider_id, status, amount, `+half.columns+`)
+					 VALUES ($1, $2, $3, 'Submitted', 450.00, `+half.values+`)`, id, job, provider)
+				if err == nil {
+					t.Fatalf("an offer stating only its %s reached the table; "+
+						"ck_bids_timing_is_ordered passes when either instant is NULL, so nothing "+
+						"else here refuses it", half.columns)
+				}
+				if !strings.Contains(err.Error(), "ck_bids_offer_has_timing") {
+					t.Errorf("expected ck_bids_offer_has_timing to refuse it, got: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("a draft may state neither", func(t *testing.T) {
+		id, _ := uuid.NewV7()
+		if _, err := pool.Exec(t.Context(),
+			`INSERT INTO bids (id, job_id, provider_id) VALUES ($1, $2, $3)`,
+			id, job, provider); err != nil {
+			t.Fatalf("a provider could not start composing an offer: %v", err)
+		}
+
+		// And it cannot leave Draft on the strength of its price alone, which is the pair working:
+		// the amount is stated here so that ck_bids_offer_has_an_amount is not what refuses it.
+		if _, err := pool.Exec(t.Context(),
+			`UPDATE bids SET amount = 450.00 WHERE id = $1`, id); err != nil {
+			t.Fatalf("pricing the draft: %v", err)
+		}
+		_, err := pool.Exec(t.Context(),
+			`UPDATE bids SET status = 'Submitted' WHERE id = $1`, id)
+		if err == nil {
+			t.Fatal("an offer with a price and no dates was submitted to a customer")
+		}
+		if !strings.Contains(err.Error(), "ck_bids_offer_has_timing") {
+			t.Errorf("expected ck_bids_offer_has_timing to refuse it, got: %v", err)
+		}
+	})
+}
+
 // TestABidBelongsToARealJobAndProvider is Docs/10 §3.3's foreign key rule, both directions.
 //
 // ON DELETE RESTRICT rather than a cascade: SHIP-171 pseudonymises an account rather than
@@ -395,8 +522,8 @@ func TestABidBelongsToARealJobAndProvider(t *testing.T) {
 		id, _ := uuid.NewV7()
 		stranger, _ := uuid.NewV7()
 		_, err := pool.Exec(t.Context(),
-			`INSERT INTO bids (id, job_id, provider_id, status, amount)
-			 VALUES ($1, $2, $3, 'Submitted', 100.00)`, id, stranger, provider)
+			`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+			 VALUES ($1, $2, $3, 'Submitted', 100.00, `+offerTiming+`)`, id, stranger, provider)
 		if err == nil {
 			t.Fatal("a bid was placed on a job that does not exist")
 		}
@@ -409,8 +536,8 @@ func TestABidBelongsToARealJobAndProvider(t *testing.T) {
 		id, _ := uuid.NewV7()
 		stranger, _ := uuid.NewV7()
 		_, err := pool.Exec(t.Context(),
-			`INSERT INTO bids (id, job_id, provider_id, status, amount)
-			 VALUES ($1, $2, $3, 'Submitted', 100.00)`, id, job, stranger)
+			`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+			 VALUES ($1, $2, $3, 'Submitted', 100.00, `+offerTiming+`)`, id, job, stranger)
 		if err == nil {
 			t.Fatal("a bid was placed by an account that does not exist")
 		}

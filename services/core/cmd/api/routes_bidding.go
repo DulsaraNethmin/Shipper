@@ -118,6 +118,28 @@ import (
 // `counter` are acts on an offer and leave the job where it is; this is the other kind, and putting
 // it under `/bids/{bid_id}` would have made the two look alike.
 //
+// # Messaging is a collection under the offer, and the offer is a way in rather than a subject
+//
+// SHIP-97. `POST` and `GET /v1/jobs/{id}/bids/{bid_id}/messages`, one address for both parties, and
+// the platform works out which side the caller is on — the same arrangement `counter` takes and for
+// the same reason. Two addresses would be two authorisation rules to keep in step.
+//
+// **The conversation is `(job_id, provider_id)` and the bid in the path is how a caller reaches it.**
+// A negotiation can hold several chains — a counter replaces the live row, and a withdrawn offer can
+// be replaced by a fresh one — so a conversation attached to one offer would restart every time
+// somebody answered, and would lose the question the answer was to. Migration 000506 records no
+// `bid_id` for that reason. Addressing it under an offer rather than under the job is what keeps
+// competing providers out of one room: `/v1/jobs/{id}/messages` would have to mean either the whole
+// job or an unnamed provider, and the first breaks Docs/01 §4.3's second privacy rule.
+//
+// It is five segments, which was the only shape available when SHIP-84 wrote this file and is now a
+// choice rather than a constraint — SHIP-83a freed the four-segment `GET /v1/jobs/{id}/<literal>`
+// space. This path stays at five because `bids/{bid_id}` is what names the conversation.
+//
+// **`RequireUser` and not a role, for the sixth time.** The two callers are told apart by the
+// database exactly as they are for a counter, and messaging deliberately outlives the offer: there is
+// no status gate, because the moment a customer most needs to ask a question is after the award.
+//
 // **`RequireUser` and not a role, for the fourth time and with the most riding on it.** Docs/02 §3
 // gives the award to the customer alone, and which account that is is a column — `jobs.customer_id` —
 // rather than a claim in a token. A provider presenting a token that says `customer` is refused by
@@ -165,6 +187,20 @@ func init() {
 			Group:   GroupV1,
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).History() },
+		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/bids/{bid_id}/messages",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).SendMessage() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/jobs/{id}/bids/{bid_id}/messages",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return biddingHandler(d).Messages() },
 		},
 		Route{
 			Method:  http.MethodGet,

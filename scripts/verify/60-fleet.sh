@@ -1133,8 +1133,9 @@ status="$(fleet_get "$elig_provider_token" "/v1/fleet/jobs/$awarded_job_id" "$WO
 [[ "$status" == "200" ]] || { cat "$WORKDIR/awarded-before.json"; fail "an eligible provider returned $status, want 200"; }
 
 "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
-  "insert into bids (id, job_id, provider_id, status, amount)
-   values (gen_random_uuid(), '$awarded_job_id', '$elig_provider_id', 'Accepted', 45000);"
+  "insert into bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+   values (gen_random_uuid(), '$awarded_job_id', '$elig_provider_id', 'Accepted', 45000,
+           now() + interval '2 days', now() + interval '3 days');"
 publish_job "$awarded_job_id" Open Awarded
 
 # The feed no longer carries it. This is the half that makes the next check mean something: without
@@ -1182,8 +1183,9 @@ ok "the widened read carries no budget — not the word, not the value, and not 
 # check at the harness: `WHERE id = $3 AND eligible OR bid` without the brackets binds the identifier
 # to the first branch alone, and every provider holding any bid would read every job on the platform.
 "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
-  "insert into bids (id, job_id, provider_id, status, amount)
-   values (gen_random_uuid(), '$elig_job_id', '$fleet_other_id', 'Submitted', 39000);"
+  "insert into bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+   values (gen_random_uuid(), '$elig_job_id', '$fleet_other_id', 'Submitted', 39000,
+           now() + interval '2 days', now() + interval '3 days');"
 
 status="$(fleet_get "$fleet_other_token" "/v1/fleet/jobs/$awarded_job_id" "$WORKDIR/awarded-stranger.json")"
 [[ "$status" == "404" ]] || { cat "$WORKDIR/awarded-stranger.json"; fail "a provider with no bid returned $status, want 404"; }

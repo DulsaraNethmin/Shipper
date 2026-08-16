@@ -270,6 +270,8 @@ paths:
     $ref: './paths/bidding.yaml#/CounterOffer'
   /v1/jobs/{id}/bids/{bid_id}/history:
     $ref: './paths/bidding.yaml#/BidHistory'
+  /v1/jobs/{id}/bids/{bid_id}/messages:
+    $ref: './paths/bidding.yaml#/JobMessages'
   /v1/jobs/{id}/bids/{bid_id}/withdraw:
     $ref: './paths/bidding.yaml#/WithdrawBid'
   /v1/jobs/{id}/cancel:

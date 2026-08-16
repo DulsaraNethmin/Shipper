@@ -58,14 +58,19 @@ func partyFixture(t *testing.T, pool *pgxpool.Pool, email, phone string, awarded
 		t.Fatalf("inserting the losing provider: %v", err)
 	}
 	if _, err := pool.Exec(t.Context(),
-		`INSERT INTO bids (id, job_id, provider_id, status, amount) VALUES ($1, $2, $3, 'Rejected', 500.00)`,
+		// The timing is SHIP-87a's `ck_bids_offer_has_timing`: a bid past 'Draft' states both of its
+		// instants, so a fixture arranging a negotiation writes the row the platform would have
+		// written rather than one the schema now refuses.
+		`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+		 VALUES ($1, $2, $3, 'Rejected', 500.00, now() + interval '2 days', now() + interval '3 days')`,
 		uuid.Must(uuid.NewV7()), job, loser); err != nil {
 		t.Fatalf("inserting the losing bid: %v", err)
 	}
 
 	if awarded {
 		if _, err := pool.Exec(t.Context(),
-			`INSERT INTO bids (id, job_id, provider_id, status, amount) VALUES ($1, $2, $3, 'Accepted', 450.00)`,
+			`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+			 VALUES ($1, $2, $3, 'Accepted', 450.00, now() + interval '2 days', now() + interval '3 days')`,
 			uuid.Must(uuid.NewV7()), job, provider); err != nil {
 			t.Fatalf("accepting a bid: %v", err)
 		}

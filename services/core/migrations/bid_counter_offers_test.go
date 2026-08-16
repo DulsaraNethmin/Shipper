@@ -43,9 +43,12 @@ func newCounter(
 	if err != nil {
 		t.Fatalf("generating an id: %v", err)
 	}
+	// The timing is SHIP-87a's `ck_bids_offer_has_timing`, which refuses a row past 'Draft' naming
+	// neither instant. It is stated unconditionally because every caller here writes a status past
+	// 'Draft' — the chain constraints this file is about have nothing to say about a draft.
 	if _, err := pool.Exec(t.Context(), `
-		INSERT INTO bids (id, job_id, provider_id, offered_by, status, amount)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
+		INSERT INTO bids (id, job_id, provider_id, offered_by, status, amount, pickup_at, deliver_by)
+		VALUES ($1, $2, $3, $4, $5, $6, now() + interval '2 days', now() + interval '3 days')`,
 		id, job, provider, string(by), string(status), amount); err != nil {
 		t.Fatalf("inserting a %s offer by the %s: %v", status, by, err)
 	}
@@ -277,8 +280,10 @@ func TestOneKeyPerPartyPerNegotiation(t *testing.T) {
 			t.Fatalf("generating an id: %v", err)
 		}
 		_, err = pool.Exec(t.Context(), `
-			INSERT INTO bids (id, job_id, provider_id, offered_by, status, amount, idempotency_key)
-			VALUES ($1, $2, $3, $4, 'Superseded', '400.00', $5)`,
+			INSERT INTO bids (id, job_id, provider_id, offered_by, status, amount, idempotency_key,
+			                  pickup_at, deliver_by)
+			VALUES ($1, $2, $3, $4, 'Superseded', '400.00', $5,
+			        now() + interval '2 days', now() + interval '3 days')`,
 			id, job, provider, string(by), shared)
 		return err
 	}
