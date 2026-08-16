@@ -638,7 +638,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
 | **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
-| **SHIP-87a** | M3 | `ck_bids_offer_has_timing` restored (`000505`) — the constraint `000501` wrote, applied and removed because it would have bound SHIP-87's design. That design is made and it **inherits**, so every row the platform writes past `Draft` already states both instants. It is a `CHECK` rather than a validator because the validator is in front of one door and a worker, a repair script or a psql prompt is not behind it. **The cost `Docs/09` priced in was real and wider than the six tests it named** — ten fixture sites across five packages and two verify sections wrote a closed bid with no timing, because until now nothing refused one — *see below* |
+| **SHIP-87a** | M3 | `ck_bids_offer_has_timing` restored (`000505`) — the constraint `000501` wrote, applied and removed because it would have bound SHIP-87's design. That design is made and it **inherits**, so every row the platform writes past `Draft` already states both instants. It is a `CHECK` rather than a validator because the validator is in front of one door and a worker, a repair script or a psql prompt is not behind it. **The cost `Docs/09` priced in was real and wider than the six tests it named** — twelve fixture sites across five packages and three verify sections wrote a closed bid with no timing, because until now nothing refused one — *see below* |
 | **SHIP-95a** | M3 | The race nothing was running: **an expiry sweep and an award contending for one `jobs` row.** `LeaveNegotiation`'s `FOR UPDATE SKIP LOCKED` was the strongest untested invariant on the board — `make check` exited 0 with it removed. It now exits 1 in two ways: the race, driven by hand and confirmed with `pg_blocking_pids` as SHIP-95 does, and a source guard over **all three copies** of the statement. With the clause gone PostgreSQL reports a real deadlock, SQLSTATE **40P01**, in about a second. **No endpoint: demonstrated by its own tests** — *see below* |
 | **SHIP-97** | M3 | Job-scoped messaging — `POST` and `GET /v1/jobs/{id}/bids/{bid_id}/messages`, `000506_job_messages`. **A conversation is the `(job, provider)` pair rather than the job**, which is `bids.provider_id`'s meaning since `000502` and is what keeps competing providers out of one room — a shared thread discloses through prose, which no closed key set can catch. It attaches to the *negotiation* and not to an offer, so it survives a counter, and **there is no status gate at all**: the moment two parties most need to arrange something is after the award. The disclosure guard is **word-level over rendered output**, inverted — every word must be accounted for. **The 'and admins' clause is declared reduced**: met in the domain, unreachable from the wire — *see below* |
 
@@ -13158,7 +13158,7 @@ about a hundred and fifty failures behind **one** helper. The sites are
 
 | File | Sites | What it was arranging |
 |---|---|---|
-| `migrations/bids_test.go` | 6 | `ck_bids_status`, `uq_bids_one_accepted_per_job`, the two foreign keys |
+| `migrations/bids_test.go` | 8 | the `newBid` helper, `ck_bids_status`, `uq_bids_one_accepted_per_job`, `ck_bids_offer_has_amount`'s three, and the two foreign keys |
 | `migrations/bid_counter_offers_test.go` | 2 | the supersede chain and the per-party idempotency key |
 | `internal/delivery/assignment_test.go` | 1 | `acceptBid` — the awarded job every delivery test starts from |
 | `internal/admin/service_test.go` | 2 | `acceptBid`, and a losing bid for the stranger checks |
@@ -13167,6 +13167,13 @@ about a hundred and fifty failures behind **one** helper. The sites are
 | `scripts/verify/60-fleet.sh` | 2 | SHIP-96a's awarded job, and the rival provider's bid on another job |
 | `scripts/verify/70-delivery.sh` | 1 | `delivery_award` |
 | `scripts/verify/90-admin.sh` | 1 | `dispute_award` |
+
+**The table sums to twenty and the figure above is twelve, and that is deliberate rather than a
+slip: the twelve excludes `migrations/bids_test.go`'s eight**, whose repair `Docs/09`'s row already
+names as part of the ticket ("`migrations/bids_test.go`'s fixtures are updated"). Twelve is the
+*blast radius outside what the ticket priced*, which is the number worth carrying. It is written
+down because the two figures sit in one paragraph and the next reader will otherwise correct the
+one that is right — this session nearly did.
 
 **Every one of those edits makes a fixture write the row the platform would actually have written**,
 which is why they are corrections rather than accommodations. `internal/fleet`'s is the only one
