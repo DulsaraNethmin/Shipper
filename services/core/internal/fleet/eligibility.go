@@ -98,6 +98,29 @@ import (
 // it is confined to this one file by TestOnlyTheEligibilityFilterReadsAnotherDomainsTables, and it
 // hard-codes no enumeration that a migration could rename underneath it.
 //
+// # And a sixth, in a fourth domain, which is the case the threshold was actually about
+//
+// SHIP-81a adds `provider_verifications`, owned by `internal/profiles`. That is the *fourth domain*
+// the sentence above named, so it is worth answering rather than waving through — and the answer is
+// that the threshold's own words are about a **join**, not a count. "At that point the statement
+// stops being a filter and becomes a query planner written by hand" describes a predicate whose cost
+// nobody can reason about. This clause is `EXISTS (SELECT 1 … WHERE pv.provider_id = $1 AND pv.state
+// = 'Verified')`: one primary-key probe against a parameter, correlated with nothing in `j`, and the
+// planner may evaluate it once for the whole feed. It cannot be the thing that turns this statement
+// into a planner, because it does not depend on the rows being filtered.
+//
+// **The alternative was worse in exactly the way the ticket names.** A `profiles` port called from Go
+// gives an N+1 against a paginated feed, or a fetch-then-filter whose page boundary lands on the
+// unfiltered set — the first objection this file's header records — and it produces *a second
+// eligibility answer*, which the closing paragraph of §2 forbids in the ticket's own words. So the
+// shape that respects the threshold is the one that adds the clause.
+//
+// The three things offered in exchange for reaching into `jobs` hold for it unchanged: it runs
+// against the real schema in `make check`, it is confined to this file by
+// TestOnlyTheEligibilityFilterReadsAnotherDomainsTables, and the one enumeration it hard-codes —
+// 'Verified' — is paired with `ck_provider_verifications_state` by
+// TestTheVerifiedStateIsARealVerificationState, the same discipline [biddableStatuses] is under.
+//
 // **The port shape was reconsidered here and rejected again, on a different argument.** The
 // paging objection that ruled it out for the feed does not apply to a single job by identifier, so
 // the honest comparison is one statement against two. Two means reading the job with *no*
@@ -161,28 +184,66 @@ var biddableStatuses = []string{"Open", "Negotiating"}
 //
 // # 2. Verification state
 //
+// **Two clauses since SHIP-81a, and they are two different facts rather than one repeated.** The
+// first is the *account*: this is a provider, in good standing, reachable. The second is the
+// *decision*: an administrator has reviewed their documents and said so. Neither implies the other,
+// and the predicate names both because either one going false must stop the provider bidding.
+//
+// ## The decision, which is what this filter had been standing in for
+//
 // Docs/04 §4 gives verification five outcomes — Pending, Verified, Restricted, Rejected, Suspended
-// — and 000002's own comment says where they will live: "Provider verification state is separate
-// and lives with profiles". **`internal/profiles` is empty and migration block 200–299 is unused**,
-// so those five states do not exist yet and this filter cannot read them.
+// — and 000002's own comment said where they would live: "Provider verification state is separate
+// and lives with profiles". SHIP-81a is where they arrived: `provider_verifications` in migration
+// block 200–299, owned by `internal/profiles`, one row per provider from registration, and a state
+// that only `provider_verification_decide()` can change.
 //
-// What it checks instead is the part of Docs/04 §3's baseline that *does* exist, which is the
-// automated row of that table: email and phone verified, on a provider account in good standing.
-// `identity.User.CanPublish` is the customer-side twin and Docs/04 §2 is its authority; this is
-// §3's. Three positions worth stating rather than leaving to be re-derived:
+// **Only 'Verified' bids.** Docs/04 §4 says so for four of the five in as many words — Pending
+// "cannot bid", Rejected "may not bid", Suspended is "access disabled" — and Restricted is settled
+// in the same direction by §1's first principle, "do not allow a provider to bid until baseline
+// checks are complete": an account nobody has finished clarifying does not bid, and the conservative
+// direction is also the reversible one. That is the same reading the account clause below already
+// takes of `users.status`, reached independently and agreeing, which is worth stating because the
+// two columns are otherwise unrelated.
 //
-//   - **`status = 'active'`, so 'restricted' is excluded as well as 'suspended'.** §4 makes
-//     Restricted "limited access pending clarification", and §1's first principle is "do not allow
-//     a provider to bid until baseline checks are complete". An account nobody has finished
-//     clarifying does not bid, and the conservative direction is also the reversible one.
+// **A provider with no record does not bid**, which is the opt-in rule holding rather than a special
+// case: `EXISTS` gives it by construction, exactly as it does for the service area. It is also
+// unreachable — 000200's trigger gives every provider a row at registration and backfilled the ones
+// who already existed — and the ticket that made it unreachable is the reason the rule is safe here:
+// "no record" would otherwise have been indistinguishable from "reviewed and rejected", and the
+// **queue** in SHIP-153 could not have listed anybody waiting.
+//
+// **`internal/fleet` does not import `internal/profiles` and must not.** The seam is SQL, which is
+// what this file has done for `users` since SHIP-78 and for `jobs` since SHIP-81. A Go port —
+// `VerificationState(ctx, providerID)` in ports.go — was considered and is forbidden by SHIP-81a's
+// own last clause: it means either an N+1 against a paginated feed or a fetch-then-filter, and either
+// way it produces *a second eligibility answer*, which is what the paragraph below has said since
+// this file was written.
+//
+// ## The account, which is a different question and stays
+//
+// `identity.User.CanPublish` is the customer-side twin and Docs/04 §2 is its authority; this is §3's
+// automated row — "email and phone: required, automated". Three positions worth stating rather than
+// leaving to be re-derived:
+//
+//   - **It was not replaced by the verification record, and replacing it would be a regression.**
+//     SHIP-81a's *Done when* says the predicate reads the record "instead of its automated stand-in",
+//     and what was standing in was the *answer to whether the provider is verified* — which now comes
+//     from a decision rather than being inferred. The account facts are not that inference: an
+//     administrator's decision taken in January cannot know that the account was suspended in March
+//     or that the phone number stopped being reachable, and a Verified record outliving either would
+//     let a provider bid from an account the platform cannot contact.
+//   - **`status = 'active'`, so 'restricted' is excluded as well as 'suspended'.** Account standing,
+//     Docs/04 §9 and SHIP-161's business, and a different column from the verification state that
+//     happens to share two of its words.
 //   - **`role = 'provider'` is read from the column, not from the token's claim** — the claim is
 //     evidence about the token and the column is the fact, the reading [ErrNotProvider] already
 //     takes.
-//   - **This filter is deliberately incomplete, and the ticket completing it is named.** The
-//     document-review half of Docs/04 §3 — licence, registration, insurance, ABN — arrives with
-//     SHIP-152…154. **That work adds its clause to this predicate.** It must not add a second
-//     eligibility check elsewhere, or there will be two answers to who may bid. Docs/11 §3 records
-//     this as the seam.
+//
+// **There is still exactly one answer to who may bid**, which is the clause SHIP-81a's *Done when*
+// ends on: both facts are read by one predicate, in one statement, and no second eligibility check
+// exists anywhere. Adding one — a `CanBid()` on the profiles state, a boolean on the verification
+// endpoint's response — is what this paragraph forbids, and `internal/profiles` deliberately exports
+// neither.
 //
 // # 3. Service area
 //
@@ -221,7 +282,13 @@ const eligible = `
 	AND (j.expires_at IS NULL OR j.expires_at > $2)
 	AND j.customer_id <> $1
 
-	-- 2. verification state
+	-- 2a. verification state — the administrator's decision (SHIP-81a)
+	AND EXISTS (
+		SELECT 1 FROM provider_verifications pv
+		WHERE pv.provider_id = $1
+		  AND pv.state       = 'Verified')
+
+	-- 2b. verification state — the account the decision was made about
 	AND EXISTS (
 		SELECT 1 FROM users u
 		WHERE u.id                = $1
