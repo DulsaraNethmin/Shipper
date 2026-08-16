@@ -134,9 +134,30 @@ SQL
 # Driving the real verification endpoints would need the token out of the console email and the OTP
 # out of the log, which 40-identity.sh already demonstrates; repeating it here would be testing
 # identity rather than bidding.
+
+# verify_provider <user-id>… — move a provider's verification record to Verified (SHIP-81a).
+#
+# **Added by SHIP-81a, which is the minimum this section needed and nothing else.** Docs/04 §4's five
+# outcomes now exist as a record, every provider starts Pending, and only Verified may bid — so the
+# baseline update below is no longer the whole of "this provider may bid", and without this every
+# check in this file would fail on a 403 that is the platform working correctly.
+#
+# It goes through `provider_verification_decide` because that is the only thing that can move the
+# state: `provider_verification_change_is_guarded` refuses a direct UPDATE, so a fixture that tried
+# one would fail here rather than in the check it was setting up.
+verify_provider() {
+  local id
+  for id in "$@"; do
+    "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+      "select provider_verification_decide('$id', 'Verified', 'system', null,
+                                           'the bidding verify section');" >/dev/null
+  done
+}
+
 "$PSQL" "$DATABASE_URL" -q -c \
   "update users set email_verified_at = now(), phone_verified_at = now()
      where id in ('$bid_provider_id', '$bid_rival_id');"
+verify_provider "$bid_provider_id" "$bid_rival_id"
 
 for pair in "$bid_provider_token:BID101" "$bid_rival_token:BID102"; do
   status="$(bid_post "${pair%%:*}" "verify-bid-area-${pair##*:}-$$" /v1/fleet/vehicles \
@@ -1644,6 +1665,7 @@ sweep_third_token="$(mint_token "$sweep_third_id")"
 "$PSQL" "$DATABASE_URL" -q -c \
   "update users set email_verified_at = now(), phone_verified_at = now()
      where id in ('$sweep_second_id', '$sweep_third_id');"
+verify_provider "$sweep_second_id" "$sweep_third_id"
 
 for pair in "$sweep_second_token:SWP102" "$sweep_third_token:SWP103"; do
   status="$(bid_post "${pair%%:*}" "verify-sweep-veh-${pair##*:}-$$" /v1/fleet/vehicles \

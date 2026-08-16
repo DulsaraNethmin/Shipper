@@ -814,9 +814,12 @@ func declaredAt(t *testing.T, pool *pgxpool.Pool, provider uuid.UUID, area strin
 
 // TestOnlyAProviderDeclaresAServiceArea, read from users.role rather than from a token's claim.
 //
-// The read is deliberately not refused: a customer's declaration is empty because they have never
-// made one, and answering 403 to a read that discloses nothing would make the client special-case a
-// screen it never shows.
+// **The read is refused too, and SHIP-78a is where that changed.** It used to answer an empty
+// profile, on the argument that a customer's declaration discloses nothing and that refusing it made
+// the client special-case a screen it never shows. What that missed is that a read succeeding beside
+// a write that refuses is a screen which renders and then fails at the save button — and that
+// Docs/07 §3's "the platform decides" is not exercised by a surface which answers plausibly and
+// relies on the client to stay away. See [Service.mustBeProvider].
 func TestOnlyAProviderDeclaresAServiceArea(t *testing.T) {
 	pool := pgtest.DB(t)
 	customer := newAccount(t, pool, "declare-customer@example.com", "+61400000354", "customer")
@@ -826,12 +829,8 @@ func TestOnlyAProviderDeclaresAServiceArea(t *testing.T) {
 		t.Errorf("Declare() by a customer = %v, want ErrNotProvider", err)
 	}
 
-	profile, err := newTestService().Profile(t.Context(), pool, customer)
-	if err != nil {
-		t.Errorf("Profile() for a customer = %v, want an empty profile", err)
-	}
-	if len(profile.Areas) != 0 {
-		t.Errorf("a customer has a service area: %+v", profile.Areas)
+	if _, err := newTestService().Profile(t.Context(), pool, customer); !errors.Is(err, ErrNotProvider) {
+		t.Errorf("Profile() for a customer = %v, want ErrNotProvider (SHIP-78a)", err)
 	}
 }
 

@@ -481,7 +481,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **843 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **862 checks across 16 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -706,6 +706,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-121a** | M4 | `GET /v1/driver/jobs/{id}/milestones` — **the fourth route on the driver's surface and the first read it has that pages**, so the portal's controls survive a reload instead of starting at rest on every page view. The response is a **type of its own rather than a redaction step**: `DriverMilestone` is `Milestone` without `recipient_name` and `delivery_note`, which are a third party's details on a credential that is a forwardable seven-day link naming no account. `Service.MilestonesForDriver` **takes the grant and no job identifier**, so a handler cannot widen the scope by passing the wrong job — wave 7's surviving mutation was exactly that shape. Both refusals are recorded against the running binary, and the one that matters is a driver link on the parties' shelf — *see below* |
 | **SHIP-147b** | M6 | An administrator's idempotency key no longer lands in `idem:v1:anonymous:<key>`. **A per-route guard could never have fixed this**: at the moment `Idempotent` computes the scope there is nothing on the context to read. §9's named mechanism — a second group-wide resolver naming the administrator — **was built, passed `make check`, and broke a nine-month-old `make verify` check**: `DELETE /v1/admin/sessions/current` revokes the credential it was called with, so the retry's resolution fails and the replayed 204 is filed under a scope nothing can recompute. `SubjectScope` scopes on a **salted digest of the credential** instead — stable across revocation, no database read, no resolver, and `cmd/api/routes.go` byte-identical to `develop`. **It closes the driver half of §9 as a side effect** — *see below* |
 | **SHIP-147a** | M6 | The platform's password cost, under its own name. `Config.Identity.Argon2` and `IDENTITY_ARGON2_*` became `Config.Passwords.Argon2` and `PASSWORDS_ARGON2_*` — one setting, read by identity's hasher, by admin's, and by identity's phone one-time codes. **Declined in three consecutive prep passes and it cost nothing to take**: five files. "No second knob" is a **guard rather than a claim** — a reflective walk of the `Config` tree and a source scan of `cmd/api` — and the release note naming the rename is in `deploy/.env.example` beside the variables, because no release-notes artefact exists to put it in — *see below* |
+| **SHIP-78a** | M3 | Every one of `internal/fleet`'s eight service methods refuses a caller who is not a provider, with the sentinel `Add` and `Declare` already returned. **Docs/11 §9's oldest ownerless finding**, open since wave 5, and it was never a disclosure — each of the six that did not check scopes to the caller's own identifier, so a customer got an empty list or a 404 and never another provider's vehicle. What it was is a surface declining to *refuse*. `Service.Profile` reversed its own recorded position to take it — *see below* |
+| **SHIP-81a** | M3 | `Docs/04` §4's five outcomes exist as a record: `provider_verifications` and its append-only decision trail (`000200` — migration block 200–299's first table, owned by `internal/profiles`), `GET /v1/provider/verification`, and the eligibility predicate reading that record instead of its automated stand-in. **The guarded function is in the database rather than in Go** — `provider_verification_decide()` records the decision with its actor and reason, names it to a trigger through a transaction-local setting, then moves the state — so the domain, a `make verify` fixture and a psql prompt are the same caller; the jobs precedent puts the protocol in Go and this file already records what the hand-written copy of it cost. **Every provider has a row from registration and the existing ones are backfilled `Pending`**, which is the ticket rather than a detail: Pending is a state a provider is *in*, so SHIP-153 has somebody to list — and **every provider on the platform stops being eligible to bid** until somebody decides otherwise. `internal/fleet` imports nothing from `internal/profiles`; the seam is one `EXISTS` clause — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13928,6 +13930,211 @@ row count. Both restored from `/tmp/snap-d-ship147b`, confirmed with `git diff` 
 `shasum -c SHASUMS`, eight files, all OK. The current form's own guard against reversion is that
 same test plus the two retry tests, which fail in opposite directions: revert the credential branch
 and the *Done when* test fails; make the scope depend on resolution again and both retry tests fail.
+
+### SHIP-78a — the oldest ownerless finding, and the position one method had to reverse to close it
+
+`isProvider` was called in `Add` and `Declare` and in no other method. `Update`, `Deactivate`,
+`Reactivate`, `Vehicle`, `Vehicles` and `Profile` did not check, and §9 carried that from wave 5 under
+two different measurements. It is closed by one helper — `Service.mustBeProvider` — called by all
+eight, returning the sentinel the other two already returned, so a customer reaching this surface
+gets one 403 carrying `fleet_provider_only` at their **first** request rather than at their seventh.
+
+**It was never a disclosure and must not be recorded as one.** Every one of the six scopes to the
+caller's own identifier, so a customer got an empty page, an empty declaration, or a 404 about a
+vehicle that was never theirs. What the gap was is an endpoint declining to refuse somebody with no
+business on it — which is exactly the condition Docs/07 §3's "the app may hide or disable; the
+platform decides" describes, with SHIP-98's client-side gating standing in for the platform's answer.
+
+#### `Service.Profile` argued the other way in its own doc comment, and the argument is kept
+
+That comment said a customer's declaration is empty because they never made one, so a 403 disclosed
+nothing a 200 did not, and refusing it would make the client special-case a screen it never shows.
+That reasoning is sound and incomplete. A read that succeeds beside a write that refuses is a screen
+which renders and then fails at the save button, and a surface whose answer to a customer depends on
+which verb they used is not a rule a client can act on. The old position is left in the file above the
+new one rather than deleted, because the next person to wonder why a read is refused will ask exactly
+that question.
+
+#### The completeness half is what makes the test more than a snapshot
+
+The acceptance criterion is a table of eight, and a table of eight says nothing about the ninth method
+somebody adds. `TestEveryServiceMethodIsClassified` reflects over `*fleet.Service` and fails when a
+method is neither in the table nor in `exemptFromProviderOnly` with a written reason. Four are exempt
+and each names why: `PublicProfiles` is SHIP-79a's customer-facing read, and `EligibleJobs`,
+`EligibleFor` and `ProviderJobFor` are governed by a SQL predicate that already carries
+`u.role = 'provider'` — a Go check beside it would be the second answer to who may bid that
+`eligibility.go` exists not to have.
+
+`TestEveryFleetMethodStillAnswersAProvider` is the other half, and without it the first test is
+satisfied by a service that refuses everybody.
+
+#### Nothing was needed from `internal/config`
+
+### SHIP-81a — the five verification outcomes, and a guard that lives in the database
+
+`Docs/04` §4 has named five outcomes since the document was written and until this ticket they were
+in no table anywhere. `000002_users.up.sql` had already said where they belonged, in its own column
+comment — *"Provider verification state is separate and lives with profiles (Docs/04 §4)"* — and
+`000200_provider_verifications.up.sql` is that place: migration block 200–299's first table, eleven
+waves after SHIP-10 created the package that owns it.
+
+Two tables. `provider_verifications` holds one row per provider, keyed by the provider because there
+is nothing a second row could mean. `provider_verification_decisions` holds every decision ever taken
+about that standing — both end states, the actor, and a **required** reason — and is append-only by
+trigger, the control `audit_log`, `job_status_history` and `milestones` are already under. The reason
+is `NOT NULL` here where `job_status_history.reason` is nullable, and the difference is deliberate:
+most job transitions are self-explanatory and no verification decision is.
+
+#### The guarded function is in SQL, which is where this parts company with the jobs precedent
+
+`Docs/02` §2's rule — status is never a settable field, every transition passes one guarded function
+— is the shape this follows. `000402` is the precedent and it puts the guarded function in Go, with a
+trigger that checks Go wrote a history row first. That works, and it has a cost this file has already
+recorded: anything that is not Go has to reproduce the protocol by hand, and the harness's own
+`dispute_move` fixture is a hand-written copy of the jobs protocol that carried an ambiguity nobody
+saw until a job reached one status twice.
+
+So `provider_verification_decide(provider, to, actor_type, actor_id, reason)` is a database function.
+It takes the row's lock, writes the decision, names that decision to the trigger through
+`set_config('shipper.provider_verification_decision', …, true)`, moves the state, and clears the
+setting again so one decision authorises exactly one update. `provider_verification_change_is_guarded`
+refuses any change to `state` not described by a decision row written in the same transaction.
+
+Three guarantees fall out of one condition. The change went through the guard, because nothing else
+writes that setting. It is recorded with an actor and a reason, because those are `NOT NULL` columns
+on the row the trigger looks for. And it happened inside a transaction, because the setting is
+transaction-local — a caller holding a pool is refused rather than committing a state change whose
+record might not follow.
+
+**The consequence worth stating is that the domain service, an administrator at a psql prompt, and
+every `make verify` fixture are now the same caller.** `scripts/verify/60-fleet.sh`,
+`scripts/verify/61-bidding.sh`, `scripts/verify/62-profiles.sh` and the Go fixtures in
+`internal/fleet` and `internal/bidding` all move a verification state, and every one of them calls
+the same function, because none of them can do anything else. A guard that constrains the test suite
+is the strongest available evidence that it constrains anything else.
+
+What the function deliberately does not do is judge whether a move is sensible. `Docs/04` §4 defines
+no transition table — a Suspended provider is reinstated, a Rejected one is Restricted after
+clarification, a Verified one whose insurance lapses goes back to Pending — so the only refusals are
+coherence: no such provider, and a move to the state the provider is already in.
+
+#### Every provider has a row, and every existing provider is now Pending
+
+The alternative — a row appearing when somebody first decides something — was rejected on SHIP-153,
+whose *Done when* is "pending provider verifications listed oldest first". A queue over a table that
+holds only *decided* providers lists nobody who is waiting. `Pending` is a state a provider is in, not
+the absence of a state, so it is a row: `provider_verification_on_registration`, an `AFTER INSERT`
+trigger on `users` restricted to `role = 'provider'`, and a backfill at the foot of the migration.
+
+**A trigger on another domain's table is a deliberate crossing and is the narrower of the two options
+available.** `internal/profiles` cannot ask `internal/identity` to write the row — domains do not
+import each other — and lazy creation loses on the merits: a provider who has not opened the app would
+have no row, so SHIP-153's queue could not see them and `fleet`'s predicate could not tell "not
+verified" from "never asked". The trigger adds no column to `users` and changes no answer `identity`
+can observe.
+
+**The backfill is `Pending`, not `Verified`, and that is the blast radius rather than a footnote.**
+Nobody has reviewed any existing provider's licence, registration, insurance or ABN, so `Verified`
+would be a statement the platform has no evidence for, recorded in the one table `Docs/04` §1 requires
+be an evidence trail. The visible consequence is that **every provider that exists today stops being
+eligible to bid** until an administrator decides otherwise — which is `Docs/04` §1's first principle
+read literally, and which has no administrator behind it until SHIP-153 and SHIP-154 arrive. Until
+then the only mover is the platform's own function.
+
+#### The seam with `internal/fleet` is one `EXISTS` clause, and a Go port is forbidden by the ticket
+
+`internal/fleet/eligibility.go` gains `EXISTS (SELECT 1 FROM provider_verifications pv WHERE
+pv.provider_id = $1 AND pv.state = 'Verified')` beside the four filters it already carries, and
+imports nothing from `internal/profiles`. That file's own header sets a threshold for reaching into
+another domain's tables in SQL, and this is the fourth domain it now reads — so the threshold was
+answered rather than waved through. Its words are about a **join**: "at that point the statement stops
+being a filter and becomes a query planner written by hand". This clause is a single primary-key probe
+against a parameter, correlated with nothing in `j`, so the planner may evaluate it once for the whole
+feed; it cannot be the thing that turns the statement into a planner because it does not depend on the
+rows being filtered.
+
+The alternative is worse in exactly the way the ticket names. A `VerificationState(ctx, providerID)`
+port called from Go gives either an N+1 against a paginated feed or a fetch-then-filter whose page
+boundary lands on the unfiltered set — and either way it produces **a second eligibility answer**,
+which is what SHIP-81a's last clause forbids. So `internal/profiles` exports no `CanBid`, the
+verification response carries no "may I bid" flag, and there is exactly one answer to who may bid.
+
+**The account clause was not replaced and replacing it would be a regression.** The *Done when* says
+the predicate reads the record "instead of its automated stand-in", and what was standing in was the
+*answer to whether the provider is verified*. The account facts are a different question: a decision
+taken in January cannot know the account was suspended in March or that the phone number stopped being
+reachable, and a Verified record outliving either would let a provider bid from an account the platform
+cannot contact. Two clauses, two facts, either one going false stops the bid.
+
+#### What the opt-in forced elsewhere, and it is more than the two verify sections
+
+Turning verification from an inference into a decision makes every existing provider fixture fail on a
+403 that is the platform working correctly. Four files outside `internal/profiles` were edited for
+that reason and no other:
+
+- `scripts/verify/60-fleet.sh` — a `decide_verification` helper, one call to make the eligibility
+  provider Verified, and then the demonstration itself: each of the other four states excludes, a
+  re-verified provider is offered work again, and a direct `UPDATE` on the record is refused.
+- `scripts/verify/61-bidding.sh` — a `verify_provider` helper and two calls, for the bidding pair and
+  for the sweep pair. **This is Lane B's section this wave and the edit is deliberately the minimum**:
+  a helper and two call sites, through the guarded function rather than around it.
+- `internal/fleet/eligibility_test.go` — `newVerifiedProvider` now means both halves, with `verify`
+  and `setVerificationState` going through the function.
+- `internal/bidding/fixtures_test.go` — the same one-helper change. **`make check` is what found it**:
+  every test in `internal/bidding` failed on "that job is not offered to this provider" and no test in
+  `internal/profiles` or `internal/fleet` could have shown it, because the fixture is in neither.
+
+`internal/delivery`, `internal/admin` and `internal/jobs` needed nothing — they build awarded jobs
+without going through the eligibility predicate — and that was established by running the suite rather
+than by reasoning about it.
+
+#### The record is read by its subject and by nobody else, and there is no parameter for whose
+
+`GET /v1/provider/verification` answers the caller's own record. The identifier comes from the token,
+so there is nothing in the request to widen and no filter to forget — a stranger's record is not
+refused, it is never selected. A caller who is not a provider gets `profiles_provider_only`, which is
+SHIP-78a's reading applied to a surface built after it.
+
+The response carries the state, the reason from the newest decision, when it was decided, and when the
+record was created. It deliberately carries **no administrator's identity** — `Docs/04` §4 requires a
+*reason* be communicated and says nothing about a name, and naming the person who rejected somebody is
+what turns a moderation decision into a personal one.
+
+**There is no route to a decision and that is not an omission.** `profiles.Service.Decide` is exported
+and unrouted: deciding somebody's standing is an administrator's act on the administrator credential
+(SHIP-147), so SHIP-153's queue and SHIP-154's decision are `/v1/admin` routes served by
+`internal/admin` through a port it declares for itself. A route here would be a second way to reach the
+same act on the wrong credential.
+
+#### Two mutations, and the second one is the finding
+
+**Mutation 1 — the domain writes the state directly.** `postgresStore.decide`'s
+`SELECT provider_verification_decide(…)` was replaced with
+`UPDATE provider_verifications SET state = $2 WHERE provider_id = $1`, which is this ticket's own
+prohibition applied to the one function that could break it. **Killed.** Six tests failed in
+`internal/profiles`, every one of them carrying the trigger's own message — *"provider verification
+state is not a settable field: … may not move from Pending to Verified by direct UPDATE"*.
+`internal/fleet` and `internal/bidding` stayed green, and that is correct rather than a gap: their
+fixtures call the database function in SQL and never travel the Go path this mutation broke.
+
+**Mutation 2 — the trigger is not attached.** The `CREATE TRIGGER
+provider_verification_change_is_guarded` statement was commented out of `000200`. The template
+database is dropped and rebuilt from the migration chain on every `make test`, so the suite ran
+against a schema with no guard at all. **Killed by exactly one test**, `TestTheStateIsNotASettableField`,
+whose three cases are a bare `UPDATE`, an `UPDATE` inside a transaction, and an `UPDATE` naming a real
+decision that describes a *different* move. Nothing else in the repository noticed.
+
+**That single survivor is the finding, and the honest reading is "one layer, and it is tested" rather
+than "a hole".** Wave 11's precedent is the case to compare against: a Go two-person check was removed
+there and the suite stayed green because a SQL predicate and a CHECK constraint held the rule
+underneath, so the survivor was correct. There is no second layer here and there could not be — "this
+change was authorised by a decision written in the same transaction" is not expressible as a CHECK
+constraint, because a CHECK cannot see another table. **The trigger is the whole guard**, which is the
+arrangement `Docs/10` §3.1 asks for; what the mutation establishes is that removing it fails the build
+rather than passing quietly. `scripts/verify/60-fleet.sh` carries the same assertion end to end,
+deliberately in the file where somebody reaching for a one-line fixture would write the UPDATE.
+
+#### Nothing was needed from `internal/config`
 
 ## 4. Partly done — do not treat these as finished
 

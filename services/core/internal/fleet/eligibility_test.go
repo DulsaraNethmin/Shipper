@@ -230,6 +230,38 @@ func TestEachFilterExcludesSomething(t *testing.T) {
 				exec(t, w.pool, `UPDATE users SET status = 'restricted' WHERE id = $1`, w.provider)
 			},
 		},
+		// The four outcomes of Docs/04 §4 that are not Verified, each shown to exclude (SHIP-81a).
+		// They are four cases rather than one parameterised case because the document gives four
+		// separate reasons, and a single "not Verified" case would pass against a predicate that had
+		// accidentally admitted one of them.
+		{
+			filter: "verification state",
+			what:   "nobody has reviewed the provider's documents yet",
+			disrupt: func(t *testing.T, w *world) {
+				setVerificationState(t, w.pool, w.provider, "Pending")
+			},
+		},
+		{
+			filter: "verification state",
+			what:   "the provider's verification is restricted pending clarification",
+			disrupt: func(t *testing.T, w *world) {
+				setVerificationState(t, w.pool, w.provider, "Restricted")
+			},
+		},
+		{
+			filter: "verification state",
+			what:   "the provider's verification was rejected",
+			disrupt: func(t *testing.T, w *world) {
+				setVerificationState(t, w.pool, w.provider, "Rejected")
+			},
+		},
+		{
+			filter: "verification state",
+			what:   "the provider's verification is suspended",
+			disrupt: func(t *testing.T, w *world) {
+				setVerificationState(t, w.pool, w.provider, "Suspended")
+			},
+		},
 		{
 			filter: "service area",
 			what:   "the provider withdrew from the state the job picks up in",
@@ -642,6 +674,65 @@ func TestTheBiddableStatusesAreRealJobStatuses(t *testing.T) {
 	}
 }
 
+// TestTheVerifiedStateIsARealVerificationState pairs the one state this predicate hard-codes with
+// `ck_provider_verifications_state` (SHIP-81a).
+//
+// The same discipline [TestTheBiddableStatusesAreRealJobStatuses] applies to the job statuses, for
+// the same reason: `provider_verifications` belongs to `internal/profiles`, a rename there produces
+// no compile error here, and the failure it *would* produce in production is a feed that is empty
+// for every provider on the platform — which reads as a bidding outage rather than as one word in
+// one clause.
+//
+// It also holds the other four out. A predicate that had widened to admit `Restricted` would still
+// pass a test that only checked `Verified` is accepted, and Docs/04 §1's "do not allow a provider to
+// bid until baseline checks are complete" is the clause that widening would break.
+func TestTheVerifiedStateIsARealVerificationState(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	var definition string
+	if err := pool.QueryRow(t.Context(),
+		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		 WHERE conname = 'ck_provider_verifications_state'`,
+	).Scan(&definition); err != nil {
+		t.Fatalf("reading ck_provider_verifications_state: %v", err)
+	}
+	accepted := quotedStrings(definition)
+
+	if len(accepted) != 5 {
+		t.Fatalf("ck_provider_verifications_state accepts %d states, and Docs/04 §4 has five: %v",
+			len(accepted), accepted)
+	}
+	if !contains(accepted, "Verified") {
+		t.Fatalf("this predicate filters on the verification state %q, which "+
+			"ck_provider_verifications_state does not accept.\nDocs/04 §4 is authoritative for "+
+			"these names, and `profiles` may have renamed one.\nIt accepts: %v", "Verified", accepted)
+	}
+
+	// The predicate names exactly one state, and it is that one. Read out of the SQL rather than
+	// asserted about it, so a clause that had gained `OR pv.state = 'Restricted'` fails here.
+	inSQL := quotedStrings(verificationClause(t, eligible))
+	if len(inSQL) != 1 || inSQL[0] != "Verified" {
+		t.Errorf("the predicate admits the verification states %v; Docs/04 §4 permits only Verified "+
+			"to bid — Pending and Rejected say so outright, Suspended is access disabled, and "+
+			"Restricted is settled by §1's 'do not allow a provider to bid until baseline checks "+
+			"are complete'", inSQL)
+	}
+}
+
+// verificationClause isolates the `pv.state = '…'` comparison so [quotedStrings] reads the
+// verification state and not every other literal in the predicate.
+var verificationState = regexp.MustCompile(`pv\.state\s*=\s*('[^']*'(?:\s*OR\s*pv\.state\s*=\s*'[^']*')*)`)
+
+func verificationClause(t *testing.T, predicate string) string {
+	t.Helper()
+
+	match := verificationState.FindStringSubmatch(predicate)
+	if match == nil {
+		t.Fatal("the predicate has no `pv.state = …` comparison, so the verification filter is gone")
+	}
+	return match[1]
+}
+
 // TestOnlyTheEligibilityFilterReadsAnotherDomainsTables confines the cross-domain reach to one file.
 //
 // The header of eligibility.go argues that reading another domain's table in SQL is acceptable
@@ -655,6 +746,11 @@ func TestTheBiddableStatusesAreRealJobStatuses(t *testing.T) {
 // acceptable, so the guard has to cover it — a second permitted file, or a `bids` query in
 // `postgres.go`, is exactly the drift this catches.
 //
+// **`provider_verifications` joined it at SHIP-81a**, and it is the first table here owned by a
+// domain that is neither `jobs` nor `bidding`. The rule did not change: the reach is one clause in
+// one file, and a verification read appearing in `postgres.go` or `service.go` would be the second
+// answer to who may bid that `eligibility.go`'s header forbids in that ticket's own words.
+//
 // Source parsing rather than a naming convention, for the reason SHIP-67's guard gives: the thing
 // to catch is a query that does not exist yet, in a file nobody has written, and the source is the
 // complete list by construction.
@@ -663,7 +759,7 @@ func TestOnlyTheEligibilityFilterReadsAnotherDomainsTables(t *testing.T) {
 	// this package mentions the jobs *domain* constantly and must not trip it.
 	const permitted = "eligibility.go"
 
-	for _, table := range []string{"jobs", "bids"} {
+	for _, table := range []string{"jobs", "bids", "provider_verifications"} {
 		reads := regexp.MustCompile(`(?i)\b(from|join|update|into)\s+` + table + `\b`)
 		found := false
 
@@ -807,18 +903,49 @@ type jobFields struct {
 	PickupLongitude float64
 }
 
-// newVerifiedProvider is a provider who has met Docs/04 §3's automated baseline.
+// newVerifiedProvider is a provider who has met both halves of Docs/04 §3: the automated baseline
+// and an administrator's decision.
 //
 // Separate from [newProvider], which SHIP-78's tests use and which leaves both channels
-// unverified. Keeping them apart matters: every test in this file would pass against a filter
-// that ignored verification if the shared helper quietly verified everybody.
+// unverified and the record Pending. Keeping them apart matters: every test in this file would pass
+// against a filter that ignored verification if the shared helper quietly verified everybody.
+//
+// **The decision goes through `provider_verification_decide` rather than an UPDATE** (SHIP-81a).
+// Not a nicety — `provider_verification_change_is_guarded` refuses a direct write, so a fixture that
+// tried one would fail here rather than in the test it was setting up. That is the guard being real
+// enough to constrain the test suite, which is the strongest evidence available that it constrains
+// anything else.
 func newVerifiedProvider(t *testing.T, pool *pgxpool.Pool, email, phone string) uuid.UUID {
 	t.Helper()
 
 	id := newAccount(t, pool, email, phone, "provider")
 	exec(t, pool,
 		`UPDATE users SET email_verified_at = now(), phone_verified_at = now() WHERE id = $1`, id)
+	verify(t, pool, id)
 	return id
+}
+
+// verify moves a provider's verification record to Verified through the one guarded transition.
+//
+// `000200`'s trigger gave them a Pending record at registration, and Pending does not bid — which is
+// what makes this call necessary in every fixture that expects an eligible provider, and what makes
+// its absence visible as an empty feed rather than as a silent pass.
+func verify(t *testing.T, pool *pgxpool.Pool, provider uuid.UUID) {
+	t.Helper()
+	exec(t, pool,
+		`SELECT provider_verification_decide($1, 'Verified', 'system', NULL, 'the fleet test suite')`,
+		provider)
+}
+
+// setVerificationState moves a provider to any of the five, for the cases that need one that is not
+// Verified.
+//
+// It goes through the same function, so a test cannot reach a state the platform could not.
+func setVerificationState(t *testing.T, pool *pgxpool.Pool, provider uuid.UUID, state string) {
+	t.Helper()
+	exec(t, pool,
+		`SELECT provider_verification_decide($1, $2, 'system', NULL, 'the fleet test suite')`,
+		provider, state)
 }
 
 func newCustomer(t *testing.T, pool *pgxpool.Pool, email, phone string) uuid.UUID {

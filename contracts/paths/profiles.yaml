@@ -1,0 +1,130 @@
+# Profiles — a provider's verification standing, and the evidence behind it.
+#
+# The counterpart of cmd/api/routes_profiles.go. Docs/10 §8.1 keeps the two in step: a domain adds
+# one route file and one fragment, and edits neither this file's siblings nor the middle of a shared
+# document. The one shared line per path is its $ref in contracts/openapi.yaml.
+#
+# Response schemas are `additionalProperties: false` throughout. Docs/07 §6 requires *clients* to
+# tolerate fields they do not recognise, which is a rule about client behaviour and not a licence for
+# the contract to describe less than the service returns.
+#
+# # This is the caller's own record and nobody else's
+#
+# There is no parameter for whose verification to read. The provider is whoever the token says is
+# calling, so there is nothing here to widen and no filter to forget — another provider's record is
+# not refused, it is never selected.
+#
+# # The administrator's side of verification is not here
+#
+# Reviewing a submission and deciding an outcome are `/v1/admin` operations on the separate
+# administrator credential (SHIP-153, SHIP-154), described in admin.yaml when they are built. A
+# provider cannot change their own state through any operation in this file, and there is deliberately
+# no operation that could: the decision is `internal/profiles`'s guarded transition, reachable from
+# the administrator's surface and from nowhere a provider can send a request to.
+#
+# # There is no "may I bid" field, and that is a deliberate absence
+#
+# Eligibility is four filters, not one (Docs/01 §4.3), and the platform answers it in exactly one
+# place — `GET /v1/fleet/jobs`. A boolean here would be a second answer computed from a quarter of the
+# question, so it would be wrong for every provider who is Verified with no vehicle or no declared
+# service area. A client that wants to know whether there is work available asks for the feed, and an
+# empty page already says so.
+
+ProviderVerification:
+  get:
+    operationId: getProviderVerification
+    summary: The calling provider's verification standing
+    tags: [Profiles]
+    description: |
+      Docs/04 §4's five outcomes, as they stand for the authenticated provider (SHIP-81a).
+
+      | State | What it means |
+      |---|---|
+      | `Pending` | Cannot bid. Information is incomplete or awaiting review |
+      | `Verified` | May bid for supported job categories |
+      | `Restricted` | Limited access pending clarification or document renewal — this does not bid |
+      | `Rejected` | May not bid. `reason` is what to tell the provider |
+      | `Suspended` | Access disabled on policy, safety or repeated-performance grounds |
+
+      Every provider has a record from the moment they register, and it starts `Pending` — so this
+      operation never answers `404` for a provider who exists. `reason` and `decided_at` are absent
+      until somebody has decided something, which for most providers is their whole first week.
+
+      **Being `Verified` is necessary to bid and is not sufficient.** The platform also requires a
+      declared service area, a vehicle in service, and an account in good standing with a verified
+      email and phone. `GET /v1/fleet/jobs` is where all of that is answered together.
+    responses:
+      '200':
+        description: |
+          The provider's own verification standing.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Verification'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The account is not a provider account (`profiles_provider_only`). Customers publish jobs;
+          they are not verified to bid.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+Verification:
+  type: object
+  additionalProperties: false
+  required: [state, submitted_at]
+  properties:
+    state:
+      type: string
+      enum: [Pending, Verified, Restricted, Rejected, Suspended]
+      description: |
+        Docs/04 §4's outcome this provider is currently in. Only `Verified` may bid.
+      example: Pending
+    reason:
+      type: string
+      maxLength: 500
+      description: |
+        Why the provider is in this state, from the decision that put them there. Absent until a
+        decision has been taken.
+
+        It is written for the provider to read — Docs/04 §4 requires a rejection's reason be
+        communicable — and it never names the administrator who took the decision.
+      example: Insurance certificate had expired. Upload a current one and we will look again.
+    decided_at:
+      type: string
+      format: date-time
+      description: |
+        When the current state was decided. Absent for a provider still in the state their record
+        was created at.
+      example: '2026-08-18T02:14:00Z'
+    submitted_at:
+      type: string
+      format: date-time
+      description: |
+        When the provider's verification record was created, which is at registration. This is what
+        "how long have I been waiting" is measured from, and what an administrator's review queue is
+        ordered by.
+      example: '2026-08-15T22:31:00Z'

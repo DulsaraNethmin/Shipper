@@ -302,6 +302,8 @@ paths:
     $ref: './paths/notifications.yaml#/CurrentDeviceToken'
   /v1/notifications/preferences:
     $ref: './paths/notifications.yaml#/Preferences'
+  /v1/provider/verification:
+    $ref: './paths/profiles.yaml#/ProviderVerification'
 
 components:
   schemas:

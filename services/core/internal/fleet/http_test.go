@@ -615,7 +615,7 @@ func TestABadEntryIsNamedByItsPositionOverTheWire(t *testing.T) {
 	}
 }
 
-// TestOnlyAProviderMayDeclare, and the read is deliberately not refused.
+// TestOnlyAProviderMayDeclare, on both verbs since SHIP-78a.
 func TestOnlyAProviderMayDeclare(t *testing.T) {
 	pool := pgtest.DB(t)
 	router := newTestRouter(t, pool)
@@ -630,9 +630,15 @@ func TestOnlyAProviderMayDeclare(t *testing.T) {
 		t.Errorf("code = %q, want %s", code, CodeProviderOnly)
 	}
 
-	// The read discloses nothing, so refusing it would only make the client special-case a screen
-	// it never shows.
-	if read := as(t, router, customer, http.MethodGet, "/v1/fleet/profile", ""); read.Code != http.StatusOK {
-		t.Errorf("GET by a customer = %d, want 200 (%s)", read.Code, read.Body)
+	// **The read is refused with the same 403 and the same code** (SHIP-78a). It answered 200 until
+	// then, which meant the surface's answer to a customer depended on which verb they used — the
+	// shape SHIP-78a exists to remove, because a client cannot act on a rule that holds for half of
+	// an endpoint.
+	read := as(t, router, customer, http.MethodGet, "/v1/fleet/profile", "")
+	if read.Code != http.StatusForbidden {
+		t.Fatalf("GET by a customer = %d, want 403 (%s)", read.Code, read.Body)
+	}
+	if code := decode[errorEnvelope](t, read).Error.Code; code != string(CodeProviderOnly) {
+		t.Errorf("GET code = %q, want %s", code, CodeProviderOnly)
 	}
 }

@@ -649,6 +649,23 @@ fleet_customer_id="$(json "$WORKDIR/fleet-customer.json" '["id"]')"
 "$PSQL" "$DATABASE_URL" -q -c \
   "update users set email_verified_at = now(), phone_verified_at = now() where id = '$elig_provider_id';"
 
+# decide_verification <user-id> <state> — the one guarded transition, from the harness (SHIP-81a).
+#
+# A direct `update provider_verifications set state = …` is refused by
+# provider_verification_change_is_guarded, which is the whole of SHIP-81a's "no code sets the state
+# directly" — including code in this file. So the fixture calls the same function the domain calls,
+# which is also what makes the state changes below a demonstration rather than a setup step.
+decide_verification() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+    "select provider_verification_decide('$1', '$2', 'system', null,
+                                         'the fleet verify section');" >/dev/null
+}
+
+# Docs/04 §4's decision, which since SHIP-81a is the other half of "verified". Every provider is
+# created Pending and only Verified bids, so without this the provider below is refused by the
+# platform working correctly.
+decide_verification "$elig_provider_id" Verified
+
 status="$(fleet_request PATCH "$elig_provider_token" "verify-elig-profile-$$" /v1/fleet/profile \
   '{"service_area":{"states":["VIC"]}}' "$WORKDIR/elig-profile.json")"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/elig-profile.json"; fail "declaring VIC returned $status"; }
@@ -763,6 +780,31 @@ for standing in restricted suspended; do
   "$PSQL" "$DATABASE_URL" -q -c "update users set status = 'active' where id = '$elig_provider_id';"
 done
 ok "verification state — an unverified, restricted or suspended provider is offered nothing"
+
+# Docs/04 §4's five outcomes, through the record SHIP-81a built. The account clause above and this
+# one are two different facts: an administrator's decision taken in January cannot know that the
+# account was suspended in March, so neither implies the other and the predicate names both.
+#
+# Four states rather than one "not Verified" case, because Docs/04 §4 gives four separate reasons —
+# and a predicate that had accidentally admitted one of them would pass a single parameterised check.
+for state in Pending Restricted Rejected Suspended; do
+  decide_verification "$elig_provider_id" "$state"
+  [[ "$(eligible)" == "0" ]] || fail "a provider whose verification is $state was still offered work"
+done
+decide_verification "$elig_provider_id" Verified
+[[ "$(eligible)" == "1" ]] || fail "a re-verified provider was not offered work again"
+ok "verification state — only Verified bids, and the other four each exclude (SHIP-81a)"
+
+# And the record cannot be moved any other way, from here either. This is the same guard
+# 62-profiles.sh demonstrates against the domain; it is repeated here because *this* file is where
+# somebody reaching for a one-line fixture would write the UPDATE.
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+     "update provider_verifications set state = 'Rejected' where provider_id = '$elig_provider_id';" \
+     >/dev/null 2>&1; then
+  fail "a direct UPDATE set a verification state — SHIP-81a requires the guarded function"
+fi
+[[ "$(eligible)" == "1" ]] || fail "the refused UPDATE changed the state anyway"
+ok "and the state is not settable by UPDATE, so a fixture cannot make a provider eligible by hand"
 
 # Through the API rather than by writing rows, because withdrawing from a region is something a
 # provider actually does — and because an empty declaration matching nothing is SHIP-79's rule,
@@ -1199,3 +1241,58 @@ sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
 " "$WORKDIR/awarded-stranger.json" "$WORKDIR/awarded-missing.json" \
   || fail "a job the caller has no bid on answers differently from a job that does not exist"
 ok "a provider with neither eligibility nor a bid gets exactly what a missing job gets"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-78a  every fleet endpoint refuses a caller who is not a provider"
+
+# Docs/11 §9 carried this from wave 5: isProvider was called in Add and Declare and in no other
+# method, so six of the eight answered a customer plausibly — an empty list, an empty profile, or a
+# 404 about a vehicle that was never theirs. **It was never a disclosure**, because every one of
+# them scopes to the caller's own identifier; what it was is an endpoint declining to refuse
+# somebody with no business on the surface, which is Docs/07 §3's "the platform decides" not being
+# exercised.
+#
+# The customer's token claims `role: customer` and so does the provider's — mint_token puts that
+# claim in every token it issues — so what is demonstrated here is the platform reading users.role
+# rather than believing a claim, in all eight places rather than two.
+#
+# `$vehicle_id` is the provider's vehicle from SHIP-78 above. A customer naming it is the sharper
+# case than a made-up identifier: the row exists, it is simply not theirs, so an endpoint that had
+# stopped refusing would answer 404 rather than 403 and this check would fail on the code.
+
+fleet_78a_refused() {
+  # fleet_78a_refused <method> <path> <body> <label>
+  local method="$1" path="$2" body="$3" label="$4" out status
+  out="$WORKDIR/78a-$(printf '%s' "$label" | tr -c 'a-z0-9' '-').json"
+
+  if [[ "$method" == "GET" ]]; then
+    status="$(fleet_get "$fleet_customer_token" "$path" "$out")"
+  else
+    status="$(fleet_request "$method" "$fleet_customer_token" "verify-78a-$label-$$" "$path" "$body" "$out")"
+  fi
+
+  [[ "$status" == "403" ]] \
+    || { cat "$out"; fail "$method $path answered a customer with $status, want 403 (SHIP-78a)"; }
+  [[ "$(json "$out" '["error"]["code"]')" == "fleet_provider_only" ]] \
+    || { cat "$out"; fail "$method $path refused a customer with a code other than fleet_provider_only"; }
+}
+
+fleet_78a_refused POST   /v1/fleet/vehicles                            '{"registration":"XX78AA","vehicle_type":"van"}' add
+fleet_78a_refused PATCH  "/v1/fleet/vehicles/$vehicle_id"              '{"make":"Toyota"}'                              update
+fleet_78a_refused POST   "/v1/fleet/vehicles/$vehicle_id/deactivate"   ''                                               deactivate
+fleet_78a_refused POST   "/v1/fleet/vehicles/$vehicle_id/reactivate"   ''                                               reactivate
+fleet_78a_refused GET    "/v1/fleet/vehicles/$vehicle_id"              ''                                               vehicle
+fleet_78a_refused GET    /v1/fleet/vehicles                            ''                                               vehicles
+fleet_78a_refused GET    /v1/fleet/profile                             ''                                               profile
+fleet_78a_refused PATCH  /v1/fleet/profile                             '{"service_area":{"states":["NSW"]}}'            declare
+ok "all eight fleet endpoints refuse a customer with 403 fleet_provider_only"
+
+# And the refusal is about the *account*, not about the surface: the same eight answer the provider
+# who owns the fleet. Without this the check above is satisfied by a service that refuses everybody.
+status="$(fleet_get "$fleet_provider_token" /v1/fleet/vehicles "$WORKDIR/78a-provider-list.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/78a-provider-list.json"; fail "the owning provider's list answered $status, want 200"; }
+status="$(fleet_get "$fleet_provider_token" /v1/fleet/profile "$WORKDIR/78a-provider-profile.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/78a-provider-profile.json"; fail "the owning provider's profile answered $status, want 200"; }
+status="$(fleet_get "$fleet_provider_token" "/v1/fleet/vehicles/$vehicle_id" "$WORKDIR/78a-provider-vehicle.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/78a-provider-vehicle.json"; fail "the owning provider's vehicle answered $status, want 200"; }
+ok "the same reads still answer the provider — the refusal is about the account, not the endpoint"

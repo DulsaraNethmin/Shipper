@@ -680,15 +680,29 @@ func newAccount(t *testing.T, pool *pgxpool.Pool, email, phone, role string) uui
 	return id
 }
 
-// newVerifiedProvider is a provider who has met Docs/04 §3's automated baseline.
+// newVerifiedProvider is a provider who has met both halves of Docs/04 §3: the automated baseline,
+// and — since SHIP-81a — an administrator's decision on their verification record.
 //
 // Kept separate from a bare provider on purpose: every eligibility test here would pass against a
 // filter that ignored verification if the shared helper quietly verified everybody.
+//
+// **The second half is a forced consequence of SHIP-81a and is the minimum this package needed.**
+// `000200` gives every provider a Pending record at registration and `internal/fleet`'s predicate
+// admits only Verified, so without the call below every test in this package fails on a filter
+// working correctly — which is what makes the opt-in real rather than asserted.
+//
+// It goes through `provider_verification_decide` rather than an UPDATE because
+// `provider_verification_change_is_guarded` refuses a direct write: a fixture that tried one would
+// fail here rather than in the test it was setting up. `internal/fleet`'s own fixture is the same
+// shape, and neither package imports `internal/profiles` to do it.
 func newVerifiedProvider(t *testing.T, pool *pgxpool.Pool, email, phone string) uuid.UUID {
 	t.Helper()
 
 	id := newAccount(t, pool, email, phone, "provider")
 	exec(t, pool, `UPDATE users SET email_verified_at = now(), phone_verified_at = now() WHERE id = $1`, id)
+	exec(t, pool,
+		`SELECT provider_verification_decide($1, 'Verified', 'system', NULL, 'the bidding test suite')`,
+		id)
 	return id
 }
 
