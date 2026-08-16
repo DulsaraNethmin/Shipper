@@ -141,7 +141,17 @@ type Argon2Profile struct {
 
 // ProductionArgon2Profile is the profile Docs/10 §5 fixes: m=64 MiB, t=3, p=4.
 //
-// It is the default in internal/config, which is where a deployment overrides it.
+// **Nothing reads it at runtime, and the previous sentence here — "it is the default in
+// internal/config" — read as though something did.** internal/config compiles the same three
+// numbers in itself, as the defaults behind `PASSWORDS_ARGON2_MEMORY_KIB`, `_ITERATIONS` and
+// `_PARALLELISM`, which is where a deployment overrides them. This is the value Docs/10 §5 states,
+// kept beside the implementation it describes.
+//
+// So the cost is written down twice, and SHIP-147a — whose whole subject is one cost setting under
+// one name — left it that way on purpose rather than importing this package into internal/config
+// for three integers. **What it added instead is the guard that makes the two unable to drift**:
+// config's own TestIdentityConfiguration compares its default against this value and fails when
+// they differ, so a raise applied to one is reported rather than discovered.
 var ProductionArgon2Profile = Argon2Profile{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 4}
 
 // Validate reports whether the profile is one this package will run.

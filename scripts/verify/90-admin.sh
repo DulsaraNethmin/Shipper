@@ -2611,3 +2611,188 @@ status="$(note_read "" job "$note_job" nocred)"
 ok "and the history is behind the administrator credential — without one it would be a public file on every customer the platform has had a problem with"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-147b — an administrator's idempotency key is scoped to that administrator.
+#
+# # Why this needs the harness rather than a Go test
+#
+# `cmd/api`'s TestTwoAdministratorSessionsDoNotShareAnIdempotencyScope drives the same two requests
+# through the same router, and it is the stronger of the two in one way — it reads `admin_notes`
+# back and counts the rows. What it cannot do is prove it against **Redis**. It uses the in-memory
+# idempotency store, because a `-race` test that reached the shared cache would be a test the whole
+# suite could not run in parallel; the deployed service uses `idempotency.RedisStore`, and the key
+# that store writes is `idem:v1:<scope>:<key>` in a real keyspace.
+#
+# So this section asserts on the thing no Go test in this repository looks at: **the keys actually
+# in Redis**. If the scope had reverted to its user-only form there would be exactly one key,
+# `idem:v1:anonymous:<key>`, holding one administrator's note where the other's request would find
+# it.
+#
+# # Two moderators, one key, one body
+#
+# `replayOrRefuse` fingerprints method, path and body, so with those identical the scope is the only
+# thing that can separate the two requests. Both are moderators because `notes.write` is a
+# moderator's permission, and a note's subject is deliberately not a foreign key (SHIP-162), so the
+# job it names need not be one either.
+
+ticket "SHIP-147b  two administrators sending one idempotency key get one execution each"
+
+admin_clear_limits
+
+# The second moderator. `$unpub_token`/`$unpub_id` above is the first.
+scope_email="verify-admin-scope-$$@example.com"
+scope_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$scope_email', 'Verify Moderator Two', '$admin_fixture_hash', 'moderator')
+   returning id;")"
+[[ -n "$scope_id" ]] || fail "the second moderator could not be created"
+[[ "$scope_id" != "$unpub_id" ]] || fail "the two administrators are the same account, so this section proves nothing"
+
+status="$(admin_signin "verify-adm147b-signin-$$" "$scope_email" "$admin_password" scope-in)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-scope-in.json"; fail "the second moderator could not sign in ($status)"; }
+scope_token="$(json "$WORKDIR/admin-scope-in.json" '["token"]')"
+[[ -n "$scope_token" ]] || fail "the second moderator's sign-in returned no token"
+[[ "$scope_token" != "$unpub_token" ]] || fail "both administrators hold the same credential"
+
+# scope_note <token> <name> — the same POST, keeping the response headers.
+#
+# One key and one body, both fixed, because they are what makes the two requests indistinguishable
+# to everything except the scope.
+scope_key="verify-adm147b-shared-$$"
+scope_job="$(dispute_draft ship147bjob)"
+scope_body="{\"subject_type\":\"job\",\"subject_id\":\"$scope_job\",\"body\":\"Rang the depot about this one.\"}"
+
+scope_note() {
+  curl -s -X POST -o "$WORKDIR/scope-$2.json" -D "$WORKDIR/scope-$2.headers" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $scope_key" \
+    -H 'Content-Type: application/json' -d "$scope_body" \
+    "http://localhost:$VERIFY_PORT/v1/admin/notes"
+}
+
+scope_replayed() { grep -qi '^idempotency-replayed: true' "$WORKDIR/scope-$1.headers"; }
+
+status="$(scope_note "$unpub_token" first)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/scope-first.json"; fail "the first administrator's note returned $status, want 201"; }
+! scope_replayed first || fail "the first request was already a replay; the key is not fresh"
+first_note="$(json "$WORKDIR/scope-first.json" '["id"]')"
+[[ "$(json "$WORKDIR/scope-first.json" '["author_id"]')" == "$unpub_id" ]] \
+  || { cat "$WORKDIR/scope-first.json"; fail "the note does not name the administrator who wrote it"; }
+
+status="$(scope_note "$scope_token" second)"
+! scope_replayed second \
+  || { cat "$WORKDIR/scope-second.json"; fail "the second administrator was handed the first one's stored response — two administrator sessions share an idempotency namespace (SHIP-147b)"; }
+[[ "$status" == "201" ]] || { cat "$WORKDIR/scope-second.json"; fail "the second administrator's note returned $status, want 201"; }
+
+second_note="$(json "$WORKDIR/scope-second.json" '["id"]')"
+[[ "$second_note" != "$first_note" ]] || fail "both administrators were given note $first_note; only one execution happened"
+[[ "$(json "$WORKDIR/scope-second.json" '["author_id"]')" == "$scope_id" ]] \
+  || { cat "$WORKDIR/scope-second.json"; fail "the second response names the wrong author — the second administrator was served the first one's note"; }
+ok "two administrators sending one key, one method, one path and one body each get their own execution and their own response"
+
+# The rows, not the responses. A replay answers without the handler running, so this is what
+# separates two executions from one execution answered twice.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(distinct author_id) from admin_notes where subject_id = '$scope_job';")" == "2" ]] \
+  || fail "the notes on this job do not have two distinct authors, so only one administrator's request ran"
+ok "and both notes are in admin_notes, written by two different administrators"
+
+# --- the keys in Redis, which is the half no Go test looks at ------------------------------------
+#
+# Two entries, one per credential, and **no `idem:v1:anonymous:` entry for this key** — which is
+# exactly the state the user-only scope would have produced instead.
+#
+# The scope is a digest of the credential rather than the administrator it names. That is not the
+# obvious choice and it was not the first one: a scope that has to *resolve* a credential is not
+# stable across that credential's own revocation, and `DELETE /v1/admin/sessions/current` revokes
+# the credential it is called with — so the retried sign-out asserted a few hundred lines above is
+# the check that found it. httpx.SubjectScope carries the argument in full.
+
+scope_keys="$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:*:$scope_key" | sort)"
+[[ "$(printf '%s\n' "$scope_keys" | grep -c .)" == "2" ]] \
+  || fail "this key produced these idempotency entries, want two:
+$scope_keys"
+[[ "$(printf '%s\n' "$scope_keys" | grep -c '^idem:v1:credential:')" == "2" ]] \
+  || fail "the two entries are not both namespaced to a credential:
+$scope_keys"
+! printf '%s\n' "$scope_keys" | grep -q "^idem:v1:anonymous:" \
+  || fail "an administrator's key landed in the shared anonymous namespace:
+$scope_keys"
+ok "the stored keys are idem:v1:credential:<digest>:<key>, one per administrator, and neither is in the anonymous namespace"
+
+# Neither key carries a credential, and neither carries the digest the database stores.
+#
+# The second half is why the digest is salted. `admin_sessions.token_hash` is `sha256(token)`, so an
+# unsalted scope would render the database's stored verifier into a cache key — readable by
+# anything that can run SCAN, and by every log line that names one. This asserts it against the
+# actual column rather than against a restatement of the rule.
+for scope_secret in "$unpub_token" "$scope_token"; do
+  ! printf '%s\n' "$scope_keys" | grep -qF "$scope_secret" \
+    || fail "an idempotency key contains a live administrator credential:
+$scope_keys"
+done
+for scope_stored in $("$PSQL" "$DATABASE_URL" -qtAc "select token_hash from admin_sessions;"); do
+  ! printf '%s\n' "$scope_keys" | grep -qF "$scope_stored" \
+    || fail "an idempotency key contains admin_sessions.token_hash ($scope_stored), so the cache is publishing the digest the database compares against:
+$scope_keys"
+done
+ok "and neither key carries the credential itself, nor the digest admin_sessions stores against it"
+
+# --- and idempotency still works within one administrator ----------------------------------------
+#
+# Without this the section above would be satisfied by a change that disabled the mechanism rather
+# than scoping it — two executions is the right answer for two administrators and the wrong one for
+# one administrator retrying.
+
+status="$(scope_note "$unpub_token" replay)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/scope-replay.json"; fail "the first administrator's retry returned $status, want the stored 201"; }
+scope_replayed replay || fail "the same administrator repeating the same key did not get a replay; idempotency has been scoped into uselessness rather than scoped correctly"
+[[ "$(json "$WORKDIR/scope-replay.json" '["id"]')" == "$first_note" ]] \
+  || fail "the replay returned a different note, so a second row was written"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from admin_notes where subject_id = '$scope_job';")" == "2" ]] \
+  || fail "the retry wrote a third note"
+ok "one administrator retrying the same key is still answered from the store, and writes nothing"
+
+# --- an invented credential reaches nobody, and `anonymous` is still there ------------------------
+#
+# **This check asserts something different from the one it replaces, and the change is deliberate.**
+# While the scope was resolved from the credential an unrecognised one fell back to `anonymous`, and
+# this asserted that. A credential digest does not fall back: anybody may invent a bearer token and
+# be given a namespace of their own. That is not a weakness — a scope nobody else can compute is a
+# scope nobody else is in, and an invented token still cannot open an administrative route — so what
+# is asserted here is the property that carries the weight instead: an invented credential lands
+# nowhere near a real administrator's entries, and a caller who presents *nothing* is still
+# anonymous, which every public route depends on.
+
+invented_key="verify-adm147b-invented-$$"
+status="$(curl -s -X POST -o "$WORKDIR/scope-invented.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer not-an-administrator-session-$$" -H "Idempotency-Key: $invented_key" \
+  -H 'Content-Type: application/json' -d "$scope_body" \
+  "http://localhost:$VERIFY_PORT/v1/admin/notes")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/scope-invented.json"; fail "an invented credential returned $status, want 401"; }
+
+invented_keys="$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:*:$invented_key" | sort)"
+[[ "$(printf '%s\n' "$invented_keys" | grep -c .)" == "1" ]] \
+  || fail "an invented credential produced these entries, want one:
+$invented_keys"
+printf '%s\n' "$invented_keys" | grep -q "^idem:v1:credential:" \
+  || fail "an invented credential did not get a namespace of its own:
+$invented_keys"
+invented_scope="$(printf '%s\n' "$invented_keys" | sed 's/:[^:]*$//')"
+! printf '%s\n' "$scope_keys" | grep -qF "$invented_scope:" \
+  || fail "an invented credential landed in a namespace a real administrator is using:
+$invented_keys
+$scope_keys"
+ok "an invented credential is refused, and its key lands in a namespace no administrator is in"
+
+nocred_key="verify-adm147b-nocred-$$"
+status="$(curl -s -X POST -o "$WORKDIR/scope-nocred.json" -w '%{http_code}' \
+  -H "Idempotency-Key: $nocred_key" -H 'Content-Type: application/json' -d "$scope_body" \
+  "http://localhost:$VERIFY_PORT/v1/admin/notes")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/scope-nocred.json"; fail "a request with no credential returned $status, want 401"; }
+[[ -n "$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:anonymous:$nocred_key")" ]] \
+  || fail "a caller who presented nothing did not land in the anonymous namespace, which every public route depends on"
+ok "and a caller who presents nothing is still anonymous, so the shared scope every public route uses is intact"
+
+admin_clear_limits

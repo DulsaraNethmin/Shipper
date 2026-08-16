@@ -332,20 +332,23 @@ func init() {
 // already written as "a job service for a domain that needs to move a job but is not `jobs`", and a
 // second constructor differing only in which file it sits in is a second place for the geocoder
 // decision to be made differently.
-// The argon2id profile is d.Config.Identity.Argon2, and that is deliberate rather than borrowed.
+// The argon2id profile is d.Config.Passwords.Argon2, and that is deliberate rather than borrowed.
 // SHIP-15r moved argon2id into `internal/passwords` precisely so that a second domain needing to
 // hash a password would not be the reason for a second implementation, and a second *cost knob*
 // would be the same mistake one level up: two profiles that agree by comment until somebody raises
-// one. There is one platform password cost and this is where it is configured. **The field's name
-// is now narrower than its meaning** — renaming it is a `internal/config` change and therefore a
-// shared-surface request rather than something this ticket takes on its own.
+// one. There is one platform password cost and this is where it is configured.
+//
+// **It was `d.Config.Identity.Argon2` until SHIP-147a**, which was the platform's cost spelled as
+// one domain's — narrower than its meaning from the moment this call site was written. The field
+// and its `IDENTITY_ARGON2_*` variables now read `Passwords` and `PASSWORDS_ARGON2_*`; identity's
+// hasher in routes_identity.go reads the same one, and there is no second knob to raise instead.
 func adminHandler(d Deps) *admin.Handler {
 	svc := admin.NewService(disputeLifecycle{jobs: newJobService(d)}, jobPartiesLookup{}, d.Clock)
 
 	hasher, err := passwords.NewHasher(passwords.Argon2Profile{
-		MemoryKiB:   d.Config.Identity.Argon2.MemoryKiB,
-		Iterations:  d.Config.Identity.Argon2.Iterations,
-		Parallelism: d.Config.Identity.Argon2.Parallelism,
+		MemoryKiB:   d.Config.Passwords.Argon2.MemoryKiB,
+		Iterations:  d.Config.Passwords.Argon2.Iterations,
+		Parallelism: d.Config.Passwords.Argon2.Parallelism,
 	})
 	if err != nil {
 		panic("cmd/api: admin password hasher: " + err.Error())

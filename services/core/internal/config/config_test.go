@@ -3,9 +3,13 @@ package config
 import (
 	"encoding/base64"
 	"log/slog"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 )
 
 // allKeys is every variable Load reads. Tests blank them so a value left behind by the
@@ -17,7 +21,7 @@ var allKeys = []string{
 	"DATABASE_URL", "DATABASE_MAX_OPEN_CONNS", "DATABASE_MAX_IDLE_CONNS", "DATABASE_CONN_MAX_LIFETIME",
 	"REDIS_URL",
 	"KAFKA_BROKERS", "KAFKA_REPLICATION_FACTOR",
-	"IDENTITY_ARGON2_MEMORY_KIB", "IDENTITY_ARGON2_ITERATIONS", "IDENTITY_ARGON2_PARALLELISM",
+	"PASSWORDS_ARGON2_MEMORY_KIB", "PASSWORDS_ARGON2_ITERATIONS", "PASSWORDS_ARGON2_PARALLELISM",
 	"IDENTITY_ACCESS_TOKEN_TTL", "IDENTITY_ACCESS_TOKEN_KEYS", "IDENTITY_ACCESS_TOKEN_ACTIVE_KID",
 	"DELIVERY_DRIVER_TOKEN_TTL", "DELIVERY_DRIVER_TOKEN_KEYS", "DELIVERY_DRIVER_TOKEN_ACTIVE_KID",
 	"GEOCODING_BASE_URL", "GEOCODING_API_KEY",
@@ -104,7 +108,7 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("DATABASE_MAX_IDLE_CONNS", "8")
 	t.Setenv("REDIS_URL", "redis://cache.internal:6379/1")
 	t.Setenv("KAFKA_BROKERS", "a:9092, b:9092 ,c:9092")
-	t.Setenv("IDENTITY_ARGON2_MEMORY_KIB", "32768")
+	t.Setenv("PASSWORDS_ARGON2_MEMORY_KIB", "32768")
 	t.Setenv("IDENTITY_ACCESS_TOKEN_TTL", "10m")
 	t.Setenv("IDENTITY_ACCESS_TOKEN_KEYS", deploymentSigningKeys)
 	t.Setenv("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", "2026-08")
@@ -135,8 +139,8 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	if cfg.Database.MaxOpenConns != 40 {
 		t.Errorf("Database.MaxOpenConns = %d, want 40", cfg.Database.MaxOpenConns)
 	}
-	if cfg.Identity.Argon2.MemoryKiB != 32768 {
-		t.Errorf("Identity.Argon2.MemoryKiB = %d, want 32768", cfg.Identity.Argon2.MemoryKiB)
+	if cfg.Passwords.Argon2.MemoryKiB != 32768 {
+		t.Errorf("Passwords.Argon2.MemoryKiB = %d, want 32768", cfg.Passwords.Argon2.MemoryKiB)
 	}
 	if cfg.Identity.AccessTokenTTL != 10*time.Minute {
 		t.Errorf("Identity.AccessTokenTTL = %s, want 10m", cfg.Identity.AccessTokenTTL)
@@ -383,8 +387,29 @@ func TestIdentityConfiguration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load() returned %v, want nil", err)
 		}
-		if cfg.Identity.Argon2 != (Argon2{MemoryKiB: 65536, Iterations: 3, Parallelism: 4}) {
-			t.Errorf("argon2 default is %+v, want m=64 MiB, t=3, p=4", cfg.Identity.Argon2)
+		if cfg.Passwords.Argon2 != (Argon2{MemoryKiB: 65536, Iterations: 3, Parallelism: 4}) {
+			t.Errorf("argon2 default is %+v, want m=64 MiB, t=3, p=4", cfg.Passwords.Argon2)
+		}
+
+		// The same three numbers are stated a second time, in passwords.ProductionArgon2Profile,
+		// as the profile Docs/10 §5 fixes. Nothing reads it — the default above is compiled in
+		// here — so the two cannot diverge in behaviour today, and could tomorrow.
+		//
+		// **Held together in a test rather than unified in the code**, deliberately: importing
+		// internal/passwords from internal/config would be infrastructure on infrastructure and
+		// permitted, but it would put argon2 in the link graph of cmd/migrate for a value that is
+		// three integers. A test import costs nothing and gives the same guarantee — the copies
+		// cannot drift apart without this failing (SHIP-147a).
+		reference := passwords.ProductionArgon2Profile
+		if cfg.Passwords.Argon2 != (Argon2{
+			MemoryKiB:   reference.MemoryKiB,
+			Iterations:  reference.Iterations,
+			Parallelism: reference.Parallelism,
+		}) {
+			t.Errorf("the default here is %+v and passwords.ProductionArgon2Profile is %+v.\n"+
+				"These are the platform's password cost written down twice. They agree by "+
+				"comment until somebody raises one, which is what Docs/10 §3.4 refuses.",
+				cfg.Passwords.Argon2, reference)
 		}
 		if cfg.Identity.AccessTokenTTL != 15*time.Minute {
 			t.Errorf("access token TTL default is %s, want 15m", cfg.Identity.AccessTokenTTL)
@@ -434,10 +459,10 @@ func TestIdentityConfiguration(t *testing.T) {
 			"IDENTITY_ACCESS_TOKEN_TTL": "24h",
 		}, "cannot be revoked before it expires"},
 		{"argon2 memory below its lanes", map[string]string{
-			"IDENTITY_ARGON2_MEMORY_KIB": "1024", "IDENTITY_ARGON2_PARALLELISM": "200",
+			"PASSWORDS_ARGON2_MEMORY_KIB": "1024", "PASSWORDS_ARGON2_PARALLELISM": "200",
 		}, "leaves less than 8 KiB"},
 		{"argon2 memory out of range", map[string]string{
-			"IDENTITY_ARGON2_MEMORY_KIB": "16",
+			"PASSWORDS_ARGON2_MEMORY_KIB": "16",
 		}, "must be between"},
 	}
 
@@ -1067,5 +1092,74 @@ func TestClientPolicyIsRefusedWhenItCannotWork(t *testing.T) {
 				t.Errorf("the error does not name the variable: %v", err)
 			}
 		})
+	}
+}
+
+// SHIP-147a's *Done when* asks for "no second cost knob anywhere", and a claim like that is worth
+// a guard rather than a search somebody did once.
+//
+// Two halves, because the knob has two forms and a second one could appear as either. The failure
+// this prevents is not exotic: a domain that needs a password adds its own cost section, both are
+// plausible, both verify every hash they are handed — the parameters travel in the PHC string —
+// and nothing reports that half the platform's passwords are stored at the old cost the day
+// somebody raises one. Docs/10 §3.4 exists to refuse exactly that, and internal/passwords was
+// promoted out of internal/identity at SHIP-15r for the same reason.
+func TestThereIsOneArgon2CostSetting(t *testing.T) {
+	// The Go half: exactly one field of type Argon2 anywhere in the Config tree.
+	var found []string
+	var walk func(prefix string, typ reflect.Type)
+	walk = func(prefix string, typ reflect.Type) {
+		for i := range typ.NumField() {
+			f := typ.Field(i)
+			path := prefix + "." + f.Name
+			switch {
+			case f.Type == reflect.TypeOf(Argon2{}):
+				found = append(found, path)
+			case f.Type.Kind() == reflect.Struct:
+				walk(path, f.Type)
+			}
+		}
+	}
+	walk("Config", reflect.TypeOf(Config{}))
+
+	if len(found) != 1 {
+		t.Errorf("the platform's argon2id cost is configured in %d places: %s.\n"+
+			"There is one password cost and every hasher reads it — two that agree by comment "+
+			"is Docs/10 §3.4's failure, and the second one is invisible until somebody raises "+
+			"the first.", len(found), strings.Join(found, ", "))
+	} else if found[0] != "Config.Passwords.Argon2" {
+		t.Errorf("the argon2id cost is at %s, want Config.Passwords.Argon2 — SHIP-147a named it "+
+			"for the platform rather than for one domain", found[0])
+	}
+
+	// The environment half: exactly one prefix, and it is not a domain's.
+	source, err := os.ReadFile(configSource)
+	if err != nil {
+		t.Fatalf("reading %s: %v", configSource, err)
+	}
+
+	want := map[string]bool{
+		"PASSWORDS_ARGON2_MEMORY_KIB":  true,
+		"PASSWORDS_ARGON2_ITERATIONS":  true,
+		"PASSWORDS_ARGON2_PARALLELISM": true,
+	}
+	got := map[string]bool{}
+	for _, m := range envKey.FindAllStringSubmatch(string(source), -1) {
+		if strings.Contains(m[1], "ARGON2") {
+			got[m[1]] = true
+		}
+	}
+
+	for key := range got {
+		if !want[key] {
+			t.Errorf("%s reads %s. One cost, one prefix: the argon2id variables are "+
+				"PASSWORDS_ARGON2_* (SHIP-147a).", configSource, key)
+		}
+	}
+	for key := range want {
+		if !got[key] {
+			t.Errorf("%s no longer reads %s; deploy/.env.example's release note tells every "+
+				"deployment to set it.", configSource, key)
+		}
 	}
 }

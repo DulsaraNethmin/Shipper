@@ -2,6 +2,8 @@ package httpx
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -27,9 +29,61 @@ import (
 //
 // So identity is resolved once, at the group level, outside Idempotent:
 //
-//	ResolveSubject  — outermost. Reads the credential if one was presented. Never rejects.
-//	Idempotent      — now has a subject to scope keys by.
-//	RequireSubject  — per route, from the manifest's auth class. Rejects.
+//	ResolveSubject — outermost. Reads the credential if one was presented. Never rejects.
+//	Idempotent     — now has a caller to scope keys by.
+//	RequireSubject — per route, from the manifest's auth class. Rejects.
+//
+// # The other two credential systems, and why their scope is the credential (SHIP-147b)
+//
+// The platform has three credential systems and only one of them produces an [authctx.Subject].
+// An administrator's console session and a driver's job-scoped token are deliberately not
+// exchangeable for a user's — CLAUDE.md's third separation — so each is verified by a guard that
+// puts its own grant on its own domain's private context key.
+//
+// **Those guards are per route, so they run inside Idempotent, after the scope is computed.** The
+// same ordering that makes SHIP-44's fix work put every administrative key in
+// `idem:v1:anonymous:<key>`, and Docs/11 §9 recorded the hole twice before anything closed it. A
+// guard cannot fix it: at the moment the scope is computed there is nothing on the context to
+// read, whatever the guard would later put there.
+//
+// The first form of the fix was a second group-wide resolver beside [ResolveSubject], turning a
+// presented credential into the administrator it named. **It shipped, and it broke a documented
+// retry contract**, which is the argument the current shape is built on and worth stating in full
+// because it is not obvious:
+//
+//	DELETE /v1/admin/sessions/current ends the session it is presented with. On the retry
+//	that a dropped connection produces, the credential is dead — so a resolver that reads it
+//	fails, the scope falls back to `anonymous`, the middleware misses the response it stored
+//	under the administrator's scope, and the request reaches the guard, which refuses it. A
+//	sign-out that succeeded reports 401 to the retry that could not hear the 204.
+//
+// Generalised: **a scope computed by resolving a credential is not stable across that
+// credential's own lifecycle, and a retry is exactly the window in which the lifecycle moves.**
+// Sign-out is the sharp case because it is the endpoint whose *purpose* is to invalidate what it
+// was called with, but a session that lapses between an attempt and its retry has the same shape.
+// Any resolution that can fail can fail *between* the two halves of one logical request.
+//
+// So the scope for a non-subject caller is a digest of the credential itself. It is stable across
+// revocation and expiry, it separates two administrators exactly — two sessions are two
+// credentials — it needs no database read at all, and it closes the driver half of Docs/11 §9 in
+// the same stroke without a second mechanism, because a job-scoped token is a bearer credential
+// like any other.
+//
+// The cost, stated rather than hidden: one administrator signed in twice has two scopes, so the
+// same key reused across their two browsers is two actions rather than one. That is a scope
+// narrower than the account, and narrower is the safe direction — a replay hands back a stored
+// response body, so the scope is a read boundary and not only a deduplication key. It is also
+// unobservable in practice: an idempotency key is generated per action by the client, so two
+// browsers colliding on one is not a thing an honest client does.
+//
+// # Why the subject still wins, and why it is not a digest
+//
+// An account holder keeps `user:<id>`, which is the account rather than the credential, because
+// **identity has a refresh and the other two systems do not**: a mobile client whose access token
+// expires mid-retry obtains a new one and retries with it, and scoping on the credential would
+// make that retry a different caller and execute the request twice. That is the duplicate bid the
+// idempotency invariant exists to prevent. An administrator cannot refresh — sign-out is terminal
+// — so the same reasoning points the other way for them.
 //
 // # Why ResolveSubject never rejects
 //
@@ -170,19 +224,75 @@ func RequireSubject() func(http.Handler) http.Handler {
 	}
 }
 
-// SubjectScope namespaces idempotency keys by the caller they belong to (SHIP-15, SHIP-44).
+// credentialScopeKind names the namespace a bearer credential that produced no [authctx.Subject]
+// is scoped into.
+//
+// It is deliberately one namespace rather than one per credential system. Telling an
+// administrator's session from a driver's job token from a stale access token needs a lookup in
+// the domain that issued it, and the whole point of the digest is that the scope must not depend
+// on a lookup that can fail — see the file comment. Two callers are separated by the digest, not
+// by the label.
+const credentialScopeKind = "credential"
+
+// credentialScopeSalt domain-separates this digest from every other SHA-256 of the same input.
+//
+// `admin_sessions.token_hash` and identity's refresh-token column both store `sha256(credential)`.
+// Without the salt this scope would render that exact value into a Redis key — putting the
+// database's stored verifier into the cache, into a log line, and into the reach of anything that
+// can run `SCAN`. It does not make the credential recoverable either way; it stops one system's
+// stored secret becoming another system's routine output.
+const credentialScopeSalt = "shipper:idempotency-scope:v1\x00"
+
+// credentialScope names a caller by what they presented rather than by who it belongs to.
+//
+// The digest is of the raw credential, so it is stable for exactly as long as the client keeps
+// sending the same one — across the session's revocation and across its expiry, which is the
+// property the retry contract needs and the reason this is not a resolved identifier.
+func credentialScope(credential string) string {
+	sum := sha256.Sum256([]byte(credentialScopeSalt + credential))
+	return credentialScopeKind + ":" + hex.EncodeToString(sum[:])
+}
+
+// SubjectScope namespaces idempotency keys by the caller they belong to (SHIP-15, SHIP-44,
+// SHIP-147b).
 //
 // This is what closes the hole the idempotency middleware shipped with. Every key used to land in
 // `idem:v1:anonymous:<key>`, so a client that guessed another client's key was handed that
 // client's stored response body — an entirely different person's job, address or bid.
 //
-// Anonymous callers still share a scope, and that is safe for the reason Docs/11 §6 sets out:
-// replayOrRefuse fingerprints method, path and body, so reading a stranger's stored response
-// requires sending their exact request — which, on every public state-changing route, means
-// already holding the secret material in their body.
+// # Three answers
+//
+//	user:<id>          an account holder, from the verified [authctx.Subject]
+//	credential:<hash>  a bearer credential that produced no subject — an administrator's
+//	                   console session, a driver's job-scoped token, or an access token this
+//	                   service will not accept
+//	anonymous          nothing was presented
+//
+// The middle one is SHIP-147b. Until it existed every administrative key landed in the shared
+// anonymous scope, so two administrators could read each other's stored responses; the file
+// comment argues why it is a digest of the credential rather than the administrator it names.
+//
+// # Anonymous is still a shared scope, and still safe
+//
+// For the reason Docs/11 §6 sets out: replayOrRefuse fingerprints method, path and body, so
+// reading a stranger's stored response requires sending their exact request — which, on every
+// public state-changing route, means already holding the secret material in their body. Every
+// caller who presents *something* now leaves that scope, so what is left in it is the traffic
+// that argument was written about.
+//
+// # A caller can choose their own scope, and that is not a weakness
+//
+// Anybody may invent a bearer token and get a private namespace of their own. They cannot reach
+// anyone else's with it — a scope nobody else can compute is a scope nobody else is in — and they
+// could already occupy unlimited entries in `anonymous` by varying the key. What no caller can do
+// is land in a namespace somebody else is using: `user:` is written from a verified subject and
+// from nothing else, and no presented value reaches a scope unhashed.
 func SubjectScope(r *http.Request) string {
 	if s, ok := authctx.SubjectFrom(r.Context()); ok && s.UserID != "" {
 		return "user:" + s.UserID
+	}
+	if credential, presented := bearerCredential(r.Header.Get(HeaderAuthorization)); presented && credential != "" {
+		return credentialScope(credential)
 	}
 	return "anonymous"
 }

@@ -105,6 +105,28 @@ import (
 // **The seam held.** `cmd/api/routes.go`, `manifest.go`, `main.go` and `Deps` are untouched by
 // SHIP-147: filling this body is what maps RequireAdmin, and `routes_admin.go` — the admin track's
 // own file — is what declares the first routes on it.
+//
+// # What SHIP-147b asked of this file, and why the answer was nothing
+//
+// An administrator's idempotency key landed in `idem:v1:anonymous:<key>`, because
+// `httpx.SubjectScope` reads an `authctx.Subject` and an administrator deliberately produces none.
+// The guard below cannot fix that: it runs **per route, inside** `httpx.Idempotent`, and the scope
+// has been computed before it ever sees the request. Docs/11 §9 named a second group-wide resolver
+// as the mechanism, and this file was where the closure over `internal/admin` would be supplied —
+// so SHIP-147b's first form returned the guard and that resolver together in a struct, to keep
+// `newRouter`'s fifteen call sites and `main.go` out of the diff.
+//
+// **That form shipped and broke the sign-out retry.** `DELETE /v1/admin/sessions/current` ends the
+// session it is presented with. On the retry that a dropped connection produces, the resolver
+// therefore runs against a revoked credential, fails, and the scope falls back to `anonymous` —
+// where the 204 the first call stored is not — so the retry reaches the guard and is refused.
+// `httpx.SubjectScope` carries the general argument: a scope computed by resolving a credential is
+// not stable across that credential's own lifecycle.
+//
+// The scope is therefore a digest of the credential, computed in `internal/httpx` from the header
+// it already reads, and **it needs nothing from this package**: no resolver, no closure, no second
+// read of `admin_sessions` per administrative write, and no struct. The signature below is the one
+// SHIP-15r wrote, unchanged through both tickets.
 func newAdminGuard(cfg *config.Config, pool *pgxpool.Pool, clk clock.Clock) (Guard, error) {
 	// cfg is deliberately unused. See the note above; an administrator session has no signing
 	// key and no configured lifetime, and the parameter is kept so that main.go stays out of the
