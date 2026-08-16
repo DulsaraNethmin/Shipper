@@ -79,7 +79,7 @@ func TestFourSegmentJobLiteralsCanBeRegistered(t *testing.T) {
 		}()
 
 		attachRoutes(mux, append(routes(), jobLiteralProbe()), GroupV1, testDeps(),
-			guardsFor(testDriverGuard(), testAdminGuard().Guard))
+			guardsFor(testDriverGuard(), testAdminGuard()))
 	}()
 
 	// Registration succeeding is the criterion; routing to the right handler is what makes the

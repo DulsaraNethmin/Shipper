@@ -22,11 +22,11 @@ import (
 //
 // # Why it is here and not in internal/httpx or internal/admin
 //
-// The clause is about three things meeting: a real administrator session, the group-wide
-// resolution `newRouter` wires, and the idempotency middleware's namespacing. `internal/httpx`
-// has no administrator and no database; `internal/admin` has both and cannot build a router.
-// cmd/api is the composition root, which is the one place all three are visible — the same
-// argument adminauth_test.go's header makes about the two verifiers.
+// The clause is about three things meeting: a real administrator session, the middleware order
+// `newRouter` wires, and the idempotency middleware's namespacing. `internal/httpx` has no
+// administrator and no database; `internal/admin` has both and cannot build a router. cmd/api is
+// the composition root, which is the one place all three are visible — the same argument
+// adminauth_test.go's header makes about the two verifiers.
 //
 // # Why it drives the real router against real sessions
 //
@@ -67,9 +67,9 @@ func signedInAdministrators(t *testing.T) twoAdministrators {
 	deps.Pool = pool
 	deps.Redis = client
 
-	// The router main.go builds, over this test's database: the real guard, the real resolver,
-	// the real middleware order. Nothing is stubbed but the idempotency store, which is in
-	// memory so that one test's keys cannot reach another's.
+	// The router main.go builds, over this test's database: the real guard, the real scope, the
+	// real middleware order. Nothing is stubbed but the idempotency store, which is in memory so
+	// that one test's keys cannot reach another's.
 	adminAuthn, err := newAdminGuard(deps.Config, pool, deps.Clock)
 	if err != nil {
 		t.Fatalf("building the administrator guard: %v", err)
@@ -189,10 +189,9 @@ func TestTwoAdministratorSessionsDoNotShareAnIdempotencyScope(t *testing.T) {
 		t.Error("a second administrator using the same idempotency key was handed the first " +
 			"administrator's stored response.\n" +
 			"Two administrator sessions share an idempotency namespace, which is the hole " +
-			"SHIP-147b exists to close — check that newRouter applies httpx.ResolvePrincipal " +
-			"outside httpx.Idempotent, that newAdminGuard supplies its Scope, and that " +
-			"httpx.SubjectScope reads a Principal when there is no authctx.Subject " +
-			"(Docs/11 §9).")
+			"SHIP-147b exists to close — check that httpx.SubjectScope still scopes a bearer " +
+			"credential that produced no authctx.Subject on the credential itself, rather " +
+			"than falling back to `anonymous` (Docs/11 §9).")
 	}
 	if second.Code != http.StatusCreated {
 		t.Fatalf("the second administrator's note was refused with %d: %s",
@@ -266,5 +265,84 @@ func assertNoteCount(t *testing.T, fixture twoAdministrators, subject uuid.UUID,
 	if want == 2 && len(authors) != 2 {
 		t.Errorf("the recorded notes have %d distinct authors, want 2 — both administrators "+
 			"should have written one", len(authors))
+	}
+}
+
+// TestARetriedSignOutIsReplayedAfterTheSessionItEndedIsGone is SHIP-147b's other half, and it is
+// here because SHIP-147b's first form broke it.
+//
+// # What it protects
+//
+// `scripts/verify/90-admin.sh` has asserted since SHIP-147 that a retried sign-out replays its 204,
+// and it states the contract in its own comment: the middleware answers **from outside the guard,
+// so the dead credential is never consulted**, and a browser whose connection dropped therefore
+// does not see a failed sign-out for a session that ended.
+//
+// Scoping an idempotency key on the administrator a credential *resolves to* broke it in the one
+// place it could: `DELETE /v1/admin/sessions/current` invalidates the credential it was called
+// with, so the retry's resolution fails, the scope falls back to `anonymous`, and the stored 204 —
+// filed under the administrator — is not there to be found. The request reached the guard and was
+// refused with 401.
+//
+// # Why here as well as in internal/httpx
+//
+// `internal/httpx`'s TestARetriedRequestReplaysAfterItsOwnCredentialIsRevoked pins the middleware
+// with a hand-built guard, which is the layer the defect was in. This pins the **real endpoint**:
+// a real `admin_sessions` row, really revoked by the handler, behind the real RequireAdmin guard
+// and the real middleware order. The two together are what `make check` needed in order to catch
+// what only `make verify` caught.
+func TestARetriedSignOutIsReplayedAfterTheSessionItEndedIsGone(t *testing.T) {
+	fixture := signedInAdministrators(t)
+
+	const key = "01J9ZK4P2M8SB3TC6VE9XA0N7E"
+
+	signOut := func(t *testing.T, idempotencyKey string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodDelete, "/v1/admin/sessions/current", nil)
+		req.Header.Set(httpx.HeaderAuthorization, "Bearer "+fixture.alice.token)
+		req.Header.Set(httpx.HeaderIdempotencyKey, idempotencyKey)
+
+		rec := httptest.NewRecorder()
+		fixture.router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	me := func(t *testing.T) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v1/admin/me", nil)
+		req.Header.Set(httpx.HeaderAuthorization, "Bearer "+fixture.alice.token)
+
+		rec := httptest.NewRecorder()
+		fixture.router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if first := signOut(t, key); first.Code != http.StatusNoContent {
+		t.Fatalf("signing out answered %d, want 204: %s", first.Code, first.Body.String())
+	}
+
+	// The session really ended, or everything below would pass against a sign-out that did
+	// nothing.
+	if code := me(t); code != http.StatusUnauthorized {
+		t.Fatalf("the credential still works after signing out (%d); this test would prove "+
+			"nothing about a dead one", code)
+	}
+
+	retry := signOut(t, key)
+	if retry.Code != http.StatusNoContent {
+		t.Errorf("the retried sign-out answered %d, want the replayed 204.\n"+
+			"A dropped connection must not report a failed sign-out — the middleware replays "+
+			"from outside the guard, which it can only do if the idempotency scope survives "+
+			"the revocation of the credential it is computed from (httpx.SubjectScope).",
+			retry.Code)
+	}
+	if retry.Header().Get(httpx.HeaderIdempotencyReplayed) != "true" {
+		t.Error("the retried sign-out was not answered from the store")
+	}
+
+	// A fresh key reaches the guard, which refuses the credential the first call ended. The
+	// scope is a namespace; it must never become an authorisation decision.
+	if again := signOut(t, "01J9ZK4P2M8SB3TC6VE9XA0N7F"); again.Code != http.StatusUnauthorized {
+		t.Errorf("a fresh key with the ended credential answered %d, want 401", again.Code)
 	}
 }

@@ -2,11 +2,12 @@ package httpx
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/authctx"
 )
@@ -28,12 +29,11 @@ import (
 //
 // So identity is resolved once, at the group level, outside Idempotent:
 //
-//	ResolveSubject   — outermost. Reads the credential if one was presented. Never rejects.
-//	ResolvePrincipal — beside it. The same, for callers who are not account holders.
-//	Idempotent       — now has a caller to scope keys by.
-//	RequireSubject   — per route, from the manifest's auth class. Rejects.
+//	ResolveSubject — outermost. Reads the credential if one was presented. Never rejects.
+//	Idempotent     — now has a caller to scope keys by.
+//	RequireSubject — per route, from the manifest's auth class. Rejects.
 //
-// # Why there is a second resolver (SHIP-147b)
+// # The other two credential systems, and why their scope is the credential (SHIP-147b)
 //
 // The platform has three credential systems and only one of them produces an [authctx.Subject].
 // An administrator's console session and a driver's job-scoped token are deliberately not
@@ -46,23 +46,44 @@ import (
 // guard cannot fix it: at the moment the scope is computed there is nothing on the context to
 // read, whatever the guard would later put there.
 //
-// ResolvePrincipal is the fix §9 named — a second group-wide resolver, running outside
-// Idempotent, with [SubjectScope] widened to read either. It takes a [PrincipalResolver] declared
-// here and satisfied by a closure over the domain, supplied in cmd/api, for the same reason
-// [Authenticator] is: infrastructure may import no domain (SHIP-15c), and every domain imports
-// this package.
+// The first form of the fix was a second group-wide resolver beside [ResolveSubject], turning a
+// presented credential into the administrator it named. **It shipped, and it broke a documented
+// retry contract**, which is the argument the current shape is built on and worth stating in full
+// because it is not obvious:
 //
-// # Why it resolves lazily
+//	DELETE /v1/admin/sessions/current ends the session it is presented with. On the retry
+//	that a dropped connection produces, the credential is dead — so a resolver that reads it
+//	fails, the scope falls back to `anonymous`, the middleware misses the response it stored
+//	under the administrator's scope, and the request reaches the guard, which refuses it. A
+//	sign-out that succeeded reports 401 to the retry that could not hear the 204.
 //
-// It installs the resolvers on the context and calls none of them. [SubjectScope] does, and only
-// when it has no subject to use instead — which means only on a state-changing request carrying a
-// valid idempotency key, because that is the only thing Idempotent computes a scope for.
+// Generalised: **a scope computed by resolving a credential is not stable across that
+// credential's own lifecycle, and a retry is exactly the window in which the lifecycle moves.**
+// Sign-out is the sharp case because it is the endpoint whose *purpose* is to invalidate what it
+// was called with, but a session that lapses between an attempt and its retry has the same shape.
+// Any resolution that can fail can fail *between* the two halves of one logical request.
 //
-// That is not a micro-optimisation. Verifying an administrator session is a database read
-// (internal/admin argues the cost in full), a console makes several requests a second, and
-// resolving eagerly would pay for one on every GET the scope is never asked about — and on every
-// public request carrying an unrecognised bearer token, which is a read an unauthenticated caller
-// gets to trigger. Resolving where the answer is used costs a read per administrative *write*.
+// So the scope for a non-subject caller is a digest of the credential itself. It is stable across
+// revocation and expiry, it separates two administrators exactly — two sessions are two
+// credentials — it needs no database read at all, and it closes the driver half of Docs/11 §9 in
+// the same stroke without a second mechanism, because a job-scoped token is a bearer credential
+// like any other.
+//
+// The cost, stated rather than hidden: one administrator signed in twice has two scopes, so the
+// same key reused across their two browsers is two actions rather than one. That is a scope
+// narrower than the account, and narrower is the safe direction — a replay hands back a stored
+// response body, so the scope is a read boundary and not only a deduplication key. It is also
+// unobservable in practice: an idempotency key is generated per action by the client, so two
+// browsers colliding on one is not a thing an honest client does.
+//
+// # Why the subject still wins, and why it is not a digest
+//
+// An account holder keeps `user:<id>`, which is the account rather than the credential, because
+// **identity has a refresh and the other two systems do not**: a mobile client whose access token
+// expires mid-retry obtains a new one and retries with it, and scoping on the credential would
+// make that retry a different caller and execute the request twice. That is the duplicate bid the
+// idempotency invariant exists to prevent. An administrator cannot refresh — sign-out is terminal
+// — so the same reasoning points the other way for them.
 //
 // # Why ResolveSubject never rejects
 //
@@ -203,140 +224,33 @@ func RequireSubject() func(http.Handler) http.Handler {
 	}
 }
 
-// PrincipalKind names a credential system whose callers are not account holders.
+// credentialScopeKind names the namespace a bearer credential that produced no [authctx.Subject]
+// is scoped into.
 //
-// **The set is closed, and that is the point of the type.** The scope is rendered as
-// `<kind>:<id>`, so a resolver free to choose its own kind could return `"user"` and land an
-// administrator in a scope an account holder is already using. A string constant declared here
-// cannot: `user` and `anonymous` are not in this set and cannot be added to it from cmd/api.
-type PrincipalKind string
+// It is deliberately one namespace rather than one per credential system. Telling an
+// administrator's session from a driver's job token from a stale access token needs a lookup in
+// the domain that issued it, and the whole point of the digest is that the scope must not depend
+// on a lookup that can fail — see the file comment. Two callers are separated by the digest, not
+// by the label.
+const credentialScopeKind = "credential"
 
-const (
-	// PrincipalAdmin is an administrator's console session (SHIP-147, SHIP-147b).
-	PrincipalAdmin PrincipalKind = "admin"
-
-	// PrincipalDriver is the driver portal's job-scoped token (SHIP-107, SHIP-108).
-	//
-	// **Declared ahead of a resolver, deliberately.** Docs/11 §9 records the identical hole for
-	// the driver — `internal/delivery/http.go` names it twice — and the mechanism SHIP-147b
-	// built takes a second resolver without any further change to this package. The name is here
-	// so that closing it is a cmd/api closure and a route file, rather than a shared-surface
-	// edit somebody has to wait a wave for. Nothing populates it today.
-	PrincipalDriver PrincipalKind = "driver"
-)
-
-// valid reports whether this is a kind the scope may be built from.
-func (k PrincipalKind) valid() bool {
-	switch k {
-	case PrincipalAdmin, PrincipalDriver:
-		return true
-	}
-	return false
-}
-
-// Principal is a verified caller who is not an [authctx.Subject].
+// credentialScopeSalt domain-separates this digest from every other SHA-256 of the same input.
 //
-// It carries what namespacing needs and nothing else: no role, no permissions, no session. This
-// package must not become a place where a second kind of caller is described, because every
-// domain sits on it — the grant itself stays in the domain that verified it, behind an unexported
-// context key, which is what makes "admin is the only domain serving a RequireAdmin route" a fact
-// about the build rather than a rule somebody follows.
-type Principal struct {
-	// Kind is which credential system this caller came from.
-	Kind PrincipalKind
+// `admin_sessions.token_hash` and identity's refresh-token column both store `sha256(credential)`.
+// Without the salt this scope would render that exact value into a Redis key — putting the
+// database's stored verifier into the cache, into a log line, and into the reach of anything that
+// can run `SCAN`. It does not make the credential recoverable either way; it stops one system's
+// stored secret becoming another system's routine output.
+const credentialScopeSalt = "shipper:idempotency-scope:v1\x00"
 
-	// ID identifies the caller within Kind, and must be stable across a retry — it is what
-	// makes a repeated request the *same* caller's repeat.
-	ID string
-}
-
-// PrincipalResolver turns a presented credential into the caller it belongs to.
+// credentialScope names a caller by what they presented rather than by who it belongs to.
 //
-// Declared here, by the consumer, and satisfied in cmd/api by a closure over the domain that
-// issued the credential — the same arrangement [Authenticator] has and for the same reason
-// (Docs/06 §4.1, SHIP-15c). An error means "not one of mine", and the next resolver is tried.
-type PrincipalResolver func(ctx context.Context, credential string) (Principal, error)
-
-type principalKey struct{}
-
-// principalLookup is the deferred resolution [ResolvePrincipal] puts on the context.
-//
-// sync.Once rather than a plain flag: one request is served by one goroutine today, and a
-// memoised value read under -race by a handler that fans out would be a data race nobody would
-// look for here.
-type principalLookup struct {
-	resolvers []PrincipalResolver
-	once      sync.Once
-	principal Principal
-	found     bool
-}
-
-func (l *principalLookup) resolve(r *http.Request) (Principal, bool) {
-	l.once.Do(func() {
-		credential, presented := bearerCredential(r.Header.Get(HeaderAuthorization))
-		if !presented || credential == "" {
-			return
-		}
-
-		ctx := r.Context()
-		for _, resolve := range l.resolvers {
-			p, err := resolve(ctx, credential)
-			if err != nil {
-				// Debug, for ResolveSubject's reason: an administrator's console lapses
-				// every morning, and logging that where anybody alerts would make the
-				// alert meaningless inside a week. A credential presented on a public
-				// route belongs to none of these systems and reaches here routinely.
-				LoggerFrom(ctx).LogAttrs(ctx, slog.LevelDebug,
-					"a credential was not attributed to a principal",
-					slog.String("error", err.Error()))
-				continue
-			}
-			if !p.Kind.valid() || p.ID == "" {
-				// Error rather than debug, and it falls through to the anonymous scope:
-				// this is a wiring defect in a resolver rather than anything the caller
-				// did, and it silently reopens the hole SHIP-147b closed.
-				LoggerFrom(ctx).LogAttrs(ctx, slog.LevelError,
-					"a principal resolver returned a caller that cannot be namespaced",
-					slog.String("kind", string(p.Kind)))
-				continue
-			}
-
-			l.principal, l.found = p, true
-			return
-		}
-	})
-	return l.principal, l.found
-}
-
-// ResolvePrincipal makes non-subject callers available to [SubjectScope] (SHIP-147b).
-//
-// Applied to the version group **outside** [Idempotent], beside [ResolveSubject]. It writes no
-// response, rejects nothing and — see the file comment — calls no resolver until a scope is
-// actually wanted. Resolvers are tried in order and the first that answers wins.
-//
-// A nil resolver is a panic rather than a skip, exactly as [ResolveSubject] treats a nil
-// [Authenticator]: it is called once from the composition root, and the failure it would
-// otherwise produce is every administrator's idempotency key silently sharing one namespace while
-// the service reports itself healthy. **No resolvers at all is legitimate** and means the
-// deployment has no credential system but the access token.
-func ResolvePrincipal(resolvers ...PrincipalResolver) func(http.Handler) http.Handler {
-	for _, resolve := range resolvers {
-		if resolve == nil {
-			panic("httpx: ResolvePrincipal was given a nil PrincipalResolver; every caller it " +
-				"was meant to namespace would fall back to the shared anonymous scope")
-		}
-	}
-
-	if len(resolvers) == 0 {
-		return func(next http.Handler) http.Handler { return next }
-	}
-
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			lookup := &principalLookup{resolvers: resolvers}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, lookup)))
-		})
-	}
+// The digest is of the raw credential, so it is stable for exactly as long as the client keeps
+// sending the same one — across the session's revocation and across its expiry, which is the
+// property the retry contract needs and the reason this is not a resolved identifier.
+func credentialScope(credential string) string {
+	sum := sha256.Sum256([]byte(credentialScopeSalt + credential))
+	return credentialScopeKind + ":" + hex.EncodeToString(sum[:])
 }
 
 // SubjectScope namespaces idempotency keys by the caller they belong to (SHIP-15, SHIP-44,
@@ -346,32 +260,39 @@ func ResolvePrincipal(resolvers ...PrincipalResolver) func(http.Handler) http.Ha
 // `idem:v1:anonymous:<key>`, so a client that guessed another client's key was handed that
 // client's stored response body — an entirely different person's job, address or bid.
 //
-// # Two callers, three answers
+// # Three answers
 //
-// An account holder scopes on their user identifier. A caller whose credential belongs to one of
-// the other systems — an administrator today — scopes on `<kind>:<id>` from a [Principal], which
-// is what SHIP-147b added: until then an administrator produced no subject, so every
-// administrative key landed in the shared anonymous scope and two administrators could read each
-// other's stored responses.
+//	user:<id>          an account holder, from the verified [authctx.Subject]
+//	credential:<hash>  a bearer credential that produced no subject — an administrator's
+//	                   console session, a driver's job-scoped token, or an access token this
+//	                   service will not accept
+//	anonymous          nothing was presented
 //
-// **The scope is the account rather than the session, on both sides.** One user signed in on two
-// devices shares a scope, and one administrator with two browsers open shares a scope, because
-// idempotency answers "has this action already been performed" and the answer does not change
-// with the device it was performed from. Two *different* administrators never share one.
+// The middle one is SHIP-147b. Until it existed every administrative key landed in the shared
+// anonymous scope, so two administrators could read each other's stored responses; the file
+// comment argues why it is a digest of the credential rather than the administrator it names.
 //
 // # Anonymous is still a shared scope, and still safe
 //
 // For the reason Docs/11 §6 sets out: replayOrRefuse fingerprints method, path and body, so
 // reading a stranger's stored response requires sending their exact request — which, on every
-// public state-changing route, means already holding the secret material in their body.
+// public state-changing route, means already holding the secret material in their body. Every
+// caller who presents *something* now leaves that scope, so what is left in it is the traffic
+// that argument was written about.
+//
+// # A caller can choose their own scope, and that is not a weakness
+//
+// Anybody may invent a bearer token and get a private namespace of their own. They cannot reach
+// anyone else's with it — a scope nobody else can compute is a scope nobody else is in — and they
+// could already occupy unlimited entries in `anonymous` by varying the key. What no caller can do
+// is land in a namespace somebody else is using: `user:` is written from a verified subject and
+// from nothing else, and no presented value reaches a scope unhashed.
 func SubjectScope(r *http.Request) string {
 	if s, ok := authctx.SubjectFrom(r.Context()); ok && s.UserID != "" {
 		return "user:" + s.UserID
 	}
-	if lookup, ok := r.Context().Value(principalKey{}).(*principalLookup); ok {
-		if p, found := lookup.resolve(r); found {
-			return string(p.Kind) + ":" + p.ID
-		}
+	if credential, presented := bearerCredential(r.Header.Get(HeaderAuthorization)); presented && credential != "" {
+		return credentialScope(credential)
 	}
 	return "anonymous"
 }

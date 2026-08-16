@@ -160,11 +160,17 @@ the handler again.
 | Same key, **different** request | `409 idempotency_key_reused` |
 | Redis unreachable | `503 service_unavailable` — it fails closed |
 
-**Keys are namespaced by caller** (SHIP-44). An authenticated request stores under
-`idem:v1:user:<user id>:<key>`, so one client cannot read another's stored response by guessing a
-key. Anonymous callers share `idem:v1:anonymous:<key>`, which is safe because the fingerprint
-covers the request body: reading a stranger's response means already holding the secret material
-in their request.
+**Keys are namespaced by caller** (SHIP-44, SHIP-147b). A request carrying an access token this
+service accepts stores under `idem:v1:user:<user id>:<key>`, so one client cannot read another's
+stored response by guessing a key. A request carrying any *other* bearer credential — an
+administrator's console session, a driver's job-scoped token — stores under
+`idem:v1:credential:<digest>:<key>`, because neither produces an authenticated subject on purpose.
+The digest is of the credential rather than of the account it names: a scope that has to resolve a
+credential is not stable across that credential's own revocation, and `DELETE
+/v1/admin/sessions/current` revokes the credential it was called with, so a retried sign-out would
+miss the response it had already stored. Callers who present nothing share `idem:v1:anonymous:<key>`,
+which is safe because the fingerprint covers the request body: reading a stranger's response means
+already holding the secret material in their request.
 
 Failing closed is deliberate. A request arriving while Redis is down is disproportionately
 likely to be a retry, and a refusal the client retries costs a moment where a duplicate

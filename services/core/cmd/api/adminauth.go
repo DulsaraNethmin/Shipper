@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -9,7 +8,6 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/admin"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
-	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
 // The composition root for an administrator's session (SHIP-147), written before the ticket.
@@ -108,41 +106,28 @@ import (
 // SHIP-147: filling this body is what maps RequireAdmin, and `routes_admin.go` — the admin track's
 // own file — is what declares the first routes on it.
 //
-// # What SHIP-147b added, and why it is a second field rather than a second parameter
+// # What SHIP-147b asked of this file, and why the answer was nothing
 //
 // An administrator's idempotency key landed in `idem:v1:anonymous:<key>`, because
 // `httpx.SubjectScope` reads an `authctx.Subject` and an administrator deliberately produces none.
 // The guard below cannot fix that: it runs **per route, inside** `httpx.Idempotent`, and the scope
-// has been computed before it ever sees the request. Docs/11 §9 named the mechanism that does —
-// a second group-wide resolver, outside `Idempotent`, which `httpx.ResolvePrincipal` now is — and
-// this file is where the closure over `internal/admin` is supplied.
+// has been computed before it ever sees the request. Docs/11 §9 named a second group-wide resolver
+// as the mechanism, and this file was where the closure over `internal/admin` would be supplied —
+// so SHIP-147b's first form returned the guard and that resolver together in a struct, to keep
+// `newRouter`'s fifteen call sites and `main.go` out of the diff.
 //
-// So this constructor returns **two** things, and it returns them in one struct rather than
-// growing `newRouter` a sixth parameter. That is not tidiness. `newRouter` has fifteen call sites
-// across five test files, and `main.go` is a shared surface: bundling means the return type and
-// the parameter type change together, `main.go` compiles untouched, and every test still says
-// `testAdminGuard()`. SHIP-108's measured cost for the *other* seam was fifteen mechanical edits
-// in a diff that also contained a token verifier, and Docs/11 §9 records that as the thing this
-// arrangement exists to avoid.
-type adminAuth struct {
-	// Guard enforces the RequireAdmin auth class, per route, from the manifest.
-	Guard Guard
-
-	// Scope names the administrator an idempotency key belongs to, group-wide.
-	//
-	// **It resolves the session a second time**, and that is a real cost stated rather than
-	// hidden: the guard resolves it too, so an administrative write does two indexed reads of
-	// `admin_sessions` instead of one. The alternative is for `internal/admin` to export a way
-	// of putting a grant on its own context key so the guard could reuse this one — which
-	// would export exactly the thing adminauth.go keeps unexported so that no other package
-	// can hold an administrator grant. One extra read on the writes only (the resolver is
-	// lazy — see httpx.ResolvePrincipal) is the cheaper side of that trade.
-	//
-	// `Authenticator.slide` is granularity-limited, so the pair produces at most one write.
-	Scope httpx.PrincipalResolver
-}
-
-func newAdminGuard(cfg *config.Config, pool *pgxpool.Pool, clk clock.Clock) (adminAuth, error) {
+// **That form shipped and broke the sign-out retry.** `DELETE /v1/admin/sessions/current` ends the
+// session it is presented with. On the retry that a dropped connection produces, the resolver
+// therefore runs against a revoked credential, fails, and the scope falls back to `anonymous` —
+// where the 204 the first call stored is not — so the retry reaches the guard and is refused.
+// `httpx.SubjectScope` carries the general argument: a scope computed by resolving a credential is
+// not stable across that credential's own lifecycle.
+//
+// The scope is therefore a digest of the credential, computed in `internal/httpx` from the header
+// it already reads, and **it needs nothing from this package**: no resolver, no closure, no second
+// read of `admin_sessions` per administrative write, and no struct. The signature below is the one
+// SHIP-15r wrote, unchanged through both tickets.
+func newAdminGuard(cfg *config.Config, pool *pgxpool.Pool, clk clock.Clock) (Guard, error) {
 	// cfg is deliberately unused. See the note above; an administrator session has no signing
 	// key and no configured lifetime, and the parameter is kept so that main.go stays out of the
 	// next diff that needs one.
@@ -150,33 +135,11 @@ func newAdminGuard(cfg *config.Config, pool *pgxpool.Pool, clk clock.Clock) (adm
 
 	verifier, err := admin.NewAuthenticator(pool, clk)
 	if err != nil {
-		return adminAuth{}, fmt.Errorf("administrator session verifier: %w", err)
+		return nil, fmt.Errorf("administrator session verifier: %w", err)
 	}
 
-	return adminAuth{
-		// admin.RequireAdmin returns a func(http.Handler) http.Handler, which is Guard's
-		// underlying type — so no conversion and, more to the point, no second declaration of
-		// the middleware shape in a package every domain can see.
-		Guard: admin.RequireAdmin(verifier),
-
-		// The scope is the **administrator**, not the session, which is the same choice
-		// httpx.SubjectScope makes for a user: one person signed in twice has performed one
-		// action, and idempotency answers whether the action has happened. A session
-		// identifier would make one administrator's second browser a different caller.
-		//
-		// An error is "not an administrator credential" and nothing more — httpx tries the
-		// next resolver and then falls back to the anonymous scope. It is deliberately not
-		// distinguished here: a lapsed session, a revoked one and a user's access token all
-		// mean the same thing to a namespace, and the *route* is where a refusal belongs.
-		Scope: func(ctx context.Context, credential string) (httpx.Principal, error) {
-			grant, err := verifier.Resolve(ctx, credential)
-			if err != nil {
-				return httpx.Principal{}, err
-			}
-			return httpx.Principal{
-				Kind: httpx.PrincipalAdmin,
-				ID:   grant.Administrator.ID.String(),
-			}, nil
-		},
-	}, nil
+	// admin.RequireAdmin returns a func(http.Handler) http.Handler, which is Guard's underlying
+	// type — so no conversion and, more to the point, no second declaration of the middleware
+	// shape in a package every domain can see.
+	return admin.RequireAdmin(verifier), nil
 }

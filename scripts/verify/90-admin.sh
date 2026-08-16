@@ -2698,23 +2698,44 @@ ok "and both notes are in admin_notes, written by two different administrators"
 
 # --- the keys in Redis, which is the half no Go test looks at ------------------------------------
 #
-# Two scopes, both naming an administrator, and **no `idem:v1:anonymous:` entry for this key** —
-# which is exactly the state the user-only scope would have produced instead.
+# Two entries, one per credential, and **no `idem:v1:anonymous:` entry for this key** — which is
+# exactly the state the user-only scope would have produced instead.
+#
+# The scope is a digest of the credential rather than the administrator it names. That is not the
+# obvious choice and it was not the first one: a scope that has to *resolve* a credential is not
+# stable across that credential's own revocation, and `DELETE /v1/admin/sessions/current` revokes
+# the credential it is called with — so the retried sign-out asserted a few hundred lines above is
+# the check that found it. httpx.SubjectScope carries the argument in full.
 
 scope_keys="$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:*:$scope_key" | sort)"
 [[ "$(printf '%s\n' "$scope_keys" | grep -c .)" == "2" ]] \
   || fail "this key produced these idempotency entries, want two:
 $scope_keys"
-printf '%s\n' "$scope_keys" | grep -q "^idem:v1:admin:$unpub_id:$scope_key$" \
-  || fail "no entry is namespaced to the first administrator:
-$scope_keys"
-printf '%s\n' "$scope_keys" | grep -q "^idem:v1:admin:$scope_id:$scope_key$" \
-  || fail "no entry is namespaced to the second administrator:
+[[ "$(printf '%s\n' "$scope_keys" | grep -c '^idem:v1:credential:')" == "2" ]] \
+  || fail "the two entries are not both namespaced to a credential:
 $scope_keys"
 ! printf '%s\n' "$scope_keys" | grep -q "^idem:v1:anonymous:" \
   || fail "an administrator's key landed in the shared anonymous namespace:
 $scope_keys"
-ok "the stored keys are idem:v1:admin:<administrator>:<key>, one each, and neither is in the anonymous namespace"
+ok "the stored keys are idem:v1:credential:<digest>:<key>, one per administrator, and neither is in the anonymous namespace"
+
+# Neither key carries a credential, and neither carries the digest the database stores.
+#
+# The second half is why the digest is salted. `admin_sessions.token_hash` is `sha256(token)`, so an
+# unsalted scope would render the database's stored verifier into a cache key — readable by
+# anything that can run SCAN, and by every log line that names one. This asserts it against the
+# actual column rather than against a restatement of the rule.
+for scope_secret in "$unpub_token" "$scope_token"; do
+  ! printf '%s\n' "$scope_keys" | grep -qF "$scope_secret" \
+    || fail "an idempotency key contains a live administrator credential:
+$scope_keys"
+done
+for scope_stored in $("$PSQL" "$DATABASE_URL" -qtAc "select token_hash from admin_sessions;"); do
+  ! printf '%s\n' "$scope_keys" | grep -qF "$scope_stored" \
+    || fail "an idempotency key contains admin_sessions.token_hash ($scope_stored), so the cache is publishing the digest the database compares against:
+$scope_keys"
+done
+ok "and neither key carries the credential itself, nor the digest admin_sessions stores against it"
 
 # --- and idempotency still works within one administrator ----------------------------------------
 #
@@ -2732,11 +2753,16 @@ scope_replayed replay || fail "the same administrator repeating the same key did
   || fail "the retry wrote a third note"
 ok "one administrator retrying the same key is still answered from the store, and writes nothing"
 
-# --- the anonymous scope is still where an unrecognised credential goes ---------------------------
+# --- an invented credential reaches nobody, and `anonymous` is still there ------------------------
 #
-# The resolver must not hand a private namespace to anybody who invents a bearer token: a caller who
-# could choose their own scope could not read anyone else's, but the scope would stop being a
-# statement about a verified identity, and every public route depends on `anonymous` still existing.
+# **This check asserts something different from the one it replaces, and the change is deliberate.**
+# While the scope was resolved from the credential an unrecognised one fell back to `anonymous`, and
+# this asserted that. A credential digest does not fall back: anybody may invent a bearer token and
+# be given a namespace of their own. That is not a weakness — a scope nobody else can compute is a
+# scope nobody else is in, and an invented token still cannot open an administrative route — so what
+# is asserted here is the property that carries the weight instead: an invented credential lands
+# nowhere near a real administrator's entries, and a caller who presents *nothing* is still
+# anonymous, which every public route depends on.
 
 invented_key="verify-adm147b-invented-$$"
 status="$(curl -s -X POST -o "$WORKDIR/scope-invented.json" -w '%{http_code}' \
@@ -2744,8 +2770,28 @@ status="$(curl -s -X POST -o "$WORKDIR/scope-invented.json" -w '%{http_code}' \
   -H 'Content-Type: application/json' -d "$scope_body" \
   "http://localhost:$VERIFY_PORT/v1/admin/notes")"
 [[ "$status" == "401" ]] || { cat "$WORKDIR/scope-invented.json"; fail "an invented credential returned $status, want 401"; }
-[[ -n "$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:anonymous:$invented_key")" ]] \
-  || fail "an unrecognised credential did not land in the anonymous namespace, so a caller can choose their own scope by inventing a token"
-ok "an unrecognised credential is still anonymous — the namespace follows a verified identity rather than whatever was presented"
+
+invented_keys="$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:*:$invented_key" | sort)"
+[[ "$(printf '%s\n' "$invented_keys" | grep -c .)" == "1" ]] \
+  || fail "an invented credential produced these entries, want one:
+$invented_keys"
+printf '%s\n' "$invented_keys" | grep -q "^idem:v1:credential:" \
+  || fail "an invented credential did not get a namespace of its own:
+$invented_keys"
+invented_scope="$(printf '%s\n' "$invented_keys" | sed 's/:[^:]*$//')"
+! printf '%s\n' "$scope_keys" | grep -qF "$invented_scope:" \
+  || fail "an invented credential landed in a namespace a real administrator is using:
+$invented_keys
+$scope_keys"
+ok "an invented credential is refused, and its key lands in a namespace no administrator is in"
+
+nocred_key="verify-adm147b-nocred-$$"
+status="$(curl -s -X POST -o "$WORKDIR/scope-nocred.json" -w '%{http_code}' \
+  -H "Idempotency-Key: $nocred_key" -H 'Content-Type: application/json' -d "$scope_body" \
+  "http://localhost:$VERIFY_PORT/v1/admin/notes")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/scope-nocred.json"; fail "a request with no credential returned $status, want 401"; }
+[[ -n "$(redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:anonymous:$nocred_key")" ]] \
+  || fail "a caller who presented nothing did not land in the anonymous namespace, which every public route depends on"
+ok "and a caller who presents nothing is still anonymous, so the shared scope every public route uses is intact"
 
 admin_clear_limits

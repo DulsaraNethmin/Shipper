@@ -163,12 +163,12 @@ func testDriverGuard() Guard {
 // naming the class — which is how the driver half announced itself, and is the failure this helper
 // converts from fifteen edits into one.
 //
-// **The paragraph above was written before SHIP-147 and the seam paid twice.** SHIP-147 filled the
-// body and the fifteen call sites did not move; SHIP-147b then gave newAdminGuard a *second* thing
-// to return — the idempotency scope resolver — and the call sites did not move again, because the
-// return type became a struct rather than the signature growing. The name is kept for that reason:
-// renaming this helper is the fifteen edits the helper exists to prevent.
-func testAdminGuard() adminAuth {
+// **The paragraph above was written before SHIP-147 and the seam held.** SHIP-147 filled the body
+// and the fifteen call sites did not move. SHIP-147b briefly changed the return type to a struct
+// so a second thing could come back beside the guard, and then did not need to: the idempotency
+// scope it was added for turned out not to be resolvable from a credential at all (see
+// httpx.SubjectScope), so the signature is the one SHIP-15r wrote.
+func testAdminGuard() Guard {
 	guard, err := newAdminGuard(testDeps().Config, nil, clock.System{})
 	if err != nil {
 		panic("cmd/api test: building the admin guard: " + err.Error())

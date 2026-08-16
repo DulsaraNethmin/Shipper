@@ -638,7 +638,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-157** | M6 | `GET /v1/admin/moderation/exceptions` **widened rather than joined by three siblings** — one `UNION ALL` over overdue pickup, delayed delivery, failed proof and unsynced milestones, with a `ground` filter and a **three-part cursor**. The third cursor field is load-bearing: the two window grounds are both keyed by the job, so a job whose windows close at one instant produces two entries agreeing on everything else. The 24-hour threshold is **passed from `delivery.UnsyncedAlertThreshold`**, never copied — *see below* |
 | **SHIP-158** | M6 | `GET /v1/admin/moderation/cancellations` — Docs/04 §5's **fifth** queue, beside the fourth rather than inside it. **The finding is that `Docs/02` §2 has no `Awarded → Cancelled` transition**, so a query keyed on a job reaching `Cancelled` returns the *pre*-award cancellations and none of the post-award ones — the exact inverse of the row. It reads the history instead, on two outcomes: `returned_to_market` (§6.2's provider cancellation, the signal that "cannot be reconstructed later") and `ended` (`Disputed → Cancelled`). The provider's history is a **count and its denominator** — *see below* |
 | **SHIP-166** | M6 | Docs/04 §9's two-person review. `000803_suspension_reviews`, and **`suspended` left `POST /v1/admin/users/{id}/standing`** — one administrator may restrict and reinstate and may no longer suspend alone. Three routes: request, the pending queue, and an approval that applies the suspension in one transaction. **The rule is a CHECK constraint as well as a Go check**, because a convention does not apply to a psql prompt; the mutation removing the Go half is reported below with its verdict — *see below* |
-| **SHIP-147b** | M6 | An administrator's idempotency key is scoped to that administrator. `httpx.ResolvePrincipal` — the **second group-wide resolver** Docs/11 §9 named twice and deferred twice, running outside `Idempotent` beside `ResolveSubject`, with `SubjectScope` widened to read either. **A per-route guard could never have fixed this**: at the moment the scope is computed there is nothing on the context to read. It resolves **lazily**, so the extra session read is paid on administrative *writes* and on nothing else, and `internal/httpx` still imports no domain — the closure over `internal/admin` is supplied in `cmd/api`. **A driver grant is a second closure and no further `httpx` change** — *see below* |
+| **SHIP-147b** | M6 | An administrator's idempotency key no longer lands in `idem:v1:anonymous:<key>`. **A per-route guard could never have fixed this**: at the moment `Idempotent` computes the scope there is nothing on the context to read. §9's named mechanism — a second group-wide resolver naming the administrator — **was built, passed `make check`, and broke a nine-month-old `make verify` check**: `DELETE /v1/admin/sessions/current` revokes the credential it was called with, so the retry's resolution fails and the replayed 204 is filed under a scope nothing can recompute. `SubjectScope` scopes on a **salted digest of the credential** instead — stable across revocation, no database read, no resolver, and `cmd/api/routes.go` byte-identical to `develop`. **It closes the driver half of §9 as a side effect** — *see below* |
 | **SHIP-147a** | M6 | The platform's password cost, under its own name. `Config.Identity.Argon2` and `IDENTITY_ARGON2_*` became `Config.Passwords.Argon2` and `PASSWORDS_ARGON2_*` — one setting, read by identity's hasher, by admin's, and by identity's phone one-time codes. **Declined in three consecutive prep passes and it cost nothing to take**: five files. "No second knob" is a **guard rather than a claim** — a reflective walk of the `Config` tree and a source scan of `cmd/api` — and the release note naming the rename is in `deploy/.env.example` beside the variables, because no release-notes artefact exists to put it in — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
@@ -13178,7 +13178,7 @@ would mean a deployment can hold two values for one setting with no rule about w
 condition that makes a compatibility period worth its cost — an existing deployment — does not
 exist. The release note is what carries the change instead.
 
-### SHIP-147b — the resolver §9 named twice, and why no guard could ever have done it
+### SHIP-147b — an administrator's idempotency key, and the retry contract that decided its shape
 
 Every administrator's idempotency key landed in `idem:v1:anonymous:<key>`, so two administrators
 shared one namespace and either could be handed the other's stored response body. It is closed.
@@ -13186,110 +13186,140 @@ shared one namespace and either could be handed the other's stored response body
 **The shape of the problem is an ordering rather than a missing branch, and that is what made it
 sit open for four waves.** `httpx.Idempotent` wraps the whole `/v1` group; an auth class is applied
 *per route*, inside it. `admin.RequireAdmin` therefore resolves the session and writes its grant
-onto the context **after** the scope has already been computed — so widening `httpx.SubjectScope`
-alone could not work, because at the moment it runs there is nothing there to read. No amount of
-work in `internal/admin` could have changed that, which is why `Docs/11` §9 recorded the fix twice
-and both times said it belonged to a prep ticket: it is an `internal/httpx` change and a
-`cmd/api/routes.go` change, and no domain branch may make either.
+onto the context **after** the scope has already been computed — so no guard could ever have fixed
+this, because at the moment the scope is computed there is nothing on the context to read. That is
+why `Docs/11` §9 recorded the fix twice and both times said it belonged to a prep ticket: it is an
+`internal/httpx` change, and no domain branch may make one.
 
-#### What was built
+#### The first form shipped, and `make verify` caught it — read this before changing the scope again
 
-`httpx.ResolvePrincipal`, applied to the version group **outside `Idempotent`, beside
-`ResolveSubject`** — §9's *first* option, the one `internal/delivery/http.go` also names. It takes
-`PrincipalResolver`s, a function type this package declares, and `cmd/api/adminauth.go` supplies
-the closure over `internal/admin`. `internal/httpx` imports no domain and `make lint-imports`
-agrees; the arrangement is exactly the one `boundaries.go` describes for `httpx.Authenticate`.
+§9's named mechanism was a **second group-wide resolver** beside `ResolveSubject`, turning the
+presented credential into the administrator it names, with `SubjectScope` widened to read either.
+That is what `45c999e` built: `httpx.ResolvePrincipal`, a `PrincipalResolver` declared in `httpx`,
+a closed `PrincipalKind` set, and a closure over `internal/admin` supplied in `cmd/api`. `make
+check` was green on it. **`make verify` was not**, and the check it failed is worth quoting because
+it is nine months older than the ticket and states its own contract:
 
-`SubjectScope` now answers three ways: `user:<id>` from an `authctx.Subject`, `<kind>:<id>` from a
-resolved `Principal`, and `anonymous`. **The subject still wins where both are somehow present**,
-so an account holder's scope cannot change because something else also recognised their credential.
+> `scripts/verify/90-admin.sh:578` — *a retried sign-out returned 401, want the replayed 204.* "A
+> browser that retried the same request reuses its key, and the middleware replays the 204 it
+> already sent — **from outside the guard, so the dead credential is never consulted.**"
 
-Three decisions inside that are worth reading rather than inferring:
+`DELETE /v1/admin/sessions/current` **revokes the credential it was called with**. So on the retry
+a dropped connection produces, resolution fails, the scope falls back to `anonymous`, the 204
+stored under `admin:<administrator-id>` is not found, and the request reaches the guard — which
+correctly refuses the session the first call ended. A sign-out that succeeded reported 401 to the
+retry that could not hear the 204.
 
-- **The kind set is closed** — `PrincipalKind` is a defined type with constants in `httpx`, and a
-  resolver returning anything else falls through to `anonymous` with an error logged. The reason is
-  concrete: the scope is rendered `<kind>:<id>`, so a resolver free to choose its own kind could
-  return `"user"` with somebody's user identifier and land in that person's scope exactly. A
-  closed set makes that impossible from `cmd/api` rather than merely discouraged.
-- **The scope is the administrator, not the session.** Same as the user side, where one person on
-  two devices shares a scope: idempotency answers "has this action been performed", and the answer
-  does not change with the browser it was performed from. Two *different* administrators never
-  share one, which is what the *Done when* asks for.
-- **It resolves lazily.** `ResolvePrincipal` installs the resolvers and calls none of them;
-  `SubjectScope` calls them, and `Idempotent` asks for a scope only on a state-changing request
-  carrying a valid key. That is load-bearing rather than tidy: verifying an administrator session
-  is a database read, an eager resolver would pay for one on every console GET whose scope is never
-  computed, **and on every public request carrying an unrecognised bearer token** — a read an
-  unauthenticated caller would get to trigger. As built, the cost is one extra read per
-  administrative *write*.
+**The general statement, which is the thing to carry forward:** *a scope computed by resolving a
+credential is not stable across that credential's own lifecycle, and a retry is exactly the window
+in which the lifecycle moves.* Sign-out is the sharp case because invalidating its own credential
+is its purpose, but a session lapsing between an attempt and its retry has the same shape. Any
+resolution that can fail can fail **between the two halves of one logical request**.
 
-#### The cost that was accepted, stated rather than hidden
+#### What is built now
 
-An administrative write now resolves the session **twice**: once for the scope, once in the guard.
-The alternative is for `internal/admin` to export a way of putting a grant on its own context key
-so that the guard could reuse the resolver's answer — which would export precisely the thing
-`adminauth.go` keeps unexported so that no other package can hold an administrator grant. One
-indexed read on the writes is the cheaper side of that trade. `Authenticator.slide` is
-granularity-limited, so the pair still produces at most one write.
+`httpx.SubjectScope` answers three ways, with no resolver, no closure and no database read:
 
-#### Two things did not change, and one of them is the seam paying off again
+| Scope | Caller |
+|---|---|
+| `user:<id>` | an account holder, from the verified `authctx.Subject` |
+| `credential:<sha256(salt‖credential)>` | a bearer credential that produced no subject — an administrator's console session, a driver's job-scoped token, an access token this service will not accept |
+| `anonymous` | nothing was presented |
 
-**`newRouter` did not grow a sixth parameter and `main.go` is not in the diff.** `newAdminGuard`
-returns an `adminAuth` — the guard and the scope resolver together — and `newRouter`'s parameter
-type changed with it, so all fifteen call sites still say `testAdminGuard()` and `main.go`'s
-`adminSession, err := newAdminGuard(…)` compiles untouched. `Docs/11` §9 records SHIP-108's
-measured cost for the other seam as fifteen mechanical edits across five test files in a diff that
-also contained a token verifier; this is that cost declined a second time.
+Four decisions inside that are worth reading rather than inferring:
 
-**`internal/httpx`'s middleware ordering is otherwise unchanged**, including the second
-`StandardErrors` and the comment that says not to tidy it.
+- **The subject still wins, and it is still the account rather than the credential.** That is not
+  inconsistency, it is the same argument pointing the other way: **identity has a refresh and the
+  other two systems do not.** A mobile client whose access token expires mid-retry gets a new one
+  and retries with it, so a credential-shaped scope would make that retry a different caller and
+  execute the request twice — the duplicate bid the invariant exists to prevent. An administrator
+  cannot refresh; sign-out is terminal.
+- **The digest is salted** (`shipper:idempotency-scope:v1\0`). `admin_sessions.token_hash` and
+  identity's refresh-token column both store `sha256(credential)`, so an unsalted scope would
+  render the database's own stored verifier into a Redis key — reachable by anything that can run
+  `SCAN`. The harness asserts this against the actual column rather than against a restatement of
+  the rule.
+- **One namespace, not one per credential system.** Telling an administrator's session from a
+  driver's token from a stale access token needs a lookup in the domain that issued it, and the
+  whole point is that the scope must not depend on a lookup that can fail. Callers are separated by
+  the digest, never by the label.
+- **A caller can choose their own scope, and that is not a weakness.** Anybody may invent a bearer
+  token and get a private namespace. They cannot reach anyone else's — a scope nobody else can
+  compute is a scope nobody else is in — and they could already occupy unlimited entries in
+  `anonymous` by varying the key. What no caller can do is land in a namespace somebody else is
+  using: `user:` is written from a verified subject and from nothing else.
 
-#### How it was demonstrated, and the mutation
+#### The cost, and the option that was rejected
 
-Three levels, deliberately, because each one can prove something the others cannot.
+**One administrator signed in twice has two scopes.** The first form scoped on the account and
+argued "one person signed in twice has performed one action". That argument is real and it lost to
+two things. The regression is one. The other is that **a replay hands back a stored response body,
+so the scope is a read boundary and not only a deduplication key** — the credential scope is
+strictly *narrower* than the account scope, and narrower is the safe direction. It is also
+unobservable in practice: an idempotency key is generated per action by the client, so two browsers
+colliding on one is not something an honest client does.
 
-`internal/httpx`'s unit tests pin the mechanism: two principals separate, an unrecognised
-credential is still anonymous, a subject beats a principal, the closed kind set refuses `user`,
-resolvers are tried in order, and — with a call counter — nothing resolves until a scope is asked
-for and the answer is memoised per request.
+**The rejected alternative was to resolve the administrator from a credential whose session has
+ended.** `admin_sessions` rows **survive sign-out** — `revokeSession` is
+`UPDATE … SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL`, measured, and nothing in the
+repository deletes one — so the row is there to be read and the option is genuinely available. It
+was rejected on three counts: it requires `internal/admin` to export *"identify without
+authorising"*, which is one refactor away from being used as authentication and is exactly the
+thing `adminauth.go` keeps unexported; it keeps the double read rather than removing it; and it
+depends on a retention policy that does not exist yet — the day something sweeps old sessions, the
+retry contract silently breaks again with no test to catch it.
+
+#### Three things fell out of it
+
+- **The double read is gone.** The first form resolved the session twice per administrative write,
+  once for the scope and once in the guard, and `Docs/11` recorded that as an accepted cost. There
+  is no scope read at all now.
+- **The driver half of §9 is closed as a side effect.** A job-scoped token is a bearer credential
+  like any other, so `internal/delivery`'s two recorded sites (`http.go:535`, `:925`) are covered
+  with no second mechanism and no closure. Note that delivery took §9's *other* option for its
+  milestone route — the job identifier in the path, backed by
+  `uq_milestones_idempotency (job_id, idempotency_key)` — so those routes now have a per-credential
+  namespace **as well as** their own constraint. Belt and braces rather than a conflict, but it is
+  a namespace change to routes somebody else reasoned about, and it should be read as one.
+- **No shared file is in the diff.** `cmd/api/routes.go` is byte-identical to `develop`;
+  `newRouter`'s signature, `main.go`, `newAdminGuard`'s signature and the fifteen `testAdminGuard()`
+  call sites are all untouched. SHIP-147b is one function in `internal/httpx/auth.go`.
+
+#### How it was demonstrated, and the mutations
 
 **`cmd/api`'s `TestTwoAdministratorSessionsDoNotShareAnIdempotencyScope` is the *Done when*.** It
 signs two moderators in for real, drives the **real** `newRouter` against a real database, sends
 `POST /v1/admin/notes` twice with one key, one method, one path and one body, and asserts on the
 **response bodies and the rows in `admin_notes`** — never on a scope. That is written against
-wave 11's finding that a test can derive its expectation from the thing it tests: anything that
-computed a scope with `SubjectScope` and compared two strings would have agreed with the mutation
-by construction.
+wave 11's finding that a test can derive its expectation from the thing it tests.
 
-`scripts/verify/90-admin.sh` adds the half no Go test looks at: **the keys actually in Redis.** The
-Go test uses the in-memory store, and the deployed service uses `idempotency.RedisStore` — so the
-section scans the keyspace and requires exactly two entries for the shared key,
-`idem:v1:admin:<administrator>:<key>` one each, and **no `idem:v1:anonymous:` entry**, which is
-precisely what the old behaviour produced instead. It also checks that one administrator retrying
-is still replayed, and that an *invented* bearer token still lands in `anonymous` — a resolver that
-handed a private namespace to anyone who made up a token would break the property that the scope
-follows a verified identity.
+**Two tests pin the retry path, at two layers, because `make check` was green while `make verify`
+was red.** `internal/httpx`'s `TestARetriedRequestReplaysAfterItsOwnCredentialIsRevoked` is the
+layer the defect was in: a handler that ends its own session, a guard that refuses once it has, and
+the assertion that the retry is replayed **with the guard called exactly once** — which is the
+"from outside the guard" half of the contract, stated as a count. `cmd/api`'s
+`TestARetriedSignOutIsReplayedAfterTheSessionItEndedIsGone` drives the real endpoint against a real
+revoked `admin_sessions` row. Both check that a *fresh* key still reaches the guard and is refused,
+so neither can be satisfied by a scope that stopped separating anybody.
 
-**The mutation: `SubjectScope` reverted to its user-only form.** It failed loudly and in the exact
-shape the hole has: the second administrator's request was answered with the **first
-administrator's note**, `author_id` and all, and `admin_notes` held one row where two were
-expected. Four `internal/httpx` tests fell with it. Restored from `/tmp/snap-d-ship147b`, confirmed
-with `git diff` **and** `shasum -a 256 -c SHASUMS` — eight files, all OK.
+`scripts/verify/90-admin.sh` reads the keys back out of **Redis**, which no Go test does: two
+`idem:v1:credential:<digest>:<key>` entries for one key, none in `anonymous`, neither carrying a
+credential and neither carrying any value from `admin_sessions.token_hash`. Its check that an
+*invented* credential lands in `anonymous` was **changed deliberately** — a credential digest does
+not fall back, so that check now asserts what carries the weight instead: an invented credential
+lands in a namespace no administrator is in, and a caller who presents **nothing** is still
+anonymous.
 
-#### The driver half is one closure away, and that is now a fact rather than a hope
-
-`Docs/11` §9's other open entry is the identical hole for the driver's job-scoped token, recorded
-at `internal/delivery/http.go:535` and `:925`. **The mechanism admits it with no further change to
-`internal/httpx`**: `ResolvePrincipal` is variadic and tries resolvers in order, `PrincipalDriver`
-is already declared, and `TestResolvePrincipalTriesEveryResolverInOrder` exercises a second
-resolver answering after the first declines. What a follow-up ticket writes is a closure in
-`cmd/api/driverauth.go` and one argument in `newRouter` — a lane's own files.
-
-**It is deliberately not done here**, and not only because it was not granted. `internal/delivery`
-took the *second* of §9's two options for its milestone route — the job identifier in the path,
-backed by `uq_milestones_idempotency (job_id, idempotency_key)` — and argued it at length. Wiring
-a driver resolver changes the namespace those routes have been reasoned about under, and that is a
-decision for whoever owns the delivery domain rather than a consequence of this ticket.
+**Two mutations, both reported.** Against the first form, `SubjectScope` reverted to its user-only
+shape: the second administrator's request was answered with the **first administrator's note**,
+`author_id` and all, and `admin_notes` held one row where two were expected. Against the first form
+the orchestrator also made the resolver return a constant principal id for every administrator —
+mechanism fully wired, scope non-anonymous, only the separation broken — and
+`TestTwoAdministratorSessionsDoNotShareAnIdempotencyScope` failed on seven assertions including the
+row count. Both restored from `/tmp/snap-d-ship147b`, confirmed with `git diff` **and**
+`shasum -c SHASUMS`, eight files, all OK. The current form's own guard against reversion is that
+same test plus the two retry tests, which fail in opposite directions: revert the credential branch
+and the *Done when* test fails; make the scope depend on resolution again and both retry tests fail.
 
 ## 4. Partly done — do not treat these as finished
 
