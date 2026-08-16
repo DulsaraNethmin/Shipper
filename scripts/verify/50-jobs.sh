@@ -1112,3 +1112,227 @@ unset warned_state extend_before extend_event aged_job capped_job rearm_job boun
 unset negotiating_stale negotiating_warn negotiating_extend negotiating_row negotiating_state
 unset negotiating_status
 unset -f expiring_job run_worker age_job
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-65a  GET /v1/jobs/{id}/history — a job's status history, served to its parties"
+
+# **The first four-segment `GET /v1/jobs/{id}/<literal>` the service has ever served.** While
+# `GET /v1/jobs/open/{id}` existed the pair could not be registered at all — both matched
+# `/v1/jobs/open/history` with neither more specific, and Go's ServeMux panics at registration, so
+# the process did not start. SHIP-83a moved the feed to `/v1/fleet/jobs/{id}`; that the harness
+# reaches this endpoint at all is the demonstration, because a regression would not be a failing
+# check here but a service that never came up in 10-service.sh.
+#
+# The fixture is a job with a budget on it, walked through three transitions and cancelled with a
+# reason in the customer's own words. Every part of that is load-bearing: three rows make "oldest
+# first" a claim with something to be wrong about, the reason is the free text a provider reads, and
+# the budget is what Docs/01 §4.3 forbids reaching them.
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-history-new-$$" /v1/jobs \
+  '{"budget_cents": 432199}' "$WORKDIR/jobs-history-src.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/jobs-history-src.json"; fail "could not create the history job: $status"; }
+history_job="$(json "$WORKDIR/jobs-history-src.json" '["id"]')"
+
+# The fixture has something to leak, checked rather than assumed. A privacy check whose job has no
+# budget passes forever and proves nothing.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select budget from jobs where id = '$history_job';")" == "4321.99" ]] \
+  || fail "the history job has no budget stored; the disclosure checks below would prove nothing"
+
+move_job "$history_job" Draft Open        || fail "could not publish the history job"
+move_job "$history_job" Open Negotiating  || fail "could not move the history job to Negotiating"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-history-cancel-$$" \
+  "/v1/jobs/$history_job/cancel" '{"reason": "The goods went with another carrier on Tuesday."}' \
+  "$WORKDIR/jobs-history-cancel.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-history-cancel.json"; fail "cancelling the history job returned $status, want 200"; }
+
+history_path="/v1/jobs/$history_job/history"
+
+# jobs_get <token> <path> <name> — one authenticated read. No Idempotency-Key: the middleware lets
+# safe methods through untouched, and an endpoint demanding one would ask a client to mint a value
+# per read.
+jobs_get() {
+  curl -s -o "$WORKDIR/jobs-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" "http://localhost:$VERIFY_PORT$2"
+}
+
+status="$(curl -s -o "$WORKDIR/jobs-history-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT$history_path")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/jobs-history-anon.json"; fail "an unauthenticated history read returned $status, want 401"; }
+ok "it needs a credential and no Idempotency-Key — nothing changes, so there is nothing to absorb"
+
+status="$(jobs_get "$jobs_customer_token" "$history_path" history-owner)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-history-owner.json"; fail "the owner's history read returned $status, want 200"; }
+
+python3 - "$WORKDIR/jobs-history-owner.json" <<'PY' || fail "the owner's history is not what SHIP-65a asks for"
+import json, sys
+
+page = json.load(open(sys.argv[1]))
+
+if page.get("has_more") is not False or page.get("next_cursor") is not None:
+    print("the history paged or reported itself truncated:", page, file=sys.stderr)
+    sys.exit(1)
+
+moves = [(e["from_status"], e["to_status"]) for e in page["data"]]
+want = [("draft", "open"), ("open", "negotiating"), ("negotiating", "cancelled")]
+if moves != want:
+    print("the history reads", moves, "want", want, "oldest first", file=sys.stderr)
+    sys.exit(1)
+
+for entry in page["data"]:
+    for field in ("id", "job_id", "actor_type", "recorded_at", "accepted_at"):
+        if not entry.get(field):
+            print("an entry is missing", field, ":", entry, file=sys.stderr)
+            sys.exit(1)
+    if entry["actor_type"] != "customer":
+        print("an entry is attributed to", entry["actor_type"], file=sys.stderr)
+        sys.exit(1)
+    # The actor identifier is deliberately absent — the actor is served as its kind. See the
+    # getJobHistory description for the four separate reasons, one per kind of actor.
+    if "actor_id" in entry:
+        print("an entry names the actor:", entry, file=sys.stderr)
+        sys.exit(1)
+
+if page["data"][-1].get("reason") != "The goods went with another carrier on Tuesday.":
+    print("the cancellation reason did not survive:", page["data"][-1], file=sys.stderr)
+    sys.exit(1)
+
+# Absent rather than empty on the entries nobody gave one for, so a client can tell "gave no
+# reason" from "gave an empty one".
+if any("reason" in entry for entry in page["data"][:-1]):
+    print("an entry with no reason carries the key:", page["data"], file=sys.stderr)
+    sys.exit(1)
+PY
+ok "the owner reads every recorded transition, oldest first, with its actor, its reason and both clocks"
+
+# The provider is asked *before* the bid exists and again after it, with one account. That is what
+# makes this a check on the bid rather than on the fixture: the same credential, the same job, and
+# the only thing that changed is a row in a table this domain may not import.
+jobs_history_provider_id="$(json "$WORKDIR/jobs-provider.json" '["id"]')"
+
+status="$(jobs_get "$jobs_provider_token" "$history_path" history-nobid)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/jobs-history-nobid.json"; fail "a provider who has not bid got $status, want 404"; }
+
+# 'Rejected', deliberately: SHIP-65a serves the history to a provider holding a bid **at any
+# status**, and a predicate that filtered on 'Accepted' or 'Submitted' would pass every unit test
+# and lock the losing bidders out of the one endpoint they need.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+  -v job="$history_job" -v provider="$jobs_history_provider_id" >/dev/null <<'SQL'
+INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+VALUES (gen_random_uuid(), :'job', :'provider', 'Rejected', 185.00,
+        now() + interval '2 days', now() + interval '3 days');
+SQL
+
+status="$(jobs_get "$jobs_provider_token" "$history_path" history-provider)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-history-provider.json"; fail "the bidding provider's history read returned $status, want 200"; }
+ok "a provider holding a rejected bid reads it, and the same provider could not a moment earlier"
+
+diff -q "$WORKDIR/jobs-history-owner.json" "$WORKDIR/jobs-history-provider.json" >/dev/null \
+  || fail "the two parties see different histories; SHIP-65a serves both the same rows"
+ok "both parties read the same rows — there is no per-reader field, so there is none to get wrong"
+
+# The disclosure rule, and it is stronger than "both are 404". A body that differs in what it *says*
+# — a different message, a different code — tells a stranger holding an identifier that somebody
+# else's job exists.
+#
+# The comparison is over `(code, message)` and deliberately not `diff` over the whole body, which is
+# the shape every other refusal check in this file already uses. `Docs/10` §4.6 puts the request id
+# **inside** the error object, so two refusals are never byte-identical and never can be: the field
+# is unique per request by design. A `diff` here fails on a service that is behaving perfectly, and
+# says "distinguishable" about the one field a stranger learns nothing from.
+jobs_same_refusal() {
+  python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$1" "$2"
+}
+
+missing_job="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+absent_status="$(jobs_get "$jobs_customer_token" "/v1/jobs/$missing_job/history" history-absent)"
+[[ "$absent_status" == "404" ]] || { cat "$WORKDIR/jobs-history-absent.json"; fail "a job that does not exist returned $absent_status, want 404"; }
+
+status="$(jobs_get "$jobs_other_token" "$history_path" history-stranger)"
+[[ "$status" == "$absent_status" ]] || { cat "$WORKDIR/jobs-history-stranger.json"; fail "another customer got $status and a missing job gets $absent_status"; }
+jobs_same_refusal "$WORKDIR/jobs-history-stranger.json" "$WORKDIR/jobs-history-absent.json" \
+  || { printf '  stranger: '; cat "$WORKDIR/jobs-history-stranger.json"; printf '\n  missing:  '; cat "$WORKDIR/jobs-history-absent.json"; \
+       fail "a stranger's refusal is distinguishable from a job that does not exist"; }
+jobs_same_refusal "$WORKDIR/jobs-history-nobid.json" "$WORKDIR/jobs-history-absent.json" \
+  || fail "a provider who has not bid gets a refusal distinguishable from a job that does not exist"
+unset -f jobs_same_refusal
+ok "anybody else gets exactly what a missing job gets — same code, same message; a 403 would confirm the job exists"
+
+# The budget, on the response a **provider** was served, and checked in four ways because three of
+# them are individually defeatable. Waves 10 and 11 each isolated a sentence carrying no field, no
+# value and no digit that passed a closed key set, a word search and a value search at once.
+python3 - "$WORKDIR/jobs-history-provider.json" <<'PY' || fail "the provider's history discloses the customer's budget"
+import json, re, sys
+
+raw = open(sys.argv[1]).read()
+page = json.loads(raw)
+
+# Not vacuous: the response has to be carrying the history before "it carries no budget" means
+# anything at all.
+if not page.get("data") or "another carrier" not in raw:
+    print("this response carries no history, so it proves nothing:", raw, file=sys.stderr)
+    sys.exit(1)
+
+allowed = {"data", "next_cursor", "has_more", "id", "job_id", "from_status", "to_status",
+           "actor_type", "reason", "recorded_at", "accepted_at"}
+
+def walk(node, path):
+    if isinstance(node, dict):
+        for key, child in node.items():
+            if key not in allowed:
+                print("the provider's history carries", repr(key), "at", path, file=sys.stderr)
+                sys.exit(1)
+            walk(child, path + "." + key)
+    elif isinstance(node, list):
+        for i, child in enumerate(node):
+            walk(child, "%s[%d]" % (path, i))
+
+walk(page, "$")
+
+if "budget" in raw.lower():
+    print("the word \"budget\" appears in a provider's response:", raw, file=sys.stderr)
+    sys.exit(1)
+
+# Identifiers are removed first: a UUID is hexadecimal, so a run of digits can occur inside one by
+# chance — rarely enough to pass in review and often enough to fail in CI one morning.
+searchable = re.sub(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                    "<id>", raw)
+for rendering in ("4321.99", "432199", "4321,99", "4,321.99", "4321"):
+    if rendering in searchable:
+        print("the budget appears as", rendering, "in", raw, file=sys.stderr)
+        sys.exit(1)
+
+# And not as a sentence, which is the check the other three cannot make. `reason` is free text an
+# actor wrote and a provider reads, so this is the form a "budget supplied" signal would take here.
+prose = ["maximum", "max ", "ceiling", "cap ", "willing to pay", "price range", "up to $",
+         "has set a", "has a limit", "limit of"]
+lowered = raw.lower()
+for phrase in prose:
+    if phrase in lowered:
+        print("a provider's history contains", repr(phrase), "in", raw, file=sys.stderr)
+        sys.exit(1)
+
+# The check on the check: the guard has to fire on the sentence waves 10 and 11 isolated, or it is
+# a list of phrases nothing could ever contain.
+smuggled = 'the goods went with another carrier. The customer has set a maximum.'
+if not any(phrase in smuggled.lower() for phrase in prose):
+    print("the prose guard does not fire on the sentence it exists for", file=sys.stderr)
+    sys.exit(1)
+PY
+ok "no budget reaches the provider as a key, a word, a value, or a sentence — and the prose guard fires on the sentence it exists for"
+
+# The proof that the identifier slot is an identifier again (SHIP-83a). "open" is now parsed as a
+# job id and refused as one, which is a 400 rather than the 404 the old literal route answered.
+# **This is not a defect to fix**: it is what four segments under `/v1/jobs/{id}/` cost, and this
+# section is the first endpoint to spend it.
+status="$(jobs_get "$jobs_customer_token" /v1/jobs/open history-open-literal)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/jobs-history-open-literal.json"; fail "GET /v1/jobs/open returned $status, want 400 — 'open' is an identifier now"; }
+ok "GET /v1/jobs/open answers 400 — the {id} slot holds an identifier again, which is what freed this path"
+
+unset history_job history_path missing_job absent_status jobs_history_provider_id
+unset -f jobs_get

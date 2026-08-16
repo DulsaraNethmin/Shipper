@@ -193,6 +193,54 @@ func (s *Service) MilestonesFor(
 	return s.store.milestonesOn(ctx, r, jobID, page.After, limit)
 }
 
+// MilestonesForDriver is a page of the milestones recorded on the delivery a driver's link opens
+// (SHIP-121a).
+//
+// # It takes a grant and no job identifier, which is the whole signature
+//
+// The same shape [Service.AssignmentFor], [Service.RecordDriverMilestone],
+// [Service.PresignDriverProofUpload], [Service.VerifyDriverProof] and [Service.DeliveryFinishedFor]
+// all take, and for the reason AssignmentFor sets out at length: a [DriverGrant] is produced by
+// [DriverTokenVerifier.Verify] and by nothing else, and the middleware that produces one has
+// already checked that the job in the request path is the job inside the token. **A handler cannot
+// widen the scope by passing the wrong identifier, because it has no identifier to pass.** Wave 7's
+// surviving mutation was exactly the failure that arrangement prevents.
+//
+// # The assignment is checked before anything is read, and the check is not the token's
+//
+// A token is stateless and cannot be recalled, so it keeps verifying after the assignment behind it
+// has ended or its link has been reissued. [Service.AssignmentFor] is what knows, and asking it
+// first means a superseded link reads nothing rather than reading a delivery it no longer opens.
+// [Service.DeliveryFinishedFor]'s note explains the ordering in the same words.
+//
+// # Why this is not [Service.MilestonesFor] with a different caller
+//
+// That one takes a `readerID` and resolves it to one of the two *account-backed* parties. A driver
+// has no account: `ck_users_role` has no such role, `milestones.actor_id` names a
+// `driver_assignments` row for them (000601), and the grant is the only thing that says which
+// delivery they are on. Passing a driver through the party lookup would mean inventing an account
+// id for somebody who has none.
+//
+// r is a reader rather than a transaction: two statements, no writes.
+func (s *Service) MilestonesForDriver(
+	ctx context.Context,
+	r db.Runner,
+	grant DriverGrant,
+	page MilestonePage,
+) ([]Record, bool, error) {
+	// The link opens something, and it opens this job. Both refusals are one 404 on the wire,
+	// which is the same answer every other driver-token operation gives.
+	if _, err := s.AssignmentFor(ctx, r, grant); err != nil {
+		return nil, false, err
+	}
+
+	limit := page.Limit
+	if limit < 1 {
+		limit = pagination.DefaultLimit
+	}
+	return s.store.milestonesOn(ctx, r, grant.JobID, page.After, limit)
+}
+
 // Party is which of the two parties to a job a reader is, if either.
 //
 // It exists because one field of [Delivery] differs between them. Everything else in this domain

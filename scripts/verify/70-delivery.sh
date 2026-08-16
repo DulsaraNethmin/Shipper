@@ -2475,3 +2475,146 @@ ok "a milestone recorded after delivery is still absorbed by the platform rather
 
 unset comp_job comp_token comp_step comp_milestone comp_row comp_before_keys comp_after_keys
 unset -f comp_post comp_read
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-121a  a driver lists the milestones on the delivery their link opens, and on no other"
+
+# # What only this section can show
+#
+# `internal/delivery`'s own tests mount the read behind the real guard and prove what it answers for
+# a job the link does not name; `cmd/api`'s prove the route is declared with the driver's auth class
+# and that neither credential system opens the other's read. Both stop short of the same thing:
+# **a real driver link, minted by the running service on a real assignment, against a real database
+# holding a real delivered milestone.**
+#
+# That matters most for the disclosure clause. The Go test builds its row through the domain and
+# asserts the shape; here the row arrives the way a row actually arrives — through
+# `POST /v1/driver/jobs/{id}/milestones` with `Docs/01` §4.4's field set on it — and the check is
+# that the *serving process* does not hand those two fields back on the driver's credential.
+#
+# # The two refusals are the ticket as much as the read is
+#
+# The driver's credential is a link: forwardable, valid for seven days, naming no account. The
+# parties' shelf `GET /v1/jobs/{id}/delivery/milestones` carries `recipient_name` and
+# `delivery_note`, and adding a driver read beside it is exactly the change that would tempt
+# somebody to widen that class. Both directions are recorded against the binary.
+
+dml_keys() { python3 -c 'import json,sys; print(",".join(sorted(json.load(open(sys.argv[1]))["data"][0])))' "$1"; }
+
+# dml_post <key> <body> <name> — one milestone on the driver's own link.
+dml_post() {
+  curl -s -X POST -o "$WORKDIR/dml-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $dml_token" -H "Idempotency-Key: $1" \
+    -H 'Content-Type: application/json' -d "$2" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$dml_job/milestones"
+}
+
+# dml_list <token> <job-id> <name> — the driver's milestone read, credential and job kept apart.
+#
+# The pairing is the point, exactly as it is for SHIP-120a's `drv_record`: a helper that built the
+# path out of the token could not express the refusal these routes exist for.
+dml_list() {
+  curl -s -o "$WORKDIR/dml-list-$3.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" \
+    "http://localhost:$VERIFY_PORT/v1/driver/jobs/$2/milestones"
+}
+
+dml_job="$(delivery_awarded_job dml)"
+dml_other="$(delivery_awarded_job dmlother)"
+
+status="$(delivery_request "$delivery_provider_token" "verify-dml-assign-$$" \
+  "/v1/jobs/$dml_job/driver" '{"driver_name":"Tam Ngo","driver_mobile":"+61417000131"}' \
+  "$WORKDIR/dml-assign.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/dml-assign.json"; fail "assigning the driver returned $status, want 201"; }
+dml_token="$(json "$WORKDIR/dml-assign.json" '["driver_token"]')"
+
+# An empty delivery answers a page rather than a 404, which is the distinction a portal opening a
+# fresh link depends on: nothing recorded yet is not the same as a link that opens nothing.
+status="$(dml_list "$dml_token" "$dml_job" empty)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/dml-list-empty.json"; fail "a fresh delivery answered $status, want 200"; }
+[[ "$(json "$WORKDIR/dml-list-empty.json" '["data"]')" == "[]" ]] \
+  || { cat "$WORKDIR/dml-list-empty.json"; fail "a delivery nobody has recorded on is not an empty page"; }
+ok "a delivery with nothing recorded on it answers an empty page, not a refusal — a fresh link opens something"
+
+# Walk the delivery the way a driver does, finishing with Docs/01 §4.4's field set so the row this
+# section withholds from actually exists.
+for dml_step in en_route_to_pickup picked_up in_transit; do
+  status="$(dml_post "verify-dml-$dml_step-$$" "{\"milestone\":\"$dml_step\"}" "$dml_step")"
+  [[ "$status" == "201" ]] || { cat "$WORKDIR/dml-$dml_step.json"; fail "recording $dml_step answered $status"; }
+done
+status="$(dml_post "verify-dml-delivered-$$" \
+  '{"milestone":"delivered","recipient_name":"R. Chen","delivery_note":"Left with reception, signed for","proof":{"exception_reason":"recipient_objected"}}' delivered)"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/dml-delivered.json"; fail "the delivery answered $status, want 201"; }
+
+# The fixture has something to withhold, established from the row rather than assumed. A disclosure
+# check whose row carries neither field passes forever and proves nothing.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select recipient_name || '|' || delivery_note from milestones
+     where job_id = '$dml_job' and milestone = 'Delivered';")" == "R. Chen|Left with reception, signed for" ]] \
+  || fail "the delivered row carries no recipient or note, so the disclosure check below withholds nothing"
+
+status="$(dml_list "$dml_token" "$dml_job" own)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/dml-list-own.json"; fail "the link's own job answered $status, want 200"; }
+[[ "$(json "$WORKDIR/dml-list-own.json" '["data"].__len__()')" == "4" ]] \
+  || { cat "$WORKDIR/dml-list-own.json"; fail "the driver reads $(json "$WORKDIR/dml-list-own.json" '["data"].__len__()') milestones, want the 4 on their job"; }
+[[ "$(json "$WORKDIR/dml-list-own.json" '["data"][0]["milestone"]')" == "delivered" ]] \
+  || fail "the list is not newest first by the actor's clock"
+ok "a driver lists every milestone on the delivery their link opens, newest first — which is what lets the portal survive a reload"
+
+# --- the disclosure clause, as a closed key set ---------------------------------------------------
+#
+# A closed set rather than a search for the two names, which is SHIP-83's argument: a search for
+# "recipient_name" catches `recipient_name` and misses `recipient` or `signed_by`. A field added to
+# the driver's shape has to be added here too, which is the point.
+dml_shape="$(dml_keys "$WORKDIR/dml-list-own.json")"
+[[ "$dml_shape" == "accepted_at,id,job_id,milestone,recorded_at,recorded_by" ]] \
+  || fail "the driver's milestone carries '$dml_shape'; recipient_name and delivery_note are a third party's details and a forwardable seven-day link is not the credential to serve them on"
+grep -q 'R. Chen\|Left with reception' "$WORKDIR/dml-list-own.json" \
+  && { cat "$WORKDIR/dml-list-own.json"; fail "the driver's milestone list discloses the recipient or the note"; }
+ok "and it carries neither the recipient nor the delivery note, though the row it is built from holds both — the driver's surface is narrow, and the narrowness is the security property"
+
+# The customer reads exactly what the driver does not, on the same delivery. Without this the check
+# above would pass just as well against a platform that had stopped recording the fields at all.
+status="$(curl -s -o "$WORKDIR/dml-shelf.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $delivery_customer_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$dml_job/delivery/milestones")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/dml-shelf.json"; fail "the customer's shelf answered $status"; }
+grep -q '"recipient_name":"R. Chen"' "$WORKDIR/dml-shelf.json" \
+  || { cat "$WORKDIR/dml-shelf.json"; fail "the customer cannot see who took the delivery, so the omission above is a missing field rather than a withheld one"; }
+ok "the customer still reads both on /delivery/milestones — so what the driver is not shown is withheld from them rather than absent from the platform"
+
+# --- one job, and the refusals ---------------------------------------------------------------------
+
+status="$(dml_list "$dml_token" "$dml_other" other)"
+[[ "$status" == "404" ]] \
+  || { cat "$WORKDIR/dml-list-other.json"; fail "a link for one job listed another job's milestones with status $status — the token grants exactly one job (CLAUDE.md)"; }
+dml_nowhere_status="$(dml_list "$dml_token" "00000000-0000-4000-8000-000000000121" nowhere)"
+[[ "$dml_nowhere_status" == "404" ]] || fail "a job that does not exist answered $dml_nowhere_status"
+
+# Over `(code, message)` and deliberately not `diff` over the whole body: `Docs/10` §4.6 puts the
+# request id **inside** the error object, so two refusals are never byte-identical and never can be.
+# A `diff` here would fail on a service behaving perfectly, and would say "distinguishable" about the
+# one field a holder learns nothing from.
+python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))['error']
+b = json.load(open(sys.argv[2]))['error']
+sys.exit(0 if (a['code'], a['message']) == (b['code'], b['message']) else 1)
+" "$WORKDIR/dml-list-other.json" "$WORKDIR/dml-list-nowhere.json" \
+  || { cat "$WORKDIR/dml-list-other.json" "$WORKDIR/dml-list-nowhere.json"; fail "another job and a missing job answer differently, so the refusal tells a holder which jobs exist"; }
+ok "another party's job answers exactly what a job that does not exist answers — same code, same message; the link grants one delivery and discloses nothing about any other"
+
+# Neither credential opens the other's read. The second direction is the one that matters: the
+# parties' shelf is where recipient_name and delivery_note live.
+status="$(dml_list "$delivery_provider_token" "$dml_job" session)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/dml-list-session.json"; fail "a mobile access token opened the driver's read with status $status"; }
+status="$(curl -s -o "$WORKDIR/dml-link-on-shelf.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $dml_token" \
+  "http://localhost:$VERIFY_PORT/v1/jobs/$dml_job/delivery/milestones")"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/dml-link-on-shelf.json"; fail "a driver link opened the parties' milestone shelf with status $status — the two token systems are separate and neither can be exchanged for the other"; }
+ok "a session is refused on the driver's read and a driver link is refused on the parties' shelf — both directions, against the running binary"
+
+unset dml_job dml_other dml_token dml_step dml_shape dml_nowhere_status
+unset -f dml_keys dml_post dml_list

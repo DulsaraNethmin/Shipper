@@ -702,6 +702,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-87a** | M3 | `ck_bids_offer_has_timing` restored (`000505`) — the constraint `000501` wrote, applied and removed because it would have bound SHIP-87's design. That design is made and it **inherits**, so every row the platform writes past `Draft` already states both instants. It is a `CHECK` rather than a validator because the validator is in front of one door and a worker, a repair script or a psql prompt is not behind it. **The cost `Docs/09` priced in was real and wider than the six tests it named** — twelve fixture sites across five packages and three verify sections wrote a closed bid with no timing, because until now nothing refused one — *see below* |
 | **SHIP-95a** | M3 | The race nothing was running: **an expiry sweep and an award contending for one `jobs` row.** `LeaveNegotiation`'s `FOR UPDATE SKIP LOCKED` was the strongest untested invariant on the board — `make check` exited 0 with it removed. It now exits 1 in two ways: the race, driven by hand and confirmed with `pg_blocking_pids` as SHIP-95 does, and a source guard over **all three copies** of the statement. With the clause gone PostgreSQL reports a real deadlock, SQLSTATE **40P01**, in about a second. **No endpoint: demonstrated by its own tests** — *see below* |
 | **SHIP-97** | M3 | Job-scoped messaging — `POST` and `GET /v1/jobs/{id}/bids/{bid_id}/messages`, `000506_job_messages`. **A conversation is the `(job, provider)` pair rather than the job**, which is `bids.provider_id`'s meaning since `000502` and is what keeps competing providers out of one room — a shared thread discloses through prose, which no closed key set can catch. It attaches to the *negotiation* and not to an offer, so it survives a counter, and **there is no status gate at all**: the moment two parties most need to arrange something is after the award. The disclosure guard is **word-level over rendered output**, inverted — every word must be accounted for. **The 'and admins' clause is declared reduced**: met in the domain, unreachable from the wire — *see below* |
+| **SHIP-65a** | M2 | `GET /v1/jobs/{id}/history` — **the first four-segment `GET /v1/jobs/{id}/<literal>` the service has ever served**, and the endpoint SHIP-83a existed to make registrable. It supplies the endpoint that has kept SHIP-77 in §4 longer than any other ticket — `job_status_history` has recorded the actor, the reason and both clocks since SHIP-57a and nothing exposed it — **without closing that row, which now needs the screen to render what exists**. Two parties — the owning customer, and **a provider holding a bid at any status**, decided from rows rather than from a role claim — and everybody else gets a refusal proved **byte-identical** to a missing job. The actor is served as its *kind* and never as an identifier. The budget guard is **word-level over rendered output**, because `reason` is free text a provider reads — *see below* |
+| **SHIP-121a** | M4 | `GET /v1/driver/jobs/{id}/milestones` — **the fourth route on the driver's surface and the first read it has that pages**, so the portal's controls survive a reload instead of starting at rest on every page view. The response is a **type of its own rather than a redaction step**: `DriverMilestone` is `Milestone` without `recipient_name` and `delivery_note`, which are a third party's details on a credential that is a forwardable seven-day link naming no account. `Service.MilestonesForDriver` **takes the grant and no job identifier**, so a handler cannot widen the scope by passing the wrong job — wave 7's surviving mutation was exactly that shape. Both refusals are recorded against the running binary, and the one that matters is a driver link on the parties' shelf — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -13514,6 +13516,195 @@ per-reader row rather than a column, and an attachment is an object-storage desi
 negotiation, and a message from one would have to be attributed to a party who did not write it.
 
 #### Nothing was needed from `internal/config`
+
+### SHIP-65a — the first four-segment job path, and a disclosure guard that had to be word-level
+
+`GET /v1/jobs/{id}/history` serves every `job_status_history` row for one job, oldest first, in the
+`Docs/10` §4.5 envelope. The domain is `jobs.Service.HistoryFor` (`internal/jobs/history.go`), the
+handler is `Handler.History`, the route is one entry in `cmd/api/routes_jobs.go`, and the contract
+fragment is `JobHistory` with `StatusChange` and `StatusChangePage` beside it.
+
+**§4's SHIP-77 row is not struck by this and should not be.** That row's missing half was an endpoint
+over `job_status_history` that no ticket added; it now exists, so the row changes kind — from
+SHIP-77's shape ("belongs to work that does not exist") to SHIP-118's ("a missing half with a named
+owner"). What is still absent is the *screen* reading it: the Flutter timeline is still derived from
+the current status and still refuses to date a step it cannot date. Striking the row is the job of
+whoever wires `GET /v1/jobs/{id}/history` into `apps/mobile`, and §4 is not this branch's to edit.
+
+**This is the first endpoint to spend what SHIP-83a bought.** Until last wave the pattern could not
+be registered at all: `GET /v1/jobs/open/{id}` put a literal where the identifier goes, so it and any
+four-segment `GET /v1/jobs/{id}/<literal>` both matched `/v1/jobs/open/history` with neither more
+specific, and Go's `ServeMux` **panics at registration** — `make run` died at startup rather than an
+endpoint answering oddly. Four tickets took workarounds for it (SHIP-115, SHIP-115a, SHIP-101a,
+SHIP-102a) and `Docs/09`'s row for this one declared the blocker instead. `scripts/verify/50-jobs.sh`
+ends its section by asserting that **`GET /v1/jobs/open` now answers `400`**: "open" lands in the
+identifier slot and fails UUID parsing. That is the proof the slot is an identifier again, and it is
+not a defect to fix.
+
+#### The second reader is a fact about the job, and the port is what keeps `jobs` from importing `bidding`
+
+The two parties are the owning customer and **a provider holding a bid on that job**. `bids` belongs
+to `bidding`, which `jobs` may not import, so `jobs` declares `Bidders` in its own `ports.go` and
+`cmd/api` implements it as `jobBidders` — `EXISTS (SELECT 1 FROM bids WHERE job_id = $1 AND
+provider_id = $2)`. That is the arrangement `delivery.Awards` and `acceptedBids` have been in since
+SHIP-115, and this is the second instance of it and the first outside `delivery`.
+
+**Any bid, at any status, and the absence of a status filter is the decision rather than an
+omission.** A provider whose offer was rejected, superseded or withdrawn priced this job, and what
+became of it is the answer to the only question they have about it — and the narrower rule would have
+made the endpoint useless in the case it most matters, because a job cancelled while three providers
+held live offers has no awarded provider at all. Filtering would also have put `bidding`'s
+eight-value enumeration into a statement neither domain owns. `TestTheBidderLookupAnswersForEveryBidStatus`
+walks all eight, and reads them out of `ck_bids_status` rather than from a list, so a ninth fails the
+test instead of being silently untested.
+
+**The port is a variadic `jobs.Option` rather than a fourth constructor parameter, and the reason is
+a shared-surface one.** `jobs.NewService` has seven non-test call sites across `cmd/api` and
+`cmd/worker`, six of which move a job's status and none of which reads a history; a positional
+parameter would have put a `nil` at every one of them, in files belonging to three tracks.
+`notifications.Option` is the same pattern for the same reason. What made it safe to be optional took
+arranging: **an absent lookup must not be read as "no bid"**, because that refuses every provider
+while being indistinguishable from a job nobody bid on — a narrowing that fails safe and fails
+silently. `HistoryFor` returns `ErrNoBidderLookup` instead, and two tests hold both halves.
+
+#### "Anybody else gets exactly what a missing job gets" is asserted as bytes, not as a status code
+
+A 403 tells a stranger the job exists, and so does a 404 with a different message, a different code
+or a different length. `TestAStrangerAndAMissingJobAreTheSameBytes` compares the whole response body
+and the content type for three kinds of non-party — another customer, a provider who bid on a
+*different* job, and a provider who has bid on nothing — and the verify section does the same with
+`diff -q` against a job identifier that does not exist.
+
+#### The actor is served as its kind and never as an identifier
+
+`actor_id` is in the table and is not on the wire. That is the call `delivery.milestoneResponse`
+already makes for a milestone's `recorded_by`, and it is right here for four separate readings of one
+column: for `customer` both readers already know who it is; for `admin` it would name a member of
+staff to a commercial party, which `Docs/01` §3's *auditable* requirement does not ask for and
+`audit_log` already satisfies; for `driver` it is a `driver_assignments` row rather than an account
+and would read as a user id while being one only by coincidence of type; and for `system` it is
+absent, so a client rendering a timeline would have to branch on a field none of its rows needs.
+**A timeline renders the kind** — "Cancelled by you", "Expired by Shipper" — which is what SHIP-77
+wants. This is a deliberate narrowing of the *Done when*'s "with its actor" and it is written down
+here rather than left to be discovered.
+
+#### The mutation: no field, no value, no digit — and only the word-level guard caught it
+
+`statusChangeFrom` was changed to `Reason: c.Reason + " The customer has set a maximum."` — the
+sentence waves 10 and 11 each isolated, appended to a free-text field a provider reads.
+
+| Guard | Fired |
+|---|---|
+| The closed key set (`historyKeys`, walked at every depth) | **No** — the sentence adds no key |
+| The word `budget` in the rendered bytes | **No** — it does not say "budget" |
+| The stored value, in five renderings, with UUIDs masked | **No** — it carries no digit |
+| The word-level prose guard (`historyProseIn`) | **Yes**, on `"maximum"` |
+
+Three of the four structural checks are individually defeated by one sentence, which is the third
+consecutive wave to demonstrate it and the first to demonstrate it in a field a *human being* wrote.
+`TestTheHistoryProseGuardIsNotVacuous` is the check on the check: it asserts the guard fires on that
+exact sentence, and that none of the phrases occurs in any fixture's own free text — the two ways a
+list like this stops meaning anything. The verify section carries the same pair.
+
+Restored from `/tmp/snap-c-ship65a` and confirmed with `git diff` **and** `shasum -a 256 -c SHASUMS`
+(two files, both OK).
+
+#### What the guard cannot do, and is not pretending to
+
+**A customer who types their own maximum into a cancellation reason discloses it, and no code guard
+can stop that.** `job_status_history.reason` is free text, a provider reads it, and distinguishing
+platform prose from customer prose inside one string would be guessing. `Docs/01` §4.3 is a rule
+about what the *platform* exposes and this endpoint honours it; the residual is a client-side
+warning or a decision not to serve customer-written reasons to providers, and neither has a ticket.
+It is recorded in §9 rather than closed here.
+
+#### The collection does not page, and that is a fact about the table
+
+`has_more` is always `false` and there is no `cursor` parameter. `Docs/02` §2's transition graph is
+acyclic and twelve statuses wide, `Service.Transition` refuses a move to the status a job already
+stands in, and 000402's trigger refuses a status write with no history row — so the collection is
+bounded by the lifecycle at under a dozen rows, the way `/v1/jobs/{id}/delivery/proof` is bounded by
+there being at most one photograph per milestone. `delivery`'s milestone list is the contrast worth
+keeping in view: 000601 deliberately has no uniqueness on `(job_id, milestone)`, so a repeat is
+legitimate there and that collection has no bound to stand on.
+
+### SHIP-121a — the driver's first paging read, and a shape that withholds by construction
+
+`GET /v1/driver/jobs/{id}/milestones` serves every milestone recorded on the delivery a driver's
+link opens, newest first by the actor's clock, in the same envelope and on the same cursor as
+`GET /v1/jobs/{id}/delivery/milestones`. The domain is `delivery.Service.MilestonesForDriver`
+(`internal/delivery/read.go`), the handler is `Handler.DriverMilestones`, the route is one entry in
+`cmd/api/routes_delivery.go`, and the contract fragment is `DriverMilestone` with
+`DriverMilestonePage` beside it.
+
+**Until this existed the driver surface had no milestone read at all.** It was three routes — one
+read and two writes — so a portal reopened from a link had no way to know what it had already
+recorded, and started every control at rest. Nothing was lost by that, which is why `Docs/09` makes
+this two points and a usability row rather than a correctness one: recording a milestone twice is
+safe (`Docs/02` §5) and a repeat is an ordinary recording. What a driver could not do is *tell*.
+
+#### The response is a second type, not the first with a field blanked
+
+`driverMilestoneResponse` is `milestoneResponse` without `recipient_name` and `delivery_note`. That
+is deliberately a separate struct rather than a shared one with a redaction step, which is the same
+call `jobs` made about the budget and for the same reason: **a shape that is safe only because a
+handler remembers to blank a field is safe until the day somebody renders the struct.**
+
+The two fields are a third party's details, recorded on a delivered milestone by whoever recorded it
+— which may be the provider rather than this driver. The credential here is a link: forwardable,
+valid for seven days, naming no account, held by whoever the provider sent it to. `Docs/01` §4 asks
+the platform to minimise exposure of personal data, and those two fields are the only things on a
+milestone that could breach it. **The driver's surface is narrow and the narrowness is the security
+property.**
+
+The guard is asserted as a **closed key set** in both the Go test and the verify section, rather than
+as a search for the two names — SHIP-83's argument, which is that a search for `recipient_name`
+catches `recipient_name` and misses `recipient` or `signed_by`. A field added to the driver's shape
+has to be added to the assertion too, which is the point of writing it that way.
+
+**Both halves of the disclosure claim are checked, and the second is what stops the first being
+vacuous.** `scripts/verify/70-delivery.sh` establishes from the row that the delivered milestone
+*holds* both fields, then that the driver's list omits them, then that the customer's shelf still
+serves them. Without the third the check would pass equally well against a platform that had stopped
+recording the fields altogether — an omission rather than a withholding.
+
+#### The handler takes the grant and no job identifier
+
+`Service.MilestonesForDriver(ctx, r, grant, page)` takes a `DriverGrant` and no `uuid.UUID`, exactly
+as `AssignmentFor`, `RecordDriverMilestone`, `PresignDriverProofUpload`, `VerifyDriverProof` and
+`DeliveryFinishedFor` do. A `DriverGrant` is produced by `DriverTokenVerifier.Verify` and by nothing
+else, and the middleware that produces one has already compared the job in the path with the job
+inside the token. **A handler therefore cannot widen the scope by passing the wrong job, because it
+has none to pass** — and wave 7's surviving mutation was exactly that shape, a driver surface that
+derived the job it acted on from its own credential and survived a full suite while rendering
+another job's delivery with a 200. `TestTheDriverMilestoneReadTakesNoJobIdentifier` holds the
+signature with the compiler rather than with a comment.
+
+The assignment is checked before anything is read, and that check is not the token's. A token is
+stateless and cannot be recalled, so it keeps verifying after the assignment behind it has ended or
+its link has been reissued; `AssignmentFor` is what knows. `TestASupersededLinkListsNothing` records
+it — a reissued link opens the delivery and the link it replaced answers 404.
+
+#### Neither credential opens the other's read, and the direction that matters is the second one
+
+A mobile access token is refused here, and a driver's link is still refused on
+`GET /v1/jobs/{id}/delivery/milestones`. The manifest allows one auth class per method, so those are
+structural — but the pair is asserted anyway, in `cmd/api/routes_delivery_test.go` against the real
+middleware chain, because the property is about the running router rather than about the
+declaration. **The second direction is the one worth the test**: the parties' shelf is `RequireUser`
+and is where `recipient_name` and `delivery_note` live, and adding a driver read beside it is exactly
+the change that would tempt somebody to widen that class.
+
+`TestTheDriverMilestoneReadIsServedOnTheDriversOwnLink` is what keeps those refusals meaningful — a
+route that refused every credential would pass both rows. The link's own job reaches a handler and
+answers 503 because `testDeps` carries no pool, and *reaching* one is the signal.
+
+#### No idempotency key, recorded rather than assumed
+
+A GET changes nothing and SHIP-15's middleware lets safe methods through untouched. The write beside
+it is refused without a key; the read must not be, and the two routes share a path and a class and
+differ only by method — which is the shape a later change is most likely to flatten. It is asserted
+for that reason alone.
 
 ## 4. Partly done — do not treat these as finished
 

@@ -1402,6 +1402,173 @@ DriverMilestones:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+  get:
+    operationId: driverMilestones
+    summary: The milestones recorded on the delivery your link opens
+    tags: [Delivery]
+    security:
+      - BearerDriverToken: []
+    description: |
+      Every milestone recorded on this delivery, newest first by the actor's clock (SHIP-121a).
+
+      ## What it is for
+
+      **So the page survives a reload.** Until this existed the driver surface had no milestone read
+      at all, so a portal reopened from a link had no way to know what it had already recorded and
+      started every control at rest. Nothing was lost by that — recording a milestone twice is safe,
+      and a repeat is an ordinary recording — but a driver could not tell.
+
+      It is a *presentation* input and not an authorisation one. `Docs/07` §3 puts every
+      authorisation decision on the platform; what a client may do with this is decide what to show.
+
+      ## The same link, the same one job
+
+      The token names one job inside its signature and the platform compares it with the job in the
+      path before this runs. Another job answers `404`, and so does a link whose assignment is no
+      longer the live one on the job — a driver who has been stood down, or one holding a link that
+      has since been reissued.
+
+      **A mobile access token is not accepted here**, and your link is not accepted on
+      `GET /v1/jobs/{id}/delivery/milestones`. The two credential systems are separate and neither
+      can be exchanged for the other.
+
+      ## What it carries, and the two fields it deliberately does not
+
+      `DriverMilestone` is `Milestone` **without `recipient_name` and `delivery_note`**. Those two
+      are a third party's details recorded on a delivered milestone — by whoever recorded it, which
+      may be the provider rather than you — and a forwardable seven-day link is not the credential
+      to serve them on. Everything else about the milestone is here, including `reason`: the note
+      whoever recorded it wrote, where one was given.
+
+      ## Ordering and paging
+
+      Newest first by `recorded_at`, which is deliberately not arrival order: a batch recorded
+      through a morning with no signal arrives all at once, and the sync order would show a delivery
+      that ran backwards. It pages exactly as `GET /v1/jobs/{id}/delivery/milestones` does — same
+      `limit`, same opaque `cursor`, same envelope — so a client that has implemented one has
+      implemented both.
+
+      No `Idempotency-Key`: a read changes nothing.
+    parameters:
+      - $ref: '#/JobID'
+      - name: limit
+        in: query
+        required: false
+        description: |
+          How many milestones to return. Above the platform's maximum it is narrowed rather than
+          refused; a value that is not a positive whole number is refused.
+        schema:
+          type: integer
+          minimum: 1
+        example: 20
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          The `next_cursor` from the previous page. Omit it for the first page. It is opaque —
+          decoding one, or building one, is not something a client should do.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: |
+          A page of milestones, which may be empty — a delivery nobody has recorded anything on yet
+          answers `data: []` rather than `404`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DriverMilestonePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+DriverMilestone:
+  type: object
+  additionalProperties: false
+  required: [id, job_id, milestone, recorded_by, recorded_at, accepted_at]
+  description: |
+    One recorded milestone, as the driver carrying the delivery sees it (SHIP-121a).
+
+    **This is `Milestone` without `recipient_name` and `delivery_note`**, and the omission is the
+    decision rather than an oversight. See `driverMilestones`.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7f2
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    milestone:
+      type: string
+      description: |
+        Which milestone was recorded, in the same vocabulary the recording operations accept.
+      enum: [en_route_to_pickup, picked_up, in_transit, delivered]
+      example: picked_up
+    recorded_by:
+      type: string
+      description: |
+        The kind of actor that recorded it, and not who they are. `driver` is you; `provider` is the
+        company that put you on this job, recording from their own application.
+      enum: [provider, driver]
+      example: driver
+    reason:
+      type: string
+      description: |
+        The note whoever recorded it wrote, where one was given. Absent otherwise.
+      example: nobody at the gate, returning at four
+    recorded_at:
+      type: string
+      format: date-time
+      description: |
+        The actor's clock: when they say they acted. What to display.
+      example: '2026-08-12T06:40:11.000Z'
+    accepted_at:
+      type: string
+      format: date-time
+      description: |
+        The platform's clock: when this reached us. Later than `recorded_at` by however long the
+        device was out of signal.
+      example: '2026-08-12T08:02:55.417Z'
+
+DriverMilestonePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    One page of the milestones on the delivery your link opens, newest first.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/DriverMilestone'
+    next_cursor:
+      type: string
+      description: |
+        Pass this back as `?cursor=` for the next page. Absent on the last page — read `has_more`
+        rather than inferring from its absence, because the first request looks the same.
+    has_more:
+      type: boolean
+
 # --- the delivery read shelf (SHIP-115a) --------------------------------------------------------
 
 DeliveryDetail:

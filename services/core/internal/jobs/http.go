@@ -760,6 +760,142 @@ func (h *Handler) Extend() http.Handler {
 	})
 }
 
+// statusChangeResponse is one recorded transition — one row of `job_status_history` (SHIP-65a).
+//
+// # The actor is served as its kind and never as an identifier
+//
+// `actor_id` is in the table and is not on this shape. That is the same call
+// `delivery.milestoneResponse.RecordedBy` already makes — "the kind of actor rather than who they
+// are" — and it is the right one here for four separate readings of one column:
+//
+//   - For `customer` there is exactly one, and both readers already know who: it is the reader, or
+//     it is the counterparty on their own bid. The identifier adds nothing and hands a provider an
+//     account id they had no other way to obtain.
+//   - For `admin` it names a member of staff to a commercial party. `Docs/01` §3 requires an
+//     administrator's action to be *auditable*, and `audit_log` is where it is auditable; naming
+//     them to the customer whose job they unpublished is a different thing entirely.
+//   - For `driver` it is a `driver_assignments` row rather than an account, because a driver has no
+//     account (000401). It would read as a user id and be one only by coincidence of type.
+//   - For `system` it is absent, and a field that is present for four kinds and absent for the
+//     fifth is one a client has to branch on to render a timeline that never needed it.
+//
+// **What a timeline renders is the kind**: "Cancelled by you", "Expired by Shipper", "Picked up by
+// the driver". SHIP-77 is the screen and none of its rows wants a UUID.
+//
+// # Two clocks, named for what they mean rather than for their columns
+//
+// `recorded_at` is the actor's — when the person or process says they acted — and is what a
+// customer is shown. `accepted_at` is the platform's, and is what support reasons about. `Docs/02`
+// §3.1 requires them carried separately because a driver records a milestone with no signal and the
+// request arrives much later, and `delivery.milestoneResponse` names the same pair the same way so
+// that a client reading both timelines learns one convention.
+//
+// # `reason` is free text and may be absent
+//
+// Optional for everyone except an administrator, for whom `Docs/01` §3 makes it the condition of
+// changing a commercial record at all (`ck_job_status_history_admin_reason`). `omitempty`, because
+// an absent field says nothing while an empty string would say somebody supplied no words when they
+// were asked for some.
+//
+// **This is the field the budget-privacy guard exists for.** See history.go's file note: a provider
+// reads it, and a sentence is the one form of disclosure no key list, word search or value search
+// can see.
+type statusChangeResponse struct {
+	ID    string `json:"id"`
+	JobID string `json:"job_id"`
+
+	// From and To are the wire form of Docs/02 §1's statuses, lower snake case per Docs/10 §4.7 —
+	// the same spelling `status` takes on [jobResponse], through the same [Status.Wire].
+	From string `json:"from_status"`
+	To   string `json:"to_status"`
+
+	// ActorType is one of the five in [ActorTypes]. See the type note for why there is no id
+	// beside it.
+	ActorType string `json:"actor_type"`
+
+	Reason string `json:"reason,omitempty"`
+
+	RecordedAt string `json:"recorded_at"`
+	AcceptedAt string `json:"accepted_at"`
+}
+
+func statusChangeFrom(c StatusChange) statusChangeResponse {
+	return statusChangeResponse{
+		ID:    c.ID.String(),
+		JobID: c.JobID.String(),
+
+		From: c.From.Wire(),
+		To:   c.To.Wire(),
+
+		ActorType: c.Actor.Type.String(),
+
+		Reason: c.Reason,
+
+		RecordedAt: timestamp(c.ActorRecordedAt),
+		AcceptedAt: timestamp(c.ServerRecordedAt),
+	}
+}
+
+// History handles GET /v1/jobs/{id}/history (SHIP-65a).
+//
+// # The first four-segment `GET /v1/jobs/{id}/<literal>` in the service
+//
+// Until SHIP-83a this path could not be registered at all. `GET /v1/jobs/open/{id}` (SHIP-83) put a
+// literal where the identifier goes, so it and any four-segment `GET /v1/jobs/{id}/<literal>` both
+// matched `/v1/jobs/open/history` with neither more specific — and Go's `ServeMux` **panics at
+// registration**, so the process did not start rather than an endpoint answering oddly. Four
+// tickets took workarounds for it (SHIP-115, SHIP-115a, SHIP-101a, SHIP-102a) and this row declared
+// the blocker instead. SHIP-83a moved the feed to `GET /v1/fleet/jobs/{id}`; this is the first
+// endpoint to spend what that bought.
+//
+// # The collection envelope, with `has_more` always false
+//
+// `Docs/10` §4.5's shape, so a client tells a collection from a single resource without knowing the
+// endpoint — and it does not page, which is a fact about the table rather than an omission.
+// `Docs/02` §2's transition graph is acyclic and twelve statuses wide, [Service.Transition] refuses
+// a move to the status a job already stands in ([ErrAlreadyInStatus]), and 000402's trigger refuses
+// a status write with no history row describing it. So the collection is bounded by the lifecycle
+// at somewhere under a dozen rows, the way `/v1/jobs/{id}/delivery/proof` is bounded by there being
+// at most one photograph per milestone. `delivery`'s milestone list is the contrast and the reason
+// this paragraph is worth writing: 000601 deliberately has *no* uniqueness on `(job_id, milestone)`,
+// so a repeat is a legitimate outcome there and that collection has no bound to stand on.
+//
+// A `cursor` parameter would therefore be one no caller could usefully pass, and `next_cursor` is
+// omitted rather than sent empty ([pagination.NewPage]).
+//
+// No idempotency key: a GET changes nothing.
+func (h *Handler) History() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		readerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		changes, err := h.svc.HistoryFor(r.Context(), pool, readerID, jobID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		out := make([]statusChangeResponse, 0, len(changes))
+		for _, change := range changes {
+			out = append(out, statusChangeFrom(change))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, ""))
+		return nil
+	})
+}
+
 // jobIDFrom reads and parses the {id} path parameter.
 //
 // A path parameter of the wrong shape is bad_request rather than not_found, which is the httpx

@@ -29,6 +29,7 @@ DELETE /v1/auth/sessions/{id}                   user         v1
 POST   /v1/auth/verify-email                    public       v1
 POST   /v1/auth/verify-phone                    public       v1
 GET    /v1/driver/jobs/{id}                     driver-token v1
+GET    /v1/driver/jobs/{id}/milestones          driver-token v1
 POST   /v1/driver/jobs/{id}/milestones          driver-token v1
 POST   /v1/driver/jobs/{id}/proof-uploads       driver-token v1
 GET    /v1/fleet/bids                           user         v1
@@ -63,6 +64,7 @@ POST   /v1/jobs/{id}/disputes                   user         v1
 POST   /v1/jobs/{id}/driver                     user         v1
 POST   /v1/jobs/{id}/driver/link                user         v1
 POST   /v1/jobs/{id}/extend                     user         v1
+GET    /v1/jobs/{id}/history                    user         v1
 POST   /v1/jobs/{id}/milestones                 user         v1
 POST   /v1/jobs/{id}/proof-uploads              user         v1
 POST   /v1/notifications/device-tokens          user         v1
