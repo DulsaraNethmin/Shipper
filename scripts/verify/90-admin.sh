@@ -2796,3 +2796,168 @@ status="$(curl -s -X POST -o "$WORKDIR/scope-nocred.json" -w '%{http_code}' \
 ok "and a caller who presents nothing is still anonymous, so the shared scope every public route uses is intact"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-153 — the provider verification review queue.
+#
+# # What this section demonstrates that no Go test can
+#
+# `internal/admin` may not import `internal/profiles`, so the two meet only in `cmd/api` — in
+# `providerVerifications`, an adapter no test in package main can drive against a database. The Go
+# suite in `internal/admin` exercises a *copy* of that adapter, which proves the domain and proves
+# nothing about the one the running service registers. This section drives the built binary, so the
+# adapter under test is the one that ships.
+#
+# # The queue is a shared, never-reset table, so every assertion is fenced by id or by clock
+#
+# `make verify` runs against a database that is not reset between runs, and **every provider ever
+# registered by any section of any run is on the Pending queue** — SHIP-81a gives one a record at
+# registration. So a count would be meaningless and "the first page" would be whatever history left
+# there. The three providers below are backdated to 1990, which puts them at the head of an
+# oldest-first queue no matter how much precedes them, and every other check names an identifier.
+#
+# **The mobile prefix is 04197 and 04198**, which are this section's; 04190…04196 are taken by the
+# sections above (see the block at the head of this file).
+
+ticket "SHIP-153  pending provider verifications are listed oldest first"
+
+admin_clear_limits
+
+# A moderator and a support administrator of this section's own, rather than the ones the SHIP-160
+# section signed in: `verifications.read` and `verifications.decide` split across those two roles is
+# exactly what this section is about, and a token borrowed from another section is one another
+# section can revoke.
+verif_mod_email="verify-admin-verif-mod-$$@example.com"
+verif_mod_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$verif_mod_email', 'Verify Reviewer', '$admin_fixture_hash', 'moderator')
+   returning id;")"
+[[ -n "$verif_mod_id" ]] || fail "the reviewing moderator could not be created"
+
+status="$(admin_signin "verify-adm153-modin-$$" "$verif_mod_email" "$admin_password" verif-mod)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-mod.json"; fail "the reviewing moderator could not sign in ($status)"; }
+verif_mod_token="$(json "$WORKDIR/admin-verif-mod.json" '["token"]')"
+
+verif_sup_email="verify-admin-verif-sup-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$verif_sup_email', 'Verify Looker', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the support administrator could not be created"
+status="$(admin_signin "verify-adm153-supin-$$" "$verif_sup_email" "$admin_password" verif-sup)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-sup.json"; fail "the support administrator could not sign in ($status)"; }
+verif_sup_token="$(json "$WORKDIR/admin-verif-sup.json" '["token"]')"
+
+# verif_provider <suffix> <name> — a registered provider, answering with its id.
+#
+# Registered through the API rather than inserted, because `000200`'s trigger firing on a real
+# registration is half of what makes the queue non-empty at all.
+verif_provider() {
+  local out="$WORKDIR/verif-provider-$1.json"
+  local code
+  code="$(post_json "verify-adm153-reg-$1-$$" /v1/auth/register \
+    "{\"name\":\"$2\",\"email\":\"verify-verif-$1-$$@example.com\",\"phone\":\"0419$3$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+    "$out")"
+  [[ "$code" == "201" ]] || { cat "$out"; fail "could not register the provider $1: $code"; }
+  json "$out" '["id"]'
+}
+
+verif_first="$(verif_provider first "Ngaire Tuiavii" 7)"
+verif_second="$(verif_provider second "Boadicea Kellsworth" 8)"
+
+# A customer, which must never appear on a queue of providers — most accounts on this platform are
+# customers, and a queue holding them is a queue of people nobody will ever review.
+status="$(post_json "verify-adm153-cust-$$" /v1/auth/register \
+  "{\"name\":\"Verify Harness\",\"email\":\"verify-verif-cust-$$@example.com\",\"phone\":\"04197$$1\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/verif-customer.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/verif-customer.json"; fail "could not register the verification customer: $status"; }
+verif_customer_id="$(json "$WORKDIR/verif-customer.json" '["id"]')"
+
+# The fence. Backdated to 1990 in a known order, so these two are the head of an oldest-first queue
+# whatever else the database is carrying — and deliberately backdated in the *reverse* of the order
+# they were registered, so a queue reading the insertion sequence rather than the submission clock
+# fails here rather than passing by accident.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null <<SQL
+update provider_verifications set created_at = timestamptz '1990-01-02 00:00:00Z' where provider_id = '$verif_second';
+update provider_verifications set created_at = timestamptz '1990-01-01 00:00:00Z' where provider_id = '$verif_first';
+SQL
+
+# verif_queue <state> <token> <name> [extra] — one read of the queue, answering with its status.
+verif_queue() {
+  admin_get "/v1/admin/verifications?state=$1${4:+&$4}" "$2" "$3"
+}
+
+# verif_at <name> <index> — the provider id at that position on the page.
+verif_at() {
+  python3 - "$WORKDIR/admin-$1.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+rows = page.get("data") or []
+index = int(sys.argv[2])
+print(rows[index]["provider_id"] if index < len(rows) else "")
+PY
+}
+
+# verif_carries <name> <provider-id> — 1 when the provider is on the page, 0 when not.
+verif_carries() {
+  python3 - "$WORKDIR/admin-$1.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for e in (page.get("data") or []) if e["provider_id"] == sys.argv[2]))
+PY
+}
+
+status="$(curl -s -o "$WORKDIR/verif-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/admin/verifications?state=Pending")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/verif-anon.json"; fail "the queue answered $status without a credential, want 401"; }
+ok "the queue cannot be read without an administrator session"
+
+status="$(verif_queue Pending "$verif_sup_token" verif-sup-queue "limit=2")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-sup-queue.json"; fail "a support administrator could not read the queue: $status"; }
+[[ "$(verif_at verif-sup-queue 0)" == "$verif_first" ]] \
+  || { cat "$WORKDIR/admin-verif-sup-queue.json"; fail "the first entry is not the longest-waiting provider"; }
+[[ "$(verif_at verif-sup-queue 1)" == "$verif_second" ]] \
+  || { cat "$WORKDIR/admin-verif-sup-queue.json"; fail "the second entry is not the next-longest-waiting provider"; }
+ok "pending providers are listed oldest first, and a support administrator may read them — looking is what the least-privileged role exists to be able to do"
+
+[[ "$(verif_carries verif-sup-queue "$verif_customer_id")" == "0" ]] \
+  || fail "a customer is on the provider verification queue"
+status="$(verif_queue Pending "$verif_mod_token" verif-wide "limit=100")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-wide.json"; fail "the queue returned $status"; }
+[[ "$(verif_carries verif-wide "$verif_customer_id")" == "0" ]] \
+  || fail "a customer appears on a wider page of the provider verification queue"
+ok "and a customer is on neither page — the record is a provider's, and most accounts here are not"
+
+# What the entry carries, and the closed key set that is where a budget would arrive. Checked as a
+# key set rather than by searching for the word: SHIP-83 established that a spelling-based guard
+# misses a field named anything at all.
+python3 - "$WORKDIR/admin-verif-sup-queue.json" "$verif_first" <<'PY' || fail "the queue entry shape is wrong"
+import json, sys
+page = json.load(open(sys.argv[1]))
+entry = next(e for e in page["data"] if e["provider_id"] == sys.argv[2])
+allowed = {"provider_id", "name", "email", "phone", "state", "submitted_at"}
+extra = set(entry) - allowed
+missing = allowed - set(entry)
+if extra:
+    print("the entry carries", sorted(extra))
+    sys.exit(1)
+if missing:
+    print("the entry is missing", sorted(missing))
+    sys.exit(1)
+if entry["name"] != "Ngaire Tuiavii":
+    print("the entry does not name the provider:", entry["name"])
+    sys.exit(1)
+if entry["state"] != "Pending":
+    print("a Pending queue entry reads", entry["state"])
+    sys.exit(1)
+PY
+ok "an entry names who the provider is and carries nothing commercial — six keys, and no shape to put a budget in"
+
+status="$(verif_queue Approved "$verif_mod_token" verif-badstate)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/admin-verif-badstate.json"; fail "an outcome Docs 04 does not have returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-verif-badstate.json")" == *'"state"'* ]] \
+  || { cat "$WORKDIR/admin-verif-badstate.json"; fail "the refusal does not name the field"; }
+status="$(admin_get "/v1/admin/verifications" "$verif_mod_token" verif-nostate)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/admin-verif-nostate.json"; fail "a queue with no state returned $status, want 422"; }
+ok "a state the document does not have, and no state at all, are both refused — an ignored filter answers an empty page, and an empty review queue is what 'nobody is waiting' looks like"
+
+admin_clear_limits

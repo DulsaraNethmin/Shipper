@@ -708,6 +708,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-147a** | M6 | The platform's password cost, under its own name. `Config.Identity.Argon2` and `IDENTITY_ARGON2_*` became `Config.Passwords.Argon2` and `PASSWORDS_ARGON2_*` — one setting, read by identity's hasher, by admin's, and by identity's phone one-time codes. **Declined in three consecutive prep passes and it cost nothing to take**: five files. "No second knob" is a **guard rather than a claim** — a reflective walk of the `Config` tree and a source scan of `cmd/api` — and the release note naming the rename is in `deploy/.env.example` beside the variables, because no release-notes artefact exists to put it in — *see below* |
 | **SHIP-78a** | M3 | Every one of `internal/fleet`'s eight service methods refuses a caller who is not a provider, with the sentinel `Add` and `Declare` already returned. **Docs/11 §9's oldest ownerless finding**, open since wave 5, and it was never a disclosure — each of the six that did not check scopes to the caller's own identifier, so a customer got an empty list or a 404 and never another provider's vehicle. What it was is a surface declining to *refuse*. `Service.Profile` reversed its own recorded position to take it — *see below* |
 | **SHIP-81a** | M3 | `Docs/04` §4's five outcomes exist as a record: `provider_verifications` and its append-only decision trail (`000200` — migration block 200–299's first table, owned by `internal/profiles`), `GET /v1/provider/verification`, and the eligibility predicate reading that record instead of its automated stand-in. **The guarded function is in the database rather than in Go** — `provider_verification_decide()` records the decision with its actor and reason, names it to a trigger through a transaction-local setting, then moves the state — so the domain, a `make verify` fixture and a psql prompt are the same caller; the jobs precedent puts the protocol in Go and this file already records what the hand-written copy of it cost. **Every provider has a row from registration and the existing ones are backfilled `Pending`**, which is the ticket rather than a detail: Pending is a state a provider is *in*, so SHIP-153 has somebody to list — and **every provider on the platform stops being eligible to bid** until somebody decides otherwise. `internal/fleet` imports nothing from `internal/profiles`; the seam is one `EXISTS` clause — *see below* |
+| **SHIP-153** | M6 | `GET /v1/admin/verifications` — Docs/04 §5's **first** moderation queue, and the read half of what ends the state SHIP-81a left the marketplace in. Oldest first, cursor paged on `(created_at, provider_id)`, and `state` is a **required** parameter rather than one defaulting to `Pending`: every provider has a record from registration, so an unfiltered request is the whole supply side wearing a queue's name, and a default would make the same URL mean two things depending on whether a console remembered to send one. The query lives in `internal/profiles`, which owns the tables; `internal/admin` declares a port and `cmd/api` supplies the adapter, so **no package imports another** — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14135,6 +14136,61 @@ rather than passing quietly. `scripts/verify/60-fleet.sh` carries the same asser
 deliberately in the file where somebody reaching for a one-line fixture would write the UPDATE.
 
 #### Nothing was needed from `internal/config`
+
+
+### SHIP-153 — the review queue, and the state it exists to end
+
+**SHIP-81a left the platform with no provider eligible to bid and no way for anybody to see who was
+waiting.** Every provider was backfilled `Pending` — deliberately, because nobody had reviewed
+anyone's documents and `Docs/04` §1 requires that table be an evidence trail — and there was no
+screen anywhere that listed them. `GET /v1/admin/verifications` is that screen. Acting on what it
+shows is SHIP-154.
+
+#### Where the SQL lives, and the rule that decided it
+
+`admin/ports.go` declares `ProviderVerifications`; `cmd/api` supplies `providerVerifications`, an
+adapter over `profiles.Service`. **`internal/admin` imports nothing from `internal/profiles` and the
+reverse is also true**, which is what `cmd/api/routes_profiles.go`'s header said would happen before
+either endpoint existed.
+
+This is `disputeLifecycle`'s shape rather than `jobDirectory`'s, and the line between them is one
+`postgres_users.go` had already drawn: a statement spanning **two other domains'** tables belongs in
+the composition root, because that is the only place both are visible, and a statement over one
+domain's own tables belongs to that domain. `provider_verifications` is `internal/profiles`', so the
+query is a method there and cmd/api holds a translation of the page shapes.
+
+**There is no copy of Docs/04 §4's five outcomes in `internal/admin`.** `cmd/api` passes
+`profiles.States` into `NewVerifications`, which is `JobConsole`'s arrangement and the newer of the
+two precedents in that package. `UserStanding` is the older one — a copy held to `ck_users_status`
+by a pairing test — and it works at the cost of a test somebody has to remember. The passed list
+costs nothing and cannot drift, and the refusal message a console shows is built from it, so the
+five names in a validation failure and the five the `CHECK` accepts are the same five by
+construction.
+
+#### `state` is required, and that is the decision most worth reading
+
+The *Done when* is the Pending ones, so defaulting to `Pending` was available. It was rejected twice
+over: `Docs/04` §5's first queue is "new **or changed**" submissions, so four of the five outcomes
+are worth listing; and a default makes one URL mean two different things depending on whether the
+client remembered to send a parameter. An unrecognised state is **refused rather than ignored**,
+which matters more here than on the account search — an ignored filter answers an empty page, and an
+empty review queue is precisely what "nobody is waiting" looks like.
+
+#### Oldest first, on the record's clock and never on a decision's
+
+`000200`'s `created_at` column comment asked for exactly this and the queue is what depends on it: a
+provider whose state was corrected twice has not gone to the back of the line by being corrected.
+The cursor is `(created_at, provider_id)` because two providers registering in the same millisecond
+would otherwise make a single-column cursor skip a row or repeat one — and on this queue a skipped
+row is a person nobody looks at.
+
+#### What the harness proves that no Go test can
+
+`make verify` runs against a database that is never reset, so **every provider ever registered by
+any section of any run is on the Pending queue**. The section's fixtures are backdated to 1990,
+which puts them at the head of an oldest-first queue whatever precedes them, and every other
+assertion names an identifier — the same fence-by-id discipline `Docs/11` §9 records for Kafka,
+applied to a shared table.
 
 ## 4. Partly done — do not treat these as finished
 

@@ -57,18 +57,19 @@ import (
 // for intake that is this layer: the party check, the dispute row and the status change are one
 // decision against one version of the job.
 type Handler struct {
-	svc         *Service
-	creds       *Credentials
-	moderation  *Moderation
-	cancels     *Cancellations
-	users       *Users
-	jobs        *JobConsole
-	trail       *AuditTrail
-	enforce     *Enforcement
-	notes       *Notes
-	suspensions *Suspensions
-	pool        *pgxpool.Pool
-	log         *slog.Logger
+	svc           *Service
+	creds         *Credentials
+	moderation    *Moderation
+	cancels       *Cancellations
+	users         *Users
+	jobs          *JobConsole
+	trail         *AuditTrail
+	enforce       *Enforcement
+	notes         *Notes
+	suspensions   *Suspensions
+	verifications *Verifications
+	pool          *pgxpool.Pool
+	log           *slog.Logger
 }
 
 // HandlerServices is what a handler is built from, beyond the pool and the logger.
@@ -112,6 +113,10 @@ type HandlerServices struct {
 
 	// Suspensions is Docs/04 §9's two-person review (SHIP-166).
 	Suspensions *Suspensions
+
+	// Verifications is Docs/04 §5's first queue and Docs/04 §6's decision (SHIP-153,
+	// SHIP-154).
+	Verifications *Verifications
 }
 
 // NewHandler wires the handlers to the services.
@@ -180,22 +185,30 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// exactly like the control refusing.
 		return nil, errors.New("admin: a handler needs the suspension review service")
 	}
+	if s.Verifications == nil {
+		// SHIP-153, SHIP-154. The same argument once more, and here it guards the endpoints
+		// that decide who may trade at all: with every provider backfilled `Pending` by
+		// SHIP-81a, a nil discovered at the first request is a marketplace with no eligible
+		// provider and no way to make one.
+		return nil, errors.New("admin: a handler needs the verification console")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
 	return &Handler{
-		svc:         s.Disputes,
-		creds:       s.Credentials,
-		moderation:  s.Moderation,
-		cancels:     s.Cancellations,
-		users:       s.Users,
-		jobs:        s.Jobs,
-		trail:       s.Trail,
-		enforce:     s.Enforcement,
-		notes:       s.Notes,
-		suspensions: s.Suspensions,
-		pool:        pool,
-		log:         log,
+		svc:           s.Disputes,
+		creds:         s.Credentials,
+		moderation:    s.Moderation,
+		cancels:       s.Cancellations,
+		users:         s.Users,
+		jobs:          s.Jobs,
+		trail:         s.Trail,
+		enforce:       s.Enforcement,
+		notes:         s.Notes,
+		suspensions:   s.Suspensions,
+		verifications: s.Verifications,
+		pool:          pool,
+		log:           log,
 	}, nil
 }
 
@@ -636,6 +649,15 @@ func apiError(err error) error {
 	case errors.Is(err, ErrJobAlreadyUnpublished):
 		return httpx.NewError(http.StatusConflict, CodeJobAlreadyUnpublished,
 			"This job has already been unpublished.").WithCause(err)
+
+	// --- Docs/04 §5's first queue (SHIP-153) --------------------------------------------------
+
+	case errors.Is(err, ErrVerificationStateUnrecognised):
+		// Reached only when something other than the queue handler raises it — that handler
+		// names the five outcomes itself, which needs the list cmd/api supplied and which this
+		// package function has no service to ask for. Named as a field failure either way,
+		// because a client that sent a bad state has made a mistake about a field somebody typed.
+		return fieldProblem("state", err)
 
 	case errors.Is(err, ErrAdminUnavailable):
 		// 503 rather than 500: a dependency is not answering, and retrying is the right
@@ -2749,4 +2771,164 @@ func noteSubjectFrom(subjectType, subjectID string) (NoteSubject, uuid.UUID, err
 		return "", uuid.Nil, err
 	}
 	return subject, id, nil
+}
+
+// --- SHIP-153: the verification review queue ------------------------------------------------------
+
+// verificationEntryResponse is one provider waiting for a verification decision.
+//
+// **No budget, no job and no bid**, which is structural: [VerificationEntry] has nowhere to put one,
+// so no change to this mapping can acquire one. Held to its key set by
+// TestTheVerificationQueueCarriesNothingCommercial.
+//
+// Every field is always present and never null, so a console that renders without checking does not
+// crash on the ordinary case — which for `name` is a provider who registered before `000006` and has
+// none.
+type verificationEntryResponse struct {
+	ProviderID string `json:"provider_id"`
+
+	// Name is what the account holder is called. Empty for an account created before SHIP-30a
+	// collected one; a name cannot be backfilled, so the console shows that the platform was
+	// never told rather than inventing a placeholder.
+	Name string `json:"name"`
+
+	Email string `json:"email"`
+	Phone string `json:"phone"`
+
+	// State is one of Docs/04 §4's five outcomes, in the document's own spelling — which is also
+	// the stored form and the one `GET /v1/provider/verification` uses.
+	State string `json:"state"`
+
+	// SubmittedAt is when the record was created, which is what the queue is ordered by and what
+	// "how long has this provider been waiting" is answered from.
+	SubmittedAt string `json:"submitted_at"`
+}
+
+func verificationEntryFrom(e VerificationEntry) verificationEntryResponse {
+	return verificationEntryResponse{
+		ProviderID:  e.ProviderID.String(),
+		Name:        e.Name,
+		Email:       e.Email,
+		Phone:       e.Phone,
+		State:       e.State,
+		SubmittedAt: timestamp(e.SubmittedAt),
+	}
+}
+
+// VerificationQueue handles GET /v1/admin/verifications (SHIP-153).
+//
+// Docs/04 §5's **first** moderation queue and Docs/01 §4.6's second capability — "review provider
+// verification status". It needs [PermissionVerificationsRead], which every role holds including
+// `support`: reading a queue is what the least-privileged role exists to be able to do, and deciding
+// what is in it is a different permission on a different endpoint.
+//
+// # Oldest first, unlike the account and job searches
+//
+// A queue and a search want opposite orderings and both are deliberate. The searches are
+// newest-first because the account somebody is looking for is overwhelmingly a recent one. This is a
+// queue with somebody waiting at the front of it: an unreviewed provider cannot bid at all
+// (Docs/04 §1), so the oldest entry is the provider who has been unable to trade for longest — the
+// same argument the delivery-exception queue records for its own ordering.
+//
+// # `state` is required rather than defaulted, and that is the interesting decision
+//
+// SHIP-153's *Done when* is the Pending ones, so a default of `Pending` was available and was
+// rejected: Docs/04 §5's first queue is "new or **changed**" submissions, four of the five outcomes
+// are worth listing, and a default would make `?state=` mean two different things depending on
+// whether a console remembered to send it. A required parameter is one a console cannot forget
+// silently.
+func (h *Handler) VerificationQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionVerificationsRead); err != nil {
+			return err
+		}
+
+		query, err := h.verificationQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so that "is there another page" is answered by the rows
+		// rather than by a second COUNT — the same arrangement every other queue here uses.
+		query.Limit++
+
+		entries, err := h.verifications.AwaitingReview(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+			next = pagination.Cursor{
+				timestamp(last.SubmittedAt),
+				last.ProviderID.String(),
+			}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]verificationEntryResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, verificationEntryFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// verificationQueryFrom reads the page parameters.
+//
+// A method rather than a function, because validating `state` needs the closed list the service was
+// given by cmd/api — the seam [JobConsole] opened and the reason there is no copy of Docs/04 §4's
+// five outcomes in this package.
+func (h *Handler) verificationQueryFrom(r *http.Request) (VerificationQuery, error) {
+	values := r.URL.Query()
+
+	state := strings.TrimSpace(values.Get("state"))
+	if !h.verifications.KnowsState(state) {
+		var problems validate.Errors
+		problems.Add("state", validate.CodeInvalid,
+			"That is not a verification outcome. Use one of %s.",
+			strings.Join(h.verifications.States(), ", "))
+		return VerificationQuery{}, problems.Err()
+	}
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return VerificationQuery{}, err
+	}
+
+	after, err := decodeVerificationCursor(values.Get("cursor"))
+	if err != nil {
+		return VerificationQuery{}, err
+	}
+
+	return VerificationQuery{State: state, Limit: limit, After: after}, nil
+}
+
+// decodeVerificationCursor reads the two fields the queue's ordering is total on.
+func decodeVerificationCursor(raw string) (VerificationCursor, error) {
+	if raw == "" {
+		return VerificationCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return VerificationCursor{}, err
+	}
+
+	submittedAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return VerificationCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	providerID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return VerificationCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return VerificationCursor{SubmittedAt: submittedAt, ProviderID: providerID}, nil
 }

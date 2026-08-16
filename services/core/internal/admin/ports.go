@@ -591,3 +591,112 @@ type JobDirectory interface {
 	// caller here is an administrator holding `jobs.read` and every job is theirs to open.
 	OpenJob(ctx context.Context, r db.Runner, jobID uuid.UUID) (detail JobDetail, found bool, err error)
 }
+
+// --- SHIP-153, SHIP-154: the provider verification queue and its decision -------------------------
+
+// ProviderVerifications is Docs/04 §4's five outcomes, as far as this domain reaches into them.
+//
+// # Why this is a port
+//
+// `provider_verifications` and `provider_verification_decisions` are `internal/profiles`' tables and
+// this domain may not import that package — the boundary lint refuses it, and
+// `cmd/api/routes_profiles.go` wrote the arrangement down before either endpoint existed: *"SHIP-153's
+// queue and SHIP-154's decision are `/v1/admin` routes served by `internal/admin` — which will call
+// this transition through a port it declares for itself."* cmd/api holds the implementation and is
+// the only place the two packages meet.
+//
+// **The implementation is an adapter over that domain's service rather than SQL written in cmd/api**,
+// which is the [Jobs] arrangement and not the [JobParties] one. The distinction postgres_users.go
+// records is about how many domains a *statement* spans: [ExceptionQueue] and [JobDirectory] are SQL
+// in the composition root because they join two other domains' tables, and these two touch one
+// domain's tables plus `users`. So the statements stay with the domain that owns the rows, and what
+// lives in cmd/api is a translation.
+//
+// # The vocabulary stays on the other side, and there is no copy of the five states here
+//
+// [VerificationEntry.State] and the states on a decision are plain strings, for the reason
+// [ExceptionEntry.JobStatus] is one: `profiles.States` is that domain's closed list, held to
+// `ck_provider_verifications_state` by a test in both directions, and a second list in this package
+// would be a hand-written copy shadowing a checked one. **What the decision endpoint validates
+// against is supplied to [NewVerifications] by cmd/api**, exactly as [JobConsole.Statuses] is —
+// which is the newer of the two precedents this package holds and the better one. [UserStanding] is
+// the older shape: a copy in this package held to `ck_users_status` by a pairing test, which works
+// and costs a test that has to be remembered.
+type ProviderVerifications interface {
+	// VerificationsAwaitingReview returns one page of providers in one state, oldest first
+	// (SHIP-153).
+	//
+	// Oldest first because the queue's whole purpose is that somebody has been waiting: Docs/04
+	// §1 requires baseline checks before a provider may bid, so an unreviewed provider is a
+	// provider who cannot trade, and the one at the front has been unable to trade for longest.
+	// The account search is newest-first for the opposite reason and [Users.Search] records it.
+	VerificationsAwaitingReview(ctx context.Context, r db.Runner, q VerificationQuery) ([]VerificationEntry, error)
+}
+
+// VerificationQuery is one page of the verification review queue.
+//
+// Cursor paged rather than offset paged, per Docs/10 §4.5: providers register while somebody is
+// working through the queue, and an offset would show the same provider twice or skip one. A skipped
+// row here is a person waiting for a decision nobody is going to take.
+type VerificationQuery struct {
+	// State is which of Docs/04 §4's outcomes to list. **Required, and validated against the
+	// list cmd/api supplies** — see [ProviderVerifications].
+	//
+	// A required filter rather than an optional one, because there is no useful unfiltered
+	// answer: every provider on the platform has a record, so "no state" is a list of the whole
+	// supply side wearing a queue's name. SHIP-153 asks for the Pending ones and Docs/04 §5's
+	// first queue is "new or **changed**" submissions, which is what makes the other four worth
+	// asking for.
+	State string
+
+	// Limit is how many entries to return. Bounded by internal/pagination before it gets here.
+	Limit int
+
+	// After is where the previous page stopped. The zero value is the first page.
+	After VerificationCursor
+}
+
+// VerificationCursor is the position of the last entry a caller saw.
+//
+// Two fields, because a submission clock is not unique — two providers registering in the same
+// millisecond would make a single-column cursor either skip a row or repeat one.
+type VerificationCursor struct {
+	SubmittedAt time.Time
+	ProviderID  uuid.UUID
+}
+
+// Zero reports whether this is the first page.
+func (c VerificationCursor) Zero() bool {
+	return c.ProviderID == uuid.Nil && c.SubmittedAt.IsZero()
+}
+
+// VerificationEntry is one provider in the queue.
+//
+// **No budget, no job and no bid**, which is structural: there is nowhere on this struct to put one,
+// so no change to the response mapping can acquire one. Docs/01 §4.3's invariant names providers as
+// the audience it protects a budget from, and the safest administrative shape is one that never
+// carried a commercial fact at all — [CancellationEntry] and [ExceptionEntry] take the same position
+// and record it.
+//
+// **No decision reason and no decided-at.** A queue entry is what somebody triaging needs in order
+// to choose whom to open next; the reason behind a previous decision is a fact about a review that
+// has already happened, and SHIP-155's document viewer is where a reviewer opens the case.
+type VerificationEntry struct {
+	ProviderID uuid.UUID
+
+	// Name is what the account holder is called (SHIP-30a). Empty for an account created before
+	// `000006` — a name cannot be backfilled, so an older provider has none and the console shows
+	// that it has none.
+	Name string
+
+	Email string
+	Phone string
+
+	// State is where this provider stands. Always the state that was asked for.
+	State string
+
+	// SubmittedAt is when the record was created, which is what "oldest first" orders by — and
+	// deliberately not the newest decision's clock, so that a provider whose state was corrected
+	// twice has not gone to the back of the line by being corrected.
+	SubmittedAt time.Time
+}

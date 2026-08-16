@@ -118,6 +118,16 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the suspension review: %v", err)
 	}
 
+	// SHIP-153, SHIP-154. The port is the *real* one over `internal/profiles`, not a double, and
+	// the states come from that package rather than from a list written here — see
+	// verifications_test.go. A test file may import another domain (the boundary lint skips
+	// `_test.go` for exactly this reason: a test wires domains together the way cmd/api does).
+	verifications, err := NewVerifications(
+		testProviderVerifications(), testVerificationStates(), auditor, pool)
+	if err != nil {
+		t.Fatalf("building the verification console: %v", err)
+	}
+
 	return HandlerServices{
 		Disputes:      testDisputeService(t),
 		Credentials:   creds,
@@ -129,6 +139,7 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		Enforcement:   enforce,
 		Notes:         notes,
 		Suspensions:   suspensions,
+		Verifications: verifications,
 	}
 }
 

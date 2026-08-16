@@ -486,3 +486,25 @@ var (
 		"This account already has a suspension waiting for a second administrator. Approve the "+
 			"existing request rather than making another.")
 )
+
+// --- SHIP-153: the verification review queue -----------------------------------------------------
+
+// The sentinel the verification queue raises.
+//
+// One, and it is not `profiles`'. That domain has its own — `ErrStateUnrecognised` — and this
+// package may not import it to match one, so the queue service raises its own and cmd/api's adapter
+// never has to translate this particular refusal at all: it is caught before the port is reached.
+//
+// **There is no error code beside it, and that is the restraint errors.go applies throughout.** A
+// state Docs/04 §4 does not have is `validation_failed` with the field named and the five choices
+// listed, which is what a console needs; a domain code would earn its place only if a client would
+// otherwise have to parse a message to know what to do.
+var (
+	// ErrVerificationStateUnrecognised means the outcome asked for is not one of Docs/04 §4's.
+	//
+	// Refused rather than ignored: an ignored filter answers an empty page, and an empty review
+	// queue is what "nobody is waiting" looks like to somebody who mistyped a state. [Users.Search]
+	// takes the same position about its standing filter, and it matters more here — the cost of
+	// the confusion is a provider nobody reviews.
+	ErrVerificationStateUnrecognised = errors.New("admin: that is not a verification outcome")
+)
