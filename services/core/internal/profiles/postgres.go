@@ -148,6 +148,66 @@ func missingProvider(err error) error {
 	return err
 }
 
+// awaitingReview reads one page of the review queue, oldest first (SHIP-153).
+//
+// # The ordering is total and the cursor is why it needs two columns
+//
+// `(created_at, provider_id)`. `created_at` is not unique — two providers registering in the same
+// millisecond would make a single-column cursor either skip a row or repeat one, and a review queue
+// that can hide a row is worse than one that shows it twice, because the hidden row is a person
+// waiting.
+//
+// `idx_provider_verifications_state` is `(state, created_at)` and serves the predicate and the
+// leading ordering column; `000200` built it for this read and said so.
+//
+// # An INNER JOIN on `users`, and it cannot lose a row
+//
+// `fk_provider_verifications_provider` is `ON DELETE RESTRICT`, so a verification record cannot
+// outlive the account it belongs to. The join is therefore total, and an outer join would only be
+// insurance against a foreign key the schema does not permit to be violated.
+//
+// `name` is coalesced because `000006` made the column nullable deliberately: an account created
+// before it has none, a name cannot be backfilled, and the empty string is the honest report of
+// "the platform was never told".
+func (postgresStore) awaitingReview(ctx context.Context, r db.Runner, q QueueQuery) ([]QueueEntry, error) {
+	const query = `
+		SELECT v.provider_id, coalesce(u.name, ''), u.email, u.phone, v.state, v.created_at
+		FROM provider_verifications v
+		JOIN users u ON u.id = v.provider_id
+		WHERE v.state = $1
+		  AND ($2::timestamptz IS NULL OR (v.created_at, v.provider_id) > ($2, $3))
+		ORDER BY v.created_at, v.provider_id
+		LIMIT $4`
+
+	// A nil rather than a zero time for the first page: `> (NULL, …)` is NULL rather than true, so
+	// the predicate has to be skipped rather than satisfied. Passing the zero time would work today
+	// and would stop working the first time somebody backdated a fixture.
+	var after, afterID any
+	if !q.After.Zero() {
+		after, afterID = q.After.SubmittedAt, q.After.ProviderID
+	}
+
+	rows, err := r.Query(ctx, query, string(q.State), after, afterID, q.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("profiles: reading the %s verification queue: %w", q.State, err)
+	}
+	defer rows.Close()
+
+	out := []QueueEntry{}
+	for rows.Next() {
+		var e QueueEntry
+		if err := rows.Scan(&e.ProviderID, &e.Name, &e.Email, &e.Phone,
+			&e.State, &e.SubmittedAt); err != nil {
+			return nil, fmt.Errorf("profiles: reading a verification queue entry: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("profiles: reading the %s verification queue: %w", q.State, err)
+	}
+	return out, nil
+}
+
 // isProvider reports whether the account exists and is a provider account.
 //
 // This domain reading `users` is sanctioned rather than a boundary crossed, the reading

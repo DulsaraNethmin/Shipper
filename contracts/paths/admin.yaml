@@ -3700,3 +3700,448 @@ AdminNoteList:
       description: The notes, newest first. Always an array, never `null`.
       items:
         $ref: '#/AdminNote'
+
+# --- the provider verification queue and its decision (SHIP-153, SHIP-154) ----------------------
+#
+# Docs/04 §5's **first** moderation queue and Docs/04 §6's process ending in a recorded decision.
+# Together they are what makes a provider able to trade at all: SHIP-81a gave every provider a
+# verification record and backfilled the existing ones `Pending`, deliberately, because nobody had
+# reviewed anyone's documents — so until these two endpoints existed there was no eligible provider
+# anywhere on the platform and no way to make one.
+#
+# There is no route to a decision on the *user* credential and there deliberately will not be.
+# `GET /v1/provider/verification` is the provider's own record and is read-only; deciding somebody's
+# standing is an administrator's act on the administrator credential (SHIP-147), and a second way to
+# reach the same act on the wrong credential is what Docs/04 §9's least-privilege requirement exists
+# to prevent.
+
+AdminVerifications:
+  get:
+    operationId: adminVerificationQueue
+    summary: Providers in one verification state, oldest first
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §5's first moderation queue — "new or changed provider verification submissions" — and
+      Docs/01 §4.6's second administrative capability, "review provider verification status"
+      (SHIP-153).
+
+      ## `state` is required, and that is a decision rather than an omission
+
+      Every provider has a verification record from the moment they register (SHIP-81a), so a request
+      with no state would be a list of the whole supply side wearing a queue's name. Requiring the
+      parameter also means a console cannot forget it silently: an omitted filter that defaulted to
+      `Pending` would make the same URL mean two different things depending on whether the client
+      remembered to send one.
+
+      A state that is not one of Docs/04 §4's five is refused rather than ignored. An ignored filter
+      answers an empty page, and an empty review queue is exactly what "nobody is waiting" looks
+      like to somebody who mistyped — on this screen that costs a provider a week of not trading.
+
+      ## Ordering
+
+      **Oldest first**, and deliberately unlike the account and job searches. Those are newest-first
+      because the record somebody is looking for is overwhelmingly a recent one. This is a queue with
+      somebody waiting at the front of it: an unreviewed provider cannot bid at all (Docs/04 §1), so
+      the oldest entry is the provider who has been unable to trade for longest.
+
+      The clock it orders by is when the **record was created**, never the newest decision's. A
+      provider whose state was corrected twice has not gone to the back of the line by being
+      corrected.
+
+      ## What an entry carries, and what it never will
+
+      Who the provider is, so that a reviewer checking a licence against the account name does not
+      need a second request per row. **No jobs, no bids and nothing commercial** — a customer's
+      maximum budget is never exposed in any form (Docs/01 §4.3), and the surest way to keep an
+      administrative shape clear of one is for it never to have carried anything from the trading
+      side of the platform.
+
+      No decision reason and no decision clock: a queue entry is what somebody triaging needs in
+      order to choose whom to open next, and the reason behind a previous decision is a fact about a
+      review that has already happened.
+
+      ## Permission
+
+      Needs `verifications.read`, which every administrator role holds **including `support`** —
+      looking is what the least-privileged role exists to be able to do. Deciding what is in the
+      queue is `verifications.decide` on a different endpoint.
+    parameters:
+      - name: state
+        in: query
+        required: true
+        description: |
+          Which of Docs/04 §4's five outcomes to list. `Pending` is the review queue proper; the
+          other four answer "who did we decide what about, and when".
+        schema:
+          type: string
+          enum: [Pending, Verified, Restricted, Rejected, Suspended]
+        example: Pending
+      - name: limit
+        in: query
+        required: false
+        description: How many providers to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page — a client that sent one has a bug, and
+          answering "nothing here" would let it page for ever through a queue it never saw.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of providers in that state, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/VerificationQueuePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `verifications.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          `state` was absent, or was not one of Docs/04 §4's five outcomes (`validation_failed`,
+          with one `error.details` entry naming `state` and listing the choices).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminVerificationDecision:
+  post:
+    operationId: adminDecideVerification
+    summary: Record a verification outcome against a provider
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: |
+          The **provider's account identifier**, which is `provider_id` on a queue entry. There is
+          exactly one verification record per provider and no separate identifier for it — a second
+          one would only make "which of these is current" a question somebody has to answer.
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/IdempotencyKey'
+    description: |
+      Docs/04 §6 step 4 and step 6: an administrator selects an outcome and it is recorded with the
+      actor, the timestamp and the reason (SHIP-154). This is the **only** route in the API that
+      moves a verification state.
+
+      ## One endpoint for all five outcomes
+
+      Docs/04 §4 defines no transition table and this endpoint enforces none: a Suspended provider is
+      reinstated, a Rejected one is Restricted after clarification, and a Verified one whose
+      insurance lapses goes back to Pending. Any outcome may follow any other, and the reason is
+      required in every direction — a trail that records a rejection and not its reversal is the one
+      that makes a person look permanently unsuitable.
+
+      Deciding the outcome a provider already holds is refused (`admin_verification_unchanged`)
+      rather than recorded. A decision is an act by a person and Docs/04 §6.6 requires it be recorded
+      with a reason; a second one with no change to show for it would be a row asserting a review
+      took place. On a queue two moderators are reading, the right response is to reload — most often
+      because somebody got there first, which the audit trail will show.
+
+      ## What a decision writes, and why it is two tables
+
+      One transaction writes both, and neither is redundant:
+
+      - **the provider's evidence trail** — a `provider_verification_decisions` row with both ends,
+        the actor, the clock and the reason. Docs/04 §1 requires that "every review, evidence item,
+        decision, and expiry date" be recorded, and it is append-only: a rejection cannot be
+        rewritten as an approval afterwards.
+      - **the administrator's accountability record** — an `audit_log` entry naming the provider,
+        the administrator, the reason and both ends. Docs/04 §9's controls read this one.
+
+      If either cannot be written, neither is, and the state does not move.
+
+      ## What the provider is told
+
+      The state and the reason reach them through their own endpoint,
+      `GET /v1/provider/verification`. **The deciding administrator's identity does not** — Docs/04
+      §4 requires a *reason* be communicated and says nothing about a name, and naming the person who
+      rejected somebody is what turns a moderation decision into a personal one.
+
+      ## Only `Verified` may bid
+
+      The eligibility answer is one predicate in the fleet domain and this endpoint has no second
+      opinion about it. What changes when a provider becomes `Verified` is that they satisfy the
+      verification clause of that predicate; a vehicle and a declared service area are separate
+      clauses of the same one.
+
+      ## Permission
+
+      Needs `verifications.decide`, which `moderator` and `owner` hold and **`support` does not**. A
+      support administrator may read the queue and may not decide what is in it — Docs/04 §9's
+      least-privilege control, expressed as two permissions on two endpoints.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/VerificationDecisionRequest'
+    responses:
+      '200':
+        description: The verification outcome has changed.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/VerificationDecisionResult'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `verifications.decide`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          There is no verification record for that identifier (`not_found`) — either no such
+          account, or an account that is not a provider. One answer for both, because every provider
+          gets a record at registration and the two are indistinguishable from the record's side.
+          Unlike the `404` on dispute intake this is not a disclosure decision: the caller holds a
+          permission over verifications and nothing is being kept from them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The provider already holds that outcome (`admin_verification_unchanged`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The outcome is not one of Docs/04 §4's five, or the reason records nothing
+          (`validation_failed`, with one `error.details` entry per field).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+VerificationQueuePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/VerificationQueueEntry'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wNi0xMFQwODowMDowMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like and a client should not have to know the difference.
+      example: false
+
+VerificationQueueEntry:
+  type: object
+  additionalProperties: false
+  required: [provider_id, name, email, phone, state, submitted_at]
+  description: |
+    One provider in the queue. Six fields, all always present — a console that renders without
+    checking does not crash on the ordinary case.
+
+    **Nothing commercial, and there is nowhere in this shape to put any.** A customer's budget is
+    never exposed in any form (Docs/01 §4.3), and an administrative shape that never carried one
+    cannot leak one.
+  properties:
+    provider_id:
+      type: string
+      format: uuid
+      description: |
+        The provider's account identifier, and the value to put in the decision endpoint's path.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    name:
+      type: string
+      description: |
+        What the account holder is called (SHIP-30a). **Empty for an account created before
+        `000006`** — a name cannot be backfilled, so the console shows the absence rather than a
+        placeholder that would read as a name somebody chose.
+      example: Hana Osei
+    email:
+      type: string
+      format: email
+      example: hana@acme.example
+    phone:
+      type: string
+      description: E.164, as the account holds it.
+      example: '+61400111222'
+    state:
+      type: string
+      enum: [Pending, Verified, Restricted, Rejected, Suspended]
+      description: |
+        Docs/04 §4's outcome, in the document's own spelling — the same vocabulary the provider's
+        own endpoint uses. Always the state that was asked for.
+      example: Pending
+    submitted_at:
+      type: string
+      format: date-time
+      description: |
+        When the verification record was created, in UTC. What the queue is ordered by, and what
+        "how long has this provider been waiting" is answered from.
+      example: '2026-06-10T08:00:00.000Z'
+
+VerificationDecisionRequest:
+  type: object
+  additionalProperties: false
+  required: [state, reason]
+  description: |
+    **No provider identifier** — it is in the path. **No reviewer**: the administrator is whoever the
+    credential says is calling, and a body that named its own reviewer would be an evidence trail the
+    client writes. **No `from`**: what the provider currently holds is read under a row lock rather
+    than taken from a console that may have loaded the queue five minutes ago.
+  properties:
+    state:
+      type: string
+      enum: [Pending, Verified, Restricted, Rejected, Suspended]
+      description: The outcome to record. Any outcome may follow any other.
+      example: Verified
+    reason:
+      type: string
+      minLength: 10
+      maxLength: 500
+      description: |
+        Why, and it is required for every outcome. Docs/04 §4 requires a rejection's reason be
+        communicable to the provider and §6.6 requires one of every moderation outcome; the floor is
+        what stops a required field being satisfied without recording anything.
+      example: Licence, registration and insurance all current and matching the account.
+
+VerificationDecisionResult:
+  type: object
+  additionalProperties: false
+  required: [provider_id, from, to, reason]
+  description: |
+    What changed. **Both ends, never just the new one** — one endpoint serves all five outcomes, so a
+    console rendering `Restricted` alone cannot tell a reader whether that was a tightening or a
+    loosening.
+  properties:
+    provider_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    from:
+      type: string
+      enum: [Pending, Verified, Restricted, Rejected, Suspended]
+      description: |
+        What the provider held, read under the row lock the transition takes rather than supplied by
+        the caller.
+      example: Pending
+    to:
+      type: string
+      enum: [Pending, Verified, Restricted, Rejected, Suspended]
+      description: What they hold now.
+      example: Verified
+    reason:
+      type: string
+      description: |
+        The reason as it was **stored** — trimmed and collapsed — so that what the platform recorded
+        is what the reviewer sees rather than what they typed.
+      example: Licence, registration and insurance all current and matching the account.

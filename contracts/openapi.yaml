@@ -208,6 +208,10 @@ paths:
     $ref: './paths/admin.yaml#/AdminUserStanding'
   /v1/admin/users/{id}/suspension:
     $ref: './paths/admin.yaml#/AdminUserSuspension'
+  /v1/admin/verifications:
+    $ref: './paths/admin.yaml#/AdminVerifications'
+  /v1/admin/verifications/{id}/decision:
+    $ref: './paths/admin.yaml#/AdminVerificationDecision'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
   /v1/app/policy:

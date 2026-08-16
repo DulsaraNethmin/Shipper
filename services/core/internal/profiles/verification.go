@@ -187,6 +187,34 @@ type Verification struct {
 // Decided reports whether anything has been decided about this provider yet.
 func (v Verification) Decided() bool { return !v.DecidedAt.IsZero() }
 
+// Decision is what one decision did: where the provider was, and where they now are.
+//
+// # Why [Service.Decide] answers with both ends rather than with the record alone
+//
+// SHIP-154 is the first caller outside this package's own tests, and it writes an `audit_log` entry
+// beside the decision. `user.standing_changed` established the shape that entry takes — `from` and
+// `to` in the metadata, because "Restricted" alone does not say what changed and an append-only
+// trail cannot be joined to a row's history afterwards.
+//
+// **The alternative was for the caller to read the state first, and it is wrong rather than merely
+// wordier.** [Service.Decide] takes the row's lock and reads the state under it; a read the caller
+// made before calling would be outside that lock, so two administrators deciding at once would both
+// record a move from the state neither of them was moving from. The from-state is a fact this
+// method already holds at the only instant it is true, so it hands it back rather than inviting a
+// second read of it.
+//
+// `provider_verification_decisions` records both ends too, and that is not a duplication to remove:
+// that table is the *provider's* evidence trail (Docs/04 §1) and `audit_log` is the
+// *administrator's* accountability record (Docs/04 §9). SHIP-160 wrote the same reason into two
+// tables for exactly this reason, and recorded why.
+type Decision struct {
+	// From is the state the provider held when the decision was taken, read under the row lock.
+	From State
+
+	// Verification is the record as it now stands, with the reason and clock of this decision.
+	Verification Verification
+}
+
 // Service holds this domain's rules.
 //
 // It owns no connection, for the reason `fleet.Service` does not: the transaction belongs to whoever
@@ -286,13 +314,13 @@ func (s *Service) Decide(
 	to State,
 	by Actor,
 	reason string,
-) (Verification, error) {
+) (Decision, error) {
 
 	if _, inTx := r.(pgx.Tx); !inTx {
-		return Verification{}, fmt.Errorf("profiles: deciding %s: %w", providerID, ErrNotInTransaction)
+		return Decision{}, fmt.Errorf("profiles: deciding %s: %w", providerID, ErrNotInTransaction)
 	}
 	if providerID == uuid.Nil {
-		return Verification{}, fmt.Errorf("profiles: a decision names no provider: %w", ErrNoSuchProvider)
+		return Decision{}, fmt.Errorf("profiles: a decision names no provider: %w", ErrNoSuchProvider)
 	}
 
 	tidy := strings.Join(strings.Fields(reason), " ")
@@ -311,22 +339,27 @@ func (s *Service) Decide(
 		// Not a field error: no client supplies the actor. It is the composition root's, taken from
 		// the administrator's own credential, so a bad one is a wiring fault rather than a request
 		// somebody can correct.
-		return Verification{}, fmt.Errorf("profiles: %q with id %s: %w", by.Type, by.ID, ErrActorNotRecorded)
+		return Decision{}, fmt.Errorf("profiles: %q with id %s: %w", by.Type, by.ID, ErrActorNotRecorded)
 	}
 	if err := problems.Err(); err != nil {
-		return Verification{}, err
+		return Decision{}, err
 	}
 
 	current, err := s.store.lockVerification(ctx, r, providerID)
 	if err != nil {
-		return Verification{}, err
+		return Decision{}, err
 	}
 	if current == to {
-		return Verification{}, fmt.Errorf("profiles: %s is already %s: %w", providerID, to, ErrAlreadyInState)
+		return Decision{}, fmt.Errorf("profiles: %s is already %s: %w", providerID, to, ErrAlreadyInState)
 	}
 
 	if err := s.store.decide(ctx, r, providerID, to, by, tidy); err != nil {
-		return Verification{}, err
+		return Decision{}, err
 	}
-	return s.store.verification(ctx, r, providerID)
+
+	after, err := s.store.verification(ctx, r, providerID)
+	if err != nil {
+		return Decision{}, err
+	}
+	return Decision{From: current, Verification: after}, nil
 }

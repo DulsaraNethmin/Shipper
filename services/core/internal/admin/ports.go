@@ -591,3 +591,209 @@ type JobDirectory interface {
 	// caller here is an administrator holding `jobs.read` and every job is theirs to open.
 	OpenJob(ctx context.Context, r db.Runner, jobID uuid.UUID) (detail JobDetail, found bool, err error)
 }
+
+// --- SHIP-153, SHIP-154: the provider verification queue and its decision -------------------------
+
+// ProviderVerifications is Docs/04 §4's five outcomes, as far as this domain reaches into them.
+//
+// # Why this is a port
+//
+// `provider_verifications` and `provider_verification_decisions` are `internal/profiles`' tables and
+// this domain may not import that package — the boundary lint refuses it, and
+// `cmd/api/routes_profiles.go` wrote the arrangement down before either endpoint existed: *"SHIP-153's
+// queue and SHIP-154's decision are `/v1/admin` routes served by `internal/admin` — which will call
+// this transition through a port it declares for itself."* cmd/api holds the implementation and is
+// the only place the two packages meet.
+//
+// **The implementation is an adapter over that domain's service rather than SQL written in cmd/api**,
+// which is the [Jobs] arrangement and not the [JobParties] one. The distinction postgres_users.go
+// records is about how many domains a *statement* spans: [ExceptionQueue] and [JobDirectory] are SQL
+// in the composition root because they join two other domains' tables, and these two touch one
+// domain's tables plus `users`. So the statements stay with the domain that owns the rows, and what
+// lives in cmd/api is a translation.
+//
+// # The vocabulary stays on the other side, and there is no copy of the five states here
+//
+// [VerificationEntry.State] and the states on a decision are plain strings, for the reason
+// [ExceptionEntry.JobStatus] is one: `profiles.States` is that domain's closed list, held to
+// `ck_provider_verifications_state` by a test in both directions, and a second list in this package
+// would be a hand-written copy shadowing a checked one. **What the decision endpoint validates
+// against is supplied to [NewVerifications] by cmd/api**, exactly as [JobConsole.Statuses] is —
+// which is the newer of the two precedents this package holds and the better one. [UserStanding] is
+// the older shape: a copy in this package held to `ck_users_status` by a pairing test, which works
+// and costs a test that has to be remembered.
+type ProviderVerifications interface {
+	// VerificationsAwaitingReview returns one page of providers in one state, oldest first
+	// (SHIP-153).
+	//
+	// Oldest first because the queue's whole purpose is that somebody has been waiting: Docs/04
+	// §1 requires baseline checks before a provider may bid, so an unreviewed provider is a
+	// provider who cannot trade, and the one at the front has been unable to trade for longest.
+	// The account search is newest-first for the opposite reason and [Users.Search] records it.
+	VerificationsAwaitingReview(ctx context.Context, r db.Runner, q VerificationQuery) ([]VerificationEntry, error)
+
+	// DecideVerification records one administrator's decision and moves the state, inside the
+	// caller's transaction (SHIP-154).
+	//
+	// It takes a Runner rather than opening its own, and that is the whole of why SHIP-154 is
+	// atomic: the decision row, the state change and this domain's `audit_log` entry are one
+	// transaction, so a decision cannot exist without the record of who took it. Docs/10 §3.2
+	// puts the boundary with whoever owns the invariant, and the invariant is that one.
+	//
+	// A non-nil error is a failure of the mechanism — the database, a malformed request that got
+	// past validation. A refusal comes back as a [VerificationMove] with a nil error, because
+	// "there is no such provider" and "they are already in that state" are answers rather than
+	// faults. [Jobs] takes the same position for the same reason.
+	//
+	// The returned [VerificationChange] is populated only on [VerificationDecided]. Its `From` is
+	// read **under the row lock the transition takes**, never before it: two administrators
+	// deciding at once would otherwise both record a move from a state only one of them was
+	// moving from.
+	DecideVerification(ctx context.Context, r db.Runner, d VerificationDecision) (VerificationMove, VerificationChange, error)
+}
+
+// VerificationQuery is one page of the verification review queue.
+//
+// Cursor paged rather than offset paged, per Docs/10 §4.5: providers register while somebody is
+// working through the queue, and an offset would show the same provider twice or skip one. A skipped
+// row here is a person waiting for a decision nobody is going to take.
+type VerificationQuery struct {
+	// State is which of Docs/04 §4's outcomes to list. **Required, and validated against the
+	// list cmd/api supplies** — see [ProviderVerifications].
+	//
+	// A required filter rather than an optional one, because there is no useful unfiltered
+	// answer: every provider on the platform has a record, so "no state" is a list of the whole
+	// supply side wearing a queue's name. SHIP-153 asks for the Pending ones and Docs/04 §5's
+	// first queue is "new or **changed**" submissions, which is what makes the other four worth
+	// asking for.
+	State string
+
+	// Limit is how many entries to return. Bounded by internal/pagination before it gets here.
+	Limit int
+
+	// After is where the previous page stopped. The zero value is the first page.
+	After VerificationCursor
+}
+
+// VerificationCursor is the position of the last entry a caller saw.
+//
+// Two fields, because a submission clock is not unique — two providers registering in the same
+// millisecond would make a single-column cursor either skip a row or repeat one.
+type VerificationCursor struct {
+	SubmittedAt time.Time
+	ProviderID  uuid.UUID
+}
+
+// Zero reports whether this is the first page.
+func (c VerificationCursor) Zero() bool {
+	return c.ProviderID == uuid.Nil && c.SubmittedAt.IsZero()
+}
+
+// VerificationEntry is one provider in the queue.
+//
+// **No budget, no job and no bid**, which is structural: there is nowhere on this struct to put one,
+// so no change to the response mapping can acquire one. Docs/01 §4.3's invariant names providers as
+// the audience it protects a budget from, and the safest administrative shape is one that never
+// carried a commercial fact at all — [CancellationEntry] and [ExceptionEntry] take the same position
+// and record it.
+//
+// **No decision reason and no decided-at.** A queue entry is what somebody triaging needs in order
+// to choose whom to open next; the reason behind a previous decision is a fact about a review that
+// has already happened, and SHIP-155's document viewer is where a reviewer opens the case.
+type VerificationEntry struct {
+	ProviderID uuid.UUID
+
+	// Name is what the account holder is called (SHIP-30a). Empty for an account created before
+	// `000006` — a name cannot be backfilled, so an older provider has none and the console shows
+	// that it has none.
+	Name string
+
+	Email string
+	Phone string
+
+	// State is where this provider stands. Always the state that was asked for.
+	State string
+
+	// SubmittedAt is when the record was created, which is what "oldest first" orders by — and
+	// deliberately not the newest decision's clock, so that a provider whose state was corrected
+	// twice has not gone to the back of the line by being corrected.
+	SubmittedAt time.Time
+}
+
+// VerificationDecision is one administrator deciding a provider's standing (SHIP-154).
+type VerificationDecision struct {
+	// ProviderID is the provider. Named in the path, never in the body.
+	ProviderID uuid.UUID
+
+	// To is the outcome — one of Docs/04 §4's five, validated before this is built.
+	To string
+
+	// ActorID is the administrator taking the decision, from the grant rather than from the
+	// request. A body that named its own reviewer would be an evidence trail a client writes.
+	ActorID uuid.UUID
+
+	// Reason is why, and it is required. Docs/04 §4 requires a rejection's reason be
+	// communicable to the provider, Docs/04 §6.6 requires one of every moderation outcome, and
+	// `ck_provider_verification_decisions_reason` is the layer underneath.
+	Reason string
+}
+
+// VerificationMove is what a decision did, in terms this domain can act on.
+//
+// Not an error type, for [JobMove]'s reason: an error would have to be one of `profiles`' sentinels
+// to be matched, and matching it would be an import.
+type VerificationMove int
+
+const (
+	// VerificationMoveUnrecognised is the zero value and is never a valid answer.
+	//
+	// First on purpose. A stub, a half-written adapter or a switch with a missing case returns
+	// this, and [Verifications.Decide] refuses it rather than reading silence as success.
+	VerificationMoveUnrecognised VerificationMove = iota
+
+	// VerificationDecided means the decision was recorded and the state moved.
+	VerificationDecided
+
+	// VerificationProviderNotFound means there is no verification record for that identifier.
+	//
+	// One answer for two conditions — no such account, and an account that is not a provider —
+	// because `000200` gives every provider a record at registration, so the two are
+	// indistinguishable from the record's side. **Not a disclosure decision**, unlike the
+	// identical-looking answer [JobParties] gives: the caller holds `verifications.decide` and
+	// nothing is being kept from them. It is simply the only thing the port can know.
+	VerificationProviderNotFound
+
+	// VerificationAlreadyInState means the provider already holds that outcome.
+	//
+	// Refused rather than absorbed, which is `profiles`' decision and the right one: a decision
+	// is an act by a person, Docs/04 §6.6 requires it be recorded with a reason, and a second one
+	// that changed nothing would be a row asserting a review took place with no change to show
+	// for it. `ck_provider_verification_decisions_moves` is the layer underneath.
+	VerificationAlreadyInState
+)
+
+func (m VerificationMove) String() string {
+	switch m {
+	case VerificationDecided:
+		return "decided"
+	case VerificationProviderNotFound:
+		return "no such provider"
+	case VerificationAlreadyInState:
+		return "already in that state"
+	default:
+		return "unrecognised"
+	}
+}
+
+// VerificationChange is what a recorded decision changed, for the response and for the entry.
+type VerificationChange struct {
+	ProviderID uuid.UUID
+
+	// From is the outcome the provider held, read under the row lock rather than supplied by the
+	// caller. A console sending what it last saw would record a `from` that was already stale —
+	// [StandingChange] records the same argument for the same reason.
+	From string
+
+	// To is the outcome they now hold.
+	To string
+}

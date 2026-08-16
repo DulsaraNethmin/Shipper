@@ -2796,3 +2796,353 @@ status="$(curl -s -X POST -o "$WORKDIR/scope-nocred.json" -w '%{http_code}' \
 ok "and a caller who presents nothing is still anonymous, so the shared scope every public route uses is intact"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-153 and SHIP-154 — the verification review queue, and the decision taken from it.
+#
+# # What this section demonstrates that no Go test can
+#
+# `internal/admin` may not import `internal/profiles`, so the two meet only in `cmd/api` — in
+# `providerVerifications`, an adapter no test in package main can drive against a database. The Go
+# suite in `internal/admin` exercises a *copy* of that adapter, which proves the domain and proves
+# nothing about the one the running service registers. This section drives the built binary, so the
+# adapter under test is the one that ships.
+#
+# It is also where the two credential systems are shown apart: the decision is reachable on an
+# administrator session and on nothing else, which is the claim `cmd/api/routes_profiles.go` made in
+# a comment before either endpoint existed.
+#
+# # The queue is a shared, never-reset table, so every assertion is fenced by id or by clock
+#
+# `make verify` runs against a database that is not reset between runs, and **every provider ever
+# registered by any section of any run is on the Pending queue** — SHIP-81a gives one a record at
+# registration. So a count would be meaningless and "the first page" would be whatever history left
+# there. The three providers below are backdated to 1990, which puts them at the head of an
+# oldest-first queue no matter how much precedes them, and every other check names an identifier.
+#
+# **The mobile prefix is 04197 and 04198**, which are this section's; 04190…04196 are taken by the
+# sections above (see the block at the head of this file).
+
+ticket "SHIP-153  pending provider verifications are listed oldest first"
+
+admin_clear_limits
+
+# A moderator and a support administrator of this section's own, rather than the ones the SHIP-160
+# section signed in: `verifications.read` and `verifications.decide` split across those two roles is
+# exactly what this section is about, and a token borrowed from another section is one another
+# section can revoke.
+verif_mod_email="verify-admin-verif-mod-$$@example.com"
+verif_mod_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$verif_mod_email', 'Verify Reviewer', '$admin_fixture_hash', 'moderator')
+   returning id;")"
+[[ -n "$verif_mod_id" ]] || fail "the reviewing moderator could not be created"
+
+status="$(admin_signin "verify-adm153-modin-$$" "$verif_mod_email" "$admin_password" verif-mod)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-mod.json"; fail "the reviewing moderator could not sign in ($status)"; }
+verif_mod_token="$(json "$WORKDIR/admin-verif-mod.json" '["token"]')"
+
+verif_sup_email="verify-admin-verif-sup-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$verif_sup_email', 'Verify Looker', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the support administrator could not be created"
+status="$(admin_signin "verify-adm153-supin-$$" "$verif_sup_email" "$admin_password" verif-sup)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-sup.json"; fail "the support administrator could not sign in ($status)"; }
+verif_sup_token="$(json "$WORKDIR/admin-verif-sup.json" '["token"]')"
+
+# verif_provider <suffix> <name> — a registered provider, answering with its id.
+#
+# Registered through the API rather than inserted, because `000200`'s trigger firing on a real
+# registration is half of what makes the queue non-empty at all.
+verif_provider() {
+  local out="$WORKDIR/verif-provider-$1.json"
+  local code
+  code="$(post_json "verify-adm153-reg-$1-$$" /v1/auth/register \
+    "{\"name\":\"$2\",\"email\":\"verify-verif-$1-$$@example.com\",\"phone\":\"0419$3$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+    "$out")"
+  [[ "$code" == "201" ]] || { cat "$out"; fail "could not register the provider $1: $code"; }
+  json "$out" '["id"]'
+}
+
+verif_first="$(verif_provider first "Ngaire Tuiavii" 7)"
+verif_second="$(verif_provider second "Boadicea Kellsworth" 8)"
+
+# A customer, which must never appear on a queue of providers — most accounts on this platform are
+# customers, and a queue holding them is a queue of people nobody will ever review.
+status="$(post_json "verify-adm153-cust-$$" /v1/auth/register \
+  "{\"name\":\"Verify Harness\",\"email\":\"verify-verif-cust-$$@example.com\",\"phone\":\"04197$$1\",\"password\":\"correct-horse-battery-staple\",\"role\":\"customer\"}" \
+  "$WORKDIR/verif-customer.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/verif-customer.json"; fail "could not register the verification customer: $status"; }
+verif_customer_id="$(json "$WORKDIR/verif-customer.json" '["id"]')"
+
+# The fence. Backdated to 1990 in a known order, so these two are the head of an oldest-first queue
+# whatever else the database is carrying — and deliberately backdated in the *reverse* of the order
+# they were registered, so a queue reading the insertion sequence rather than the submission clock
+# fails here rather than passing by accident.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 >/dev/null <<SQL
+update provider_verifications set created_at = timestamptz '1990-01-02 00:00:00Z' where provider_id = '$verif_second';
+update provider_verifications set created_at = timestamptz '1990-01-01 00:00:00Z' where provider_id = '$verif_first';
+SQL
+
+# verif_queue <state> <token> <name> [extra] — one read of the queue, answering with its status.
+verif_queue() {
+  admin_get "/v1/admin/verifications?state=$1${4:+&$4}" "$2" "$3"
+}
+
+# verif_at <name> <index> — the provider id at that position on the page.
+verif_at() {
+  python3 - "$WORKDIR/admin-$1.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+rows = page.get("data") or []
+index = int(sys.argv[2])
+print(rows[index]["provider_id"] if index < len(rows) else "")
+PY
+}
+
+# verif_carries <name> <provider-id> — 1 when the provider is on the page, 0 when not.
+verif_carries() {
+  python3 - "$WORKDIR/admin-$1.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for e in (page.get("data") or []) if e["provider_id"] == sys.argv[2]))
+PY
+}
+
+status="$(curl -s -o "$WORKDIR/verif-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/admin/verifications?state=Pending")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/verif-anon.json"; fail "the queue answered $status without a credential, want 401"; }
+ok "the queue cannot be read without an administrator session"
+
+status="$(verif_queue Pending "$verif_sup_token" verif-sup-queue "limit=2")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-sup-queue.json"; fail "a support administrator could not read the queue: $status"; }
+[[ "$(verif_at verif-sup-queue 0)" == "$verif_first" ]] \
+  || { cat "$WORKDIR/admin-verif-sup-queue.json"; fail "the first entry is not the longest-waiting provider"; }
+[[ "$(verif_at verif-sup-queue 1)" == "$verif_second" ]] \
+  || { cat "$WORKDIR/admin-verif-sup-queue.json"; fail "the second entry is not the next-longest-waiting provider"; }
+ok "pending providers are listed oldest first, and a support administrator may read them — looking is what the least-privileged role exists to be able to do"
+
+[[ "$(verif_carries verif-sup-queue "$verif_customer_id")" == "0" ]] \
+  || fail "a customer is on the provider verification queue"
+status="$(verif_queue Pending "$verif_mod_token" verif-wide "limit=100")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-wide.json"; fail "the queue returned $status"; }
+[[ "$(verif_carries verif-wide "$verif_customer_id")" == "0" ]] \
+  || fail "a customer appears on a wider page of the provider verification queue"
+ok "and a customer is on neither page — the record is a provider's, and most accounts here are not"
+
+# What the entry carries, and the closed key set that is where a budget would arrive. Checked as a
+# key set rather than by searching for the word: SHIP-83 established that a spelling-based guard
+# misses a field named anything at all.
+python3 - "$WORKDIR/admin-verif-sup-queue.json" "$verif_first" <<'PY' || fail "the queue entry shape is wrong"
+import json, sys
+page = json.load(open(sys.argv[1]))
+entry = next(e for e in page["data"] if e["provider_id"] == sys.argv[2])
+allowed = {"provider_id", "name", "email", "phone", "state", "submitted_at"}
+extra = set(entry) - allowed
+missing = allowed - set(entry)
+if extra:
+    print("the entry carries", sorted(extra))
+    sys.exit(1)
+if missing:
+    print("the entry is missing", sorted(missing))
+    sys.exit(1)
+if entry["name"] != "Ngaire Tuiavii":
+    print("the entry does not name the provider:", entry["name"])
+    sys.exit(1)
+if entry["state"] != "Pending":
+    print("a Pending queue entry reads", entry["state"])
+    sys.exit(1)
+PY
+ok "an entry names who the provider is and carries nothing commercial — six keys, and no shape to put a budget in"
+
+status="$(verif_queue Approved "$verif_mod_token" verif-badstate)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/admin-verif-badstate.json"; fail "an outcome Docs 04 does not have returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-verif-badstate.json")" == *'"state"'* ]] \
+  || { cat "$WORKDIR/admin-verif-badstate.json"; fail "the refusal does not name the field"; }
+status="$(admin_get "/v1/admin/verifications" "$verif_mod_token" verif-nostate)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/admin-verif-nostate.json"; fail "a queue with no state returned $status, want 422"; }
+ok "a state the document does not have, and no state at all, are both refused — an ignored filter answers an empty page, and an empty review queue is what 'nobody is waiting' looks like"
+
+admin_clear_limits
+
+# ==========================================================================================
+ticket "SHIP-154  a reviewer records an outcome with a reason, and the audit entry commits with it"
+
+admin_clear_limits
+
+# verif_decide <token> <key> <provider> <body> <name> — one decision, answering with its status.
+verif_decide() {
+  curl -s -X POST -o "$WORKDIR/verif-dec-$5.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$4" \
+    "http://localhost:$VERIFY_PORT/v1/admin/verifications/$3/decision"
+}
+
+verif_state() {
+  "$PSQL" "$DATABASE_URL" -tAc "select state from provider_verifications where provider_id = '$1';"
+}
+
+verif_reason="Licence, registration, insurance and ABN evidence all current and matching the account."
+
+# --- the permission, before anything succeeds -----------------------------------------------------
+
+status="$(verif_decide "$verif_sup_token" "verify-adm154-sup-$$" "$verif_first" \
+  "{\"state\":\"Verified\",\"reason\":\"$verif_reason\"}" sup)"
+[[ "$status" == "403" ]] || { cat "$WORKDIR/verif-dec-sup.json"; fail "a support administrator decided a verification and got $status, want 403"; }
+[[ "$(verif_state "$verif_first")" == "Pending" ]] || fail "a refused decision moved the provider anyway"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from provider_verification_decisions where provider_id = '$verif_first';")" == "0" ]] \
+  || fail "a refused decision wrote into the evidence trail"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log where target_id = '$verif_first';")" == "0" ]] \
+  || fail "a refused decision wrote an audit entry, in a table nothing can correct"
+ok "a support administrator may read the queue and may not decide what is in it — Docs 04 §9's least privilege as two permissions on two endpoints"
+
+# --- a reason that records nothing, and an outcome the document does not have -----------------------
+
+status="$(verif_decide "$verif_mod_token" "verify-adm154-noreason-$$" "$verif_first" \
+  '{"state":"Verified","reason":"ok"}' noreason)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/verif-dec-noreason.json"; fail "a reason too short to record anything returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/verif-dec-noreason.json")" == *'"reason"'* ]] \
+  || { cat "$WORKDIR/verif-dec-noreason.json"; fail "the refusal does not name the field"; }
+
+status="$(verif_decide "$verif_mod_token" "verify-adm154-badstate-$$" "$verif_first" \
+  "{\"state\":\"Approved\",\"reason\":\"$verif_reason\"}" badstate)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/verif-dec-badstate.json"; fail "an outcome Docs 04 does not have returned $status, want 422"; }
+for outcome in Pending Verified Restricted Rejected Suspended; do
+  grep -q "$outcome" "$WORKDIR/verif-dec-badstate.json" \
+    || { cat "$WORKDIR/verif-dec-badstate.json"; fail "the refusal does not offer $outcome as a choice"; }
+done
+ok "a reason that records nothing is refused, and an unknown outcome is refused with Docs 04 §4's five named — the list comes from the domain that owns it, not from a copy in the console"
+
+# --- the decision itself, and the two tables it writes ----------------------------------------------
+
+status="$(verif_decide "$verif_mod_token" "verify-adm154-verify-$$" "$verif_first" \
+  "{\"state\":\"Verified\",\"reason\":\"$verif_reason\"}" verify)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/verif-dec-verify.json"; fail "the decision returned $status, want 200"; }
+[[ "$(json "$WORKDIR/verif-dec-verify.json" '["from"]')" == "Pending" ]] \
+  || { cat "$WORKDIR/verif-dec-verify.json"; fail "the response does not say what the provider held before"; }
+[[ "$(json "$WORKDIR/verif-dec-verify.json" '["to"]')" == "Verified" ]] \
+  || { cat "$WORKDIR/verif-dec-verify.json"; fail "the response does not say what the provider holds now"; }
+[[ "$(verif_state "$verif_first")" == "Verified" ]] || fail "the provider is not Verified"
+ok "a moderator records an outcome and the response carries both ends — one endpoint serves five outcomes, so a console shown only the new one cannot tell a tightening from a loosening"
+
+# The provider's evidence trail (Docs 04 §1), which is the table the review has to be reconstructible
+# from years later.
+trail="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select from_state || ' ' || to_state || ' ' || actor_type || ' ' || (actor_id = '$verif_mod_id')::text
+     from provider_verification_decisions where provider_id = '$verif_first';")"
+[[ "$trail" == "Pending Verified admin true" ]] \
+  || fail "the recorded decision is '$trail', want 'Pending Verified admin true'"
+
+# The administrator's accountability record (Docs 04 §9), which is a different table for a different
+# reader — and the same reason written into both, deliberately.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$verif_first' and target_type = 'user'
+      and action = 'verification.decided' and actor_id = '$verif_mod_id'
+      and reason = '$verif_reason'
+      and metadata->>'from' = 'Pending' and metadata->>'to' = 'Verified';")" == "1" ]] \
+  || fail "the decision wrote no audit entry carrying the administrator, the reason and both ends"
+ok "the decision is in two tables — the provider's evidence trail and the administrator's audit entry — and the reason is in both, because a reader of either should not have to find the other"
+
+# --- the queue moves, which is what makes it a queue -------------------------------------------------
+
+status="$(verif_queue Pending "$verif_mod_token" verif-after "limit=2")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-after.json"; fail "the queue returned $status"; }
+[[ "$(verif_carries verif-after "$verif_first")" == "0" ]] \
+  || { cat "$WORKDIR/admin-verif-after.json"; fail "a decided provider is still on the Pending queue"; }
+[[ "$(verif_at verif-after 0)" == "$verif_second" ]] \
+  || { cat "$WORKDIR/admin-verif-after.json"; fail "the next-longest-waiting provider did not move to the head of the queue"; }
+
+status="$(verif_queue Verified "$verif_mod_token" verif-verified "limit=100")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-verif-verified.json"; fail "the Verified queue returned $status"; }
+[[ "$(verif_carries verif-verified "$verif_first")" == "1" ]] \
+  || fail "a verified provider is on no queue at all — Docs 04 §5's first queue is new *or changed* submissions"
+ok "the decided provider leaves the Pending queue and is findable on the one for the outcome they moved to"
+
+# --- what the provider is told, which is the round trip the whole ticket exists for -------------------
+
+verif_first_token="$(mint_token "$verif_first")"
+status="$(curl -s -o "$WORKDIR/verif-provider-read.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $verif_first_token" \
+  "http://localhost:$VERIFY_PORT/v1/provider/verification")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/verif-provider-read.json"; fail "the provider could not read their own record: $status"; }
+[[ "$(json "$WORKDIR/verif-provider-read.json" '["state"]')" == "Verified" ]] \
+  || { cat "$WORKDIR/verif-provider-read.json"; fail "the provider does not read Verified"; }
+grep -q "matching the account" "$WORKDIR/verif-provider-read.json" \
+  || { cat "$WORKDIR/verif-provider-read.json"; fail "the reason did not reach the provider"; }
+for disclosure in admin_id decided_by reviewer administrator "$verif_mod_id" "$verif_mod_email"; do
+  grep -qi -- "$disclosure" "$WORKDIR/verif-provider-read.json" \
+    && { cat "$WORKDIR/verif-provider-read.json"; fail "the provider's record discloses '$disclosure'"; }
+done
+ok "an administrator decides and the provider reads the outcome and the reason — and never who decided it, which is what keeps a moderation decision from becoming a personal one"
+
+# --- a decision that changes nothing, and one on an account that has no record ------------------------
+
+status="$(verif_decide "$verif_mod_token" "verify-adm154-noop-$$" "$verif_first" \
+  "{\"state\":\"Verified\",\"reason\":\"Looked at it again and left it exactly as it was.\"}" noop)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/verif-dec-noop.json"; fail "re-deciding the outcome already held returned $status, want 409"; }
+[[ "$(cat "$WORKDIR/verif-dec-noop.json")" == *'admin_verification_unchanged'* ]] \
+  || { cat "$WORKDIR/verif-dec-noop.json"; fail "the refusal does not carry the code a console branches on"; }
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from provider_verification_decisions where provider_id = '$verif_first';")" == "1" ]] \
+  || fail "a decision that changed nothing was recorded anyway"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log where target_id = '$verif_first';")" == "1" ]] \
+  || fail "a refused decision wrote a second audit entry, in a table whose value is that everything in it happened"
+ok "deciding the outcome a provider already holds is refused rather than recorded — on a queue two moderators are reading, that is the answer the second one gets"
+
+status="$(verif_decide "$verif_mod_token" "verify-adm154-cust-$$" "$verif_customer_id" \
+  "{\"state\":\"Verified\",\"reason\":\"$verif_reason\"}" cust)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/verif-dec-cust.json"; fail "deciding a customer's verification returned $status, want 404"; }
+ok "an account with no verification record is a plain 404 — the caller is an administrator, and unlike dispute intake nothing is being kept from them"
+
+# --- the second half of Docs 04 §4's vocabulary, and that any outcome may follow any other -----------
+#
+# Docs/04 §4 defines no transition table and the platform enforces none: a Suspended provider is
+# reinstated, a Rejected one is Restricted after clarification. Four moves on one provider is the
+# demonstration, and the trail keeps every one of them.
+
+verif_step() {
+  local code
+  code="$(verif_decide "$verif_mod_token" "verify-adm154-$3-$$" "$verif_second" \
+    "{\"state\":\"$1\",\"reason\":\"$2\"}" "$3")"
+  [[ "$code" == "200" ]] || { cat "$WORKDIR/verif-dec-$3.json"; fail "deciding $1 returned $code"; }
+  [[ "$(verif_state "$verif_second")" == "$1" ]] || fail "the provider is not $1"
+}
+
+verif_step Restricted "Insurance certificate expires this month; bidding paused until it is renewed." restrict
+verif_step Rejected "The licence supplied is in a different name from the account holder's." reject
+verif_step Suspended "Three unresolved safety reports from customers over one fortnight." suspend
+verif_step Verified "Reports resolved and documents re-supplied; standing restored after review." reinstate
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from provider_verification_decisions where provider_id = '$verif_second';")" == "4" ]] \
+  || fail "the evidence trail does not hold all four decisions"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log where target_id = '$verif_second' and action = 'verification.decided';")" == "4" ]] \
+  || fail "the audit trail does not hold all four decisions"
+ok "all five of Docs 04 §4's outcomes are reachable and any may follow any other, including a reinstatement — and both trails keep every one of the four moves"
+
+# --- there is exactly one route to this act, and it is on the administrator credential ---------------
+#
+# The claim `cmd/api/routes_profiles.go` made in a comment before either endpoint existed: a route to
+# a decision on the *user* credential would be a second way to reach the same act on the wrong one,
+# which is what Docs/04 §9's least-privilege requirement exists to prevent.
+
+status="$(curl -s -X POST -o "$WORKDIR/verif-user-route.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $verif_first_token" -H "Idempotency-Key: verify-adm154-userroute-$$" \
+  -H 'Content-Type: application/json' -d '{"state":"Verified","reason":"I decided this about myself."}' \
+  "http://localhost:$VERIFY_PORT/v1/provider/verification")"
+[[ "$status" == "405" ]] \
+  || { cat "$WORKDIR/verif-user-route.json"; fail "POST /v1/provider/verification answered $status, want 405 — the provider's own record is read-only"; }
+
+status="$(verif_decide "$verif_first_token" "verify-adm154-usertoken-$$" "$verif_second" \
+  "{\"state\":\"Verified\",\"reason\":\"$verif_reason\"}" usertoken)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/verif-dec-usertoken.json"; fail "a user token reached the decision endpoint and got $status, want 401"; }
+ok "a provider cannot decide their own standing and a user token cannot reach the administrator's endpoint — one act, one credential, one route"
+
+admin_clear_limits

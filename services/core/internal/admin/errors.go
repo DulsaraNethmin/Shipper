@@ -486,3 +486,67 @@ var (
 		"This account already has a suspension waiting for a second administrator. Approve the "+
 			"existing request rather than making another.")
 )
+
+// --- SHIP-153, SHIP-154: the verification queue and its decision ---------------------------------
+
+// The sentinels the verification console raises.
+//
+// Four, and none of them is `profiles`'. That domain has its own — `ErrNoSuchProvider`,
+// `ErrAlreadyInState` and the rest — and this package may not import it to match them, which is why
+// [ProviderVerifications] answers refusals as a [VerificationMove] and these are what the outcome is
+// turned into. Docs/10 §2.1 keeps the sentinels beside each other so that a caller deciding what to
+// do about a failure has one file to read.
+var (
+	// ErrVerificationNotFound means there is no verification record for that identifier.
+	//
+	// One sentinel for two conditions — no such account, and an account that is not a provider —
+	// because `000200` gives every provider a record at registration and the two are
+	// indistinguishable from the record's side. **Not a disclosure decision** (see
+	// [VerificationProviderNotFound]): the caller holds a permission over verifications and
+	// nothing is being kept from them.
+	ErrVerificationNotFound = errors.New("admin: no such provider verification record")
+
+	// ErrVerificationUnchanged means the provider already holds that outcome.
+	//
+	// Refused rather than recorded, which is [ErrStandingUnchanged]'s position applied to a
+	// second vocabulary: an entry saying "changed from Verified to Verified" is noise in the one
+	// table whose value is that everything in it happened, and on a queue two moderators are
+	// reading the console's right response is to reload.
+	ErrVerificationUnchanged = errors.New("admin: that provider already holds that verification outcome")
+
+	// ErrVerificationStateUnrecognised means the outcome asked for is not one of Docs/04 §4's.
+	//
+	// Raised by the queue as well as by the decision, and refused in both rather than ignored: an
+	// ignored filter answers an empty page, and an empty review queue is what "nobody is waiting"
+	// looks like to somebody who mistyped a state.
+	ErrVerificationStateUnrecognised = errors.New("admin: that is not a verification outcome")
+
+	// ErrVerificationMoveUnrecognised means the port answered with something that is not an
+	// outcome.
+	//
+	// [VerificationMoveUnrecognised]'s counterpart, and it exists for [ErrJobMoveUnrecognised]'s
+	// reason: a half-written adapter returning the zero value must not be read as success. It is
+	// a wiring fault rather than anything a caller did, so it stays an opaque 500 with the cause
+	// logged.
+	ErrVerificationMoveUnrecognised = errors.New("admin: the verification port answered with no outcome")
+)
+
+// The error codes the verification console answers with (SHIP-153, SHIP-154).
+//
+// **One**, and the restraint is the same judgement errors.go applies throughout: everything else
+// these two endpoints can refuse is already served by a code that exists — a state Docs/04 §4 does
+// not have is `validation_failed` naming the field, a reason too short to record anything is the
+// same, a provider who does not exist is `not_found`, and a permission the role lacks is
+// `admin_permission_denied`. A domain code earns its place only where a client would otherwise have
+// to parse a message to know what to do next.
+var (
+	// CodeVerificationUnchanged is returned when the provider already holds that outcome.
+	//
+	// 409, and a distinct code because an administrator seeing it has learned something specific:
+	// somebody else has already decided this one, and the trail will say who. It is the ordinary
+	// outcome of two moderators working the same queue, which is why it is worth telling apart
+	// from a validation failure at all.
+	CodeVerificationUnchanged = httpx.RegisterCode("admin_verification_unchanged",
+		"This provider already has that verification outcome. Reload the queue — another "+
+			"administrator may have decided it already, and the audit trail will say who.")
+)

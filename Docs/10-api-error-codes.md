@@ -62,6 +62,7 @@ them where the call is made, beside the thing the user was trying to do.
 | `admin_suspension_review_outstanding` | This account already has a suspension waiting for a second administrator. Approve the existing request rather than making another. |
 | `admin_suspension_review_settled` | That suspension review has already been settled. Reload the queue — another administrator may have approved it. |
 | `admin_user_standing_unchanged` | This account already has that standing. Reload it — another administrator may have changed it already, and the audit trail will say who. |
+| `admin_verification_unchanged` | This provider already has that verification outcome. Reload the queue — another administrator may have decided it already, and the audit trail will say who. |
 | `bidding_already_bid` | You already have a live offer on this job. Revise or withdraw it rather than placing a second. |
 | `bidding_bid_accepted` | That offer has been accepted. An accepted bid can be neither revised nor withdrawn. |
 | `bidding_bid_closed` | That offer is no longer live, so it can be neither changed nor answered. |

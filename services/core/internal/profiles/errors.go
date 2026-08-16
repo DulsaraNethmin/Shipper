@@ -42,6 +42,15 @@ var (
 	// layer underneath.
 	ErrActorNotRecorded = errors.New("profiles: a decision must record who took it")
 
+	// ErrStateUnrecognised means a queue was asked for a state Docs/04 §4 does not have
+	// (SHIP-153).
+	//
+	// Refused rather than answered with an empty page. An ignored filter answers "nobody", which
+	// on a review queue is indistinguishable from "nobody is waiting" — and the cost of that
+	// confusion is a provider who never gets looked at. `admin.Users.Search` takes the same
+	// position about its standing filter for the same reason.
+	ErrStateUnrecognised = errors.New("profiles: that is not a verification outcome")
+
 	// ErrNotInTransaction means a decision was attempted outside a transaction.
 	//
 	// The database refuses it too — `provider_verification_decide` sets a transaction-local variable

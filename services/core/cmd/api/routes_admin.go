@@ -14,6 +14,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/profiles"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 )
 
@@ -301,6 +302,60 @@ func init() {
 		},
 
 		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/verifications",
+			Group:   GroupV1,
+
+			// Docs/04 §5's **first** queue (SHIP-153), and the endpoint that ends the state
+			// SHIP-81a left the marketplace in: every provider backfilled `Pending`, and no
+			// way for anybody to see who was waiting.
+			//
+			// RequireAdmin is the credential; `verifications.read` is the permission, checked
+			// in the handler (SHIP-148). Every role holds it, including `support` — Docs/01
+			// §4.6 lists "review provider verification status" second, and looking is what the
+			// least-privileged role exists to be able to do.
+			//
+			// Under /admin and not under /provider. `GET /v1/provider/verification` is the
+			// provider's own record, scoped to the caller by construction and with no
+			// identifier anywhere in it; this is every provider's, scoped to nothing, which is
+			// a different resource wearing the same noun. routes_profiles.go's header settled
+			// that before either endpoint existed.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).VerificationQueue() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/admin/verifications/{id}/decision",
+			Group:   GroupV1,
+
+			// SHIP-154, and the act `profiles.Service.Decide` was exported and left unrouted
+			// for. **This is the only route to it in the service, and that is the point**:
+			// routes_profiles.go declines to put one on the user credential because Docs/04
+			// §9's least-privilege requirement makes a second way to reach the same act on the
+			// wrong credential the thing to avoid.
+			//
+			// `verifications.decide` is the permission, which `moderator` and `owner` hold and
+			// `support` does not — the same split `jobs.read` against `jobs.unpublish` makes.
+			//
+			// `{id}` is the **provider's account identifier**. There is one verification record
+			// per provider and `provider_verifications.provider_id` is its primary key, so
+			// there is no second identifier to name — `000200` records why a separate `id`
+			// column would only make "which of these is current" a question.
+			//
+			// Five segments, which is safe: the four-segment collision SHIP-83a cleared was
+			// `GET /v1/jobs/{id}/<literal>`, this is a POST under /admin, and it has no literal
+			// sibling at its depth.
+			//
+			// A named sub-resource rather than PATCH on the record: the state is not a settable
+			// field — `provider_verification_change_is_guarded` refuses any UPDATE that no
+			// decision describes — so a verb that reads as "edit these columns" would describe
+			// the opposite of what happens.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).DecideVerification() },
+		},
+
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
@@ -452,6 +507,22 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin notes: " + err.Error())
 	}
 
+	// SHIP-153, SHIP-154. The five outcomes are supplied rather than copied, exactly as the job
+	// statuses are above: `admin` may not import `profiles`, and the alternative to passing them
+	// here is a hand-written five-value list in that package shadowing one already held to
+	// `ck_provider_verifications_state` by a test in both directions. This is the composition root,
+	// where both vocabularies are visible.
+	verificationStates := make([]string, 0, len(profiles.States))
+	for _, s := range profiles.States {
+		verificationStates = append(verificationStates, s.String())
+	}
+
+	verifications, err := admin.NewVerifications(
+		providerVerifications{svc: profiles.NewService(d.Clock)}, verificationStates, auditor, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin verification console: " + err.Error())
+	}
+
 	handler, err := admin.NewHandler(admin.HandlerServices{
 		Disputes:      svc,
 		Credentials:   creds,
@@ -463,6 +534,7 @@ func adminHandler(d Deps) *admin.Handler {
 		Enforcement:   enforcement,
 		Notes:         notes,
 		Suspensions:   suspensions,
+		Verifications: verifications,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
@@ -676,11 +748,12 @@ func (jobPartiesLookup) PartyOn(
 // in the build where that can be established — admin names neither type and neither type names
 // admin, so nothing else links them.
 var (
-	_ admin.Jobs              = disputeLifecycle{}
-	_ admin.JobParties        = jobPartiesLookup{}
-	_ admin.ExceptionQueue    = exceptionQueueLookup{}
-	_ admin.CancellationQueue = cancellationQueueLookup{}
-	_ admin.JobDirectory      = jobDirectory{}
+	_ admin.Jobs                  = disputeLifecycle{}
+	_ admin.JobParties            = jobPartiesLookup{}
+	_ admin.ExceptionQueue        = exceptionQueueLookup{}
+	_ admin.CancellationQueue     = cancellationQueueLookup{}
+	_ admin.JobDirectory          = jobDirectory{}
+	_ admin.ProviderVerifications = providerVerifications{}
 )
 
 // exceptionQueueLookup implements admin.ExceptionQueue over `delivery`s and `jobs`' rows
@@ -1306,4 +1379,126 @@ func scanAdminJob(row interface{ Scan(...any) error }) (admin.JobRecord, error) 
 		j.ExpiresAt = *expiresAt
 	}
 	return j, nil
+}
+
+// --- SHIP-153, SHIP-154: the provider verification queue and its decision -------------------------
+
+// providerVerifications implements admin.ProviderVerifications over `internal/profiles`.
+//
+// # An adapter over a domain service, not a statement written here
+//
+// This is disputeLifecycle's shape rather than jobDirectory's, and the line between them is one
+// postgres_users.go already drew: a query spanning **two other domains'** tables belongs in the
+// composition root, because that is the only place both are visible; a query over one domain's own
+// tables belongs to that domain. `provider_verifications` and `provider_verification_decisions` are
+// `internal/profiles`', and the reads and the transition are methods on its service.
+//
+// What lives here is the translation, and there are three of them:
+//
+//   - **the page shapes.** `profiles.QueueEntry` and `admin.VerificationEntry` are two packages'
+//     own types with the same fields, and neither may name the other's — the boundary lint refuses
+//     both directions. Go satisfies the interface structurally, so this file is the only thing in
+//     the build that knows the two correspond.
+//   - **the refusals.** `admin` cannot call errors.Is against `profiles`' sentinels, so
+//     ErrNoSuchProvider and ErrAlreadyInState become an admin.VerificationMove with a nil error.
+//     Everything else stays an error, because a failing database is not an answer.
+//   - **the actor.** `profiles.Actor` distinguishes an administrator from the platform acting as
+//     itself, and `admin` supplies only the first — SHIP-159's expiry sweep is what will supply the
+//     second, from wherever it runs.
+//
+// # Why the domain service is built here rather than shared with profilesHandler
+//
+// `profiles.NewService` takes the clock and holds nothing else: no pool, no connection, no state. So
+// a second instance is a struct with one field, and passing one between two route files would be a
+// shared surface built for no gain — profilesHandler builds its own for exactly the same reason.
+type providerVerifications struct {
+	svc *profiles.Service
+}
+
+// VerificationsAwaitingReview is one page of the queue, oldest first.
+//
+// The Runner is the caller's — a pool, because a queue is a read that owns no invariant and opens no
+// transaction (admin.Verifications.AwaitingReview records why).
+//
+// An unrecognised state cannot reach here: admin.Verifications validates against the list this file
+// handed it, built from profiles.States. The domain refuses one anyway, which is the layer that
+// survives somebody calling the service directly.
+func (p providerVerifications) VerificationsAwaitingReview(
+	ctx context.Context,
+	r db.Runner,
+	q admin.VerificationQuery,
+) ([]admin.VerificationEntry, error) {
+
+	found, err := p.svc.AwaitingReview(ctx, r, profiles.QueueQuery{
+		State: profiles.State(q.State),
+		Limit: q.Limit,
+		After: profiles.QueueCursor{
+			SubmittedAt: q.After.SubmittedAt,
+			ProviderID:  q.After.ProviderID,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the %s verification queue: %w", q.State, err)
+	}
+
+	out := make([]admin.VerificationEntry, 0, len(found))
+	for _, e := range found {
+		out = append(out, admin.VerificationEntry{
+			ProviderID:  e.ProviderID,
+			Name:        e.Name,
+			Email:       e.Email,
+			Phone:       e.Phone,
+			State:       string(e.State),
+			SubmittedAt: e.SubmittedAt,
+		})
+	}
+	return out, nil
+}
+
+// DecideVerification runs `profiles`' one guarded transition inside the caller's transaction.
+//
+// # The Runner must be a transaction and this method does not check that
+//
+// `profiles.Service.Decide` refuses a pool with its own sentinel, and `provider_verification_decide`
+// would refuse one underneath that — the transaction-local setting the trigger reads lasts only for
+// the statement that set it outside a transaction. A third check here would be a third opinion about
+// a rule two layers already hold. admin.Verifications.Decide opens the transaction, which is where
+// the audit entry joins it.
+//
+// # A refusal is an outcome and a failure is an error
+//
+// The same split disputeLifecycle takes. profiles.ErrNoSuchProvider and profiles.ErrNotProvider are
+// one outcome, because `000200` gives every provider a record at registration and an account with no
+// record is either not a provider or not an account — indistinguishable from the record's side, and
+// the same answer to whoever asked.
+//
+// The validation failures — a state Docs/04 §4 does not have, a reason that is blank or a novel —
+// stay errors deliberately: `admin` has already refused both a layer earlier against a stricter
+// bound, so one arriving here is a defect in this translation rather than something a caller did.
+func (p providerVerifications) DecideVerification(
+	ctx context.Context,
+	r db.Runner,
+	d admin.VerificationDecision,
+) (admin.VerificationMove, admin.VerificationChange, error) {
+
+	decision, err := p.svc.Decide(ctx, r, d.ProviderID, profiles.State(d.To),
+		profiles.Actor{Type: profiles.ActorAdmin, ID: d.ActorID}, d.Reason)
+
+	switch {
+	case err == nil:
+		return admin.VerificationDecided, admin.VerificationChange{
+			ProviderID: d.ProviderID,
+			From:       string(decision.From),
+			To:         string(decision.Verification.State),
+		}, nil
+
+	case errors.Is(err, profiles.ErrNoSuchProvider), errors.Is(err, profiles.ErrNotProvider):
+		return admin.VerificationProviderNotFound, admin.VerificationChange{}, nil
+
+	case errors.Is(err, profiles.ErrAlreadyInState):
+		return admin.VerificationAlreadyInState, admin.VerificationChange{}, nil
+
+	default:
+		return admin.VerificationMoveUnrecognised, admin.VerificationChange{}, err
+	}
 }
