@@ -251,6 +251,28 @@ const (
 	// standing". The metadata names both administrators, because a two-person control that
 	// records one name has not recorded what happened.
 	AuditActionUserSuspensionApproved AuditAction = "user.suspension_approved"
+
+	// AuditActionVerificationDecided is a provider's verification standing being set (SHIP-154).
+	//
+	// **One action for all five of Docs/04 §4's outcomes**, and for the reason
+	// [AuditActionUserStandingChanged] is one for three: "what has happened to this provider's
+	// eligibility" is one question, and a reader filtering by action should get the whole history
+	// of it rather than having to know which of five verbs to ask for. Which way it moved is in
+	// the metadata, as `from` and `to`.
+	//
+	// **The target is the provider's `users` row rather than the verification record.** They are
+	// one-to-one — `provider_verifications.provider_id` is the primary key — so nothing is lost,
+	// and a support query asking "everything that happened to this account" returns the
+	// verification decisions beside the standing changes and the notes taken about it.
+	// [AuditActionNoteAdded] settled that reading first.
+	//
+	// **The same reason is written into two tables and that is deliberate**, exactly as it is for
+	// [AuditActionJobUnpublished]. `provider_verification_decisions` is the *provider's* evidence
+	// trail, which Docs/04 §1 requires and which the provider's own endpoint reads; `audit_log` is
+	// the *administrator's* accountability record, which Docs/04 §9's controls read. The two are
+	// joined by nothing but the provider identifier, and a reader of either should not have to
+	// find the other.
+	AuditActionVerificationDecided AuditAction = "verification.decided"
 )
 
 // AuditActions is the whole catalogue, in the order the constants declare it.
@@ -269,6 +291,7 @@ var AuditActions = []AuditAction{
 	AuditActionNoteAdded,
 	AuditActionUserSuspensionRequested,
 	AuditActionUserSuspensionApproved,
+	AuditActionVerificationDecided,
 }
 
 // Valid reports whether a is in the catalogue.

@@ -241,3 +241,51 @@ func TestACustomerIsNeverOnTheQueue(t *testing.T) {
 		}
 	}
 }
+
+// TestADecisionReportsBothEnds.
+//
+// SHIP-154 writes `from` and `to` into an audit entry, and the from-state has to be the one read
+// under the row lock rather than one the caller looked up beforehand — see [Decision]. This is the
+// half of [Service.Decide]'s answer that the [decide] helper unwraps away.
+func TestADecisionReportsBothEnds(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "pq-bothends@example.com", "+61400300012")
+	admin := newAdmin(t, pool, "pq-bothends-admin@example.com")
+
+	first, err := decided(t, pool, provider, StateVerified, Actor{Type: ActorAdmin, ID: admin},
+		"All four documents current.")
+	if err != nil {
+		t.Fatalf("verifying: %v", err)
+	}
+	if first.From != StatePending {
+		t.Errorf("the first decision reports moving from %q, want Pending", first.From)
+	}
+	if first.Verification.State != StateVerified {
+		t.Errorf("the first decision reports arriving at %q, want Verified", first.Verification.State)
+	}
+
+	second, err := decided(t, pool, provider, StateRestricted, Actor{Type: ActorAdmin, ID: admin},
+		"Insurance certificate expires this month; renew it.")
+	if err != nil {
+		t.Fatalf("restricting: %v", err)
+	}
+	if second.From != StateVerified {
+		t.Errorf("the second decision reports moving from %q, want Verified", second.From)
+	}
+	if second.Verification.State != StateRestricted {
+		t.Errorf("the second decision reports arriving at %q, want Restricted", second.Verification.State)
+	}
+
+	// And what the trail says, which is where the two ends have to agree with the decision row.
+	var from, to string
+	if err := pool.QueryRow(t.Context(),
+		`SELECT from_state, to_state FROM provider_verification_decisions
+		 WHERE provider_id = $1 ORDER BY decided_at DESC, id DESC LIMIT 1`, provider,
+	).Scan(&from, &to); err != nil {
+		t.Fatalf("reading the newest decision: %v", err)
+	}
+	if from != string(second.From) || to != string(second.Verification.State) {
+		t.Errorf("the recorded decision is %s → %s and the method reported %s → %s",
+			from, to, second.From, second.Verification.State)
+	}
+}

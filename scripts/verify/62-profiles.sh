@@ -62,13 +62,15 @@ prof_get() {
     "http://localhost:$VERIFY_PORT$2"
 }
 
-# prof_decide <user-id> <state> <reason> — the one guarded transition, called the only way anything
-# can call it.
+# prof_decide <user-id> <state> <reason> — the one guarded transition, called directly.
 #
-# There is no HTTP route to a decision and there deliberately is not: deciding somebody's standing is
-# an administrator's act on the administrator credential, and SHIP-153 and SHIP-154 are the endpoints.
-# Until those exist the platform's own function is what an administrator would be driving, so it is
-# what this harness drives.
+# **There is one HTTP route to a decision and it is not on this credential.**
+# `POST /v1/admin/verifications/{id}/decision` (SHIP-154) is an administrator's act on the
+# administrator credential, and it is demonstrated end to end in 90-admin.sh — including that a
+# provider holding their own token cannot reach it. This file has no administrator session and is
+# not the place to acquire one, so it drives the platform's own function, which is what that
+# endpoint calls underneath: `provider_verification_decide` is the single implementation of a
+# transition, and the domain, the console and this fixture are the same caller.
 prof_decide() {
   "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
     "select provider_verification_decide('$1', '$2', 'system', null, '$3');" >/dev/null

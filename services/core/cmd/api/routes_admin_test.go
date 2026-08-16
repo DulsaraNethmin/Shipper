@@ -68,6 +68,21 @@ var auditedAdminMutations = map[string]admin.AuditAction{
 	// `requested_by` is in the metadata. A control whose trail names one participant has not
 	// recorded what happened.
 	"POST /v1/admin/suspensions/{id}/approval": admin.AuditActionUserSuspensionApproved,
+
+	// SHIP-154. One action for all five of Docs/04 §4's outcomes, which is what this table's
+	// one-action-per-route rule requires and independently the right shape: "what has happened
+	// to this provider's eligibility" is one question, and a reader filtering by action should
+	// get the whole history rather than having to know which of five verbs to ask for.
+	//
+	// **The reason is written into two tables and neither is redundant.**
+	// `provider_verification_decisions` is the provider's evidence trail (Docs/04 §1) and this
+	// entry is the administrator's accountability record (Docs/04 §9) — the same split SHIP-160
+	// makes between `job_status_history` and `audit_log`.
+	//
+	// `GET /v1/admin/verifications` is not here and does not need to be: it is a read, and
+	// Docs/01 §5.1 asks for audit logs of **privileged actions**. An entry per queue load would
+	// bury the decisions in the reads.
+	"POST /v1/admin/verifications/{id}/decision": admin.AuditActionVerificationDecided,
 }
 
 // administrativeMutation reports whether this route is a state change an administrator makes.

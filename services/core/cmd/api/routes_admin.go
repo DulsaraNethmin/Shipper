@@ -326,6 +326,37 @@ func init() {
 
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/admin/verifications/{id}/decision",
+			Group:   GroupV1,
+
+			// SHIP-154, and the act `profiles.Service.Decide` was exported and left unrouted
+			// for. **This is the only route to it in the service, and that is the point**:
+			// routes_profiles.go declines to put one on the user credential because Docs/04
+			// §9's least-privilege requirement makes a second way to reach the same act on the
+			// wrong credential the thing to avoid.
+			//
+			// `verifications.decide` is the permission, which `moderator` and `owner` hold and
+			// `support` does not — the same split `jobs.read` against `jobs.unpublish` makes.
+			//
+			// `{id}` is the **provider's account identifier**. There is one verification record
+			// per provider and `provider_verifications.provider_id` is its primary key, so
+			// there is no second identifier to name — `000200` records why a separate `id`
+			// column would only make "which of these is current" a question.
+			//
+			// Five segments, which is safe: the four-segment collision SHIP-83a cleared was
+			// `GET /v1/jobs/{id}/<literal>`, this is a POST under /admin, and it has no literal
+			// sibling at its depth.
+			//
+			// A named sub-resource rather than PATCH on the record: the state is not a settable
+			// field — `provider_verification_change_is_guarded` refuses any UPDATE that no
+			// decision describes — so a verb that reads as "edit these columns" would describe
+			// the opposite of what happens.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).DecideVerification() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
 
@@ -1422,4 +1453,52 @@ func (p providerVerifications) VerificationsAwaitingReview(
 		})
 	}
 	return out, nil
+}
+
+// DecideVerification runs `profiles`' one guarded transition inside the caller's transaction.
+//
+// # The Runner must be a transaction and this method does not check that
+//
+// `profiles.Service.Decide` refuses a pool with its own sentinel, and `provider_verification_decide`
+// would refuse one underneath that — the transaction-local setting the trigger reads lasts only for
+// the statement that set it outside a transaction. A third check here would be a third opinion about
+// a rule two layers already hold. admin.Verifications.Decide opens the transaction, which is where
+// the audit entry joins it.
+//
+// # A refusal is an outcome and a failure is an error
+//
+// The same split disputeLifecycle takes. profiles.ErrNoSuchProvider and profiles.ErrNotProvider are
+// one outcome, because `000200` gives every provider a record at registration and an account with no
+// record is either not a provider or not an account — indistinguishable from the record's side, and
+// the same answer to whoever asked.
+//
+// The validation failures — a state Docs/04 §4 does not have, a reason that is blank or a novel —
+// stay errors deliberately: `admin` has already refused both a layer earlier against a stricter
+// bound, so one arriving here is a defect in this translation rather than something a caller did.
+func (p providerVerifications) DecideVerification(
+	ctx context.Context,
+	r db.Runner,
+	d admin.VerificationDecision,
+) (admin.VerificationMove, admin.VerificationChange, error) {
+
+	decision, err := p.svc.Decide(ctx, r, d.ProviderID, profiles.State(d.To),
+		profiles.Actor{Type: profiles.ActorAdmin, ID: d.ActorID}, d.Reason)
+
+	switch {
+	case err == nil:
+		return admin.VerificationDecided, admin.VerificationChange{
+			ProviderID: d.ProviderID,
+			From:       string(decision.From),
+			To:         string(decision.Verification.State),
+		}, nil
+
+	case errors.Is(err, profiles.ErrNoSuchProvider), errors.Is(err, profiles.ErrNotProvider):
+		return admin.VerificationProviderNotFound, admin.VerificationChange{}, nil
+
+	case errors.Is(err, profiles.ErrAlreadyInState):
+		return admin.VerificationAlreadyInState, admin.VerificationChange{}, nil
+
+	default:
+		return admin.VerificationMoveUnrecognised, admin.VerificationChange{}, err
+	}
 }

@@ -709,6 +709,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-78a** | M3 | Every one of `internal/fleet`'s eight service methods refuses a caller who is not a provider, with the sentinel `Add` and `Declare` already returned. **Docs/11 §9's oldest ownerless finding**, open since wave 5, and it was never a disclosure — each of the six that did not check scopes to the caller's own identifier, so a customer got an empty list or a 404 and never another provider's vehicle. What it was is a surface declining to *refuse*. `Service.Profile` reversed its own recorded position to take it — *see below* |
 | **SHIP-81a** | M3 | `Docs/04` §4's five outcomes exist as a record: `provider_verifications` and its append-only decision trail (`000200` — migration block 200–299's first table, owned by `internal/profiles`), `GET /v1/provider/verification`, and the eligibility predicate reading that record instead of its automated stand-in. **The guarded function is in the database rather than in Go** — `provider_verification_decide()` records the decision with its actor and reason, names it to a trigger through a transaction-local setting, then moves the state — so the domain, a `make verify` fixture and a psql prompt are the same caller; the jobs precedent puts the protocol in Go and this file already records what the hand-written copy of it cost. **Every provider has a row from registration and the existing ones are backfilled `Pending`**, which is the ticket rather than a detail: Pending is a state a provider is *in*, so SHIP-153 has somebody to list — and **every provider on the platform stops being eligible to bid** until somebody decides otherwise. `internal/fleet` imports nothing from `internal/profiles`; the seam is one `EXISTS` clause — *see below* |
 | **SHIP-153** | M6 | `GET /v1/admin/verifications` — Docs/04 §5's **first** moderation queue, and the read half of what ends the state SHIP-81a left the marketplace in. Oldest first, cursor paged on `(created_at, provider_id)`, and `state` is a **required** parameter rather than one defaulting to `Pending`: every provider has a record from registration, so an unfiltered request is the whole supply side wearing a queue's name, and a default would make the same URL mean two things depending on whether a console remembered to send one. The query lives in `internal/profiles`, which owns the tables; `internal/admin` declares a port and `cmd/api` supplies the adapter, so **no package imports another** — *see below* |
+| **SHIP-154** | M6 | `POST /v1/admin/verifications/{id}/decision` — the **only** route in the API that moves a verification state, and the act `profiles.Service.Decide` was exported and left unrouted for a whole wave. All five of Docs/04 §4's outcomes on one endpoint, any following any other, with a reason required in every direction including a reinstatement. **Four writes in one transaction** — the decision row, the transaction-local setting the trigger reads, the state change and the `audit_log` entry — so a provider's eligibility cannot move with nobody accountable for moving it. The evidence trail and the audit trail are two tables for two readers and carry the same reason deliberately, which is SHIP-160's arrangement. The mutation taking the entry out of the transaction is reported below with its verdict — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14138,59 +14139,107 @@ deliberately in the file where somebody reaching for a one-line fixture would wr
 #### Nothing was needed from `internal/config`
 
 
-### SHIP-153 — the review queue, and the state it exists to end
+### SHIP-153 and SHIP-154 — the queue and the decision, and the marketplace they switch back on
 
-**SHIP-81a left the platform with no provider eligible to bid and no way for anybody to see who was
-waiting.** Every provider was backfilled `Pending` — deliberately, because nobody had reviewed
-anyone's documents and `Docs/04` §1 requires that table be an evidence trail — and there was no
-screen anywhere that listed them. `GET /v1/admin/verifications` is that screen. Acting on what it
-shows is SHIP-154.
+The two rows are written together because the state they end is one state. **SHIP-81a left the
+platform with no provider eligible to bid and no way for anybody to change that.** Every provider was
+backfilled `Pending` — deliberately, because nobody had reviewed anyone's documents and `Docs/04` §1
+requires that table be an evidence trail — and `profiles.Service.Decide` was exported with no
+endpoint anywhere, because deciding somebody's standing is an administrator's act on the
+administrator credential. These two endpoints are the whole of the path back.
+
+#### The architecture was settled a wave before it was built, and this ticket did not re-decide it
+
+`cmd/api/routes_profiles.go`'s header said, before either endpoint existed, that the queue and the
+decision would be `/v1/admin` routes served by `internal/admin` "through a port it declares for
+itself", and that a route on the user credential would be "a second way to reach the same act, on the
+wrong credential". That is exactly what was built, and the last clause is now demonstrated rather than
+asserted: `POST /v1/provider/verification` answers **405**, and a user token on the administrator's
+endpoint answers **401**.
 
 #### Where the SQL lives, and the rule that decided it
 
-`admin/ports.go` declares `ProviderVerifications`; `cmd/api` supplies `providerVerifications`, an
-adapter over `profiles.Service`. **`internal/admin` imports nothing from `internal/profiles` and the
-reverse is also true**, which is what `cmd/api/routes_profiles.go`'s header said would happen before
-either endpoint existed.
+`admin/ports.go` declares `ProviderVerifications` with two methods; `cmd/api` supplies
+`providerVerifications`, an adapter over `profiles.Service`. **`internal/admin` imports nothing from
+`internal/profiles` and the reverse is also true.**
 
 This is `disputeLifecycle`'s shape rather than `jobDirectory`'s, and the line between them is one
 `postgres_users.go` had already drawn: a statement spanning **two other domains'** tables belongs in
 the composition root, because that is the only place both are visible, and a statement over one
 domain's own tables belongs to that domain. `provider_verifications` is `internal/profiles`', so the
-query is a method there and cmd/api holds a translation of the page shapes.
+queue query is a method there and cmd/api holds a translation — of the page shapes, of the refusals,
+and of the actor.
 
 **There is no copy of Docs/04 §4's five outcomes in `internal/admin`.** `cmd/api` passes
 `profiles.States` into `NewVerifications`, which is `JobConsole`'s arrangement and the newer of the
-two precedents in that package. `UserStanding` is the older one — a copy held to `ck_users_status`
-by a pairing test — and it works at the cost of a test somebody has to remember. The passed list
-costs nothing and cannot drift, and the refusal message a console shows is built from it, so the
-five names in a validation failure and the five the `CHECK` accepts are the same five by
-construction.
+two precedents in that package. `UserStanding` is the older one — a copy held to `ck_users_status` by
+a pairing test — and it works at the cost of a test somebody has to remember. The passed list costs
+nothing and cannot drift, and the validation message a console shows is built from it, so the five
+names in a refusal and the five the `CHECK` accepts are the same five by construction.
 
-#### `state` is required, and that is the decision most worth reading
+#### `state` is required on the queue, and that is the decision most worth reading
 
-The *Done when* is the Pending ones, so defaulting to `Pending` was available. It was rejected twice
-over: `Docs/04` §5's first queue is "new **or changed**" submissions, so four of the five outcomes
-are worth listing; and a default makes one URL mean two different things depending on whether the
-client remembered to send a parameter. An unrecognised state is **refused rather than ignored**,
-which matters more here than on the account search — an ignored filter answers an empty page, and an
-empty review queue is precisely what "nobody is waiting" looks like.
+SHIP-153's *Done when* is the Pending ones, so defaulting to `Pending` was available. It was
+rejected twice over: `Docs/04` §5's first queue is "new **or changed**" submissions, so four of the
+five outcomes are worth listing; and a default makes one URL mean two different things depending on
+whether the client remembered to send a parameter. An unrecognised state is **refused rather than
+ignored**, which matters more here than on the account search — an ignored filter answers an empty
+page, and an empty review queue is precisely what "nobody is waiting" looks like.
 
-#### Oldest first, on the record's clock and never on a decision's
+#### The decision writes into two tables and neither is redundant
 
-`000200`'s `created_at` column comment asked for exactly this and the queue is what depends on it: a
-provider whose state was corrected twice has not gone to the back of the line by being corrected.
-The cursor is `(created_at, provider_id)` because two providers registering in the same millisecond
-would otherwise make a single-column cursor skip a row or repeat one — and on this queue a skipped
-row is a person nobody looks at.
+`provider_verification_decisions` is the **provider's** evidence trail, which `Docs/04` §1 requires
+and which `GET /v1/provider/verification` reads from. `audit_log` is the **administrator's**
+accountability record, which `Docs/04` §9's controls read. The same reason goes into both, which is
+SHIP-160's arrangement between `job_status_history` and `audit_log` and the same argument: the two
+are joined by nothing but an identifier, and a reader of either should not have to find the other.
 
-#### What the harness proves that no Go test can
+`AuditActionVerificationDecided` is **one action for all five outcomes**, targeting the provider's
+`users` row rather than the verification record — so a support query asking "everything that happened
+to this account" returns the eligibility decisions beside the standing changes and the notes.
 
-`make verify` runs against a database that is never reset, so **every provider ever registered by
-any section of any run is on the Pending queue**. The section's fixtures are backdated to 1990,
-which puts them at the head of an oldest-first queue whatever precedes them, and every other
-assertion names an identifier — the same fence-by-id discipline `Docs/11` §9 records for Kafka,
-applied to a shared table.
+#### The mutation: the audit entry taken out of the decision's transaction
+
+**Applied.** `Verifications.Decide` was changed to keep both writes and to give the audit entry its
+own connection — `v.auditor.Record(ctx, v.pool, …)` instead of the transaction's runner — so the
+entry commits separately from the state change and a failure after the state change leaves a
+decision with no evidence behind it.
+
+**It survived everything that existed when it was written, and that is the finding.** `internal/admin`,
+`cmd/api`, `internal/profiles` and `migrations` all stayed green, and so did all sixteen sections of
+`make verify`.
+
+**The obvious test does not catch it, and it is worth being precise about why.**
+`TestADecisionAndItsAuditEntryCommitTogether` nils the auditor so that `Auditor.Record` fails before
+any SQL — wave 10's rule, because a trigger-induced failure proves a rollback and proves nothing
+about an `if err != nil`. It is a good test of the claim it makes. But a nil auditor fails whichever
+runner it is handed, so **it passes unchanged under the mutation**: what it establishes is that the
+error is checked, not that the write is in the transaction.
+
+**No other layer could hold it either, and both are worth naming.** The *database* cannot: the entry
+is in `audit_log`, the decision in `provider_verification_decisions`, and no constraint spans two
+tables in two transactions — this is exactly the case `Docs/10` §3.1 leaves to the domain. The
+*harness* cannot: its section asserts that a refused decision writes nothing and an accepted one
+writes both, and on a healthy database a mutation committing both separately satisfies both
+assertions.
+
+**So the mutation was a hole rather than a guard living one layer down, and it is now closed.**
+`TestTheAuditEntryIsWrittenOnTheDecisionsOwnConnection` builds the console on a pool with
+`MaxConns = 1` and asserts the decision completes. That is the one observable difference between the
+two arrangements and it is structural rather than timing-based: an entry written into the caller's
+transaction needs no second connection, and one written to the pool needs one *while the transaction
+is still holding the only one there is*. Under the mutation the test fails in ten seconds with
+`context deadline exceeded`; on the restored code it passes in under a second.
+
+**The same hole is open on four other administrative actions and this branch did not close them.**
+`Enforcement.Unpublish`, `Enforcement.SetStanding`, `Notes.Add` and both halves of `Suspensions` all
+pass `tx` to `Auditor.Record` — correctly — and **nothing in the repository would notice if any of
+them passed the pool instead**. The check is one test each on the same pattern, and it is reported
+for §9 rather than taken here — §9 is not this branch's to edit, and four other services' test files
+are not this ticket's either.
+
+Reverted from a copy taken before the mutation was applied, confirmed with `git diff` **and**
+`shasum -a 256 -c` against that copy.
 
 ## 4. Partly done — do not treat these as finished
 

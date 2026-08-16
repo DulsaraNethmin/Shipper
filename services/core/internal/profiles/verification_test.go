@@ -80,10 +80,22 @@ func inTx(t *testing.T, pool *pgxpool.Pool, fn func(ctx context.Context, r db.Ru
 }
 
 // decide moves a provider through the domain rather than by writing rows.
+//
+// It unwraps [Decision] to the record, because that is what almost every test here is about. The
+// other half — the state the provider was moved *from* — is what SHIP-154 writes into its audit
+// entry, and [TestADecisionReportsBothEnds] is where it is exercised.
 func decide(t *testing.T, pool *pgxpool.Pool, provider uuid.UUID, to State, by Actor, reason string) (Verification, error) {
 	t.Helper()
 
-	var out Verification
+	decision, err := decided(t, pool, provider, to, by, reason)
+	return decision.Verification, err
+}
+
+// decided is [decide] without the unwrapping, for the tests that care about both ends.
+func decided(t *testing.T, pool *pgxpool.Pool, provider uuid.UUID, to State, by Actor, reason string) (Decision, error) {
+	t.Helper()
+
+	var out Decision
 	err := inTx(t, pool, func(ctx context.Context, r db.Runner) error {
 		var err error
 		out, err = newTestService().Decide(ctx, r, provider, to, by, reason)

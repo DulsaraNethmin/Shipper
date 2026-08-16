@@ -441,6 +441,45 @@ func adminMutations() []adminMutation {
 				return approver.ID, userID
 			},
 		},
+		{
+			name:       "deciding a provider's verification",
+			action:     AuditActionVerificationDecided,
+			targetType: AuditTargetUser,
+			run: func(t *testing.T, f auditFixture, ready func()) (uuid.UUID, uuid.UUID) {
+				t.Helper()
+
+				// A moderator: `support` holds `verifications.read` and not
+				// `verifications.decide`, which is Docs/04 §9's least-privilege control as two
+				// permissions on two endpoints.
+				moderator, token := f.signedIn(t, "verif-decider@example.com", RoleModerator, "10.0.58.1")
+
+				// `000200`'s trigger gives the account a Pending record on the way in, which
+				// is what makes this a *transition* rather than an insertion.
+				providerID := newAccount(t, f.pool, "verif-subject@example.com", "+61400580", "provider")
+				ready()
+
+				req := httptest.NewRequest(http.MethodPost,
+					"/v1/admin/verifications/"+providerID.String()+"/decision",
+					strings.NewReader(`{"state":"Verified",`+
+						`"reason":"Licence, registration and insurance all current."}`))
+				req.SetPathValue("id", providerID.String())
+				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+				req.Header.Set("Content-Type", "application/json")
+
+				rec := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.DecideVerification()).ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("deciding a verification: status = %d, want 200 (%s)",
+						rec.Code, rec.Body)
+				}
+
+				// The entry names the **provider's account**, not the verification record.
+				// They are one-to-one, and a support query asking "everything that happened to
+				// this account" should return the eligibility decisions beside the standing
+				// changes — see AuditActionVerificationDecided.
+				return moderator.ID, providerID
+			},
+		},
 	}
 }
 
@@ -562,6 +601,7 @@ func TestEveryAuditActionConstantIsInTheCatalogue(t *testing.T) {
 		AuditActionNoteAdded,
 		AuditActionUserSuspensionRequested,
 		AuditActionUserSuspensionApproved,
+		AuditActionVerificationDecided,
 	}
 
 	if len(declared) != len(AuditActions) {

@@ -631,6 +631,25 @@ type ProviderVerifications interface {
 	// provider who cannot trade, and the one at the front has been unable to trade for longest.
 	// The account search is newest-first for the opposite reason and [Users.Search] records it.
 	VerificationsAwaitingReview(ctx context.Context, r db.Runner, q VerificationQuery) ([]VerificationEntry, error)
+
+	// DecideVerification records one administrator's decision and moves the state, inside the
+	// caller's transaction (SHIP-154).
+	//
+	// It takes a Runner rather than opening its own, and that is the whole of why SHIP-154 is
+	// atomic: the decision row, the state change and this domain's `audit_log` entry are one
+	// transaction, so a decision cannot exist without the record of who took it. Docs/10 §3.2
+	// puts the boundary with whoever owns the invariant, and the invariant is that one.
+	//
+	// A non-nil error is a failure of the mechanism — the database, a malformed request that got
+	// past validation. A refusal comes back as a [VerificationMove] with a nil error, because
+	// "there is no such provider" and "they are already in that state" are answers rather than
+	// faults. [Jobs] takes the same position for the same reason.
+	//
+	// The returned [VerificationChange] is populated only on [VerificationDecided]. Its `From` is
+	// read **under the row lock the transition takes**, never before it: two administrators
+	// deciding at once would otherwise both record a move from a state only one of them was
+	// moving from.
+	DecideVerification(ctx context.Context, r db.Runner, d VerificationDecision) (VerificationMove, VerificationChange, error)
 }
 
 // VerificationQuery is one page of the verification review queue.
@@ -699,4 +718,82 @@ type VerificationEntry struct {
 	// deliberately not the newest decision's clock, so that a provider whose state was corrected
 	// twice has not gone to the back of the line by being corrected.
 	SubmittedAt time.Time
+}
+
+// VerificationDecision is one administrator deciding a provider's standing (SHIP-154).
+type VerificationDecision struct {
+	// ProviderID is the provider. Named in the path, never in the body.
+	ProviderID uuid.UUID
+
+	// To is the outcome — one of Docs/04 §4's five, validated before this is built.
+	To string
+
+	// ActorID is the administrator taking the decision, from the grant rather than from the
+	// request. A body that named its own reviewer would be an evidence trail a client writes.
+	ActorID uuid.UUID
+
+	// Reason is why, and it is required. Docs/04 §4 requires a rejection's reason be
+	// communicable to the provider, Docs/04 §6.6 requires one of every moderation outcome, and
+	// `ck_provider_verification_decisions_reason` is the layer underneath.
+	Reason string
+}
+
+// VerificationMove is what a decision did, in terms this domain can act on.
+//
+// Not an error type, for [JobMove]'s reason: an error would have to be one of `profiles`' sentinels
+// to be matched, and matching it would be an import.
+type VerificationMove int
+
+const (
+	// VerificationMoveUnrecognised is the zero value and is never a valid answer.
+	//
+	// First on purpose. A stub, a half-written adapter or a switch with a missing case returns
+	// this, and [Verifications.Decide] refuses it rather than reading silence as success.
+	VerificationMoveUnrecognised VerificationMove = iota
+
+	// VerificationDecided means the decision was recorded and the state moved.
+	VerificationDecided
+
+	// VerificationProviderNotFound means there is no verification record for that identifier.
+	//
+	// One answer for two conditions — no such account, and an account that is not a provider —
+	// because `000200` gives every provider a record at registration, so the two are
+	// indistinguishable from the record's side. **Not a disclosure decision**, unlike the
+	// identical-looking answer [JobParties] gives: the caller holds `verifications.decide` and
+	// nothing is being kept from them. It is simply the only thing the port can know.
+	VerificationProviderNotFound
+
+	// VerificationAlreadyInState means the provider already holds that outcome.
+	//
+	// Refused rather than absorbed, which is `profiles`' decision and the right one: a decision
+	// is an act by a person, Docs/04 §6.6 requires it be recorded with a reason, and a second one
+	// that changed nothing would be a row asserting a review took place with no change to show
+	// for it. `ck_provider_verification_decisions_moves` is the layer underneath.
+	VerificationAlreadyInState
+)
+
+func (m VerificationMove) String() string {
+	switch m {
+	case VerificationDecided:
+		return "decided"
+	case VerificationProviderNotFound:
+		return "no such provider"
+	case VerificationAlreadyInState:
+		return "already in that state"
+	default:
+		return "unrecognised"
+	}
+}
+
+// VerificationChange is what a recorded decision changed, for the response and for the entry.
+type VerificationChange struct {
+	ProviderID uuid.UUID
+
+	// From is the outcome the provider held, read under the row lock rather than supplied by the
+	// caller. A console sending what it last saw would record a `from` that was already stale —
+	// [StandingChange] records the same argument for the same reason.
+	From string
+
+	// To is the outcome they now hold.
+	To string
 }

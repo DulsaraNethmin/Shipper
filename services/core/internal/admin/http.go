@@ -650,13 +650,25 @@ func apiError(err error) error {
 		return httpx.NewError(http.StatusConflict, CodeJobAlreadyUnpublished,
 			"This job has already been unpublished.").WithCause(err)
 
-	// --- Docs/04 §5's first queue (SHIP-153) --------------------------------------------------
+	// --- Docs/04 §5's first queue and Docs/04 §6's decision (SHIP-153, SHIP-154) --------------
+
+	case errors.Is(err, ErrVerificationNotFound):
+		// Disclosed plainly, like the account 404 above and unlike the one on dispute intake:
+		// the caller is an administrator holding a permission over verifications, and there is
+		// nothing here being kept from them.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such provider.").WithCause(err)
+
+	case errors.Is(err, ErrVerificationUnchanged):
+		return httpx.NewError(http.StatusConflict, CodeVerificationUnchanged,
+			"This provider already has that verification outcome.").WithCause(err)
 
 	case errors.Is(err, ErrVerificationStateUnrecognised):
-		// Reached only when something other than the queue handler raises it — that handler
-		// names the five outcomes itself, which needs the list cmd/api supplied and which this
-		// package function has no service to ask for. Named as a field failure either way,
-		// because a client that sent a bad state has made a mistake about a field somebody typed.
+		// Reached only when something other than a handler raises it — [Handler.verificationError]
+		// intercepts it first so the message can name the five outcomes, which needs the list
+		// cmd/api supplied and which this package function has no service to ask for. Named as a
+		// field failure either way, because a client that sent a bad state has made a mistake
+		// about a field somebody typed.
 		return fieldProblem("state", err)
 
 	case errors.Is(err, ErrAdminUnavailable):
@@ -2773,7 +2785,7 @@ func noteSubjectFrom(subjectType, subjectID string) (NoteSubject, uuid.UUID, err
 	return subject, id, nil
 }
 
-// --- SHIP-153: the verification review queue ------------------------------------------------------
+// --- SHIP-153, SHIP-154: the verification queue and its decision ---------------------------------
 
 // verificationEntryResponse is one provider waiting for a verification decision.
 //
@@ -2931,4 +2943,137 @@ func decodeVerificationCursor(raw string) (VerificationCursor, error) {
 	}
 
 	return VerificationCursor{SubmittedAt: submittedAt, ProviderID: providerID}, nil
+}
+
+// decideVerificationRequest is the body of POST /v1/admin/verifications/{id}/decision.
+//
+//	{"state": "Verified",
+//	 "reason": "Licence, registration and insurance all current and matching the account."}
+//
+// No provider identifier — it is in the path. **No reviewer**: the administrator is whoever the
+// credential says is calling, and a body that named its own reviewer would be an evidence trail the
+// client writes. No `from` either: what the provider currently holds is read under a row lock rather
+// than taken from a console that may have loaded the queue five minutes ago.
+//
+// httpx.DecodeJSON refuses unknown fields, so a console sending any of them is told the field does
+// not exist rather than having it quietly ignored.
+type decideVerificationRequest struct {
+	State  string `json:"state"`
+	Reason string `json:"reason"`
+}
+
+// verificationDecisionResponse is what changed.
+//
+// **Both ends, never just the new one.** One endpoint serves all five of Docs/04 §4's outcomes, so a
+// console rendering "Restricted" cannot tell a reader whether that was a tightening or a loosening —
+// [standingResponse] records the same argument for the same reason.
+type verificationDecisionResponse struct {
+	ProviderID string `json:"provider_id"`
+
+	From string `json:"from"`
+	To   string `json:"to"`
+
+	// Reason is read back so a console can render what was recorded without a second request,
+	// and so that what the platform *stored* is what the reviewer sees rather than what they
+	// typed. The two differ by trimming.
+	Reason string `json:"reason"`
+}
+
+// DecideVerification handles POST /v1/admin/verifications/{id}/decision (SHIP-154).
+//
+// Docs/04 §6 step 4 and step 6: an administrator selects an outcome and it is recorded with the
+// actor, the timestamp and the reason. It needs [PermissionVerificationsDecide], which `moderator`
+// and `owner` hold and `support` does not — reading the queue is `verifications.read` and every role
+// has it, which is Docs/04 §9's least-privilege control expressed as two permissions on two
+// endpoints.
+//
+// # `{id}` is the provider's account identifier, and there is no separate one
+//
+// `provider_verifications.provider_id` is the primary key: there is exactly one record per provider
+// and `000200` says why an `id` column would be a question somebody has to answer. So the path names
+// the provider, and the queue's `provider_id` is the value a console puts in it.
+//
+// # POST on a named sub-resource rather than PATCH on the record
+//
+// The only thing an administrator may set is the outcome, and the record's other columns are the
+// database's — `created_at` is the submission clock the queue orders by and the state is not a
+// settable field at all. A PATCH would invite a body that grows keys, on a resource where the one
+// key that matters passes a guarded transition.
+//
+// # The Idempotency-Key matters more here than usual
+//
+// Every state-changing endpoint takes one (SHIP-15) and this one is refused without it. A retry
+// after a dropped connection must not produce two decisions — `provider_verification_decisions` is
+// append-only and `audit_log` is append-only, so neither duplicate can be tidied up afterwards. What
+// makes a *replay* safe rather than merely idempotent is the refusal underneath: a second decision
+// to the outcome already held is [ErrVerificationUnchanged] rather than a second row.
+func (h *Handler) DecideVerification() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		// The grant is used rather than discarded: the decision is attributed to whoever took
+		// it, and taking the actor from the grant means a handler cannot record one without
+		// having stated the permission it was acting under.
+		grant, err := h.permitted(r, PermissionVerificationsDecide)
+		if err != nil {
+			return err
+		}
+
+		providerID, err := providerIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req decideVerificationRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		change, err := h.verifications.Decide(r.Context(), VerificationCommand{
+			ProviderID: providerID,
+			ActorID:    grant.Administrator.ID,
+			State:      strings.TrimSpace(req.State),
+			Reason:     req.Reason,
+		})
+		if err != nil {
+			return h.verificationError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, verificationDecisionResponse{
+			ProviderID: change.ProviderID.String(),
+			From:       change.From,
+			To:         change.To,
+			Reason:     strings.TrimSpace(req.Reason),
+		})
+		return nil
+	})
+}
+
+// verificationError renders this console's failures, including the one that needs the state list.
+//
+// A method rather than a case in [apiError], because naming the five outcomes in the message needs
+// the list cmd/api supplied and [apiError] is a package function with no service to ask. Everything
+// else falls through to [apiError], which is where the shared vocabulary lives.
+func (h *Handler) verificationError(err error) error {
+	if errors.Is(err, ErrVerificationStateUnrecognised) {
+		var problems validate.Errors
+		problems.Add("state", validate.CodeInvalid,
+			"That is not a verification outcome. Use one of %s.",
+			strings.Join(h.verifications.States(), ", "))
+		return problems.Err()
+	}
+	return apiError(err)
+}
+
+// providerIDFrom reads and parses the {id} path parameter on the verification routes.
+//
+// A fourth function beside [jobIDFrom], [userIDFrom] and [reviewIDFrom] rather than a shared one,
+// for the reason userIDFrom records: the message names the thing, and "the account id in the path"
+// on a verification route is not quite what a reviewer is looking at — they have a provider in front
+// of them.
+func providerIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The provider id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
 }
