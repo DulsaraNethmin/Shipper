@@ -708,6 +708,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-147a** | M6 | The platform's password cost, under its own name. `Config.Identity.Argon2` and `IDENTITY_ARGON2_*` became `Config.Passwords.Argon2` and `PASSWORDS_ARGON2_*` — one setting, read by identity's hasher, by admin's, and by identity's phone one-time codes. **Declined in three consecutive prep passes and it cost nothing to take**: five files. "No second knob" is a **guard rather than a claim** — a reflective walk of the `Config` tree and a source scan of `cmd/api` — and the release note naming the rename is in `deploy/.env.example` beside the variables, because no release-notes artefact exists to put it in — *see below* |
 | **SHIP-78a** | M3 | Every one of `internal/fleet`'s eight service methods refuses a caller who is not a provider, with the sentinel `Add` and `Declare` already returned. **Docs/11 §9's oldest ownerless finding**, open since wave 5, and it was never a disclosure — each of the six that did not check scopes to the caller's own identifier, so a customer got an empty list or a 404 and never another provider's vehicle. What it was is a surface declining to *refuse*. `Service.Profile` reversed its own recorded position to take it — *see below* |
 | **SHIP-81a** | M3 | `Docs/04` §4's five outcomes exist as a record: `provider_verifications` and its append-only decision trail (`000200` — migration block 200–299's first table, owned by `internal/profiles`), `GET /v1/provider/verification`, and the eligibility predicate reading that record instead of its automated stand-in. **The guarded function is in the database rather than in Go** — `provider_verification_decide()` records the decision with its actor and reason, names it to a trigger through a transaction-local setting, then moves the state — so the domain, a `make verify` fixture and a psql prompt are the same caller; the jobs precedent puts the protocol in Go and this file already records what the hand-written copy of it cost. **Every provider has a row from registration and the existing ones are backfilled `Pending`**, which is the ticket rather than a detail: Pending is a state a provider is *in*, so SHIP-153 has somebody to list — and **every provider on the platform stops being eligible to bid** until somebody decides otherwise. `internal/fleet` imports nothing from `internal/profiles`; the seam is one `EXISTS` clause — *see below* |
+| **SHIP-103** | M3 | The negotiation screen — **one screen for two people**, over the four endpoints that each serve both sides and work out which from the credential. It reads the whole chain and the conversation, and writes a counter-offer and a message; `BidCounter` is a **difference rather than an offer**, so a counter on price alone leaves the timing on the table, and an empty `message` is sent rather than omitted because that is how conditions are cleared. A counter **re-reads the chain instead of patching it** — the response is the new head alone and the platform also superseded the row it answered — and the read count is what the test asserts, because a client that wrote both facts renders identically. **The budget guard is word-level over rendered output** in the provider's view with the counter form open, and it was mutation-tested with a sentence carrying no field, no value and no digit. What it does not build: revising and withdrawing your own offer, both still served and both still wanting a confirmation flow — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14135,6 +14136,99 @@ rather than passing quietly. `scripts/verify/60-fleet.sh` carries the same asser
 deliberately in the file where somebody reaching for a one-line fixture would write the UPDATE.
 
 #### Nothing was needed from `internal/config`
+
+### What SHIP-103 built, and the two decisions it took that a reviewer should check
+
+**SHIP-103 is a client ticket whose entire server surface already existed**, which is rare enough in
+this repository to be worth saying: `routes_golden.txt` at `4fd7fd5` serves the counter, the history
+and both message routes, and the branch adds no migration, no route and no Go file. What it adds is
+`apps/mobile/lib/features/bidding/negotiation_screen.dart` and the controller, model and request type
+beneath it, plus a way in from each party's existing screen.
+
+**Decision one: one screen for both parties, where the job deliberately has two.** `jobDetail` and
+`openJobDetail` are separate screens reading separate endpoints, because the customer's job and a
+provider's view of it are different *responses* — one carries the customer's private figure and the
+other must never be able to. A negotiation is the opposite case. All four of its endpoints serve
+customer and provider alike and decide which from the credential, so two screens would be two
+renderings of one exchange, and the first thing they would disagree about is whose turn it is. What
+differs between the two views is one word — which side of the thread is "you" — taken from the
+session's role, and it decides alignment and a label and **nothing else**: a device that got the role
+wrong would draw a bubble on the wrong side and disclose nothing, because a caller who is not a party
+gets the byte-identical `404` a bid that does not exist gets.
+
+**Decision two: a counter re-reads the chain rather than patching it.** `POST …/counter` answers with
+the new head alone, and in the same transaction the platform moved the offer that was answered to
+`superseded` and pointed its `superseded_by` at the new row. This device could write both of those
+itself and render identically. It does not, for the reason `CompareOffersController.showAwarded`
+already gives: `Docs/02` §2 makes status the platform's, and a client that computes the consequences
+of a transition keeps a second copy of the state machine that is right until the day it is not.
+**The test asserts the read count**, because that is the only observable that separates the two
+implementations.
+
+Three smaller things are worth knowing. `BidCounter` is a **third** request type rather than a
+`BidPlacement` with nullable fields — a placement states an offer and a counter states a *difference*,
+so `null` means "keep what is on the table", which is precisely what a placement's fields must never
+mean. Its `message` is the **one tri-state in this client**: `null` leaves the conditions alone and
+`''` clears them, so `toJson` emits an empty string where `BidPlacement.toJson` deliberately omits one
+— a copy of that method would have silently dropped the only way to remove conditions. And
+`InstantField` moved out of `place_bid_panel.dart`, where it was private, because both forms enter a
+commitment the same way or they disagree about what a commitment is (`Docs/07` §2).
+
+#### The budget guard is word-level over rendered output, and it was mutated to prove it
+
+**A negotiation screen is the most dangerous surface in this product for `Docs/01` §4.3**, because it
+renders both parties' words beside a form for proposing a number. The third clause — no "budget
+supplied" indicator — is a *sentence*, and a sentence carries no field, no value and no digit. Wave 10
+and wave 11 each proved that a closed key set, a source scan, a value search and an AST walk all pass
+one.
+
+So `negotiation_test.dart` collects every rendered `Text` in the **provider's** view, with the counter
+form open, and refuses fourteen phrases. It asserts four things are on screen first — both offers'
+amounts, a message body and the form's own heading — because wave 11 recorded thirteen Dart tests that
+passed while asserting over empty lists.
+
+**Mutation, applied and reverted by `CLAUDE.md`'s recipe.** A `Text` was added to the counter form,
+rendered to both parties and therefore to the provider, reading *"The customer has set a maximum."* —
+no field, no value, no digit. Result: **killed, and by exactly one assertion** — the word-level scan
+over rendered output, failing on the phrase `maximum`. Everything else passed: `flutter analyze`, the
+closed key set over `Bid`, `Message` and `ReceivedOffer`, `budget_stays_on_the_customer_side_test.dart`'s
+source scan for `budget_cents|budgetCents`, `compare_offers_test.dart`'s own word scan, and the other
+nineteen tests in `negotiation_test.dart`.
+
+**What that establishes, and what it does not.** The guard is word-level over rendered output, which is
+the shape the failure has — and none of the structural guards caught it at all, so this is not a
+structural check that happened to match the phrasing. What it is **not** is a guard against every
+sentence: a phrase the list does not carry survives, which is why the list holds shapes as well as
+nouns — `has set a`, `within their`, `over their`, `can afford`, `room to move`. That is the honest
+limit of the technique, and it is the same limit `compare_offers_test.dart` has.
+
+**One thing about the recipe itself, worth passing on.** Step 4 is *confirm with `git diff` **and**
+`shasum -a 256 -c`*, and here `git diff` was **structurally incapable of saying anything**: the mutated
+file is new on this branch, so it is untracked, so `git diff` reports nothing whether the file was
+restored or not. The checksum against the copy taken beforehand was the only evidence. That is the
+exact failure mode the recipe was written for — "after a destructive checkout the file matches the
+index, so `git diff` reports nothing, which reads as success" — arriving by a route the recipe does not
+name. **On a branch that adds files, the checksum is not the second half of step 4. It is all of it.**
+
+**One limit is recorded rather than hidden.** `Message.body` is what a party typed, stored unaltered —
+"the platform contributes no prose to it at all" — so a customer who writes their own limit into a
+message has disclosed it themselves, and this screen renders it. `Docs/01` §4.3 binds the platform and
+the product, not the customer's mouth. A guard that suppressed words inside party-authored text would
+censor a negotiation *and* leave the actual hole — the app's own copy — exactly where it was. A test
+states this out loud so the next reader meets it as a decision rather than as a gap.
+
+`Message` was also added to `budget_stays_on_the_customer_side_test.dart`'s closed-key-set registry.
+It is the only response in the bidding domain carrying free text, so an extra prose field on it is
+where a sentence would travel under an innocuous name; the registry now fails on one whatever it is
+called.
+
+#### `make verify` was not run, and why
+
+**The branch changes no server behaviour**: no migration, no route, no Go file, no
+`scripts/verify/*.sh`. `git diff --name-only develop...` touches `apps/mobile/**` and this file and
+nothing else. The harness demonstrates platform acceptance criteria end to end and has nothing to say
+about a Flutter screen, so running it would have consumed the machine-wide mutex for a result that
+could not differ. `make flutter-check` and `make check` are the gates this ticket answers to.
 
 ## 4. Partly done — do not treat these as finished
 

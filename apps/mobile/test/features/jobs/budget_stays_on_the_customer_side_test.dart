@@ -39,6 +39,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/features/bidding/bid.dart';
+import 'package:shipper/features/bidding/message.dart';
 import 'package:shipper/features/jobs/open_job.dart';
 
 /// The files allowed to name the budget, and why each one is.
@@ -139,6 +140,24 @@ final _providerFacing = <String, _ClosedShape>{
       'created_at',
       'updated_at',
     },
+  ),
+  'Message': (
+    file: 'lib/features/bidding/message.dart',
+    roundTrip: (json) => Message.fromJson(json).toJson(),
+    seed: <String, dynamic>{'id': 'a', 'sent_by': 'provider'},
+    // **Four keys, and this is the shape where the closed set earns its keep most.** Every other
+    // model here is fields and numbers; this is the one response in the bidding domain carrying
+    // *free text*, and Docs/01 §4.3's third clause — no "budget supplied" indicator — is a
+    // **sentence**, which has no field name and no value for any of the other guards to find. So
+    // an extra prose field on this shape is exactly where such a sentence would travel with an
+    // innocuous name, and it fails here whatever it is called.
+    //
+    // What is *not* covered, said plainly rather than left to be discovered: `body` is what a
+    // party typed, and a customer who writes their own limit into a message has disclosed it
+    // themselves. §4.3 binds the platform and the product, not the customer's mouth. The guard
+    // for a sentence the **client** composes is `negotiation_test.dart`, which reads the words
+    // rendered on the provider's screen.
+    keys: <String>{'id', 'sent_by', 'body', 'created_at'},
   ),
 };
 

@@ -140,3 +140,70 @@ final class BidPlacement {
         if (message.trim().isNotEmpty) 'message': message.trim(),
       };
 }
+
+/// What a party is changing about the offer they are answering — the `BidCounter` schema in
+/// `contracts/paths/bidding.yaml` (SHIP-87, SHIP-103).
+///
+/// A third type over the bidding endpoints, and a separate one from [BidPlacement] for a reason
+/// that is not symmetry. **A placement states an offer; a counter states a difference.** Every field
+/// here is optional and anything left out is inherited from the offer being answered, so `null` and
+/// "the value already on the table" are the same thing — which is precisely what [BidPlacement]'s
+/// four required fields must never mean.
+///
+/// ## One endpoint, both directions, and no field says which
+///
+/// The customer counters the provider's offer and the provider counters the customer's, over the
+/// same `POST /v1/jobs/{id}/bids/{bid_id}/counter`. Which side is countering is decided from the
+/// credential and the offer being answered; there is no field for it and there could not be, because
+/// that would be an authorisation decision made from what a client sent (`Docs/07` §3).
+///
+/// ## [message] is the one tri-state here, and the contract asks for it
+///
+/// `null` leaves the conditions on the table; `''` **clears** them — "send it blank to remove
+/// them". So this is the one place in this client where an empty string is meaningfully different
+/// from an absent field, and [toJson] therefore emits `message` whenever it is non-null, including
+/// when it is empty. [BidPlacement] does the opposite for its own good reason, which is why the two
+/// are not one type with a flag.
+///
+/// ## Countering with nothing is agreement, and agreement is a different request
+///
+/// The schema is `minProperties: 1`: a counter-offer that changes nothing is agreement, and the way
+/// to agree is to award the job. [namesSomething] is what a screen checks before offering the
+/// button — presentation only, and the platform refuses an empty body with `400` regardless.
+///
+/// ## The customer's number here is not their maximum
+///
+/// The contract states it on the field itself and it bears repeating where a client could get it
+/// wrong: a customer's counter amount is a number they **chose to put in front of a provider**. It
+/// travels to that provider by design — a `Bid` whose `offered_by` is `customer` — and it has
+/// nothing to do with the private figure `Docs/01` §4.3 protects. Nothing in this client may derive
+/// one from the other, in either direction.
+final class BidCounter {
+  const BidCounter({this.amountCents, this.pickupAt, this.deliverBy, this.message});
+
+  /// The price being proposed for the whole job, in cents. `null` keeps the one on the table.
+  final int? amountCents;
+
+  /// RFC 3339, with the device's own offset. `null` keeps the commitment on the table.
+  final String? pickupAt;
+  final String? deliverBy;
+
+  /// The conditions. `null` leaves them alone; `''` clears them. See the note on the class.
+  final String? message;
+
+  /// Whether this counter changes anything at all.
+  ///
+  /// **Presentation only.** The platform refuses an empty counter with `400 bad_request`; this only
+  /// stops a screen sending a request whose answer is already known.
+  bool get namesSomething =>
+      amountCents != null || pickupAt != null || deliverBy != null || message != null;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        if (amountCents != null) 'amount_cents': amountCents,
+        if (pickupAt != null) 'pickup_at': pickupAt,
+        if (deliverBy != null) 'deliver_by': deliverBy,
+        // **Not `isNotEmpty`.** An empty string here is the documented way to clear the conditions,
+        // which is the one behaviour a copy of `BidPlacement.toJson` would silently drop.
+        if (message != null) 'message': message,
+      };
+}

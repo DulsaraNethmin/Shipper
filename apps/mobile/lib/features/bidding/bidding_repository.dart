@@ -4,17 +4,19 @@ import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/api/page.dart';
 import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
+import 'package:shipper/features/bidding/message.dart';
 import 'package:shipper/features/bidding/received_offer.dart';
 
-/// What a provider offers against a job (SHIP-84), what they have offered so far (SHIP-101), and
-/// what a customer has been offered on theirs (SHIP-102).
+/// What a provider offers against a job (SHIP-84), what they have offered so far (SHIP-101), what a
+/// customer has been offered on theirs (SHIP-102), and how the two of them negotiate (SHIP-103).
 ///
-/// Three methods. The three endpoints `contracts/paths/bidding.yaml` serves and this does not —
-/// revise, withdraw and counter — are **served and deliberately not modelled**: an endpoint no
-/// screen calls is dead code that nothing holds to the contract, which is the position
-/// `OpenJobsRepository` took about `/v1/jobs/open/{id}` until the screen that needed it arrived.
-/// Revising and withdrawing want a confirmation flow of their own, and countering arrives with the
-/// negotiation screens (SHIP-103).
+/// Eight methods. **One endpoint `contracts/paths/bidding.yaml` serves is still deliberately not
+/// modelled** — `PATCH /v1/jobs/{id}/bids/{bid_id}`, revising your own offer — and the reason has
+/// not changed: an endpoint no screen calls is dead code that nothing holds to the contract, and
+/// revising is a write that changes a commitment the other party is relying on, so it wants a
+/// confirmation flow rather than a field on a form. Withdrawing (`POST …/withdraw`) is the same
+/// judgement. Countering arrived here with SHIP-103 because a negotiation screen is exactly the
+/// confirmation flow that argument was asking for.
 ///
 /// An interface with one real implementation, following the three repositories before it: a widget
 /// test has to be able to hand a screen something that answers, and a stub transport under a
@@ -195,6 +197,144 @@ abstract interface class BiddingRepository {
     required String bidId,
     required String idempotencyKey,
   });
+
+  /// `GET /v1/jobs/{id}/bids/{bid_id}/history` (SHIP-88) — every offer exchanged between one
+  /// customer and one provider on one job, **oldest first**.
+  ///
+  /// ## Any offer in the chain addresses the whole chain
+  ///
+  /// [bidId] may be the offer this device happens to be holding, however old. The negotiation is
+  /// what is being read, not the row: the original offer, each counter, and any offer that was
+  /// withdrawn and replaced, each at the amount it was made at. Nothing is deleted and nothing is
+  /// overwritten — `Docs/01` §4.3 requires the record and `Docs/02` §4 keeps it visible.
+  ///
+  /// ## The live head is a property of the data rather than a field
+  ///
+  /// **The one entry with no `superseded_by` is the head**, and it is the only offer anybody can act
+  /// on — the only one that can be countered, and the only one the customer can award. There is no
+  /// flag for it, so a client reads it off the chain; `NegotiationState.liveOffer` is where.
+  ///
+  /// ## It does not page, and the envelope says so honestly
+  ///
+  /// A negotiation is a handful of rounds. `next_cursor` is always null and `has_more` is a
+  /// **truncation report** for a chain longer than a hundred rounds rather than an invitation to ask
+  /// for the rest — so a client must not build a "load more" out of it.
+  ///
+  /// Anybody who is not one of the two parties gets the byte-identical `404` a bid that does not
+  /// exist gets. Another provider's prices, counters and timing are private, and this is the
+  /// response that would otherwise hand a competitor an entire negotiation at once.
+  ///
+  /// No idempotency key: a read changes nothing.
+  Future<ApiPage<Bid>> negotiationHistory({required String jobId, required String bidId});
+
+  /// `POST /v1/jobs/{id}/bids/{bid_id}/counter` (SHIP-87) — answer the other party's offer with
+  /// different terms.
+  ///
+  /// ## You counter the other party's offer and revise your own
+  ///
+  /// That single sentence is why one endpoint serves both directions. Getting it the wrong way round
+  /// — countering your own offer — answers `409 bidding_wrong_party`, and the fix is
+  /// `PATCH /v1/jobs/{id}/bids/{bid_id}`, which this client still deliberately does not model.
+  ///
+  /// ## It creates a row and leaves the one it answers behind
+  ///
+  /// The offer countered becomes `superseded` and gains a `superseded_by` pointing at the counter;
+  /// the counter becomes the live head. Nothing is overwritten, which is what keeps
+  /// [negotiationHistory] readable as the whole exchange.
+  ///
+  /// ## The whole merged offer is validated, not only what changed
+  ///
+  /// [counter] carries a difference and the platform validates the result of applying it. So a
+  /// counter on price alone, against an offer whose `pickup_at` has since passed, is refused
+  /// **naming `pickup_at`** — a field this device did not send. A screen must render a `422` by the
+  /// field the platform names rather than by the field the person touched.
+  ///
+  /// ## Who may counter, and until when — none of it decided here
+  ///
+  /// Only the live head can be countered. Superseded, withdrawn, rejected or expired answers
+  /// `bidding_bid_closed`; awarded answers `bidding_bid_accepted`. A provider's eligibility is
+  /// re-checked exactly as when they placed the offer, so a job no longer offered to them is `404`.
+  /// A customer is refused once their job can no longer be awarded, because there is nothing a
+  /// counter could then lead to.
+  ///
+  /// ## Retrying, and why a new counter needs a new key
+  ///
+  /// The same key answers `200` with the counter that request made, held by a unique index rather
+  /// than by a cached response — so a retry arriving after the counter has already superseded the
+  /// offer it answered is still answered with that counter rather than refused. A **new** counter
+  /// needs a **new** key, which is exactly what `ActionKey` produces once the body changes.
+  ///
+  /// Not queued, for [placeBid]'s reason and by the same compiler-enforced route: `Docs/07` §4 puts
+  /// negotiation beside bidding and awarding.
+  Future<Bid> counterOffer({
+    required String jobId,
+    required String bidId,
+    required BidCounter counter,
+    required String idempotencyKey,
+  });
+
+  /// `GET /v1/jobs/{id}/bids/{bid_id}/messages` (SHIP-97) — the conversation between one customer
+  /// and one provider about one job, **oldest first**.
+  ///
+  /// ## A conversation is with one provider, not with the job
+  ///
+  /// An open job can hold offers from several providers at once and **they are not in one room**.
+  /// Each pair has its own conversation and no provider can see another's. It is addressed through
+  /// any offer in the negotiation — the one this device is holding will do, however old — and a
+  /// negotiation that has run through several counters is still one conversation.
+  ///
+  /// ## Oldest first, which is the opposite of every other list in this domain
+  ///
+  /// `GET /v1/fleet/bids` and `GET /v1/jobs/{id}/bids/received` are newest first, because a work
+  /// queue is read newest first. A conversation is read forward or it is not a conversation, and
+  /// [cursor] therefore walks **towards the present** rather than into the past.
+  ///
+  /// ## It keeps working after the award, deliberately
+  ///
+  /// There is no status rule at all: the moment two parties most need to arrange something is after
+  /// the award, when the offer that got them there is accepted and the rest are closed. A client
+  /// must not hide this behind a live offer.
+  ///
+  /// Administrators are the third reader `Docs/02` §4 names, and **that reader has no endpoint** —
+  /// administrative sessions are a separate credential system and this route takes a user token. So
+  /// there is nothing for this client to build for them and it must not pretend otherwise.
+  ///
+  /// [cursor] is opaque and handed back exactly as it arrived. No idempotency key: a read changes
+  /// nothing.
+  Future<ApiPage<Message>> messagesOn({
+    required String jobId,
+    required String bidId,
+    String? cursor,
+  });
+
+  /// `POST /v1/jobs/{id}/bids/{bid_id}/messages` (SHIP-97) — write one message to the other party.
+  ///
+  /// **One endpoint for both parties.** The platform works out which side the caller is on, so there
+  /// is no field for it and sending one would be refused as an unknown field.
+  ///
+  /// ## The key matters more here than on any other write in this domain
+  ///
+  /// The contract says why: a duplicated message is worse than most duplicated writes, because the
+  /// other party has already read it and cannot tell which sending was the mistake. So the key is
+  /// stored against the message rather than merely cached, and a retry arriving after any cache has
+  /// forgotten it is answered with the message it sent rather than sending a second one. It is
+  /// scoped to the caller, to this conversation, and to their side of it, so no key of theirs can
+  /// reach the other party's message.
+  ///
+  /// `201` when it was sent, `200` when this key had already sent it. The caller cannot tell them
+  /// apart and does not need to: both answer with the same shape.
+  ///
+  /// [body] is stored as written, trimmed of surrounding whitespace and otherwise unaltered. Empty
+  /// or over 2000 characters is `422 validation_failed` naming `body`.
+  ///
+  /// There is no status rule: a message can be sent while the offer is live, after it has been
+  /// countered, and after the job has been awarded.
+  Future<Message> sendMessage({
+    required String jobId,
+    required String bidId,
+    required String body,
+    required String idempotencyKey,
+  });
 }
 
 /// The real one, over [ApiClient].
@@ -279,6 +419,74 @@ final class ApiBiddingRepository implements BiddingRepository {
         // The one field the schema has. Unknown fields are refused, and there is deliberately
         // nothing here about the status of the bid or of the job — both are the platform's.
         body: <String, Object?>{'bid_id': bidId},
+      ),
+    );
+  }
+
+  @override
+  Future<ApiPage<Bid>> negotiationHistory({
+    required String jobId,
+    required String bidId,
+  }) async {
+    return ApiPage.fromJson(
+      // No query at all. This endpoint does not page: `next_cursor` is always null and `has_more`
+      // is a truncation report, so sending a cursor would be sending one it never issued.
+      await _client.getJson('/v1/jobs/$jobId/bids/$bidId/history'),
+      Bid.fromJson,
+    );
+  }
+
+  @override
+  Future<Bid> counterOffer({
+    required String jobId,
+    required String bidId,
+    required BidCounter counter,
+    required String idempotencyKey,
+  }) async {
+    return Bid.fromJson(
+      await _client.postJson(
+        '/v1/jobs/$jobId/bids/$bidId/counter',
+        idempotencyKey: idempotencyKey,
+        body: counter.toJson(),
+      ),
+    );
+  }
+
+  @override
+  Future<ApiPage<Message>> messagesOn({
+    required String jobId,
+    required String bidId,
+    String? cursor,
+  }) async {
+    return ApiPage.fromJson(
+      await _client.getJson(
+        '/v1/jobs/$jobId/bids/$bidId/messages',
+        query: <String, dynamic>{
+          // `limit` is absent deliberately, as on every other list this client reads: the page size
+          // is server configuration (`Docs/10` §4.5), and a number compiled in here could not be
+          // changed without a store release.
+          if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+        },
+      ),
+      Message.fromJson,
+    );
+  }
+
+  @override
+  Future<Message> sendMessage({
+    required String jobId,
+    required String bidId,
+    required String body,
+    required String idempotencyKey,
+  }) async {
+    return Message.fromJson(
+      await _client.postJson(
+        '/v1/jobs/$jobId/bids/$bidId/messages',
+        idempotencyKey: idempotencyKey,
+        // One field, and the schema is `additionalProperties: false`. There is deliberately nothing
+        // here saying who is writing: the platform decides that from the credential, and a client
+        // that sent it would be offering an authorisation decision it does not get to make.
+        body: <String, Object?>{'body': body},
       ),
     );
   }

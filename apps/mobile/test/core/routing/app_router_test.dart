@@ -132,6 +132,32 @@ void main() {
       expect(redirectFor(const SessionState.signedIn(), '/jobs/0198f2c1/delivery/notes'), Routes.home);
     });
 
+    test('a negotiation path is reachable while signed in, both identifiers and all', () {
+      // SHIP-103 is the first route carrying **two** identifiers, and both are load-bearing: a job
+      // can hold one negotiation per provider and no provider may see another's, so a job
+      // identifier alone does not name one. It is reached by a button on both parties' screens and
+      // is a deep-link target besides (`Docs/07` §5), which means forgetting the pattern produces
+      // two different symptoms — a button that appears to do nothing, and a notification that lands
+      // on the home shell.
+      const path = '/jobs/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0/negotiation/offer-1';
+
+      expect(Routes.negotiationFor('abc', 'bid-1'), '/jobs/abc/negotiation/bid-1');
+      expect(redirectFor(const SessionState.signedIn(), path), isNull);
+      expect(redirectFor(const SessionState.signedOut(), path), Routes.signIn);
+      expect(redirectFor(const SessionState.restoring(), path), Routes.starting);
+
+      // Both identifiers are required and the literal between them is fixed, so this admits exactly
+      // one shape rather than everything under `/jobs/{id}/negotiation/`.
+      expect(
+        redirectFor(const SessionState.signedIn(), '/jobs/0198f2c1/negotiation'),
+        Routes.home,
+      );
+      expect(
+        redirectFor(const SessionState.signedIn(), '/jobs/0198f2c1/negotiation/offer-1/messages'),
+        Routes.home,
+      );
+    });
+
     test('the connectivity screen is reachable from either shell, and during the restore', () {
       // SHIP-19's demonstration. Putting it behind the session would have made "the app can
       // reach the API" unanswerable on a fresh install, which is exactly when it is asked.
