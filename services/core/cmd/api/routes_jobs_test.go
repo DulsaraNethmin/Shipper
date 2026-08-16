@@ -147,8 +147,8 @@ func TestTheBidderLookupAnswersForEveryBidStatus(t *testing.T) {
 				id, job, provider, status)
 		} else {
 			_, err = pool.Exec(t.Context(),
-				`INSERT INTO bids (id, job_id, provider_id, status, amount)
-				 VALUES ($1, $2, $3, $4, 185.00)`,
+				`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+				 VALUES ($1, $2, $3, $4, 185.00, now() + interval '2 days', now() + interval '3 days')`,
 				id, job, provider, status)
 		}
 		if err != nil {
@@ -188,8 +188,9 @@ func TestTheBidderLookupIsScopedToOneJobAndOneProvider(t *testing.T) {
 		t.Fatalf("generating an id: %v", err)
 	}
 	if _, err := pool.Exec(t.Context(),
-		`INSERT INTO bids (id, job_id, provider_id, status, amount)
-		 VALUES ($1, $2, $3, 'Submitted', 185.00)`, id, first, bidder); err != nil {
+		`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+		 VALUES ($1, $2, $3, 'Submitted', 185.00,
+		         now() + interval '2 days', now() + interval '3 days')`, id, first, bidder); err != nil {
 		t.Fatalf("placing the bid: %v", err)
 	}
 

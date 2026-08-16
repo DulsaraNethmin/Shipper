@@ -115,7 +115,8 @@ func placeBid(t *testing.T, pool *pgxpool.Pool, job, provider uuid.UUID, status 
 			id, job, provider, status)
 	} else {
 		_, err = pool.Exec(t.Context(),
-			`INSERT INTO bids (id, job_id, provider_id, status, amount) VALUES ($1, $2, $3, $4, $5)`,
+			`INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+			 VALUES ($1, $2, $3, $4, $5, now() + interval '2 days', now() + interval '3 days')`,
 			id, job, provider, status, amount)
 	}
 	if err != nil {

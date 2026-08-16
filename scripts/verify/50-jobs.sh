@@ -1218,8 +1218,9 @@ status="$(jobs_get "$jobs_provider_token" "$history_path" history-nobid)"
 # and lock the losing bidders out of the one endpoint they need.
 "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
   -v job="$history_job" -v provider="$jobs_history_provider_id" >/dev/null <<'SQL'
-INSERT INTO bids (id, job_id, provider_id, status, amount)
-VALUES (gen_random_uuid(), :'job', :'provider', 'Rejected', 185.00);
+INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+VALUES (gen_random_uuid(), :'job', :'provider', 'Rejected', 185.00,
+        now() + interval '2 days', now() + interval '3 days');
 SQL
 
 status="$(jobs_get "$jobs_provider_token" "$history_path" history-provider)"
