@@ -13293,6 +13293,39 @@ writer — so `bids` and `job_messages` answer "who is this between" and "who wr
 There is no `sender_id` and no `customer_id`: the first is derivable from the other two and the
 second is `jobs`' column, which this domain may not read.
 
+#### The room is shut by a guard that was mutated rather than believed
+
+A passing check is not a verdict, and this section's own check — *"a provider holding a live offer on
+the same job gets exactly what a bid that does not exist gets, in both directions"* — passes just as
+readily against a guard that is not there, because a conversation a stranger cannot reach and a
+conversation nobody thought to widen look identical from outside.
+
+| Mutation | Verdict |
+|---|---|
+| `if !audience.permitted()` replaced by `if false` in `Service.Messages` — the read guard removed, so a caller `audienceFor` resolves as `AudienceNone` reads the page anyway | **Caught**, by three tests and five assertions |
+
+`TestNobodyOutsideTheNegotiationCanReadOrWrite` fails on all three of its outsiders — a provider
+bidding on the same job, a customer with no relationship to it, and an identifier belonging to
+nobody — each reporting `reading = <nil>, want ErrNotBidOwner — one 404 for every outsider`.
+`TestTwoProvidersOnOneJobHaveTwoConversations` fails in both directions, which is the disclosure
+above stated as a test: each provider reads the other's conversation with the customer.
+
+**And `TestAnAdministratorReadsAnyConversation` fails on its own negative control**, which is the
+result worth keeping. It reads the conversation once *without* the flag before reading it with one,
+and reports `the same account without the flag = <nil>, want ErrNotBidOwner — otherwise this test
+proves nothing about the flag`. A test for a permission that never establishes the permission was
+needed is a test that passes when the permission is deleted; this one says so itself.
+
+**One assertion did not fire, and that is a fact about the code rather than a gap.** Every *writing*
+assertion in those tests still passed, because `SendMessage` does not go through `Service.Messages`
+at all — it reaches its offer through `Service.reachableBid` in `service.go`, which is SHIP-87's own
+guard and was not mutated. **Reading
+and writing are refused by two independent functions**, so no single mutation can open both, and a
+future session mutating one must not read the other's tests staying green as coverage.
+
+Restored from `/tmp/wave12b-msg-snap` with `cp`, and confirmed both ways: `git diff` empty and
+`shasum -a 256 -c` reporting `OK`.
+
 #### It attaches to the negotiation, not to an offer, which is why there is no `bid_id`
 
 `POST /v1/jobs/{id}/bids/{bid_id}/messages` names an offer and the row records none. A counter
