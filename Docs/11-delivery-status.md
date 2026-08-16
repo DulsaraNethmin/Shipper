@@ -420,7 +420,7 @@ Identical hashes mean the merge result is exactly `develop`'s content. Different
 
 ## 3. Done
 
-Verified by `make verify` — **802 checks across 15 sections**, and `make check` green. Since
+Verified by `make verify` — **862 checks across 16 sections**, and `make check` green. Since
 SHIP-15e the checks live one file per milestone or domain in `scripts/verify/`, sourced by the
 runner; a ticket adds its section by adding a file. Wave 4 added two: SHIP-78's
 `scripts/verify/60-fleet.sh` and SHIP-134's `scripts/verify/80-notifications.sh`. SHIP-67 and
@@ -13274,6 +13274,34 @@ and unrouted: deciding somebody's standing is an administrator's act on the admi
 (SHIP-147), so SHIP-153's queue and SHIP-154's decision are `/v1/admin` routes served by
 `internal/admin` through a port it declares for itself. A route here would be a second way to reach the
 same act on the wrong credential.
+
+#### Two mutations, and the second one is the finding
+
+**Mutation 1 — the domain writes the state directly.** `postgresStore.decide`'s
+`SELECT provider_verification_decide(…)` was replaced with
+`UPDATE provider_verifications SET state = $2 WHERE provider_id = $1`, which is this ticket's own
+prohibition applied to the one function that could break it. **Killed.** Six tests failed in
+`internal/profiles`, every one of them carrying the trigger's own message — *"provider verification
+state is not a settable field: … may not move from Pending to Verified by direct UPDATE"*.
+`internal/fleet` and `internal/bidding` stayed green, and that is correct rather than a gap: their
+fixtures call the database function in SQL and never travel the Go path this mutation broke.
+
+**Mutation 2 — the trigger is not attached.** The `CREATE TRIGGER
+provider_verification_change_is_guarded` statement was commented out of `000200`. The template
+database is dropped and rebuilt from the migration chain on every `make test`, so the suite ran
+against a schema with no guard at all. **Killed by exactly one test**, `TestTheStateIsNotASettableField`,
+whose three cases are a bare `UPDATE`, an `UPDATE` inside a transaction, and an `UPDATE` naming a real
+decision that describes a *different* move. Nothing else in the repository noticed.
+
+**That single survivor is the finding, and the honest reading is "one layer, and it is tested" rather
+than "a hole".** Wave 11's precedent is the case to compare against: a Go two-person check was removed
+there and the suite stayed green because a SQL predicate and a CHECK constraint held the rule
+underneath, so the survivor was correct. There is no second layer here and there could not be — "this
+change was authorised by a decision written in the same transaction" is not expressible as a CHECK
+constraint, because a CHECK cannot see another table. **The trigger is the whole guard**, which is the
+arrangement `Docs/10` §3.1 asks for; what the mutation establishes is that removing it fails the build
+rather than passing quietly. `scripts/verify/60-fleet.sh` carries the same assertion end to end,
+deliberately in the file where somebody reaching for a one-line fixture would write the UPDATE.
 
 #### Nothing was needed from `internal/config`
 
