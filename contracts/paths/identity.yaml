@@ -866,8 +866,123 @@ Refresh:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+AccountDeletion:
+  post:
+    operationId: requestAccountDeletion
+    summary: Ask for this account to be deleted
+    tags: [Identity]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Records a request to delete the signed-in account and answers with the date it will be
+      completed by (SHIP-169).
+
+      **Which account is deleted is decided by the token.** There is nothing to send: no body, no
+      identifier, and no confirmation field. The confirmation belongs in the app, where a person
+      can be shown what deletion costs them before they tap; a `confirm` flag on the wire is a
+      checkbox the platform cannot see anybody tick.
+
+      ## What happens, and when
+
+      `completes_by` is thirty days after the request and it is **recorded when the request is
+      made**, not worked out afresh each time it is read. Ask again a week later and the answer
+      is the same date, because it is the date this platform promised rather than a rolling
+      window.
+
+      Deletion removes the person and keeps the transaction. Profile details, contact
+      information, identity evidence, message content, push tokens and attributable
+      proof-of-delivery images go; jobs, bids, status history, audit entries and
+      proof-of-delivery metadata stay, with the account replaced by a stable pseudonym. That is
+      what keeps a counterparty's own record of who carried their goods coherent after the other
+      party leaves.
+
+      ## Asking twice
+
+      A repeat is not an error and does not create a second request. The first call answers
+      `202`; every call after it answers `200` carrying the same `id` and the same
+      `completes_by`. Neither answer moves the date.
+
+      A retry of a *dropped* request — the same `Idempotency-Key` — replays the original response
+      byte for byte, so a client that lost the connection sees the `202` it did not receive.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    responses:
+      '200':
+        description: |
+          This account already had an open deletion request. The body is that request, unchanged
+          — including the completion date it has carried since it was made.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DeletionRequest'
+      '202':
+        description: The request has been recorded and will be executed by `completes_by`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DeletionRequest'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: The database was not reachable. Retry; this is transient by construction.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 # ---------------------------------------------------------------------------------------
 # Shared pieces
+
+DeletionRequest:
+  type: object
+  required: [id, state, requested_at, completes_by]
+  additionalProperties: false
+  description: |
+    An outstanding request to delete an account, and the date the platform promised (SHIP-169).
+
+    The account itself is not echoed back. A client that has just asked to be deleted does not
+    need its own contact details returned to it, and a response carrying them is one more copy to
+    end up in a log.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: The deletion request. Stable across repeat calls.
+      example: 0198f2c1-6d3b-7a41-9e2f-1c4b7d8a5e60
+    state:
+      type: string
+      enum: [requested]
+      description: |
+        Where the request has got to. `requested` is the only value today; a request made during
+        an active delivery will report a deferred state once SHIP-170 exists, so branch on this
+        rather than assuming it.
+      example: requested
+    requested_at:
+      type: string
+      format: date-time
+      description: When the person asked, UTC.
+      example: '2026-08-16T09:30:00.000Z'
+    completes_by:
+      type: string
+      format: date-time
+      description: |
+        The date the platform committed to, UTC — thirty days after the request. Recorded when the
+        request was made and returned unchanged on every later read, so it is safe to show a
+        person as a promise rather than as an estimate.
+      example: '2026-09-15T09:30:00.000Z'
 
 TokenPair:
   type: object

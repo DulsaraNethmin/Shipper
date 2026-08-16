@@ -1,4 +1,5 @@
 GET    /health                                  public       operational
+POST   /v1/account/deletion                     user         v1
 POST   /v1/admin/administrators                 admin        v1
 GET    /v1/admin/audit                          admin        v1
 GET    /v1/admin/jobs                           admin        v1
