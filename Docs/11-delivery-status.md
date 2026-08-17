@@ -17762,12 +17762,22 @@ in the repository would notice if one stopped.** Lane A's assigned mutation — 
 off the decision's transaction and onto its own connection — **survived** `internal/admin`,
 `cmd/api`, `internal/profiles`, `migrations` and all sixteen verify sections. A closed it for its own
 action with a test that pins a `MaxConns = 1` pool, so a second connection deadlocks rather than
-succeeding quietly. Measured here on `4fd7fd5`: `Auditor.Record` is called with a transaction at
+succeeding quietly. Measured on `4fd7fd5`: `Auditor.Record` is called with a transaction at
 exactly **five** sites — `enforcement.go:240` (`Unpublish`), `:338` (`SetStanding`), `notes.go:248`
-(`Notes.Add`), and `suspension.go:248` and `:338` (`Suspensions.Request` and `.Approve`) — **and the
-only `MaxConns` in any test in this repository is `internal/bidding/race_test.go:524`**, which is
-SHIP-95's race harness and has nothing to do with audit. So all five are correct today and not one of
-them is held to it. **One test each, on Lane A's pattern.**
+(`Notes.Add`), and `suspension.go:248` and `:338` (`Suspensions.Request` and `.Approve`) — and the
+only `MaxConns` in any test in the repository was `internal/bidding/race_test.go:524`, which is
+SHIP-95's race harness and has nothing to do with audit.
+
+**Re-measured on `54ea9af` after the merge, and one half of that has changed.** The five call sites
+are unchanged, line for line, and all five still take `tx`. **The `MaxConns` claim is now false**:
+there are two, because Lane A's `internal/admin/verifications_test.go:590` merged with the branch that
+found the hole. **The sentence was correct on the ref it named and the merge invalidated it**, which
+is not carelessness and is worth naming as a class — **a pre-merge measurement of "the only X in the
+repository" expires at the merge that adds the second X**, and the branch most likely to add it is the
+branch making the claim. Restated so it survives: **`Auditor.Record` is held to its caller's
+connection at exactly one of its six call sites**, `verifications.go:265`, and the other five —
+`Unpublish`, `SetStanding`, `Notes.Add`, `Suspensions.Request` and `Suspensions.Approve` — are correct
+by convention and by nothing else. **One test each, on Lane A's pattern, roughly thirty lines.**
 
 **Why the tests that look like they cover it do not, which is the reusable half.**
 `TestAPrivilegedActionIsRefusedWhenItsAuditEntryCannotBeWritten` builds an `Enforcement` with
@@ -17806,17 +17816,49 @@ as the collector written for it.** This wants an owner and a decision about scop
 ticket-sized patch, and it is the one item in this section that touches a `CLAUDE.md` invariant.
 
 **A rendered banner interpolates the platform's own free text, and no closed key set can cover
-prose.** Measured here: `ApiErrorResponse.userMessage` returns `message` — the error contract's
-human-readable string, written by the platform — and it is interpolated straight into rendered
-widgets at `features/bidding/compare_offers_screen.dart:797` and `:829` (the customer's comparison
-screen and its stale-read banner) and at `features/bidding/place_bid_panel.dart:402`, **which is
-provider-facing**. Lane B reports the same shape on the negotiation screen it is building; that file
-is on its branch and is not readable from here, so it is recorded as reported rather than as
-measured. **B left its own fixture fail-closed rather than admitting a shape for it** — no fixture in
-that group renders one, so a test that does will fail until somebody decides what such a message may
-say in front of a provider. **That is the right call and it is not a screen's decision to make**: it
-is the same undecided thing as the channel enumeration above, arriving from the platform's end
-instead of the client's.
+prose.** `ApiErrorResponse.userMessage` returns `message` — the error contract's human-readable
+string, written by the platform — and it is interpolated straight into rendered widgets. **The
+measurement below was taken on `4fd7fd5` and every line number in it moved at the merge; the
+re-measurement on `54ea9af` follows and it also narrows the finding.** As written: `compare_offers_
+screen.dart:797` and `:829`, and `place_bid_panel.dart:402`, *"which is provider-facing"*, with Lane
+B's negotiation screen recorded as reported rather than measured because its branch was not readable
+from the prep branch.
+
+**Re-measured on `54ea9af`, and two things change.** `git grep -n userMessage -- apps/mobile/lib/
+features` returns exactly four sites:
+
+| Site | Screen | Audience |
+|---|---|---|
+| `compare_offers_screen.dart:842` | the customer's comparison | **customer** |
+| `compare_offers_screen.dart:874` | its stale-read banner | **customer** |
+| `place_bid_panel.dart:403` | the provider's own offer form | **provider** |
+| `negotiation_screen.dart:849` | the negotiation's stale banner | **both parties** |
+
+**First: `compare_offers_screen.dart` is the customer's screen and `Docs/01` §4.3 is not engaged
+there.** Its own header says so — *"the customer's bid comparison"* — so two of the three sites the
+entry cited were never instances of the finding. Wave 13's Lane B added 57 lines to that file, so
+`:797` and `:829` are now a class boundary and a field block, and **a reader following the citation
+lands on unrelated code with nothing to tell them the number is stale.**
+
+**Second: Lane B's instance merged and is measurable rather than reported.**
+`negotiation_screen.dart:849` interpolates `userMessage` into *"This negotiation may be out of date.
+${failure.userMessage}"*, and its own header states that one screen serves both parties — *"the
+customer opens it from an offer on their delivery; the provider opens it from their own bid"* — so it
+is provider-facing whenever a provider has it open. **So the finding is two sites rather than three,
+and both of them are new since wave 12.**
+
+**B left its own fixture fail-closed rather than admitting a shape for it** — no fixture in that group
+renders one, so a test that does will fail until somebody decides what such a message may say in front
+of a provider. **That is the right call and it is not a screen's decision to make**: it is the same
+undecided thing as the channel enumeration above, arriving from the platform's end instead of the
+client's.
+
+**The instrument lesson is worth more here than the finding.** A line number is the fastest-decaying
+fact this file records — faster than a commit count, a check count or a table count — because any
+lane editing anywhere above it moves it, and **nothing anywhere in the repository checks a line
+citation.** `place_bid_panel.dart:402` became `:403` from a one-line insertion. **Cite the symbol and
+the file; cite a line only with the ref beside it, and expect to re-run the grep rather than to read
+the number.**
 
 **The mutation-revert recipe has a second route to a silent `git diff`, and it does not name it.**
 `CLAUDE.md` step 4 explains that after a destructive `git checkout` the file matches the index, so
@@ -17843,6 +17885,130 @@ strongest instrument and several waves of write-ups treat a green harness as the
 ticket whose change lives entirely in a client, a green `make verify` is not evidence of anything.**
 Nothing is wrong with the harness and there is nothing in it to fix; what is missing is the sentence
 in a dispatch naming which gate is load-bearing for which ticket.
+
+---
+
+**The eight below were found at the wave-13 reconciliation, and none of them is owned by a ticket.**
+**This pass also corrected four figures rather than adding them**, and the pattern across the four is
+what it is really reporting: the `MaxConns` sentence and the banner's line numbers, both corrected in
+place above; SHIP-182's self-counting grep, corrected in §6 for the second consecutive pass; and
+SHIP-164's partition count, the first entry below. **Every one of the four was correct on the ref it
+named.** This file's errors have stopped being copied figures and become **expired** ones, which needs
+a different habit to catch: a copied figure is caught by re-deriving it once, and an expired figure is
+caught only by re-measuring on the ref you are publishing against.
+
+**A decision each of two tickets defers to the other stays open indefinitely and no gate detects
+it.** Measured on `54ea9af`. §3's SHIP-163 entry says a `dispute.raised` event *"would need a fourth
+aggregate in `internal/events` and a fourth topic in `cmd/topics`, both shared surfaces, and it
+belongs to SHIP-136 rather than here"*. §3's SHIP-136 entry says *"whoever writes SHIP-164 should
+decide whether a dispute is a fourth aggregate, because that is a topic and a partition count, and
+partitions cannot be reduced."* **SHIP-136 shipped in wave 8 without taking it**, and SHIP-164 has
+never been built, so the question circulated between two write-ups for five waves and read as an
+irreversible deployment decision waiting on the owner. **It was not blocked. It was ownerless.**
+
+**The instruments cannot see it and it is worth saying which ones and why.** `make status` reads
+commit subjects; `make check` reads code; §3's new structural guard reads table rows; `make verify`
+drives the platform. **A deferral is prose pointing at prose**, and the only reader that would catch
+it is a person holding both entries at once — which is exactly what a reconciliation pass is for and
+what took five of them. **The cheap habit: when an entry defers a decision, name the ticket *and*
+write the decision into §9.** A ticket that ships without taking a deferred decision then leaves a
+trace somewhere other than inside its own write-up, where nobody looks again.
+
+**The owner closed this one at the wave-14 dispatch — no fourth aggregate — and §6 has the reasoning.**
+The correction that matters for the next planner is separate from the decision: **`TopicPartitions`
+is one constant applied to every topic** (`internal/events/catalogue.go:137`), read by `cmd/topics`
+for all of them and enforced by a test that refuses any topic whose count disagrees, so **there was
+never a per-topic partition number for SHIP-164 to choose.** Four consecutive dispatch briefs said
+otherwise, having copied the phrase out of SHIP-136's §3 entry where it was true of the *decision*
+and not of the ticket.
+
+**SHIP-155 and SHIP-159 want a dependency edge each and the rows to point at already exist.**
+Measured on `54ea9af`: no verification-document table anywhere — `grep -rIln "verification_document"`
+over `services/core`, `apps/mobile` and `contracts` returns nothing, and the profiles block holds one
+migration — so SHIP-155 has no image to render and SHIP-159 has no document to expire. **The honest
+fix is two dependency-column edits in `Docs/09`**: `SHIP-155 → SHIP-81b`, and `SHIP-159 → SHIP-81b`
+and `→ X-4`. §6 strikes both meanwhile and §5 carries the X-4 half. **This is the cheapest case of
+the category the file has recorded** — the previous ones each needed a row written and argued for,
+and this one needs two cells — **and it is still an owner edit rather than a reconciliation pass's**,
+because a pass that adds edges to `Docs/09` to clear its own table is writing the plan it reports on.
+
+**SHIP-159's cadence is X-4's answer and nobody may invent it.** `Docs/04` §3's *Decision required* is
+*"which documents are legally required rather than merely prudent, and how often each must be
+renewed"*, owner **legal and insurance advisers**, and it says in the same paragraph that this
+*"determines expiry tracking (§5)"* — where §5 item 7 is *"Expiring or expired provider verification
+records"*, which is SHIP-159's queue. **`Docs/04` §3 permits building ahead of the answer**: *"needed
+before pilot users are invited, not before build begins."* **So the constraint is a design rule rather
+than a block — the renewal cadence and the warning window must be server-side configuration and never
+compiled in**, which is `CLAUDE.md`'s standing rule for anything that changes under operational
+pressure, and doubly so here because a Dart constant cannot be changed over the air. **Five
+consecutive passes have declined to invent a number in this file. Do not be the sixth to try.**
+
+**A provider cannot revise or withdraw an offer from the app, no backlog row owns it, and a screen
+promises it.** Measured on `54ea9af`: `PATCH /v1/jobs/{id}/bids/{bid_id}` and `POST
+/v1/jobs/{id}/bids/{bid_id}/withdraw` are lines 56 and 61 of `routes_golden.txt`, both served and both
+authenticated. `bidding_repository.dart` declares eight methods — `placeBid`, `myBids`, `offersOn`,
+`awardTo`, `negotiationHistory`, `counterOffer`, `messagesOn`, `sendMessage` — **and neither a revise
+nor a withdraw is among them.** The five client bidding rows SHIP-100…104 name neither in any *Done
+when*: SHIP-103's is *"both parties exchange messages and counter-offers"*, which is a different act.
+
+**What makes this worth a §9 entry rather than a note is that the app says it is coming.**
+`place_bid_panel.dart:122` renders *"Revising or withdrawing an offer arrives with your bids list."*,
+and `place_bid_controller.dart:147` names the withdraw endpoint in a comment. **A promise in shipped
+copy is a commitment no backlog row is carrying.** It has been declined three times, each time for a
+defensible reason — reported by wave 13's Lane B rather than measured here — **and three defensible
+declines is how a gap becomes permanent.** A `Docs/09` row would close it and it is an owner decision;
+this pass does not draft it.
+
+**`AutovalidateMode.onUserInteraction` swallows a refusal nobody can trigger, and the shape is wider
+than the screen that fixed it.** `POST /v1/jobs/{id}/bids/{bid_id}/counter` validates the **merged**
+offer — `internal/bidding/http.go` says so at the request type: *"a customer countering on price alone
+restates the timing or inherits it from the offer it answers"*, and *"a counter is validated against
+the stored offer"*. So a counter that changes only the price can be refused naming `pickup_at`, and
+under `onUserInteraction` that message waits for interaction with a field the person has no reason to
+touch. **It never appears, and the form looks like it did nothing.** Wave 13's Lane B fixed its own
+screen with `AutovalidateMode.always` — `negotiation_screen.dart:491`, the only `always` in the client
+— and **five other forms still use `onUserInteraction`**: `registration_screen.dart:140`,
+`sign_in_screen.dart:118`, `place_bid_panel.dart:246`, `job_locations_screen.dart:138` and
+`vehicle_form.dart:185`. **Not one of those is wrong today**, because each sits over an endpoint that
+validates what it was sent. **The rule is the general one: a form over an endpoint that validates more
+than the form sends cannot use `onUserInteraction`**, and nothing marks which endpoints those are.
+
+**§3's bodyless "Nothing was needed from `internal/config`" headings number nine, and the finding as
+reported named the wrong ticket.** Wave 13's Lane D reported *"a dangling heading
+left by SHIP-81a"* and correctly did not touch it. Measured on `54ea9af`: **nine fourth-level headings of
+that exact text carry no body at all**, each one terminating its entry, and **twelve earlier entries
+write the same statement as a bold sentence instead**. The one sitting immediately above SHIP-81a's
+heading **terminates SHIP-78a's entry**, not SHIP-81a's — both were on one branch in wave 12, which is
+how the attribution went wrong.
+
+**So it is a convention that drifted rather than one heading somebody forgot**, and that changes what
+to do about it: fixing the single instance would leave it inconsistent with eight others. **Either
+form is defensible and the file should pick one** — the heading reads as an assertion and renders as
+an empty section; the bold sentence reads the same and nests correctly. It is a §3 edit either way, so
+it is a lane's or an owner's, and **it is recorded here rather than taken.** The reusable half is
+smaller and sharper: **a finding reported as "one instance, left by ticket X" is worth re-counting
+before it is written down**, because the reporter saw the instance next to the thing they were working
+on.
+
+**`AdminUserStanding`'s contract description says a control is unimplemented that has been
+implemented since wave 11.** `contracts/paths/admin.yaml:3245` carries a `## Two-person review is not
+implemented` block saying *"That is a separate ticket and there is deliberately no half of it here —
+no pending state and no approval field, because an administrator who sees a 'pending approval' that
+nothing enforces believes there is a control."* **SHIP-166 built it.** `internal/admin/http.go:2355`
+says the opposite in the same words the contract denies: *"`suspended` is refused here with
+`admin_suspension_needs_review`, pointing at `POST /v1/admin/users/{id}/suspension`"*, and
+`suspension_reviews` is a table. **The published contract and the code disagree about whether a
+control exists**, which is the one class of staleness a published contract cannot afford. `contracts/`
+is not this branch's to edit and this is SHIP-166's territory; recorded so that whoever next opens
+`contracts/paths/admin.yaml` fixes it in passing.
+
+**`make status`'s five "declared done, no commit names them" rows have been the same five for three
+waves and nobody re-reads them.** SHIP-57a, SHIP-91, SHIP-109, SHIP-115a and X-6, re-read off
+`make status` on `54ea9af`. **All five are still correct** — two landed inside a commit naming
+SHIP-120a, SHIP-91 was closed by an owner ruling, X-6 is a decision recorded in `Docs/02` — and the
+tool prints *"check it is not wishful"* every time. **A list that is right for three consecutive waves
+stops being read**, which is the failure mode the tool exists to prevent, in the tool's own output.
+Nothing to fix; the habit is to re-read it at each reconciliation, which this pass did.
 
 ## 10. The done list, in a form a script can read
 
