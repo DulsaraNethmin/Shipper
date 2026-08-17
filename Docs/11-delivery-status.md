@@ -770,6 +770,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-131a** | M4 | The driver's own words on a milestone. **No platform change at all** — `MilestoneRecording.reason` has been published, bounded and stored since SHIP-111, and the customer's tracking view has rendered it since SHIP-133, against a field **no client had ever sent**. Three controls, one per screen the row names: the Flutter milestone screen, the Flutter proof-exception panel and the driver portal. On the exception path it sits **beside** the selected reason rather than instead of one — a note alone still records nothing, because a closed list is what `Docs/04` §5's queue can group and the sentence is which of the three it was. **Optional in the strong sense**: an empty or whitespace-only note puts no `reason` key in the body, because a customer's view branches on the field being *present*. The mutation aimed at exactly the defect the ticket closes — drop the note from the portal's request body, leave the field on screen — was killed by `lib/completion.test.ts`, which asserts on the body the platform received — *see below* |
 | **SHIP-169** | M7 | `POST /v1/account/deletion` — a signed-in person asks to be deleted and is told the date, and **the date is recorded when it is promised rather than derived when it is read**. That is the whole ticket: `now() + 30 days` computed while rendering answers plausibly every time, writes nothing, and lets the promise slide forward for as long as nobody executes it. The state lives in a **new table in identity's block** (`000105`) and not in a column on `users` — the shared block is not a domain branch's to take, and `Docs/10` §3.3 forbids the soft delete a `deleted_at` invites. One open request per account is a **partial unique index**, so two honest taps carrying two keys are one promise. **The deferral clause is declared out of scope with its reason**: `Docs/09` gives it to SHIP-170, which depends on SHIP-57 as well as on this — *see below* |
 | **SHIP-170** | M7 | The deferral. A deletion request made while the account is party to a job between `Awarded` and `Delivered` is recorded as `deferred` with the platform's own explanation beside it, and **both parties count** — `Docs/05` §3.1 says a *party* mid-delivery, and the endpoint is `RequireUser` with no role predicate, so a lookup reading `jobs.customer_id` alone would pass every customer-side assertion and erase a driver mid-delivery. It is `internal/identity`'s **first port over another domain** rather than over an adapter, following `admin.JobParties`: one method answering yes or no, with the statement that spans `jobs` and `bids` in `cmd/api`. **No job identifier is stored** — the deferral is re-read on every call, in both directions, so it cannot go stale and the row stays what `000105` built it to be. `000106` widens the CHECK *and* the open-request index, which is the half a reader would miss: a deferred request is an open request, and an index still partial on `'requested'` would let one account hold two promises. It answers `deletion.go:200`'s question — the two statements became three and one transaction, because the re-read is now followed by a write. The mutation dropping the provider half is reported below with the layer that killed it — *see below* |
+| **SHIP-173** | M7 | The account deletion screen — the client half of the two, and the only place in the app that reaches `POST /v1/account/deletion`. **It renders `deferred` because SHIP-170 exists**, which is why the two were one lane: `contracts/paths/identity.yaml` had already told clients to branch on `state` rather than assume it, and a screen shipped before the state would have told somebody mid-delivery their account goes on the fifteenth. Consequences are `Docs/05` §3.1's split rather than a warning — what is deleted for good, and **what stays under a pseudonym**, which is the half nobody expects. The confirmation is tested in **both** directions: opening the dialog sends nothing and dismissing it sends nothing, which is `award_test.dart`'s argument that a confirmation tested only in the accepting direction is one nobody has checked. It draws **no job** on a screen both roles reach, and a repeat is not read as a new request — asking again is how a deferral lifts, so the button stays and the second call is what the test asserts. Entry point is a third app-bar action on the signed-in shell, because there is no settings screen and inventing one for a single action would be building what a later ticket has to reconcile with — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14765,6 +14766,97 @@ buildable in a wave where neither package is anybody's.
 `40-identity.sh` and no other file, and the two guards SHIP-169 planted — the harness's state-list
 assertion and `migrations/account_deletion_requests_test.go`'s pairing — were both moved rather than
 deleted, which is what SHIP-169 wrote the first one for.
+
+### SHIP-173 — the deletion screen, and why it had to come second
+
+`/account/deletion`, reached from a third action in the signed-in shell's app bar, over the endpoint
+SHIP-169 built and the state SHIP-170 added. It is the only place in the client that reaches
+`POST /v1/account/deletion`.
+
+**It was built after SHIP-170 deliberately, on the same lane.** `contracts/paths/identity.yaml`
+already told clients that *"a request made during an active delivery will report a deferred state
+once SHIP-170 exists, so branch on this rather than assuming it"* — so a screen shipped first would
+have been a screen that silently broke on the day the state arrived, telling somebody mid-delivery
+that their account goes on the fifteenth of September.
+
+#### Where it lives, and the screen that was not invented to hold it
+
+There is no settings or account screen in this app: `features/profile` is a doc-only stub and
+`Routes` has no `/settings`. The affordance is an app-bar `IconButton` beside sign-out, on the shell
+both halves of the marketplace land on — which is what Apple actually requires, that deletion be
+*discoverable* from inside the app. Inventing an account screen to hold one action would have been
+building the surface a later ticket has to reconcile with, and the screen's own header records that
+it moves under one when it exists.
+
+`Routes.accountDeletion` mirrors the endpoint's path, which `Routes.myBids` deliberately does not —
+those diverge because a URL is a person's map of the product and `/v1/fleet/bids` names where a
+provider's records live. This is the account itself, and both sides mean the same thing by it.
+
+#### The trap this route was one line from falling into
+
+`_signedInLocations` has a third entry, added in the same change as the route. A route missing from
+that set sends the app to the home shell, which **from the outside is indistinguishable from a button
+that does nothing** — SHIP-102's lane lost a run to it. The test asserts both halves after the tap:
+the deletion screen is present *and* `shell-signed-in` is not, so the silent redirect fails rather
+than passing as a screen nobody looked at.
+
+#### The two clauses, and what would have made each look true
+
+**Clear consequences** is `Docs/05` §3.1's split rather than a warning. Two paragraphs, because they
+answer two different questions: what is deleted for good, and **what stays** — the jobs, the offers
+and the history, under a pseudonym that is no longer you, which is the part nobody expects and which
+"this cannot be undone" would omit entirely. Asserted on the rendered text of both.
+
+**Confirmation** is tested in both directions, which is `award_test.dart`'s argument applied
+unchanged: *"a confirmation that is only tested in the accepting direction is a confirmation nobody
+has checked is a confirmation"* — it would pass against a dialog that deleted when it opened. So
+opening it sends nothing, dismissing it sends nothing, and both are asserted on **what the repository
+was asked** rather than on what the screen drew, because a screen that changed colour and sent
+nothing looks identical.
+
+#### What it does not draw, and the repeat it must not misread
+
+**No jobs.** A deferral is explained by the platform's own sentence and by nothing this screen
+assembles. Listing the delivery being waited on would put job data on a screen both roles reach,
+which engages `Docs/01` §4.3 for no gain — and the person can already see their own deliveries.
+Asserted as a real negative: the deferred sentence is confirmed on screen first, so the absence is a
+finding rather than a blank page passing.
+
+**A `200` is not "nothing happened".** The endpoint answers `202` first and `200` on every repeat, and
+a repeat is also how a deferral lifts. So the button stays after a request exists — relabelled, and
+without a second confirmation, because checking on a request that already exists cannot delete
+anything twice and a dialog nobody needs is one they learn to dismiss. The lift is asserted as a
+**second call** with a different answer, which is the only shape that can demonstrate "queues until
+the job closes" from the client's side.
+
+**No "cancel my request".** Withdrawing a deletion has no ticket and no endpoint; `000105` declined
+to invent the state because doing so invents the product decision with it.
+
+#### `deferral_reason` is rendered as given
+
+The platform holds the sentence (`CLAUDE.md` puts policy copy server-side, and `Docs/05` §3.1 is a
+legal position); the screen renders it and never parses it. The test compares against the platform's
+own wording rather than a paraphrase, so a screen that rewrote a legal sentence fails. There is a
+fallback sentence for the case where the field is absent, which is the `Docs/07` §6 direction — read
+what you use, tolerate the rest.
+
+#### `make verify` has nothing to say about this ticket, and that is stated rather than implied
+
+`git diff --name-only develop...HEAD -- services/ scripts/ contracts/ deploy/ mk/ Makefile` attributes
+**no file** to SHIP-173: every line of it is under `apps/mobile`. The harness drives the platform with
+`curl`, so `make flutter-check` is this ticket's only real guard — 1050 tests including twelve new
+ones, plus the analyzer.
+
+#### What it touched
+
+One model, one controller, one screen, one repository method with a **second base constant** — the
+endpoint is `/v1/account/deletion` and `ApiIdentityRepository._base` is `/v1/auth`, a different prefix
+chosen deliberately on the platform's side, so `'$_base/…'` would have been a `404` nobody would
+predict from the call site. Three lines in `app_router.dart` (a `Routes` constant, a `GoRoute`, an
+entry in `_signedInLocations`), one `IconButton` in `signed_in_shell.dart`, two fixtures and one
+method on `FakeIdentityRepository`, and one test file. **`signup_app.dart` is untouched**: the screen
+reads `identityRepositoryProvider`, which that harness already overrides, so no new named parameter
+was needed.
 
 ## 4. Partly done — do not treat these as finished
 

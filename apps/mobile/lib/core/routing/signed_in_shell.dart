@@ -59,6 +59,18 @@ class SignedInShell extends ConsumerWidget {
             tooltip: 'Connectivity',
             onPressed: () => context.go(Routes.health),
           ),
+          // Account deletion (SHIP-173), and it is in the app bar for the same reason sign-out
+          // is: it is a real product action, and this shell is the only signed-in surface both
+          // halves of the marketplace land on. Apple requires deletion to be *discoverable* from
+          // inside the app, and there is no settings or account screen to put it in — see the
+          // note on AccountDeletionScreen, which argues why inventing one here would be worse.
+          // It moves under an account screen when one exists.
+          IconButton(
+            key: const Key('delete-account'),
+            icon: const Icon(Icons.person_remove_outlined),
+            tooltip: 'Delete account',
+            onPressed: () => context.go(Routes.accountDeletion),
+          ),
           // Sign-out is a real product action and not a development affordance: Docs/07 §3
           // requires it to clear the stored token, and this is the one place that currently can.
           // The server-side revocation is SHIP-46. It keeps the key it has had since SHIP-49 —

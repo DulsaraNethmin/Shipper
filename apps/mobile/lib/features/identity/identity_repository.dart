@@ -4,6 +4,7 @@ import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/auth/token_pair.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/features/identity/account.dart';
+import 'package:shipper/features/identity/account_deletion.dart';
 
 /// The identity endpoints a screen calls: the five in the signup journey (SHIP-51…54) and the
 /// sign-in that ends it (SHIP-55).
@@ -108,6 +109,25 @@ abstract interface class IdentityRepository {
     required String deviceLabel,
     required String idempotencyKey,
   });
+
+  /// `POST /v1/account/deletion` (SHIP-169, SHIP-170), which is where an account ends.
+  ///
+  /// **The only call on this interface that is not under `/v1/auth`**, and the prefix is a claim
+  /// about what the resource is: everything under `/auth` is how a caller obtains, holds or ends a
+  /// *credential*, and asking to be deleted is an act on the account itself.
+  ///
+  /// There is nothing to send. Which account is deleted is decided by the token, and no
+  /// confirmation field belongs on the wire — the confirmation is a screen, and a `"confirm": true`
+  /// is a checkbox the platform cannot see anybody tick.
+  ///
+  /// **Branch on [AccountDeletion.state], never on the status code.** `202` the first time and
+  /// `200` on every repeat, and neither is an error; a `200` does not mean nothing changed, because
+  /// the deferral may have lifted on that very call.
+  ///
+  /// Asking twice is not an error and does not create a second request, so a retry under the same
+  /// key and an honest second ask are both safe — which is why this returns the request rather than
+  /// a bare success.
+  Future<AccountDeletion> requestAccountDeletion({required String idempotencyKey});
 }
 
 /// The real one, over [ApiClient].
@@ -123,6 +143,14 @@ final class ApiIdentityRepository implements IdentityRepository {
   /// Product endpoints live under `/v1` (SHIP-13). The base URL carries the host and nothing
   /// else, so the version prefix belongs here.
   static const _base = '/v1/auth';
+
+  /// The account itself, which is **not** under `/v1/auth` (SHIP-169).
+  ///
+  /// A second constant rather than a suffix on [_base], because `'$_base/../account/deletion'` is
+  /// not a path anybody should have to read and `'$_base/account/deletion'` is a `404` nobody
+  /// would predict from the call site. `cmd/api/routes_identity.go` argues the split from the
+  /// platform's side.
+  static const _accountBase = '/v1/account';
 
   @override
   Future<Account> register({
@@ -218,6 +246,13 @@ final class ApiIdentityRepository implements IdentityRepository {
         idempotencyKey: idempotencyKey,
         body: loginBody(email: email, password: password, deviceLabel: deviceLabel),
       ),
+    );
+  }
+
+  @override
+  Future<AccountDeletion> requestAccountDeletion({required String idempotencyKey}) async {
+    return AccountDeletion.fromJson(
+      await _client.postJson('$_accountBase/deletion', idempotencyKey: idempotencyKey),
     );
   }
 

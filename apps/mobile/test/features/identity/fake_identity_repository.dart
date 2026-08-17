@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:shipper/core/auth/token_pair.dart';
 import 'package:shipper/core/auth/user_role.dart';
 import 'package:shipper/features/identity/account.dart';
+import 'package:shipper/features/identity/account_deletion.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 
 import '../../core/auth/session_fixtures.dart';
@@ -33,6 +34,45 @@ Account anAccount({
   );
 }
 
+/// A deletion request the platform could have answered with (SHIP-169, SHIP-170).
+///
+/// Built from `contracts/paths/identity.yaml`'s own example, like [anAccount], so that a field
+/// renamed in the contract shows up here rather than only on a device.
+AccountDeletion aDeletionRequest({
+  String id = '0198f2c1-6d3b-7a41-9e2f-1c4b7d8a5e60',
+  String state = 'requested',
+  String requestedAt = '2026-08-16T09:30:00.000Z',
+  String completesBy = '2026-09-15T09:30:00.000Z',
+  String? deferralReason,
+}) {
+  return AccountDeletion(
+    id: id,
+    state: state,
+    requestedAt: requestedAt,
+    completesBy: completesBy,
+    deferralReason: deferralReason,
+  );
+}
+
+/// A deferred one, with the platform's own explanation attached.
+///
+/// The sentence is `identity.DeferralReason`'s, copied rather than shortened: a fixture that
+/// paraphrased it would let a screen that rewrote the platform's words pass.
+AccountDeletion aDeferredDeletionRequest({
+  String id = '0198f2c1-6d3b-7a41-9e2f-1c4b7d8a5e60',
+  String completesBy = '2026-09-15T09:30:00.000Z',
+}) {
+  return aDeletionRequest(
+    id: id,
+    state: 'deferred',
+    completesBy: completesBy,
+    deferralReason:
+        'Your account will be deleted once your current delivery is finished. Deleting it now '
+        'would leave the other party without the person carrying or receiving their goods, so '
+        'the request is held until the delivery closes and the thirty days start then.',
+  );
+}
+
 /// One recorded call.
 typedef IdentityCall = ({String action, Map<String, Object?> body, String idempotencyKey});
 
@@ -56,6 +96,17 @@ class FakeIdentityRepository implements IdentityRepository {
 
   /// What the platform says to wait before asking again.
   Duration retryAfter = const Duration(seconds: 60);
+
+  /// What each successive `requestAccountDeletion` answers with, consumed in order.
+  ///
+  /// **A queue rather than a single value**, because the ticket's most important behaviour is what
+  /// the *second* call does: a deferral lifts by asking again (SHIP-170), and a fake with one fixed
+  /// answer could never show it. When it runs out, [deletionRequest] answers — which keeps the
+  /// ordinary case a one-liner.
+  final deletionAnswers = <AccountDeletion>[];
+
+  /// What a deletion request answers with once [deletionAnswers] is exhausted.
+  AccountDeletion deletionRequest = aDeletionRequest();
 
   /// Set to make the next call of that action throw instead of answering.
   final failures = <String, Object>{};
@@ -157,6 +208,18 @@ class FakeIdentityRepository implements IdentityRepository {
       verifyPhoneBody(phone: phone, code: code),
       idempotencyKey,
       () => account = account.copyWith(phoneVerified: true),
+    );
+  }
+
+  @override
+  Future<AccountDeletion> requestAccountDeletion({required String idempotencyKey}) {
+    return _record(
+      'account-deletion',
+      // The endpoint takes no body, which is a fact worth recording rather than eliding: it is
+      // what makes every attempt fingerprint identically to `ActionKey`.
+      const <String, Object?>{},
+      idempotencyKey,
+      () => deletionAnswers.isEmpty ? deletionRequest : deletionAnswers.removeAt(0),
     );
   }
 
