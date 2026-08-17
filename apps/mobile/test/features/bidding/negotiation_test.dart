@@ -45,7 +45,6 @@
 // provider's view**.
 
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -55,6 +54,7 @@ import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
 import 'package:shipper/features/bidding/message.dart';
 
+import '../../support/disclosure.dart';
 import 'fake_bidding_repository.dart';
 import 'negotiation_app.dart';
 
@@ -859,32 +859,23 @@ void main() {
       expect(rendered, contains(customerAnswered));
       expect(rendered, contains('Answer with different terms'));
 
-      final unrecorded = rendered
-          .where((data) => !_providerCopy.contains(data))
-          .where((data) => !_frameworkCopy.contains(data))
-          .where((data) => !partyWords.contains(data))
-          .where((data) => !_computed.any((shape) => shape.hasMatch(data)))
-          .toSet();
-
-      expect(
-        unrecorded,
-        isEmpty,
-        reason: '\n\nThe negotiation screen renders a string to a **provider** that nothing in this '
-            'file records:\n\n'
-            '  ${unrecorded.map((s) => '“$s”').join('\n  ')}\n\n'
-            'This assertion is closed-world on purpose. Docs/01 §4.3 forbids the customer’s\n'
-            'maximum as an amount, as a band, **and as a “budget supplied” indicator** — and the\n'
-            'third form is a sentence, which carries no field, no value and no digit. A list of\n'
-            'banned phrases loses to a paraphrase; this one loses to nothing, because it fails on\n'
-            'anything it was not told about.\n\n'
-            'If the string above is legitimate copy, add it to `_providerCopy` — that is the\n'
-            'decision being recorded, and it is a decision about what a provider may be told. If\n'
-            'it is a value the screen computes, add its **shape** to `_computed`, tightly enough\n'
-            'that prose cannot match it. If it is something a party typed, it belongs in this\n'
-            'test’s `partyWords`, which is the fixture’s own four strings and not a licence.\n\n'
-            'If it relates an offer to what the customer can spend, in any wording at all, it is a\n'
-            'product decision about Docs/01 §4.3 and belongs in the document before it belongs in\n'
-            'a widget.\n',
+      // **The shared assertion (wave 14), and the change is a strengthening rather than a move.**
+      // This block used to allow-list money by *shape* — `RegExp(r'^\$-?[\d,]+\.\d{2}$')` and
+      // `RegExp(r'^\d+\.\d{2}$')` were in `_computed` — and a shape cannot tell the provider's own
+      // price from the customer's maximum, because as strings they are the same kind of thing. A
+      // lone `$1,500.00` chip on this screen passed all 1075 tests in this repository, measured.
+      //
+      // Amounts now go through `amounts:` in **cents with a provenance**: the two offers this
+      // fixture wrote and nothing else. An amount from anywhere else fails whatever its shape, and
+      // `expectOnlyRecordedStrings` refuses a `computed` shape that would re-open the door.
+      expectOnlyRecordedStrings(
+        rendered,
+        surface: 'The negotiation screen',
+        copy: _providerCopy,
+        framework: _frameworkCopy,
+        typedByAParty: partyWords,
+        amounts: const <int>{52000, 40000},
+        computed: _computed,
       );
     });
 
@@ -896,22 +887,15 @@ void main() {
       //
       // Adjacent Dart string literals are joined before searching, because the source wraps a long
       // sentence across two quoted parts and the rendered string has no such seam.
-      final source = <String>[
-        'lib/features/bidding/negotiation_screen.dart',
-        'lib/features/bidding/negotiation_controller.dart',
-        'lib/features/bidding/instant_field.dart',
-      ].map((path) => File(path).readAsStringSync()).join('\n').replaceAll(RegExp(r"'\s*\n\s*'"), '');
-
-      final stale = _providerCopy.where((copy) => !source.contains(copy)).toList();
-
-      expect(
-        stale,
-        isEmpty,
-        reason: '\n\nThese strings are recorded as copy a provider may be shown and no longer '
-            'appear in the negotiation’s source:\n\n'
-            '  ${stale.map((s) => '“$s”').join('\n  ')}\n\n'
-            'Delete them, or correct them to what the screen now says. A recorded string that\n'
-            'matches nothing is a slot the closed-world assertion above would wave through.\n',
+      expectEveryRecordedStringStillExists(
+        _providerCopy,
+        surface: 'the negotiation screen',
+        exempt: _frameworkCopy,
+        sources: <String>[
+          'lib/features/bidding/negotiation_screen.dart',
+          'lib/features/bidding/negotiation_controller.dart',
+          'lib/features/bidding/instant_field.dart',
+        ],
       );
     });
   });
@@ -1013,11 +997,10 @@ const _instant = r'\d{1,2} [A-Z][a-z]{2} \d{4}, \d{1,2}:\d{2} [ap]m';
 /// **Anchored at both ends, every one of them.** An unanchored pattern is a hole: a mutant that
 /// appended a sentence to a price line would still match `\$[\d,]+\.\d{2}` somewhere inside itself.
 final _computed = <RegExp>[
-  // A price, as `audFromCents` renders it.
-  RegExp(r'^\$-?[\d,]+\.\d{2}$'),
-
-  // The same price seeded into the counter form's own box, which has no currency symbol.
-  RegExp(r'^\d+\.\d{2}$'),
+  // **No money shape here, and `expectOnlyRecordedStrings` refuses one.** Two used to be —
+  // `RegExp(r'^\$-?[\d,]+\.\d{2}$')` and `RegExp(r'^\d+\.\d{2}$')` — and between them they
+  // allow-listed *any* bare amount, which is exactly the form a budget takes when it carries no
+  // field, no label and no phrase. Amounts are declared in cents at the call site instead.
 
   // One offer's two commitments, either of which may be absent.
   RegExp('^Collect (?:$_instant|not stated) · deliver by (?:$_instant|not stated)\$'),
